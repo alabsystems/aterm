@@ -249,7 +249,7 @@ tests/red_fixtures.rs	an_unpatched_sibling_version_reds_the_forge_verb	check-ver
 ## 4. Tests that are not spec samples
 
 None remaining from the 2026-10-16 pass: the 25 non-spec tests were retired, and the crate currently
-holds 101 `#[test]` functions (57 secondary/multi-spec rows in §2 alongside §1's `subsumes` column).
+holds 104 `#[test]` functions (57 secondary/multi-spec rows in §2 alongside §1's `subsumes` column).
 
 ## 5. Implied specs that look wrong, or disagree with the code
 

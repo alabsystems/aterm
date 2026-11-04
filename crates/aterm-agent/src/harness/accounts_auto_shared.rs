@@ -877,7 +877,10 @@ impl AccountsHost for BackgroundHost<'_> {
         &self,
         access_token: &str,
         wait: std::time::Duration,
-    ) -> Result<super::super::cli::shared_provider::ClaudeProfile, String> {
+    ) -> Result<
+        super::super::cli::shared_provider::ClaudeProfile,
+        super::super::cli::shared_provider::ObservationError,
+    > {
         super::super::cli::shared_provider::read_claude_profile(access_token, wait)
     }
     fn machine_var(&self, name: &str) -> Option<std::ffi::OsString> {

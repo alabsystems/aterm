@@ -866,6 +866,11 @@ impl<'a> Session<'a> {
     }
     pub(crate) fn writer(&self) -> Result<()> {
         self.generation_guard(true)?;
+        if !self.access.seals() {
+            return Err(Error::new(
+                "Commons still wraps a removed Mac: table writes wait for the removal's rotation",
+            ));
+        }
         if !self.journal.is_writer()
             || self.access.local().role() != Role::Writer
             || !self.access.is_current(&self.journal)

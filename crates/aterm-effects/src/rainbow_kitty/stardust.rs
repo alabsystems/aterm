@@ -6904,7 +6904,9 @@ mod tests {
                 next_key += 83;
             }
         };
-        for ms in [500u64, 1000] {
+        let grain_dead = (StarClass::M3.life_s(StarLane::Strike) * 1000.0).ceil() as u64 + 1;
+        let melt_from = ((1.0 - EXPIRY_MELT_SHARE) * FIELD_LIFE_S * 1000.0).round() as u64;
+        for ms in [grain_dead, melt_from.saturating_sub(50)] {
             type_until(&mut sky, ms);
             let a = field_alpha(&sky, ms);
             assert!(
@@ -6912,7 +6914,7 @@ mod tests {
                 "a field grain under a typing hand is at alpha {a} at {ms} ms, not full"
             );
         }
-        let sc = frame_at(&mut sky, at(1000), &c);
+        let sc = frame_at(&mut sky, at(melt_from.saturating_sub(50)), &c);
         assert!(
             lum(px(&sc.out, 150, 100)) > 0,
             "the field grain died with the grain's life"
@@ -6920,9 +6922,8 @@ mod tests {
         assert_eq!(
             lum(px(&sc.out, 200, 100)),
             0,
-            "a strike grain outlived its 225 ms"
+            "a strike grain outlived StarClass::M3.life_s(StarLane::Strike)"
         );
-        let melt_from = ((1.0 - EXPIRY_MELT_SHARE) * FIELD_LIFE_S * 1000.0).round() as u64;
         type_until(&mut sky, melt_from + 20);
         let a_early = field_alpha(&sky, melt_from + 20);
         type_until(&mut sky, melt_from + 220);

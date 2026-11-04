@@ -601,9 +601,37 @@ fn gpu_submit_cpu_work_is_part_of_the_load_shed_feedback_signal() {
     assert!(!app.perf_reduced);
 }
 
+/// NEGATIVE CONTROL: a re-shed at or past `PERF_RESHED_QUICK_WINDOW` resets the dwell to
+/// `PERF_SHED_DWELL_MIN`, while quick re-sheds double up to `PERF_SHED_DWELL_MAX`, giving an exact
+/// closed-form transition and unshed-frame trajectory over a sustained oscillator.
 #[test]
 fn shed_latch_flap_backoff_bounds_transitions() {
+    use crate::app_render::{
+        PERF_HYSTERESIS_FRAMES, PERF_RESHED_QUICK_WINDOW, PERF_SHED_DWELL_MAX, PERF_SHED_DWELL_MIN,
+        next_shed_dwell,
+    };
     use std::time::Duration;
+
+    assert_eq!(
+        next_shed_dwell(PERF_SHED_DWELL_MAX, None),
+        PERF_SHED_DWELL_MIN
+    );
+    assert_eq!(
+        next_shed_dwell(
+            PERF_SHED_DWELL_MIN,
+            Some(PERF_RESHED_QUICK_WINDOW - Duration::from_nanos(1)),
+        ),
+        PERF_SHED_DWELL_MIN.saturating_mul(2),
+    );
+    assert_eq!(
+        next_shed_dwell(Duration::MAX, Some(Duration::ZERO)),
+        PERF_SHED_DWELL_MAX,
+    );
+    assert_eq!(
+        next_shed_dwell(PERF_SHED_DWELL_MAX, Some(PERF_RESHED_QUICK_WINDOW)),
+        PERF_SHED_DWELL_MIN,
+    );
+
     let mut app = App::headless_for_test();
     let fi = Duration::from_millis(16);
     let t0 = std::time::Instant::now();
@@ -620,19 +648,43 @@ fn shed_latch_flap_backoff_bounds_transitions() {
         }
         shed_frames += u32::from(app.perf_reduced);
     }
-    assert!(
-        transitions <= 14,
-        "flap backoff must bound the limit cycle (got {transitions} transitions/min)"
+
+    let mut expected_frame = PERF_HYSTERESIS_FRAMES - 1;
+    let mut expected_transitions = 1u32;
+    let mut expected_unshed_frames = PERF_HYSTERESIS_FRAMES - 1;
+    let mut expected_dwell = next_shed_dwell(PERF_SHED_DWELL_MIN, None);
+    let fi_ns = fi.as_nanos();
+    loop {
+        let dwell_frames = u32::try_from(expected_dwell.as_nanos().div_ceil(fi_ns)).unwrap();
+        let clear_frame = expected_frame + dwell_frames;
+        if clear_frame >= total_frames {
+            break;
+        }
+        expected_transitions += 1;
+        expected_unshed_frames += PERF_HYSTERESIS_FRAMES.min(total_frames - clear_frame);
+        let reshed_frame = clear_frame + PERF_HYSTERESIS_FRAMES;
+        if reshed_frame >= total_frames {
+            break;
+        }
+        expected_transitions += 1;
+        expected_dwell = next_shed_dwell(expected_dwell, Some(fi * PERF_HYSTERESIS_FRAMES));
+        expected_frame = reshed_frame;
+    }
+
+    assert_eq!(
+        transitions, expected_transitions,
+        "oscillator transitions match the closed-form backoff trajectory"
     );
-    assert!(
-        shed_frames > total_frames * 3 / 4,
-        "a genuinely overloaded session converges to mostly-shed \
-         ({shed_frames}/{total_frames} frames shed)"
+    assert_eq!(
+        shed_frames,
+        total_frames - expected_unshed_frames,
+        "shed frame count matches total frames minus hysteresis unshed windows"
     );
-    assert!(
-        app.perf_shed_dwell > crate::app_render::PERF_SHED_DWELL_MIN,
-        "repeated flaps must have backed the dwell off"
+    assert_eq!(
+        app.perf_shed_dwell, PERF_SHED_DWELL_MAX,
+        "repeated quick flaps saturate the dwell at PERF_SHED_DWELL_MAX"
     );
+    assert_eq!(app.perf_shed_dwell, expected_dwell);
 }
 
 #[test]

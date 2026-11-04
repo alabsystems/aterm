@@ -977,10 +977,7 @@ impl Real {
             .env("PUBLICATION_ENGINE", engine)
             .env(
                 "PATH",
-                rustup_dir().map_or_else(
-                    |_| std::env::var_os("PATH").unwrap_or_default(),
-                    |dir| path_with(&dir),
-                ),
+                rustup_dir().map_or_else(|_| publication_path(), |dir| path_with(&dir)),
             )
             .envs(reads.iter().map(|(key, value)| (key, value)))
             .args([
@@ -2341,12 +2338,40 @@ fn publication_command(engine: &Path, program: impl AsRef<std::ffi::OsStr>) -> C
     cmd
 }
 
-/// Start the engine's launcher without starting a stage, using the publication environment.
+/// Why the engine's launcher did not start ([`engine_bootstrap`]).
+#[cfg(unix)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Bootstrap {
+    /// `bin/pub-python` found no Python 3.11+ with tomllib on the publication PATH (its exit
+    /// 127 and its own line, which it keeps for exactly this): the pinned `cpython` row, which
+    /// [`publication_path`] puts first, is not in place.
+    NoPython(String),
+    /// Anything else: what the launcher said, or why it could not run.
+    Failed(String),
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for Bootstrap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoPython(why) | Self::Failed(why) => f.write_str(why),
+        }
+    }
+}
+
+/// `bin/pub-python`'s line when no interpreter on PATH imports tomllib.
+#[cfg(unix)]
+const NO_PYTHON: &str = "no Python 3.11 or newer";
+
+/// Start the engine's launcher (`bin/pub --help`) without starting a stage, using the
+/// publication environment every release step runs the engine in ([`publication_command`]).
 ///
 /// # Errors
-/// The launcher cannot start, exceeds the one-minute hang detector, or exits unsuccessfully.
+/// The launcher cannot start, exceeds the one-minute hang detector, or exits unsuccessfully:
+/// [`Bootstrap::NoPython`] when its interpreter is the missing piece, with the launcher's
+/// last stderr line in either.
 #[cfg(unix)]
-pub(crate) fn engine_bootstrap(repo: &Path, engine: &Path) -> Result<(), String> {
+pub(crate) fn engine_bootstrap(repo: &Path, engine: &Path) -> Result<(), Bootstrap> {
     let mut cmd = publication_command(engine, engine.join("bin/pub"));
     cmd.arg("--help")
         .current_dir(repo)
@@ -2354,29 +2379,46 @@ pub(crate) fn engine_bootstrap(repo: &Path, engine: &Path) -> Result<(), String>
         .env("PYTHONDONTWRITEBYTECODE", "1");
     let out = aterm_uds::deadline::output_within(&mut cmd, std::time::Duration::from_secs(60))
         .map_err(|e| {
-            format!(
+            Bootstrap::Failed(format!(
                 "publication engine {} --help cannot run: {e}",
                 engine.display()
-            )
+            ))
         })?;
     if out.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "publication engine {} --help exited unsuccessfully ({}); check its launcher's \
-             runtime on the publication PATH",
-            engine.display(),
-            out.status
-        ))
+        return Ok(());
     }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let said = stderr
+        .lines()
+        .map(str::trim)
+        .rfind(|l| !l.is_empty())
+        .unwrap_or("");
+    if out.status.code() == Some(127) && said.contains(NO_PYTHON) {
+        return Err(Bootstrap::NoPython(format!(
+            "publication engine {} has no interpreter: {said}",
+            engine.display()
+        )));
+    }
+    Err(Bootstrap::Failed(format!(
+        "publication engine {} --help exited unsuccessfully ({}){}; check its launcher's \
+         runtime on the publication PATH",
+        engine.display(),
+        out.status,
+        if said.is_empty() {
+            String::new()
+        } else {
+            format!(": {said}")
+        }
+    )))
 }
 
-/// The publication engine sees installed managed programs, rustup and the pinned scanner even
-/// when the launching shell has not adopted the package prefix or developer tooling PATH.
+/// The publication engine sees installed managed programs, rustup, the pinned scanner and the
+/// pinned CPython (whose `python3.14` `bin/pub-python` takes first) even when the launching
+/// shell has not adopted the package prefix or developer tooling PATH.
 fn publication_path() -> std::ffi::OsString {
     let path = std::env::var_os("PATH").unwrap_or_default();
     let mut path = prepend_path(&atpkg::abrew::prefix::Prefix::resolve().bin(), &path);
-    for name in ["rustup", "gitleaks"] {
+    for name in ["rustup", "gitleaks", "cpython"] {
         if let Some(tool) = aterm_uds::host::tool(name).find()
             && let Some(dir) = tool.parent()
         {
@@ -3598,15 +3640,44 @@ impl Backend for Real {
                 )
                 .detail(moved));
             }
-            let msg = format!("release: {to} — the version and the lockfile move together");
+            // The bump opens a release window, so it also carries the harness versions the
+            // window owes (`ship harness-bump`'s writes), after the version-only check above
+            // judged the edit's own changes.
+            let owed = match crate::harness_versions::apply(&self.repo) {
+                Ok(applied) => applied.map(|(_, owed)| owed).unwrap_or_default(),
+                Err(e) => {
+                    undo(self);
+                    return Err(Refusal::new(
+                        format!(
+                            "the harness versions could not be bumped ({e}); the bump is undone"
+                        ),
+                        "read the commit step's log",
+                    ));
+                }
+            };
+            let msg = if owed.is_empty() {
+                format!("release: {to} — the version and the lockfile move together")
+            } else {
+                let names: Vec<String> = owed
+                    .iter()
+                    .map(|o| format!("alab {} harness {}.{}", o.harness.cli(), o.to.0, o.to.1))
+                    .collect();
+                format!(
+                    "release: {to} — the version, the lockfile and the harness versions move \
+                     together ({})",
+                    names.join(", ")
+                )
+            };
             let mut commit = command(aterm_uds::os_path!("git"));
             commit
                 .args(["commit", "-q", "-m", &msg, "--", "Cargo.toml", "Cargo.lock"])
                 .args(&followed)
+                .args(crate::harness_versions::written(&owed))
                 .current_dir(&self.repo);
             if self.logged(Step::Commit, &mut commit).code != 0 {
+                undo(self);
                 return Err(Refusal::new(
-                    "could not commit the bump",
+                    "could not commit the bump; it is undone",
                     "read the commit step's log",
                 ));
             }
@@ -3818,7 +3889,12 @@ impl Backend for Real {
             ),
             (
                 "harness versions",
-                crate::gates::harness_versions_gate_at(&git, commit, version).map(|_| ()),
+                if dry && c.bump_from.is_some() {
+                    crate::gates::harness_versions_bump_writes_at(&git, commit, version)
+                } else {
+                    crate::gates::harness_versions_gate_at(&git, commit, version)
+                }
+                .map(|_| ()),
             ),
             (
                 "handoff fixtures",
@@ -4506,9 +4582,26 @@ mod tests {
         std::fs::create_dir_all(&repo).unwrap();
         std::fs::create_dir_all(engine.join("bin")).unwrap();
         let launcher = engine.join("bin/pub");
-        std::fs::write(&launcher, "#!/bin/sh\nexit 127\n").unwrap();
+        std::fs::write(&launcher, "#!/bin/sh\necho 'gone' >&2\nexit 127\n").unwrap();
         std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(engine_bootstrap(&repo, &engine).is_err());
+        match engine_bootstrap(&repo, &engine) {
+            Err(Bootstrap::Failed(why)) => {
+                assert!(why.contains("(exit status: 127): gone;"), "{why}")
+            }
+            other => panic!("{other:?}"),
+        }
+        // pub-python's own refusal is the missing interpreter, not an opaque launcher fault.
+        std::fs::write(
+            &launcher,
+            "#!/bin/sh\necho 'pub: no Python 3.11 or newer (with tomllib) on PATH' >&2\nexit 127\n",
+        )
+        .unwrap();
+        match engine_bootstrap(&repo, &engine) {
+            Err(Bootstrap::NoPython(why)) => {
+                assert!(why.contains("no Python 3.11 or newer"), "{why}")
+            }
+            other => panic!("{other:?}"),
+        }
 
         std::fs::rename(&launcher, engine.join("bin/unavailable-pub")).unwrap();
         std::fs::write(

@@ -43,9 +43,6 @@ pub fn is_install_process(exe: &Path) -> bool {
 /// `xcode-select`.
 pub const XCODE_SELECT: &str = aterm_uds::os_path!("xcode-select");
 
-/// The catalog host whose reachability the probe checks before it plans an install.
-pub const CATALOG: &str = "https://swscan.apple.com/";
-
 /// `softwareupdate -l` reads Apple's catalog; slow networks take minutes.
 pub const LIST_BUDGET: Duration = Duration::from_secs(20 * 60);
 
@@ -330,27 +327,24 @@ fn stamped(sys: &dyn System) -> Option<Vec<u8>> {
 }
 
 /// Whether Apple's installer window is over with nothing else installing, by `listed` (what
-/// [`installers_listed`] read this tick) and `seen` (the window was listed on some tick of this
-/// wait): no window and no command-line installer listed, and either the on-demand placeholder
+/// [`installers_listed`] read this tick): no window and no command-line installer listed, and
+/// either the on-demand placeholder
 /// gone, which the window unlinks by its path when its request ends (Not Now, Cancel, Done),
 /// whoever made it (itself, this run, or an earlier run that kept it beside the window), just
-/// before it quits; or, the window seen, a placeholder aterm stamped still there ([`stamped`]):
+/// before it quits; or a placeholder aterm stamped still there ([`stamped`]):
 /// a window quit before Install was pressed (its menu's Quit, the Dock's, a logout) ends no
 /// request and unlinks at its exit only a file it created, never one aterm's run had made
-/// beside it ([`aterm_types::macos_setup::APPLE_TOOLS_INSTALLER`]). Until the window was seen,
-/// this run's own stamp is the one it holds while the window it asked for comes up, so it is no
-/// end; nor is an unstamped placeholder (Apple's own or an older aterm's, which only a window
-/// killed outright leaves) or a process table that cannot be read: the wait goes on to its
-/// patience.
+/// beside it ([`aterm_types::macos_setup::APPLE_TOOLS_INSTALLER`]). The caller already observed
+/// the external window. An unstamped placeholder (Apple's own or an older aterm's, which only
+/// a window killed outright leaves) or an unread process table does not prove it closed.
 fn window_closed(
     sys: &dyn System,
     listed: Option<&[aterm_types::macos_setup::ToolsInstaller]>,
-    seen: bool,
 ) -> bool {
     listed.is_some_and(<[_]>::is_empty)
         && match sys.stat(Path::new(PLACEHOLDER)) {
             Err(e) => e.kind() == std::io::ErrorKind::NotFound,
-            Ok(_) => seen && stamped(sys).is_some(),
+            Ok(_) => stamped(sys).is_some(),
         }
 }
 
@@ -425,7 +419,44 @@ impl CommandLineTools {
         // [`Placeholder`]), and then ends the run as it would have, so a stop meant for a whole
         // apply is not lost.
         let _stops = sys.defer_stops();
-        let installed = Self::install_placeheld(sys);
+        let mut installed = Self::install_placeheld(sys);
+        // Recover inside the authorized root run, rather than opening another password tab.
+        // Each attempt reacquires the placeholder and defers to any installer that took over.
+        for seconds in [5, 15] {
+            if !matches!(
+                installed.as_ref(),
+                Err(Failure {
+                    class: Unfinished::Catalog | Unfinished::Download | Unfinished::NoneOffered,
+                    ..
+                })
+            ) || sys.stopped().is_some()
+            {
+                break;
+            }
+            say(&format!(
+                "Apple's Command Line Tools are not ready; retrying in {seconds} seconds"
+            ));
+            sys.sleep(Duration::from_secs(seconds));
+            if sys.stopped().is_some() {
+                break;
+            }
+            if let Some(why) = low_data(sys) {
+                installed = Err(Failure::new(Unfinished::LowData, why.to_owned()));
+                break;
+            }
+            match self::installed(sys) {
+                Ok(true) => {
+                    installed = Ok(());
+                    break;
+                }
+                Err(why) => {
+                    installed = Err(Failure::new(Unfinished::Unread, why));
+                    break;
+                }
+                Ok(false) => {}
+            }
+            installed = Self::install_placeheld(sys);
+        }
         if sys.stopped().is_some() {
             say(stopped_line(installed.is_ok()));
         }
@@ -510,7 +541,17 @@ impl CommandLineTools {
         }
         let labels = parse_labels(&listed);
         let Some(label) = pick(&labels) else {
-            return Self::through_installer(sys, &list);
+            if installed(sys).map_err(|why| Failure::new(Unfinished::Unread, why))? {
+                return Ok(());
+            }
+            return Err(Failure::new(
+                Unfinished::NoneOffered,
+                format!(
+                    "{} lists no Command Line Tools for Xcode, with the on-demand placeholder \
+                     in place",
+                    list.display()
+                ),
+            ));
         };
         let install = Cmd::new(SOFTWAREUPDATE)
             .args(["-i", label.label.as_str()])
@@ -561,33 +602,6 @@ impl CommandLineTools {
         Ok(())
     }
 
-    /// Where `softwareupdate` lists no tools (`list` read the catalog) and no window of Apple's
-    /// is open: Apple's own installer window (`xcode-select --install`), which a person at this
-    /// run's terminal presses Install in, then the wait on it ([`Self::wait_on_window`]).
-    fn through_installer(sys: &dyn System, list: &Cmd) -> Result<(), Failure> {
-        let open = Cmd::new(XCODE_SELECT).arg("--install");
-        let unlisted = format!(
-            "{} lists no Command Line Tools for Xcode, with the on-demand placeholder in place",
-            list.display()
-        );
-        run_ok(sys, &open).map_err(|why| {
-            Failure::new(Unfinished::NoneOffered, format!("{unlisted}, and {why}"))
-        })?;
-        say(
-            "Apple's software catalog lists none for this Mac, so Apple's installer window is \
-             open instead: press Install there (Ctrl-C stops waiting)",
-        );
-        Self::wait_on_window(
-            sys,
-            &format!(
-                "{unlisted}, and Apple's installer (`{}`) did not install them within {} \
-                 minutes: press Install in its window, then run `aterm init --only base.clt`",
-                open.display(),
-                INSTALLER_PATIENCE.as_secs() / 60
-            ),
-        )
-    }
-
     /// Where Apple's installer window is open already ([`Holder::AppleWindow`]): as this run
     /// began, with a placeholder beside it or none, or raised while it read the catalog beside
     /// its placeholder. Its own flow installs the tools once the person presses Install there
@@ -621,7 +635,6 @@ impl CommandLineTools {
     fn wait_on_window(sys: &dyn System, patience: &str) -> Result<(), Failure> {
         let other = |why: String| Failure::new(Unfinished::Other, why);
         let ticks = INSTALLER_PATIENCE.as_millis() / INSTALLER_TICK.as_millis();
-        let mut seen = false;
         for _ in 0..ticks {
             if installed(sys).map_err(other)? {
                 return Ok(());
@@ -636,10 +649,7 @@ impl CommandLineTools {
                 ));
             }
             let listed = installers_listed(sys);
-            seen |= listed.as_ref().is_some_and(|listed| {
-                listed.contains(&aterm_types::macos_setup::ToolsInstaller::AppleWindow)
-            });
-            if window_closed(sys, listed.as_deref(), seen) {
+            if window_closed(sys, listed.as_deref()) {
                 remove_a_gone_runs_placeholder(sys);
                 // Read once more: the window quits a moment after its install ends.
                 if installed(sys).map_err(other)? {
@@ -680,37 +690,8 @@ impl CommandLineTools {
                 if let Some(why) = low_data(sys) {
                     return Probe::Blocked { why: why.into() };
                 }
-                let probe = Cmd::new("/usr/bin/curl")
-                    .args([
-                        "--disable",
-                        "--proto",
-                        "=https",
-                        "-sSI",
-                        "--max-time",
-                        "20",
-                        CATALOG,
-                    ])
-                    .budget(Duration::from_secs(30));
-                match sys.run(&probe) {
-                    Ok(r) if r.success() => {}
-                    Ok(r) => {
-                        return Probe::Blocked {
-                            why: format!(
-                                "Apple's software update catalog is unreachable ({}: {})",
-                                probe.display(),
-                                r.describe()
-                            ),
-                        };
-                    }
-                    Err(e) => {
-                        return Probe::Blocked {
-                            why: format!(
-                                "Apple's software update catalog is unreachable ({}: {e})",
-                                probe.display()
-                            ),
-                        };
-                    }
-                }
+                // softwareupdate owns catalog reachability and its recovery. A separate
+                // HTTP probe can fail before the authorized install reaches those retries.
                 Planned::Install
             }
         };
@@ -889,13 +870,6 @@ Software Update found the following new or updated software:\n\
         }
     }
 
-    fn reachable() -> Ran {
-        Ran::ok("HTTP/1.1 404 Not Found\r\nServer: Apple\r\nContent-Length: 0\r\n\r\n")
-    }
-
-    const CURL: &str =
-        "/usr/bin/curl --disable --proto =https -sSI --max-time 20 https://swscan.apple.com/";
-
     const RECEIPT: &str = "package-id: com.apple.pkg.CLTools_Executables\nversion: 27.0.0.0.1788430756\nvolume: /\nlocation: /\ninstall-time: 1792019691\n";
 
     fn no_receipt() -> Ran {
@@ -917,6 +891,151 @@ Software Update found the following new or updated software:\n\
 
     fn installed_quietly() -> Ran {
         Ran::ok("Software Update Tool\n\nFinding available software\n")
+    }
+
+    const SOFTWAREUPDATE_LIST: &str = "/usr/sbin/softwareupdate -l";
+
+    #[test]
+    fn a_catalog_failure_recovers_in_the_same_authorized_run() {
+        let sys = Fake::root();
+        sys.on(
+            SOFTWAREUPDATE_LIST,
+            Ran {
+                status: Some(1),
+                ..Ran::ok("")
+            },
+        )
+        .on(SOFTWAREUPDATE_LIST, Ran::ok(VM_LIST))
+        .on(
+            "/usr/sbin/softwareupdate -i 'Command Line Tools for Xcode 27.0-27.0'",
+            installed_quietly(),
+        )
+        .on(PKGUTIL, Ran::ok(RECEIPT));
+        CommandLineTools::install(&sys).unwrap();
+        let calls = sys.calls();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| c.as_str() == SOFTWAREUPDATE_LIST)
+                .count(),
+            2
+        );
+        assert!(calls.iter().any(|c| c == "sleep 5000ms"));
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.contains("sudo") || c.contains("xcode-select --install"))
+        );
+        assert!(sys.written(PLACEHOLDER).is_none());
+    }
+
+    #[test]
+    fn a_persistent_catalog_failure_is_bounded_and_a_stop_prevents_recovery() {
+        for stop_after in [None, Some(0), Some(1)] {
+            let mut sys = Fake::root();
+            sys.stop_after = stop_after;
+            sys.on(
+                SOFTWAREUPDATE_LIST,
+                Ran {
+                    status: Some(1),
+                    ..Ran::ok("")
+                },
+            );
+            assert_eq!(
+                CommandLineTools::install(&sys).unwrap_err().class,
+                Unfinished::Catalog
+            );
+            let calls = sys.calls();
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|c| c.as_str() == SOFTWAREUPDATE_LIST)
+                    .count(),
+                if stop_after.is_some() { 1 } else { 3 }
+            );
+            assert_eq!(
+                calls.iter().filter(|c| c.starts_with("sleep ")).count(),
+                match stop_after {
+                    Some(0) => 0,
+                    Some(_) => 1,
+                    None => 2,
+                }
+            );
+            assert!(sys.written(PLACEHOLDER).is_none());
+        }
+    }
+
+    #[test]
+    fn recovery_rechecks_low_data_and_tools_installed_during_the_wait() {
+        for low_data in [false, true] {
+            let mut sys = Fake::root();
+            sys.low_data = Some(low_data);
+            sys.on(
+                SOFTWAREUPDATE_LIST,
+                Ran {
+                    status: Some(1),
+                    ..Ran::ok("")
+                },
+            );
+            if !low_data {
+                sys.on_sleep(|sys, _| {
+                    sys.stat_of(CLT_GIT, git());
+                });
+            }
+            let result = CommandLineTools::install(&sys);
+            if low_data {
+                assert_eq!(result.unwrap_err().class, Unfinished::LowData);
+            } else {
+                result.unwrap();
+            }
+            assert_eq!(
+                sys.calls()
+                    .iter()
+                    .filter(|c| c.as_str() == SOFTWAREUPDATE_LIST)
+                    .count(),
+                1
+            );
+            assert!(sys.written(PLACEHOLDER).is_none());
+        }
+    }
+
+    #[test]
+    fn a_download_failure_recovers_but_an_installer_failure_is_not_retried() {
+        const INSTALL: &str =
+            "/usr/sbin/softwareupdate -i 'Command Line Tools for Xcode 27.0-27.0'";
+        for reached_installer in [false, true] {
+            let sys = Fake::root();
+            sys.on(SOFTWAREUPDATE_LIST, Ran::ok(VM_LIST))
+                .on(
+                    INSTALL,
+                    Ran {
+                        status: Some(1),
+                        ..Ran::ok(if reached_installer {
+                            "Installing Command Line Tools\n"
+                        } else {
+                            "Download failed\n"
+                        })
+                    },
+                )
+                .on(INSTALL, installed_quietly())
+                .on(PKGUTIL, Ran::ok(RECEIPT));
+            let result = CommandLineTools::install(&sys);
+            if reached_installer {
+                assert_eq!(result.unwrap_err().class, Unfinished::Installer);
+            } else {
+                result.unwrap();
+            }
+            let calls = sys.calls();
+            assert_eq!(
+                calls.iter().filter(|c| c.as_str() == INSTALL).count(),
+                if reached_installer { 1 } else { 2 }
+            );
+            assert_eq!(
+                calls.iter().filter(|c| c.starts_with("sleep ")).count(),
+                usize::from(!reached_installer)
+            );
+            assert!(sys.written(PLACEHOLDER).is_none());
+        }
     }
 
     #[test]
@@ -994,7 +1113,6 @@ Software Update found the following new or updated software:\n\
                 "/usr/bin/xcode-select -p",
                 Ran::ok("/Library/Developer/CommandLineTools\n"),
             )
-            .on(CURL, reachable())
             .on("/usr/sbin/softwareupdate -l", Ran::ok(VM_LIST))
             .on(
                 "/usr/sbin/softwareupdate -i 'Command Line Tools for Xcode 27.0-27.0'",
@@ -1125,8 +1243,7 @@ Software Update found the following new or updated software:\n\
         for low_data in [Some(false), None] {
             let mut sys = Fake::root();
             sys.low_data = low_data;
-            sys.on("/usr/bin/xcode-select -p", none_selected())
-                .on(CURL, reachable());
+            sys.on("/usr/bin/xcode-select -p", none_selected());
             assert!(
                 matches!(items[0].probe(&sys, &ctx()), Probe::Change { .. }),
                 "{low_data:?}"
@@ -1134,102 +1251,93 @@ Software Update found the following new or updated software:\n\
         }
     }
 
-    /// Where `softwareupdate` lists no tools, Apple's installer window opens instead and the run
-    /// waits in this process (no `sleep` child) until the tools are there; no `sudo` is run
-    /// (the root half already runs as root). A stop ends the wait, and an installer that never
-    /// finishes is a failure that says what to press.
     #[test]
-    fn an_unlisted_catalog_opens_apples_installer_and_waits_for_the_tools() {
-        let unlisted = || {
-            Ran::ok(
-                "Software Update Tool\n\nFinding available software\nNo new software available.\n",
-            )
-        };
+    fn an_unlisted_catalog_recovers_without_launching_apples_installer() {
         let sys = Fake::root();
-        sys.on("/usr/sbin/softwareupdate -l", unlisted()).on(
-            "/usr/bin/xcode-select --install",
-            Ran::ok("xcode-select: note: install requested for command line developer tools\n"),
-        );
-        sys.on_sleep(|sys, _| {
-            if sys
-                .calls()
+        sys.on(SOFTWAREUPDATE_LIST, Ran::ok("No new software available.\n"))
+            .on(SOFTWAREUPDATE_LIST, Ran::ok("No new software available.\n"))
+            .on(SOFTWAREUPDATE_LIST, Ran::ok(VM_LIST))
+            .on(
+                "/usr/sbin/softwareupdate -i 'Command Line Tools for Xcode 27.0-27.0'",
+                installed_quietly(),
+            )
+            .on(PKGUTIL, Ran::ok(RECEIPT));
+        CommandLineTools::install(&sys).unwrap();
+        let calls = sys.calls();
+        assert_eq!(
+            calls
                 .iter()
-                .filter(|c| c.starts_with("sleep "))
-                .count()
-                == 3
-            {
-                sys.stat_of(CLT_GIT, git());
+                .filter(|c| c.as_str() == SOFTWAREUPDATE_LIST)
+                .count(),
+            3
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| c.starts_with("/usr/sbin/softwareupdate -i"))
+                .count(),
+            1
+        );
+        assert!(calls.iter().any(|c| c == "sleep 5000ms"));
+        assert!(calls.iter().any(|c| c == "sleep 15000ms"));
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.contains("xcode-select --install") || c.contains("sudo"))
+        );
+        assert!(sys.written(PLACEHOLDER).is_none());
+    }
+
+    #[test]
+    fn an_unlisted_catalog_reports_unavailability_without_a_gui_fallback() {
+        for stop_after in [None, Some(0)] {
+            let mut sys = Fake::root();
+            sys.stop_after = stop_after;
+            sys.on(SOFTWAREUPDATE_LIST, Ran::ok("No new software available.\n"));
+            let failure = CommandLineTools::install(&sys).unwrap_err();
+            assert_eq!(
+                failure.class,
+                if stop_after.is_some() {
+                    Unfinished::Stopped
+                } else {
+                    Unfinished::NoneOffered
+                }
+            );
+            let calls = sys.calls();
+            assert!(!calls.iter().any(|c| c.contains("xcode-select --install")
+                || c.starts_with("/usr/sbin/softwareupdate -i")));
+            assert!(sys.written(PLACEHOLDER).is_none());
+            if stop_after.is_none() {
+                assert_eq!(
+                    calls
+                        .iter()
+                        .filter(|c| c.as_str() == SOFTWAREUPDATE_LIST)
+                        .count(),
+                    3
+                );
             }
+        }
+    }
+
+    #[test]
+    fn tools_arriving_during_an_unlisted_catalog_retry_end_the_wait() {
+        let sys = Fake::root();
+        sys.on(SOFTWAREUPDATE_LIST, Ran::ok("No new software available.\n"));
+        sys.on_sleep(|sys, _| {
+            sys.stat_of(CLT_GIT, git());
         });
         CommandLineTools::install(&sys).unwrap();
         let calls = sys.calls();
-        let at = |needle: &str| calls.iter().position(|c| c.starts_with(needle)).unwrap();
-        assert!(
-            at("create /tmp/.com.apple.dt.CommandLineTools") < at("/usr/sbin/softwareupdate -l")
-        );
-        assert!(at("/usr/sbin/softwareupdate -l") < at("/usr/bin/xcode-select --install"));
-        assert!(at("/usr/bin/xcode-select --install") < at("sleep 2000ms"));
-        assert!(at("sleep 2000ms") < at("remove /tmp/.com.apple.dt.CommandLineTools"));
         assert_eq!(
-            calls.iter().filter(|c| c.starts_with("sleep ")).count(),
-            3,
-            "{calls:?}"
+            calls
+                .iter()
+                .filter(|c| c.as_str() == SOFTWAREUPDATE_LIST)
+                .count(),
+            1
         );
-        assert!(
-            calls.iter().all(|c| !c.contains("/bin/sleep")
-                && !c.contains("sudo")
-                && !c.starts_with("/usr/sbin/softwareupdate -i")),
-            "{calls:?}"
-        );
-
-        let mut stopped = Fake::root();
-        stopped.stop_after = Some(2);
-        stopped
-            .on("/usr/sbin/softwareupdate -l", unlisted())
-            .on("/usr/bin/xcode-select --install", Ran::ok(""));
-        let failure = CommandLineTools::install(&stopped).unwrap_err();
-        assert_eq!(failure.class, Unfinished::Stopped);
-        let why = failure.why;
-        assert!(
-            why.starts_with("stopped by signal 2 while Apple's installer"),
-            "{why}"
-        );
-
-        let never = Fake::root();
-        never
-            .on("/usr/sbin/softwareupdate -l", unlisted())
-            .on("/usr/bin/xcode-select --install", Ran::ok(""));
-        let failure = CommandLineTools::install(&never).unwrap_err();
-        assert_eq!(failure.class, Unfinished::AppleWindow);
-        let why = failure.why;
-        assert!(
-            why.contains("did not install them within 30 minutes"),
-            "{why}"
-        );
-        assert!(why.contains("`aterm init --only base.clt`"), "{why}");
-        let waits = never
-            .calls()
-            .iter()
-            .filter(|c| c.starts_with("sleep "))
-            .count();
-        assert_eq!(waits, 900, "every 2 s for 30 minutes");
-
-        let refused = Fake::root();
-        refused.on("/usr/sbin/softwareupdate -l", unlisted()).on(
-            "/usr/bin/xcode-select --install",
-            Ran::exit(
-                1,
-                "xcode-select: error: command line tools are already installed\n",
-            ),
-        );
-        let failure = CommandLineTools::install(&refused).unwrap_err();
-        assert_eq!(failure.class, Unfinished::NoneOffered);
-        let why = failure.why;
-        assert!(
-            why.contains("lists no Command Line Tools") && why.contains("already installed"),
-            "{why}"
-        );
-        assert!(refused.calls().iter().all(|c| !c.starts_with("sleep ")));
+        assert!(!calls.iter().any(|c| c.contains("xcode-select --install")
+            || c.starts_with("/usr/sbin/softwareupdate -i")));
+        assert!(sys.written(PLACEHOLDER).is_none());
     }
 
     /// Apple's window open with no placeholder beside it as the run begins (it opened beside
@@ -1334,8 +1442,8 @@ Software Update found the following new or updated software:\n\
     }
 
     /// The run's placeholder guard leaves its placeholder in place while Apple's window is listed
-    /// as the run ends, on each route a window comes up beside it (`xcode-select --install`'s,
-    /// or one a stub raised while the catalog was read) and however the wait ends (its patience
+    /// as the run ends, when another program raises a window while the catalog is read,
+    /// and however the wait ends (its patience
     /// spent, or a stop): that window made none of its own, its install needs the file to find
     /// the tools in Apple's catalog, and it unlinks the file when its request ends. Every reader
     /// then holds the tools for the window, so the next run waits on it, making, removing and
@@ -1345,14 +1453,13 @@ Software Update found the following new or updated software:\n\
     /// takes the placeholder with it.
     #[test]
     fn the_guard_keeps_its_placeholder_while_apples_window_is_listed_as_the_run_ends() {
-        for (route, raised, stop_after, class) in [
-            ("raised", true, None, Unfinished::AppleWindow),
-            ("opened", false, None, Unfinished::AppleWindow),
-            ("stopped", false, Some(2), Unfinished::Stopped),
+        for (route, stop_after, class) in [
+            ("raised", None, Unfinished::AppleWindow),
+            ("stopped", Some(2), Unfinished::Stopped),
         ] {
             let mut sys = Fake::root();
             sys.stop_after = stop_after;
-            window_comes_up(&sys, raised);
+            window_comes_up(&sys);
             let failure = CommandLineTools::install(&sys).unwrap_err();
             assert_eq!(failure.class, class, "{route}: {failure:?}");
             let calls = sys.calls();
@@ -1380,9 +1487,10 @@ Software Update found the following new or updated software:\n\
             );
         }
 
-        for (route, raised) in [("raised", true), ("opened", false)] {
+        {
+            let route = "raised";
             let gone = Fake::root();
-            window_comes_up(&gone, raised);
+            window_comes_up(&gone);
             gone.on_sleep(|sys, _| {
                 sys.running(&["/sbin/launchd"]);
             });
@@ -1406,26 +1514,11 @@ Software Update found the following new or updated software:\n\
         }
     }
 
-    /// A run that lists nothing at first, where Apple's window comes up beside its placeholder:
-    /// raised by a stub while `softwareupdate -l` reads a catalog that lists the tools
-    /// (`raised`), or opened by `xcode-select --install` where the catalog lists none.
-    fn window_comes_up(sys: &Fake, raised: bool) {
-        let window = ["/sbin/launchd", APPLE_WINDOW];
-        sys.running(&["/sbin/launchd"]);
-        if raised {
-            sys.on("/usr/sbin/softwareupdate -l", Ran::ok(VM_LIST))
-                .on_running("/usr/sbin/softwareupdate -l", &window);
-        } else {
-            sys.on(
-                "/usr/sbin/softwareupdate -l",
-                Ran::ok(
-                    "Software Update Tool\n\nFinding available software\nNo new software \
-                     available.\n",
-                ),
-            )
-            .on("/usr/bin/xcode-select --install", Ran::ok(""))
-            .on_running("/usr/bin/xcode-select --install", &window);
-        }
+    /// Another program raises Apple's window beside this run's placeholder during its catalog read.
+    fn window_comes_up(sys: &Fake) {
+        sys.running(&["/sbin/launchd"])
+            .on(SOFTWAREUPDATE_LIST, Ran::ok(VM_LIST))
+            .on_running(SOFTWAREUPDATE_LIST, &["/sbin/launchd", APPLE_WINDOW]);
     }
 
     /// The placeholder is removed, then the stops are restored, then the one caught is sent again.
@@ -1464,12 +1557,10 @@ Software Update found the following new or updated software:\n\
     #[test]
     fn the_placeholder_is_removed_even_when_softwareupdate_lists_no_tools() {
         let sys = Fake::root();
-        sys.on("/usr/bin/xcode-select -p", none_selected())
-            .on(CURL, reachable())
-            .on(
-                "/usr/sbin/softwareupdate -l",
-                Ran::ok(&VM_LIST.replace("Command Line Tools for Xcode 27.0", "Safari 27.0")),
-            );
+        sys.on("/usr/bin/xcode-select -p", none_selected()).on(
+            "/usr/sbin/softwareupdate -l",
+            Ran::ok(&VM_LIST.replace("Command Line Tools for Xcode 27.0", "Safari 27.0")),
+        );
         let items = expand(
             &Table {
                 command_line_tools: Some(true),
@@ -1498,7 +1589,6 @@ Software Update found the following new or updated software:\n\
     fn an_install_softwareupdate_refused_with_exit_0_fails_with_its_own_words() {
         let sys = Fake::root();
         sys.on("/usr/bin/xcode-select -p", none_selected())
-            .on(CURL, reachable())
             .on("/usr/sbin/softwareupdate -l", Ran::ok(VM_LIST))
             .on(
                 "/usr/sbin/softwareupdate -i 'Command Line Tools for Xcode 27.0-27.0'",
@@ -1527,12 +1617,27 @@ Software Update found the following new or updated software:\n\
     }
 
     #[test]
-    fn no_route_to_apples_catalog_blocks_the_install_instead_of_failing_it() {
+    fn a_first_catalog_outage_reaches_recovery_through_the_apply_engine() {
         let sys = Fake::root();
-        sys.on("/usr/bin/xcode-select -p", none_selected()).on(
-            CURL,
-            Ran::exit(6, "curl: (6) Could not resolve host: swscan.apple.com"),
-        );
+        let install = "/usr/sbin/softwareupdate -i 'Command Line Tools for Xcode 27.0-27.0'";
+        sys.on("/usr/bin/xcode-select -p", none_selected())
+            .on("/usr/bin/xcode-select -p", none_selected())
+            .on(
+                "/usr/bin/xcode-select -p",
+                Ran::ok("/Library/Developer/CommandLineTools\n"),
+            )
+            .on(
+                SOFTWAREUPDATE_LIST,
+                Ran::exit(1, "catalog network unavailable"),
+            )
+            .on(SOFTWAREUPDATE_LIST, Ran::ok(VM_LIST))
+            .on(install, installed_quietly())
+            .on_stat(install, Path::new(CLT_GIT), git())
+            .on(PKGUTIL, Ran::ok(RECEIPT))
+            .on(
+                "/usr/bin/xcode-select --switch /Library/Developer/CommandLineTools",
+                Ran::ok(""),
+            );
         let items = expand(
             &Table {
                 command_line_tools: Some(true),
@@ -1541,19 +1646,23 @@ Software Update found the following new or updated software:\n\
         )
         .unwrap();
         let rows = engine::run(&items, Mode::Apply, &sys, &ctx(), &mut NoJournal);
-        assert_eq!(rows[0].outcome, Outcome::Blocked);
-        assert!(
-            rows[0]
-                .why
-                .as_deref()
-                .unwrap()
-                .contains("Could not resolve host")
-        );
-        assert!(
-            sys.calls()
+        assert_eq!(rows[0].outcome, Outcome::Changed, "{rows:?}");
+        assert!(matches!(items[0].probe(&sys, &ctx()), Probe::Ok { .. }));
+        let calls = sys.calls();
+        assert_eq!(
+            calls
                 .iter()
-                .all(|c| !c.contains("softwareupdate") && !c.starts_with("write"))
+                .filter(|c| c.as_str() == SOFTWAREUPDATE_LIST)
+                .count(),
+            2
         );
+        assert_eq!(calls.iter().filter(|c| c.as_str() == install).count(), 1);
+        assert!(calls.iter().any(|c| c == "sleep 5000ms"));
+        assert!(!calls.iter().any(|c| c.contains("curl")
+            || c.contains("sudo")
+            || c.contains("xcode-select --install")));
+        assert!(sys.written(PLACEHOLDER).is_none());
+        assert_eq!(items[0].unfinished(), None);
     }
 
     #[test]
@@ -1593,7 +1702,6 @@ Software Update found the following new or updated software:\n\
             "/usr/bin/xcode-select -p",
             Ran::ok("/Applications/Xcode.app/Contents/Developer\n"),
         )
-        .on(CURL, reachable())
         .on("/usr/sbin/softwareupdate -l", Ran::ok(VM_LIST))
         .on(
             "/usr/sbin/softwareupdate -i 'Command Line Tools for Xcode 27.0-27.0'",
@@ -2037,68 +2145,24 @@ Software Update found the following new or updated software:\n\
     }
 
     /// Apple's installer window that closes without installing the tools ends the wait on it at
-    /// once, as its own class, on every route: this run opened it where the catalog lists none, a
-    /// stub raised it while this run read the catalog, or it was open already, beside its own
+    /// once, as its own class: a stub raised it while this run read the catalog, or it was open
+    /// already, beside its own
     /// placeholder, beside one an earlier run kept for it, or with none. A person pressed Not
     /// Now, Cancel, or Done on Apple's own failure there (the window unlinks the placeholder,
     /// whoever made it, and quits), or quit the window before pressing Install, which leaves a
     /// placeholder aterm stamped (the window unlinks at its exit only a file it made): this run's,
     /// which its guard removes (the wait does as the window goes where its start was not read,
     /// which reads its run gone), or an earlier run's, which the wait removes as the window goes.
-    /// Where this run opened the window, its own placeholder with no window listed yet is no
-    /// close: the wait ends only once the window it asked for was seen and is gone.
     /// NEGATIVE CONTROL: a window gone with Apple's own empty placeholder still there (killed
     /// outright, so it removed nothing) is no end, and the wait runs to its patience.
     #[test]
     fn apples_window_closing_without_the_tools_ends_the_wait_at_once() {
-        let unlisted = || {
-            Ran::ok(
-                "Software Update Tool\n\nFinding available software\nNo new software available.\n",
-            )
-        };
         let sleeps = |sys: &Fake| {
             sys.calls()
                 .iter()
                 .filter(|c| c.starts_with("sleep "))
                 .count()
         };
-        // This run opened it: nothing listed while `xcode-select --install` brings the window up
-        // (this run's own placeholder holds the wait), then the window, then its close.
-        let opened = Fake::root();
-        opened
-            .running(&["/sbin/launchd"])
-            .on("/usr/sbin/softwareupdate -l", unlisted())
-            .on("/usr/bin/xcode-select --install", Ran::ok(""));
-        opened.on_sleep(move |sys, _| {
-            let slept = sys
-                .calls()
-                .iter()
-                .filter(|c| c.starts_with("sleep "))
-                .count();
-            if slept == 1 {
-                sys.running(&["/sbin/launchd", APPLE_WINDOW]);
-            } else if slept == 3 {
-                let _ = sys.remove(Path::new(PLACEHOLDER));
-                sys.running(&["/sbin/launchd"]);
-            }
-        });
-        let failure = CommandLineTools::install(&opened).unwrap_err();
-        assert_eq!(failure.class, Unfinished::WindowClosed, "{failure:?}");
-        assert!(
-            failure.why.contains("closed without installing")
-                && failure.why.contains("`aterm init --only base.clt`"),
-            "{failure:?}"
-        );
-        assert_eq!(sleeps(&opened), 3, "{:?}", opened.calls());
-        assert!(
-            !opened
-                .calls()
-                .iter()
-                .any(|c| c.starts_with("/usr/sbin/softwareupdate -i")),
-            "{:?}",
-            opened.calls()
-        );
-
         // Already open beside its own placeholder when the run began.
         let found = Fake::root();
         found.file(PLACEHOLDER, b"");
@@ -2140,12 +2204,12 @@ Software Update found the following new or updated software:\n\
         assert_eq!(sleeps(&raised), 1, "{:?}", raised.calls());
 
         // Quit before Install was pressed, beside a placeholder aterm stamped, which stays: this
-        // run opened the window (nothing listed until the second tick), a stub raised it during
-        // the catalog read, or an earlier run, gone now, kept its placeholder for it. Whether
+        // a stub raised it during the catalog read, or an earlier run, gone now, kept its
+        // placeholder for it. Whether
         // this run's own start is read (its stamp then a live run's, as on a Mac) or not (a start
         // of 0, which matches no process), the stamped placeholder is gone once the run has
         // ended, removed once.
-        for (route, own_start) in ["opened", "raised", "kept"]
+        for (route, own_start) in ["raised", "kept"]
             .into_iter()
             .flat_map(|route| [(route, false), (route, true)])
         {
@@ -2154,11 +2218,6 @@ Software Update found the following new or updated software:\n\
                 quit.born(std::process::id(), 1_000);
             }
             match route {
-                "opened" => {
-                    quit.running(&["/sbin/launchd"])
-                        .on("/usr/sbin/softwareupdate -l", unlisted())
-                        .on("/usr/bin/xcode-select --install", Ran::ok(""));
-                }
                 "raised" => {
                     quit.running(&["/sbin/launchd"])
                         .on("/usr/sbin/softwareupdate -l", Ran::ok(VM_LIST))
@@ -2173,22 +2232,8 @@ Software Update found the following new or updated software:\n\
                     assert_eq!(holder(&quit, true), Holder::AppleWindow);
                 }
             }
-            let (comes_up, quit_at) = if route == "opened" {
-                (Some(1), 3)
-            } else {
-                (None, 1)
-            };
-            quit.on_sleep(move |sys, _| {
-                let slept = sys
-                    .calls()
-                    .iter()
-                    .filter(|c| c.starts_with("sleep "))
-                    .count();
-                if Some(slept) == comes_up {
-                    sys.running(&["/sbin/launchd", APPLE_WINDOW]);
-                } else if slept == quit_at {
-                    sys.running(&["/sbin/launchd"]);
-                }
+            quit.on_sleep(|sys, _| {
+                sys.running(&["/sbin/launchd"]);
             });
             let failure = CommandLineTools::install(&quit).unwrap_err();
             assert_eq!(
@@ -2197,7 +2242,7 @@ Software Update found the following new or updated software:\n\
                 "{route} {own_start}: {failure:?}"
             );
             let calls = quit.calls();
-            assert_eq!(sleeps(&quit), quit_at, "{route} {own_start}: {calls:?}");
+            assert_eq!(sleeps(&quit), 1, "{route} {own_start}: {calls:?}");
             assert!(
                 quit.written(PLACEHOLDER).is_none(),
                 "{route} {own_start}: the stamped placeholder goes with the window: {calls:?}"
@@ -2292,8 +2337,7 @@ Software Update found the following new or updated software:\n\
     fn each_way_the_install_falls_short_is_named_by_its_class() {
         let applied = |script: &dyn Fn(&Fake)| {
             let sys = Fake::root();
-            sys.on("/usr/bin/xcode-select -p", none_selected())
-                .on(CURL, reachable());
+            sys.on("/usr/bin/xcode-select -p", none_selected());
             script(&sys);
             let items = expand(
                 &Table {
@@ -2376,21 +2420,5 @@ Software Update found the following new or updated software:\n\
             }),
             Some(Unfinished::WindowClosed)
         );
-        // Apple's catalog out of reach blocks the probe: the same class as an unread catalog.
-        let sys = Fake::root();
-        sys.on("/usr/bin/xcode-select -p", none_selected()).on(
-            CURL,
-            Ran::exit(6, "curl: (6) Could not resolve host: swscan.apple.com"),
-        );
-        let items = expand(
-            &Table {
-                command_line_tools: Some(true),
-            },
-            &ctx(),
-        )
-        .unwrap();
-        let rows = engine::run(&items, Mode::Apply, &sys, &ctx(), &mut NoJournal);
-        assert_eq!(rows[0].outcome, Outcome::Blocked);
-        assert_eq!(items[0].unfinished(), Some(Unfinished::Catalog));
     }
 }

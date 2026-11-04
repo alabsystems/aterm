@@ -8,12 +8,18 @@
 //! and retires the job that ran it, exiting 0 so launchd does not start it again. A job whose
 //! program is an aterm from before that answer (0.145.0) exits 2 every time instead, so the old
 //! login jobs no aterm will run again ([`retired_jobs`]) are those whose program is gone, is this
-//! aterm, or is another aterm that says it has no old verb. [`tidy`], once a process from the
-//! first pass of an ordinary window's keep-awake watch that finds this login's paths
-//! ([`crate::cli::keep_awake`]), retires those jobs and discards the old mug's copies of aterm;
-//! the converge pass's keep-awake ([`crate::cli::keep_installed_awake`]) retires the jobs alone.
-//! It leaves the mug's other files, a few bytes that an old build writes without its lock, to
-//! `aterm pkg self-uninstall`.
+//! aterm, or is another aterm that says it has no old verb. On a home that is not on a disk of
+//! this Mac, which another Mac may read at the same time, only a job whose program lies inside the
+//! home is judged ([`crate::launchd::judged`]): one outside it may be another Mac's mug, so it
+//! stays and its program is never run to ask, and the old `serve` and [`tidy`] each say so of
+//! every such job ([`kept_on_shared_home`]). One of those whose program is gone here, which
+//! this Mac cannot run, is unloaded from this Mac's launchd while it has no process, and its plist
+//! stays ([`retire_jobs`]).
+//! [`tidy`], once a process from the first pass of an ordinary window's keep-awake watch that
+//! finds this login's paths ([`crate::cli::keep_awake`]), retires those jobs and discards the old
+//! mug's copies of aterm; the converge pass's keep-awake ([`crate::cli::keep_installed_awake`])
+//! retires the jobs alone. It leaves the mug's other files, a few bytes that an old build writes
+//! without its lock, to `aterm pkg self-uninstall`.
 
 use std::ffi::OsString;
 #[cfg(unix)]
@@ -37,10 +43,11 @@ pub const RENAMED: &str =
     "aterm caffeine: `aterm caffeine` is now `aterm acaffiene`; run `aterm acaffiene --help`";
 
 /// What `aterm caffeine serve` says first, on the old job's log; a line follows for each thing
-/// that could not be done.
+/// that could not be done, and for each old login item kept on a home another Mac may share,
+/// its own among them when it is one ([`serve_retires`]).
 pub const RETIRED: &str = "aterm caffeine: serve: this login job runs `aterm caffeine`, which \
 is `aterm acaffiene` since 0.145.0 and starts with every ordinary aterm window; it exits 0, so \
-launchd does not start it again, and removes its login item";
+launchd does not start it again, and removes its login item unless a line below keeps it";
 
 /// Whether `text` is a label an old build made ([`crate::launchd::is_label`]'s grammar under the
 /// old name).
@@ -56,9 +63,10 @@ pub fn is_serve(args: &[OsString]) -> bool {
 }
 
 /// The old verb's entry: `args` are the words after `caffeine`. `serve` lets go of the old mug's
-/// update bridge and retires the job that ran it (on macOS), and exits 0, as an old mug's
-/// refusals did, so launchd's KeepAlive does not start it again; anything else names the new
-/// verb and exits 2.
+/// update bridge and retires the job that ran it (on macOS; on a home that is not on a disk of
+/// this Mac it keeps each old job whose program lies outside the home, its own among them, and
+/// says so, [`serve_retires`]), and exits 0, as an old mug's refusals did, so launchd's KeepAlive
+/// does not start it again; anything else names the new verb and exits 2.
 #[must_use = "handle or propagate the command's exit status"]
 pub fn main_entry(args: &[OsString]) -> ExitCode {
     if !is_serve(args) {
@@ -89,18 +97,22 @@ fn retire_own_job() {
 
 /// What the old `serve` does under this login's `paths`. It lets go of the old mug's update
 /// bridge, then retires the old login jobs for `exe`, this aterm ([`retire_jobs`], asking another
-/// program whether it has the old verb with `has_verb` and unloading each with `unload`). An old
-/// mug that ends for an update restart leaves a bridge keeping the Mac awake until its successor
-/// lets it go, or for at most 21 minutes, and that successor is now this. It takes no lock: an
-/// old build's mug that finds its lock held by a process whose command line is `caffeine serve`,
-/// with no label in the file, reads it as a running mug and gives up its start for the whole
-/// login. What could not be done, one line each.
+/// program whether it has the old verb with `has_verb` and unloading each with `unload`). On a
+/// home that is not on a disk of this Mac ([`Paths::launch_agents_local`]) each job whose program
+/// lies outside the home is kept, as another Mac that shares the home may run an old build there,
+/// and a line says so ([`kept_on_shared_home`]); `unload` takes one whose program is gone here
+/// too, and that line says what it did. An old mug that ends for an update restart leaves a
+/// bridge keeping the Mac awake until its successor lets it go, or for at most 21 minutes, and
+/// that successor is now this. It takes no lock: an old build's mug that finds its lock held by a
+/// process whose command line is `caffeine serve`, with no label in the file, reads it as a
+/// running mug and gives up its start for the whole login. What could not be done, and each job
+/// kept so, one line each.
 #[cfg(all(unix, any(target_os = "macos", test)))]
 fn serve_retires(
     paths: &Paths,
     exe: std::io::Result<PathBuf>,
     has_verb: impl Fn(&Path) -> Option<bool>,
-    unload: impl Fn(&str),
+    unload: impl Fn(&str) -> crate::launchd::Unload,
 ) -> Vec<String> {
     let bridge = bridge_file(paths);
     let mut failed = match crate::paths::existing_real_dir(&paths.state_dir) {
@@ -114,7 +126,11 @@ fn serve_retires(
         Err(e) => vec![format!("{}: {e}", bridge.display())],
     };
     match exe {
-        Ok(exe) => failed.extend(retire_jobs_with(paths, &exe, has_verb, unload)),
+        Ok(exe) => {
+            let retired = retire_jobs_with(paths, &exe, has_verb, unload);
+            failed.extend(retired.failed);
+            failed.extend(retired.kept.iter().map(kept_on_shared_home));
+        }
         Err(e) => failed.push(format!("this executable's path cannot be read: {e}")),
     }
     failed
@@ -157,25 +173,76 @@ pub fn code_dir(paths: &Paths) -> PathBuf {
 /// either: its job exits 2 and is started again about every ten seconds (0.145.0, which knows
 /// neither the old verb nor its `serve`), or retires itself when it runs (0.146.0 on), so it goes
 /// now either way. A program that still has the old verb (0.144.0 and before) keeps its job,
-/// which is its own mug, and so does one that gives no answer.
+/// which is its own mug, and so does one that gives no answer. On a home that is not on a disk of
+/// this Mac ([`Paths::launch_agents_local`]) only a job whose program lies inside the home is
+/// judged ([`crate::launchd::judged`]): one outside it, in `/Applications` say, may be another
+/// Mac's mug, so it stays and its program is never run to ask, even where it is a 0.145.0 here
+/// whose job fails every ten seconds ([`kept_on_shared_home`]). Where that program is gone here,
+/// [`retire_jobs`] unloads the job from this Mac's launchd while it has no process, and leaves its
+/// plist.
 #[cfg(unix)]
 #[must_use]
 pub fn retired_jobs(paths: &Paths, exe: &Path) -> Vec<(String, PathBuf)> {
     retired_jobs_with(paths, exe, has_old_verb)
 }
 
-/// [`retired_jobs`], asking another program whether it has the old verb with `has_verb`.
+/// [`retired_jobs`], asking another program whether it has the old verb with `has_verb`. Whether
+/// this Mac may judge a job comes first, so `has_verb` never runs a program outside a home that is
+/// not on a disk of this Mac.
 #[cfg(unix)]
 pub(crate) fn retired_jobs_with(
     paths: &Paths,
     exe: &Path,
     has_verb: impl Fn(&Path) -> Option<bool>,
 ) -> Vec<(String, PathBuf)> {
+    let local = paths.launch_agents_local();
     crate::launchd::login_jobs(paths, is_label, &SERVE_ARGS, |program| {
-        crate::launchd::program_gone(program)
-            || same_file(program, exe)
-            || has_verb(program) == Some(false)
+        crate::launchd::judged(program, &paths.home, local)
+            && (crate::launchd::program_gone(program)
+                || same_file(program, exe)
+                || has_verb(program) == Some(false))
     })
+}
+
+/// What is said of an old login job [`retired_jobs`] keeps on a home that is not on a disk of
+/// this Mac ([`Paths::launch_agents_local`]) because its program lies outside the home
+/// ([`crate::launchd::judged`]), whatever that program is here (gone, this aterm, or another):
+/// one line naming its label, plist and program, saying why and what to do, and for a program
+/// gone here what its unload from this Mac's launchd did ([`unload_said`]). No program is run to
+/// ask whether it has the old verb ([`has_old_verb`]): one outside the home may be another Mac's.
+#[cfg(unix)]
+fn kept_on_shared_home(job: &crate::launchd::Unjudged) -> String {
+    format!(
+        "kept {} ({}): its program, {}, lies outside this home, which is not on a disk of this \
+         Mac, so another Mac that shares the home may still run an aterm before 0.145.0 from \
+         there; it stays and its program is not run to ask, and once no Mac does, remove the \
+         plist by hand{}",
+        job.label,
+        job.plist.display(),
+        job.program.display(),
+        job.unload.as_ref().map(unload_said).unwrap_or_default()
+    )
+}
+
+/// What [`kept_on_shared_home`] adds for a job whose program is gone on this Mac: what its
+/// unload did with it, `unload` ([`crate::launchd::unload_idle`] live).
+#[cfg(unix)]
+fn unload_said(unload: &crate::launchd::Unload) -> String {
+    use crate::launchd::Unload;
+    let gone = "; it is gone on this Mac, which cannot run it,";
+    match unload {
+        Unload::Unloaded => {
+            format!("{gone} so aterm unloaded the job from this Mac's launchd until the next login")
+        }
+        Unload::NotLoaded => format!("{gone} and this Mac's launchd has no such job loaded"),
+        Unload::Running(pid) => format!(
+            "{gone} but the job's process, pid {pid}, still runs here, so aterm leaves the job \
+             loaded in this Mac's launchd while that process runs"
+        ),
+        Unload::Failed(why) => {
+            format!("{gone} and aterm could not unload the job from this Mac's launchd: {why}")
+        }
+    }
 }
 
 /// Whether the executable `program` still has the old verb: every release from 0.107.0 to
@@ -204,27 +271,44 @@ fn same_file(a: &Path, b: &Path) -> bool {
 }
 
 /// Retire the old login jobs [`retired_jobs`] finds for `exe`, this aterm
-/// ([`crate::launchd::retire`]). What could not be removed, one line each.
+/// ([`crate::launchd::retire_with`] with [`crate::launchd::unload_idle`]). On a home that is not
+/// on a disk of this Mac, unload each old job kept there whose program is gone here and that has
+/// no process, leaving its plist ([`crate::launchd::unload_stranded`]). What could not be removed,
+/// one line each.
 #[cfg(unix)]
 #[must_use]
 pub fn retire_jobs(paths: &Paths, exe: &Path) -> Vec<String> {
-    retire_jobs_with(paths, exe, has_old_verb, crate::launchd::unload_idle)
+    retire_jobs_with(paths, exe, has_old_verb, crate::launchd::unload_idle).failed
+}
+
+/// What [`retire_jobs_with`] did.
+#[cfg(unix)]
+pub(crate) struct Retired {
+    /// What could not be removed, one line each.
+    pub(crate) failed: Vec<String>,
+    /// Each old job kept on a home that is not on a disk of this Mac, with what its unload did
+    /// where its program is gone here ([`crate::launchd::unload_stranded`]); none on a home on a
+    /// disk of this Mac.
+    pub(crate) kept: Vec<crate::launchd::Unjudged>,
 }
 
 /// [`retire_jobs`], asking another program whether it has the old verb with `has_verb` and
-/// unloading each retired job with `unload`.
+/// unloading each retired job, and each stranded one, with `unload`.
 #[cfg(unix)]
 pub(crate) fn retire_jobs_with(
     paths: &Paths,
     exe: &Path,
     has_verb: impl Fn(&Path) -> Option<bool>,
-    unload: impl Fn(&str),
-) -> Vec<String> {
-    crate::launchd::retire_with(retired_jobs_with(paths, exe, has_verb), unload)
+    unload: impl Fn(&str) -> crate::launchd::Unload,
+) -> Retired {
+    let failed = crate::launchd::retire_with(retired_jobs_with(paths, exe, has_verb), &unload);
+    let kept = crate::launchd::unload_stranded(paths, is_label, &SERVE_ARGS, unload);
+    Retired { failed, kept }
 }
 
-/// [`retire_jobs`] for `exe`, this aterm, then [`discard_copies`]. What could not be removed, and
-/// a copy kept, one line each.
+/// [`retire_jobs`] for `exe`, this aterm, then [`discard_copies`]. What could not be removed, each
+/// job kept on a home that is not on a disk of this Mac ([`kept_on_shared_home`]), and each copy
+/// kept, one line each.
 #[cfg(unix)]
 #[must_use]
 pub fn tidy(paths: &Paths, exe: &Path) -> Vec<String> {
@@ -232,15 +316,17 @@ pub fn tidy(paths: &Paths, exe: &Path) -> Vec<String> {
 }
 
 /// [`tidy`], asking another program whether it has the old verb with `has_verb` and unloading
-/// each retired job with `unload`.
+/// each job [`retire_jobs`] unloads with `unload`.
 #[cfg(unix)]
 fn tidy_with(
     paths: &Paths,
     exe: &Path,
     has_verb: impl Fn(&Path) -> Option<bool>,
-    unload: impl Fn(&str),
+    unload: impl Fn(&str) -> crate::launchd::Unload,
 ) -> Vec<String> {
-    let mut failed = retire_jobs_with(paths, exe, has_verb, unload);
+    let retired = retire_jobs_with(paths, exe, has_verb, unload);
+    let mut failed = retired.failed;
+    failed.extend(retired.kept.iter().map(kept_on_shared_home));
     failed.extend(discard_copies(paths));
     failed
 }
@@ -289,6 +375,8 @@ fn kept_line(copy: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::launchd::{Unjudged, Unload};
 
     #[test]
     fn only_a_label_the_old_name_made_is_one() {
@@ -328,6 +416,7 @@ mod tests {
             state_dir: root.join("state"),
             home: root.join("home"),
             logs_dir: root.join("logs"),
+            local_volume: |_| true,
         }
     }
 
@@ -341,6 +430,85 @@ mod tests {
         std::fs::create_dir_all(paths.launch_agents()).expect("agents");
         std::fs::write(&plist, text).expect("plist");
         plist
+    }
+
+    /// `paths` with `~/Library/LaunchAgents` read as on no disk of this Mac: a network home.
+    #[cfg(unix)]
+    fn network(paths: &Paths) -> Paths {
+        Paths {
+            local_volume: |_| false,
+            ..paths.clone()
+        }
+    }
+
+    /// The old job `label` under `paths`, running `program`, kept on a network home, with what its
+    /// unload did (`None` where its program is here and nothing was unloaded).
+    #[cfg(unix)]
+    fn kept_job(paths: &Paths, label: &str, program: &Path, unload: Option<Unload>) -> Unjudged {
+        Unjudged {
+            label: label.to_string(),
+            plist: paths.startup_plist(label),
+            program: program.to_path_buf(),
+            unload,
+        }
+    }
+
+    /// Whether `lines` are one kept line ([`kept_on_shared_home`]) for each of `jobs`, its label,
+    /// plist, program and what its unload did, ending with what that unload did ([`unload_said`])
+    /// where there was one, and nothing else.
+    #[cfg(unix)]
+    fn says_kept(lines: &[String], jobs: &[Unjudged]) -> bool {
+        lines.len() == jobs.len()
+            && jobs.iter().all(|job| {
+                let line = kept_on_shared_home(job);
+                job.unload
+                    .as_ref()
+                    .is_none_or(|unload| line.ends_with(&unload_said(unload)))
+                    && lines.iter().filter(|said| **said == line).count() == 1
+            })
+    }
+
+    /// A kept line names the job and its program, and, for a program gone here, ends with what
+    /// the unload did, a clause apart for each outcome: an idle job unloaded, one whose process
+    /// still runs left loaded (naming that process), one launchd had not loaded, and a failure
+    /// (saying why). A program here adds nothing.
+    #[test]
+    #[cfg(unix)]
+    fn a_kept_line_says_what_the_unload_did() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let paths = network(&scratch(root.path()));
+        let label = "com.aterm.aterm.caffeine.dev.0000000a";
+        let program = Path::new("/Applications/aterm.app/Contents/MacOS/aterm");
+        let here = kept_on_shared_home(&kept_job(&paths, label, program, None));
+        assert!(here.starts_with(&format!("kept {label} ")), "{here}");
+        assert!(
+            here.contains(&paths.startup_plist(label).display().to_string())
+                && here.contains(&program.display().to_string()),
+            "{here}"
+        );
+        let outcomes = [
+            Unload::Unloaded,
+            Unload::Running(4242),
+            Unload::NotLoaded,
+            Unload::Failed("launchctl refused".to_string()),
+        ];
+        let said: Vec<String> = outcomes.iter().map(unload_said).collect();
+        for (unload, clause) in outcomes.iter().zip(&said) {
+            let line = kept_on_shared_home(&kept_job(&paths, label, program, Some(unload.clone())));
+            assert_eq!(line, format!("{here}{clause}"), "{unload:?}");
+            assert!(!clause.is_empty(), "{unload:?}");
+        }
+        for (i, a) in said.iter().enumerate() {
+            for b in &said[i + 1..] {
+                assert_ne!(a, b, "each outcome is told apart");
+            }
+        }
+        assert!(
+            said[1].contains("4242"),
+            "a job left loaded names its process"
+        );
+        assert!(!said[0].contains("4242"), "one unloaded has none");
+        assert!(said[3].contains("launchctl refused"), "a failure says why");
     }
 
     #[test]
@@ -413,6 +581,38 @@ mod tests {
             asked, others,
             "only another program is asked, never this aterm or one that is gone"
         );
+
+        let in_home = plant(
+            &paths,
+            "com.aterm.aterm.caffeine.dev.00000010",
+            &paths.home.join("worktree/aterm"),
+        );
+        let answers_no = paths.home.join("Applications/aterm");
+        std::fs::create_dir_all(answers_no.parent().expect("a folder")).expect("mkdir");
+        std::fs::write(&answers_no, "0.145.0").expect("exe");
+        let without_verb = plant(&paths, "com.aterm.aterm.caffeine.dev.00000011", &answers_no);
+        let asked = std::cell::RefCell::new(Vec::new());
+        let says_no = |program: &Path| {
+            asked.borrow_mut().push(program.to_path_buf());
+            Some(false)
+        };
+        assert_eq!(
+            retired_jobs_with(&network(&paths), &exe, says_no),
+            [
+                ("com.aterm.aterm.caffeine.dev.00000010".to_string(), in_home),
+                (
+                    "com.aterm.aterm.caffeine.dev.00000011".to_string(),
+                    without_verb
+                ),
+            ],
+            "on a network home only a program inside it is judged: one outside may be another \
+             Mac's"
+        );
+        assert_eq!(
+            asked.into_inner(),
+            [answers_no],
+            "no program outside a network home is run to ask"
+        );
     }
 
     /// An old login job whose program is another aterm that says it has no old verb (0.145.0,
@@ -454,6 +654,7 @@ mod tests {
         let unloaded = std::cell::RefCell::new(Vec::new());
         let failed = tidy_with(&paths, &exe, has_verb, |label| {
             unloaded.borrow_mut().push(label.to_string());
+            Unload::Unloaded
         });
         assert_eq!(failed, Vec::<String>::new());
         assert!(!retired.exists(), "the job that can only fail goes");
@@ -509,6 +710,7 @@ mod tests {
         };
         let failed = tidy_with(&paths, &exe, has_verb, |label| {
             unloaded.borrow_mut().push(label.to_string());
+            Unload::Unloaded
         });
         assert_eq!(failed, Vec::<String>::new());
         assert!(!mine.exists() && !orphan.exists(), "both retired");
@@ -527,6 +729,77 @@ mod tests {
         assert!(!ran.exists() && !code_dir(&paths).exists(), "the copies go");
         assert!(state.is_file(), "an old build writes it without the lock");
         assert_eq!(std::fs::read(lock_file(&paths)).expect("lock"), b"");
+
+        let mine = plant(&paths, "com.aterm.aterm.caffeine.dev.0000000a", &exe);
+        let gone = root.path().join("gone/aterm");
+        let elsewhere = plant(&paths, "com.aterm.aterm.caffeine.dev.0000000b", &gone);
+        let in_home = plant(
+            &paths,
+            "com.aterm.aterm.caffeine.dev.0000000d",
+            &paths.home.join("gone/aterm"),
+        );
+        let removed = root.path().join("removed-app/aterm");
+        let running = plant(&paths, "com.aterm.aterm.caffeine.dev.0000000e", &removed);
+        let unloaded = std::cell::RefCell::new(Vec::new());
+        let failed = tidy_with(
+            &network(&paths),
+            &exe,
+            |program| {
+                panic!(
+                    "{} is outside a network home, never asked",
+                    program.display()
+                )
+            },
+            |label| {
+                unloaded.borrow_mut().push(label.to_string());
+                if label == "com.aterm.aterm.caffeine.dev.0000000e" {
+                    Unload::Running(4242)
+                } else {
+                    Unload::Unloaded
+                }
+            },
+        );
+        assert!(
+            says_kept(
+                &failed,
+                &[
+                    kept_job(&paths, "com.aterm.aterm.caffeine.dev.0000000a", &exe, None),
+                    kept_job(
+                        &paths,
+                        "com.aterm.aterm.caffeine.dev.0000000b",
+                        &gone,
+                        Some(Unload::Unloaded)
+                    ),
+                    kept_job(
+                        &paths,
+                        "com.aterm.aterm.caffeine.dev.0000000c",
+                        &other,
+                        None
+                    ),
+                    kept_job(
+                        &paths,
+                        "com.aterm.aterm.caffeine.dev.0000000e",
+                        &removed,
+                        Some(Unload::Running(4242))
+                    ),
+                ]
+            ),
+            "on a network home each job whose program lies outside it is kept and said to be, \
+             once each tidy, and one whose program is gone here with what its unload did: an \
+             idle one unloaded, one whose process still runs left loaded: {failed:#?}"
+        );
+        assert!(mine.is_file() && elsewhere.is_file() && kept.is_file() && running.is_file());
+        assert!(!in_home.exists(), "a job inside the home is judged");
+        assert_eq!(
+            unloaded.into_inner(),
+            [
+                "com.aterm.aterm.caffeine.dev.0000000d",
+                "com.aterm.aterm.caffeine.dev.0000000b",
+                "com.aterm.aterm.caffeine.dev.0000000e"
+            ],
+            "the job retired is unloaded, and so is each one kept whose program is gone here, \
+             which this Mac cannot run"
+        );
     }
 
     #[test]
@@ -548,6 +821,7 @@ mod tests {
         let has_verb = |program: &Path| (program == other).then_some(true);
         let failed = serve_retires(&paths, Ok(exe.clone()), has_verb, |label| {
             unloaded.borrow_mut().push(label.to_string());
+            Unload::Unloaded
         });
         assert_eq!(failed, Vec::<String>::new());
         assert!(
@@ -571,6 +845,80 @@ mod tests {
         assert!(!bridge.exists(), "the bridge goes first");
         assert!(mine.is_file());
         assert!(!lock_file(&paths).exists(), "no lock is opened");
+
+        let in_home = plant(
+            &paths,
+            "com.aterm.aterm.caffeine.dev.00000011",
+            &paths.home.join("removed-worktree/aterm"),
+        );
+        let gone = root.path().join("removed-elsewhere/aterm");
+        let elsewhere = plant(&paths, "com.aterm.aterm.caffeine.dev.00000012", &gone);
+        let removed = root.path().join("removed-app/aterm");
+        let running = plant(&paths, "com.aterm.aterm.caffeine.dev.00000013", &removed);
+        let unloaded = std::cell::RefCell::new(Vec::new());
+        let failed = serve_retires(
+            &network(&paths),
+            Ok(exe.clone()),
+            |program| {
+                panic!(
+                    "{} is outside a network home, never asked",
+                    program.display()
+                )
+            },
+            |label| {
+                unloaded.borrow_mut().push(label.to_string());
+                if label == "com.aterm.aterm.caffeine.dev.00000013" {
+                    Unload::Running(4242)
+                } else {
+                    Unload::Unloaded
+                }
+            },
+        );
+        assert!(
+            says_kept(
+                &failed,
+                &[
+                    kept_job(&paths, INSTALLED_LABEL, &exe, None),
+                    kept_job(
+                        &paths,
+                        "com.aterm.aterm.caffeine.dev.0000000c",
+                        &other,
+                        None
+                    ),
+                    kept_job(
+                        &paths,
+                        "com.aterm.aterm.caffeine.dev.00000012",
+                        &gone,
+                        Some(Unload::Unloaded)
+                    ),
+                    kept_job(
+                        &paths,
+                        "com.aterm.aterm.caffeine.dev.00000013",
+                        &removed,
+                        Some(Unload::Running(4242))
+                    ),
+                ]
+            ),
+            "on a network home its own job and every other whose program lies outside the home, \
+             there or gone, are kept and said to be, one gone with what its unload did: \
+             {failed:#?}"
+        );
+        assert!(mine.is_file() && kept.is_file() && elsewhere.is_file() && running.is_file());
+        assert!(!in_home.exists(), "a job inside the home is judged");
+        assert_eq!(
+            unloaded.into_inner(),
+            [
+                "com.aterm.aterm.caffeine.dev.00000011",
+                "com.aterm.aterm.caffeine.dev.00000012",
+                "com.aterm.aterm.caffeine.dev.00000013"
+            ],
+            "the job retired is unloaded, and so is each one kept whose program is gone here"
+        );
+        assert_eq!(
+            retire_jobs_with(&paths, &exe, has_verb, |_| Unload::Unloaded).kept,
+            [],
+            "a home on this Mac keeps none so"
+        );
     }
 
     #[test]

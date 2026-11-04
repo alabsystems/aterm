@@ -1422,13 +1422,22 @@ impl App {
         match body.trim() {
             atpkg::cli::C_TOOLCHAIN_MISSING => {
                 self.except_clear(&broken.key());
-                self.except(&missing);
+                // aterm's own Command Line Tools tab (or an installer) is installing them: an
+                // entry telling the person to run the install would be one aterm makes moot. It
+                // waits for that install to end without them.
+                if self.developer_tools_on_their_way() {
+                    self.workstation_setup.c_toolchain_missing_held = true;
+                } else {
+                    self.except(&missing);
+                }
             }
             atpkg::cli::C_TOOLCHAIN_BROKEN => {
+                self.workstation_setup.c_toolchain_missing_held = false;
                 self.except_clear(&missing.key());
                 self.except(&broken);
             }
             atpkg::cli::C_TOOLCHAIN_READY => {
+                self.workstation_setup.c_toolchain_missing_held = false;
                 self.except_clear(&missing.key());
                 self.except_clear(&broken.key());
             }

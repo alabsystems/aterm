@@ -27,9 +27,11 @@ pub(crate) mod command;
 pub mod google;
 pub mod host;
 mod policy;
+mod publish;
 mod refresh;
 pub mod transport;
 pub use policy::{ENTRY, Grant, Policy};
+pub use publish::Publication;
 pub use refresh::Refresh;
 const MAX_SESSIONS: usize = 64;
 

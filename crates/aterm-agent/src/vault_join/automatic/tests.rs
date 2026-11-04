@@ -196,6 +196,7 @@ impl Fixture {
         }
         let device = device(&self.fake.root, name);
         let joining = Joining {
+            records_bound: aterm_secrets::crossing::RecordsBound::uncrossed(),
             device: &device,
             node: [7; 32],
             name: name.to_owned(),
@@ -269,6 +270,7 @@ fn attempt_proof(mut stream: TcpStream, greeting: joiner::Greeting, root: &std::
     let pair = ring::signature::Ed25519KeyPair::from_seed_unchecked(&[0x44; 32]).unwrap();
     let node: [u8; 32] = pair.public_key().as_ref().try_into().unwrap();
     let joining = Joining {
+        records_bound: aterm_secrets::crossing::RecordsBound::uncrossed(),
         device: &device,
         node,
         name: "newcomer".to_owned(),

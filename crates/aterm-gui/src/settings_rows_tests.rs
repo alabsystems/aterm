@@ -4827,10 +4827,70 @@ fn the_color_theme_row_holds_its_picker_and_reset_at_every_width() {
 #[test]
 fn a_one_line_rows_name_keeps_its_floor_on_every_page() {
     at_each_text_scale(&[1.0, 1.25, 1.5, 2.0], "one-line rows", |scale| {
+        crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
         let mut short = std::collections::BTreeSet::new();
+        let widths: Vec<f32> = (0..30).map(|step| 300.0 + 40.0 * step as f32).collect();
+        // At rest in a 760pt window, the pages `classed` names read the window's width only as its
+        // tier, the FORM_MEASURE column and the compact toolbar's form: widths equal in those lay
+        // one walk shifted across, and every label's width and place beside its control with it,
+        // so the first and last of each run stand for the run. A narrower column is a class of its
+        // own. A page that reads the width any other way (Home's grid, Themes' stage, Software
+        // Update's columns, Messages' opening) walks every width, and a classed page that comes to
+        // must leave `classed`. 1× stays whole, its interior widths the sentinel for such a read.
+        // Negative controls: both of finished_setting_row_as's floors `+ 24.0` leave colour rows
+        // short at narrow widths at 1× and 1.25×; inline controls widened where text_width >= 690,
+        // which only 1.25× reaches, show at the first and the last width of its 720pt run.
+        let class = |width: f32| {
+            let tier = SettingsWidth::for_viewport(width);
+            let toolbar = (tier == SettingsWidth::Compact).then(|| {
+                compact_titled(LogicalRect::new(0.0, 0.0, width, 760.0)).ok_or(width.to_bits())
+            });
+            (
+                tier,
+                settings_page_content_width(width, tier, FORM_MEASURE).to_bits(),
+                toolbar,
+            )
+        };
+        assert!(
+            class(widths[0]) != class(widths[1]),
+            "{scale}×: a narrow window's column is its own class"
+        );
+        let edges: Vec<f32> = widths
+            .iter()
+            .enumerate()
+            .filter(|&(at, &width)| {
+                at == 0
+                    || at + 1 == widths.len()
+                    || class(widths[at - 1]) != class(width)
+                    || class(widths[at + 1]) != class(width)
+            })
+            .map(|(_, &width)| width)
+            .collect();
         for route in SettingsRoute::ALL {
-            let mut width = 300.0;
-            while width <= 1_480.0 {
+            let classed = scale > 1.0
+                && matches!(
+                    route,
+                    SettingsRoute::Modified
+                        | SettingsRoute::Manual
+                        | SettingsRoute::Appearance
+                        | SettingsRoute::Wallpaper
+                        | SettingsRoute::TextFonts
+                        | SettingsRoute::CursorMotion
+                        | SettingsRoute::CursorStyles
+                        | SettingsRoute::Sound
+                        | SettingsRoute::WindowTabs
+                        | SettingsRoute::TabColor
+                        | SettingsRoute::KeyboardInput
+                        | SettingsRoute::Terminal
+                        | SettingsRoute::Harness
+                        | SettingsRoute::Ai
+                        | SettingsRoute::Tabs
+                        | SettingsRoute::Security
+                        | SettingsRoute::Lab
+                        | SettingsRoute::Packages
+                        | SettingsRoute::About
+                );
+            for &width in if classed { &edges } else { &widths } {
                 let (mut runtime, instance, view) = setup();
                 {
                     let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
@@ -4876,7 +4936,6 @@ fn a_one_line_rows_name_keeps_its_floor_on_every_page() {
                         }
                     },
                 );
-                width += 40.0;
             }
         }
         assert!(
@@ -7752,7 +7811,9 @@ fn a_segment_pressed_stays_where_it_was_pressed() {
     // moved sideways (Window appearance, Dark, at 738x420: 1.4pt). In every window of the
     // switches' sweep, the last segment a screen draws whole that is not chosen is pressed, a
     // frame drawn while its write is in flight and one after it lands: it is where it was on
-    // both, whole, and no status's bar covers it.
+    // both, whole, and no status's bar covers it. Negative control: `PressedAt::key_in` returning
+    // the key the press found moves segments at both scales (Cursor & Motion's cursor style at
+    // 164x292 with 1x text: from 189pt to 192pt).
     at_each_text_scale(&[1.0, 2.0], "a pressed segment stays", |scale| {
         let (mut pressed, mut over) = (0, 0);
         let mut faults = Vec::new();
@@ -9244,7 +9305,14 @@ fn a_tab_lands_on_the_nearest_screen_that_shows_the_control_with_its_name() {
 /// control is whole with a line of its name on some screen a Page Down or a Tab shows, and every
 /// Messages entry is whole on a screen. In the 164x96 view the window's fixed least gave
 /// Settings, 2× text left 127 of 282 Tab landings with no line of the control's name and 41
-/// controls never whole; 1× text, 58 landings.
+/// controls never whole; 1× text, 58 landings. And no screen a Page Down shows there draws a row's
+/// words without a line of the row's name or one of its controls, or says a row's name twice
+/// ([`a_rows_words_parted_from_its_name_are_led_by_it`]): a screen that started with a row's parted
+/// words drew them alone under the card's repeated heading (Appearance at 164x348: "THEME", then
+/// Window appearance's "Unchanged"); 36 such screens in the 1× least view, 73 at 2×. Negative
+/// controls: [`scroll::mark_words`] returning its node leaves words without their name at every
+/// scale; `quiet_row_captions` not called says names twice; `WORDS_CAPTION` renamed leaves the
+/// count of screens led by a name at 0.
 #[test]
 fn the_least_view_holds_every_control_whole_with_its_name_at_every_text_scale() {
     at_each_text_scale(&[0.85, 1.0, 1.25, 1.5, 1.75, 2.0], "least view", |scale| {
@@ -9254,6 +9322,7 @@ fn the_least_view_holds_every_control_whole_with_its_name_at_every_text_scale() 
             .filter(|route| !matches!(route, SettingsRoute::Themes | SettingsRoute::Messages))
             .collect();
         let faults = std::sync::Mutex::new(Vec::new());
+        let led = std::sync::atomic::AtomicUsize::new(0);
         on_workers(&routes, "least view pages", |&route| {
             let mut found = Vec::new();
             // Each control: whole on some screen, and whole with a line of its name.
@@ -9272,7 +9341,7 @@ fn the_least_view_holds_every_control_whole_with_its_name_at_every_text_scale() 
             let mut lab = Lab::new("");
             lab.state_mut().navigate(route);
             let mut before: Option<Vec<(UiKey, LogicalRect)>> = None;
-            for _ in 0..300 {
+            for page in 0..300 {
                 let compiled = lab.compile(width, height);
                 let place: Vec<(UiKey, LogicalRect)> = compiled
                     .paint
@@ -9283,6 +9352,8 @@ fn the_least_view_holds_every_control_whole_with_its_name_at_every_text_scale() 
                     break;
                 }
                 note(&compiled);
+                let at = format!("{route:?} {width}x{height} screen {page}");
+                note_words_led_by_their_name(&compiled, &at, &mut found, &led);
                 before = Some(place);
                 lab.dispatch(AppEvent::ScrollPage(1));
             }
@@ -9381,6 +9452,10 @@ fn the_least_view_holds_every_control_whole_with_its_name_at_every_text_scale() 
             "{scale}x in the least view {width}x{height}, {} faults:\n{}",
             faults.len(),
             faults.join("\n")
+        );
+        assert!(
+            led.into_inner() > 10,
+            "{scale}x: screens start with a row's words led by its name"
         );
     });
 }
@@ -9736,6 +9811,31 @@ fn words_alone_on_page_down(route: SettingsRoute, width: f32, height: f32) -> Ve
     found
 }
 
+/// What a screen a Page Down shows owes a row's words parted from its name, at `at`: a row's words
+/// with no line of its name or control of its own, or a name said twice, go on `found`, and `led`
+/// counts the screen if it opens a row's name over its words ([`scroll::words_caption_marker`]).
+fn note_words_led_by_their_name(
+    screen: &crate::native_ui::CompiledUi,
+    at: &str,
+    found: &mut Vec<String>,
+    led: &std::sync::atomic::AtomicUsize,
+) {
+    for setting in words_without_their_row(screen) {
+        found.push(format!("{at}: {setting}'s words without its name"));
+    }
+    let twice = names_said_twice(screen);
+    if !twice.is_empty() {
+        found.push(format!("{at}: {twice:?} named twice"));
+    }
+    if screen.paint.iter().any(|node| {
+        node.key.as_str().starts_with("settings/row-caption/")
+            && node.key.as_str().contains("/words/")
+            && drawn_whole(node)
+    }) {
+        led.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// A STOP OF A ROW'S WORDS JOINS THE ROWS AFTER IT ONLY AS FAR AS THEY FIT UNDER THE ROW'S NAME
 /// ([`scroll::SplitCard::stops`]): two parts of a note, each cut to fit under its row's name,
 /// were joined into one stop as far as the card's head left room, so a screen that started with
@@ -9815,87 +9915,69 @@ fn the_last_screen_starts_with_a_rows_words_only_under_its_name() {
 
 /// A ROW'S WORDS PARTED FROM ITS NAME ARE LED BY IT ON A SCREEN THAT STARTS WITH THEM, AND THE
 /// NAME IS SAID ONCE ([`scroll::words_caption_marker`]): on every page but the themes chooser's
-/// and Messages, in the least view at every text scale ([`least_view`]), at 220x348 with 1×
-/// text and at 584x348 (80x24) with 2× text, no screen Page Down shows draws a row's words
-/// without a line of the row's name or one of its controls, and none says a row's name twice.
-/// A screen that started with a row's parted words drew them alone under the card's repeated
-/// heading, where they read as the card's value (Appearance at 164x348: "THEME", then Window
-/// appearance's "Unchanged"; at 220x348: "THEME", then "Auto matches the terminal theme"): 36 such
-/// screens in the 1× least view, 73 at 2×. Said in the words themselves, the name stood twice on
-/// every screen that showed it over its control ("Font family", then "Font family: Unchanged").
+/// and Messages, at 220x348 with 1× text and at 584x348 (80x24) with 2× text, no screen Page Down
+/// shows draws a row's words without a line of the row's name or one of its controls, and none
+/// says a row's name twice; the least view at every text scale holds the same of the same walk
+/// ([`the_least_view_holds_every_control_whole_with_its_name_at_every_text_scale`]). A screen that
+/// started with a row's parted words drew them alone under the card's repeated heading, where they
+/// read as the card's value (at 220x348: "THEME", then "Auto matches the terminal theme"). Said in
+/// the words themselves, the name stood twice on every screen that showed it over its control
+/// ("Font family", then "Font family: Unchanged"). Negative control: [`scroll::mark_words`]
+/// returning its node fails both windows (Appearance's Window appearance at 220x348 and 584x348).
 #[test]
 fn a_rows_words_parted_from_its_name_are_led_by_it() {
-    for (scale, sizes) in [
-        (0.85, vec![least_view(0.85)]),
-        (1.0, vec![least_view(1.0), (220.0, 348.0)]),
-        (1.25, vec![least_view(1.25)]),
-        (1.5, vec![least_view(1.5)]),
-        (1.75, vec![least_view(1.75)]),
-        (2.0, vec![least_view(2.0), (584.0, 348.0)]),
-    ] {
-        at_each_text_scale(&[scale], "a row's words led by its name", |_| {
-            let routes: Vec<SettingsRoute> = SettingsRoute::ALL
-                .into_iter()
-                .filter(|route| !matches!(route, SettingsRoute::Themes | SettingsRoute::Messages))
-                .collect();
-            let faults = std::sync::Mutex::new(Vec::new());
-            let led = std::sync::atomic::AtomicUsize::new(0);
-            on_workers(&routes, "a row's words led by its name", |&route| {
-                for &(width, height) in &sizes {
-                    let mut lab = Lab::new("");
-                    lab.state_mut().navigate(route);
-                    let mut before: Option<Vec<(UiKey, LogicalRect)>> = None;
-                    for page in 0..300 {
-                        let screen = lab.compile(width, height);
-                        let place: Vec<(UiKey, LogicalRect)> = screen
-                            .paint
-                            .iter()
-                            .map(|node| (node.key.clone(), node.rect))
-                            .collect();
-                        if before.as_ref() == Some(&place) {
-                            break;
-                        }
-                        let at = format!("{route:?} {width}x{height} screen {page}");
-                        let mut found = Vec::new();
-                        for setting in words_without_their_row(&screen) {
-                            found.push(format!("{at}: {setting}'s words without its name"));
-                        }
-                        let twice = names_said_twice(&screen);
-                        if !twice.is_empty() {
-                            found.push(format!("{at}: {twice:?} named twice"));
-                        }
-                        if screen.paint.iter().any(|node| {
-                            node.key.as_str().starts_with("settings/row-caption/")
-                                && node.key.as_str().contains("/words/")
-                                && drawn_whole(node)
-                        }) {
-                            led.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        faults
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .extend(found);
-                        before = Some(place);
-                        lab.dispatch(AppEvent::ScrollPage(1));
-                    }
+    at_each_text_scale(&[1.0, 2.0], "a row's words led by its name", |scale| {
+        let (width, height) = if scale < 1.5 {
+            (220.0, 348.0)
+        } else {
+            (584.0, 348.0)
+        };
+        let routes: Vec<SettingsRoute> = SettingsRoute::ALL
+            .into_iter()
+            .filter(|route| !matches!(route, SettingsRoute::Themes | SettingsRoute::Messages))
+            .collect();
+        let faults = std::sync::Mutex::new(Vec::new());
+        let led = std::sync::atomic::AtomicUsize::new(0);
+        on_workers(&routes, "a row's words led by its name", |&route| {
+            let mut lab = Lab::new("");
+            lab.state_mut().navigate(route);
+            let mut before: Option<Vec<(UiKey, LogicalRect)>> = None;
+            for page in 0..300 {
+                let screen = lab.compile(width, height);
+                let place: Vec<(UiKey, LogicalRect)> = screen
+                    .paint
+                    .iter()
+                    .map(|node| (node.key.clone(), node.rect))
+                    .collect();
+                if before.as_ref() == Some(&place) {
+                    break;
                 }
-            });
-            let mut faults = faults
-                .into_inner()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            faults.sort();
-            assert!(
-                faults.is_empty(),
-                "{scale}x: {} screens:\n{}",
-                faults.len(),
-                faults.join("\n")
-            );
-            assert!(
-                led.into_inner() > 10,
-                "{scale}x: screens start with a row's words led by its name"
-            );
+                let at = format!("{route:?} {width}x{height} screen {page}");
+                let mut found = Vec::new();
+                note_words_led_by_their_name(&screen, &at, &mut found, &led);
+                faults
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend(found);
+                before = Some(place);
+                lab.dispatch(AppEvent::ScrollPage(1));
+            }
         });
-    }
+        let mut faults = faults
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        faults.sort();
+        assert!(
+            faults.is_empty(),
+            "{scale}x: {} screens:\n{}",
+            faults.len(),
+            faults.join("\n")
+        );
+        assert!(
+            led.into_inner() > 0,
+            "{scale}x: screens start with a row's words led by its name"
+        );
+    });
 }
 
 /// THE RESET NEVER STARVES THE NAME ([`seat_stacked_reset`]): Keyboard & Input in a 178pt view

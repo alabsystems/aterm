@@ -486,6 +486,7 @@ fn a_vault_join_over_the_fleets_channel_reaches_the_desk_only_as_the_channel_pro
     let device = Device::open(&fresh).expect("device").expect("an identity");
     let m7 = NodeIdentity::from_seed(&"07".repeat(16), &[7; 32]).expect("node");
     let joining = Joining {
+        records_bound: aterm_secrets::crossing::RecordsBound::uncrossed(),
         device: &device,
         node: *m7.key().bytes(),
         name: "m7".to_owned(),

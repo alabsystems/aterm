@@ -17,6 +17,14 @@ use crate::ai::connector::{Flow, Region, RowKeys, Seam};
 
 use super::one_line;
 
+#[path = "accounts_auth_scope.rs"]
+mod auth_scope;
+pub(super) use auth_scope::note_auth_for_observed_row;
+pub(super) use auth_scope::note_served_login_for_observed_row;
+pub use auth_scope::{
+    LifetimeScope, ManagedContexts, ManagedScope, note_auth_in_context, note_auth_on_default,
+};
+
 #[path = "accounts_shared.rs"]
 pub mod shared;
 
@@ -29,7 +37,9 @@ use sync_commit::usage_target;
 
 #[path = "accounts_directory.rs"]
 mod directory;
-pub(super) use directory::{naming_row, retained_directory_owner, shared_staging_retained};
+pub(super) use directory::{
+    lists_directory, naming_row, retained_directory_owner, shared_staging_retained,
+};
 
 #[cfg_attr(
     any(test, debug_assertions),
@@ -41,6 +51,33 @@ pub(super) use directory::{naming_row, retained_directory_owner, shared_staging_
 )]
 #[doc(hidden)]
 pub fn directory_admission_environment() {}
+
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountLifetimeScope",
+        action = "AnotherTransform",
+        reason = "Model bookkeeping selects the edit the fixture replays: a credential replacement or a non-credential edit"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountLifetimeScope",
+        action = "WithAuth",
+        reason = "Model bookkeeping selects a fixture whose login carries a current authentication word"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountLifetimeScope",
+        action = "Seed",
+        reason = "Model bookkeeping starts the walk: the fixture every replayed transition rebuilds writes the initial roster and lifetime observations through the store's own notes"
+    )
+)]
+#[doc(hidden)]
+pub fn lifetime_scope_environment() {}
 
 /// The roster's file name, beside `aterm.toml`.
 pub const ACCOUNTS_FILE: &str = "accounts.toml";
@@ -614,8 +651,10 @@ impl Roster {
                         .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
             }) {
                 return Err(format!(
-                    "{file}: rows `{}` and `{}` name one email in the same provider realm; an account is one row",
-                    twin.label, row.label
+                    "{file}: rows `{}` and `{}` name one email in the same provider realm; an account is one row: {}",
+                    twin.label,
+                    row.label,
+                    drop_one_of(twin, &row)
                 ));
             }
             if matches!(cli, Cli::Claude | Cli::Codex)
@@ -626,8 +665,10 @@ impl Roster {
                 })
             {
                 return Err(format!(
-                    "{file}: rows `{}` and `{}` expect one provider identity; an account is one row",
-                    twin.label, row.label
+                    "{file}: rows `{}` and `{}` expect one provider identity; an account is one row: {}",
+                    twin.label,
+                    row.label,
+                    drop_one_of(twin, &row)
                 ));
             }
             if let Some(twin) = rows.iter().find(|r| r.dir == row.dir) {
@@ -720,6 +761,26 @@ impl Roster {
             .iter()
             .find(|row| row.was.iter().any(|was| was.as_deref() == login))
     }
+
+    /// The rows a session on the login at `login` (`None`: the default one) belongs to: the row
+    /// that holds it now, else each row that left it ([`Row::was`]). A row's `was` keeps naming what
+    /// it left, so once another row takes that login (a default login reassigned,
+    /// `accounts_sync::reassign_codex_default`), the row holding it is its account's.
+    #[must_use]
+    pub fn rows_of_login(&self, login: Option<&str>) -> Vec<&Row> {
+        let holding: Vec<&Row> = self
+            .rows
+            .iter()
+            .filter(|row| row.dir.as_deref() == login)
+            .collect();
+        if !holding.is_empty() {
+            return holding;
+        }
+        self.rows
+            .iter()
+            .filter(|row| row.was.iter().any(|was| was.as_deref() == login))
+            .collect()
+    }
 }
 
 /// Reads the raw text of the roster file at `path` ([`MAX_ROSTER_BYTES`]).
@@ -729,6 +790,19 @@ impl Roster {
 /// or is not UTF-8 — named with its path.
 pub fn roster_text(path: &Path) -> Result<Option<String>, String> {
     read_bounded(path, MAX_ROSTER_BYTES).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Which of two rows naming one account a person removes to admit the roster: the row with a login
+/// directory of its own beside the row on this machine's own login, which keeps the account on
+/// the login this machine runs (a lab sync then gives that row the lab's label), else the later
+/// row, which the first one already covers.
+fn drop_one_of(first: &Row, later: &Row) -> String {
+    let (keep, drop) = if later.dir.is_none() {
+        (later, first)
+    } else {
+        (first, later)
+    };
+    format!("remove `{}` and keep `{}`", drop.label, keep.label)
 }
 
 fn row_of(cli: Cli, item: &aterm_toml::Value, n: usize) -> Result<Row, String> {
@@ -1193,6 +1267,54 @@ pub fn enrolled_in(cli: Cli, roster: &Roster, home: &Path) -> BTreeSet<String> {
     enrolled
 }
 
+/// The address `cli`'s default login under the user home `home` names, where aterm reads one
+/// without asking the OS keyring or running the CLI: Codex's `auth.json` under a file store.
+/// `None` for every other CLI, under a keyring store, and where the file names no address.
+#[must_use]
+pub fn default_login_address(cli: Cli, home: &Path) -> Option<String> {
+    if cli != Cli::Codex {
+        return None;
+    }
+    let dir = home.join(cli.accounts().default_home);
+    if !crate::ai::facts::codex_file_store(&dir) {
+        return None;
+    }
+    super::codex_app_login::read_account_email(&dir)
+        .map(|email| email.trim().to_owned())
+        .filter(|email| email_refusal(email).is_none())
+}
+
+/// The row on the default login whose address is not the one that login names (`login`,
+/// [`default_login_address`]): that login moved off its account, so a launch or a handoff on the
+/// row is refused ([`super::accounts_pool::check_launch_login_identity`]).
+#[must_use]
+pub fn default_login_moved_off<'a>(roster: &'a Roster, login: Option<&str>) -> Option<&'a Row> {
+    let row = roster.row_for_login(None)?;
+    let expected = row.expected_identity_email()?;
+    (!email_matches(expected, login?)).then_some(row)
+}
+
+/// One account listed twice: the row on the default login that names no address, and a row of its
+/// own whose address is the one that login names (`login`, [`default_login_address`]).
+#[must_use]
+pub fn default_login_twin<'a>(
+    roster: &'a Roster,
+    login: Option<&str>,
+) -> Option<(&'a Row, &'a Row)> {
+    let login = login?;
+    let own = roster.row_for_login(None)?;
+    if own.expected_identity_email().is_some() {
+        return None;
+    }
+    let twin = roster.rows.iter().find(|row| {
+        row.dir.is_some()
+            && row
+                .expected_identity_email()
+                .is_some_and(|held| email_matches(held, login))
+    })?;
+    Some((own, twin))
+}
+
 /// Whether `cli`'s default home under the user home `home` holds the file the CLI keeps its
 /// login in ([`crate::ai::connector::stored_login_file`]).
 #[must_use]
@@ -1639,6 +1761,56 @@ pub(super) struct RenewalParent {
 }
 
 impl RenewalParent {
+    /// Fence a pending native login to this exact row, parent and authentication facts.
+    #[cfg(unix)]
+    pub(super) fn recovery_scope(
+        self,
+        row: &Row,
+        state: &State,
+        logins: &Logins,
+    ) -> Result<[u8; 32], String> {
+        self.require_current(logins, &row.label)?;
+        let row_text = row_text(row).ok_or("native recovery row is invalid")?;
+        let mut selected = Logins::default();
+        if let Some(binding) = logins.get(&row.label) {
+            let mut binding = binding.clone();
+            // Reporting an interrupted attempt must not revoke its retained completion.
+            // These observations carry no account identity or parent authority.
+            binding.sign_in_attempt = None;
+            binding.sign_in_task = None;
+            // A first failed attempt may create a report-only default binding.
+            // It carries the same identity facts as no binding at all.
+            if binding != Binding::default() {
+                selected.labels.insert(row.label.clone(), binding);
+            }
+        }
+        // A versioned parent survives unrelated renewals; a legacy parent cannot.
+        selected.generation_clock = self
+            .generation
+            .filter(|value| *value > 0)
+            .unwrap_or(self.clock);
+        let account = state.accounts.get(&row.label);
+        let mut auth = aterm_json::json!({
+            "auth": account.map_or(Auth::Unseen, |a| a.auth).as_str(),
+            "auth_at": account.and_then(|a| a.auth_at),
+            "was": row.was.clone(),
+        });
+        if !state.contextual_auth
+            && account.is_some_and(|account| !account.managed_auth_is_current())
+            && let Some(object) = auth.as_object_mut()
+        {
+            object.insert("auth_retired".into(), Value::Bool(true));
+        }
+        let auth = auth.to_string();
+        let mut digest = aterm_digest::Sha256::new();
+        digest.update(b"aterm.native-google-recovery.v1\0");
+        for field in [row_text, selected.to_json(), auth] {
+            digest.update((field.len() as u64).to_be_bytes());
+            digest.update(field.as_bytes());
+        }
+        Ok(digest.finalize())
+    }
+
     pub(super) fn capture(logins: &Logins, label: &str) -> Self {
         Self {
             generation: logins.get(label).map(|binding| binding.renewal_generation),
@@ -1689,6 +1861,7 @@ pub(super) struct RenewalCheckpoint {
     pub proved_by: Option<Proof>,
     pub google_principal: Option<[u8; 32]>,
     pub google_grant_digest: Option<[u8; 32]>,
+    pub google_binding_scope: Option<[u8; 32]>,
     pub parent: RenewalParent,
 }
 
@@ -1766,6 +1939,7 @@ pub(super) fn write_renewal_checkpoint_for(
         proved_by,
         None,
         None,
+        None,
         checked_at,
         logins,
     )
@@ -1803,6 +1977,7 @@ pub(super) fn write_google_renewal_checkpoint(
         Some(Proof::Status),
         Some(profile.principal),
         Some(grant.digest().map_err(io::Error::other)?),
+        Some(grant.checkpoint_scope().map_err(io::Error::other)?),
         checked_at,
         logins,
     )
@@ -1822,6 +1997,7 @@ fn write_checkpoint(
     proved_by: Option<Proof>,
     google_principal: Option<[u8; 32]>,
     google_grant_digest: Option<[u8; 32]>,
+    google_binding_scope: Option<[u8; 32]>,
     checked_at: i64,
     logins: &Logins,
 ) -> io::Result<()> {
@@ -1837,12 +2013,14 @@ fn write_checkpoint(
         proved_by,
         google_principal,
         google_grant_digest,
+        google_binding_scope,
         parent: RenewalParent::capture(logins, label),
     };
     if !checkpoint.valid()
         || (cli == Cli::Kimi) != region.is_some()
         || (cli == Cli::Agy) != google_principal.is_some()
         || (cli == Cli::Agy) != google_grant_digest.is_some()
+        || (cli == Cli::Agy) != google_binding_scope.is_some()
         || (cli == Cli::Agy && proved_by != Some(Proof::Status))
     {
         return Err(io::Error::new(
@@ -1854,7 +2032,7 @@ fn write_checkpoint(
     doc.insert(
         "schema".into(),
         Value::from(if google_principal.is_some() {
-            4
+            5
         } else if region.is_some() {
             3
         } else {
@@ -1891,6 +2069,12 @@ fn write_checkpoint(
         doc.insert(
             "google_grant_digest".into(),
             Value::from(aterm_codec::hex::encode_lower(&digest)),
+        );
+    }
+    if let Some(scope) = checkpoint.google_binding_scope {
+        doc.insert(
+            "google_binding_scope".into(),
+            Value::from(aterm_codec::hex::encode_lower(&scope)),
         );
     }
     let text = Value::Object(doc).to_string();
@@ -1949,13 +2133,14 @@ pub(super) fn read_renewal_checkpoint_for(
     let doc: Value = aterm_json::from_str(std::str::from_utf8(&bytes).ok()?).ok()?;
     // Schema 1 has no parent evidence; Kimi's schema 2 has no region evidence. Preserve
     // either for inspection without inventing the missing scope from current policy.
+    // Google's schema 4 likewise lacks the binding revision and state-root scope.
     if doc.get("program")?.as_str()? != cli.id() {
         return None;
     }
     let region = match (doc.get("schema")?.as_u64()?, cli) {
         (2, cli) if !matches!(cli, Cli::Kimi | Cli::Agy) => None,
         (3, Cli::Kimi) => Some(Region::parse(doc.get("region")?.as_str()?)?),
-        (4, Cli::Agy) => None,
+        (5, Cli::Agy) => None,
         _ => return None,
     };
     let checkpoint = RenewalCheckpoint {
@@ -1979,6 +2164,11 @@ pub(super) fn read_renewal_checkpoint_for(
         },
         google_grant_digest: if cli == Cli::Agy {
             Some(google_principal(doc.get("google_grant_digest")?)?)
+        } else {
+            None
+        },
+        google_binding_scope: if cli == Cli::Agy {
+            Some(google_principal(doc.get("google_binding_scope")?)?)
         } else {
             None
         },
@@ -2007,22 +2197,49 @@ pub(super) fn checkpoint_current(
     state: &State,
     logins: &Logins,
     proof: &RenewalCheckpoint,
+    google_state: Option<&Path>,
 ) -> bool {
+    use auth_scope::Clock;
+
     let account = state.accounts.get(&row.label);
     proof.parent.matches(logins, &row.label)
+        && proof.google_binding_scope.is_none_or(|scope| {
+            #[cfg(unix)]
+            {
+                google_state.is_some_and(|root| {
+                    super::agy_signin::current_checkpoint_scope(root, &proof.label, &proof.email)
+                        == Some(scope)
+                })
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (scope, google_state);
+                false
+            }
+        })
         && proof
             .google_principal
             .is_none_or(|principal| require_google_principal(logins, &row.label, principal).is_ok())
         && proof
             .google_grant_digest
             .is_none_or(|digest| native_google_digest(Path::new(&proof.dir)) == Some(digest))
-        && !account.is_some_and(|a| a.auth_at.is_some_and(|at| at >= proof.checked_at))
+        && !account.is_some_and(|a| {
+            (state.contextual_auth || a.managed_auth_is_current())
+                && a.auth_at.is_some_and(|at| at >= proof.checked_at)
+        })
         && !logins.labels.get(&row.label).is_some_and(|binding| {
-            binding.renewed_at.iter().chain(binding.ended_at.iter())
-                .chain(binding.wrong_at.iter()).chain(binding.served_at.iter())
-                .any(|at| *at >= proof.checked_at)
+            let current = |clock| {
+                state.contextual_auth || auth_scope::lifetime_current_for_row(row, logins, clock)
+            };
+            let later = |clock, at: Option<i64>| {
+                current(clock) && at.is_some_and(|at| at >= proof.checked_at)
+            };
+            later(Clock::Renewal, binding.renewed_at)
+                || later(Clock::Ended, binding.ended_at)
+                || binding.wrong_at.is_some_and(|at| at >= proof.checked_at)
+                || later(Clock::Served, binding.served_at)
                 // An old checkpoint must not clear an undated login-end notice.
-                || binding.notice_end.is_some()
+                || (current(Clock::Notice) && binding.notice_end.is_some())
         })
 }
 
@@ -2037,7 +2254,8 @@ pub(super) fn checkpoint_identity_matches(cli: Cli, row: &Row, proof: &RenewalCh
         && (cli != Cli::Agy
             || (proof.proved_by == Some(Proof::Status)
                 && proof.google_principal.is_some()
-                && proof.google_grant_digest.is_some()))
+                && proof.google_grant_digest.is_some()
+                && proof.google_binding_scope.is_some()))
         && expected.is_some_and(|email| email_matches(email, &proof.email))
 }
 
@@ -2086,6 +2304,9 @@ pub struct Binding {
     pub ended_at: Option<i64>,
     /// When a turn was last served under the bound login ([`note_served_login`]).
     pub served_at: Option<i64>,
+    /// Applicability of retained managed renewal, notice, end and served observations.
+    /// Codex uses its credential-context metadata authority instead.
+    pub lifetime_scope: LifetimeScope,
     /// The `subscriptionType` its renewal's check answered (`max`, `pro`).
     pub subscription: Option<String>,
     /// When a renewal last answered another account than the row's ([`note_wrong_account`]).
@@ -2231,8 +2452,8 @@ pub struct SignInTask {
 /// What proved a sign-in made the row's account ([`Binding::proved_by`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Proof {
-    /// The CLI's own report named the row's email (Codex's `account/read`, Grok's `Signed in
-    /// as`).
+    /// The native CLI or its canonical account endpoint named the row's email
+    /// (Codex's `account/read`, Grok's `Signed in as`, or Kimi's verified `/me`).
     Status,
     /// The sign-in page showed the row's email.
     Page,
@@ -2271,6 +2492,7 @@ impl Default for Binding {
             notice_end: None,
             ended_at: None,
             served_at: None,
+            lifetime_scope: LifetimeScope::default(),
             subscription: None,
             wrong_at: None,
             was: Vec::new(),
@@ -2396,6 +2618,9 @@ pub struct Logins {
     /// Consumed by the transaction guard, never serialized.
     #[doc(hidden)]
     pub pending_native_retirement: Option<NativeRotationRetirement>,
+    /// Captured entry contexts for observations created during an admitted publication.
+    #[doc(hidden)]
+    pub auth_contexts: ManagedContexts,
 }
 
 impl Logins {
@@ -2485,6 +2710,7 @@ impl Logins {
                 m.insert("notice_end".to_owned(), Value::from(b.notice_end));
                 m.insert("ended_at".to_owned(), Value::from(b.ended_at));
                 m.insert("served_at".to_owned(), Value::from(b.served_at));
+                b.lifetime_scope.write_json(&mut m);
                 m.insert(
                     "subscription".to_owned(),
                     Value::from(b.subscription.clone()),
@@ -2670,6 +2896,7 @@ impl Logins {
                 notice_end: int(v.get("notice_end")),
                 ended_at: stamp(v.get("ended_at"), now),
                 served_at: stamp(v.get("served_at"), now),
+                lifetime_scope: LifetimeScope::from_json(v),
                 subscription: word(v.get("subscription"), SUBSCRIPTION_MAX),
                 wrong_at: stamp(v.get("wrong_at"), now),
                 was,
@@ -2760,6 +2987,7 @@ impl Logins {
             shared,
             native_rotations,
             pending_native_retirement: None,
+            auth_contexts: ManagedContexts::default(),
         })
     }
 }
@@ -2924,13 +3152,22 @@ fn advance_sign_in_receipts(
             binding.last_success_generation = 0;
         }
     }
-    after
-        .sign_in_receipts
-        .retain(|label, _| state.accounts.contains_key(label) && !invalidated.contains(label));
+    after.sign_in_receipts.retain(|label, _| {
+        state
+            .accounts
+            .get(label)
+            .is_some_and(|account| state.contextual_auth || account.managed_auth_is_current())
+            && !invalidated.contains(label)
+    });
     let signed_in: BTreeSet<_> = events
         .iter()
         .filter(|event| event.kind == Kind::SignedIn)
-        .filter(|event| state.accounts.contains_key(&event.account))
+        .filter(|event| {
+            state.accounts.get(&event.account).is_some_and(|account| {
+                state.contextual_auth
+                    || (account.managed_auth_is_current() && account.managed_auth() == Auth::Ok)
+            })
+        })
         .filter(|event| !invalidated.contains(&event.account))
         // A result for the old login cannot certify a replacement made by
         // another edit in this transaction. A first empty metadata binding
@@ -3017,7 +3254,8 @@ impl LoginState {
     }
 }
 
-/// Forecasts the Unix expiration timestamp of `binding`.
+/// Retrospective estimate from all retained dates, without checking their applicability.
+/// Use [`login_forecast`] for the current login's status, scheduling and reports.
 #[must_use]
 pub fn forecast(binding: &Binding) -> Option<i64> {
     let by_life = binding
@@ -3026,26 +3264,66 @@ pub fn forecast(binding: &Binding) -> Option<i64> {
     [by_life, binding.notice_end].into_iter().flatten().min()
 }
 
+/// The expiration estimate supported by observations applicable to this row's current login.
+/// Retained dates that describe another managed login remain available through [`forecast`].
+#[must_use]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountLifetimeScope",
+        action = "Read",
+        project = "aterm_agent::harness::accounts::lifetime_scope_tests::lifetime_transition"
+    )
+)]
+pub fn login_forecast(row: &Row, logins: &Logins, state: &State) -> Option<i64> {
+    if state.contextual_auth {
+        let account = state.accounts.get(&row.label)?;
+        return (account.current_auth(row) != Auth::Unseen && account.renewal_metadata)
+            .then(|| logins.get(&row.label).and_then(forecast))
+            .flatten();
+    }
+    auth_scope::lifetime_forecast(row, logins)
+}
+
+/// The last served observation applicable to the current login, not retained history.
+#[must_use]
+pub fn login_served_at(row: &Row, logins: &Logins, state: &State) -> Option<i64> {
+    if state.contextual_auth {
+        let account = state.accounts.get(&row.label)?;
+        return (account.current_auth(row) != Auth::Unseen && account.served_metadata)
+            .then(|| logins.get(&row.label)?.served_at)
+            .flatten();
+    }
+    auth_scope::lifetime_served(row, logins)
+}
+
+/// The retained end observation only when it applies to this managed login.
+/// Contextual stores keep their existing credential-authentication authority.
+#[must_use]
+pub fn login_ended_at(row: &Row, logins: &Logins, state: &State) -> Option<i64> {
+    if state.contextual_auth {
+        return logins.get(&row.label)?.ended_at;
+    }
+    auth_scope::lifetime_ended(row, logins)
+}
+
 /// Computes the [`LoginState`] of `row` at `now` from `logins` and `state`.
 #[must_use]
 pub fn login_state(row: &Row, logins: &Logins, state: &State, now: i64) -> LoginState {
-    if state
-        .accounts
-        .get(&row.label)
-        .is_some_and(|a| a.auth == Auth::SignedOut)
-    {
+    let account = state.accounts.get(&row.label);
+    let auth = account.map_or(Auth::Unseen, |account| account.current_auth(row));
+    if auth == Auth::SignedOut {
         return LoginState::Expired;
     }
-    let binding = logins.get(&row.label);
-    if let Some(by) = binding.and_then(forecast)
+    if state.contextual_auth && auth == Auth::Unseen {
+        return LoginState::Idle;
+    }
+    if let Some(by) = login_forecast(row, logins, state)
         && by.saturating_sub(now) <= DUE_S
     {
         return LoginState::Due { by };
     }
-    if binding
-        .and_then(|b| b.served_at)
-        .is_some_and(|at| recent(at, now, OK_FRESH_S))
-    {
+    if login_served_at(row, logins, state).is_some_and(|at| recent(at, now, OK_FRESH_S)) {
         LoginState::Ok
     } else {
         LoginState::Idle
@@ -3094,9 +3372,7 @@ pub fn none_working_within(
     rows.peek().is_some()
         && rows.all(|row| match login_state(row, logins, state, now) {
             LoginState::Expired => true,
-            _ => logins
-                .get(&row.label)
-                .and_then(forecast)
+            _ => login_forecast(row, logins, state)
                 .is_some_and(|by| by.saturating_sub(now) <= within),
         })
 }
@@ -3241,53 +3517,92 @@ pub fn claude_serves(
 
 /// Records a login wall hit at `at` on `label`'s bound login and updates learned lifetime.
 pub fn note_login_end(state: &mut State, logins: &mut Logins, label: &str, at: i64) -> Vec<Event> {
-    let mut out = if state.account(label).auth == Auth::SignedOut {
+    let mut out = if state.contextual_auth && state.account(label).auth == Auth::SignedOut {
         Vec::new()
     } else {
-        note_auth(state, label, Auth::SignedOut, at)
+        note_auth_in_context(state, logins, label, Auth::SignedOut, at)
     };
+    auth_scope::prepare_lifetime(logins, label);
+    let ended_current = auth_scope::clock_current(logins, label, auth_scope::Clock::Ended);
+    let renewal_current = auth_scope::clock_current(logins, label, auth_scope::Clock::Renewal);
     let Some(binding) = logins.entry(label) else {
         return out;
     };
-    let first = binding
-        .ended_at
-        .is_none_or(|ended| binding.renewed_at.is_some_and(|renewed| ended < renewed));
+    let first = !ended_current
+        || binding.ended_at.is_none_or(|ended| {
+            renewal_current && binding.renewed_at.is_some_and(|renewed| ended < renewed)
+        });
     if first {
         binding.ended_at = Some(at);
-        if binding
-            .renewed_at
-            .is_some_and(|renewed| at.saturating_sub(renewed) >= LIFETIME_MIN_S)
+        if renewal_current
+            && binding
+                .renewed_at
+                .is_some_and(|renewed| at.saturating_sub(renewed) >= LIFETIME_MIN_S)
         {
             binding.lower_lifetime(at);
         }
         out.push(Event::new(at, Kind::LoginEnded, label));
     }
+    auth_scope::stamp_lifetime(logins, label, auth_scope::Clock::Ended, None);
     out
 }
 
 /// Records a vendor `Your login expires in N days` notice read at `at` on `label`.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountLifetimeScope",
+        action = "Notice",
+        project = "aterm_agent::harness::accounts::lifetime_scope_tests::lifetime_transition"
+    )
+)]
 pub fn note_login_notice(logins: &mut Logins, label: &str, days: u32, at: i64) -> bool {
     if days == 0 || days > NOTICE_DAYS_MAX {
         return false;
     }
+    auth_scope::prepare_lifetime(logins, label);
+    let notice_current = auth_scope::clock_current(logins, label, auth_scope::Clock::Notice);
+    let renewal_current = auth_scope::clock_current(logins, label, auth_scope::Clock::Renewal);
     let Some(binding) = logins.entry(label) else {
         return false;
     };
     let end = at.saturating_add(i64::from(days).saturating_mul(DAY_S));
     let before = binding.clone();
-    binding.notice_end = Some(binding.notice_end.map_or(end, |held| held.min(end)));
-    binding.lower_lifetime(end);
-    *binding != before
+    binding.notice_end = Some(if notice_current {
+        binding.notice_end.map_or(end, |held| held.min(end))
+    } else {
+        end
+    });
+    if renewal_current {
+        binding.lower_lifetime(end);
+    }
+    auth_scope::stamp_lifetime(logins, label, auth_scope::Clock::Notice, None);
+    logins.get(label).is_some_and(|binding| *binding != before)
 }
 
 /// Records that `label`'s bound login served a turn at `at`.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountLifetimeScope",
+        action = "Served",
+        project = "aterm_agent::harness::accounts::lifetime_scope_tests::lifetime_transition"
+    )
+)]
 pub fn note_served_login(logins: &mut Logins, label: &str, at: i64) -> bool {
+    auth_scope::prepare_lifetime(logins, label);
+    let current = auth_scope::clock_current(logins, label, auth_scope::Clock::Served);
     let Some(binding) = logins.entry(label) else {
         return false;
     };
-    let served = binding.served_at.map_or(at, |held| held.max(at));
-    let changed = binding.served_at != Some(served);
+    let served = if current {
+        binding.served_at.map_or(at, |held| held.max(at))
+    } else {
+        at
+    };
+    let changed = binding.served_at != Some(served) || !current;
     binding.served_at = Some(served);
+    auth_scope::stamp_lifetime(logins, label, auth_scope::Clock::Served, None);
     changed
 }
 
@@ -3299,11 +3614,9 @@ pub fn note_signed_back(
     label: &str,
     at: i64,
 ) -> Vec<Event> {
-    if state
-        .accounts
-        .get(label)
-        .is_none_or(|a| a.auth != Auth::SignedOut)
-    {
+    if state.accounts.get(label).is_none_or(|a| {
+        a.auth != Auth::SignedOut && (state.contextual_auth || a.managed_auth_is_current())
+    }) {
         return Vec::new();
     }
     note_checked_sign_in(state, logins, label, at)
@@ -3318,27 +3631,56 @@ pub(super) fn note_checked_sign_in(
     label: &str,
     at: i64,
 ) -> Vec<Event> {
-    if state
-        .accounts
-        .get(label)
-        .is_some_and(|account| account.auth_at.is_some_and(|held| held > at))
-    {
+    auth_scope::retire_changed_context(state, logins, label, false);
+    if state.accounts.get(label).is_some_and(|account| {
+        (state.contextual_auth || account.managed_auth_is_current())
+            && account.auth_at.is_some_and(|held| held > at)
+    }) {
         return Vec::new();
     }
-    let mut out = note_auth(state, label, Auth::Ok, at);
-    if state
-        .accounts
-        .get(label)
-        .is_none_or(|account| account.auth != Auth::Ok)
-    {
-        return out;
+    let mut out = if state.contextual_auth {
+        let out = note_auth(state, label, Auth::Ok, at);
+        if state
+            .accounts
+            .get(label)
+            .is_none_or(|account| account.auth != Auth::Ok)
+        {
+            return out;
+        }
+        out
+    } else {
+        if account_mut(state, label).is_none() {
+            return Vec::new();
+        }
+        Vec::new()
+    };
+    if !state.contextual_auth {
+        auth_scope::replace_lifetime(logins, label);
     }
     if let Some(binding) = logins.labels.get_mut(label) {
         binding.renewed_at = Some(at);
         binding.notice_end = None;
-        binding.served_at = Some(binding.served_at.map_or(at, |held| held.max(at)));
+        binding.served_at = Some(if state.contextual_auth {
+            binding.served_at.map_or(at, |held| held.max(at))
+        } else {
+            at
+        });
         binding.sign_in_task = None;
         binding.clear_failed_sign_in();
+    }
+    if !state.contextual_auth {
+        auth_scope::clear_absent_lifetime(logins, label);
+        auth_scope::stamp_lifetime(logins, label, auth_scope::Clock::Renewal, None);
+        auth_scope::stamp_lifetime(logins, label, auth_scope::Clock::Served, None);
+        // The verified legacy result describes the metadata just refreshed above.
+        out = note_auth_in_context(state, logins, label, Auth::Ok, at);
+        if state
+            .accounts
+            .get(label)
+            .is_none_or(|account| account.managed_auth() != Auth::Ok || account.auth_at != Some(at))
+        {
+            return out;
+        }
     }
     out.push(Event::new(at, Kind::SignedIn, label));
     out
@@ -3347,6 +3689,14 @@ pub(super) fn note_checked_sign_in(
 /// Binds `label` to the newly authenticated staging directory `dir` after a verified renewal.
 /// The store advances its publication generation when committing the returned renewal event.
 /// A persistent caller must return these events from its enclosing login transaction.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountLifetimeScope",
+        action = "Renewed",
+        project = "aterm_agent::harness::accounts::lifetime_scope_tests::lifetime_transition"
+    )
+)]
 pub fn note_renewed(
     state: &mut State,
     logins: &mut Logins,
@@ -3357,6 +3707,9 @@ pub fn note_renewed(
     at: i64,
 ) -> Vec<Event> {
     let mut out = Vec::new();
+    if !state.contextual_auth {
+        auth_scope::replace_lifetime(logins, label);
+    }
     let Some(binding) = logins.entry(label) else {
         return out;
     };
@@ -3380,7 +3733,18 @@ pub fn note_renewed(
     binding.subscription = subscription
         .map(|s| one_line(s, SUBSCRIPTION_MAX))
         .filter(|s| !s.is_empty());
-    out.extend(note_auth(state, label, Auth::Ok, at));
+    if !state.contextual_auth {
+        auth_scope::clear_absent_lifetime(logins, label);
+        auth_scope::stamp_lifetime(logins, label, auth_scope::Clock::Renewal, None);
+    }
+    // A verified replacement is a new credential observation, even at the same
+    // path and timestamp as the previous login.
+    if !state.contextual_auth
+        && let Some(account) = state.accounts.get_mut(label)
+    {
+        account.auth_scope.retire();
+    }
+    out.extend(note_auth_in_context(state, logins, label, Auth::Ok, at));
     out.push(Event::new(at, Kind::Renewed, label));
     out
 }
@@ -3492,12 +3856,18 @@ pub fn note_displaced(
     now_default: &str,
     at: i64,
 ) -> Vec<Event> {
+    let contextual = state.contextual_auth;
     let Some(record) = account_mut(state, label) else {
         return Vec::new();
     };
-    if record.auth_at.is_none_or(|held| held <= at) {
+    if (!contextual && !record.managed_auth_is_current())
+        || record.auth_at.is_none_or(|held| held <= at)
+    {
+        record.clear_auth_context();
         record.auth = Auth::SignedOut;
         record.auth_at = Some(at);
+        // Metadata loss is not a provider observation on the replacement. Preserve the
+        // entry witness, including any actual result already captured in this transaction.
     }
     let mut out = vec![
         Event::new(at, Kind::Displaced, label)
@@ -3566,20 +3936,55 @@ pub fn note_default_login_made(
     was: Option<&str>,
     at: i64,
 ) -> Vec<Event> {
-    let mut out = note_auth(state, label, Auth::Ok, at);
-    if !state
-        .accounts
-        .get(label)
-        .is_some_and(|account| account.auth == Auth::Ok && account.auth_at == Some(at))
-    {
+    let out = note_auth_on_default(state, logins, label, Auth::Ok, at);
+    finish_default_login_made(state, logins, label, was, at, out, None)
+}
+
+/// The caller inspected this row's expected identity on the native default login. Retain
+/// that observed policy rather than attributing the result to the transaction's entry row.
+pub(super) fn note_default_login_made_observed(
+    state: &mut State,
+    logins: &mut Logins,
+    row: &Row,
+    was: Option<&str>,
+    at: i64,
+) -> Vec<Event> {
+    let out = note_auth_for_observed_row(state, logins, row, Auth::Ok, at);
+    finish_default_login_made(state, logins, &row.label, was, at, out, Some(row))
+}
+
+fn finish_default_login_made(
+    state: &mut State,
+    logins: &mut Logins,
+    label: &str,
+    was: Option<&str>,
+    at: i64,
+    mut out: Vec<Event>,
+    observed: Option<&Row>,
+) -> Vec<Event> {
+    if !state.accounts.get(label).is_some_and(|account| {
+        account.auth == Auth::Ok
+            && (state.contextual_auth || account.managed_auth_is_current())
+            && account.auth_at == Some(at)
+    }) {
         return out;
     }
+    if !state.contextual_auth {
+        auth_scope::replace_lifetime(logins, label);
+    }
     if let Some(binding) = logins.entry(label) {
-        binding.served_at = Some(binding.served_at.map_or(at, |held| held.max(at)));
         binding.ended_at = None;
         binding.notice_end = None;
         binding.sign_in_task = None;
         binding.clear_failed_sign_in();
+    }
+    if !state.contextual_auth {
+        auth_scope::clear_absent_lifetime(logins, label);
+    }
+    if let Some(row) = observed {
+        note_served_login_for_observed_row(logins, row, at);
+    } else {
+        note_served_login(logins, label, at);
     }
     if let Some(was) = was {
         out.extend(move_default_sessions(state, label, was, at));
@@ -3653,6 +4058,7 @@ pub fn move_accounts(
                 .insert(label.to_owned());
         }
     }
+    auth_scope::move_contexts(logins, moves);
     let moved: Vec<_> = map
         .iter()
         .map(|(from, to)| {
@@ -3749,6 +4155,9 @@ pub(super) fn label_is_retained(state: &State, logins: &Logins, label: &str) -> 
 /// another account: its observations (walls, samples, auth word) and its binding's turns served.
 /// The login directory the label is bound to is kept: what it holds is checked where it is run.
 pub fn forget_account(state: &mut State, logins: &mut Logins, label: &str) {
+    state
+        .pending_auth
+        .retain(|intent| intent.raw.label != label);
     logins.sign_in_receipts.remove(label);
     logins
         .pending_sign_in_invalidations
@@ -3771,6 +4180,11 @@ pub fn forget_account(state: &mut State, logins: &mut Logins, label: &str) {
 pub(crate) fn remember_forgotten(state: &mut State, pk: String, mut account: Account) {
     account.auth = Auth::Unseen;
     account.auth_at = None;
+    account.auth_scope = ManagedScope::default();
+    account.auth_context = None;
+    account.renewal_metadata = false;
+    account.served_metadata = false;
+    account.auth_projection = AuthProjection::Unknown;
     account.pk = Some(pk.clone());
     if let Some(held) = state.forgotten.remove(&pk) {
         fill_observations(&mut account, held);
@@ -3786,6 +4200,11 @@ pub(crate) fn take_observations(account: &mut Account) -> Account {
     account.pk.clone_from(&observed.pk);
     account.auth = observed.auth;
     account.auth_at = observed.auth_at;
+    account.auth_scope.clone_from(&observed.auth_scope);
+    account.auth_context.clone_from(&observed.auth_context);
+    account.renewal_metadata = observed.renewal_metadata;
+    account.served_metadata = observed.served_metadata;
+    account.auth_projection = observed.auth_projection.clone();
     observed
 }
 
@@ -4200,7 +4619,7 @@ impl SampleContext {
 }
 
 /// Per-account observations persisted in `state.json`.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Account {
     /// Observation: the walls, by the vendor's limit type.
     pub walls: BTreeMap<String, Wall>,
@@ -4217,6 +4636,16 @@ pub struct Account {
     pub auth: Auth,
     /// Machine-local: when that word was learned.
     pub auth_at: Option<i64>,
+    /// Machine-local applicability of a legacy harness's auth word to its managed login.
+    pub auth_scope: ManagedScope,
+    /// Machine-local credential and routing context of the retained auth observation.
+    pub auth_context: Option<AuthContext>,
+    /// Local renewal metadata was established in `auth_context`, rather than inherited.
+    pub renewal_metadata: bool,
+    /// A served turn was observed in `auth_context`, rather than inherited.
+    pub served_metadata: bool,
+    /// Read-only applicability projection; never serialized or compared as persisted state.
+    pub auth_projection: AuthProjection,
     /// Machine-local: the latest account-wide clearing ([`pin`], [`note_reading`]).
     pub cleared_at: Option<i64>,
     /// Machine-local: when a session was last read running on it ([`note_session`],
@@ -4244,7 +4673,117 @@ pub struct Account {
     pub pk: Option<String>,
 }
 
+impl Eq for Account {}
+
+impl PartialEq for Account {
+    fn eq(&self, other: &Self) -> bool {
+        self.walls == other.walls
+            && self.sample == other.sample
+            && self.sample_context == other.sample_context
+            && self.before == other.before
+            && self.offer == other.offer
+            && self.auth == other.auth
+            && self.auth_at == other.auth_at
+            && self.auth_scope == other.auth_scope
+            && self.auth_context == other.auth_context
+            && self.renewal_metadata == other.renewal_metadata
+            && self.served_metadata == other.served_metadata
+            && self.cleared_at == other.cleared_at
+            && self.ran_at == other.ran_at
+            && self.credits == other.credits
+            && self.credits_day == other.credits_day
+            && self.warned_session == other.warned_session
+            && self.warned_week == other.warned_week
+            && self.key == other.key
+            && self.keyed_at == other.keyed_at
+            && self.windows == other.windows
+            && self.pk == other.pk
+    }
+}
+
+/// A local auth observation's exact credentials and effective routing policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthContext {
+    credential: super::codex_app_login::CredentialContext,
+    login: Option<String>,
+    expected_email: Option<String>,
+}
+
+impl AuthContext {
+    pub(crate) fn uses(&self, credential: &super::codex_app_login::CredentialContext) -> bool {
+        &self.credential == credential
+    }
+    pub(crate) fn new(row: &Row, credential: super::codex_app_login::CredentialContext) -> Self {
+        Self {
+            credential,
+            login: row.dir.clone(),
+            expected_email: row.expected_identity_email().map(str::to_owned),
+        }
+    }
+
+    fn matches_row(&self, row: &Row) -> bool {
+        self.login == row.dir && self.expected_email.as_deref() == row.expected_identity_email()
+    }
+
+    fn to_json(&self) -> Value {
+        aterm_json::json!({"credential": self.credential.to_private_wire(), "login": self.login,
+            "expected_email": self.expected_email})
+    }
+
+    fn from_json(value: &Value) -> Option<Self> {
+        let optional = |name| match value.get(name)? {
+            Value::Null => Some(None),
+            Value::String(text) if text.len() <= MAX_STATE_BYTES as usize => {
+                Some(Some(text.clone()))
+            }
+            _ => None,
+        };
+        Some(Self {
+            credential: super::codex_app_login::CredentialContext::from_private_wire(
+                value.get("credential")?.as_str()?,
+            )?,
+            login: optional("login")?,
+            expected_email: optional("expected_email")?,
+        })
+    }
+}
+
+/// Runtime-only evidence available to pure account consumers.
+#[derive(Debug, Clone, Default)]
+pub enum AuthProjection {
+    /// Existing non-Codex observations have no provider snapshot interface.
+    #[default]
+    Legacy,
+    /// No current credential snapshot was observed.
+    Unknown,
+    /// A read-only snapshot of the effective login.
+    Current(AuthContext),
+}
+
 impl Account {
+    fn clear_auth_context(&mut self) {
+        self.auth_context = None;
+        self.renewal_metadata = false;
+        self.served_metadata = false;
+        if !matches!(self.auth_projection, AuthProjection::Legacy) {
+            self.auth_projection = AuthProjection::Unknown;
+        }
+    }
+
+    /// The retained auth word only while its local credential context still applies.
+    #[must_use]
+    pub fn current_auth(&self, row: &Row) -> Auth {
+        match &self.auth_projection {
+            AuthProjection::Legacy => self.managed_auth(),
+            AuthProjection::Current(current)
+                if current.matches_row(row) && self.auth_context.as_ref() == Some(current) =>
+            {
+                self.auth
+            }
+            AuthProjection::Unknown | AuthProjection::Current(_) => Auth::Unseen,
+        }
+    }
+
     /// Returns whether a reading at `at` comes before the end of the [`KEY_ADOPT_S`] grace that
     /// follows a reading under another key ([`Self::keyed_at`]).
     #[must_use]
@@ -4253,14 +4792,17 @@ impl Account {
             .is_some_and(|keyed| at < keyed.saturating_add(KEY_ADOPT_S))
     }
 
-    /// Returns whether any wall, sample, offer, auth word, credits word, warning or window figure
-    /// is on record.
+    /// Returns whether any wall, sample, offer, applicable auth word, credits word, warning or
+    /// window figure is on record.
     #[must_use]
     pub fn observed(&self) -> bool {
         !self.walls.is_empty()
             || self.sample.is_some()
             || self.offer.is_some()
-            || self.auth != Auth::Unseen
+            || match self.auth_projection {
+                AuthProjection::Legacy => self.managed_auth() != Auth::Unseen,
+                AuthProjection::Unknown | AuthProjection::Current(_) => self.auth != Auth::Unseen,
+            }
             || self.credits.is_some()
             || self.warned_session.is_some()
             || self.warned_week.is_some()
@@ -4564,7 +5106,7 @@ pub struct AccountLease {
 }
 
 /// Persisted accounts state (`state.json`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct State {
     /// [`SCHEMA`].
     pub schema: u64,
@@ -4572,6 +5114,15 @@ pub struct State {
     pub machine: String,
     /// The accounts, by label.
     pub accounts: BTreeMap<String, Account>,
+    /// Transient scoped observations, drained before any publication is compared or saved.
+    #[doc(hidden)]
+    pub pending_auth: Vec<PendingAuth>,
+    /// Runtime store scope; Codex accounts cannot inherit context-free auth authority.
+    #[doc(hidden)]
+    pub contextual_auth: bool,
+    /// Operation-local failed preparations; not authority, history or persisted policy.
+    #[doc(hidden)]
+    pub excluded_accounts: BTreeSet<String>,
     /// Machine-local: the one account this home runs on.
     pub active: Option<String>,
     /// Machine-local: the account `active` was before the last rotation or pin ([`strike`]).
@@ -4627,12 +5178,47 @@ pub struct State {
     pub forgotten: BTreeMap<String, Account>,
 }
 
+impl Eq for State {}
+
+impl PartialEq for State {
+    fn eq(&self, other: &Self) -> bool {
+        self.schema == other.schema
+            && self.machine == other.machine
+            && self.accounts == other.accounts
+            && self.pending_auth == other.pending_auth
+            && self.active == other.active
+            && self.previous == other.previous
+            && self.previous_proven == other.previous_proven
+            && self.proven == other.proven
+            && self.canary == other.canary
+            && self.undo == other.undo
+            && self.pinned == other.pinned
+            && self.pending_pin == other.pending_pin
+            && self.sessions == other.sessions
+            && self.rotations == other.rotations
+            && self.probe == other.probe
+            && self.reset == other.reset
+            && self.leases == other.leases
+            && self.home_accounts == other.home_accounts
+            && self.prepared_accounts == other.prepared_accounts
+            && self.swarm_label == other.swarm_label
+            && self.swarm_aliases == other.swarm_aliases
+            && self.unrecorded == other.unrecorded
+            && self.claimed_at == other.claimed_at
+            && self.clock == other.clock
+            && self.forgotten == other.forgotten
+    }
+}
+
 impl Default for State {
     fn default() -> State {
         State {
             schema: SCHEMA,
             machine: String::new(),
             accounts: BTreeMap::new(),
+            pending_auth: Vec::new(),
+            contextual_auth: false,
+            excluded_accounts: BTreeSet::new(),
             active: None,
             previous: None,
             previous_proven: false,
@@ -4852,6 +5438,17 @@ fn account_json(a: &Account) -> Value {
     );
     o.insert("auth".to_owned(), Value::from(a.auth.as_str()));
     o.insert("auth_at".to_owned(), Value::from(a.auth_at));
+    if a.auth_scope.is_retired() {
+        o.insert("auth_retired".to_owned(), Value::Bool(true));
+    }
+    if let Some(context) = &a.auth_context {
+        o.insert("auth_context".to_owned(), context.to_json());
+        o.insert(
+            "renewal_metadata".to_owned(),
+            Value::from(a.renewal_metadata),
+        );
+        o.insert("served_metadata".to_owned(), Value::from(a.served_metadata));
+    }
     o.insert("cleared_at".to_owned(), Value::from(a.cleared_at));
     o.insert("ran_at".to_owned(), Value::from(a.ran_at));
     o.insert(
@@ -4994,6 +5591,15 @@ fn account_of(v: &Value, now: i64) -> Account {
         .collect();
     windows.sort_by_key(|(_, w)| std::cmp::Reverse(w.at));
     windows.truncate(MAX_WINDOWS);
+    let auth_context = v.get("auth_context").and_then(AuthContext::from_json);
+    let renewal_metadata = auth_context.is_some()
+        && v.get("renewal_metadata")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    let served_metadata = auth_context.is_some()
+        && v.get("served_metadata")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
     Account {
         key: v
             .get("key")
@@ -5019,6 +5625,14 @@ fn account_of(v: &Value, now: i64) -> Account {
             .and_then(Value::as_str)
             .map_or(Auth::Unseen, Auth::parse),
         auth_at: stamp(v.get("auth_at"), now),
+        auth_scope: ManagedScope::from_retired(
+            v.get("auth_retired")
+                .is_some_and(|value| value.as_bool() != Some(false)),
+        ),
+        auth_context,
+        renewal_metadata,
+        served_metadata,
+        auth_projection: AuthProjection::Legacy,
         cleared_at: stamp(v.get("cleared_at"), now),
         ran_at: stamp(v.get("ran_at"), now),
         credits: v.get("credits").and_then(|c| credits_of(c, cap)),
@@ -5424,6 +6038,9 @@ impl State {
                 .map(str::to_owned)
                 .unwrap_or_default(),
             accounts,
+            pending_auth: Vec::new(),
+            contextual_auth: false,
+            excluded_accounts: BTreeSet::new(),
             active: label(doc.get("active")),
             previous: label(doc.get("previous")),
             previous_proven: doc
@@ -5484,15 +6101,19 @@ impl State {
                 .any(|a| trimmed.eq_ignore_ascii_case(a))
     }
 
-    /// Checks the preparation-only execution hold on `label`.
+    /// Checks preparation-only authority and operation-local preparation failures on `label`.
     /// Other admission rules, including leases, are evaluated separately.
     ///
     /// # Errors
     ///
-    /// [`WhyNot::PreparationOnly`] when the credential is still held for preparation only.
+    /// [`WhyNot::PreparationOnly`] when the credential is still held for preparation only,
+    /// or [`WhyNot::PreparationFailed`] when this operation already failed to prepare it.
     pub fn execution_verdict(&self, label: &str) -> Result<(), WhyNot> {
         if self.prepared_accounts.contains(label) {
             return Err(WhyNot::PreparationOnly);
+        }
+        if self.excluded_accounts.contains(label) {
+            return Err(WhyNot::PreparationFailed);
         }
         Ok(())
     }
@@ -5503,6 +6124,7 @@ impl State {
     /// # Errors
     ///
     /// - [`WhyNot::PreparationOnly`] when a shared credential has no separate execution grant.
+    /// - [`WhyNot::PreparationFailed`] when this operation could not prepare the account.
     /// - [`WhyNot::LeasedElsewhere`] when another Mac's live claim on `label` is the senior one.
     /// - [`WhyNot::ClockOff`] when this Mac's peers read its clock Off and `label` is not one of
     ///   its home accounts, or Split and `label` is not one of its home accounts
@@ -5686,7 +6308,7 @@ pub fn condition(row: &Row, state: &State, enrolled: bool, now: i64) -> Conditio
     let Some(account) = state.accounts.get(&row.label) else {
         return Condition::Unseen;
     };
-    if account.auth == Auth::SignedOut {
+    if account.current_auth(row) == Auth::SignedOut {
         return Condition::SignedOut;
     }
     if let Some(until) = account.limited_until(now) {
@@ -5695,7 +6317,15 @@ pub fn condition(row: &Row, state: &State, enrolled: bool, now: i64) -> Conditio
     if account.low(now) {
         return Condition::Low;
     }
-    if account.observed() {
+    if !account.walls.is_empty()
+        || account.sample.is_some()
+        || account.offer.is_some()
+        || account.current_auth(row) != Auth::Unseen
+        || account.credits.is_some()
+        || account.warned_session.is_some()
+        || account.warned_week.is_some()
+        || !account.windows.is_empty()
+    {
         Condition::Usable
     } else {
         Condition::Unseen
@@ -5902,7 +6532,8 @@ pub enum StayWhy {
     /// where no row's own login file is read, so no row is picked or moved to.
     KeyringStore,
     /// A move is due, and the relaunch line onto the row could not be written (its overlay home
-    /// could not be made, or holds entries of its own): nothing was committed.
+    /// could not be made, or holds entries of its own), or the Codex build the session runs keeps
+    /// no row's login its own ([`super::codex_alab::auth_path_unread`]): nothing was committed.
     NoLine,
 }
 
@@ -6010,6 +6641,8 @@ impl Rank {
 pub enum WhyNot {
     /// Its credential is prepared, but no separate execution policy admits use.
     PreparationOnly,
+    /// Preparation failed in this selection attempt; no new authority is implied.
+    PreparationFailed,
     /// It is the session's own account.
     Me,
     /// Assigned only to other Macs' warm sets in `ai-pool.toml` (`Row::held_by`).
@@ -6049,6 +6682,7 @@ impl WhyNot {
     pub const fn as_str(self) -> &'static str {
         match self {
             WhyNot::PreparationOnly => "prepared: awaiting execution authority",
+            WhyNot::PreparationFailed => "preparation failed in this selection",
             WhyNot::Me => "this session's own",
             WhyNot::HeldElsewhere => "held-elsewhere",
             WhyNot::NotEnrolled => "not-enrolled",
@@ -6418,11 +7052,12 @@ pub fn advise_session(
     }
 }
 
-/// The row a launch aterm makes of a pool's CLI starts under (a worker's spawn, a cold restore):
-/// `active` while the owner's pin holds it (a row whose login is here and not signed out) or
-/// while it is fresh, else the first candidate a wall would move to (`next:` in
-/// `aterm accounts`), else `active` while it still runs (a low row, every other one walled);
-/// `None` when no row is usable.
+/// Claude Code's rotation target, and the row every other CLI's launch weighs: `active` while the
+/// owner's pin holds it (a row whose login is here and not signed out) or while it is fresh, else
+/// the first candidate a wall would move to, else `active` while it still runs (a low row, every
+/// other one walled); `None` when no row is usable. A launch of a CLI other than Claude Code
+/// passes this through [`super::accounts_pool::launch_now`], which decides that pool's `next:` in
+/// `aterm accounts`.
 #[must_use]
 pub fn launch_row<'a>(
     roster: &'a Roster,
@@ -6679,7 +7314,7 @@ fn advise_with(
         && available_here(mine)
         && cond(mine).runs()
         && state.accounts.get(&mine.label).is_some_and(|a| {
-            a.auth == Auth::Ok && a.auth_at.is_some_and(|signed_in| signed_in > seen)
+            a.current_auth(mine) == Auth::Ok && a.auth_at.is_some_and(|signed_in| signed_in > seen)
         })
     {
         let unanswered = !state.proven && state.active.as_deref() == Some(mine.label.as_str());
@@ -7094,7 +7729,11 @@ fn account_mut<'a>(state: &'a mut State, label: &str) -> Option<&'a mut Account>
     if !admissible_label(label) {
         return None;
     }
-    Some(state.accounts.entry(label.to_owned()).or_default())
+    let account = state.accounts.entry(label.to_owned()).or_default();
+    if state.contextual_auth && matches!(account.auth_projection, AuthProjection::Legacy) {
+        account.auth_projection = AuthProjection::Unknown;
+    }
+    Some(account)
 }
 
 fn end_pin(state: &mut State, account: &str, why: &str, t: i64, out: &mut Vec<Event>) {
@@ -7364,6 +8003,11 @@ pub fn note_reading_held(
             offer: _,
             auth,
             auth_at,
+            auth_scope,
+            auth_context,
+            renewal_metadata,
+            served_metadata,
+            auth_projection,
             cleared_at: _,
             ran_at,
             credits: _,
@@ -7378,6 +8022,11 @@ pub fn note_reading_held(
         *record = Account {
             auth,
             auth_at,
+            auth_scope,
+            auth_context,
+            renewal_metadata,
+            served_metadata,
+            auth_projection,
             cleared_at: Some(now),
             keyed_at: Some(now),
             ran_at,
@@ -7533,28 +8182,135 @@ pub fn note_offer(
     true
 }
 
-/// Records an [`Auth`] observation for `account` at `at`.
+/// Records an [`Auth`] observation for `account` at `at`. In a contextual Codex store this
+/// retains history only; a scoped observation must validate current credentials before
+/// affecting a pin or supplying current auth authority.
 pub fn note_auth(state: &mut State, account: &str, auth: Auth, at: i64) -> Vec<Event> {
     let mut out = Vec::new();
     if auth == Auth::Unseen {
         return out;
     }
+    let contextual = state.contextual_auth;
     let Some(record) = account_mut(state, account) else {
         return out;
     };
-    if record.auth_at.is_some_and(|held| at < held) {
+    if (contextual || record.managed_auth_is_current())
+        && record.auth_at.is_some_and(|held| at < held)
+    {
         return out;
     }
+    record.clear_auth_context();
     let changed = record.auth != auth;
+    let reactivated = !contextual && !record.managed_auth_is_current();
     record.auth = auth;
     record.auth_at = Some(at);
+    if !contextual {
+        record.auth_scope.observe_entry();
+    }
     if changed {
         out.push(Event::new(at, Kind::Auth, account).because(auth.as_str()));
-        if auth == Auth::SignedOut {
-            end_pin(state, account, "signed-out", at, &mut out);
-        }
+    }
+    if auth == Auth::SignedOut && !contextual && (changed || reactivated) {
+        end_pin(state, account, "signed-out", at, &mut out);
     }
     out
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PendingAuthKind {
+    Word(Auth),
+    LoginEnd,
+    SignedBack,
+    CheckedSignIn,
+    Check,
+}
+
+/// A transient observation whose authority is checked against the final publication.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingAuth {
+    raw: Row,
+    context: AuthContext,
+    kind: PendingAuthKind,
+    at: i64,
+}
+
+fn stage_auth_kind(
+    state: &mut State,
+    raw: &Row,
+    _logins: &Logins,
+    context: AuthContext,
+    kind: PendingAuthKind,
+    at: i64,
+) {
+    state.pending_auth.push(PendingAuth {
+        raw: raw.clone(),
+        context,
+        kind,
+        at,
+    });
+}
+
+/// Stages an explicit auth result without applying pin or lifecycle effects yet.
+pub(crate) fn stage_auth(
+    state: &mut State,
+    raw: &Row,
+    logins: &Logins,
+    context: AuthContext,
+    word: Auth,
+    at: i64,
+) {
+    stage_auth_kind(state, raw, logins, context, PendingAuthKind::Word(word), at);
+}
+
+/// Stages a current-login failure including its learned lifetime metadata.
+pub(crate) fn stage_login_end(
+    state: &mut State,
+    raw: &Row,
+    logins: &Logins,
+    context: AuthContext,
+    at: i64,
+) {
+    stage_auth_kind(state, raw, logins, context, PendingAuthKind::LoginEnd, at);
+}
+
+/// Stages a served login's recovery, preserving the existing signed-back semantics.
+pub(crate) fn stage_signed_back(
+    state: &mut State,
+    raw: &Row,
+    logins: &Logins,
+    context: AuthContext,
+    at: i64,
+) {
+    stage_auth_kind(state, raw, logins, context, PendingAuthKind::SignedBack, at);
+}
+
+/// Stages verified sign-in metadata for the final login.
+pub(crate) fn stage_checked_sign_in(
+    state: &mut State,
+    raw: &Row,
+    logins: &Logins,
+    context: AuthContext,
+    at: i64,
+) {
+    stage_auth_kind(
+        state,
+        raw,
+        logins,
+        context,
+        PendingAuthKind::CheckedSignIn,
+        at,
+    );
+}
+
+/// Requires a current context for other effects without recording an auth result.
+pub(crate) fn stage_auth_check(
+    state: &mut State,
+    raw: &Row,
+    logins: &Logins,
+    context: AuthContext,
+    at: i64,
+) {
+    stage_auth_kind(state, raw, logins, context, PendingAuthKind::Check, at);
 }
 
 /// Records the account `sid` is running on and any hold reason.
@@ -8105,11 +8861,30 @@ pub fn prove(state: &mut State, account: &str, now: i64) -> Option<Event> {
     state.proven = true;
     state.canary = None;
     state.undo.clear();
+    let contextual = state.contextual_auth;
     if let Some(record) = account_mut(state, account) {
+        record.clear_auth_context();
         record.auth = Auth::Ok;
         record.auth_at = Some(now);
+        if !contextual {
+            record.auth_scope.observe_entry();
+        }
     }
     Some(Event::new(now, Kind::Proven, account))
+}
+
+/// Record a response admitted against the current login and bind its proof to that context.
+pub fn prove_in_context(
+    state: &mut State,
+    logins: &Logins,
+    account: &str,
+    now: i64,
+) -> Option<Event> {
+    let event = prove(state, account, now);
+    if event.is_some() {
+        auth_scope::bind_observation(state, logins, account, false);
+    }
+    event
 }
 
 /// Failure reason when a canary session on a newly rotated account fails to serve a response.
@@ -8198,6 +8973,8 @@ pub(crate) enum PinRefusal {
     NotListed,
     /// The row is held for preparation only, with no execution authority here.
     PreparationOnly,
+    /// This selection already failed to prepare the row.
+    PreparationFailed,
     /// No login of the row is made on this machine.
     NotEnrolled,
     /// The row's login is known signed out.
@@ -8211,6 +8988,7 @@ impl PinRefusal {
             Self::PreparationOnly => {
                 format!("`{label}` is prepared but has no execution authority")
             }
+            Self::PreparationFailed => format!("`{label}` preparation failed in this selection"),
             Self::NotEnrolled => format!(
                 "`{label}` is not-enrolled: no login was made for it on this machine (its login \
                  directory is missing or empty)"
@@ -8231,8 +9009,11 @@ pub(crate) fn pin_refusal(
     let Some(row) = roster.row(label) else {
         return Some(PinRefusal::NotListed);
     };
-    if state.execution_verdict(label).is_err() {
+    if state.prepared_accounts.contains(label) {
         return Some(PinRefusal::PreparationOnly);
+    }
+    if state.excluded_accounts.contains(label) {
+        return Some(PinRefusal::PreparationFailed);
     }
     if !is_enrolled(row, enrolled) {
         return Some(PinRefusal::NotEnrolled);
@@ -8240,7 +9021,7 @@ pub(crate) fn pin_refusal(
     state
         .accounts
         .get(label)
-        .is_some_and(|a| a.auth == Auth::SignedOut)
+        .is_some_and(|a| a.current_auth(row) == Auth::SignedOut)
         .then_some(PinRefusal::SignedOut)
 }
 
@@ -8257,7 +9038,8 @@ pub enum PinSelection {
 /// # Errors
 ///
 /// By name: a label the roster does not list, one not enrolled on this
-/// machine, one known signed out, or one held for preparation only. Nothing is changed.
+/// machine, one known signed out, one held for preparation only, or one whose current
+/// preparation failed. Nothing is changed.
 pub fn pin(
     state: &mut State,
     roster: &Roster,
@@ -8653,6 +9435,130 @@ impl Store {
     #[must_use]
     pub fn default_home(&self) -> Option<PathBuf> {
         Some(self.user_home()?.join(self.cli.accounts().default_home))
+    }
+
+    /// Captures local credentials and routing without refreshing or changing the login.
+    pub(crate) fn capture_auth_context(&self, row: &Row) -> Option<AuthContext> {
+        if self.cli != Cli::Codex {
+            return None;
+        }
+        let user_home = self.user_home()?;
+        let default = self.default_home()?;
+        let home = row
+            .dir
+            .as_deref()
+            .filter(|dir| !dir.is_empty())
+            .map_or(default.as_path(), Path::new);
+        let credential = super::codex_app_login::current_context(home, user_home)?;
+        Some(AuthContext::new(row, credential))
+    }
+
+    /// Hydrates only runtime applicability; it creates neither observations nor writes.
+    pub(crate) fn hydrate_auth_contexts(&self, state: &mut State, roster: &Roster) {
+        if self.cli != Cli::Codex {
+            return;
+        }
+        state.contextual_auth = true;
+        for account in state.accounts.values_mut() {
+            account.auth_projection = AuthProjection::Unknown;
+        }
+        for row in &roster.rows {
+            if let Some(account) = state.accounts.get_mut(&row.label) {
+                account.auth_projection = self
+                    .capture_auth_context(row)
+                    .map_or(AuthProjection::Unknown, AuthProjection::Current);
+            }
+        }
+    }
+
+    fn finalize_auth(
+        &self,
+        state: &mut State,
+        logins: &mut Logins,
+        final_raw: Option<&Roster>,
+    ) -> Result<Vec<Event>, String> {
+        let pending = std::mem::take(&mut state.pending_auth);
+        // Validate the entire publication before any auth, pin or lifecycle effect runs.
+        for intent in &pending {
+            let raw = match final_raw {
+                Some(roster) => roster
+                    .row(&intent.raw.label)
+                    .ok_or("auth account is absent from the final roster")?,
+                None => &intent.raw,
+            };
+            let effective = bound(
+                &Roster {
+                    rows: vec![raw.clone()],
+                },
+                logins,
+            );
+            let row = &effective.rows[0];
+            if !intent.context.matches_row(row)
+                || self.capture_auth_context(row).as_ref() != Some(&intent.context)
+            {
+                return Err("login credentials or routing changed before auth publication; nothing recorded".into());
+            }
+        }
+        let mut events = Vec::new();
+        for intent in pending {
+            if matches!(intent.kind, PendingAuthKind::Check) {
+                continue;
+            }
+            if state
+                .accounts
+                .get(&intent.raw.label)
+                .is_some_and(|account| account.auth_at.is_some_and(|at| at > intent.at))
+            {
+                continue;
+            }
+            let label = &intent.raw.label;
+            let old = state.accounts.get(label);
+            let same_context =
+                old.is_some_and(|old| old.auth_context.as_ref() == Some(&intent.context));
+            let renewal_metadata = (same_context && old.is_some_and(|old| old.renewal_metadata))
+                || matches!(intent.kind, PendingAuthKind::CheckedSignIn)
+                || (matches!(intent.kind, PendingAuthKind::SignedBack)
+                    && old.is_some_and(|old| old.auth == Auth::SignedOut));
+            let served_metadata = (same_context && old.is_some_and(|old| old.served_metadata))
+                || matches!(
+                    intent.kind,
+                    PendingAuthKind::CheckedSignIn | PendingAuthKind::SignedBack
+                );
+            let word = match intent.kind {
+                PendingAuthKind::Word(word) => {
+                    events.extend(note_auth(state, label, word, intent.at));
+                    word
+                }
+                PendingAuthKind::LoginEnd => {
+                    events.extend(note_auth(state, label, Auth::SignedOut, intent.at));
+                    events.extend(note_login_end(state, logins, label, intent.at));
+                    Auth::SignedOut
+                }
+                PendingAuthKind::SignedBack => {
+                    events.extend(note_signed_back(state, logins, label, intent.at));
+                    events.extend(note_auth(state, label, Auth::Ok, intent.at));
+                    note_served_login(logins, label, intent.at);
+                    Auth::Ok
+                }
+                PendingAuthKind::CheckedSignIn => {
+                    events.extend(note_checked_sign_in(state, logins, label, intent.at));
+                    Auth::Ok
+                }
+                PendingAuthKind::Check => continue,
+            };
+            if word == Auth::SignedOut {
+                end_pin(state, label, "signed-out", intent.at, &mut events);
+            }
+            if word != Auth::Unseen
+                && let Some(account) = account_mut(state, label)
+            {
+                account.auth_context = Some(intent.context.clone());
+                account.renewal_metadata = renewal_metadata;
+                account.served_metadata = served_metadata;
+                account.auth_projection = AuthProjection::Current(intent.context);
+            }
+        }
+        Ok(events)
     }
 
     /// The user home whose `.aterm/logins/<cli>` holds this store's logins ([`Store::at_for`]);
@@ -9058,6 +9964,14 @@ impl Store {
             project = "aterm_agent::harness::accounts::report_read_tests::report_transition"
         )
     )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountRenewalGeneration",
+            action = "ReadAuth",
+            project = "aterm_agent::harness::accounts::generation_tests::generation_transition"
+        )
+    )]
     pub fn read_account_records(
         &self,
         roster_path: Option<&Path>,
@@ -9142,9 +10056,11 @@ impl Store {
         let result = (|| {
             let (raw, roster_present) = raw.map_err(RosterReadError::Roster)?;
             let (logins, login_note) = self.load_logins(now).map_err(RosterReadError::Records)?;
-            let (state, state_note) = self.load(now).map_err(RosterReadError::Records)?;
+            let (mut state, state_note) = self.load(now).map_err(RosterReadError::Records)?;
+            let roster = bound(&raw, &logins);
+            self.hydrate_auth_contexts(&mut state, &roster);
             Ok(AccountRecords {
-                roster: bound(&raw, &logins),
+                roster,
                 raw_roster: raw,
                 roster_present,
                 state,
@@ -9392,6 +10308,16 @@ impl Store {
             }
         }
         self.check_sync_read_receipt(&receipt)?;
+        if self.cli == Cli::Codex {
+            state.contextual_auth = true;
+            for account in state
+                .accounts
+                .values_mut()
+                .chain(state.forgotten.values_mut())
+            {
+                account.auth_projection = AuthProjection::Unknown;
+            }
+        }
         Ok((state, note))
     }
 
@@ -9770,9 +10696,10 @@ impl Store {
                 }
                 let roster = bound(raw, logins);
                 let enrolled = self.enrolled_here(&roster);
+                self.hydrate_auth_contexts(state, &roster);
                 match pin_refusal(state, &roster, &enrolled, label) {
                     None => pin(state, &roster, &enrolled, label, now).map(|event| vec![event]),
-                    Some(why @ (PinRefusal::NotListed | PinRefusal::PreparationOnly)) => {
+                    Some(why @ (PinRefusal::NotListed | PinRefusal::PreparationOnly | PinRefusal::PreparationFailed)) => {
                         Err(why.message(label))
                     }
                     Some(why @ (PinRefusal::NotEnrolled | PinRefusal::SignedOut)) => {
@@ -11057,6 +11984,22 @@ mod selection_commit_tests;
 #[path = "accounts_generation_tests.rs"]
 mod generation_tests;
 
+#[cfg(test)]
+#[path = "accounts_auth_scope_tests.rs"]
+mod auth_scope_tests;
+
+#[cfg(test)]
+#[path = "accounts_auth_scope_codec_tests.rs"]
+mod auth_scope_codec_tests;
+
+#[cfg(test)]
+#[path = "accounts_auth_scope_publication_tests.rs"]
+mod auth_scope_publication_tests;
+
+#[cfg(test)]
+#[path = "accounts_lifetime_scope_tests.rs"]
+mod lifetime_scope_tests;
+
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::spec_unmodeled(
@@ -11075,3 +12018,7 @@ pub(super) mod rename_tests;
 #[cfg(test)]
 #[path = "accounts_lock_tests.rs"]
 mod lock_tests;
+
+#[cfg(test)]
+#[path = "accounts_auth_context_tests.rs"]
+mod auth_context_tests;

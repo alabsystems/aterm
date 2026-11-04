@@ -14,14 +14,15 @@ fn an_immediate_move_waits_for_its_completion_write() {
     let held_by_restart = Arc::clone(&held);
     let world = Arc::clone(&a);
     let original = Arc::clone(&idle.hooks.acts.restart);
-    idle.hooks.acts.restart = Arc::new(move |sid, grace, why, selected| {
-        let step = original(sid, grace, why, selected);
+    idle.hooks.acts.restart = Arc::new(move |sid, grace, why, ask, selected| {
+        let step = original(sid, grace, why, ask, selected);
         *held_by_restart.lock().unwrap() = Some(world.hold_lock());
         step
     });
     assert_eq!(moves(&idle.account(usage_wall())), Some("work-2"));
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("wait:account-unverified")
     );
     {
@@ -64,7 +65,7 @@ fn immediate_case(case: i64) -> [i64; 8] {
     let world = Arc::clone(&a);
     let kept = Arc::clone(&idle.kept);
     let original = Arc::clone(&idle.hooks.acts.restart);
-    idle.hooks.acts.restart = Arc::new(move |sid, grace, why, selected| {
+    idle.hooks.acts.restart = Arc::new(move |sid, grace, why, ask, selected| {
         let gate = Arc::clone(&kept.lock().unwrap().account.landing);
         let locked = matches!(gate.try_lock(), Err(std::sync::TryLockError::WouldBlock));
         let rotations = world
@@ -76,7 +77,7 @@ fn immediate_case(case: i64) -> [i64; 8] {
             locked && rotations == world.asked("restart:") + 1,
             Ordering::SeqCst,
         );
-        let step = original(sid, grace, why, selected);
+        let step = original(sid, grace, why, ask, selected);
         if matches!(case, 2 | 3) {
             *held_by_restart.lock().unwrap() = Some(world.hold_lock());
         }
@@ -96,14 +97,14 @@ fn immediate_case(case: i64) -> [i64; 8] {
     if case == 7 {
         *held.lock().unwrap() = Some(a.hold_lock());
     }
-    let _ = idle.restart(&move_to("work-2", AccountAt::Wall));
+    let _ = idle.restart_once(&move_to("work-2", AccountAt::Wall));
     if case == 3 {
         drop(held.lock().unwrap().take());
         account_land(sid, &idle.kept, &idle.hooks, Landing::Asked);
     }
     if matches!(case, 4 | 5) {
         assert_eq!(moves(&idle.account(usage_wall())), Some("work-2"));
-        let _ = idle.restart(&move_to("work-2", AccountAt::Wall));
+        let _ = idle.restart_once(&move_to("work-2", AccountAt::Wall));
     }
     let target = if case == 6 {
         idle.account_served();
@@ -116,7 +117,7 @@ fn immediate_case(case: i64) -> [i64; 8] {
         a.now.store(ACCT_NOW + 30, Ordering::SeqCst);
         a.wall(ACCT_TALK_A, ACCT_NOW + 20);
         assert_eq!(moves(&idle.account(usage_wall())), Some("main"));
-        let _ = idle.restart(&move_to("main", AccountAt::Wall));
+        let _ = idle.restart_once(&move_to("main", AccountAt::Wall));
         "main"
     } else {
         "work-2"
@@ -225,14 +226,15 @@ pub(super) fn blocked_rejection() -> (Arc<Accts>, WorkerIdle, Arc<Mutex<Option<a
     let held_by_restart = Arc::clone(&held);
     let world = Arc::clone(&a);
     let original = Arc::clone(&idle.hooks.acts.restart);
-    idle.hooks.acts.restart = Arc::new(move |sid, grace, why, selected| {
-        let step = original(sid, grace, why, selected);
+    idle.hooks.acts.restart = Arc::new(move |sid, grace, why, ask, selected| {
+        let step = original(sid, grace, why, ask, selected);
         *held_by_restart.lock().unwrap() = Some(world.hold_lock());
         step
     });
     assert_eq!(moves(&idle.account(usage_wall())), Some("work-2"));
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("wait:account-unverified")
     );
     assert!(
@@ -317,15 +319,16 @@ fn a_rejection_receipt_recovers_without_repeating_the_failure() {
     a.answers.lock().unwrap().push_back("wait:changed");
     let world = Arc::clone(&a);
     let original = Arc::clone(&idle.hooks.acts.restart);
-    idle.hooks.acts.restart = Arc::new(move |sid, grace, why, selected| {
-        let step = original(sid, grace, why, selected);
+    idle.hooks.acts.restart = Arc::new(move |sid, grace, why, ask, selected| {
+        let step = original(sid, grace, why, ask, selected);
         assert!(!world.store().wake_path().exists());
         std::fs::create_dir(world.store().wake_path()).unwrap();
         step
     });
     assert_eq!(moves(&idle.account(usage_wall())), Some("work-2"));
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("wait:account-unverified")
     );
     assert!(a.store().load(a.clock()).is_err());

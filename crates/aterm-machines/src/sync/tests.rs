@@ -129,6 +129,8 @@ pub(crate) struct Inert {
     accounts: Mutex<AccountsRead>,
     release: Mutex<ReleaseRead>,
     github: Mutex<GithubRead>,
+    /// What `github` reads once `sync_github` ran, in place of a current route.
+    github_after: Mutex<Option<GithubRead>>,
     /// What `sync.clone` reads ([`Ports::owed_clone`]).
     owed: Mutex<crate::init::OwedClone>,
     fabric: Mutex<FabricRead>,
@@ -196,6 +198,7 @@ impl Inert {
             applies: Mutex::new(Vec::new()),
             vault: Mutex::new(VaultRead::Runs("runs (pid 7)".to_owned())),
             github: Mutex::new(GithubRead::NotApplicable("no vault helper".into())),
+            github_after: Mutex::new(None),
             owed: Mutex::new(crate::init::OwedClone::Nothing(
                 "aterm init owes no clone".into(),
             )),
@@ -467,9 +470,15 @@ impl Ports for Inert {
     fn github(&self) -> Result<GithubRead, String> {
         self.read(&self.github)
     }
-    fn sync_github(&self) -> Result<String, String> {
+    fn sync_github(&self, journaled: &str) -> Result<String, String> {
         self.applied("github");
-        *self.github.lock().unwrap() = GithubRead::Current("vault helper verified".into());
+        assert_eq!(journaled, "git config --add stand-in");
+        *self.github.lock().unwrap() = self
+            .github_after
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or_else(|| GithubRead::Current("vault helper verified".into()));
         Ok("vault helper verified".into())
     }
     fn owed_clone(&self) -> Result<crate::init::OwedClone, String> {
@@ -791,9 +800,17 @@ fn the_subscribers_pass_runs_the_clone_init_owes_once_its_token_lands() {
 fn subscriber_repairs_the_git_helper_and_a_swarm_off_never_does() {
     let scratch = aterm_tempfile::tempdir().unwrap();
     let ports = Inert::new(scratch.path());
-    *ports.github.lock().unwrap() = GithubRead::Due("managed override shadows vault helper".into());
+    *ports.github.lock().unwrap() = GithubRead::Due {
+        from: "git's global settings name the login keychain's GitHub helper".into(),
+        revert: "git config --add stand-in".into(),
+    };
     let planned = ran(ports.pass(Trigger::Init, Mode::Plan));
     assert_eq!(row(&planned.rows, GITHUB).outcome, Outcome::Planned);
+    assert_eq!(
+        row(&planned.rows, GITHUB).revert.as_deref(),
+        Some("git config --add stand-in"),
+        "the row carries the block's revert, which the engine journals before the apply"
+    );
     assert!(!ports.applies().contains(&"github"));
     *ports.swarm.lock().unwrap() = Ok(false);
     let off = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
@@ -807,6 +824,30 @@ fn subscriber_repairs_the_git_helper_and_a_swarm_off_never_does() {
         row(&ran(ports.pass(Trigger::Init, Mode::Plan)).rows, GITHUB).outcome,
         Outcome::Ok
     );
+}
+
+/// The block's replacement is what the row applied: a route that then waits on something else
+/// (no token yet, a custom source) reads back as done, and the next pass reads that as it stands.
+#[test]
+fn a_replaced_block_reads_back_as_done_whatever_the_route_waits_on() {
+    for after in [
+        GithubRead::NotApplicable("a custom GitHub token source is left unchanged".into()),
+        GithubRead::Deferred("the GitHub token file is not on this Mac yet".into()),
+    ] {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let ports = Inert::new(scratch.path());
+        *ports.github.lock().unwrap() = GithubRead::Due {
+            from: "git's global settings name the login keychain's GitHub helper".into(),
+            revert: "git config --add stand-in".into(),
+        };
+        *ports.github_after.lock().unwrap() = Some(after);
+        let applied = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
+        assert_eq!(row(&applied.rows, GITHUB).outcome, Outcome::Changed);
+        assert_ne!(
+            row(&ran(ports.pass(Trigger::Init, Mode::Plan)).rows, GITHUB).outcome,
+            Outcome::Ok
+        );
+    }
 }
 
 /// A person's off switch leaves its kind as it is: the row reads `NotApplicable`, naming it, and

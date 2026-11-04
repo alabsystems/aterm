@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Untrusted proposals and bounded offline inspection. These commands never
-//! publish root policy, create a token or initialize/spend a resource ledger.
+//! Untrusted proposal tools and explicit conditional root publication.
+//! Proposal generation and inspection never publish or spend a resource.
 
 use super::*;
 use crate::{
@@ -31,7 +31,12 @@ fn run_with(
         command,
         options,
         paths,
-        Instant::now() + Duration::from_secs(2),
+        Instant::now()
+            + Duration::from_secs(if command == "accounts-broker-publish" {
+                60
+            } else {
+                2
+            }),
     )
 }
 
@@ -42,6 +47,38 @@ fn run_until(
     deadline: Instant,
 ) -> Result<Value> {
     match command {
+        "accounts-broker-publish" => {
+            let id = decode_hex(take(&mut options, "--grant")?)?;
+            let base = decode_hex(take(&mut options, "--base")?)?;
+            let file = take(&mut options, "--file")?;
+            empty(&options)?;
+            if id == [0; 16] || base == [0; 32] {
+                return Err(Error::new("publication IDs must be nonzero"));
+            }
+            let target = read(file)?;
+            let paths = paths()?;
+            let config = client::config(&paths)
+                .map_err(crate::table::failure)?
+                .ok_or_else(|| Error::new("broker publication needs a configured vault"))?;
+            let broker = Broker::at(paths.clone(), config)?;
+            broker.check_publication_writer_until(id, deadline)?;
+            let active = crate::application_paths_until(&paths, deadline)?;
+            client::sync_reader_until(&active, deadline).map_err(crate::table::failure)?;
+            let admin =
+                client::admin_cached_until(&active, deadline).map_err(crate::table::failure)?;
+            let result = broker.publish_refresh_until(id, base, &target, &admin, deadline)?;
+            Ok(match result {
+                super::super::Publication::AlreadyCurrent { sequence } => json!({
+                    "kind": "broker-policy-publication", "status": "already-current", "sequence": sequence,
+                    "provider_request": "not-attempted", "base_checked": false
+                }),
+                super::super::Publication::Published(published) => json!({
+                    "kind": "broker-policy-publication", "status": "stored", "sequence": published.seq,
+                    "queued": published.queued, "local": published.local, "scope": "receiving-stores",
+                    "provider_request": "not-attempted"
+                }),
+            })
+        }
         "accounts-broker-refresh" => {
             let id = decode_hex(take(&mut options, "--grant")?)?;
             empty(&options)?;
@@ -282,6 +319,44 @@ mod tests {
             })
             .unwrap_err();
             assert!(!error.to_string().contains("sensitive-sentinel"));
+        }
+    }
+
+    #[test]
+    fn publication_options_are_closed_before_opening_any_vault() {
+        let id = "61".repeat(16);
+        let base = "62".repeat(32);
+        let zero_id = "00".repeat(16);
+        let zero_base = "00".repeat(32);
+        let valid = BTreeMap::from([
+            ("--grant", id.as_str()),
+            ("--base", base.as_str()),
+            ("--file", "missing-policy.toml"),
+        ]);
+        for (key, value) in [
+            ("--grant", "sensitive-sentinel"),
+            ("--base", "sensitive-sentinel"),
+            ("--grant", zero_id.as_str()),
+            ("--base", zero_base.as_str()),
+            ("--unknown", "sensitive-sentinel"),
+        ] {
+            let mut options = valid.clone();
+            options.insert(key, value);
+            let error = run_with("accounts-broker-publish", options, || {
+                panic!("invalid publication opened vault")
+            })
+            .unwrap_err();
+            assert!(!error.to_string().contains("sensitive-sentinel"));
+        }
+        for missing in ["--grant", "--base", "--file"] {
+            let mut options = valid.clone();
+            options.remove(missing);
+            assert!(
+                run_with("accounts-broker-publish", options, || panic!(
+                    "incomplete publication opened vault"
+                ))
+                .is_err()
+            );
         }
     }
 

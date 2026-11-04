@@ -135,12 +135,15 @@ pub fn taught_ctl_verbs(text: &str) -> Vec<(String, String)> {
                 Some("--sock" | "--pid" | "--timeout" | "--host") => {
                     words.next();
                 }
-                Some(w) if w.starts_with(['@', '"', '\'', '-', '$', '<', '[']) => {}
+                Some(w) if w.starts_with(['@', '"', '\'', '-', '$', '<', '[', '…']) => {}
                 other => break other,
             }
         };
         let Some(verb) = verb else { continue };
         let verb = verb.trim_end_matches(|c: char| !c.is_ascii_alphanumeric());
+        if verb.is_empty() {
+            continue;
+        }
         let command: String = span.chars().take(80).collect();
         taught.push((command, verb.to_string()));
     }
@@ -4686,6 +4689,10 @@ A worker's report ends with `ATERM-TASK-DONE` on a line by itself.
         ));
     }
 
+    /// `taught_ctl_verbs` scans across line breaks, skips global flags and session/placeholder
+    /// tokens (including `'…'`), and ignores punctuation-only placeholder tokens.
+    /// NEGATIVE CONTROL: omitting `'…'` or the empty-verb guard pushes `""` for `` `aterm ctl …` ``
+    /// and `` `aterm ctl ...` `` and drops `"ls"` in `` `aterm ctl … ls` ``.
     #[test]
     fn a_taught_command_is_read_to_its_verb_across_a_line_break() {
         let verbs = |text: &str| -> Vec<String> {
@@ -4702,6 +4709,12 @@ A worker's report ends with `ATERM-TASK-DONE` on a line by itself.
         assert_eq!(
             verbs("every step is an `aterm ctl` verb; `aterm ctl --help` needs no session"),
             Vec::<String>::new()
+        );
+        assert_eq!(
+            verbs(
+                "placeholders `aterm ctl …` and `aterm ctl ...` name no verb, while `aterm ctl … ls` names ls"
+            ),
+            ["ls"]
         );
     }
 

@@ -2,13 +2,12 @@
 // Copyright 2026 Andrew Yates
 
 //! The steps of `LineCustody` (`aterm_models_harness::line_custody_model`) that no function here
-//! performs: the worker's program, the person, the session's state and the host's deferral, and
-//! the model's mutants. The custody's own steps are anchored on the pure core
-//! (`supervise::custody`), each projected by the Tier-1 bind (`tests/conformance_custody.rs`).
-//! Proof and test builds only.
+//! performs: the worker's program, the person, the session's state, and the model's mutants. The
+//! custody's own steps, the host's deferral of the restart among them (`Restarts::deferred`), are
+//! anchored on the pure core (`supervise::custody`), each projected by the Tier-1 bind
+//! (`tests/conformance_custody.rs`). Proof and test builds only.
 
-/// The program's, the person's, the session's and the host's steps, and the mutants of
-/// `LineCustody`.
+/// The program's, the person's and the session's steps, and the mutants of `LineCustody`.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::spec_unmodeled(
@@ -102,7 +101,7 @@
     aterm_spec_anchor::spec_unmodeled(
         machine = "LineCustody",
         action = "Stirs",
-        reason = "The session leaving rest (a turn running, a frame torn mid-redraw, a hold, the word Off, a person's key within the grace, a background call making no progress): the session's. A box over the composer is DialogShows. The Tier-1 bind renders one of those into the read's Rest exactly there."
+        reason = "The session leaving rest (a turn running, a frame torn mid-redraw, the agent's own background work running under its turn's end, a hold, the word Off, a person's key within the grace, a background call making no progress): the session's. A box over the composer is DialogShows. The Tier-1 bind renders one of those into the read's Rest exactly there."
     )
 )]
 #[cfg_attr(
@@ -110,7 +109,7 @@
     aterm_spec_anchor::spec_unmodeled(
         machine = "LineCustody",
         action = "Rests",
-        reason = "The session at rest again: the session's. The Tier-1 bind renders the read's Rest at rest exactly there. Under a box over the composer (DialogShows) it renders the read's Rest not idle instead, as a box is no rest."
+        reason = "The session at rest again: the session's. The Tier-1 bind renders the read's Rest at rest exactly there. Under a box over the composer (DialogShows) it renders the read's Rest as the shell judges that read: a dialog drawn or no composer drawn as no turn's end, the composer's glyph cell unread as the turn's end the rest says with its composer never clear, as a read that cannot say what the composer holds is no rest."
     )
 )]
 #[cfg_attr(
@@ -118,7 +117,7 @@
     aterm_spec_anchor::spec_unmodeled(
         machine = "LineCustody",
         action = "DialogShows",
-        reason = "A box drawn over the composer (a permission box, a question), no composer drawn (a full-screen view), or the composer's glyph cell unread, while a line is held: the program's or the window's, which the loop or a person answers or closes, never the custody. The Tier-1 bind renders every read from there, the gate's included, as one that cannot say what the composer holds (Shows::stands None: no composer text, the composer's text with its cell unread, or no key count), the line drawn under it or not, and the read's Rest not idle."
+        reason = "A box drawn over the composer (a permission box, a question), no composer drawn (a full-screen view), or the composer's glyph cell unread, while a line is held: the program's or the window's, which the loop or a person answers or closes, never the custody. The Tier-1 bind renders every read from there, the gate's included, as one that cannot say what the composer holds (Shows::stands None: no composer text, the composer's text with its cell unread, or no key count), the line drawn under it or not, and the read's Rest as the shell judges it: no turn's end under a dialog or with no composer drawn, and under the glyph cell unread the turn's end the rest says with its composer never clear (Rest::clear false), so the gate's hold there is the clear read's alone."
     )
 )]
 #[cfg_attr(
@@ -135,14 +134,6 @@
         machine = "LineCustody",
         action = "NextAct",
         reason = "The turn an act submitted ran, and the next point is the policy's to decide: the policy's. The Tier-1 bind changes nothing the custody reads there."
-    )
-)]
-#[cfg_attr(
-    any(test, debug_assertions),
-    aterm_spec_anchor::spec_unmodeled(
-        machine = "LineCustody",
-        action = "RestartDeferred",
-        reason = "The host deferring the restart asked (wait:...): the host's, which Session::restart_later books and asks again on the restart's back-off. The Tier-1 bind books no restart there."
     )
 )]
 #[cfg_attr(
@@ -247,6 +238,22 @@
         machine = "LineCustody",
         action = "AnswersWithoutRead",
         reason = "Buggy=13 negative control only; a dialog's key goes past a line no clear input read proved the worker read, so the still-queued line may reach the dialog before its answer (the Tier-1 bind plants CustodyAnswersWithoutRead in answer_goes)"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "LineCustody",
+        action = "RestartTakenOnWord",
+        reason = "Buggy=14 negative control only; the host's word that it made the restart settles the line and books the restart made though the host names the process the line was written to, so the line that process may still draw is written again (the Tier-1 bind plants CustodyRestartOnWord in Line::restarted)"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "LineCustody",
+        action = "SettleKeepsAsked",
+        reason = "Buggy=15 negative control only; the line held settles with its program while the restart asked for it stands deferred, and the restart is left unspent, so one the host made and answered as a deferral is asked again for the next loss of the line written to the process it started (the Tier-1 bind plants CustodySettleKeepsAsked in Restarts::settled)"
     )
 )]
 #[doc(hidden)]

@@ -379,7 +379,7 @@ fn native_google_worker_recovers_rejected_grant_once_in_new_home() {
 
 #[test]
 fn native_google_worker_renewal_is_not_a_general_failure_retry() {
-    for change in 0..4 {
+    for change in 0..5 {
         let world = World::new(Some([1; 32]));
         let result = recover_google_worker_with(
             &world.seat(),
@@ -389,6 +389,9 @@ fn native_google_worker_renewal_is_not_a_general_failure_retry() {
                     return Err(super::super::google_profile::Error::Refused(
                         "network unavailable",
                     ));
+                }
+                if change == 4 {
+                    return Err(super::super::google_profile::Error::Unavailable);
                 }
                 if change == 1 {
                     std::fs::write(

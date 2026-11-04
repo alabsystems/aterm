@@ -4,10 +4,11 @@
 //! Native GitHub transport using `agh` and [`crate::git_credential`].
 
 use super::{
-    Asked, Github, INPUT_MAX, TokenUnread, asked, decode, get, identity, read_token, repos,
+    Asked, Github, INPUT_MAX, TokenUnread, asked, decode, get, identity, keychain, read_token,
+    repos,
 };
 use crate::engine::Place;
-use crate::git_credential::{GITHUB, Git, Lookups, Standing, VaultStanding};
+use crate::git_credential::{Git, Lookups};
 use crate::init_observe::{LastReading, Reading, Wait};
 use crate::items::{Ctx, Item};
 use crate::model::{ItemReport, Mode, Probe, User};
@@ -67,17 +68,20 @@ fn run_with(
         // What a clone killed mid-way left (design §6.5): never a clone still running.
         repos::sweep_staging(sys, user);
     }
+    // The keychain block goes first, whatever GitHub says below.
+    let keychain = keychain::Keychain::new(user.clone());
     let item = NativeRepositories::new(user.clone(), captured);
+    let place = || Place {
+        layer: Layer::Workstation,
+        class: Class::Install,
+        requires: Requires::Console,
+        remedy: Remedy::Command("aterm init".into()),
+    };
     let bound = crate::engine::bind(
-        [(
-            &item as &dyn Item,
-            Place {
-                layer: Layer::Workstation,
-                class: Class::Install,
-                requires: Requires::Console,
-                remedy: Remedy::Command("aterm init".into()),
-            },
-        )],
+        [
+            (&keychain as &dyn Item, place()),
+            (&item as &dyn Item, place()),
+        ],
         sys,
         ctx,
     );
@@ -104,9 +108,6 @@ struct NativeRepositories {
     /// What the last probe or apply read, for the step after it: the apply reuses the probe's
     /// inventory and verdicts, and the read-back reads again only what the apply cloned.
     carried: Mutex<Option<Carried>>,
-    /// The commands that put back git's GitHub settings, read by the probe before an apply that
-    /// replaces them ([`Standing::revert`]): the engine journals it before the apply runs.
-    revert: Mutex<Option<String>>,
 }
 
 /// What one step read for the next ([`NativeRepositories::carried`]).
@@ -174,33 +175,6 @@ impl InitialRepositoryInputs {
     }
 }
 
-/// How git's github.com lookups stand for the plan's token ([`NativeRepositories::credentials`]).
-struct Credentials {
-    /// git's own helpers already hand back the token for every repository alike
-    /// ([`lookups_answer`]): nothing is written.
-    answered: bool,
-    /// Else how git's settings stand, and whether the login keychain holds the token.
-    standing: Option<(Standing, bool)>,
-}
-
-impl Credentials {
-    /// Clones get the token: git's helpers hand it back, or the keychain holds it and git asks
-    /// the keychain, or git's settings are someone else's and the clones pin the keychain.
-    fn ready(&self) -> bool {
-        self.answered
-            || self.standing.as_ref().is_some_and(|(standing, held)| {
-                *held && (standing.lookups.ready() || standing.foreign.is_some())
-            })
-    }
-
-    /// The setting of someone else's that the run leaves as it is, when there is one.
-    fn foreign(&self) -> Option<&str> {
-        self.standing
-            .as_ref()
-            .and_then(|(standing, _)| standing.foreign.as_deref())
-    }
-}
-
 impl NativeRepositories {
     fn new(user: User, captured: Option<Captured>) -> Self {
         Self {
@@ -210,7 +184,6 @@ impl NativeRepositories {
             after: None,
             unasked: false,
             carried: Mutex::new(None),
-            revert: Mutex::new(None),
         }
     }
 
@@ -226,46 +199,10 @@ impl NativeRepositories {
         *self.carried.lock().unwrap_or_else(PoisonError::into_inner) = Some(carried);
     }
 
-    /// How git's lookups stand for `plan`'s token. The settings and the keychain are read only
-    /// when git's own helpers do not already hand it back, and the keychain only when git asks
-    /// it or leaves someone else's settings.
-    fn credentials(&self, sys: &dyn System, plan: &Plan) -> Result<Credentials, String> {
-        let owners = plan.owners();
-        let git = Git::keychain(sys);
-        match git.vault_standing(sys, &self.user, &plan.account, &owners, &plan.token) {
-            VaultStanding::Ready => {
-                return Ok(Credentials {
-                    answered: true,
-                    standing: None,
-                });
-            }
-            VaultStanding::Convert { revert } => {
-                return Ok(Credentials {
-                    answered: false,
-                    standing: Some((
-                        Standing {
-                            lookups: Lookups::Not(
-                                "git's global file overrides the XDG GitHub credential helper"
-                                    .into(),
-                            ),
-                            foreign: None,
-                            revert: Some(revert),
-                            convert_to_vault: true,
-                        },
-                        false,
-                    )),
-                });
-            }
-            VaultStanding::Absent => {}
-        }
-        let standing =
-            git.standing_for(sys, &self.user, &plan.account, &owners, Some(&plan.token))?;
-        let held = (standing.lookups.ready() || standing.foreign.is_some())
-            && credential_ready(sys, &self.user, &plan.account, &plan.token)?;
-        Ok(Credentials {
-            answered: false,
-            standing: Some((standing, held)),
-        })
+    /// Whether aterm's route hands back `plan`'s token ([`Git::lookups`]).
+    fn lookups(&self, sys: &dyn System, plan: &Plan) -> Result<Lookups, String> {
+        let helper = super::helper(sys, &self.user);
+        Git::new(sys).lookups(sys, &self.user, helper.as_ref(), &plan.token)
     }
 
     /// The reading the probe answers from: the apply's, with what it cloned read back, or a
@@ -305,7 +242,7 @@ impl Item for NativeRepositories {
         self.reading.set(None);
         let check = (|| {
             let (plan, standing) = self.read(sys)?;
-            let credentials = self.credentials(sys, &plan)?;
+            let lookups = self.lookups(sys, &plan)?;
             self.ensure_current().map_err(Block::from)?;
             // Signed in, with no repository left that fits: the row waits for room instead of
             // a pass that would clone nothing.
@@ -315,7 +252,7 @@ impl Item for NativeRepositories {
                 .iter()
                 .filter_map(|repo| repos::no_room(volume.as_ref(), repo))
                 .collect();
-            if credentials.ready()
+            if lookups.ready()
                 && !standing.missing.is_empty()
                 && left.len() == standing.missing.len()
             {
@@ -323,9 +260,9 @@ impl Item for NativeRepositories {
                     repos::short_of_room(volume.as_ref(), &left, CHECK_AGAIN).unwrap_or_default();
                 return Err(Block::of(Wait::DiskSpace)(why));
             }
-            Ok::<_, Block>((plan, standing, credentials))
+            Ok::<_, Block>((plan, standing, lookups))
         })();
-        let (plan, standing, credentials) = match check {
+        let (plan, standing, lookups) = match check {
             Ok(read) => read,
             Err(block) => {
                 // Why it cannot go on, where this probe decided it: System State's note.
@@ -333,34 +270,38 @@ impl Item for NativeRepositories {
                 return block.probe(self.unasked, sys.macos());
             }
         };
-        let ready = credentials.ready();
+        let ready = lookups.ready();
         let (count, missing) = (standing.admissible(), standing.missing.len());
         self.reading.set(Some(Reading::Repositories {
             present: count.saturating_sub(missing),
             count,
             signed_in: ready,
         }));
-        *self.revert.lock().unwrap_or_else(PoisonError::into_inner) = credentials
-            .standing
-            .as_ref()
-            .and_then(|(standing, _)| standing.revert.clone());
         let mut notes = plan.notes.clone();
         notes.extend(standing.notes.iter().cloned());
-        let foreign = credentials.foreign().map(|named| {
-            format!("; git's own GitHub settings left as they are ({named}): clones use the login keychain's credential")
-        });
-        let probe = if missing == 0 && ready {
-            let mut now =
-                format!("{count} matching worktrees present; native GitHub credentials verified");
-            now.push_str(foreign.as_deref().unwrap_or_default());
+        let probe = if let Lookups::Not(why) = &lookups {
+            Probe::Blocked {
+                why: format!(
+                    "{missing} of {count} repositories missing, and aterm's GitHub route does \
+                     not hand back the synced token: {why}; aterm never keeps the token in the \
+                     login keychain"
+                ),
+            }
+        } else if missing == 0 {
+            let mut now = format!(
+                "{count} matching worktrees present; aterm's GitHub route hands back the synced \
+                 token"
+            );
             if let Some(left) = repos::named(&notes) {
                 now.push_str(&format!("; left as they are: {left}"));
             }
             Probe::Ok { now }
         } else {
             Probe::Change {
-                from: format!("{missing} of {count} repositories missing, or native GitHub credentials need setup"),
-                to: "configure native GitHub credentials and clone missing repositories; preserve existing worktrees".into(),
+                from: format!("{missing} of {count} repositories missing"),
+                to: "clone missing repositories through aterm's GitHub route; preserve existing \
+                     worktrees"
+                    .into(),
             }
         };
         self.carry(Carried::Probed(plan, standing));
@@ -386,27 +327,20 @@ impl Item for NativeRepositories {
         };
         let current = || self.ensure_current();
         current()?;
-        let owners = plan.owners();
-        let installed = install_credentials(
-            sys,
-            &self.user,
-            &plan.account,
-            &owners,
-            &plan.token,
-            &current,
-        )?;
-        let unchecked = || Ok::<(), String>(());
-        let guard = match (installed, self.captured.is_some()) {
-            (Install::Vault, true) => Some(repos::CloneGuard::current_only(&current)),
-            (Install::Vault, false) => None,
-            (Install::Keychain { .. }, true) => {
-                Some(repos::CloneGuard::pinned(&plan.account, &current))
-            }
-            (Install::Keychain { pin: true }, false) => {
-                Some(repos::CloneGuard::pinned(&plan.account, &unchecked))
-            }
-            (Install::Keychain { pin: false }, false) => None,
-        };
+        if standing.missing.is_empty() {
+            self.carry(Carried::Applied(plan, standing, Vec::new()));
+            return Ok(());
+        }
+        if let Lookups::Not(why) = self.lookups(sys, &plan)? {
+            return Err(format!(
+                "aterm's GitHub route does not hand back the synced token: {why}; no repository \
+                 was cloned"
+            ));
+        }
+        let guard = self
+            .captured
+            .is_some()
+            .then(|| repos::CloneGuard::new(&current));
         let cloned = repos::clone_all(sys, &self.user, &standing.missing, guard.as_ref());
         current()?;
         let home = Path::new(&self.user.home);
@@ -426,46 +360,17 @@ impl Item for NativeRepositories {
         }
     }
 
-    fn revert(&self) -> Option<String> {
-        self.revert
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-            .map(|settings| {
-                format!(
-                    "{settings} (puts back git's GitHub settings; the login keychain's github.com \
-                     credential and the cloned repositories stay)"
-                )
-            })
-    }
-
     fn detail(&self, _sys: &dyn System, _ctx: &Ctx) -> Option<String> {
         self.reading.detail()
     }
 }
 
 struct Plan {
-    account: String,
     token: Arc<Secret>,
     repositories: Vec<repos::Repo>,
     /// The listed repositories left out because another takes their folder
     /// ([`repos::Inventory::notes`]).
     notes: Vec<String>,
-}
-
-impl Plan {
-    fn owners(&self) -> Vec<&str> {
-        let mut out = vec![self.account.as_str()];
-        for repo in &self.repositories {
-            if !out
-                .iter()
-                .any(|seen| seen.eq_ignore_ascii_case(&repo.owner))
-            {
-                out.push(repo.owner.as_str());
-            }
-        }
-        out
-    }
 }
 
 /// Why [`NativeRepositories::plan`] cannot go on: the engine's line, and the reason System
@@ -627,7 +532,6 @@ impl NativeRepositories {
         }
         self.ensure_current().map_err(Block::from)?;
         Ok(Plan {
-            account,
             token,
             repositories: listed.repositories,
             notes: listed.notes,
@@ -662,110 +566,10 @@ fn configuration(sys: &dyn System, user: &User) -> Result<Option<Github>, String
     Ok(configured)
 }
 
-/// Whether the login keychain holds exactly `token` for `account` at github.com.
-fn credential_ready(
-    sys: &dyn System,
-    user: &User,
-    account: &str,
-    token: &Secret,
-) -> Result<bool, String> {
-    Ok(Git::keychain(sys)
-        .fill(sys, Some(user), GITHUB, account)?
-        .is_some_and(|stored| stored.bytes() == token.bytes()))
-}
-
-/// Whether git's own non-keychain github.com lookups, through the helpers `user`'s configuration
-/// names and asked as a clone asks, already hand back `token` for `account` and `owners` alike.
-pub(super) fn lookups_answer_for(
-    sys: &dyn System,
-    user: &User,
-    account: &str,
-    owners: &[&str],
-    token: &Secret,
-) -> bool {
-    let git = Git::keychain(sys);
-    git.fill_as_configured(sys, Some(user), GITHUB)
-        .is_ok_and(|answer| answer.is_some_and(|got| got.bytes() == token.bytes()))
-        && git
-            .uniform_for(sys, user, account, owners)
-            .is_ok_and(|lookups| lookups.ready())
-}
-
-enum Install {
-    /// git's own non-keychain (vault / XDG) helper answers the token: neither write nor pin the
-    /// keychain.
-    Vault,
-    /// Clones use the keychain helper (`pin` when someone else's git settings stay in place).
-    Keychain { pin: bool },
-}
-
-pub(super) fn unconfigure_to_vault(
-    git: &Git,
-    sys: &dyn System,
-    user: &User,
-    account: &str,
-    owners: &[&str],
-    token: &Secret,
-    current: &dyn Fn() -> Result<(), String>,
-) -> Result<(), String> {
-    current()?;
-    git.unconfigure(sys, user)?;
-    if !lookups_answer_for(sys, user, account, owners, token) {
-        return Err(
-            "git's XDG GitHub credential helper did not answer after removing the global override"
-                .into(),
-        );
-    }
-    Ok(())
-}
-
-/// Accept git's non-keychain (vault / XDG) helper when it already answers `token`, convert a
-/// keychain-path `~/.gitconfig` written by an earlier pass back to that XDG helper without
-/// writing the keychain, or fall back to storing `token` in the login keychain.
-fn install_credentials(
-    sys: &dyn System,
-    user: &User,
-    account: &str,
-    owners: &[&str],
-    token: &Secret,
-    current: &dyn Fn() -> Result<(), String>,
-) -> Result<Install, String> {
-    let git = Git::keychain(sys);
-    match git.vault_standing(sys, user, account, owners, token) {
-        VaultStanding::Ready => return Ok(Install::Vault),
-        VaultStanding::Convert { .. } => {
-            unconfigure_to_vault(&git, sys, user, account, owners, token, current)?;
-            return Ok(Install::Vault);
-        }
-        VaultStanding::Absent => {}
-    }
-    let standing = git.standing_for(sys, user, account, owners, Some(token))?;
-    if standing.convert_to_vault {
-        unconfigure_to_vault(&git, sys, user, account, owners, token, current)?;
-        return Ok(Install::Vault);
-    }
-    if !credential_ready(sys, user, account, token)? {
-        current()?;
-        git.store(sys, Some(user), GITHUB, account, token)?;
-    }
-    if standing.foreign.is_some() {
-        return Ok(Install::Keychain { pin: true });
-    }
-    if !standing.lookups.ready() {
-        current()?;
-        git.configure(sys, user, account)?;
-        if let Lookups::Not(why) = git.configured(sys, user, account)? {
-            return Err(format!(
-                "native GitHub credentials did not read back after setup: {why}"
-            ));
-        }
-    }
-    Ok(Install::Keychain { pin: false })
-}
-
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+    use crate::git_credential::GITHUB;
     use crate::git_credential::script;
     use crate::items::defaults::tests::user;
     use crate::port::{Fake, GithubResponse, Ran, Stat};
@@ -786,6 +590,7 @@ pub(super) mod tests {
     fn fixture() -> (Fake, NativeRepositories) {
         let (sys, item) = bare();
         sys.file(crate::items::github::CLT_GIT, b"synthetic git");
+        script::launcher(&sys, &item.user);
         source(&sys, "/Users//alice/.secrets/gh_access_token");
         answer(
             &sys,
@@ -811,7 +616,7 @@ pub(super) mod tests {
     }
 
     /// `user`'s account on `sys` listing one repository of hers, `name`, already a worktree in
-    /// `~`, with her synced token and git's helpers holding it, and the git `sys` runs (the
+    /// `~`, with her synced token and aterm's route handing it back, and the git `sys` runs (the
     /// distribution's on Linux): the stage init runs with no init.toml, converged.
     pub(in crate::init_github) fn converged(sys: &Fake, user: &User, name: &str) {
         let git = if sys.macos() {
@@ -820,6 +625,7 @@ pub(super) mod tests {
             crate::items::github::SYSTEM_GIT
         };
         sys.file(git, b"synthetic git");
+        script::launcher(sys, user);
         sys.stat_of(&user.home, stat(true, 0o700));
         let home = Path::new(&user.home);
         source(
@@ -862,9 +668,9 @@ pub(super) mod tests {
             aterm_json::json!([]),
         );
         let rows = run_captured(&sys, &ctx, Mode::Plan, captured, Box::new(|| Ok(true))).unwrap();
-        assert_eq!(Reading::of(&rows[0]), Some(Reading::Waits(Wait::Token)));
+        assert_eq!(Reading::of(stage(&rows)), Some(Reading::Waits(Wait::Token)));
         // The vault this Mac reads holds no GitHub token: only a person puts one there.
-        assert_eq!(rows[0].outcome, crate::model::Outcome::Person);
+        assert_eq!(stage(&rows).outcome, crate::model::Outcome::Person);
         assert!(!sys.calls().iter().any(|call| call.contains(" agh GET ")));
     }
 
@@ -897,7 +703,6 @@ pub(super) mod tests {
             ]),
         );
         let plan = item.plan(&sys).unwrap();
-        assert_eq!(plan.account, "alice");
         assert_eq!(
             plan.repositories
                 .iter()
@@ -938,12 +743,13 @@ pub(super) mod tests {
         script::alike(&sys, &item.user);
         let context = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
         let rows = run(&sys, &context, Mode::Apply).unwrap();
-        assert_eq!(rows[0].outcome, crate::model::Outcome::Ok, "{rows:?}");
+        assert_eq!(stage(&rows).outcome, crate::model::Outcome::Ok, "{rows:?}");
         assert_eq!(
-            rows[0].to.as_deref(),
+            stage(&rows).to.as_deref(),
             Some(
-                "1 matching worktrees present; native GitHub credentials verified; left as they \
-                 are: github.com/team/Shared: ~/shared is github.com/alice/shared's; not cloned"
+                "1 matching worktrees present; aterm's GitHub route hands back the synced \
+                 token; left as they are: github.com/team/Shared: ~/shared is \
+                 github.com/alice/shared's; not cloned"
             )
         );
         assert!(sys.calls().iter().all(|call| !call.contains(" clone ")
@@ -1197,16 +1003,16 @@ pub(super) mod tests {
             } else {
                 (crate::model::Outcome::Blocked, Standing::Waiting)
             };
-            assert_eq!(rows[0].outcome, outcome, "{case}");
+            assert_eq!(stage(&rows).outcome, outcome, "{case}");
             assert_eq!(
-                Reading::of(&rows[0]),
+                Reading::of(stage(&rows)),
                 wait.map(Reading::Waits),
                 "{case}: {rows:?}"
             );
-            let seen = observation(Setting::Repositories, &[&rows[0]]);
+            let seen = observation(Setting::Repositories, &[stage(&rows)]);
             assert_eq!(seen.standing, standing, "{case}");
             assert_eq!(seen.note.as_deref(), wait.map(Wait::note), "{case}");
-            let line = rows[0].why.as_deref().unwrap();
+            let line = stage(&rows).why.as_deref().unwrap();
             assert!(
                 seen.note.as_deref().is_none_or(|note| !note.contains(line)),
                 "{case}"
@@ -1231,48 +1037,131 @@ pub(super) mod tests {
         );
     }
 
-    /// git's github.com settings unset, then as `configure` leaves them.
-    fn credential_commands(sys: &Fake, user: &User, keychain: &str) {
-        script::unconfigured(sys, user);
-        script::configured(sys, user, "alice");
-        script::configure(sys, user, "alice");
-        script::holds_nothing(sys, Some(user));
-        script::holds(sys, Some(user), GITHUB, "alice", keychain);
-        script::approves(sys, Some(user));
+    /// git's settings with the keychain block an earlier `aterm init` wrote, for the keychain
+    /// row's probe and apply, then the vault's alone, and the block's replacement answering. The
+    /// writes, in the order they run.
+    fn keychain_block_then_vault(sys: &Fake, user: &User) -> Vec<String> {
+        script::keychain_block(sys, user, "alice");
+        script::keychain_block(sys, user, "alice");
+        script::alike(sys, user);
+        script::replaces_keychain_block(sys, user)
     }
 
-    #[test]
-    fn native_keychain_configuration_is_verified_and_secret_never_enters_command_records() {
-        let (sys, item) = fixture();
-        answer(
-            &sys,
-            &item.user,
-            &format!("{ACCESSIBLE}&page=1"),
-            aterm_json::json!([]),
-        );
-        credential_commands(&sys, &item.user, TOKEN);
-        let context = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
-        item.apply(&sys, &context).unwrap();
-        let calls = sys.calls();
-        let approve = script::credential(Some(&item.user), "approve");
-        let at = |key: &str| calls.iter().position(|call| call == key);
-        assert!(at(&approve).is_some(), "{calls:?}");
-        let writes = script::configure(&sys, &item.user, "alice");
-        assert!(at(&approve) < at(&writes[0]), "{calls:?}");
-        assert_eq!(
-            calls
-                .iter()
-                .filter(|call| **call == script::helpers(&item.user))
-                .count(),
-            2,
-            "{calls:?}"
-        );
-        assert!(calls.iter().all(|call| !call.contains(TOKEN)
-            && !call.contains("/gh ")
-            && !call.contains("credential-osxkeychain")
-            && !call.contains("auth login")));
-        assert!(sys.fed().is_empty());
+    /// The stage's own row: the keychain row comes before it ([`run_with`]).
+    fn stage(rows: &[crate::model::ItemReport]) -> &crate::model::ItemReport {
+        rows.last().expect("the stage's row")
+    }
 
+    /// `[github] enabled = false` holds on this entry point too, which System State reaches with
+    /// no look at init.toml: the block stays, and nothing writes to git's settings. An init.toml
+    /// that cannot be admitted says nothing either way, so the row cannot read and writes nothing.
+    #[test]
+    fn the_off_switch_keeps_the_keychain_block_on_the_stages_own_run() {
+        for (profile, off) in [
+            ("[github]\nenabled = false\n", true),
+            ("[github]\nowner = \"alice\"\n", false),
+        ] {
+            let (sys, item) = fixture();
+            answer(
+                &sys,
+                &item.user,
+                &format!("{ACCESSIBLE}&page=1"),
+                aterm_json::json!([]),
+            );
+            keychain_block_then_vault(&sys, &item.user);
+            sys.write_user_file(
+                &item.user,
+                &Path::new(&item.user.home).join(".config/aterm/init.toml"),
+                profile.as_bytes(),
+                0o600,
+            )
+            .unwrap();
+            let context = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
+            let rows = run(&sys, &context, Mode::Apply);
+            let calls = sys.calls();
+            assert!(
+                calls
+                    .iter()
+                    .all(|call| !call.contains("--unset-all") && !call.contains(" --add ")),
+                "{profile}: {calls:?}"
+            );
+            if off {
+                let rows = rows.unwrap();
+                assert_eq!(
+                    rows[0].outcome,
+                    crate::model::Outcome::NotApplicable,
+                    "{rows:?}"
+                );
+            }
+        }
+    }
+
+    /// The keychain block an earlier `aterm init` wrote gives way before anything of the stage
+    /// runs, and whatever becomes of the stage: with no token on the Mac, and with GitHub out of
+    /// reach. The login keychain is never asked, nothing is approved into it, and the token
+    /// enters no command record.
+    #[test]
+    fn the_keychain_block_gives_way_first_whatever_the_token_or_github_say() {
+        type Setup = fn() -> (Fake, NativeRepositories);
+        let cases: [(&str, Setup); 2] = [
+            ("no token", || {
+                let (sys, item) = bare();
+                sys.file(crate::items::github::CLT_GIT, b"synthetic git");
+                script::launcher(&sys, &item.user);
+                (sys, item)
+            }),
+            ("GitHub out of reach", || {
+                let (sys, item) = fixture();
+                sys.fail_github_api(
+                    &item.user,
+                    &format!("{ACCESSIBLE}&page=1"),
+                    crate::port::GithubFailure::Unreached,
+                );
+                (sys, item)
+            }),
+        ];
+        for (label, setup) in cases {
+            let (sys, item) = setup();
+            let writes = keychain_block_then_vault(&sys, &item.user);
+            let context = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
+            let rows = run(&sys, &context, Mode::Apply).unwrap();
+            assert_eq!(
+                rows[0].outcome,
+                crate::model::Outcome::Changed,
+                "{label}: {rows:?}"
+            );
+            assert_ne!(
+                stage(&rows).outcome,
+                crate::model::Outcome::Changed,
+                "{label}"
+            );
+            let calls = sys.calls();
+            let at = |key: &str| calls.iter().position(|call| call == key);
+            for write in &writes {
+                assert!(at(write).is_some(), "{label}: {calls:?}");
+            }
+            if let Some(asked) = calls.iter().position(|call| call.contains("agh GET")) {
+                assert!(at(&writes[writes.len() - 1]) < Some(asked), "{calls:?}");
+            }
+            assert!(
+                calls.iter().all(|call| !call.contains(TOKEN)
+                    && !call.contains("/gh ")
+                    && !call.contains("credential fill")
+                    && !call.contains("credential approve")
+                    && !call.contains("credential-osxkeychain")
+                    && !call.contains("--replace-all")
+                    && !call.contains("auth login")),
+                "{label}: {calls:?}"
+            );
+            assert!(sys.fed().is_empty(), "{label}");
+        }
+    }
+
+    /// aterm's route answers past a keychain helper it did not write (CLT's own, with no vault
+    /// reset): the stage needs nothing of the person's git settings, which stay as they are.
+    #[test]
+    fn a_keychain_helper_aterm_did_not_write_neither_stops_the_stage_nor_is_asked() {
+        let context = crate::items::defaults::tests::ctx(&[user("alice", 501)]);
         let (sys, item) = fixture();
         answer(
             &sys,
@@ -1280,15 +1169,19 @@ pub(super) mod tests {
             &format!("{ACCESSIBLE}&page=1"),
             aterm_json::json!([]),
         );
-        script::configured(&sys, &item.user, "alice");
-        script::holds(&sys, Some(&item.user), GITHUB, "alice", TOKEN);
-        item.apply(&sys, &context).unwrap();
+        script::unconfigured(&sys, &item.user);
+        script::lookups_hold(&sys, &item.user, GITHUB, "alice", TOKEN);
+        let rows = run(&sys, &context, Mode::Apply).unwrap();
+        assert_eq!(rows[0].outcome, crate::model::Outcome::NotApplicable);
+        assert_eq!(stage(&rows).outcome, crate::model::Outcome::Ok, "{rows:?}");
+        let calls = sys.calls();
         assert!(
-            sys.calls()
-                .iter()
-                .all(|call| !call.contains("credential approve") && !call.contains("--global")),
-            "{:?}",
-            sys.calls()
+            calls.iter().all(|call| !call.contains("--unset-all")
+                && !call.contains("--add")
+                && !call.contains("credential approve")
+                && !call.contains("--global")
+                && !call.contains("osxkeychain")),
+            "{calls:?}"
         );
     }
 
@@ -1313,11 +1206,14 @@ pub(super) mod tests {
                 &format!("{ACCESSIBLE}&page=1"),
                 aterm_json::json!([]),
             );
-            credential_commands(&sys, &item.user, TOKEN);
+            keychain_block_then_vault(&sys, &item.user);
             let context = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
             let rows = run(&sys, &context, mode).unwrap();
             let want = if mode == Mode::Apply {
-                (crate::model::Outcome::Changed, vec![item.id()])
+                (
+                    crate::model::Outcome::Changed,
+                    vec![format!("init.github.keychain@{}", item.user.name)],
+                )
             } else {
                 (crate::model::Outcome::Planned, Vec::new())
             };
@@ -1329,13 +1225,26 @@ pub(super) mod tests {
         }
     }
 
-    /// Lookups that already answer the synced token alike for every repository are kept: nothing
-    /// goes into the keychain and git's settings are not rewritten. Ones that answer another
-    /// token, or that some repositories' settings could answer otherwise, still get the keychain.
+    /// aterm's route is read, never rewritten: one that hands back the synced token is ready,
+    /// and one that hands back another, or none, stops the row, which says why, with nothing
+    /// written and every worktree in place: no stage is done while a clone would fail. Nothing
+    /// goes into the keychain or rewrites git's settings.
     #[test]
-    fn lookups_that_already_answer_the_synced_token_are_kept_as_they_are() {
+    fn lookups_are_read_and_never_rewritten() {
         let context = |item: &NativeRepositories| {
             crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user))
+        };
+        let unwritten = |sys: &Fake| {
+            assert!(
+                sys.calls()
+                    .iter()
+                    .all(|call| !call.contains("credential approve")
+                        && !call.contains("--global")
+                        && !call.contains("--unset-all")
+                        && !call.contains("--replace-all")),
+                "{:?}",
+                sys.calls()
+            );
         };
         let (sys, item) = fixture();
         answer(
@@ -1345,55 +1254,38 @@ pub(super) mod tests {
             aterm_json::json!([]),
         );
         script::lookups_hold(&sys, &item.user, GITHUB, "alice", TOKEN);
-        script::alike(&sys, &item.user);
-        assert!(
-            matches!(item.probe(&sys, &context(&item)), Probe::Ok { .. }),
-            "{:?}",
-            sys.calls()
-        );
+        match item.probe(&sys, &context(&item)) {
+            Probe::Ok { now } => assert!(now.contains("hands back the synced token"), "{now}"),
+            other => panic!("{other:?}"),
+        }
         item.apply(&sys, &context(&item)).unwrap();
-        assert!(
-            sys.calls()
-                .iter()
-                .all(|call| !call.contains("credential approve") && !call.contains("--global")),
-            "{:?}",
-            sys.calls()
-        );
+        unwritten(&sys);
 
-        let (sys, item) = fixture();
-        answer(
-            &sys,
-            &item.user,
-            &format!("{ACCESSIBLE}&page=1"),
-            aterm_json::json!([]),
-        );
-        script::lookups_hold(&sys, &item.user, GITHUB, "alice", TOKEN);
-        let owners = format!("{}/.gitconfig", item.user.home);
-        sys.on(
-            &script::helpers(&item.user),
-            Ran::ok(&script::printed(&[(
-                &owners,
-                "credential.https://github.com/alice.helper",
-                "store",
-            )])),
-        );
-        credential_commands(&sys, &item.user, TOKEN);
-        item.apply(&sys, &context(&item)).unwrap();
-        let approve = script::credential(Some(&item.user), "approve");
-        assert!(sys.calls().contains(&approve), "{:?}", sys.calls());
-
-        let (sys, item) = fixture();
-        answer(
-            &sys,
-            &item.user,
-            &format!("{ACCESSIBLE}&page=1"),
-            aterm_json::json!([]),
-        );
-        script::lookups_hold(&sys, &item.user, GITHUB, "alice", "a_rotated_out_value");
-        credential_commands(&sys, &item.user, TOKEN);
-        item.apply(&sys, &context(&item)).unwrap();
-        let approve = script::credential(Some(&item.user), "approve");
-        assert!(sys.calls().contains(&approve), "{:?}", sys.calls());
+        // Lookups that hand back a token the vault rotated out, and ones that hand back none.
+        for (held, said) in [
+            (Some("a_rotated_out_value"), "another credential"),
+            (None, "hands back no token"),
+        ] {
+            let (sys, item) = fixture();
+            answer(
+                &sys,
+                &item.user,
+                &format!("{ACCESSIBLE}&page=1"),
+                aterm_json::json!([]),
+            );
+            match held {
+                Some(held) => script::lookups_hold(&sys, &item.user, GITHUB, "alice", held),
+                None => script::lookups_hold_nothing(&sys, &item.user),
+            }
+            match item.probe(&sys, &context(&item)) {
+                Probe::Blocked { why } => {
+                    assert!(why.contains(said), "{why}");
+                    assert!(!why.contains("a_rotated_out_value"), "{why}");
+                }
+                other => panic!("{other:?}"),
+            }
+            unwritten(&sys);
+        }
     }
 
     const GIB: u64 = aterm_capacity::floor::GIB;
@@ -1418,23 +1310,12 @@ pub(super) mod tests {
     }
 
     /// The first-launch inventory leaves a repository the disk has no room for above the disk
-    /// watch's floor and names it; with no reading of the volume it tries the clone. Before
-    /// the sign-in is set up, the plan still changes, so the credentials are set up.
+    /// watch's floor and names it; with no reading of the volume it tries the clone.
     #[test]
     fn a_repository_the_disk_has_no_room_for_is_not_cloned() {
-        let (mut sys, item) = fixture();
-        sys.volume = Some(volume(12 * GIB));
-        answer(&sys, &item.user, &format!("{ACCESSIBLE}&page=1"), huge());
-        credential_commands(&sys, &item.user, TOKEN);
-        let context = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
-        assert!(
-            matches!(item.probe(&sys, &context), Probe::Change { .. }),
-            "{:?}",
-            sys.calls()
-        );
-
         // One that fits beside one that does not: the plan changes, so the one that fits arrives.
         let (mut sys, item) = fixture();
+        let context = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
         sys.volume = Some(volume(12 * GIB));
         let mut both = huge();
         both.as_array_mut()
@@ -1516,18 +1397,19 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn native_keychain_readback_failure_stops_before_any_clone_and_withholds_output() {
+    fn lookups_that_hand_back_another_token_stop_before_any_clone_and_withhold_output() {
         let (sys, item) = fixture();
         answer(
             &sys,
             &item.user,
             &format!("{ACCESSIBLE}&page=1"),
-            aterm_json::json!([]),
+            aterm_json::json!([repository("alice", "new", 1)]),
         );
-        credential_commands(&sys, &item.user, "unrelated_private_value");
+        script::alike(&sys, &item.user);
+        script::lookups_hold(&sys, &item.user, GITHUB, "alice", "unrelated_private_value");
         let context = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
         let why = item.apply(&sys, &context).unwrap_err();
-        assert!(why.contains("did not hand back"), "{why}");
+        assert!(why.contains("does not hand back the synced token"), "{why}");
         assert!(!why.contains("unrelated_private_value") && !why.contains(TOKEN));
         assert!(!sys.calls().iter().any(|call| call.contains(" clone ")));
     }
@@ -1624,9 +1506,9 @@ pub(super) mod tests {
         );
     }
 
+    /// A captured run's clones go through aterm's route and never write the login keychain.
     #[test]
-    fn captured_clones_store_the_snapshot_through_private_keychain_input_only() {
-        // Vault helper answers: captured clones never write to the login keychain.
+    fn captured_clones_never_write_the_login_keychain() {
         let (sys, mut item) = fixture();
         let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
         let inputs = InitialRepositoryInputs::capture(&sys, &ctx).unwrap();
@@ -1637,49 +1519,26 @@ pub(super) mod tests {
             aterm_json::json!([repository("alice", "new", 1)]),
         );
         script::lookups_hold(&sys, &item.user, GITHUB, "alice", TOKEN);
-        script::alike(&sys, &item.user);
         item.captured = Some(Captured {
             inputs,
             current: Box::new(|| Ok(true)),
         });
+        // The clone itself is not scripted: it stops at its first git run.
         assert!(item.apply(&sys, &ctx).is_err());
-        let approve = script::credential(Some(&item.user), "approve");
+        let calls = sys.calls();
         assert!(
-            !sys.calls().contains(&approve),
-            "vault helper path must not write to osxkeychain: {:?}",
-            sys.calls()
-        );
-        assert!(sys.calls().iter().all(|call| !call.contains(TOKEN)
-            && !call.contains("--global")
-            && !call.contains(" clone ")));
-
-        // Keychain path (no vault helper): captured clones store the snapshot through private
-        // `credential approve` input only.
-        let (sys, mut item) = fixture();
-        let inputs = InitialRepositoryInputs::capture(&sys, &ctx).unwrap();
-        answer(
-            &sys,
-            &item.user,
-            &format!("{ACCESSIBLE}&page=1"),
-            aterm_json::json!([repository("alice", "new", 1)]),
-        );
-        credential_commands(&sys, &item.user, TOKEN);
-        item.captured = Some(Captured {
-            inputs,
-            current: Box::new(|| Ok(true)),
-        });
-        assert!(item.apply(&sys, &ctx).is_err());
-        assert!(sys.calls().contains(&approve), "{:?}", sys.calls());
-        assert!(
-            sys.calls()
-                .iter()
-                .all(|call| !call.contains(TOKEN) && !call.contains(" clone "))
+            calls.iter().all(|call| !call.contains("credential approve")
+                && !call.contains("osxkeychain")
+                && !call.contains(TOKEN)
+                && !call.contains("--global")
+                && !call.contains(" clone ")),
+            "{calls:?}"
         );
     }
 
     /// A Mac whose GitHub account lists `listed` (each alice's, sized `0`, in GitHub's order),
     /// of which `present` are already worktrees in `~` and every other one is scripted to clone
-    /// into the staging directories a pass makes in list order; git's own helpers hand back the
+    /// into the staging directories a pass makes in list order; aterm's route hands back the
     /// synced token.
     fn listing(listed: &[String], present: &[String]) -> (Fake, NativeRepositories) {
         listing_with(listed, present, &[])
@@ -1742,7 +1601,7 @@ pub(super) mod tests {
                 .iter()
                 .any(|folder| folder.eq_ignore_ascii_case(name))
             {
-                script_clone_named(&sys, &item.user, name, sequence, false, None);
+                script_clone_named(&sys, &item.user, name, sequence, false);
                 sequence += 1;
             }
             script_existing(&sys, &item.user, &path, name);
@@ -1777,10 +1636,14 @@ pub(super) mod tests {
         let (sys, item) = listing(&listed, &present);
         let context = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
         let rows = run(&sys, &context, Mode::Apply).unwrap();
-        assert_eq!(rows[0].outcome, crate::model::Outcome::Changed, "{rows:?}");
         assert_eq!(
-            rows[0].to.as_deref(),
-            Some("60 matching worktrees present; native GitHub credentials verified")
+            stage(&rows).outcome,
+            crate::model::Outcome::Changed,
+            "{rows:?}"
+        );
+        assert_eq!(
+            stage(&rows).to.as_deref(),
+            Some("60 matching worktrees present; aterm's GitHub route hands back the synced token")
         );
         let calls = sys.calls();
         let count = |what: &str| calls.iter().filter(|call| call.ends_with(what)).count();
@@ -1883,8 +1746,12 @@ pub(super) mod tests {
         });
         let context = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
         let rows = run(&sys, &context, Mode::Apply).unwrap();
-        assert_eq!(rows[0].outcome, crate::model::Outcome::Failed, "{rows:?}");
-        let why = rows[0].why.as_deref().unwrap_or_default();
+        assert_eq!(
+            stage(&rows).outcome,
+            crate::model::Outcome::Failed,
+            "{rows:?}"
+        );
+        let why = stage(&rows).why.as_deref().unwrap_or_default();
         assert!(why.contains("1 of 1 repositories missing"), "{why}");
         assert!(
             sys.calls()
@@ -1905,13 +1772,17 @@ pub(super) mod tests {
         let home = Path::new(&item.user.home);
         let context = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
         let rows = run(&sys, &context, Mode::Apply).unwrap();
-        assert_eq!(rows[0].outcome, crate::model::Outcome::Changed, "{rows:?}");
         assert_eq!(
-            rows[0].to.as_deref(),
+            stage(&rows).outcome,
+            crate::model::Outcome::Changed,
+            "{rows:?}"
+        );
+        assert_eq!(
+            stage(&rows).to.as_deref(),
             Some(
-                "1 matching worktrees present; native GitHub credentials verified; left as they \
-                 are: ~/Documents is a standard home folder; left untouched; ~/infra has a \
-                 different or credential-bearing GitHub origin; left untouched"
+                "1 matching worktrees present; aterm's GitHub route hands back the synced \
+                 token; left as they are: ~/Documents is a standard home folder; left untouched; \
+                 ~/infra has a different or credential-bearing GitHub origin; left untouched"
             )
         );
         assert!(sys.stat(&home.join("new")).is_ok());
@@ -2026,12 +1897,12 @@ pub(super) mod tests {
         assert_eq!(names(&item, &sys), ["fork", "kept", "old"]);
     }
 
-    /// git's GitHub settings are replaced only once the engine journaled the line that puts the
-    /// global file's old ones back (before any `--replace-all`). A helper of someone else's that
-    /// git already uses (`gh`'s, here) stays as it is, the row says so, and the clones pin the
-    /// keychain's credential on their own command line.
+    /// The keychain block is replaced only once the engine journaled the commands that put it
+    /// back, the settings exactly as they were written. A helper of someone else's that git
+    /// already uses (git's `store`, here, which reads no keychain) stays as it is, and the clones
+    /// carry aterm's route past it, with the person's own URL rewrite (the control).
     #[test]
-    fn git_settings_are_journaled_before_they_are_replaced_and_someone_elses_helper_stays() {
+    fn the_keychain_block_is_journaled_before_it_is_replaced_and_someone_elses_helper_stays() {
         let journaled = |sys: &Fake| -> Vec<aterm_json::Value> {
             sys.written(Fake::JOURNAL)
                 .map(|bytes| String::from_utf8(bytes).unwrap())
@@ -2047,38 +1918,41 @@ pub(super) mod tests {
             &format!("{ACCESSIBLE}&page=1"),
             aterm_json::json!([]),
         );
-        let global = script::global(&item.user);
-        sys.on(
-            &global,
-            Ran::ok("credential.https://github.com.username\nold-login\0"),
-        );
-        // The probe's reading, then the apply's own before and after it configures.
-        script::unconfigured(&sys, &item.user);
-        credential_commands(&sys, &item.user, TOKEN);
+        let writes = keychain_block_then_vault(&sys, &item.user);
+        script::lookups_hold(&sys, &item.user, GITHUB, "alice", TOKEN);
+        let first = writes[0].clone();
+        sys.simulate(move |fake, cmd| {
+            if cmd.display() == first {
+                assert!(
+                    fake.written(Fake::JOURNAL)
+                        .is_some_and(|bytes| String::from_utf8_lossy(&bytes).contains("--add")),
+                    "the block was replaced before its revert was journaled"
+                );
+            }
+            None
+        });
         let context = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
         let rows = run(&sys, &context, Mode::Apply).unwrap();
         assert_eq!(rows[0].outcome, crate::model::Outcome::Changed, "{rows:?}");
         let lines = journaled(&sys);
         let revert = lines[0]["revert"].as_str().unwrap();
         assert!(
-            revert.starts_with(
-                "git config --global --unset-all credential.https://github.com.helper; git \
-                 config --global --unset-all credential.https://github.com.username; git config \
-                 --global --add credential.https://github.com.username old-login; git config \
-                 --global --unset-all credential.https://github.com.useHttpPath"
+            revert.contains(
+                "git config --file /Users//alice/.gitconfig --add \
+                 credential.https://github.com.helper ''; git config --file \
+                 /Users//alice/.gitconfig --add credential.https://github.com.helper osxkeychain; \
+                 git config --file /Users//alice/.gitconfig --add \
+                 credential.https://github.com.username alice; git config --file \
+                 /Users//alice/.gitconfig --add credential.https://github.com.usehttppath false \
+                 (puts back"
             ),
             "{revert}"
         );
-        let calls = sys.calls();
-        let read = calls.iter().position(|call| *call == global).unwrap();
-        let replaced = calls
-            .iter()
-            .position(|call| call.contains("--replace-all"))
-            .unwrap();
-        assert!(read < replaced, "{calls:?}");
+        assert!(writes.iter().all(|write| sys.calls().contains(write)));
 
-        // Control: gh's helper for github.com is someone else's. The one missing repository
-        // clones with the keychain's credential pinned on its own command line.
+        // Control: a helper of the person's own for github.com (git's `store`, no keychain) is
+        // someone else's. The one missing repository clones through aterm's route, an SSH
+        // rewrite of the person's included.
         for rewritten in [false, true] {
             let (sys, item) = fixture();
             answer(
@@ -2087,16 +1961,8 @@ pub(super) mod tests {
                 &format!("{ACCESSIBLE}&page=1"),
                 aterm_json::json!([repository("alice", "new", 1)]),
             );
-            let unchecked = || Ok::<(), String>(());
-            let pinned = repos::CloneGuard::pinned("alice", &unchecked);
             super::repos::tests::script_clone_named_route(
-                &sys,
-                &item.user,
-                "new",
-                0,
-                false,
-                Some(&pinned),
-                rewritten,
+                &sys, &item.user, "new", 0, false, rewritten,
             );
             super::repos::tests::script_existing(
                 &sys,
@@ -2110,110 +1976,36 @@ pub(super) mod tests {
                 Ran::ok(&script::printed(&[
                     (script::CLT_CONFIG, "credential.helper", "osxkeychain"),
                     ("/Users//alice/.gitconfig", helper, ""),
-                    (
-                        "/Users//alice/.gitconfig",
-                        helper,
-                        "!/opt/homebrew/bin/gh auth git-credential",
-                    ),
+                    ("/Users//alice/.gitconfig", helper, "store"),
                 ])),
             );
-            script::holds(&sys, Some(&item.user), GITHUB, "alice", TOKEN);
+            script::lookups_hold(&sys, &item.user, GITHUB, "alice", TOKEN);
             let rows = run(&sys, &context, Mode::Apply).unwrap();
-            assert_eq!(rows[0].outcome, crate::model::Outcome::Changed, "{rows:?}");
-            let now = rows[0].to.as_deref().unwrap();
+            assert_eq!(rows[0].outcome, crate::model::Outcome::NotApplicable);
+            assert_eq!(
+                stage(&rows).outcome,
+                crate::model::Outcome::Changed,
+                "{rows:?}"
+            );
+            let now = stage(&rows).to.as_deref().unwrap();
+            assert!(now.contains("hands back the synced token"), "{now}");
+            assert!(!now.contains("store"), "{now}");
+            let calls = sys.calls();
             assert!(
-            now.contains(
-                "git's own GitHub settings left as they are (credential.https://github.com.helper \
-                 in /Users//alice/.gitconfig)"
-            ),
-            "{now}"
-        );
-            assert!(!now.contains("gh auth"), "{now}");
+                calls.iter().all(|call| !call.contains("--global")
+                    && !call.contains("--unset-all")
+                    && !call.contains("credential approve")),
+                "{calls:?}"
+            );
+            let clone = calls
+                .iter()
+                .find(|call| call.contains(" clone "))
+                .expect("the clone ran");
             assert!(
-                sys.calls()
-                    .iter()
-                    .all(|call| !call.contains("--global") && !call.contains("credential approve")),
-                "{:?}",
-                sys.calls()
+                clone.contains("secrets git-credential") && clone.contains(helper),
+                "{clone}"
             );
             assert_eq!(journaled(&sys)[0]["revert"], aterm_json::Value::Null);
         }
-    }
-
-    #[test]
-    fn native_converts_shadowed_keychain_gitconfig_without_writing_keychain() {
-        let journaled = |sys: &Fake| -> Vec<aterm_json::Value> {
-            sys.written(Fake::JOURNAL)
-                .map(|bytes| String::from_utf8(bytes).unwrap())
-                .unwrap_or_default()
-                .lines()
-                .map(|line| aterm_json::from_str(line).unwrap())
-                .collect()
-        };
-
-        // 1. Keychain holds current token, ~/.gitconfig shadows XDG helper: converts, journals
-        //    revert before apply, and never runs `credential approve`.
-        for keychain_token in [TOKEN, "a_rotated_out_value"] {
-            let (sys, item) = fixture();
-            answer(
-                &sys,
-                &item.user,
-                &format!("{ACCESSIBLE}&page=1"),
-                aterm_json::json!([]),
-            );
-            script::lookups_hold(&sys, &item.user, GITHUB, "alice", keychain_token);
-            script::lookups_hold(&sys, &item.user, GITHUB, "alice", keychain_token);
-            script::lookups_hold(&sys, &item.user, GITHUB, "alice", TOKEN);
-            script::lookups_hold(&sys, &item.user, GITHUB, "alice", TOKEN);
-            script::lookups_hold_xdg(&sys, &item.user, GITHUB, "alice", TOKEN);
-            script::shadowed(&sys, &item.user, "alice");
-            script::shadowed(&sys, &item.user, "alice");
-            script::alike(&sys, &item.user);
-            script::alike(&sys, &item.user);
-            let unsets = script::unconfigure(&sys, &item.user);
-            let context = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
-            let rows = run(&sys, &context, Mode::Apply).unwrap();
-            assert_eq!(
-                rows[0].outcome,
-                crate::model::Outcome::Changed,
-                "{keychain_token}: {rows:?}"
-            );
-            let revert = journaled(&sys)[0]["revert"].as_str().unwrap().to_owned();
-            assert!(
-                revert.contains(
-                    "git config --global --add credential.https://github.com.helper osxkeychain"
-                ),
-                "{revert}"
-            );
-            let calls = sys.calls();
-            assert!(unsets.iter().all(|u| calls.contains(u)), "{calls:?}");
-            assert!(
-                calls
-                    .iter()
-                    .all(|call| !call.contains("credential approve")
-                        && !call.contains("--replace-all")),
-                "{calls:?}"
-            );
-        }
-
-        // 2. Negative control: pure keychain `~/.gitconfig` with no XDG helper stays Ready and
-        //    keeps the keychain path untouched.
-        let (sys, item) = fixture();
-        answer(
-            &sys,
-            &item.user,
-            &format!("{ACCESSIBLE}&page=1"),
-            aterm_json::json!([]),
-        );
-        script::lookups_hold(&sys, &item.user, GITHUB, "alice", TOKEN);
-        script::configured(&sys, &item.user, "alice");
-        script::holds(&sys, Some(&item.user), GITHUB, "alice", TOKEN);
-        let context = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
-        assert!(matches!(item.probe(&sys, &context), Probe::Ok { .. }));
-        assert!(
-            sys.calls()
-                .iter()
-                .all(|call| !call.contains("--unset-all") && !call.contains("credential approve"))
-        );
     }
 }

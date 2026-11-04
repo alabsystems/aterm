@@ -28,12 +28,7 @@ impl Obstruction {
 }
 
 fn run_operation(world: &World, cli: Cli, operation: i64, mut arm: impl FnMut()) -> bool {
-    let mut s = session(
-        cli,
-        Supervisor::Aterm,
-        Mode::Early,
-        Path::new("/opt/provider"),
-    );
+    let mut s = session(cli, Supervisor::Aterm, Mode::Early, &world.exe);
     if operation == 8 {
         s.sample = None;
     }
@@ -160,12 +155,7 @@ fn observe(operation: i64, fault: i64) -> [bool; 6] {
     }
     if operation == 1 {
         let snapshot = super::super::pool_snapshot(&world.seat(), cli).unwrap();
-        let s = session(
-            cli,
-            Supervisor::Aterm,
-            Mode::Early,
-            Path::new("/opt/provider"),
-        );
+        let s = session(cli, Supervisor::Aterm, Mode::Early, &world.exe);
         let who = accounts::ProcessLogin {
             login: None,
             default_home: true,

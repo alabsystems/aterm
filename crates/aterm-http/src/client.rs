@@ -507,9 +507,11 @@ impl RequestBuilder<'_> {
         if let Some(idle) = idle {
             deadline = deadline.with_idle(idle);
         }
-        let connect = connect_within.map_or(deadline, |within| deadline.connect_phase(within));
         let guard: Arc<dyn Guard> = guard.unwrap_or_else(|| Arc::new(AlwaysAuthorized));
         let via = proxy::resolve(client.proxy_mode, &target, env).map_err(not_sent)?;
+        // The connect budget starts once the proxy is chosen: reading its variables is no
+        // part of the DNS, connect, CONNECT and handshake that `connect_within` bounds.
+        let connect = connect_within.map_or(deadline, |within| deadline.connect_phase(within));
 
         let mut stream = client
             .open(&target, via.as_ref(), &guard, connect)

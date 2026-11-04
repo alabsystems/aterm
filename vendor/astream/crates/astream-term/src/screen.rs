@@ -3817,16 +3817,24 @@ const fn osc_hex_nibble(b: u8) -> Option<u8> {
 }
 
 fn sanitize_osc_title(raw: &[u8]) -> String {
-    let lossy = String::from_utf8_lossy(raw);
     let mut out = String::new();
-    for ch in lossy.chars() {
-        if ch.is_control() {
-            continue;
+    for chunk in raw.utf8_chunks() {
+        for ch in chunk.valid().chars() {
+            if ch.is_control() {
+                continue;
+            }
+            if out.len().saturating_add(ch.len_utf8()) > MAX_OSC_TITLE_BYTES {
+                return out;
+            }
+            out.push(ch);
         }
-        if out.len().saturating_add(ch.len_utf8()) > MAX_OSC_TITLE_BYTES {
-            break;
+        if !chunk.invalid().is_empty() {
+            let repl = char::REPLACEMENT_CHARACTER;
+            if out.len().saturating_add(repl.len_utf8()) > MAX_OSC_TITLE_BYTES {
+                return out;
+            }
+            out.push(repl);
         }
-        out.push(ch);
     }
     out
 }

@@ -136,6 +136,26 @@ fn gate_passes_and_counts_top_level_bullets() {
     );
 }
 
+/// The line harness-bump generates is no release notes: alone it refuses, beside a hand-written
+/// entry it passes. CONTROL: the same section with only the hand-written entry passes.
+#[test]
+fn the_generated_harness_line_alone_is_no_release_notes() {
+    let generated = format!(
+        "{}0.149.0: `alab claude harness 0.9`.** Each harness's minor moves once per release \
+         in which it changed.",
+        changelog::HARNESS_ENTRY_HEAD
+    );
+    let alone = format!("## [Unreleased]\n\n### Changed\n\n{generated}\n\n## [0.25] - x\n- y\n");
+    let err = changelog::gate_unreleased(&alone).unwrap_err().to_string();
+    assert!(err.contains("no release notes"), "{err}");
+    let beside = format!(
+        "## [Unreleased]\n\n### Changed\n\n{generated}\n\n### Fixed\n\n- **A fix.**\n\n## [0.25] - x\n"
+    );
+    assert_eq!(changelog::gate_unreleased(&beside).unwrap().entries, 2);
+    let hand = "## [Unreleased]\n\n### Fixed\n\n- **A fix.**\n\n## [0.25] - x\n";
+    assert_eq!(changelog::gate_unreleased(hand).unwrap().entries, 1);
+}
+
 #[test]
 fn gate_refuses_every_empty_shape() {
     let empties = [

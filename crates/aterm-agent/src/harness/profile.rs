@@ -766,6 +766,12 @@ fn profile_in_home(home: &Path) -> PathBuf {
     effective(&home.join(".claude.json"), Some(home), false)
 }
 
+/// The account the profile of the Claude Code home `home` names, where it names one: `home`'s own
+/// login, which this Mac's keychain may hold with no login file stored.
+pub(super) fn key_in_home(home: &Path) -> Option<AccountKey> {
+    read(&profile_in_home(home)).ok()?.key
+}
+
 /// The profile [`identity_in_home`] reads under `home`, where it is there but cannot be opened or
 /// read through: whom it names is then unknown, not none. `None` where it was read, or is absent,
 /// something other than a file, or over [`PROFILE_MAX`].

@@ -185,7 +185,7 @@ impl Run {
     #[must_use]
     pub fn parse(text: &str) -> Run {
         let mut r = Run::default();
-        for line in text.lines() {
+        for line in env_records(text) {
             let Some((k, v)) = line.split_once('=') else {
                 continue;
             };
@@ -340,6 +340,69 @@ impl Run {
     }
 }
 
+/// Split `env.sh` into top-level assignment records on unquoted, unescaped newlines so values
+/// holding literal newlines inside POSIX `'...'`, `"..."`, or `$'...'` quotes round-trip intact
+/// and cannot spoof later `KEY=VALUE` lines.
+fn env_records(text: &str) -> Vec<&str> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+        DollarSingle,
+    }
+
+    let mut out = Vec::new();
+    let mut quote = Quote::None;
+    let mut start = 0;
+    let mut it = text.char_indices().peekable();
+    while let Some((idx, c)) = it.next() {
+        match quote {
+            Quote::None => match c {
+                '\\' => {
+                    let _ = it.next();
+                }
+                '\'' => quote = Quote::Single,
+                '"' => quote = Quote::Double,
+                '$' if it.peek().is_some_and(|&(_, n)| n == '\'') => {
+                    let _ = it.next();
+                    quote = Quote::DollarSingle;
+                }
+                '\n' => {
+                    let rec = &text[start..idx];
+                    out.push(rec.strip_suffix('\r').unwrap_or(rec));
+                    start = idx + 1;
+                }
+                _ => {}
+            },
+            Quote::Single => {
+                if c == '\'' {
+                    quote = Quote::None;
+                }
+            }
+            Quote::Double => match c {
+                '\\' => {
+                    let _ = it.next();
+                }
+                '"' => quote = Quote::None,
+                _ => {}
+            },
+            Quote::DollarSingle => match c {
+                '\\' => {
+                    let _ = it.next();
+                }
+                '\'' => quote = Quote::None,
+                _ => {}
+            },
+        }
+    }
+    if start < text.len() {
+        let rec = &text[start..];
+        out.push(rec.strip_suffix('\r').unwrap_or(rec));
+    }
+    out
+}
+
 /// Whether `tag` names a lab that has a run directory.
 #[must_use]
 pub fn is_run(tag: &str) -> bool {
@@ -477,9 +540,21 @@ mod tests {
         let unread = Run {
             agent: "muse".into(),
             muse_ver: String::new(),
-            ..r
+            ..r.clone()
         };
         assert_eq!(unread.fixture_prefix(), "muse-?");
+
+        // NEGATIVE CONTROL: a quoted field containing a newline and `KEY=VALUE` text must round-trip
+        // as part of its own field and never overwrite `ATERM` or `AGENT`.
+        let multiline = Run {
+            proj: "/tmp/at.AbCd/dir'with\nATERM=/evil/spoof\r\nAGENT=codex\\tail".into(),
+            agent: "agy".into(),
+            ..r
+        };
+        let parsed = Run::parse(&multiline.render());
+        assert_eq!(parsed, multiline);
+        assert_eq!(parsed.aterm, "/Users//o/Developer/aterm/target/debug/aterm");
+        assert_eq!(parsed.agent, "agy");
     }
 
     /// AN OLDER LAB'S GEMINI CLI TAB IS REFUSED, never read as Claude Code's: the env.sh an

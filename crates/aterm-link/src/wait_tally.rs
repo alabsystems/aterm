@@ -7,7 +7,7 @@
 //! ([`Row::LaneOutbox`](crate::wait_tally::Row::LaneOutbox), the presence reads [`Row::LaneStatus`](crate::wait_tally::Row::LaneStatus) to
 //! [`Row::LaneSessionsStatus`](crate::wait_tally::Row::LaneSessionsStatus), [`Row::LaneOther`](crate::wait_tally::Row::LaneOther), [`lane_row`](crate::wait_tally::lane_row)), [`crate::state::StateDir`]
 //! ([`Row::DirReplace`](crate::wait_tally::Row::DirReplace), [`Row::DirFlush`](crate::wait_tally::Row::DirFlush), [`Row::SetPostPin`](crate::wait_tally::Row::SetPostPin), [`Row::AppendSelfAcked`](crate::wait_tally::Row::AppendSelfAcked),
-//! [`Kept`](crate::wait_tally::Kept), [`Tally::dir`](crate::wait_tally::Tally::dir)), [`crate::mailbox::Mailbox`] wakes ([`Row::WakeEvent`](crate::wait_tally::Row::WakeEvent),
+//! [`Row::LogpinFence`](crate::wait_tally::Row::LogpinFence), [`Kept`](crate::wait_tally::Kept), [`Tally::dir`](crate::wait_tally::Tally::dir)), [`crate::mailbox::Mailbox`] wakes ([`Row::WakeEvent`](crate::wait_tally::Row::WakeEvent),
 //! [`Row::QueuedRecord`](crate::wait_tally::Row::QueuedRecord)), posts ([`Row::PostPublish`](crate::wait_tally::Row::PostPublish), [`Row::DrainPosts`](crate::wait_tally::Row::DrainPosts)), and loop park/write
 //! ([`Row::Park`](crate::wait_tally::Row::Park), [`Row::TallyWrite`](crate::wait_tally::Row::TallyWrite)). The line's head ([`FORMAT`](crate::wait_tally::FORMAT)) names how many rows
 //! follow, so a reader built for another count refuses the line, and carries the process's
@@ -85,6 +85,10 @@ pub enum Row {
     ClearPostSeq,
     /// `StateDir::append_self_acked`.
     AppendSelfAcked,
+    /// The mirror pin's fence: the one write of `logpin` an open makes durable
+    /// (`StateDir::ensure_logpin_durable`, or the first `StateDir::set_logpin`), its two full
+    /// flushes included (critic item D06).
+    LogpinFence,
     /// Aterm's events queued while the loop was parked.
     WakeEvent,
     /// Broker records queued while the loop was parked.
@@ -104,7 +108,7 @@ pub enum Row {
 }
 
 /// How many rows a line holds.
-pub const ROWS: usize = 29;
+pub const ROWS: usize = 30;
 
 impl Row {
     /// Every row, in the line's order.
@@ -130,6 +134,7 @@ impl Row {
         Row::ClearInFlight,
         Row::ClearPostSeq,
         Row::AppendSelfAcked,
+        Row::LogpinFence,
         Row::WakeEvent,
         Row::WakeRecord,
         Row::QueuedEvent,
@@ -171,6 +176,7 @@ impl Row {
             Row::ClearInFlight => "clear_in_flight",
             Row::ClearPostSeq => "clear_post_seq",
             Row::AppendSelfAcked => "append_self_acked",
+            Row::LogpinFence => "logpin_fence",
             Row::WakeEvent => "wake_event",
             Row::WakeRecord => "wake_record",
             Row::QueuedEvent => "queued_event",
@@ -230,6 +236,7 @@ impl Row {
                 | Row::ClearInFlight
                 | Row::ClearPostSeq
                 | Row::AppendSelfAcked
+                | Row::LogpinFence
         )
     }
 }
@@ -812,7 +819,7 @@ mod tests {
         let t = sample();
         let line = t.render();
         assert!(
-            line.starts_with("wait-tally v=4 rows=029 pid=0000004242 "),
+            line.starts_with("wait-tally v=4 rows=030 pid=0000004242 "),
             "{line}"
         );
         assert!(
@@ -865,10 +872,10 @@ mod tests {
             Ok(sample()),
             "the control: re-summed as it was, it reads"
         );
-        let fewer = body.replacen("rows=029", "rows=025", 1);
+        let fewer = body.replacen("rows=030", "rows=025", 1);
         let why = Tally::parse(&resummed(fewer)).expect_err("another row count");
         assert!(
-            why.contains("of 25 rows") && why.contains("reads 29"),
+            why.contains("of 25 rows") && why.contains("reads 30"),
             "{why}"
         );
         let other = if FLUSHES_COUNTED == "all" {
@@ -936,7 +943,7 @@ mod tests {
         ] {
             assert!(Tally::parse(bad).is_err(), "{bad:?}");
         }
-        for body in ["wait-tally v=4 rows=029 pid=1 requests=1".to_string(), {
+        for body in ["wait-tally v=4 rows=030 pid=1 requests=1".to_string(), {
             let (body, _) = old.trim_end().rsplit_once(" sum=").expect("a sum");
             body.rsplit_once('.').expect("a band").0.to_string()
         }] {

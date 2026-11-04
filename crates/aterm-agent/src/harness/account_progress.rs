@@ -225,7 +225,7 @@ pub fn enrich_inventory_with_identity(
         }
         let before = progress.details.len();
         let label = &row.label;
-        if state.account(label).auth == accounts::Auth::SignedOut {
+        if state.account(label).current_auth(row) == accounts::Auth::SignedOut {
             progress.details.push(format!("{label}: signed out"));
         }
         let binding = logins.get(label);

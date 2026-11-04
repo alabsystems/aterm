@@ -29,6 +29,11 @@ const BUNDLED: &str = "a_keeper_whose_app_is_deleted_is_still_that_apps";
 const STOPPED: &str = "a_stopped_keeper_leaves_no_copy_of_its_code";
 
 fn play_role_if_asked() {
+    if std::env::var_os(ROLE).is_some() {
+        // Each role's keeper or verb must answer: its checks and reads wait on the hang
+        // detector, not on bounds a loaded machine can outlast.
+        aterm_keeper::identity::set_peer_waits_for_test(MUST_HAPPEN);
+    }
     match std::env::var(ROLE).as_deref() {
         Ok("keeper") => {
             let sock = std::env::var(SOCK).expect("the test names the socket");

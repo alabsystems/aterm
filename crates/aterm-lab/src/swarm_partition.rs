@@ -1833,6 +1833,11 @@ impl Lane {
             .ok_or_else(|| format!("{mac} holds no identity"))?;
         let joining = joiner::Joining {
             device: &device,
+            records_bound: client::records_bound(
+                &paths,
+                &client::load_records(&paths).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?,
             node: [0; 32],
             name: mac.into(),
             model: "Mac15,3".into(),

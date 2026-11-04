@@ -513,7 +513,8 @@ fn body(fixture: &str) -> String {
 /// The stand-in Claude Code (after `host_live`'s): it draws each scene file it is given in turn,
 /// each a whole frame one `cat` writes ([`frame`]).
 /// After a `*.gate` scene it waits for `$log.<n>` (the scene's ordinal, from 1), which the test
-/// makes; after a `*.type` scene ONE bounded read takes what was typed, logged `text:`; after a
+/// makes; after `wall.type` it echoes the resume text and waits for Enter, as the real composer
+/// does; after another `*.type` scene ONE bounded read takes what was typed, logged `text:`; after a
 /// `*.drain` scene it reads until half a second passes with nothing to read, logged `drained`;
 /// after any other scene it reads ONE key into the key log (`$1`), as `od -c` spells it, a space
 /// as `space`. It first clears what the shell printed between its fork and this exec, then writes a
@@ -530,6 +531,7 @@ const FAKE: &str = "#!/bin/sh\n\
      \x20 cat \"$scene\"\n\
      \x20 case \"$scene\" in\n\
      \x20 *.gate) while [ ! -e \"$log.$i\" ]; do sleep 0.1; done; continue ;;\n\
+     \x20 */wall.type) t=$(dd bs=4096 count=1 2>/dev/null); printf 'text:%s\\n' \"$t\" >> \"$log\"; printf '\\033[0m\\033[K%s' \"$t\"; dd bs=1 count=1 >/dev/null 2>&1; continue ;;\n\
      \x20 *.type) t=$(dd bs=4096 count=1 2>/dev/null); printf 'text:%s\\n' \"$t\" >> \"$log\"; continue ;;\n\
      \x20 *.drain) stty min 0 time 5; while [ -n \"$(dd bs=65536 count=1 2>/dev/null)\" ]; do :; done; stty min 1 time 0; echo drained >> \"$log\"; continue ;;\n\
      \x20 esac\n\
@@ -564,11 +566,11 @@ fn fake_path_in(root: &Path) -> PathBuf {
 /// first two cells of its last row that opens with `❯`, the prompt, reached by moving up from the
 /// frame's end (on the prompt's own row in a scene taller than the screen too), then the cursor on
 /// row `n` column 3, `n` the prompt's line in the scene: its caret, where Claude Code leaves it,
-/// in a scene the screen holds. A read of the frame half written finds that row without its `❯`,
-/// so only the frame's last bytes could show the prompt with the cursor off its caret, where a
-/// dim suggestion reads as a draft a person typed, which holds the harness off for their grace
-/// (two minutes, past the wait for the carry-on a wall's reset brings).
-fn frame(scene: &str) -> String {
+/// in a scene the screen holds. `hint` draws its composer text dim, as the measured wall's
+/// suggestion is: plain text is a person's draft, even with the cursor home. A partial frame
+/// lacks the prompt's `❯`; the final bytes place it and its cursor together, so a grey suggestion
+/// with the cursor still away does not leave the harness waiting on an unknown composer.
+fn frame(scene: &str, hint: bool) -> String {
     let rows: Vec<&str> = scene.split_inclusive('\n').collect();
     let caret = rows.iter().rposition(|row| row.starts_with('❯'));
     let mut out = String::from("\x1b[2J\x1b[H");
@@ -580,7 +582,13 @@ fn frame(scene: &str) -> String {
         }
         let head: String = row.chars().take_while(|c| *c != '\n').take(2).collect();
         out.push_str(&format!("\x1b[{}C", head.chars().count()));
+        if hint {
+            out.push_str("\x1b[2m");
+        }
         out.push_str(&row[head.len()..]);
+        if hint {
+            out.push_str("\x1b[22m");
+        }
         let up = rows[i..].iter().filter(|r| r.ends_with('\n')).count();
         let up = if up == 0 {
             String::new()
@@ -626,7 +634,7 @@ fn write_fake(inst: &Inst, wall: &str) {
         ("busy3.gate", body(SPINNER)),
         ("wall.type", wall_screen),
     ] {
-        std::fs::write(sc.join(name), frame(&text)).expect("a scene");
+        std::fs::write(sc.join(name), frame(&text, name == "wall.type")).expect("a scene");
     }
 }
 
@@ -1257,10 +1265,9 @@ fn the_owners_ask_over_the_stream() {
         "the carry-on came {resumed_after:?} after the approval the wall follows, before the \
          wall's reset ({scaled_reset:?})"
     );
-    assert_eq!(
-        keys_read(&a, "k1")[1],
-        "text:",
-        "the carry-on sends the drafted prompt"
+    assert!(
+        keys_read(&a, "k1")[1].starts_with("text:[aterm harness] "),
+        "the carry-on writes its own resume message over the suggestion"
     );
     let carry = until_on(
         &a,
@@ -3173,7 +3180,7 @@ fn the_harness_review_reaches_aterm_log_only_as_words() {
         ("box22.gate", box22, "QZP6SECRET22", 2),
     ] {
         assert_eq!(text.matches(plant).count(), rows, "{name}: {text}");
-        std::fs::write(sc.join(name), frame(&text)).expect("a scene");
+        std::fs::write(sc.join(name), frame(&text, false)).expect("a scene");
     }
     let s = spawn_tab(&a);
     start_fake(

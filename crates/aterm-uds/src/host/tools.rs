@@ -169,6 +169,22 @@ pub const TOOLS: &[Tool] = &[
         &[],
         "OpenSSL 3 for Ed25519 source attestations on a release host; separate from Apple's certificate tools",
     ),
+    workspace(
+        "cpython",
+        When::Release,
+        Some(Pin {
+            package: "cpython",
+            version: "3.14.8+20261013",
+            exe: "bin/python3.14",
+            built: false,
+            hosts: MACOS_HOSTS,
+        }),
+        &[],
+        "the publication engine's interpreter on a release host: `bin/pub-python` runs the newest \
+         `python3.14` … `python3.11` on PATH that imports tomllib, and macOS ships only 3.9, so \
+         `ship release` puts this pinned standalone CPython's `bin` first on the engine's PATH \
+         (3.14, the version the engine's ported guards were measured on)",
+    ),
     os(
         "sh",
         &["/bin/sh"],
@@ -786,8 +802,9 @@ pub const TOOLS: &[Tool] = &[
             "/usr/bin/git",
             "/Library/Developer/CommandLineTools/usr/bin/git",
         ],
-        "the change cone, the forge, the release and every checkout; CLT's git also holds the \
-         GitHub credential through its osxkeychain helper (row 22)",
+        "the change cone, the forge, the release and every checkout; aterm's init and converge \
+         git carry aterm's own GitHub helper, and any other git uses the configured route, the \
+         vault's helper where the vault wrote it (row 22)",
     ),
     clt(
         "make",

@@ -11280,6 +11280,7 @@ mod tone_status_tests {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         app.trail_audio = TrailAudio::capturing_for_test();
+        app.config.trail_sound_volume = Some(0.65);
         type_line(&mut app, wid, "why is this broken again ugh");
 
         let line = app.tone_status().expect("the fixture window is focused");
@@ -11287,7 +11288,7 @@ mod tone_status_tests {
         assert!(line.contains("effective=frustrated"), "{line}");
         assert!(line.contains("audio=live"), "{line}");
         assert!(line.contains("active=true"), "{line}");
-        assert!(line.contains("knob=on sounds=on volume=0.40"), "{line}");
+        assert!(line.contains("knob=on sounds=on volume=0.65"), "{line}");
         assert!(!line.contains("inferences=0"), "the model ran: {line}");
     }
 

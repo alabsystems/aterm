@@ -23,7 +23,8 @@ fn a_target_profile_changed_after_advice_cannot_start_a_claude_rotation() {
     let before = std::fs::read(a.store().state_file()).unwrap();
     let ledger = a.ledger();
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("wait:account-changed")
     );
     assert_eq!(a.asked("restart:"), 0);
@@ -94,7 +95,7 @@ fn policy_case(case: i64) -> [i64; 5] {
         _ => {}
     }
     if initiation {
-        let step = idle.restart(&move_to("work-2", AccountAt::Wall));
+        let step = idle.restart_once(&move_to("work-2", AccountAt::Wall));
         assert_eq!(
             step.as_deref(),
             Some(if case == 10 {

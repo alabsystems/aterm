@@ -13,6 +13,11 @@ use std::time::{Duration, SystemTime};
 /// short enough that a week of merges does not pile up beside it.
 pub const RECLAIM_STALE: Duration = Duration::from_secs(3 * 24 * 60 * 60);
 
+/// Below the disk watch's floor, [`RECLAIM_STALE`] is this: a day of merges in one worktree
+/// leaves more stale folders than the volume has room for, and the worst a wrong call costs is
+/// one crate's cold compile.
+pub const RECLAIM_STALE_UNDER_PRESSURE: Duration = Duration::from_secs(60 * 60);
+
 /// The leading bytes of a fingerprint's JSON that name its compiler: cargo writes
 /// `{"rustc":<u64>,` first.
 const FINGERPRINT_HEAD: usize = 64;
@@ -110,17 +115,17 @@ pub struct Doomed {
     pub paths: Vec<PathBuf>,
 }
 
-/// THE RULE, pure: in each profile, every incremental crate folder nothing wrote for
-/// [`RECLAIM_STALE`]; and, when cargo last built here with a store's build
-/// ([`Survey::last_built`]), every unit whose fingerprint names a compiler no unit of the
-/// profile written since the store's `current` link was made names, nothing having written
-/// its fingerprint or any of its entries for [`RECLAIM_STALE`]. Where that build is the
-/// current one, a profile with no unit written since keeps every unit: nothing there says
-/// which compiler is current.
+/// THE RULE, pure: in each profile, every incremental crate folder nothing wrote for `after`
+/// ([`RECLAIM_STALE`], or [`RECLAIM_STALE_UNDER_PRESSURE`] below the disk watch's floor); and,
+/// when cargo last built here with a store's build ([`Survey::last_built`]), every unit whose
+/// fingerprint names a compiler no unit of the profile written since the store's `current` link
+/// was made names, nothing having written its fingerprint or any of its entries for `after`.
+/// Where that build is the current one, a profile with no unit written since keeps every unit:
+/// nothing there says which compiler is current.
 #[must_use]
-pub fn decide(survey: &Survey, now: SystemTime) -> Vec<Doomed> {
+pub fn decide(survey: &Survey, now: SystemTime, after: Duration) -> Vec<Doomed> {
     let stale = |t: Option<SystemTime>| {
-        t.is_some_and(|t| now.duration_since(t).unwrap_or(Duration::ZERO) >= RECLAIM_STALE)
+        t.is_some_and(|t| now.duration_since(t).unwrap_or(Duration::ZERO) >= after)
     };
     let mut doomed = Vec::new();
     for profile in &survey.profiles {

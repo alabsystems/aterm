@@ -131,6 +131,7 @@ fn shared_claude_mailbox_uses_exact_private_input_and_cleans_every_outcome() {
             seen: RefCell::new(None),
         };
         let context = Context {
+            admission: None,
             env: &env,
             store: &store,
             host: &host,
@@ -160,6 +161,7 @@ fn shared_claude_mailbox_uses_exact_private_input_and_cleans_every_outcome() {
         seen: RefCell::new(None),
     };
     let context = Context {
+        admission: None,
         env: &env,
         store: &store,
         host: &host,
@@ -369,6 +371,7 @@ mod vendor {
                     outcome,
                 };
                 let context = Context {
+                    admission: None,
                     env: &env,
                     store: &store,
                     host: &host,
@@ -393,6 +396,7 @@ mod vendor {
             let store = accounts::Store::at_for(&env.state, cli, temp.path());
             let row = row(cli);
             let context = Context {
+                admission: None,
                 env: &env,
                 store: &store,
                 host: &host,

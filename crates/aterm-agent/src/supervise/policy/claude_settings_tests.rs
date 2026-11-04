@@ -558,6 +558,13 @@ const PROVIDER_STAGE_DONE: &str = "ATERM_CLAUDE_SETTINGS_PROVIDER_DONE";
 
 #[test]
 fn the_approval_lane_reads_its_settings_in_a_file_provider_domain_of_this_home() {
+    if let (Some(proj), Some(done)) = (
+        std::env::var_os(PROVIDER_STAGE).map(PathBuf::from),
+        std::env::var_os(PROVIDER_STAGE_DONE).map(PathBuf::from),
+    ) {
+        provider_home_stage(&proj, &done);
+        return;
+    }
     let s = ScratchDir::new("claude-settings", "provider-lane");
     let base = std::fs::canonicalize(&*s).expect("canonical");
     let home = base.join("home");
@@ -567,7 +574,7 @@ fn the_approval_lane_reads_its_settings_in_a_file_provider_domain_of_this_home()
     let out = aterm_uds::deadline::output_until(
         aterm_uds::spawnfd::command(std::env::current_exe().expect("the test binary"))
             .args([
-                "supervise::policy::claude_settings::tests::provider_home_stage",
+                "supervise::policy::claude_settings::tests::the_approval_lane_reads_its_settings_in_a_file_provider_domain_of_this_home",
                 "--exact",
                 "--nocapture",
                 "--test-threads=1",
@@ -588,44 +595,34 @@ fn the_approval_lane_reads_its_settings_in_a_file_provider_domain_of_this_home()
     assert!(done.exists(), "the stage ran no check:\n{said}");
 }
 
-#[test]
-fn provider_home_stage() {
-    let (Some(proj), Some(done)) = (
-        std::env::var_os(PROVIDER_STAGE).map(PathBuf::from),
-        std::env::var_os(PROVIDER_STAGE_DONE).map(PathBuf::from),
-    ) else {
-        return;
-    };
+fn provider_home_stage(proj: &Path, done: &Path) {
     let home = aterm_types::dirs::home_dir().expect("the stage's HOME");
     assert!(
-        atpkg::protected::under_file_provider_domain(&home, &proj),
+        atpkg::protected::under_file_provider_domain(&home, proj),
         "{} is in a file-provider domain of {}",
         proj.display(),
         home.display()
     );
     let worker = WorkerEnv::hermetic(None).with(&format!("HOME={}", home.display()));
-    assert_eq!(worker.git_settings_env(&proj), Ok(()), "nothing there");
-    assert!(
-        found(owner_asks(&worker, &proj)).is_empty(),
-        "nothing there"
-    );
+    assert_eq!(worker.git_settings_env(proj), Ok(()), "nothing there");
+    assert!(found(owner_asks(&worker, proj)).is_empty(), "nothing there");
     let local = proj.join(".claude/settings.local.json");
     write(
         &local,
         r#"{"permissions":{"allow":["Bash(ls:*)"],"ask":["Write"]}}"#,
     );
-    assert_eq!(worker.git_settings_env(&proj), Ok(()), "a quiet local file");
+    assert_eq!(worker.git_settings_env(proj), Ok(()), "a quiet local file");
     assert_eq!(
-        found(owner_asks(&worker, &proj)),
+        found(owner_asks(&worker, proj)),
         [("Write".to_string(), local.display().to_string())]
     );
     write(&local, r#"{"env":{"GIT_DIR":"elsewhere"}}"#);
-    let why = worker.git_settings_env(&proj).expect_err("an env it names");
+    let why = worker.git_settings_env(proj).expect_err("an env it names");
     assert!(
         why.contains("gets `GIT_DIR` from Claude Code's settings"),
         "{why}"
     );
-    write(&done, "ran");
+    write(done, "ran");
 }
 
 #[test]

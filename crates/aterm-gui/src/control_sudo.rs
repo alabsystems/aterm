@@ -132,6 +132,17 @@ fn shown(words: &[String]) -> String {
     crate::askpass::escape_display(&quoted.join(" "))
 }
 
+/// What the sheet shows of the run: the exact words ([`shown`]) and the folder they run in
+/// (`cwd`, escaped the same way), since root resolves every relative word there and the person
+/// typing the password must see what `.` or `./ssh` names.
+fn sheet_text(cwd: &str, words: &[String]) -> String {
+    format!(
+        "{}\n\nIn the folder:\n{}",
+        shown(words),
+        crate::askpass::escape_display(cwd)
+    )
+}
+
 /// The caller's stdin, stdout and stderr, sent as one message once it read the admission.
 fn receive_stdio(stream: &CtlStream) -> Option<[Stdio; 3]> {
     let deadline = Instant::now() + STDIO_WAIT;
@@ -162,14 +173,15 @@ fn exit_line(status: std::process::ExitStatus) -> String {
     }
 }
 
-/// Start `command` stopped, bind its pid to `words` before it runs an instruction, and see it out.
+/// Start `command` stopped, bind its pid to `sheet` (the words and folder the password sheet
+/// shows, [`sheet_text`]) before it runs an instruction, and see it out.
 /// A caller that hangs up has its sheet withdrawn and sudo sent `SIGTERM`, which sudo relays to the
 /// command. aterm (uid 501) cannot signal the root command itself, and `SIGKILL` to sudo would only
 /// end the relay and orphan the command, so a command that outlives the signal by `grace` runs on to
 /// its own end: the lane stops waiting, and the reaper collects sudo when it exits.
 fn run_bound(
     mut command: Command,
-    words: &[String],
+    sheet: String,
     client_pid: i32,
     grace: Duration,
     hung_up: &mut dyn FnMut() -> bool,
@@ -186,7 +198,7 @@ fn run_bound(
     };
     let bound = Arc::new(Bound {
         identity,
-        command: shown(words),
+        command: sheet,
         client_pid,
         tickets: Mutex::new(None),
     });
@@ -253,6 +265,11 @@ pub(crate) fn serve(
     let Some((cwd, words)) = aterm_uds::sudo::decode_command(rest) else {
         return "ERR usage: aterm ctl sudo -- <command> [args...]\n".to_string();
     };
+    // The folder is shown on the sheet as the client sent it, so it must name one folder
+    // whatever aterm's own directory is.
+    if !cwd.starts_with('/') {
+        return "ERR sudo refused the working directory is not an absolute path\n".to_string();
+    }
     let argv = match admit(&words) {
         Ok(argv) => argv,
         Err(refusal) => return refusal.to_string(),
@@ -291,7 +308,7 @@ pub(crate) fn serve(
         .stderr(stderr);
     run_bound(
         command,
-        &words,
+        sheet_text(&cwd, &words),
         client_pid,
         aterm_uds::process::END_GRACE,
         &mut || crate::control::caller_hung_up(),
@@ -361,6 +378,19 @@ mod tests {
         }
     }
 
+    /// The sheet names the folder the words run in, where root resolves a relative word, and
+    /// no folder name can forge the sheet's other lines.
+    /// NEGATIVE CONTROL: the same words in two folders read differently.
+    #[test]
+    fn the_sheet_names_the_folder_the_command_runs_in() {
+        let chmod = words(&["/bin/chmod", "-R", "777", "."]);
+        let at_root = sheet_text("/", &chmod);
+        assert_eq!(at_root, "/bin/chmod -R 777 .\n\nIn the folder:\n/");
+        assert_ne!(at_root, sheet_text("/Users//a/project", &chmod));
+        let forged = sheet_text("/tmp/x\n\nAsked by:\nyou", &chmod);
+        assert_eq!(forged.matches('\n').count(), 3, "{forged}");
+    }
+
     fn stand_in(script: &str) -> Command {
         let mut command = aterm_uds::spawnfd::command(aterm_uds::os_path!("sh"));
         command.args(["-c", script]);
@@ -374,9 +404,9 @@ mod tests {
         let (reader, writer) = std::io::pipe().expect("pipe");
         let mut command = stand_in("echo ran; exit 7");
         command.stdout(writer);
-        let marker = words(&["/bin/bound-for-its-life"]);
+        let marker = "/bin/bound-for-its-life".to_owned();
         let mut seen: Option<u32> = None;
-        let line = run_bound(command, &marker, 4242, Duration::from_secs(60), &mut || {
+        let line = run_bound(command, marker, 4242, Duration::from_secs(60), &mut || {
             let table = BOUND.lock().unwrap_or_else(PoisonError::into_inner);
             if let Some(bound) = table
                 .iter()
@@ -399,7 +429,7 @@ mod tests {
     /// NEGATIVE CONTROL: until the hang-up the command is running and the ticket live.
     #[test]
     fn a_caller_hang_up_ends_the_command_and_withdraws_the_sheet() {
-        let marker = words(&["/bin/hang-up-case"]);
+        let marker = "/bin/hang-up-case".to_owned();
         let ticket = Arc::new(AskpassTicket::new(
             1,
             Instant::now() + Duration::from_secs(60),
@@ -407,7 +437,7 @@ mod tests {
         let mut watched = false;
         let line = run_bound(
             stand_in("exec sleep 60"),
-            &marker,
+            marker,
             4243,
             Duration::from_secs(60),
             &mut || {
@@ -434,7 +464,7 @@ mod tests {
     /// NEGATIVE CONTROL: the process is still alive when the verb answers.
     #[test]
     fn a_command_that_ignores_the_hang_up_runs_on_and_frees_the_lane() {
-        let marker = words(&["/bin/ignores-term"]);
+        let marker = "/bin/ignores-term".to_owned();
         let scratch = aterm_tempfile::Builder::new()
             .prefix("aterm-sudo-term-")
             .tempdir()
@@ -445,7 +475,7 @@ mod tests {
         let mut pid: Option<u32> = None;
         let line = run_bound(
             command,
-            &marker,
+            marker,
             4244,
             Duration::from_millis(200),
             &mut || {

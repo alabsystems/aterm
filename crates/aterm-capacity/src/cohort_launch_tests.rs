@@ -77,6 +77,128 @@ fn cat() -> Command {
     command
 }
 
+/// A capture taken across a child's exit, whichever instant it lands on, finds the child read or
+/// reaped. Without the wait, 63 of 1,604 such launches were refused on the child's way out
+/// (`docs/measured/cohort-capture-at-exit-2026-11-04.md`). The exit has a test's minute to finish.
+#[test]
+fn a_capture_across_a_childs_exit_never_refuses_it() {
+    use std::time::{Duration, Instant};
+    for delay in (0..2_000).step_by(20) {
+        let fixture = CohortFixture::new();
+        let mut claim = fixture.claim();
+        let mut command = spawnfd::command("/usr/bin/true");
+        command.stdin(Stdio::null()).stdout(Stdio::null());
+        let launched = launch_with(&mut claim, &mut command, |_, spawned| {
+            let until = Instant::now() + Duration::from_micros(delay);
+            while Instant::now() < until {}
+            Cohort::of_spawned(spawned)
+        });
+        match launched {
+            Ok(mut launched) => drop(launched.child_mut().wait()),
+            Err(error) => panic!("{delay} µs after its spawn: {error}"),
+        }
+    }
+}
+
+#[test]
+fn group_requests_keep_full_custody_and_require_the_original_unreaped_birth() {
+    use std::os::unix::process::ExitStatusExt as _;
+    let fixture = CohortFixture::new();
+    let mut claim = fixture.claim();
+    let mut leader = Leader::new(claim.launch_cohort(&mut cat()).unwrap());
+    let mut deaf = spawnfd::command("/bin/sh");
+    deaf.args(["-c", "trap '' TERM; exec /bin/cat"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped());
+    let mut member = Cat::of_child(
+        claim
+            .launch_cohort_member(&mut leader.launched, &mut deaf)
+            .unwrap(),
+    );
+    let mut unrelated = Cat::of_child(cat().process_group(0).spawn().unwrap());
+    let expected = claim.record().need.mem;
+    let original = leader.launched.cohort.clone();
+
+    std::mem::swap(leader.launched.child_mut(), &mut unrelated.child);
+    let capture = Cohort::of_spawned(&mut leader.launched.spawned);
+    // Even a matching capture of a replacement actual child cannot retarget
+    // the original birth receipt. Its immutable native handle seal differs.
+    leader.launched.cohort = Cohort::of_child(leader.launched.child_mut()).unwrap();
+    let changed = leader.launched.request_group(CohortSignal::Kill);
+    std::mem::swap(leader.launched.child_mut(), &mut unrelated.child);
+    leader.launched.cohort = original.clone();
+    assert!(
+        capture.is_err(),
+        "replacement cannot inherit the original dedicated birth for BIND either"
+    );
+    assert_eq!(changed.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+    assert!(!unrelated.child.exited().unwrap());
+
+    leader.launched.cohort.scope.boot.push('x');
+    assert_eq!(
+        leader
+            .launched
+            .request_group(CohortSignal::Kill)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    leader.launched.cohort = original.clone();
+    leader.launched.cohort.group = i32::try_from(unrelated.child.id()).unwrap();
+    assert_eq!(
+        leader
+            .launched
+            .request_group(CohortSignal::Kill)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    leader.launched.cohort = original;
+    assert!(!unrelated.child.exited().unwrap());
+
+    leader
+        .launched
+        .request_group(CohortSignal::Terminate)
+        .unwrap();
+    // Observation does NOT reap: the original leader still pins its group even
+    // after its terminal exit, so a surviving member can be continued/cancelled.
+    leader.launched.child_mut().wait_exited().unwrap();
+    assert!(!leader.launched.child_mut().is_reaped());
+    leader
+        .launched
+        .request_group(CohortSignal::Continue)
+        .unwrap();
+    assert!(
+        !member.child.exited().unwrap(),
+        "TERM-ignoring work survives the accepted request"
+    );
+    assert!(claim.finish_cohort().is_err());
+    let retained = fixture.ledger.list().unwrap();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].need.mem, expected);
+    assert_eq!(retained[0].accounting, Accounting::Whole);
+
+    leader.launched.request_group(CohortSignal::Kill).unwrap();
+    assert_eq!(member.child.wait().unwrap().signal(), Some(libc::SIGKILL));
+    assert_eq!(
+        leader.launched.child_mut().wait().unwrap().signal(),
+        Some(libc::SIGTERM)
+    );
+    assert_eq!(
+        leader
+            .launched
+            .request_group(CohortSignal::Kill)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    assert!(!unrelated.child.exited().unwrap());
+    unrelated.end();
+    claim.finish_cohort().unwrap();
+    drop(claim);
+    assert!(fixture.ledger.list().unwrap().is_empty());
+}
+
 #[test]
 fn launch_binds_actual_birth_before_returning_success() {
     let fixture = CohortFixture::new();

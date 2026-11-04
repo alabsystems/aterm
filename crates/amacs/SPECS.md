@@ -140,7 +140,7 @@ None is a reachable hazard in amacs's own code: each is a fact the solver
 cannot see, or code Trust has no model for. By status and kind:
 
 - **Failed, `unbounded_allocation`:** `with_capacity` sized by the document
-  (`TextRope::from`, `TextRope::to_flat_string`, `line_starts`). A document
+  (`TextRope::from`, `TextRope::to_flat_string`). A document
   has no static size bound, and a `requires` would only move the obligation
   to every caller. The same holds for the unknown `collect`/`extend` rows.
   `project_viewport_with`'s and `concat`'s capacities are bounded in fact (a

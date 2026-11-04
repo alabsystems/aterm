@@ -17,6 +17,26 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+/// Darwin may report a start-suspended child's CLD_STOPPED even with WEXITED.
+/// Neither that notification nor its pid means the actual owned child exited.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_start_suspended_child_is_not_an_exited_child() {
+    let mut child = command("/bin/cat")
+        .start_suspended(true)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stopped = child.exited();
+    child.resume().unwrap();
+    let input = crate::deadline::cat_echoes(&mut child);
+    drop(input);
+    let status = child.wait().unwrap();
+    assert!(!stopped.unwrap(), "CLD_STOPPED is not terminal evidence");
+    assert!(status.success());
+}
+
 /// The accounting handle owns the wait, including a nonblocking look while a
 /// pipe handshake keeps the child alive, and caches status and usage together.
 #[cfg(all(

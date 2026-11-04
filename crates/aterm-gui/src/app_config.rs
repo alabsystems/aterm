@@ -7161,7 +7161,15 @@ impl App {
 
     /// Toggle borderless full screen for the window that received the command.
     pub(crate) fn toggle_fullscreen_in(&self, wid: WindowId) -> Result<(), &'static str> {
-        let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) else {
+        let Some(ws) = self.windows.get(&wid) else {
+            return Err("no window is on screen to full-screen");
+        };
+        #[cfg(test)]
+        if ws.os_window_for_test {
+            ws.fullscreen_for_test.set(!ws.fullscreen_for_test.get());
+            return Ok(());
+        }
+        let Some(w) = ws.os_window.as_ref() else {
             return Err("no window is on screen to full-screen");
         };
         let next = match w.fullscreen() {

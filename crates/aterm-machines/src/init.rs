@@ -95,7 +95,7 @@ aterm init --converge [--check] [--json] [--verbose] [--trigger subscriber|windo
   row; --only runs those ids, families or groups (base, github, dock, ...); --[no-]develop
   records or drops this checkout as a develop machine; --no-wait waits for no System State
   pass (else 10 min); --converge runs one pass now. Exit: 0 done, or left to the vault or
-  a person; 75 a lock or step, 77 a permission, 69 the network; 1 otherwise; 2 usage.
+  a person (--check: 77); 75 a lock or step, 77 a permission, 69 offline; 1 else; 2 usage.
 ",
         spotlight = Setting::Spotlight.label(),
         secrets = Setting::Secrets.label(),
@@ -1943,14 +1943,15 @@ pub fn forget_owed_clone(state: &Path) -> Result<(), String> {
 }
 
 /// `sync.clone`'s apply: the GitHub step an `aterm init` owes, run once as init runs it, in any
-/// shell of the account; its record under `state` goes once every row is in place, and stays
-/// for the next pass otherwise. A row only a person can finish marks the record with the
-/// step's mark now ([`OwedClone::Person`]), so no pass runs the step again until the token,
-/// init.toml or git's presence changes, or the person's own `aterm init` owes it afresh
+/// shell of the account; its record under `state` goes once every repository row is in place,
+/// and stays for the next pass otherwise. The keychain row runs with them but is no repository
+/// row: its retry is `sync.github`'s. A repository row only a person can finish marks the record
+/// with the step's mark now ([`OwedClone::Person`]), so no pass runs the step again until the
+/// token, init.toml or git's presence changes, or the person's own `aterm init` owes it afresh
 /// ([`note_owed`]).
 ///
 /// # Errors
-/// A row of the step did not end in place (its words), or the step could not run.
+/// A repository row of the step did not end in place (its words), or the step could not run.
 pub fn clone_owed(sys: &dyn System, state: &Path) -> Result<String, String> {
     let (ctx, _) = local_context(sys)?;
     let items = crate::init_github::items(sys, &ctx, None)?;
@@ -1965,7 +1966,13 @@ pub fn clone_owed(sys: &dyn System, state: &Path) -> Result<String, String> {
     let rows = aterm_converge::run(&bound, Mode::Apply, journal.as_mut())
         .map_err(|why| why.to_string())?;
     let dir = converge_state(state);
-    if let Some(row) = rows.iter().find(|row| {
+    // The repositories' rows alone: the keychain row's own retry is `sync.github`'s, and its
+    // failing must not leave the mark unwritten and rerun this whole step every pass.
+    let repository_rows = || {
+        rows.iter()
+            .filter(|row| !crate::init_github::keychain_row(row))
+    };
+    if let Some(row) = repository_rows().find(|row| {
         !matches!(
             row.outcome,
             Outcome::Ok | Outcome::Changed | Outcome::NotApplicable
@@ -2005,12 +2012,12 @@ pub fn clone_owed(sys: &dyn System, state: &Path) -> Result<String, String> {
     }
     aterm_uds::private_file::remove_private(&dir, CLONE_OWED)
         .map_err(|why| format!("{}: {why}", dir.join(CLONE_OWED).display()))?;
-    let changed = rows
-        .iter()
+    let changed = repository_rows()
         .filter(|row| row.outcome == Outcome::Changed)
         .count();
     Ok(format!(
-        "ran the GitHub step aterm init owed: {changed} changed, the rest in place"
+        "ran the GitHub step aterm init owed: {changed} of its repository rows changed, the rest \
+         in place"
     ))
 }
 
@@ -2897,7 +2904,8 @@ fn report_json(
 /// Compute the exit status for `rows` under `action` (`0`, `75`, `77`, `69`, or `1`): a run
 /// left only by rows that stood aside exits with the first of 75, 77 and 69 one of them maps to
 /// ([`aterm_converge::StoodAside::exit_status`]). A row waiting on an admin counts as done
-/// ([`counts`]).
+/// ([`counts`]). Under `--check` a row left to a person or the vault ([`left`]) maps to 77, a
+/// permission: the check neither reads it as in place (0) nor as failed (1).
 fn status(rows: &[ItemReport], action: Action) -> u8 {
     if complete(rows, action) {
         return 0;
@@ -2905,10 +2913,9 @@ fn status(rows: &[ItemReport], action: Action) -> u8 {
     let incomplete: Vec<&ItemReport> = rows.iter().filter(|row| !counts(row, action)).collect();
     let codes: Option<Vec<u8>> = incomplete
         .iter()
-        .map(|row| {
-            row.stood_aside
-                .as_ref()
-                .map(aterm_converge::StoodAside::exit_status)
+        .map(|row| match &row.stood_aside {
+            Some(aside) => Some(aside.exit_status()),
+            None => (action == Action::Check && left(row)).then_some(77),
         })
         .collect();
     let codes = codes.unwrap_or_default();
@@ -5155,11 +5162,17 @@ fn counts(row: &ItemReport, action: Action) -> bool {
         Outcome::Ok | Outcome::Changed | Outcome::NotApplicable
     ) || (action == Action::Plan && row.outcome == Outcome::Planned)
         || waits_by_itself(row)
-        || (action != Action::Check
-            && (is_grant(row)
-                || waits_for_a_person(row)
-                || owed(row)
-                || crate::init_clt::deferred(row)))
+        || (action != Action::Check && left(row))
+}
+
+/// Whether `row` is not a run's to finish ([`counts`]): a grant only the person switches on
+/// ([`is_grant`]), a row deferred to a person ([`waits_for_a_person`]), one owed once this Mac
+/// is let into the vault ([`owed`]), or the Command Line Tools deferred
+/// ([`crate::init_clt::deferred`]). `--check` reads such a row as not in place and exits 77 for
+/// it ([`status`]): what is missing waits on a person's (or the vault's) permission, which is
+/// neither done nor a failure.
+fn left(row: &ItemReport) -> bool {
+    is_grant(row) || waits_for_a_person(row) || owed(row) || crate::init_clt::deferred(row)
 }
 
 /// Whether `row` is deferred to a person: the stand-in for the workstation rows a person at
@@ -6409,8 +6422,8 @@ mod tests {
             .collect();
         assert_eq!(
             github.len(),
-            2,
-            "the GitHub sign-in and checkouts: {github:?}"
+            3,
+            "the keychain block, the GitHub sign-in and checkouts: {github:?}"
         );
         assert!(github.iter().all(|id| id.contains("github")), "{github:?}");
         let asked: Vec<String> = bound
@@ -6819,7 +6832,6 @@ mod tests {
             crate::init_clt::NO_TTY,
             crate::items::developer::LOW_DATA,
             crate::init_github::NEEDS_GIT,
-            crate::controller::github::NO_GIT,
         ] {
             let named = init_lines(text);
             assert!(!named.is_empty(), "{text}");
@@ -7272,7 +7284,7 @@ mod tests {
                     || call.contains("accounts.data")));
                 assert_eq!(status(&rows, Action::Apply), 0);
                 assert_eq!(status(&rows, Action::Plan), 0);
-                assert_eq!(status(&rows, Action::Check), 1);
+                assert_eq!(status(&rows, Action::Check), 77);
             }
         }
         assert!(
@@ -7740,6 +7752,31 @@ mod tests {
             owed_clone(&sys, state.path(), &Holds::NONE).unwrap(),
             nothing(),
             "run once"
+        );
+    }
+
+    /// The keychain row's own trouble is `sync.github`'s to retry: with the repositories done, the
+    /// owed step is done, so a settings read that fails does not rerun it every pass.
+    #[test]
+    fn the_keychain_rows_trouble_does_not_hold_the_owed_clone() {
+        use aterm_converge::StoodAside;
+        let state = aterm_tempfile::tempdir().unwrap();
+        let waiting = ItemReport {
+            stood_aside: Some(StoodAside::Waiting("waiting to be let in".into())),
+            ..report("init.github.native@alice", Outcome::Blocked)
+        };
+        let sys = alice_at(501);
+        let who = user("alice", 501);
+        note_owed(&[waiting], Action::Apply, Some(state.path()), &Holds::NONE).unwrap();
+        sys.on(
+            &crate::git_credential::script::helpers(&who),
+            crate::port::Ran::exit(128, "fatal: bad config line 1"),
+        );
+        crate::init_github::scripted::converged(&sys, &who, "notes");
+        clone_owed(&sys, state.path()).unwrap();
+        assert_eq!(
+            owed_clone(&sys, state.path(), &Holds::NONE).unwrap(),
+            OwedClone::Nothing("aterm init owes no clone".into()),
         );
     }
 
@@ -8550,7 +8587,7 @@ mod tests {
                     "",
                 );
                 sys.on(
-                    &crate::checkout::git(&sys, &alice, Some(Path::new("/Users//alice/aterm")))
+                    &crate::checkout::network(&sys, &alice, Some(Path::new("/Users//alice/aterm")))
                         .args(["ls-remote", "--symref", "origin", "HEAD"])
                         .display(),
                     Ran::exit(128, stderr),
@@ -9981,6 +10018,16 @@ mod tests {
         assert!(counts(person, Action::Apply) && !counts(person, Action::Check));
         assert!(tally(&reported, Action::Apply).ends_with("needs you: Full Disk Access"));
         assert_eq!(status(&reported, Action::Apply), 0, "{reported:?}");
+        // `--check` reads the grant as not in place, and as a permission, not a failure.
+        assert_eq!(status(&reported, Action::Check), 77, "{reported:?}");
+        // CONTROL: the same rows with one that failed read as a failure under `--check`.
+        let mut failed = reported.clone();
+        failed.push(ItemReport {
+            id: "base.failed".into(),
+            outcome: Outcome::Failed,
+            ..person.clone()
+        });
+        assert_eq!(status(&failed, Action::Check), 1, "{failed:?}");
     }
 
     #[test]
@@ -10423,7 +10470,7 @@ mod tests {
             );
             assert_eq!(row.outcome, Outcome::Deferred, "{row:?}");
             assert_eq!(status(&rows, Action::Apply), 0, "{row:?}");
-            assert_ne!(status(&rows, Action::Check), 0, "{row:?}");
+            assert_eq!(status(&rows, Action::Check), 77, "{row:?}");
         }
 
         let mut sys = alice_at(501);

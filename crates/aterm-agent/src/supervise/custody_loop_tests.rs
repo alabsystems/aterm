@@ -13,7 +13,7 @@ use super::super::super::turn_end_loop::{
 use super::*;
 use crate::supervise::LineHeld;
 use crate::supervise::journal::{
-    LINE_LOST_AGAIN, LINE_READ_UNDRAWN, LINE_RESTART_UNMADE, LINE_SETTLED,
+    LINE_LOST_AGAIN, LINE_READ_UNDRAWN, LINE_RESTART_STANDS, LINE_RESTART_UNMADE, LINE_SETTLED,
 };
 
 /// What the worker said at the turn end the line is written at.
@@ -65,6 +65,17 @@ fn lost_run_on(
     host: Option<Arc<AccountHost>>,
     shape: impl FnOnce(&mut Mock, &mut SupervisorConfig),
 ) -> Lost {
+    lost_run_at(tag, screens, host, shape, |_| {})
+}
+
+/// [`lost_run_on`], `at` setting the session up as well (its wall clock, say).
+fn lost_run_at(
+    tag: &str,
+    screens: Vec<Vec<String>>,
+    host: Option<Arc<AccountHost>>,
+    shape: impl FnOnce(&mut Mock, &mut SupervisorConfig),
+    at: impl FnOnce(&mut Session<'_, TapedCtl<'_, Mock>>),
+) -> Lost {
     let mut m = Mock::new(screens);
     m.gen_fence = true;
     m.sends_gen = true;
@@ -95,6 +106,7 @@ fn lost_run_on(
         if let Some(host) = &host {
             host.stamps_on(s);
         }
+        at(s);
     });
     let noted: Vec<String> = journal_records(&journal)
         .0
@@ -238,6 +250,560 @@ fn a_line_the_worker_read_and_never_drew_restarts_it_once_and_is_written_once() 
     );
 }
 
+/// What the worker asks at the turn end a question point's line is written at.
+const ASKED: &str = "Stage 1 is in. Shall I start stage 2?";
+
+/// A LINE LOST AT A QUESTION POINT IS RESTARTED AS AT AN IDLE ONE (ATERM-KI-1101-3,
+/// [`Session::custody_at_rest`]): the worker ends its turn on a question, the loop answers it with
+/// the continuation, and `status` reads it clear while the screen shows none of it. A question is a
+/// turn's end, no turn running and no box, as an idle point is: a minute after the first clear read
+/// the host is asked for one restart in place, the line settles with its program, and the resumed
+/// point writes it once, entered when it draws. Before, the rest asked for `Phase::Idle` alone: at
+/// every due the gate held the line `not at rest`, no restart was ever asked and the host was told
+/// for good that the line stands. Negative control by mutation: rest read from `Phase::Idle` alone
+/// again in [`Session::custody_at_rest`]: no restart asked.
+#[test]
+fn a_line_lost_at_a_question_point_is_restarted_as_at_an_idle_one() {
+    let mut screens = vec![busy_screen(), ended(ASKED)];
+    screens.extend(resumed());
+    let run = lost_run_on(
+        "question",
+        screens,
+        Some(AccountHost::scripted(&[], &["relaunched"])),
+        |m, policy| {
+            policy.answer_questions = true;
+            m.screen_cols.insert(4, 2 + LINE.len());
+            m.cell_attrs_on.insert(4, "none");
+        },
+    );
+    let (t, noted) = (&run.t, &run.noted);
+    assert_eq!(
+        run.host.said("restart:"),
+        ["restart:input-lost"],
+        "one restart in place: {noted:#?}\n{}",
+        t.evidence()
+    );
+    let after = restart_after_clear(&run);
+    assert!(
+        after.len() == 1 && after[0] >= ECHO_HANG && restarting(noted).len() == 1,
+        "asked once, a minute after the first clear read: {after:?}\n{noted:#?}"
+    );
+    assert!(
+        !noted.iter().any(|l| l.contains("not at rest")),
+        "a question is a rest: {noted:#?}"
+    );
+    assert!(
+        settled(noted, Settles::Ended),
+        "the line settled with its program: {noted:#?}"
+    );
+    assert_eq!(
+        (lines_sent(t), t.enters().len()),
+        (2, 1),
+        "once to each process, entered once: {}",
+        t.evidence()
+    );
+    assert!(t.m.attention.is_none(), "no badge: {}", t.evidence());
+}
+
+/// A LINE LOST AT A LIMIT'S POINT AFTER ITS RESET IS RESTARTED AS AT AN IDLE ONE (ATERM-KI-1101-3,
+/// [`Session::custody_at_rest`]): the worker's turn ended on a weekly limit whose reset has passed,
+/// the loop writes the limit's resume (`usage-resume@v1`), and `status` reads it clear while the
+/// screen, still the limit's notice, shows none of it. A limit's notice is a turn's end, no turn
+/// running and no box: a minute after the first clear read the host is asked for one restart in
+/// place and the line settles with its program. Before, the rest asked for `Phase::Idle` alone: the
+/// notice held the line `not at rest` at every due, no restart was ever asked. Negative control by
+/// mutation: rest read from `Phase::Idle` alone again in [`Session::custody_at_rest`]: no restart
+/// asked.
+#[test]
+fn a_line_lost_at_a_limits_point_after_its_reset_is_restarted_as_at_an_idle_one() {
+    let mut screens = vec![busy_screen(), weekly_limited()];
+    screens.extend(resumed());
+    let run = lost_run_at(
+        "limit",
+        screens,
+        Some(AccountHost::scripted(&[], &["relaunched"])),
+        |_, policy| policy.resume_limits = true,
+        |s| s.set_clock(AFTER_RESET, PDT),
+    );
+    let (t, noted) = (&run.t, &run.noted);
+    assert!(
+        t.sends()
+            .first()
+            .is_some_and(|r| r.ends_with(&format!(" -- {CLEARED}"))),
+        "the limit's resume, written first: {}",
+        t.evidence()
+    );
+    assert_eq!(
+        run.host.said("restart:"),
+        ["restart:input-lost"],
+        "one restart in place: {noted:#?}\n{}",
+        t.evidence()
+    );
+    let after = restart_after_clear(&run);
+    assert!(
+        after.len() == 1 && after[0] >= ECHO_HANG && restarting(noted).len() == 1,
+        "asked once, a minute after the first clear read: {after:?}\n{noted:#?}"
+    );
+    assert!(
+        !noted.iter().any(|l| l.contains("not at rest")),
+        "a limit's notice is a rest: {noted:#?}"
+    );
+    assert!(
+        settled(noted, Settles::Ended),
+        "the line settled with its program: {noted:#?}"
+    );
+    assert!(t.m.attention.is_none(), "no badge: {}", t.evidence());
+}
+
+/// `screen` with its done row saying `work` still runs (` · 1 local agent still running`).
+fn under_work(mut screen: Vec<String>, work: &str) -> Vec<String> {
+    let done = screen
+        .iter()
+        .position(|row| row.starts_with("✻ ") && row.contains(" · done "))
+        .expect("a done row");
+    screen[done] = format!("{} · {work} still running", screen[done]);
+    screen
+}
+
+/// A LINE LOST OVER THE AGENT'S OWN BACKGROUND WORK IS NEVER RESTARTED WHILE THAT WORK RUNS
+/// (ATERM-KI-1101-3, [`Session::custody_at_rest`]): the worker's turn ends on a question with a
+/// monitor it left running, or on a weekly limit whose reset has passed with a background agent
+/// still running in its own process; the loop writes the point's line, `status` reads it clear and
+/// the screen shows none of it. The phase reads a question or a limit's notice there (the notice
+/// and the question are read before the soft busy of the work), but a restart in place would end
+/// the work, which no process row names for an agent of its own process: the line is held `not at
+/// rest` at every due while the work runs, the host is asked for no restart, and the resumed turn
+/// settles the line. A monitor the done row names at that limit, under the progress row of a
+/// workflow that ended (which Claude Code leaves drawn at its full bar, ahead of the monitor in the
+/// screen reader's first rule), is held the same. Before, the rest took any question or limit's
+/// phase as rest: the host was asked `restart:input-lost` over the running work; and the monitor
+/// under that progress row read as no work, the restart asked over it. Negative control by
+/// mutation: the background work dropped from [`Session::custody_at_rest`]: a restart asked in
+/// each case.
+#[test]
+fn a_line_lost_over_the_agents_own_background_work_is_never_restarted_while_it_runs() {
+    let mut wrong = Vec::new();
+    for (tag, point, limit) in [
+        (
+            "question-monitor",
+            under_work(ended(ASKED), "1 monitor"),
+            false,
+        ),
+        (
+            "limit-monitor-outlived",
+            under_outlived_progress(under_work(weekly_limited(), "1 monitor")),
+            true,
+        ),
+        (
+            "limit-agent",
+            under_work(weekly_limited(), "1 local agent"),
+            true,
+        ),
+    ] {
+        let mut screens = vec![busy_screen(), point];
+        screens.extend(resumed());
+        let run = lost_run_at(
+            &format!("work-{tag}"),
+            screens,
+            Some(AccountHost::scripted(&[], &["relaunched"])),
+            |m, policy| {
+                policy.answer_questions = !limit;
+                policy.resume_limits = limit;
+                m.screen_cols.insert(4, 2 + LINE.len());
+                m.cell_attrs_on.insert(4, "none");
+            },
+            |s| {
+                if limit {
+                    s.set_clock(AFTER_RESET, PDT);
+                }
+            },
+        );
+        let noted = &run.noted;
+        let held = held_formed(noted);
+        let restarts = run.host.said("restart:");
+        if !held.is_some_and(|f| f.ends_with("(input=clear)"))
+            || !restarts.is_empty()
+            || !noted.iter().any(|l| l.contains("not at rest"))
+        {
+            wrong.push(format!(
+                "{tag}: held={held:?} restarts={restarts:?}\n{noted:#?}\n{}",
+                run.t.evidence()
+            ));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "no restart in place over the agent's own work: {wrong:#?}"
+    );
+}
+
+/// `screen` with the progress row a dynamic workflow leaves drawn under the footer at its full
+/// bar once it ended (Claude Code 2.1.304, `claude-2.1.304-agents-panel-workflow-done-3m20s-120col.txt`).
+fn under_outlived_progress(mut screen: Vec<String>) -> Vec<String> {
+    screen.push(String::new());
+    screen.push("  ◯ stall-probe  ▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰  2/2 · 3m20s · ↓ 12.9k tokens".to_string());
+    screen
+}
+
+/// A LINE LOST UNDER A PROGRESS ROW ITS WORKFLOW OUTLIVED IS RESTARTED AS AT ANY REST
+/// (ATERM-KI-1101-3, [`Session::custody_at_rest`]): the worker's turn ends on a weekly limit whose
+/// reset has passed, its done row naming no work left running, and under the footer the progress
+/// row of a dynamic workflow that ended, which Claude Code leaves drawn at its full bar
+/// (`aterm_phase::phase::background_wait` still reads it as `a workflow running`); the loop
+/// writes the point's line, `status` reads it clear and the screen shows none of it. No work runs
+/// that a restart would end (a workflow still running is named by its status row's `Waiting for
+/// …`, `aterm_phase::phase::in_process_work`), so the line is restarted in place once, as at an
+/// idle point. Before, the rest read the progress row as background work: the line was held `not
+/// at rest` at every due, for as long as the row stood drawn, and no restart was asked.
+#[test]
+fn a_line_lost_under_a_progress_row_its_workflow_outlived_is_restarted_in_place() {
+    let mut screens = vec![busy_screen(), under_outlived_progress(weekly_limited())];
+    screens.extend(resumed());
+    let run = lost_run_at(
+        "outlived-progress",
+        screens,
+        Some(AccountHost::scripted(&[], &["relaunched"])),
+        |m, policy| {
+            policy.answer_questions = false;
+            policy.resume_limits = true;
+            m.screen_cols.insert(4, 2 + LINE.len());
+            m.cell_attrs_on.insert(4, "none");
+        },
+        |s| s.set_clock(AFTER_RESET, PDT),
+    );
+    let noted = &run.noted;
+    assert!(
+        held_formed(noted).is_some_and(|f| f.ends_with("(input=clear)")),
+        "the line held, read: {noted:#?}\n{}",
+        run.t.evidence()
+    );
+    assert_eq!(
+        run.host.said("restart:"),
+        ["restart:input-lost"],
+        "restarted in place once: {noted:#?}\n{}",
+        run.t.evidence()
+    );
+    assert!(
+        !noted.iter().any(|l| l.contains("not at rest")),
+        "never held not at rest: {noted:#?}"
+    );
+}
+
+/// A host whose restarts answer `answers` while it names the agent's process 41, then each
+/// process of `moves` after each restart asked (none: 41 for ever).
+fn naming(answers: &[&'static str], moves: &[u32]) -> Arc<AccountHost> {
+    let host = AccountHost::scripted(&[], answers);
+    *host.pid.lock().unwrap() = Some(41);
+    *host.pids_on_restart.lock().unwrap() = moves.iter().copied().collect();
+    host
+}
+
+/// `host`, each restart's own report naming each process of `lefts` after it, in order
+/// ([`IdleHost::restart_left`]; none: the report names none).
+fn reporting(host: Arc<AccountHost>, lefts: &[u32]) -> Arc<AccountHost> {
+    *host.left_on_restart.lock().unwrap() = lefts.iter().copied().collect();
+    host
+}
+
+/// A RESTART ANSWERED MADE WHILE THE PROCESS THAT READ THE LINE STILL RUNS IS NO RESTART
+/// (ATERM-KI-1101-3): the worker read the line and drew none of it a minute on, at rest, and the
+/// host answers the restart in place with a success word (`adopted`, as a window's host answers
+/// a relaunch in flight it only adopted, or `relaunched:…`) while the process the line was written
+/// to is named after it, by the restart's own report or, where that names none, by the host. The
+/// custody settles only on evidence, and nothing shows its program ended: the line stands held, is
+/// never written again to the process that may still hold it, and the restart is no restart made
+/// but stands asked, asked again on its back-off, the line's `restarting it in place` record
+/// written once, and no `RESTARTED` record books it made. Once the screen shows the line it is
+/// entered, as drawn. Negative control by mutation: the settle on the word restored in
+/// [`Session::restart_agent`]: the line settles `ended with its program` on the first answer and
+/// the restart is asked once; the deferral alone dropped there: the restart is booked made.
+#[test]
+fn a_restart_answered_made_while_the_lines_process_runs_is_no_restart() {
+    let cases: [(&'static str, &[u32]); 3] = [
+        ("adopted", &[]),
+        ("relaunched:same", &[]),
+        ("adopted", &[41]),
+    ];
+    for (word, lefts) in cases {
+        let answer = format!("{word} reported {lefts:?}");
+        let run = lost_run_on(
+            &format!("stands-{}-{}", word.len(), lefts.len()),
+            vec![busy_screen(), ended(SAID), typed_in(SAID, LINE)],
+            Some(reporting(naming(&[word], &[]), lefts)),
+            |m, _| {
+                m.unmoved_after_send = Some(Duration::from_secs(200));
+                m.screen_cols.insert(2, 2 + LINE.len());
+                m.cell_attrs_on.insert(2, "none");
+            },
+        );
+        let (t, noted) = (&run.t, &run.noted);
+        assert!(
+            run.host.said("restart:").len() >= 2,
+            "{answer}: asked again on its back-off: {noted:#?}\n{}",
+            t.evidence()
+        );
+        assert!(
+            !settled(noted, Settles::Ended),
+            "{answer}: no program ended: {noted:#?}"
+        );
+        assert!(
+            !noted.iter().any(|l| l.starts_with("RESTARTED ")),
+            "{answer}: no restart booked made: {noted:#?}"
+        );
+        assert_eq!(
+            lines_sent(t),
+            1,
+            "{answer}: never written again to the process that read it: {}",
+            t.evidence()
+        );
+        assert_eq!(
+            restarting(noted).len(),
+            1,
+            "{answer}: its record once: {noted:#?}"
+        );
+        assert!(
+            settled(noted, Settles::Drawn) && t.enters().len() == 1,
+            "{answer}: drawn, entered once: {noted:#?}\n{}",
+            t.evidence()
+        );
+        assert!(
+            t.m.attention.is_none() && !noted.iter().any(|l| l.starts_with("ESCALATED ")),
+            "{answer}: no badge, no ask: {noted:#?}"
+        );
+    }
+}
+
+/// A RESTART THAT ENDED NOTHING IS ASKED AGAIN, AND MADE ONCE THE HOST NAMES ANOTHER PROCESS: the
+/// first answer `adopted` leaves the process the line was written to standing, so it is no
+/// restart; the second moves the agent to another process, which ends the line's program: the
+/// line settles `ended with its program` then, once, and the point the new process resumes on
+/// writes it once to it, entered when it draws. Negative control by mutation: the settle on the
+/// word restored in [`Session::restart_agent`]: settled on the first answer, the restart asked
+/// once, and the line written again to the process that read it.
+#[test]
+fn a_restart_that_ended_nothing_is_asked_again_and_made_once_the_process_moves() {
+    let mut screens = vec![busy_screen(), ended(SAID)];
+    screens.extend(resumed());
+    let run = lost_run_on(
+        "moves",
+        screens,
+        Some(naming(&["adopted"], &[41, 42])),
+        |m, _| {
+            m.screen_cols.insert(4, 2 + LINE.len());
+            m.cell_attrs_on.insert(4, "none");
+        },
+    );
+    let (t, noted) = (&run.t, &run.noted);
+    assert_eq!(
+        run.host.said("restart:"),
+        ["restart:input-lost"; 2],
+        "asked again, then made: {noted:#?}\n{}",
+        t.evidence()
+    );
+    assert_eq!(
+        noted
+            .iter()
+            .filter(|l| l.starts_with("NOTE ") && l.contains(&format!("{LINE_SETTLED} ")))
+            .count(),
+        1,
+        "settled once: {noted:#?}"
+    );
+    assert!(
+        settled(noted, Settles::Ended),
+        "with its program: {noted:#?}"
+    );
+    assert_eq!(
+        noted.iter().filter(|l| l.starts_with("RESTARTED ")).count(),
+        1,
+        "booked made once, by the ask that moved the process: {noted:#?}"
+    );
+    assert_eq!(
+        (lines_sent(t), t.enters().len()),
+        (2, 1),
+        "once to each process, entered once: {}",
+        t.evidence()
+    );
+}
+
+/// A RESTART ITS OWN REPORT NAMES MADE IS MADE, THOUGH THE HOST'S KEPT SNAPSHOT LAGS IT: the host
+/// answers the restart in place `adopted`, its report naming the process it started (42), while
+/// the host still names the one the line was written to (41), as a window's host does whose
+/// snapshot read after the act outran its bound. The report is the restart's own evidence: the
+/// line settles `ended with its program` once, the restart is booked made once (`RESTARTED`, no
+/// `WAITING` that says nothing ended), it is never asked again, and the point after writes the
+/// line once to the new process, entered when it draws. Negative control by mutation: the host's
+/// naming taken before the report in `custody::Line::restarted` (the planted
+/// `CustodyRestartBySnapshot`): nothing reads ended, the restart is asked again and never booked.
+#[test]
+fn a_restart_its_report_names_made_is_made_though_the_hosts_snapshot_lags() {
+    let mut screens = vec![busy_screen(), ended(SAID)];
+    screens.extend(resumed());
+    let run = lost_run_on(
+        "lags",
+        screens,
+        Some(reporting(naming(&["adopted"], &[]), &[42])),
+        |m, _| {
+            m.screen_cols.insert(4, 2 + LINE.len());
+            m.cell_attrs_on.insert(4, "none");
+        },
+    );
+    let (t, noted) = (&run.t, &run.noted);
+    assert_eq!(
+        run.host.said("restart:"),
+        ["restart:input-lost"],
+        "made at the first ask, never asked again: {noted:#?}\n{}",
+        t.evidence()
+    );
+    assert_eq!(
+        noted.iter().filter(|l| l.starts_with("RESTARTED ")).count(),
+        1,
+        "booked made once: {noted:#?}"
+    );
+    assert!(
+        !noted.iter().any(|l| l.contains(LINE_RESTART_STANDS)),
+        "never journaled as nothing ended: {noted:#?}"
+    );
+    assert!(
+        settled(noted, Settles::Ended),
+        "with its program: {noted:#?}"
+    );
+    assert_eq!(
+        (lines_sent(t), t.enters().len()),
+        (2, 1),
+        "once to each process, entered once: {}",
+        t.evidence()
+    );
+}
+
+/// A RESTART MADE UNDER A DEFERRAL'S WORD SPENDS THE LINE'S RESTART ONCE THE LINE SETTLES: the
+/// host answers the restart in place `wait:resume`, as a window's host does whose relaunch sent
+/// its signal and typed its line but whose new process had not registered within the held wait,
+/// and names another process (42) from then on. The restart stood asked; the line settles `ended
+/// with its program` at the gate, which spends it, as the host may have made it; the line written
+/// to the new process, read and drawn none of either, then waits ([`LINE_LOST_AGAIN`]) and writes
+/// nothing more: one restart for the line short of an act submitted. Negative control by
+/// mutation: the spend dropped from `custody::Restarts::settled` (the planted
+/// `CustodySettleKeepsAsked`): the second loss asks a second restart in place.
+#[test]
+fn a_restart_made_under_a_deferrals_word_spends_the_lines_restart() {
+    let run = lost_run_on(
+        "made-deferred",
+        vec![busy_screen(), ended(SAID), busy_screen(), ended(RESUMED)],
+        Some(naming(&["wait:resume"], &[42])),
+        |m, _| {
+            // The process the restart started reads the line written to it and draws none of it.
+            m.stands.insert(3, Duration::from_secs(600));
+            m.exit_when =
+                Some(|m| m.requests.iter().filter(|r| r.starts_with("send ")).count() > 2);
+        },
+    );
+    let (t, noted) = (&run.t, &run.noted);
+    assert_eq!(
+        run.host.said("restart:"),
+        ["restart:input-lost"],
+        "one restart, never a second: {noted:#?}\n{}",
+        t.evidence()
+    );
+    assert!(
+        settled(noted, Settles::Ended),
+        "the line went with its program: {noted:#?}"
+    );
+    assert_eq!(
+        lines_sent(t),
+        2,
+        "once to each process, no more: {}",
+        t.evidence()
+    );
+    assert!(
+        noted
+            .iter()
+            .any(|l| l.starts_with("WAITING ") && l.contains(LINE_LOST_AGAIN)),
+        "the second loss waits: {noted:#?}"
+    );
+    assert!(t.enters().is_empty(), "{}", t.evidence());
+    assert!(t.m.attention.is_none(), "no badge: {}", t.evidence());
+}
+
+/// A RESTART FOR A LINE WRITTEN WHERE THE HOST NAMED NO PROCESS, ASKED AGAIN AFTER A DEFERRAL, IS
+/// BOOKED ONCE ON THE WORD ITS RE-ASK CARRIES (ATERM-KI-1101-3): the host names no agent process
+/// at the write, so the line's restart names none (`Restart::InputLost { of: (None, None), .. }`)
+/// and the line cannot settle by its program's end. Its first ask answers `wait:resume`, as a
+/// window's host does whose relaunch sent its signal and typed its line but whose new process (42,
+/// named from then on) had not registered within the held wait; the loop asks again on the
+/// back-off with the same line's ask (`Restart::InputLost`'s `line`, the restart standing
+/// deferred), and there the host's relaunch carries the record that ask claimed
+/// (`relaunch::its_own`, the record's `ask`) and answers `adopted`, ending nothing; a record
+/// of its cause another line's ask claimed is another's, which it supersedes. Every ask of one
+/// line's restart carries that line's ask, and none another's: the loop's next line asks with its
+/// own. With no process named at the write, the word is all the evidence there is
+/// (`custody::Line::restarted`): the line settles with its program once, the restart is booked
+/// made once (one `RESTARTED` for the one relaunch), and the point after writes the line once to
+/// the new process. The relaunch's half: `a_restart_asked_again_over_its_own_record_carries_it`.
+#[test]
+fn a_nameless_lines_restart_asked_again_after_a_deferral_is_booked_once_on_its_carried_word() {
+    let host = AccountHost::scripted(&[], &["wait:resume", "adopted"]);
+    *host.pids_on_restart.lock().unwrap() = [42].into_iter().collect();
+    let mut screens = vec![busy_screen(), ended(SAID)];
+    screens.extend(resumed());
+    let run = lost_run_on("nameless", screens, Some(host), |m, _| {
+        m.screen_cols.insert(4, 2 + LINE.len());
+        m.cell_attrs_on.insert(4, "none");
+    });
+    let (t, noted) = (&run.t, &run.noted);
+    assert_eq!(
+        run.host.said("restart:"),
+        ["restart:input-lost"; 2],
+        "asked again after its deferral: {noted:#?}\n{}",
+        t.evidence()
+    );
+    let asked = run.host.asked.lock().unwrap().clone();
+    assert!(
+        matches!(
+            asked.as_slice(),
+            [
+                Restart::InputLost {
+                    of: (None, None),
+                    line: first,
+                },
+                Restart::InputLost {
+                    of: (None, None),
+                    line: again,
+                },
+            ] if first == again
+        ),
+        "first asked, then asked again with the same line's ask: {asked:?} {noted:#?}"
+    );
+    let asks = run.host.asks.lock().unwrap().clone();
+    assert!(
+        matches!(asks.as_slice(), [first, again] if first == again && first.word().starts_with("line:")),
+        "the host is asked the line's restart as one ask, its line's: {asks:?}"
+    );
+    assert_eq!(
+        noted.iter().filter(|l| l.starts_with("RESTARTED ")).count(),
+        1,
+        "booked made once, on the carried word: {noted:#?}"
+    );
+    assert_eq!(
+        noted
+            .iter()
+            .filter(|l| l.starts_with("NOTE ") && l.contains(&format!("{LINE_SETTLED} ")))
+            .count(),
+        1,
+        "settled once: {noted:#?}"
+    );
+    assert!(
+        settled(noted, Settles::Ended),
+        "with its program: {noted:#?}"
+    );
+    assert_eq!(restarting(noted).len(), 1, "its record once: {noted:#?}");
+    assert_eq!(
+        (lines_sent(t), t.enters().len()),
+        (2, 1),
+        "once to each process, entered once: {}",
+        t.evidence()
+    );
+}
+
 /// A LINE FIRST READ CLEAR AT A LOOK IS RESTARTED A MINUTE AFTER THAT READ, NOT AT IT: the worker
 /// holds the continuation unread (`input=pending`) 90 s after the write, so it is held unread at
 /// the echo's minute; the doubling wait's look that first reads it clear dates its read, and the
@@ -355,47 +921,140 @@ fn a_held_lines_wait_doubles_to_its_cap() {
     assert_eq!(custody_step(u32::MAX), CUSTODY_CAP, "capped");
 }
 
+/// A LOST LINE'S `restarting it in place` RECORD IS WRITTEN ONCE, WHATEVER HOLDS COME BETWEEN ITS
+/// ASKS (ATERM-KI-1101-3, [`crate::supervise::custody::Line::lose`]'s `Loss::Restart { first }`,
+/// on which [`Session::custody_lost`] writes it): the line read clear and drawn none of past its
+/// minute, at rest, its restart asked and deferred, then held at a due by a read not at rest (a
+/// person's key within the grace, a background call making no progress:
+/// [`crate::supervise::custody::NOT_AT_REST`]'s record) or by `status` reading typeahead (the read
+/// hold's record), and lost again at rest: the restart is asked again, its first record standing.
+/// Before, `first` was read off the field the hold records keep their last words in, which each of
+/// those records overwrote, so the next ask wrote the line's `restarting it in place` record again.
+#[test]
+fn a_lost_lines_restart_record_is_written_once_whatever_holds_come_between_its_asks() {
+    use crate::supervise::custody::{GateRead, Lane, Line, Loss, NOT_AT_REST, Restarts, hold_said};
+    let t0 = Instant::now();
+    let mut line = Line::formed(LINE, 0, Some("clear"), None, Some((Some(41), None)), t0);
+    let lane = Lane {
+        relaunch: true,
+        host: true,
+        can_restart: true,
+    };
+    let mut restarts = Restarts::default();
+    let at = t0 + ECHO_HANG;
+    let first = |line: &mut Line, restarts: &Restarts| {
+        assert_eq!(line.gate_read(Some("clear"), true, at), GateRead::Again);
+        match line.lose(restarts, &lane, at) {
+            Loss::Restart { first, .. } => first,
+            other => panic!("a restart asked: {other:?}"),
+        }
+    };
+    assert!(first(&mut line, &restarts), "the first ask's record");
+    restarts.deferred();
+    assert!(
+        !first(&mut line, &restarts),
+        "asked again: no second record"
+    );
+    for said in [NOT_AT_REST.to_string(), hold_said(line.held(), "typeahead")] {
+        assert!(line.says(said.clone()), "{said}: the hold's own record");
+        assert!(
+            !first(&mut line, &restarts),
+            "{said} between asks: no second record of the restart"
+        );
+    }
+}
+
+/// A LOST LINE'S FIRST WAIT IS ITS LOSS'S FIRST, HOWEVER MANY HOLDS CAME BEFORE IT
+/// (ATERM-KI-1101-3, [`crate::supervise::custody::Line::lose`]'s `Loss::Wait { waits }`, which
+/// [`Session::custody_lost`] journals as the first four, then every sixth): the line read clear and
+/// drawn none of past its minute, held not at rest at four dues in a row (each re-armed, a wait of
+/// the line's in a row), then at rest where no restart can be made (the host makes none for the
+/// program). The loss's waits count from its first, whose `WAITING` record is the one that names
+/// why no restart is made, while its step stays the next of the line's waits in a row, so the
+/// holds before it start it higher up the doubling. Before, the loss's waits were the line's waits
+/// in a row: after four holds its first wait was counted 4, and no record of the loss was written
+/// until its third (counted 6), the host told the line lost meanwhile.
+#[test]
+fn a_lost_lines_first_wait_is_its_losss_first_however_many_holds_came_before_it() {
+    use crate::supervise::custody::{
+        CustodyGate, GateRead, Lane, Line, Loss, NOT_AT_REST, NoRestart, Rest, Restarts,
+    };
+    let t0 = Instant::now();
+    let mut line = Line::formed(LINE, 0, Some("clear"), None, None, t0);
+    let lane = Lane {
+        relaunch: true,
+        host: true,
+        can_restart: false,
+    };
+    let mut now = t0 + ECHO_HANG;
+    for _ in 0..4 {
+        assert_eq!(line.gate_read(Some("clear"), true, now), GateRead::Again);
+        assert_eq!(Rest::default().gate(), CustodyGate::Hold, "not at rest");
+        line.says(NOT_AT_REST.to_string());
+        now = line.rearm(now);
+    }
+    let mut waits = Vec::new();
+    for _ in 0..2 {
+        assert_eq!(line.gate_read(Some("clear"), true, now), GateRead::Again);
+        match line.lose(&Restarts::default(), &lane, now) {
+            Loss::Wait {
+                why: NoRestart::NoLane,
+                until,
+                waits: nth,
+            } => waits.push((nth, until.saturating_duration_since(now))),
+            other => panic!("a wait for no restart lane: {other:?}"),
+        }
+    }
+    assert_eq!(
+        waits,
+        [(0, custody_step(4)), (1, custody_step(5))],
+        "the loss's own waits count from its first; its step goes on from the holds"
+    );
+}
+
 /// A RESTART THE HOST REFUSES IS ASKED FOR ONCE, NOT AT EVERY DUE: the worker read the line and drew
-/// none of it a minute on, at rest, and the host answers the restart in place `refused:…`. A
-/// repeated failure calls for a different approach: from there the line is a doubling wait that
-/// writes nothing ([`LINE_RESTART_UNMADE`], the host's step named), and the host is never asked
-/// again. Once the screen moves to show the line, it is entered. Negative control by mutation: the
-/// refusal unkept in [`Session::restart_agent`]: `restart:input-lost` asked at each due.
+/// none of it a minute on, at rest, and the host answers the restart in place `refused:…`, or a
+/// `busy:` step other than `busy:another-sweep` (its state directory cannot hold the sweep's lock,
+/// a refusal: `relaunch::outcome`'s `Outcome::Cannot`), never a deferral. A repeated failure
+/// calls for a different approach: from there the line is a doubling wait that writes nothing
+/// ([`LINE_RESTART_UNMADE`], the host's step named), and the host is never asked again. Once the
+/// screen moves to show the line, it is entered. Negative control by mutation: the refusal unkept
+/// in [`Session::restart_agent`]: `restart:input-lost` asked at each due.
 #[test]
 fn a_refused_restart_is_asked_once_and_the_line_waits() {
-    let run = lost_run(
-        "refused",
-        vec![typed_in(SAID, LINE)],
-        "refused:not-a-shell-job",
-        |m, _| {
+    for (tag, answer) in [
+        ("refused", "refused:not-a-shell-job"),
+        ("refused-busy", "busy:state-unwritable"),
+    ] {
+        let run = lost_run(tag, vec![typed_in(SAID, LINE)], answer, |m, _| {
             m.unmoved_after_send = Some(Duration::from_secs(400));
             m.screen_cols.insert(2, 2 + LINE.len());
             m.cell_attrs_on.insert(2, "none");
-        },
-    );
-    let (t, noted) = (&run.t, &run.noted);
-    assert_eq!(
-        run.host.said("restart:"),
-        ["restart:input-lost"],
-        "asked once, never again: {noted:#?}\n{}",
-        t.evidence()
-    );
-    assert_eq!(lines_sent(t), 1, "written once: {}", t.evidence());
-    assert!(
-        t.m.attention.is_none() && !noted.iter().any(|l| l.starts_with("ESCALATED ")),
-        "no badge, no ask: {noted:#?}"
-    );
-    let unmade = format!("{LINE_RESTART_UNMADE} (refused:not-a-shell-job)");
-    assert!(
-        !waits_until(noted, &unmade).is_empty(),
-        "the refusal's wait names its step: {noted:#?}"
-    );
-    assert_eq!(
-        t.enters().len(),
-        1,
-        "drawn, entered: {noted:#?}\n{}",
-        t.evidence()
-    );
+        });
+        let (t, noted) = (&run.t, &run.noted);
+        assert_eq!(
+            run.host.said("restart:"),
+            ["restart:input-lost"],
+            "{answer}: asked once, never again: {noted:#?}\n{}",
+            t.evidence()
+        );
+        assert_eq!(lines_sent(t), 1, "{answer}: written once: {}", t.evidence());
+        assert!(
+            t.m.attention.is_none() && !noted.iter().any(|l| l.starts_with("ESCALATED ")),
+            "{answer}: no badge, no ask: {noted:#?}"
+        );
+        let unmade = format!("{LINE_RESTART_UNMADE} ({answer})");
+        assert!(
+            !waits_until(noted, &unmade).is_empty(),
+            "{answer}: the refusal's wait names its step: {noted:#?}"
+        );
+        assert_eq!(
+            t.enters().len(),
+            1,
+            "{answer}: drawn, entered: {noted:#?}\n{}",
+            t.evidence()
+        );
+    }
 }
 
 /// A RESTART THE HOST DEFERS IS ASKED AGAIN ON ITS BACK-OFF, ITS LINE'S RECORD WRITTEN ONCE: the
@@ -429,6 +1088,11 @@ fn a_deferred_restart_is_asked_again_and_its_line_noted_once() {
         ["restart:input-lost"; 4],
         "asked at each deferral's due, then refused: {noted:#?}\n{}",
         t.evidence()
+    );
+    let asked = run.host.asked.lock().unwrap().clone();
+    assert!(
+        asked.windows(2).all(|w| w[0] == w[1]),
+        "every ask of the one line's restart carries its ask: {asked:?}"
     );
     assert_eq!(
         restarting(noted).len(),

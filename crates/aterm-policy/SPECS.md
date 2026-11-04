@@ -8,13 +8,13 @@ Rust function, and the tests it subsumes then deleted. The specs restate what th
 sample, read against the code they reach; the claims come from reading the code, not running it.
 `crates/aterm-core/src/terminal/policy_bridge.rs` consumes the decisions.
 
-The specs restate what the crate's 28 `#[test]`s sample (`src/engine.rs` 4, `src/limits.rs` 12,
-`src/selector.rs` 3, `src/tests.rs` 8, `tests/serde_corpus.rs` 1), read against the code they
+The specs restate what the crate's 30 `#[test]`s sample (`src/engine.rs` 4, `src/limits.rs` 13,
+`src/selector.rs` 3, `src/tests.rs` 9, `tests/serde_corpus.rs` 1), read against the code they
 reach (`src/lib.rs`, `src/profiles.rs`). Decisions are consumed in
 `crates/aterm-core/src/terminal/policy_bridge.rs`. The claims come from reading the code, not
 from running it.
 
-Result: **19 specs**; every test is a sample of one of them.
+Result: **21 specs**; every test is a sample of one of them.
 
 Gap numbers in the `blocking_gaps` column refer to the table in §7 of
 `docs/AUDIT-trust-for-test-migration-2026-10-15.md`. Gap 0 (the installed seal publishes no
@@ -24,8 +24,7 @@ Lean-discharged row) blocks every spec, so it is listed on every row.
 
 - `rank(o)` = `OriginTag::trust_rank(o)`: Host 0, ConfigFile 1, User 2, UserTyped 3, Ai 4,
   PtySafe 5, Pty 6, NetworkUntrusted 7.
-- `strict(r)`: Drop 4, Warn 3, Rewrite 2, Ask 1, Execute 0. Today it is only the `#[cfg(test)]`
-  `profiles::refinement::response_rank`; `profile-refinement` needs it as a spec-level fn.
+- `strict(r)` = `Response::strictness_rank(r)`: Drop 4, Warn 3, Rewrite 2, Ask 1, Execute 0.
 - `Sel(s)` = `SequenceSelector::parse(s)`, `M(sel,seq)` = `sel.matches(seq)`,
   `pm(p,a)` = `SelectorParam::matches(p,a)`.
 - `Eval_X(seq,o)` = `PolicyEngine::new(X).evaluate(&seq,o)`, for X ∈ {Perm, Std, Hard} the
@@ -70,7 +69,7 @@ selector-parse-denotation	contract	SequenceSelector::parse, split_ws, parse_comp
 selector-alias-expansion	table-property	selector::expand_alias, SequenceSelector::parse	aliases match by exact bytes, so case-sensitive: parse("osc 52 set") is Err(UnknownFunction("osc")). ∀ s with trim(s) = an alias a: parse(s) = parse(canon(a)), and: OSC 52 set ⇒ {Osc,Some(52),None,[Wildcard,NotQuery]}; OSC 52 query ⇒ {Osc,Some(52),None,[Wildcard,Query]}; OSC 4 query/set ⇒ the same shapes with major 4; OSC 21 set named/indexed ⇒ {Osc,Some(21),None,[Wildcard]}; response any ⇒ catch_all(). Every alias parses Ok; any other string passes through to selector-parse-denotation.	selector.rs::selector_spellings_parse	MEDIUM given selector-parse-denotation: match on &str literals.	0,1,3,4,7
 engine-evaluate-first-match	refinement	PolicyEngine::{new,evaluate,walk_bucket,policy}, Decision::fell_through	∀ P, seq, o, E = PolicyEngine::new(P). Rule i is ok ⇔ Sel(P.rules[i].sequence) = Ok(s_i) ∧ M(s_i,seq) ∧ o.dominates(P.rules[i].origin_min). If some rule is ok, i* = the ok index with least (tier(i), i), and E.evaluate(seq,o) = Decision{P.rules[i*].response, Some(i*), P.rules[i*].rate_limit as Arc<str>}. Else Decision{P.defaults.unmatched, None, None}. So the bucketed engine (exact (function,major) bucket, then (function,None), then wildcard; declared order within each) equals a linear first-match scan by (tier, index). Corollaries: an unparsable selector never matches; an origin-gate failure falls through to later rules; an empty rule list yields the default. Also E.policy() = &P, and evaluate is total (no panic).	engine.rs::{malformed_rule_selector_is_skipped, origin_gate_failure_does_not_short_circuit}, tests.rs::single_matching_rule_decides_for_every_response_and_origin_gate	HARD: HashMap<BucketKey,Vec<usize>> built in an enumerate loop with entry().or_default(); Vec<Option<SequenceSelector>>; Arc<str>; for/continue; let-chains; Option get/and_then/cloned/flatten. Needs the bucket invariant from new: idx ∈ buckets[k] ⇔ compiled[idx] = Some(s) ∧ s.bucket_key() = k ∧ k.function ≠ Wildcard; idx ∈ wildcard bucket ⇔ compiled[idx] = Some(s) ∧ s.function = Wildcard; each bucket ascending.	0,1,2,3,4,5,7
 builtin-profile-denotation	contract	profiles::{permissive,standard,hardened}, PolicyEngine::evaluate	∀ seq, o: Eval_Perm(seq,o) = Decision{Execute, Some(0), Some("clipboard")}. Eval_Std(seq,o).response = Ask (rate_limit "clipboard") if S52set ∧ rank(o) ≤ 2; Drop if (S52q ∨ Ct) ∧ o = Host; Warn (rate_limit "notifications") if N ∧ rank(o) ≤ 2; Execute otherwise. Eval_Hard(seq,o).response = Execute if (o = Host ∧ ¬(S52set ∨ S52q ∨ Ct ∨ N)) ∨ (rank(o) ≤ 1 ∧ (S4q ∨ S4set)); Drop otherwise. Corollary (fail-closed): ∀ o with rank(o) ≥ 2, ∀ seq: Hardened answers Drop.	engine.rs::builtin_profile_decisions, tests.rs::hardened_fails_closed_on_unknown_for_untrusted_origins	MEDIUM given engine-evaluate-first-match and selector-alias-expansion: constant fns building Vec<Rule> with Strings; quantified over seq (Vec<String>, Option<String>). Matching splits seq into finitely many classes, so the statement is decidable once the class lemma is proved.	0,1,2,3,4,5,7
-profile-refinement	invariant	profiles::{permissive,standard,hardened}, PolicyEngine::evaluate, strict (spec fn; today profiles::refinement::response_rank)	∀ seq, o: strict(Eval_Hard(seq,o).response) ≥ strict(Eval_Std(seq,o).response) ≥ strict(Eval_Perm(seq,o).response). Immediate from builtin-profile-denotation.	tests.rs::refinement_holds_over_all_sequences_and_origins	EASY given builtin-profile-denotation: three evaluate calls composed; quantification over DispatchedSequence and OriginTag; strict must be a spec-level fn.	0,1,3,4,5,7
+profile-refinement	invariant	profiles::{permissive,standard,hardened}, PolicyEngine::evaluate, Response::{strictness_rank,is_at_least_as_strict_as}	∀ seq, o: strict(Eval_Hard(seq,o).response) ≥ strict(Eval_Std(seq,o).response) ≥ strict(Eval_Perm(seq,o).response). Immediate from builtin-profile-denotation.	tests.rs::refinement_holds_over_all_sequences_and_origins	EASY given builtin-profile-denotation: three evaluate calls composed; quantification over DispatchedSequence and OriginTag; const fn match over a 5-variant #[non_exhaustive] Copy enum returning u8.	0,1,3,4,5,7
 builtin-profiles-wellformed	table-property	profiles::{permissive,standard,hardened}	For (f,tag) ∈ {(permissive,Permissive),(standard,Standard),(hardened,Hardened)}, p = f(): p.schema_version = SCHEMA_VERSION ∧ p.profile = tag; every rule with rate_limit = Some(id) has id ∈ p.rate_limits[*].id; p.defaults.unmatched = Execute, Warn, Drop respectively (strict monotone H ≥ S ≥ P); shell_integration_require_nonce = false, true, true; ∀ r ∈ hardened().rules: r.origin_min ∈ {Host, ConfigFile, User}.	tests.rs::{every_rate_limit_ref_resolves_in_each_profile, hardened_rules_only_admit_host_configfile_or_user, hardened_requires_shell_integration_nonce}	EASY: constant constructors returning a struct with Vec<Rule>, Vec<RateLimit>, String, Option<String>; a quantifier over vector elements; string membership. Decidable by evaluation once content models exist.	0,1,3,4,5,7
 policy-toml-roundtrip	round-trip	Policy::to_toml, aterm_toml::from_str::<Policy>, serde derives on Policy/Defaults/Rule/RateLimit/OriginTag/Profile/Response	∀ p: Policy: p.to_toml() = Ok(s) ∧ aterm_toml::from_str::<Policy>(&s) = Ok(p). This includes empty rules or rate_limits, None rate_limit and prompt_id (skipped on serialize, defaulted on read), and arbitrary Unicode in Strings.	-	HARD: serde proc-macro output (rename_all, deny_unknown_fields, default, skip_serializing_if); the cross-crate aterm_toml serializer and parser; String escaping; Vec loops.	0,1,7,9,12
 policy-decode-schema	refinement	aterm_toml::from_str::<Policy>, Policy::to_toml, serde derives (deny_unknown_fields, default, rename_all)	∀ TOML text d: from_str::<Policy>(d) = Ok(p) ⇔ d parses as TOML and its root fits the schema: no key outside the declared fields at any level (root, defaults, rules[i], rate_limits[j]); schema_version, profile, defaults.unmatched present; each rule has sequence, origin_min, response; each rate limit has id, capacity_bytes, refill_per_second; each value has its exact TOML type (integers in 0..=u32::MAX; no float/string/bool for an int); enum strings match rename_all exactly (Response snake_case; Profile and OriginTag PascalCase); rules is an array of tables and defaults a table. Then p takes those values, with shell_integration_require_nonce = false, per_sequence_max = 0, rules = [], rate_limits = [], rate_limit = None, prompt_id = None where absent, and p re-serializes as to_toml(p). Invalid TOML (duplicate key, truncation) is Err; the empty document is Err (required keys missing). Error-message text is not part of the spec.	serde_corpus.rs::policy_documents_answer_as_recorded	HARD: first-party serde derive expansion; the aterm_toml lexer and parser (another crate); integer range checks; Strings, Vecs, loops over tables.	0,1,7,9,12
@@ -80,13 +79,15 @@ token-bucket-rate-safety	invariant	TokenBucket::try_consume	∀ bucket from from
 limiter-set-from-policy	contract	RateLimiterSet::from_policy, PolicyEngine::rate_limit_config	∀ P, ids = the distinct P.rate_limits[*].id in first-occurrence order: |buckets| = |ids|; slots maps each id_k to k and no other key; buckets[k] = from_config(c) with c the LAST entry of P.rate_limits whose id is id_k, and PolicyEngine::rate_limit_config(id) returns Some(&c) for that same last entry (None when undeclared). A duplicate id overwrites in place: it adds no slot and moves no other slot.	limits.rs::from_policy_collapses_duplicate_ids_last_wins, engine.rs::rate_limit_config_matches_last_wins_duplicate_id	MEDIUM: for loop over Vec<RateLimit>; iter().rfind; HashMap<String,usize> get/insert; Vec push/get_mut; String clone; a loop invariant over a map and a vector.	0,1,2,3,7
 limiter-set-consume-slot	contract	RateLimiterSet::{try_consume_slot,try_consume,slot}	∀ S, slot, amount, clock: slot = UNDECLARED (None) or Some(i) with i ≥ |S.buckets| ⇒ returns true and S is unchanged (a slot from a wider set allows and never aliases a bucket). Some(i) with i < |S.buckets| ⇒ returns buckets[i].try_consume(amount, clock), and only buckets[i] changes (other buckets and slots are framed). The same holds for try_consume(id, …) with slot = slot(id), so an undeclared id is unlimited.	limits.rs::{known_id_enforces_bucket, slot_debits_the_bucket_its_id_names, slot_from_a_wider_set_stays_total}	MEDIUM given the token-bucket specs: &mut self with a frame over Vec elements; Vec get_mut; Option; generic TimeSource.	0,1,2,3,4,11
 limiter-slot-resolution	equivalence	RateLimiterSet::{slot,try_consume,try_consume_slot}, RateLimitSlot::default, PolicyEngine::{rate_limit_slot,rate_limit_try_consume,rate_limit_try_consume_slot}	∀ set, id, a, clock: slot(id) = RateLimitSlot(slots.get(id)), declared ⇔ id is a key; try_consume(id,a,c) leaves the same state and answer as try_consume_slot(slot(id),a,c); two sets built from the same P with the same history answer the id-keyed and slot-keyed call sequences identically; RateLimitSlot::default() = UNDECLARED; the PolicyEngine methods delegate to its limiter set unchanged.	limits.rs::undeclared_slot_allows_like_an_unknown_id	EASY given limiter-set-consume-slot: HashMap<String,usize> lookup by &str; derived Default on a newtype over Option<usize>; &mut self delegation; generics.	0,1,2,4,11
+bucket-snapshot-restore	contract	TokenBucket::{snapshot,restore_snapshot}, RateLimiterSet::{snapshots,restore_snapshots,earliest_refill}, PolicyEngine::{bucket_snapshots,restore_bucket_snapshots,earliest_refill}	snapshot(b) = BucketSnapshot{b.tokens, b.last_refill}. restore_snapshot(b,s) sets b.tokens := clamp(s.tokens, 0.0, C as f64) normalized so −0.0 ↦ +0.0 when s.tokens.is_finite(), else +0.0, and b.last_refill := s.last_refill, framing (C, R, M). snapshots/bucket_snapshots map snapshot over buckets in first-declaration order; restore_snapshots/restore_bucket_snapshots zip-restore prefix min(|buckets|, |snaps|) and frame trailing buckets; earliest_refill = min{b.last_refill : b ∈ buckets, b.last_refill = Some(_)}.	limits.rs::snapshot_restore_clamps_invalid_balances_and_tracks_earliest_refill	MEDIUM: f64 is_finite/clamp and −0.0 normalization; Option<Instant> Ord; Vec iter/zip/filter_map/min; PolicyEngine delegation.	0,1,2,3,4,7,12
+policy-scalar-helpers	contract	Profile::{as_str,strictness_rank,is_at_least_as_strict_as}, Response::{as_str,allows_execution,is_drop}, RateLimit::{encode_params_le,decode_params_le}	Profile::as_str/strictness_rank map (Permissive, Standard, Hardened) to ("Permissive"/0, "Standard"/1, "Hardened"/2) and is_at_least_as_strict_as(a,b) ⇔ rank(a) ≥ rank(b). Response::as_str maps to snake_case; allows_execution(r) ⇔ r ∈ {Execute, Rewrite}; is_drop(r) ⇔ r ∈ {Drop, Warn}. decode_params_le(encode_params_le(c,r,m,v)) = (c,r,m,v) in 4×4-byte little-endian order.	tests.rs::profile_response_and_rate_limit_scalar_helpers_match_contracts	EASY: const fn enum matches returning &'static str / u8 / bool; fixed [u8; 16] array indexing, shifts and casts.	0,1,3,5
 ```
 
-### Distribution by kind (19)
+### Distribution by kind (21)
 
 | kind | count | ids |
 |---|---|---|
-| contract | 10 | origin-dominates-order, selector-param-matches, bucket-key-projection, selector-matches-denotation, selector-parse-denotation, builtin-profile-denotation, token-bucket-guards, token-bucket-refill-debit, limiter-set-from-policy, limiter-set-consume-slot |
+| contract | 12 | origin-dominates-order, selector-param-matches, bucket-key-projection, selector-matches-denotation, selector-parse-denotation, builtin-profile-denotation, token-bucket-guards, token-bucket-refill-debit, limiter-set-from-policy, limiter-set-consume-slot, bucket-snapshot-restore, policy-scalar-helpers |
 | table-property | 3 | origin-rank-table, selector-alias-expansion, builtin-profiles-wellformed |
 | refinement | 2 | engine-evaluate-first-match, policy-decode-schema |
 | invariant | 2 | profile-refinement, token-bucket-rate-safety |
@@ -97,16 +98,16 @@ limiter-slot-resolution	equivalence	RateLimiterSet::{slot,try_consume,try_consum
 
 | gap | specs | note |
 |---|---|---|
-| 0 | 19 | seal prerequisite; no spec is blocked by gap 0 alone |
-| 1 | 19 | every spec states something about an enum, String, Vec, Option or struct |
-| 2 | 11 | `&self`/`&mut self` views, two-state frames |
-| 3 | 15 | calls, casts, loops and enum matches in bodies |
-| 4 | 11 | composition of callee ensures |
-| 5 | 8 | quantified clauses |
-| 7 | 10 | loops |
+| 0 | 21 | seal prerequisite; no spec is blocked by gap 0 alone |
+| 1 | 21 | every spec states something about an enum, String, Vec, Option, array or struct |
+| 2 | 12 | `&self`/`&mut self` views, two-state frames |
+| 3 | 17 | calls, casts, loops and enum matches in bodies |
+| 4 | 12 | composition of callee ensures |
+| 5 | 9 | quantified clauses |
+| 7 | 11 | loops |
 | 9 | 2 | serde proc-macro boundary |
 | 11 | 5 | generic `T: TimeSource` |
-| 12 | 3 | cross-crate citation (`aterm_toml`, `aterm_time`) |
+| 12 | 4 | cross-crate citation (`aterm_toml`, `aterm_time`) |
 
 ### Proof dependency order
 
@@ -142,6 +143,7 @@ src/limits.rs	known_id_enforces_bucket	limiter-set-consume-slot	token-bucket-gua
 src/limits.rs	slot_debits_the_bucket_its_id_names	limiter-set-consume-slot	limiter-set-from-policy
 src/limits.rs	slot_from_a_wider_set_stays_total	limiter-set-consume-slot	
 src/limits.rs	undeclared_slot_allows_like_an_unknown_id	limiter-slot-resolution	limiter-set-consume-slot
+src/limits.rs	snapshot_restore_clamps_invalid_balances_and_tracks_earliest_refill	bucket-snapshot-restore	
 src/selector.rs	selector_spellings_parse	selector-parse-denotation	selector-alias-expansion
 src/selector.rs	selector_matching	selector-matches-denotation	selector-param-matches, selector-parse-denotation
 src/selector.rs	not_query_param_rejects_empty_and_question	selector-param-matches	
@@ -153,19 +155,20 @@ src/tests.rs	hardened_rules_only_admit_host_configfile_or_user	builtin-profiles-
 src/tests.rs	hardened_requires_shell_integration_nonce	builtin-profiles-wellformed	
 src/tests.rs	hardened_fails_closed_on_unknown_for_untrusted_origins	builtin-profile-denotation	
 src/tests.rs	refinement_holds_over_all_sequences_and_origins	profile-refinement	builtin-profile-denotation
+src/tests.rs	profile_response_and_rate_limit_scalar_helpers_match_contracts	policy-scalar-helpers	
 tests/serde_corpus.rs	policy_documents_answer_as_recorded	policy-decode-schema	policy-toml-roundtrip
 ```
 
 ## 3. Findings
 
-- All 28 tests have a primary spec. 16 specs retire at least one test; `bucket-key-projection`,
+- All 30 tests have a primary spec. 18 specs retire at least one test; `bucket-key-projection`,
   `selector-alias-expansion` and `policy-toml-roundtrip` retire none.
 - The biggest collapses: `token-bucket-guards` (4 primary), `engine-evaluate-first-match` (3),
   `builtin-profiles-wellformed` (3), `limiter-set-consume-slot` (3).
 - Proving `engine-evaluate-first-match` makes `builtin-profile-denotation` a finite case split,
   and `profile-refinement` then follows at once.
 
-## 4. Proof order (easiest, high value first)
+## 4. Implied specs that look wrong, or disagree with the code
 
 1. **`Standard`'s `origin_min = Host` Drop rules fall through to `response any`** (`src/profiles.rs`).
    The stale doc comment claiming `"Clipboard query: Drop"` / `"Drop from Pty"` / `"defers to the host"`
@@ -203,13 +206,17 @@ tests/serde_corpus.rs	policy_documents_answer_as_recorded	policy-decode-schema	p
     `Profile::Hardened` simply as `"Maximum restriction."`, while `hardened_rules_only_admit_host_configfile_or_user`
     and `builtin-profiles-wellformed` state the admitted origin set.
 
-1. `origin-rank-table`, then `origin-dominates-order`: const fns over an 8-variant enum,
-   decidable by enumeration, and the origin-gate lemma `engine-evaluate-first-match` needs.
+## 5. Proof order (easiest, high value first)
+
+1. `origin-rank-table`, `policy-scalar-helpers`, then `origin-dominates-order`: const fns over
+   finite enums and `[u8; 16]`, decidable by enumeration/bit-blasting, and the origin-gate lemma
+   `engine-evaluate-first-match` needs.
 2. `bucket-key-projection` and `selector-param-matches`: the matcher's leaves, with no loops.
 3. `token-bucket-guards`: u64 comparisons with an unchanged-state frame and an unread clock.
 4. `builtin-profiles-wellformed`: evaluation of three constant constructors.
-5. `selector-matches-denotation`, `token-bucket-refill-debit`, `limiter-set-from-policy`, then
-   `limiter-set-consume-slot` and `limiter-slot-resolution` (loops, f64, frames).
+5. `selector-matches-denotation`, `token-bucket-refill-debit`, `bucket-snapshot-restore`,
+   `limiter-set-from-policy`, then `limiter-set-consume-slot` and `limiter-slot-resolution`
+   (loops, f64, frames).
 6. `selector-parse-denotation` → `selector-alias-expansion` → `engine-evaluate-first-match` →
    `builtin-profile-denotation` → `profile-refinement`: the highest-value chain, and the hardest
    (string parsing, and the bucket invariant `PolicyEngine::new` establishes). Once

@@ -110,8 +110,8 @@ serial-queue-dispatch	contract	queue::SerialQueue::{new,as_id,is_current,sync,sp
 | 12 | 3 | cross-crate theorem citation |
 | 13 | 10 | threads, closures, higher-order |
 
-Gap 8 dominates: 29 of 34 specs, because this crate is an FFI binding. Only five specs avoid it
-(listed in §0), and those are the start of §6.
+Gap 8 dominates: 31 of 36 specs, because this crate is an FFI binding. Only five specs avoid it
+(those at the start of §6).
 
 ## 2. Test → spec map
 
@@ -119,7 +119,7 @@ None: §1's `subsumes` column names every test that samples each spec.
 
 ## 3. Coverage
 
-- §1 maps the 34 specs directly via `subsumes` (plus 1 non-spec parser guard in §4); the crate
+- §1 maps the 36 specs directly via `subsumes` (plus 1 non-spec parser guard in §4); the crate
   currently holds 109 `#[test]` functions alongside its custom-harness drives.
 
 ## 4. Tests that are not spec samples

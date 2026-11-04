@@ -64,11 +64,28 @@ pub fn peer_closed(stream: &CtlStream) -> bool {
 }
 
 /// Shut down `stream` so its peer reads EOF and blocked local readers wake ([`Halves`]).
+/// On Darwin a Unix socket's reader still entering `recv(2)` as this runs can sleep on until a
+/// close, past its own timeout, and a peer asleep there can miss the end: a read that must see it
+/// waits in `ready::for_read` first.
 pub fn hang_up(stream: &(impl Halves + ?Sized)) -> bool {
     let wrote = stream.shut(std::net::Shutdown::Write).is_ok();
     let read = stream.shut(std::net::Shutdown::Read).is_ok();
     stream.wake_waiting();
     wrote || read
+}
+
+/// Reads a [`CtlStream`], each read waiting first where the connection's end cannot pass it by:
+/// `ready::for_read`, on a reader nothing else ends. Windows' [`CtlStream`] wakes its own
+/// parked reads, so there this is the plain read.
+pub struct Awake<'a>(pub &'a CtlStream);
+
+impl std::io::Read for Awake<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        #[cfg(unix)]
+        crate::ready::for_read(self.0)?;
+        let mut stream = self.0;
+        stream.read(bytes)
+    }
 }
 
 /// A connected stream socket [`hang_up`] shuts half by half ([`CtlStream`] or TCP).
@@ -187,7 +204,7 @@ fn fd_peek(fd: std::os::fd::RawFd) -> Result<usize, std::io::ErrorKind> {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{PeerState, hang_up, peer_closed, peer_state};
+    use super::{Awake, PeerState, hang_up, peer_closed, peer_state};
     use std::io::{ErrorKind, Read, Write};
 
     /// What one non-blocking read of `stream` finds: `Ok(0)` is its
@@ -195,6 +212,24 @@ mod tests {
     fn read_now(stream: &crate::CtlStream) -> Result<usize, ErrorKind> {
         stream.set_nonblocking(true).expect("non-blocking");
         (&*stream).read(&mut [0u8; 16]).map_err(|e| e.kind())
+    }
+
+    /// A read of a nonblocking stream says `WouldBlock` at once, so the byte here was waited for.
+    #[test]
+    fn an_awake_read_waits_for_what_a_plain_read_would_not() {
+        let (near, mut far) = crate::CtlStream::pair().expect("pair");
+        near.set_nonblocking(true).expect("non-blocking");
+        let (done, ended) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut byte = [0];
+            let read = Awake(&near).read(&mut byte).map(|n| (n, byte));
+            let _ = done.send(read);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        far.write_all(b"k").expect("the byte");
+        let hang = std::time::Duration::from_secs(60);
+        let read = ended.recv_timeout(hang).expect("the read ends");
+        assert_eq!(read.expect("the byte is read"), (1, *b"k"));
     }
 
     /// The `try_clone` stands in for the copy a forked child holds until it execs. (Darwin

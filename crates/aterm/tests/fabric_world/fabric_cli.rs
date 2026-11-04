@@ -536,6 +536,18 @@ fn the_report_and_its_doctor_say_what_the_broker_says_of_its_log() {
             "{kind} in {out}"
         );
     }
+    // What of its log the broker keeps decoded, as the holds row's `resident=` quotes it (D10):
+    // aterm sets no residency budget, so every record the snapshot counts.
+    let snapshot = &health["snapshot"];
+    let records = snapshot["records"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("the snapshot's records in {out}"));
+    assert_eq!(
+        snapshot["resident"]["records"].as_u64(),
+        Some(records),
+        "{out}"
+    );
+    assert!(snapshot["resident"]["bytes"].as_u64().is_some(), "{out}");
     assert!(ours(&v).is_empty(), "{out}");
     let (_, doctor, _) = fabric(&s, Some(&cmd), &["doctor"]);
     assert!(
@@ -543,6 +555,7 @@ fn the_report_and_its_doctor_say_what_the_broker_says_of_its_log() {
         "{doctor}"
     );
     assert!(doctor.contains("\n  holds: "), "{doctor}");
+    assert!(doctor.contains(" (resident="), "{doctor}");
     assert!(!doctor.contains("POISONED"), "{doctor}");
 
     let mut c = root_client(&sock);

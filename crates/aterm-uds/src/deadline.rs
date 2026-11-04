@@ -3,7 +3,7 @@
 
 //! Deadlines for blocking in-process calls and child processes.
 
-use std::io::{self, Read};
+use std::io::{self, Read, Write as _};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::process::Output;
 
@@ -41,22 +41,68 @@ pub fn stamp_exec(home: &std::path::Path) {
     }
 }
 
-/// [`stamp_exec`] for a caller that must know whether the stamp was written.
+/// [`stamp_exec`] for a caller that must know whether the stamp was written. It writes only into
+/// a regular file: the open creates [`EXEC_STAMP`] or opens what is there without truncating it,
+/// and the stamp replaces the file's text only once the opened file has passed every check. On
+/// Unix the open follows no final symbolic link (`O_NOFOLLOW`) and does not wait for a FIFO's
+/// reader (`O_NONBLOCK`), and a file with more than one name (a hard link) is refused, so a file
+/// another program planted there is neither waited on nor written through. Elsewhere neither
+/// kind of link is refused: a symbolic link there is followed and a regular file it names is
+/// written, as is a file with other names.
 /// # Errors
-/// The stamp could not be written; a write cut short can leave it blank, a
-/// stamp [`exec_stamp`] reads no reading from.
+/// The stamp could not be written, or [`EXEC_STAMP`] there is anything but a regular file; on
+/// Unix also a symbolic link, a FIFO with no reader, or a regular file with more than one name.
+/// One refused is left as it was; a write cut short can leave the stamp blank, a stamp
+/// [`exec_stamp`] reads no reading from.
 pub fn try_stamp_exec(home: &std::path::Path) -> std::io::Result<()> {
     let stamp = crate::process::awake_ms()
         .map(|ms| ms.to_string())
         .unwrap_or_default();
-    std::fs::write(home.join(EXEC_STAMP), stamp)
+    let path = home.join(EXEC_STAMP);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = options.open(&path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::other(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if metadata.nlink() != 1 {
+            return Err(io::Error::other(format!(
+                "{} has {} names, not one",
+                path.display(),
+                metadata.nlink()
+            )));
+        }
+    }
+    file.set_len(0)?;
+    file.write_all(stamp.as_bytes())
 }
 
-/// The awake-clock reading [`EXEC_STAMP`] inside `home` holds: none when it is
-/// missing, unreadable or blank.
+/// The longest [`EXEC_STAMP`] [`exec_stamp`] reads, in bytes: an awake-clock reading in
+/// milliseconds has at most 20 digits.
+const STAMP_MAX: u64 = 64;
+
+/// The awake-clock reading [`EXEC_STAMP`] inside `home` holds
+/// ([`crate::atomic_file::read_regular_text`]): none when it is missing or unreadable, is anything
+/// but a regular file once a link there is followed, is longer than [`STAMP_MAX`] bytes or not
+/// UTF-8, or is blank, anything but decimal digits once trimmed, or a number past [`u64::MAX`].
+/// On Unix its open does not wait, so a FIFO another program planted there, or a link to one,
+/// reads no stamp, as a blank one does, rather than hang the sweep that reads it. A link to a
+/// regular stamp is read: a caller may keep its stamp behind one.
 #[must_use]
 pub fn exec_stamp(home: &std::path::Path) -> Option<u64> {
-    crate::atomic_file::read_regular_text(&home.join(EXEC_STAMP), 64)
+    crate::atomic_file::read_regular_text(&home.join(EXEC_STAMP), STAMP_MAX)
         .ok()
         .and_then(|text| {
             let s = text.trim();
@@ -775,8 +821,10 @@ pub struct ExitWait {
     /// reported (it stays readable, and a child not yet reapable must not spin on it).
     #[cfg(unix)]
     fd: Option<std::os::fd::OwnedFd>,
-    /// The fallback sleep, doubled up to [`POLL_MAX`].
+    /// The fallback sleep, doubled up to `tick_max`.
     tick: Duration,
+    /// The longest fallback sleep: [`POLL_MAX`] unless [`ExitWait::ticking_at_most`] lowers it.
+    tick_max: Duration,
 }
 
 impl ExitWait {
@@ -795,7 +843,19 @@ impl ExitWait {
             #[cfg(unix)]
             fd: crate::exitwatch::exit_fd(pid),
             tick: POLL_MIN,
+            tick_max: POLL_MAX,
         }
+    }
+
+    /// Caps the fallback sleep at `most` (no less than [`POLL_MIN`]). The fallback is the wait
+    /// where the kernel gives no word of the exit: no exit descriptor could be made, or it has
+    /// reported and the child is not yet reapable. The cap is for a caller whose reap must come
+    /// within `most` of the exit there, at the cost of more wakeups than [`POLL_MAX`] gives.
+    #[must_use]
+    pub fn ticking_at_most(mut self, most: Duration) -> Self {
+        self.tick_max = most.max(POLL_MIN);
+        self.tick = self.tick.min(self.tick_max);
+        self
     }
 
     /// Blocks until the kernel reports the process's exit or `timeout` elapses.
@@ -812,7 +872,7 @@ impl ExitWait {
             }
         }
         std::thread::sleep(self.tick.min(timeout));
-        self.tick = (self.tick * 2).min(POLL_MAX);
+        self.tick = (self.tick * 2).min(self.tick_max);
     }
 
     /// The descriptor to poll beside others, while it can still report.
@@ -1059,6 +1119,134 @@ mod tests {
         assert!(first <= second, "{first:?} then {second:?}");
         let now = Instant::now();
         assert!(saturating_after(now, Duration::MAX) > now);
+    }
+
+    /// A stamp another program planted as a FIFO, a link to one or a long file reads as none, at
+    /// once: the copy then ages by its folder's time, as with a blank stamp. A link to a regular
+    /// stamp reads what it names.
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_stamp_reads_without_waiting() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        use super::{EXEC_STAMP, FIRST_EXEC_HANG, copy_wait_left_at, exec_stamp};
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let read = |home: std::path::PathBuf| {
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(exec_stamp(&home));
+            });
+            rx.recv_timeout(Duration::from_secs(60))
+                .expect("the read never waits")
+        };
+        let fifo = dir.path().join("1-2");
+        std::fs::create_dir(&fifo).expect("mkdir");
+        let name =
+            std::ffi::CString::new(fifo.join(EXEC_STAMP).as_os_str().as_bytes()).expect("no NUL");
+        // SAFETY: a NUL-terminated path the call reads and does not retain.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0, "mkfifo");
+        assert_eq!(read(fifo.clone()), None, "a FIFO");
+        let now = std::time::SystemTime::now();
+        assert!(
+            copy_wait_left_at(&fifo, now, Some(u64::MAX)).is_some(),
+            "a fresh folder with no reading is young"
+        );
+        assert!(
+            copy_wait_left_at(&fifo, now + FIRST_EXEC_HANG, Some(u64::MAX)).is_none(),
+            "and ages by its time"
+        );
+
+        let to_fifo = dir.path().join("7-8");
+        std::fs::create_dir(&to_fifo).expect("mkdir");
+        std::os::unix::fs::symlink(fifo.join(EXEC_STAMP), to_fifo.join(EXEC_STAMP))
+            .expect("symlink");
+        assert_eq!(read(to_fifo), None, "a link to a FIFO");
+
+        let linked = dir.path().join("3-4");
+        std::fs::create_dir(&linked).expect("mkdir");
+        let real = dir.path().join("stamp");
+        std::fs::write(&real, "1000\n").expect("stamp");
+        std::os::unix::fs::symlink(&real, linked.join(EXEC_STAMP)).expect("symlink");
+        assert_eq!(
+            read(linked),
+            Some(1000),
+            "a link to a regular stamp reads what it names"
+        );
+
+        let long = dir.path().join("5-6");
+        std::fs::create_dir(&long).expect("mkdir");
+        std::fs::write(long.join(EXEC_STAMP), format!("1000{}", " ".repeat(64))).expect("stamp");
+        assert_eq!(read(long.clone()), None, "past the cap");
+        std::fs::write(long.join(EXEC_STAMP), format!("1000{}", " ".repeat(20))).expect("stamp");
+        assert_eq!(read(long), Some(1000), "within it");
+    }
+
+    /// A stamp is written only into a regular file with one name: a FIFO another program planted
+    /// where it goes is an error at once, not a wait for a reader, and neither a symbolic nor a
+    /// hard link is written through or truncated.
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_stamp_is_never_written_through() {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        use super::{EXEC_STAMP, try_stamp_exec};
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let stamp = |home: std::path::PathBuf| {
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(try_stamp_exec(&home).is_ok());
+            });
+            rx.recv_timeout(Duration::from_secs(60))
+                .expect("the write never waits")
+        };
+        let fifo = dir.path().join("1-2");
+        std::fs::create_dir(&fifo).expect("mkdir");
+        let name =
+            std::ffi::CString::new(fifo.join(EXEC_STAMP).as_os_str().as_bytes()).expect("no NUL");
+        // SAFETY: a NUL-terminated path the call reads and does not retain.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0, "mkfifo");
+        assert!(!stamp(fifo.clone()), "a FIFO with no reader");
+        let reader = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(fifo.join(EXEC_STAMP))
+            .expect("a reader");
+        assert!(!stamp(fifo), "a FIFO with one");
+        drop(reader);
+
+        let linked = dir.path().join("3-4");
+        std::fs::create_dir(&linked).expect("mkdir");
+        let real = dir.path().join("someone-elses");
+        std::fs::write(&real, "theirs").expect("file");
+        std::os::unix::fs::symlink(&real, linked.join(EXEC_STAMP)).expect("symlink");
+        assert!(!stamp(linked), "a link");
+        assert_eq!(std::fs::read_to_string(&real).expect("kept"), "theirs");
+
+        let hard = dir.path().join("7-8");
+        std::fs::create_dir(&hard).expect("mkdir");
+        let named = dir.path().join("someone-elses-too");
+        std::fs::write(&named, "theirs").expect("file");
+        std::fs::hard_link(&named, hard.join(EXEC_STAMP)).expect("hard link");
+        assert!(!stamp(hard), "a hard link");
+        assert_eq!(
+            std::fs::read_to_string(&named).expect("kept"),
+            "theirs",
+            "neither truncated nor written"
+        );
+
+        let fresh = dir.path().join("5-6");
+        std::fs::create_dir(&fresh).expect("mkdir");
+        assert!(stamp(fresh.clone()), "a fresh copy");
+        std::fs::write(fresh.join(EXEC_STAMP), "x".repeat(64)).expect("stamp");
+        assert!(stamp(fresh.clone()), "a regular one again");
+        assert!(
+            std::fs::read_to_string(fresh.join(EXEC_STAMP))
+                .expect("stamp")
+                .len()
+                < 64,
+            "truncated, not appended to"
+        );
     }
 
     const DEADLINE: Duration = Duration::from_millis(200);
@@ -1681,6 +1869,35 @@ mod tests {
         };
         assert!(begun.elapsed() < HANG, "the wait outlived the exit");
         assert_eq!(status.code(), Some(4));
+    }
+
+    /// Where the kernel gives no word of the exit, the fallback sleep doubles from 1 ms up to
+    /// its cap: [`super::POLL_MAX`]'s 25 ms by default, a caller's `ticking_at_most` (no less
+    /// than 1 ms, never a spin) when it asks for less. The sleeps are read off the handle, not
+    /// timed: each wait's timeout is zero.
+    #[cfg(unix)]
+    #[test]
+    fn an_exit_wait_without_the_kernels_word_sleeps_no_longer_than_its_cap() {
+        let sleeps = |exit: ExitWait| {
+            let mut exit = ExitWait { fd: None, ..exit };
+            (0..7)
+                .map(|_| {
+                    let sleep = exit.tick.as_millis();
+                    exit.wait(Duration::ZERO);
+                    sleep
+                })
+                .collect::<Vec<_>>()
+        };
+        let pid = std::process::id();
+        assert_eq!(sleeps(ExitWait::on_pid(pid)), [1, 2, 4, 8, 16, 25, 25]);
+        assert_eq!(
+            sleeps(ExitWait::on_pid(pid).ticking_at_most(Duration::from_millis(10))),
+            [1, 2, 4, 8, 10, 10, 10]
+        );
+        assert_eq!(
+            sleeps(ExitWait::on_pid(pid).ticking_at_most(Duration::ZERO)),
+            [1, 1, 1, 1, 1, 1, 1]
+        );
     }
 
     /// The window the two progress tests hold a child to: short, so a stall is named in well

@@ -48,7 +48,8 @@ enum Boot {
 
 /// A records server on loopback whose answers a test writes: `get` answers each `GET` of
 /// `/records`, and `post` each `POST`. It counts the POSTs, the records they carried, and the
-/// records its GETs sent, and keeps every `GET` it answered.
+/// records its GETs sent, and keeps every `GET` it answered. It states no records bound unless a
+/// test sets one ([`RecordsHost::set_bound`]).
 struct RecordsHost {
     addr: SocketAddr,
     posts: Arc<AtomicUsize>,
@@ -56,6 +57,7 @@ struct RecordsHost {
     sent: Arc<AtomicUsize>,
     answers: Arc<std::sync::Mutex<Vec<Answered>>>,
     boot: Arc<std::sync::Mutex<Boot>>,
+    bound: Arc<std::sync::Mutex<Option<crate::crossing::RecordsBound>>>,
     stop: Arc<AtomicBool>,
     worker: std::thread::JoinHandle<()>,
 }
@@ -74,6 +76,7 @@ impl RecordsHost {
         let sent = Arc::new(AtomicUsize::new(0));
         let answers = Arc::new(std::sync::Mutex::new(Vec::new()));
         let boot = Arc::new(std::sync::Mutex::new(Boot::Silent));
+        let bound = Arc::new(std::sync::Mutex::new(None::<crate::crossing::RecordsBound>));
         let stop = Arc::new(AtomicBool::new(false));
         let (counted_posts, counted_posted, counted_sent, kept_answers, booted, stopping) = (
             Arc::clone(&posts),
@@ -83,6 +86,7 @@ impl RecordsHost {
             Arc::clone(&boot),
             Arc::clone(&stop),
         );
+        let stating = Arc::clone(&bound);
         let worker = std::thread::spawn(move || {
             for stream in listener.incoming() {
                 if stopping.load(Ordering::SeqCst) {
@@ -137,6 +141,16 @@ impl RecordsHost {
                     if let Some(id) = boot_id {
                         need.push_str(&format!("{}: {id}\r\n", transport::RECORDS_BOOT_HEADER));
                     }
+                    if let Some(bound) = *stating
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    {
+                        need.push_str(&format!(
+                            "{}: {}\r\n",
+                            transport::RECORDS_BOUND_HEADER,
+                            bound.value()
+                        ));
+                    }
                     let status = if body.is_empty() {
                         "204 No Content"
                     } else {
@@ -161,9 +175,19 @@ impl RecordsHost {
             sent,
             answers,
             boot,
+            bound,
             stop,
             worker,
         }
+    }
+
+    /// State `bound` of its records on every `GET` of `/records` answered from now on, as a
+    /// server of the fence's build does; `None`, the default, states none, as one before it.
+    fn set_bound(&self, bound: Option<crate::crossing::RecordsBound>) {
+        *self
+            .bound
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = bound;
     }
 
     /// Put `boot` on every `GET` of `/records` answered from now on.
@@ -424,6 +448,69 @@ fn bounded_member_records_pull_retains_verified_records_without_reposting() {
     assert_eq!(host.posts(), 0, "a bounded reader does not repost");
     host.end();
     fixture.host.end();
+}
+
+/// A different writer crosses after the request began but before its legacy answer arrives.
+/// The unchanged control accepts the very same valid stream; crossing must preserve the file.
+/// An empty answer must likewise never admit a fresh pass from the stale snapshot.
+#[test]
+fn crossing_during_a_records_pull_rejects_the_old_snapshot() {
+    for (crosses, empty) in [(false, false), (true, false), (false, true), (true, true)] {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let mut fixture = lacking(root.path(), 400);
+        let late = fixture.mint(8);
+        let wire = if empty {
+            Vec::new()
+        } else {
+            encode_records(fixture.log.records())
+        };
+        let mark = crossing_mark(&fixture.member);
+        let host = RecordsHost::start(
+            Box::new(move |_| {
+                if crosses {
+                    mark.store()
+                        .expect("the other writer crosses before the reply");
+                }
+                (wire.clone(), false)
+            }),
+            400,
+        );
+        let mut moved = configured(&fixture.member).expect("config");
+        moved.source = Source::Url(host.url("team"));
+        save_config(&fixture.member, &moved).expect("new source");
+        let before = std::fs::read(fixture.member.records_file()).expect("records before");
+        let found = |_: &Config| Vec::new();
+        let found = PeerDiscovery::supplied(&found);
+        let result = sync_records_until(
+            &fixture.member,
+            None,
+            &[],
+            Some(&found),
+            Some(Instant::now() + HANG_DETECTOR),
+            None,
+        );
+        // Stop owned servers before an assertion can unwind.
+        host.end();
+        fixture.host.end();
+        if crosses {
+            assert!(
+                result.is_err(),
+                "a crossed snapshot cannot admit the old answer"
+            );
+            assert_eq!(
+                std::fs::read(fixture.member.records_file()).expect("records after"),
+                before,
+            );
+        } else {
+            result.expect("the unchanged snapshot accepts the stream");
+            assert_eq!(
+                load_records(&fixture.member)
+                    .expect("store")
+                    .holds(late.id()),
+                !empty,
+            );
+        }
+    }
 }
 
 #[test]
@@ -1398,6 +1485,8 @@ fn a_member_whose_server_holds_records_it_cannot_take_lets_no_key_in_by_proof() 
     chain.push(&removal);
     let chain = Arc::new(std::sync::Mutex::new(chain));
     let host = chain_host(&chain, 400);
+    // A server of the fence's build, so the pass's freshness turns on what it left untaken alone.
+    host.set_bound(Some(crate::crossing::RecordsBound::uncrossed()));
     // The vault's server moved to the host, and m22's applied state follows it.
     let mut moved = configured(m22).expect("m22's config");
     moved.source = Source::Url(host.url(crate::ALAB_VAULT));
@@ -1417,11 +1506,15 @@ fn a_member_whose_server_holds_records_it_cannot_take_lets_no_key_in_by_proof() 
         RecordsPass {
             added: 0,
             untaken: true,
+            unstated: false,
         },
         "the next pass names what it could not take, and the server sends nothing"
     );
     let (_, request, _) = super::log_entries_tests::newcomer(macs.root.path(), m22, "m7-fresh");
     let proven = Proven {
+        reader: crate::members::bundle::Reader::BoundedLog(
+            crate::crossing::RecordsBound::uncrossed(),
+        ),
         request: &request,
         node: n7,
         name: "m7",
@@ -1892,4 +1985,542 @@ fn a_records_pass_reads_at_most_two_peers_long_answers_whole_at_once() {
         "the records the long answer brought"
     );
     assert_eq!(pass.added, lacked.len());
+}
+
+/// What `admit_by_proof` decides for m7's node key under a fresh key at m22 (the seat a Mac that
+/// went dark moves to its new key), where m22's only answering server is a host serving m22's own
+/// log that states `bound` (`None`: a server before the fence), m22's crossed mark stored where
+/// `crossed`.
+fn proof_through_host(crossed: bool, bound: Option<crate::crossing::RecordsBound>) -> Readmit {
+    use ring::signature::{Ed25519KeyPair, KeyPair as _};
+
+    let macs = super::log_entries_tests::two_macs(&[(
+        Audience::Everyone,
+        "shared",
+        b"everyone-v1".as_slice(),
+    )]);
+    let (m22, m7) = (&macs.m22, &macs.m7);
+    let pair = Ed25519KeyPair::from_seed_unchecked(&[0x0b; 32]).expect("node key");
+    let n7: [u8; 32] = pair.public_key().as_ref().try_into().expect("32 bytes");
+    publish_local_node_key(m7, n7, |network, actor| {
+        pair.sign(&crate::membership_log::node_proof_message(network, actor))
+            .as_ref()
+            .try_into()
+            .expect("64 bytes")
+    })
+    .expect("m7 publishes its node key")
+    .expect("a Node record");
+    post_records_to_servers(m7).expect("m7 posts its records");
+    sync_records(m22, None).expect("m22 pulls m7's Node record");
+    // The vault's server moved to the host, the only one that answers.
+    macs.server.stop();
+    let store = load_records(m22).expect("m22's store");
+    let chain = Arc::new(std::sync::Mutex::new(Chain::of(
+        store.log().expect("m22's log").records(),
+    )));
+    let host = chain_host(&chain, 204);
+    host.set_bound(bound);
+    let mut moved = configured(m22).expect("m22's config");
+    moved.source = Source::Url(host.url(crate::ALAB_VAULT));
+    save_config(m22, &moved).expect("m22 reads the host");
+    let mut state = load_state(m22).expect("m22's state");
+    state.source_identity = Some(source_identity(&moved));
+    save_state(m22, &state).expect("m22's state follows its source");
+    if crossed {
+        crossing_mark(m22).store().expect("m22's mark");
+    }
+    let _answering = ServersAnswering::set();
+    let (_, request, _) = super::log_entries_tests::newcomer(macs.root.path(), m22, "m7-fresh");
+    let proven = Proven {
+        reader: crate::members::bundle::Reader::BoundedLog(
+            crate::crossing::RecordsBound::uncrossed(),
+        ),
+        request: &request,
+        node: n7,
+        name: "m7",
+        fleet: false,
+        lan: false,
+        fresh: false,
+        book: Book {
+            node_id_held_out: false,
+            node_id_seated: false,
+            node_elsewhere: false,
+            moved_seats_read: true,
+        },
+    };
+    let later = aterm_time::unix_millis().expect("clock") + super::readmit::DARK_FOR_MS + 1;
+    let decided = admit_by_proof(m22, &proven, later).expect("decided");
+    host.end();
+    drop(macs.root);
+    decided
+}
+
+/// A member whose only server states no records bound did not read the vault's newest records,
+/// crossed or not ([`crate::crossing`]): a server before the fence holds no more than the legacy
+/// bound and takes nothing past it, and once any log of the vault crossed, every crossed node
+/// refuses it, so it may not hold a removal; and a member whose own log has not crossed cannot
+/// tell a vault that never crossed from such a server frozen past the crossing. A crossed
+/// member's pass takes nothing from that server (it ends in an error); an uncrossed member's
+/// pass takes its answer and ends `Ok`, but not fresh ([`RecordsPass::unstated`]). Neither lets
+/// a key in by proof.
+///
+/// CONTROL: the same host stating its bound lets the key in, crossed or not, so the refusals
+/// turn on the bound alone. An uncrossed member's refusal is the pass's freshness itself: with
+/// `RecordsPass::fresh` ignoring `unstated` (the gate before this fix, which held only crossed
+/// members), that member lets the key in.
+#[test]
+fn a_member_whose_only_server_states_no_bound_lets_no_key_in_by_proof() {
+    for crossed in [true, false] {
+        let decided = proof_through_host(crossed, None);
+        let Readmit::Refused(why) = &decided else {
+            panic!(
+                "a member (crossed: {crossed}) read a server before the fence as fresh: \
+                 {decided:?}"
+            );
+        };
+        assert!(why.contains("newest records"), "{why}");
+
+        let stated = proof_through_host(crossed, Some(crate::crossing::RecordsBound::uncrossed()));
+        assert!(
+            matches!(stated, Readmit::Let { .. }),
+            "control: a host that states its bound is fresh (crossed: {crossed}): {stated:?}"
+        );
+    }
+}
+
+/// What [`crossing_pass`] saw: whether the pass ended `Ok`, whether this Mac's crossed mark is
+/// stored after it, whether its store holds the founder's `next` and `after` records complete,
+/// and whether it holds `after` waiting on a parent.
+#[derive(Debug, PartialEq, Eq)]
+struct Crossing {
+    ok: bool,
+    marked: bool,
+    next: bool,
+    after: bool,
+    waiting: bool,
+}
+
+/// One records pass of a Mac holding [`lacking`]'s eight records, crossed (its mark stored first)
+/// where `crossed`, under `faults`: its source states `source` of its records and sends the
+/// founder's two next records (`next`, then `after`, which descends from it) in the range
+/// `from_source`, or records the Mac holds where `from_source` is `None`; a peer beside it, where
+/// `peer` is `Some`, states what `peer` holds and sends both.
+fn crossing_pass(
+    crossed: bool,
+    faults: crate::crossing::Faults,
+    source: Option<crate::crossing::RecordsBound>,
+    from_source: Option<std::ops::Range<usize>>,
+    peer: Option<Option<crate::crossing::RecordsBound>>,
+) -> Crossing {
+    let _answering = ServersAnswering::set();
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let mut fixture = lacking(root.path(), 400);
+    let next = fixture.mint(7);
+    let after = fixture.mint(8);
+    let held = load_records(&fixture.member)
+        .expect("the member's store")
+        .missing(&[]);
+    let sent = encode_records(
+        &from_source.map_or(held, |range| [next.clone(), after.clone()][range].to_vec()),
+    );
+    let primary = RecordsHost::start(Box::new(move |_| (sent.clone(), false)), 400);
+    primary.set_bound(source);
+    let both = encode_records(&[next.clone(), after.clone()]);
+    let peer = peer.map(|bound| {
+        let host = RecordsHost::start(Box::new(move |_| (both.clone(), false)), 400);
+        host.set_bound(bound);
+        host
+    });
+    let mut moved = configured(&fixture.member).expect("the member's config");
+    moved.source = Source::Url(primary.url("team"));
+    save_config(&fixture.member, &moved).expect("the member reads the primary");
+    let mark = crossing_mark(&fixture.member);
+    if crossed {
+        mark.store().expect("the member's mark");
+    }
+    let peers: Vec<String> = peer.iter().map(|host| host.url("team")).collect();
+    let found = PeerDiscovery::selected(&peers);
+    crate::crossing::inject(mark.path(), faults);
+    let pass = sync_records_until(&fixture.member, None, &[], Some(&found), None, None);
+    crate::crossing::inject(mark.path(), crate::crossing::Faults::default());
+    let store = load_records(&fixture.member).expect("the member's store");
+    let seen = Crossing {
+        ok: pass.is_ok(),
+        marked: mark.stored().expect("look"),
+        next: store.complete_bytes(next.id()).is_some(),
+        after: store.complete_bytes(after.id()).is_some(),
+        waiting: store.contains(after.id()) && store.complete_bytes(after.id()).is_none(),
+    };
+    if let Some(peer) = peer {
+        peer.end();
+    }
+    primary.end();
+    fixture.host.end();
+    seen
+}
+
+/// A marked server with this client's capacity. Numeric mismatches are tested separately.
+fn crossed_bound() -> Option<crate::crossing::RecordsBound> {
+    Some(crate::crossing::RecordsBound::here(true))
+}
+
+#[test]
+fn numeric_incompatible_source_never_changes_records_or_crossing_state() {
+    for initially_crossed in [false, true] {
+        for range in [None, Some(0..2)] {
+            let observed = crossing_pass(
+                initially_crossed,
+                crate::crossing::Faults::default(),
+                Some(crate::crossing::RecordsBound::of(
+                    crate::crossing::fixture::RAISED.held,
+                    true,
+                )),
+                range,
+                None,
+            );
+            assert_eq!(
+                observed,
+                Crossing {
+                    ok: false,
+                    marked: initially_crossed,
+                    next: false,
+                    after: false,
+                    waiting: false,
+                }
+            );
+        }
+    }
+}
+
+/// Both branches fit an uncrossed server, but their union crosses the legacy bound.
+/// Only a server that can follow that union can make the resulting pass fresh.
+#[test]
+fn merging_uncrossed_branches_requires_a_source_compatible_with_the_result() {
+    use crate::crossing::{RecordsBound, fixture::RAISED};
+    use crate::membership_log::LEGACY_RECORDS;
+
+    let _answering = ServersAnswering::set();
+    for peer_capacity in [LEGACY_RECORDS, RAISED.held] {
+        RAISED.within(|| {
+            let root = aterm_tempfile::tempdir().expect("tempdir");
+            let mut fixture = lacking(root.path(), 400);
+            while fixture.log.held_count() < LEGACY_RECORDS - 3 {
+                fixture.mint(fixture.log.held_count() as u64);
+            }
+            let mut remote = fixture.log.clone();
+            fixture.mint(10_000);
+            fixture.mint(10_001);
+            save_records(&fixture.member, &encode_records(fixture.log.records()))
+                .expect("the local branch");
+            let tail: Vec<_> = (20_000..20_003)
+                .map(|n| {
+                    named(
+                        &mut remote,
+                        &fixture.writer,
+                        fixture.incarnation,
+                        &fixture.founder,
+                        n,
+                    )
+                })
+                .collect();
+            assert_eq!(remote.held_count(), LEGACY_RECORDS);
+            let wire = encode_records(&tail);
+            let source = RecordsHost::start(Box::new(move |_| (wire.clone(), true)), 400);
+            source.set_bound(Some(RecordsBound::of(peer_capacity, false)));
+            let mut config = configured(&fixture.member).expect("config");
+            config.source = Source::Url(source.url("team"));
+            save_config(&fixture.member, &config).expect("source");
+            let found = PeerDiscovery::selected(&[]);
+            let pass = sync_records_until(
+                &fixture.member,
+                None,
+                &[],
+                Some(&found),
+                Some(Instant::now() + HANG_DETECTOR),
+                None,
+            )
+            .expect("the valid branch is retained");
+            // Inspect the durable union through the selected local storage format.
+            assert_eq!(
+                std::fs::read(fixture.member.records_data_file().unwrap())
+                    .expect("persisted union"),
+                encode_records(fixture.log.records().chain(&tail))
+            );
+            assert_eq!(pass.added, 3);
+            assert!(!pass.untaken);
+            assert!(crossing_mark(&fixture.member).stored().expect("mark"));
+            assert_eq!(pass.fresh(), peer_capacity == RAISED.held);
+            assert_eq!(source.posts(), 0, "a bounded freshness read does not post");
+            source.end();
+            fixture.host.end();
+        });
+    }
+}
+
+/// A Mac that has not crossed stores its crossed mark ([`crate::crossing`]) before its records
+/// file holds a record a server that states its log crossed sent it; and from then on, in the
+/// same pass, it takes nothing from a server that states no bound. A Mac that dies between the
+/// mark and the write holds the mark and none of those records.
+///
+/// CONTROL (in the test): a peer that states its bound is taken in the same pass, before what the
+/// crossed server sent, so the crossed server's record, which the peer sent too, brings the store
+/// nothing new and stores no mark.
+/// CONTROL (MUTANT `Faults::mark_after_take`, dying between): the Mac holds the crossed server's
+/// record with no mark, which it would then post to a server before the fence as an uncrossed
+/// Mac's.
+#[test]
+fn an_uncrossed_mac_stores_its_mark_before_it_holds_a_crossed_servers_records() {
+    use crate::crossing::{Faults, RecordsBound};
+
+    let unstated_peer = Some(None);
+    assert_eq!(
+        crossing_pass(
+            false,
+            Faults::default(),
+            crossed_bound(),
+            Some(0..1),
+            unstated_peer
+        ),
+        Crossing {
+            ok: true,
+            marked: true,
+            next: true,
+            after: false,
+            waiting: false
+        },
+        "the mark, the crossed server's record, and nothing of the peer that states no bound"
+    );
+    assert_eq!(
+        crossing_pass(
+            false,
+            Faults::default(),
+            crossed_bound(),
+            Some(0..1),
+            Some(Some(RecordsBound::uncrossed()))
+        ),
+        Crossing {
+            ok: true,
+            marked: false,
+            next: true,
+            after: true,
+            waiting: false
+        },
+        "control: a peer that states its bound is taken first, the crossed server's record with it"
+    );
+    let dies = Faults {
+        dies_between: true,
+        ..Faults::default()
+    };
+    assert_eq!(
+        crossing_pass(false, dies, crossed_bound(), Some(0..1), None),
+        Crossing {
+            ok: false,
+            marked: true,
+            next: false,
+            after: false,
+            waiting: false
+        },
+        "dying between: the mark and no record"
+    );
+    assert_eq!(
+        crossing_pass(
+            false,
+            Faults {
+                mark_after_take: true,
+                ..dies
+            },
+            crossed_bound(),
+            Some(0..1),
+            None
+        ),
+        Crossing {
+            ok: false,
+            marked: false,
+            next: true,
+            after: false,
+            waiting: false
+        },
+        "mutant: the crossed server's record is held with no mark"
+    );
+}
+
+/// A server that states its log crossed and sends only records this Mac holds stores no mark:
+/// any LAN host can answer a records pull stating a crossed bound, and a Mac it crossed would
+/// take nothing from an old server, and count none fresh, for good.
+///
+/// CONTROL (MUTANT `Faults::mark_on_receipt`, the order before this fix): the same answer stores
+/// the mark.
+#[test]
+fn a_crossed_servers_answer_of_records_the_mac_holds_stores_no_mark() {
+    use crate::crossing::Faults;
+
+    let seen = crossing_pass(false, Faults::default(), crossed_bound(), None, None);
+    assert!(seen.ok && !seen.marked, "{seen:?}");
+    let mutant = crossing_pass(
+        false,
+        Faults {
+            mark_on_receipt: true,
+            ..Faults::default()
+        },
+        crossed_bound(),
+        None,
+        None,
+    );
+    assert!(mutant.ok && mutant.marked, "mutant: {mutant:?}");
+}
+
+/// A Mac that has not crossed takes nothing of a crossed server's answer that brings it only
+/// records waiting on a parent, and stores no mark: any key that ever held a seat (a removed
+/// Mac's among them, `Log::insert`) can sign such a record, naming a parent that never comes,
+/// and it would cross the Mac for good though it never completes.
+///
+/// CONTROL (in the test): the same answer from a server that states it has not crossed is held
+/// waiting, so what the pass leaves out turns on the crossed bound alone; and a crossed server's
+/// answer that brings the parent with it is taken, after the mark.
+/// CONTROL (MUTANT `Faults::mark_on_waiting`, the rule before this fix): the crossed answer
+/// stores the mark, and the Mac holds the record waiting.
+#[test]
+fn a_crossed_servers_answer_of_records_that_only_wait_stores_no_mark() {
+    use crate::crossing::{Faults, RecordsBound};
+
+    assert_eq!(
+        crossing_pass(false, Faults::default(), crossed_bound(), Some(1..2), None),
+        Crossing {
+            ok: true,
+            marked: false,
+            next: false,
+            after: false,
+            waiting: false
+        },
+        "nothing taken, and no mark"
+    );
+    assert_eq!(
+        crossing_pass(
+            false,
+            Faults::default(),
+            Some(RecordsBound::uncrossed()),
+            Some(1..2),
+            None
+        ),
+        Crossing {
+            ok: true,
+            marked: false,
+            next: false,
+            after: false,
+            waiting: true
+        },
+        "control: an uncrossed server's record is held waiting"
+    );
+    assert_eq!(
+        crossing_pass(false, Faults::default(), crossed_bound(), Some(0..2), None),
+        Crossing {
+            ok: true,
+            marked: true,
+            next: true,
+            after: true,
+            waiting: false
+        },
+        "control: with its parent, the record is taken after the mark"
+    );
+    assert_eq!(
+        crossing_pass(
+            false,
+            Faults {
+                mark_on_waiting: true,
+                ..Faults::default()
+            },
+            crossed_bound(),
+            Some(1..2),
+            None
+        ),
+        Crossing {
+            ok: true,
+            marked: true,
+            next: false,
+            after: false,
+            waiting: true
+        },
+        "mutant: one waiting record crossed the Mac"
+    );
+}
+
+/// A crossed Mac takes nothing from a server that states no records bound: its answer counts as
+/// one that failed, and the pass, with no other source, fails.
+///
+/// CONTROL (in the test): the same server stating its bound is taken.
+#[test]
+fn a_crossed_mac_takes_nothing_from_a_server_that_states_no_bound() {
+    use crate::crossing::{Faults, RecordsBound};
+
+    assert_eq!(
+        crossing_pass(true, Faults::default(), None, Some(0..2), None),
+        Crossing {
+            ok: false,
+            marked: true,
+            next: false,
+            after: false,
+            waiting: false
+        },
+        "nothing taken from a server that states no bound"
+    );
+    assert_eq!(
+        crossing_pass(
+            true,
+            Faults::default(),
+            Some(RecordsBound::uncrossed()),
+            Some(0..2),
+            None
+        ),
+        Crossing {
+            ok: true,
+            marked: true,
+            next: true,
+            after: true,
+            waiting: false
+        },
+        "control: the same server stating its bound is taken"
+    );
+}
+
+/// A Mac whose log crossed during a records pass (another pass of its own stored the mark while
+/// this one pulled) posts nothing to a server that stated no records bound and said it lacks the
+/// Mac's frontier: what it holds may now be a crossed log's.
+///
+/// CONTROL (in the test): the same pass, with no mark stored meanwhile, posts that server its
+/// store, as an uncrossed Mac posts a server before the fence.
+#[test]
+fn a_mac_that_crossed_during_a_pass_posts_nothing_to_a_server_that_states_no_bound() {
+    let posts = |crossing: bool| {
+        let _answering = ServersAnswering::set();
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let fixture = lacking(root.path(), 204);
+        let mark = crossing_mark(&fixture.member);
+        let meanwhile = mark.clone();
+        let host = RecordsHost::start(
+            Box::new(move |_| {
+                if crossing {
+                    meanwhile.store().expect("the mark, meanwhile");
+                }
+                (Vec::new(), true)
+            }),
+            204,
+        );
+        let mut moved = configured(&fixture.member).expect("the member's config");
+        moved.source = Source::Url(host.url("team"));
+        save_config(&fixture.member, &moved).expect("the member reads the host");
+        let found = PeerDiscovery::selected(&[]);
+        let pass = sync_records_until(&fixture.member, None, &[], Some(&found), None, None);
+        let posted = host.posts();
+        let marked = mark.stored().expect("look");
+        host.end();
+        fixture.host.end();
+        assert_eq!(
+            pass.is_err(),
+            crossing,
+            "a changed crossing rejects the stale pass"
+        );
+        (posted, marked)
+    };
+    assert_eq!(posts(true), (0, true), "no post once the Mac crossed");
+    assert_eq!(posts(false), (1, false), "control: an uncrossed Mac posts");
 }

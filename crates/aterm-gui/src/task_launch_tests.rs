@@ -2066,29 +2066,72 @@ fn a_walled_default_on_a_program_that_ignores_codex_auth_path_refuses_alike_acro
 #[test]
 fn a_signed_out_default_on_a_program_that_ignores_codex_auth_path_names_its_sign_in() {
     use aterm_agent::harness::accounts::{self, Cli};
+    use aterm_agent::harness::accounts_pool::{Reading, UsageObservation, UsageReader};
     let pool = CodexPool::new();
     let old = aterm_agent::harness::codex_alab::lay_package(&pool.root.join("store/old"), false);
-    pool.seat(POOL_NOW)
-        .store(Cli::Codex)
-        .transact_within(&accounts::LOCK_LADDER, POOL_NOW, &mut None, |s| {
-            Ok(accounts::note_auth(
-                s,
-                "main",
-                accounts::Auth::SignedOut,
-                POOL_NOW,
-            ))
-        })
-        .expect("sign `main` out");
+    let native =
+        aterm_agent::harness::codex_alab::lay_package(&pool.root.join("store/native"), true);
+    let default = pool.home.join(".codex");
+    std::fs::write(
+        default.join("auth.json"),
+        r#"{"tokens":{"access_token":"synthetic-rejected-token"}}"#,
+    )
+    .unwrap();
+    struct Rejected<'a> {
+        default: &'a Path,
+        user_home: &'a Path,
+    }
+    impl UsageReader for Rejected<'_> {
+        fn read(&self, _: Cli, at: &Path, _: Option<&str>, _: i64) -> Reading {
+            if at == self.default {
+                Reading::SignedOut
+            } else {
+                Reading::Unread
+            }
+        }
+        fn read_observed(
+            &self,
+            cli: Cli,
+            at: &Path,
+            expected: Option<&str>,
+            now: i64,
+        ) -> UsageObservation {
+            UsageObservation::from_fixture(self.read(cli, at, expected, now), at, self.user_home)
+                .expect("owned fixture credentials")
+        }
+    }
+    let reader = Rejected {
+        default: &default,
+        user_home: &pool.home,
+    };
+    // Seed through the real poll writer on a program that can use either row.
+    let seeded = aterm_agent::harness::accounts_pool::launch_env_for(
+        &pool.seat(POOL_NOW),
+        Cli::Codex,
+        &reader,
+        Some(&native),
+    )
+    .expect("record the contextual provider rejection");
+    assert_eq!(
+        seeded.as_ref().map(|login| login.label.as_str()),
+        Some("work")
+    );
     let refused = pool
         .launch(&old, POOL_NOW + 10, MainReads::Unread)
         .expect_err("no Codex account runs here while `main` is signed out");
     assert!(refused.contains("`aterm ai login codex`"), "{refused}");
     assert!(!refused.contains("harness accounts login"), "{refused}");
     assert!(!refused.contains("accounts use"), "{refused}");
+    let path = pool.cfg.join("accounts-codex.toml");
+    let roster = accounts::Roster::load_for(Cli::Codex, &path).unwrap();
     assert!(
-        pool.pin("main", POOL_NOW + 11).is_err(),
-        "the pin is refused"
+        pool.seat(POOL_NOW + 11)
+            .store(Cli::Codex)
+            .select_account_for(Cli::Codex, &roster, &path, "main", POOL_NOW + 11)
+            .is_err(),
+        "the rejected login cannot be pinned"
     );
+    assert!(!pool.pinned(POOL_NOW + 11));
 
     // No login file in the default home is no login of `main` here either, whatever the
     // records say: the same sign-in, never a start on a home with nothing to sign in with.
@@ -2534,4 +2577,138 @@ fn an_agy_worker_launch_is_held_while_every_model_pool_is_spent_and_starts_on_re
         "{stalled:?}"
     );
     assert_eq!(tries.get(), 1 + POOL_RETRIES);
+}
+
+#[test]
+fn native_google_worker_installs_before_preparing_its_guard() {
+    use aterm_agent::harness::worker::{Readiness, Refused};
+    let cli = aterm_agent::harness::worker::worker_cli(Program::Agy).unwrap();
+    for (present, lays) in [(false, true), (true, true), (false, false)] {
+        let store = FakeStore {
+            present: std::cell::Cell::new(present),
+            held: None,
+            lays,
+            asked: std::cell::RefCell::new(Vec::new()),
+        };
+        let prepared = std::cell::Cell::new(false);
+        let alive = std::cell::Cell::new(false);
+        struct Guard<'a>(&'a std::cell::Cell<bool>);
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                self.0.set(false);
+            }
+        }
+        let mut expected = cli.plain();
+        expected.exe = "/verified/native/agy".into();
+        expected.env = vec![("HOME".into(), "/verified/native/home".into())];
+        expected.args = Ok(vec!["--gemini_dir=/verified/native/home/.gemini".into()]);
+        expected.unset = vec!["GEMINI_API_KEY"];
+        let result = admit_prepared_worker(cli, cli.plain(), None, &|_| {}, &|| (), &store, |_| {
+            assert!(
+                store.present.get(),
+                "preparation ran before native installation"
+            );
+            store.asked.borrow_mut().push("prepare".into());
+            prepared.set(true);
+            alive.set(true);
+            Ok((expected.clone(), Guard(&alive)))
+        });
+        if !lays {
+            assert!(matches!(result, Err(Refused::Program(_))));
+            assert!(!prepared.get());
+            continue;
+        }
+        let (admitted, guard) = result.unwrap();
+        assert_eq!(admitted.starter(), &expected);
+        assert_eq!(
+            admitted.readiness(),
+            if present {
+                &Readiness::Present
+            } else {
+                &Readiness::Installed
+            }
+        );
+        assert!(prepared.get() && alive.get());
+        assert_eq!(
+            *store.asked.borrow(),
+            if present {
+                vec!["present", "prepare"]
+            } else {
+                vec!["present", "held", "install agy", "present", "prepare"]
+            }
+        );
+        drop(guard);
+        assert!(!alive.get());
+    }
+}
+
+#[test]
+fn prepared_worker_retains_holds_and_rechecks_replacement_sign_in() {
+    use aterm_agent::harness::worker::Refused;
+    let agy = aterm_agent::harness::worker::worker_cli(Program::Agy).unwrap();
+    let held = FakeStore {
+        present: std::cell::Cell::new(false),
+        held: Some("explicit package hold"),
+        lays: true,
+        asked: std::cell::RefCell::new(Vec::new()),
+    };
+    let (admitted, ()) =
+        admit_prepared_worker(agy, agy.plain(), None, &|_| {}, &|| (), &held, |starter| {
+            Ok((starter, ()))
+        })
+        .unwrap();
+    assert!(
+        admitted
+            .kept_off()
+            .unwrap()
+            .contains("explicit package hold")
+    );
+    assert_eq!(*held.asked.borrow(), ["present", "held"]);
+
+    let grok = aterm_agent::harness::worker::worker_cli(Program::Grok).unwrap();
+    let root = aterm_tempfile::tempdir().unwrap();
+    let auth = root.path().join(".grok/auth.json");
+    std::fs::create_dir_all(auth.parent().unwrap()).unwrap();
+    let store = FakeStore {
+        present: std::cell::Cell::new(true),
+        held: None,
+        lays: true,
+        asked: std::cell::RefCell::new(Vec::new()),
+    };
+    let result = admit_prepared_worker(
+        grok,
+        grok.plain(),
+        Some(root.path()),
+        &|_| {},
+        &|| (),
+        &store,
+        |_| -> Result<(_, ()), String> { panic!("signed-out starter reached preparation") },
+    );
+    assert!(matches!(result, Err(Refused::SignedOut(_))));
+    assert!(store.asked.borrow().is_empty());
+    std::fs::write(&auth, r#"{"token":"synthetic"}"#).unwrap();
+    let dropped = std::cell::Cell::new(false);
+    struct Guard<'a>(&'a std::cell::Cell<bool>);
+    impl Drop for Guard<'_> {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
+    }
+    let result = admit_prepared_worker(
+        grok,
+        grok.plain(),
+        Some(root.path()),
+        &|_| {},
+        &|| (),
+        &store,
+        |starter| {
+            std::fs::remove_file(&auth).unwrap();
+            Ok((starter, Guard(&dropped)))
+        },
+    );
+    assert!(matches!(result, Err(Refused::SignedOut(_))));
+    assert!(
+        dropped.get(),
+        "refused replacement retained its authentication guard"
+    );
 }

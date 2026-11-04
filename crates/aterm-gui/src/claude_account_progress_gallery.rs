@@ -189,6 +189,24 @@ fn account_progress_gallery() {
             aterm_agent::harness::account_progress::EXECUTION_PREPARED_FINDING,
         ),
         (
+            "activity-menu-recheck-unavailable",
+            120,
+            ProgressPhase::Unknown,
+            0,
+            Some("weekly"),
+            None,
+            "The account roster could not be read",
+        ),
+        (
+            "activity-menu-recheck-unavailable-narrow",
+            60,
+            ProgressPhase::Unknown,
+            0,
+            Some("weekly"),
+            None,
+            "The account roster could not be read",
+        ),
+        (
             "activity-menu-bindings-changed",
             120,
             ProgressPhase::Unknown,
@@ -259,6 +277,24 @@ fn account_progress_gallery() {
             Some("weekly"),
             Some(1_793_040_160),
             "No eligible alternate account",
+        ),
+        (
+            "lab-accounts-refresh",
+            120,
+            ProgressPhase::Unknown,
+            0,
+            None,
+            None,
+            aterm_agent::harness::footer::UNOBSERVED_RECOVERY_FINDING,
+        ),
+        (
+            "lab-accounts-refresh-narrow",
+            60,
+            ProgressPhase::Unknown,
+            0,
+            None,
+            None,
+            aterm_agent::harness::footer::UNOBSERVED_RECOVERY_FINDING,
         ),
         (
             "lab-shared-failure",
@@ -465,6 +501,16 @@ fn account_progress_gallery() {
         if name.contains("bindings-changed") {
             progress.eligible = None;
         }
+        let recheck_unavailable = name.contains("recheck-unavailable");
+        if recheck_unavailable {
+            progress.account = None;
+            progress.known = None;
+            progress.eligible = None;
+            progress.details.push(format!(
+                "{}Selected alternate: fixture-alternate",
+                aterm_agent::harness::account_progress::RECOVERY_HISTORY_PREFIX,
+            ));
+        }
         if name.contains("execution-") {
             progress.known = None;
             progress.eligible = None;
@@ -496,6 +542,7 @@ fn account_progress_gallery() {
         }
         if name.starts_with("activity-menu")
             && !name.contains("execution-")
+            && !recheck_unavailable
             && !observer_busy
             && !autopilot_off
         {
@@ -596,7 +643,7 @@ fn account_progress_gallery() {
         app.recompute_sparkle();
         let rows = if name == "activity-menu-no-next-short" || name.contains("newest-short") {
             14
-        } else if name.starts_with("lab-shared-failure") {
+        } else if name.starts_with("lab-") {
             80
         } else {
             probe::ROWS
@@ -666,7 +713,7 @@ fn account_progress_gallery() {
                     .as_ref()
                     .map_or(0, |progress| progress.observed_at),
             );
-            if name.contains("unobserved-recovery") {
+            if name.contains("unobserved-recovery") || recheck_unavailable {
                 accounts.clear();
             }
             let facts = crate::fact_menu::FactMenuFacts {
@@ -684,15 +731,18 @@ fn account_progress_gallery() {
                 cli: Some(aterm_agent::harness::accounts::Cli::Claude),
                 pool_unpinned: true,
                 accounts,
-                accounts_refused: name
-                    .contains("unobserved-recovery")
-                    .then(|| "Account roster has not been observed".into()),
+                accounts_refused: if recheck_unavailable {
+                    Some(detail.into())
+                } else {
+                    name.contains("unobserved-recovery")
+                        .then(|| "Account roster has not been observed".into())
+                },
                 ..Default::default()
             };
             let menu = app.autopilot_menu.as_mut().unwrap();
             menu.rows = crate::fact_menu::rows(fact, &facts);
             menu.highlight = None;
-        } else if name.starts_with("lab-shared-failure") {
+        } else if name.starts_with("lab-") {
             app.pool
                 .get(session)
                 .unwrap()
@@ -702,29 +752,33 @@ fn account_progress_gallery() {
                 .unwrap()
                 .set_program(4242, Some("claude".into()));
             assert!(app.proxy.is_none(), "the scene starts no account reader");
-            let snapshot = app.harness_state();
-            let published = snapshot
-                .lab
-                .sessions
-                .iter()
-                .find(|entry| entry.local_id == session)
-                .expect("fixture session");
-            assert!(published.facts.iter().any(|(key, value)| {
-                key == "Last local sign-in" && value.contains("headless browser")
-            }));
+            if name.starts_with("lab-shared-failure") {
+                let snapshot = app.harness_state();
+                let published = snapshot
+                    .lab
+                    .sessions
+                    .iter()
+                    .find(|entry| entry.local_id == session)
+                    .expect("fixture session");
+                assert!(published.facts.iter().any(|(key, value)| {
+                    key == "Last local sign-in" && value.contains("headless browser")
+                }));
+            }
             assert!(
                 app.open_settings_tab_in_window(wid, crate::native_settings::SettingsRoute::Lab)
             );
-            let key = |row: &str| {
-                crate::native_ui::UiKey::new(format!("lab/session/{session}/row/{row}"))
+            let keys = if name.starts_with("lab-accounts-refresh") {
+                ["lab/inventory/row/scope", "lab/accounts/refresh"]
+                    .map(crate::native_ui::UiKey::new)
+            } else {
+                ["last-local-sign-in", "sign-in-finished"].map(|row| {
+                    crate::native_ui::UiKey::new(format!("lab/session/{session}/row/{row}"))
+                })
             };
             let mut visible = false;
             for _ in 0..512 {
                 let compiled = app.compiled_native_ui(wid).unwrap();
-                if ["last-local-sign-in", "sign-in-finished"]
-                    .iter()
-                    .all(|row| row_is_visible(&compiled, &key(row)))
-                {
+                if keys.iter().all(|key| row_is_visible(&compiled, key)) {
                     visible = true;
                     break;
                 }
@@ -733,7 +787,7 @@ fn account_progress_gallery() {
             }
             assert!(
                 visible,
-                "the finite Lab page exposes the historical failure and timestamp"
+                "the finite Lab page exposes {name}'s account observations"
             );
         }
         let before = (app.windows[&wid].rows, app.windows[&wid].cols);

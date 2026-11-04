@@ -5,8 +5,15 @@ use super::*;
 use aterm_spec::interp::State as ModelState;
 
 const NOW: i64 = 1_790_000_000;
+// This model varies token user IDs; the native-reader matrix checks conflicting emails.
+const ACCOUNT_EMAIL: &str = "account@example.test";
 
 fn represented_read(state: &ModelState, variant: u8) -> [(&'static str, i64); 8] {
+    #[derive(Clone, Copy)]
+    enum TokenRole {
+        Id,
+        Access,
+    }
     let home = aterm_tempfile::tempdir().unwrap();
     let credential_home = home
         .path()
@@ -14,7 +21,7 @@ fn represented_read(state: &ModelState, variant: u8) -> [(&'static str, i64); 8]
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let address = listener.local_addr().unwrap();
     let issuer = format!("http://{address}");
-    let token = |user: i64, email: &str| {
+    let token = |user: i64, role: TokenRole| {
         let mut auth = json!({"chatgpt_account_id":"claimed-workspace", "chatgpt_plan_type":"pro"});
         if user != 0 {
             let name = if variant == 3 {
@@ -30,8 +37,8 @@ fn represented_read(state: &ModelState, variant: u8) -> [(&'static str, i64); 8]
                 name.into()
             };
             let legacy = variant == 1
-                || (variant == 13 && email == "access@example.test")
-                || (variant == 16 && email == "identity@example.test")
+                || (variant == 13 && matches!(role, TokenRole::Access))
+                || (variant == 16 && matches!(role, TokenRole::Id))
                 || variant == 15;
             if variant == 15 {
                 auth.as_object_mut()
@@ -50,12 +57,13 @@ fn represented_read(state: &ModelState, variant: u8) -> [(&'static str, i64); 8]
         let mut claims = json!({
             "exp": if variant == 12 { NOW - 1 } else { NOW + 7200 },
             "https://api.openai.com/auth":auth,
+            "fixture_role": match role { TokenRole::Id => "id", TokenRole::Access => "access" },
         });
         if variant != 9 {
             claims
                 .as_object_mut()
                 .unwrap()
-                .insert("email".into(), json!(email));
+                .insert("email".into(), json!(ACCOUNT_EMAIL));
         }
         make_jwt(&claims)
     };
@@ -63,13 +71,14 @@ fn represented_read(state: &ModelState, variant: u8) -> [(&'static str, i64); 8]
     let id_token = if !decoded || variant == 6 {
         "opaque-id".into()
     } else {
-        token(state["id"], "identity@example.test")
+        token(state["id"], TokenRole::Id)
     };
     let access_token = if !decoded || variant == 4 {
         "opaque-access".into()
     } else {
-        token(state["access"], "access@example.test")
+        token(state["access"], TokenRole::Access)
     };
+    assert_ne!(id_token, access_token);
     let mut doc = json!({
         "auth_mode": if variant == 7 { "chatgptAuthTokens" } else { "chatgpt" },
         "owner_note":"keep this independent metadata",
@@ -136,14 +145,7 @@ fn represented_read(state: &ModelState, variant: u8) -> [(&'static str, i64); 8]
         }
     };
     let expected = decoded.then(|| Account {
-        email: (variant != 9).then(|| {
-            if matches!(variant, 5 | 6 | 17) {
-                "access@example.test"
-            } else {
-                "identity@example.test"
-            }
-            .into()
-        }),
+        email: (variant != 9).then(|| ACCOUNT_EMAIL.into()),
         plan: Some("pro".into()),
     });
     let details_ok = |got: &Option<Account>, email: &Option<String>| match got {

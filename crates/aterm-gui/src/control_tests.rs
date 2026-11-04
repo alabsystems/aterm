@@ -2087,6 +2087,12 @@ fn acknowledge_then_exit(
     server: &CtlStream,
     outbox: &mut control_lanes::Outbox,
 ) -> ArtifactAckOutcome {
+    acknowledge_and_close(client, server);
+    await_ack(outbox, server)
+}
+
+/// Read a guarded reply and its challenge as `aterm ctl` does, acknowledge it, and close.
+fn acknowledge_and_close(client: CtlStream, server: &CtlStream) {
     {
         let mut writing = &client;
         let mut reader = BufReader::new(&client);
@@ -2112,7 +2118,96 @@ fn acknowledge_then_exit(
     }
     drop(client);
     assert_peer_detached(server);
-    await_ack(outbox, server)
+}
+
+/// Writes into `server`, and once the challenge line has gone out lets the client read the
+/// reply, acknowledge it and close, all before the outbox's next step: the order a preempted
+/// server thread meets when `aterm ctl` answers before the write call returns.
+#[cfg(unix)]
+struct AcknowledgedMidWrite<'a> {
+    server: &'a CtlStream,
+    client: Option<CtlStream>,
+}
+
+#[cfg(unix)]
+impl Write for AcknowledgedMidWrite<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = (&*self.server).write(bytes)?;
+        let challenge = aterm_types::control_verbs::ARTIFACT_REPLY_CHALLENGE_PREFIX.as_bytes();
+        if written == bytes.len()
+            && bytes.ends_with(b"\n")
+            && bytes.windows(challenge.len()).any(|w| w == challenge)
+            && let Some(client) = self.client.take()
+        {
+            acknowledge_and_close(client, self.server);
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        (&*self.server).flush()
+    }
+}
+
+/// A WRITE BOUND THAT CANNOT BE SET AFTER THE ANSWER WENT OUT DOES NOT UNDO IT: the client read
+/// the guarded reply, acknowledged it and closed before the outbox armed its flush and reset its
+/// write bound, so macOS refused both options; the reply is still delivered and its
+/// acknowledgement read.
+/// NEGATIVE CONTROL: the same order with the bare socket option as the arm fails the delivery
+/// with EINVAL on macOS, the failure `aterm ctl image` replies were quarantined by.
+#[cfg(unix)]
+#[test]
+fn an_answer_acknowledged_before_its_write_bound_is_reset_is_still_delivered() {
+    if !crate::test_alone::alone() {
+        return;
+    }
+    let deliver = |bare: bool| {
+        let alive = Arc::new(AtomicBool::new(true));
+        let (client, server) = CtlStream::pair().unwrap();
+        let reply = guarded_probe_reply(ReplyRetention::new(WireProbe {
+            alive: Arc::clone(&alive),
+            prepared: Arc::new(AtomicBool::new(false)),
+            fail_prepare: false,
+        }));
+        let mut outbox = outbox_of(reply);
+        let mut writer = AcknowledgedMidWrite {
+            server: &server,
+            client: Some(client),
+        };
+        let delivered = outbox.deliver_to(&mut writer, false, |timeout| {
+            if bare {
+                server.set_write_timeout(timeout)
+            } else {
+                arm_write(&server, timeout)
+            }
+        });
+        assert!(writer.client.is_none(), "the client acknowledged mid-write");
+        let outcome = delivered
+            .as_ref()
+            .is_ok()
+            .then(|| await_ack(&mut outbox, &server));
+        (delivered.map_err(|e| e.raw_os_error()), outcome, alive)
+    };
+
+    let (delivered, outcome, alive) = deliver(false);
+    assert_eq!(delivered, Ok(true), "the reply is out");
+    assert_eq!(outcome, Some(ArtifactAckOutcome::PeerAcknowledged));
+    assert!(
+        !alive.load(Ordering::Acquire),
+        "the acknowledged reply let its guard go"
+    );
+
+    #[cfg(target_os = "macos")]
+    {
+        let (delivered, outcome, _alive) = deliver(true);
+        assert_eq!(
+            delivered,
+            Err(Some(libc::EINVAL)),
+            "Darwin refuses the bound of a detached peer: the hazard arm_write absorbs"
+        );
+        assert_eq!(outcome, None);
+        last_quarantine_ticket();
+    }
 }
 
 /// Assert the peer really detached: the client end's last descriptor closed, which a copy a

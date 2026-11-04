@@ -8,6 +8,87 @@ use std::sync::Mutex;
 
 use super::facts::{Job, Ran, RunFailed, Runner};
 
+/// Records an explicit current Codex observation against synthetic file credentials.
+pub(crate) fn current_codex_auth(
+    store: &crate::harness::accounts::Store,
+    roster_path: &Path,
+    label: &str,
+    word: crate::harness::accounts::Auth,
+    at: i64,
+) {
+    current_codex_observation(store, roster_path, label, word, at, false);
+}
+
+/// Records a completed sign-in, including its current renewal and served metadata.
+pub(crate) fn current_codex_sign_in(
+    store: &crate::harness::accounts::Store,
+    roster_path: &Path,
+    label: &str,
+    at: i64,
+) {
+    current_codex_observation(
+        store,
+        roster_path,
+        label,
+        crate::harness::accounts::Auth::Ok,
+        at,
+        true,
+    );
+}
+
+fn current_codex_observation(
+    store: &crate::harness::accounts::Store,
+    roster_path: &Path,
+    label: &str,
+    word: crate::harness::accounts::Auth,
+    at: i64,
+    signed_in: bool,
+) {
+    use crate::harness::accounts::{self, Cli, Roster};
+    let raw = Roster::load_for(Cli::Codex, roster_path).unwrap();
+    store
+        .transact_logins(at, &mut None, |state, logins| {
+            let effective = accounts::bound(&raw, logins);
+            let row = effective.row(label).unwrap();
+            if store.capture_auth_context(row).is_none() {
+                let default = store.default_home().unwrap();
+                let home = row.dir.as_deref().map_or(default.as_path(), Path::new);
+                assert_eq!(
+                    std::fs::read_to_string(home.join("auth.json")).unwrap(),
+                    "{}"
+                );
+                let token = crate::harness::codex_app_login::tests::make_jwt(&aterm_json::json!({
+                    "email": row.email.as_deref().unwrap_or("fixture@example.test"),
+                    "https://api.openai.com/auth": {"chatgpt_user_id": "fixture-user"}
+                }));
+                std::fs::write(
+                    home.join("auth.json"),
+                    aterm_json::to_vec(&aterm_json::json!({
+                        "tokens": {"id_token": token, "access_token": token}
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+            }
+            let context = store
+                .capture_auth_context(row)
+                .expect("fixture current credentials");
+            if signed_in {
+                accounts::stage_checked_sign_in(
+                    state,
+                    raw.row(label).unwrap(),
+                    logins,
+                    context,
+                    at,
+                );
+            } else {
+                accounts::stage_auth(state, raw.row(label).unwrap(), logins, context, word, at);
+            }
+            Ok(Vec::new())
+        })
+        .unwrap();
+}
+
 /// One child the code asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Call {

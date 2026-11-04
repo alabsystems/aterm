@@ -11,12 +11,12 @@ use crate::network_deck::Target;
 use aterm_types::network_state::{ServiceAvailability, ServiceState};
 
 pub(super) const LAB_ACTION_PREFIX: &str = "lab/";
-pub(super) const LAB_REFRESH: &str = "lab/refresh";
+pub(super) const LAB_ACCOUNTS_REFRESH: &str = "lab/accounts/refresh";
 
 pub(super) fn lab_commands(lab: &LabState) -> Vec<Command> {
     vec![Command {
-        id: ActionId::new(LAB_REFRESH),
-        title: "Lab: Refresh observations".into(),
+        id: ActionId::new(LAB_ACCOUNTS_REFRESH),
+        title: "Lab: Refresh Claude accounts".into(),
         shortcut: None,
         enabled: !lab.collecting,
     }]
@@ -29,9 +29,9 @@ impl SettingsApp {
         action: &str,
         cx: &mut UpdateCx<'_>,
     ) -> EventResult {
-        if action == LAB_REFRESH {
+        if action == LAB_ACCOUNTS_REFRESH {
             if !self.harness.lab.collecting {
-                cx.harness(HarnessRequest::LabRefresh);
+                cx.harness(HarnessRequest::LabAccountsRefresh);
             }
         } else {
             return EventResult::Bubble;
@@ -132,17 +132,6 @@ pub(super) fn lab_page(
 
     let actions = [
         button(
-            "lab/refresh",
-            if lab.collecting {
-                "Reading observations…"
-            } else {
-                "Refresh observations"
-            },
-            ActionId::new(LAB_REFRESH),
-            inner,
-            !lab.collecting,
-        ),
-        button(
             "lab/harness",
             "Harness settings",
             route_action(SettingsRoute::Harness),
@@ -161,7 +150,7 @@ pub(super) fn lab_page(
     .collect();
     cards.extend(row_cards(
         "lab/actions",
-        ("Lab navigation", ("OBSERVATIONS", "OBSERVATIONS")),
+        ("Lab navigation", ("LAB NAVIGATION", "NAVIGATION")),
         actions,
         room,
         page_width,
@@ -196,11 +185,28 @@ pub(super) fn lab_page(
         ("Observed".into(), observed_time(lab.accounts.observed_at_ms)),
         ("Scope".into(), "Claude's local roster and retained observations; catalog access and secret availability do not prove a provider login or remaining quota".into()),
     ];
-    cards.extend(facts(
+    let mut inventory = facts(
         "lab/inventory",
         ("CLAUDE ACCOUNTS", "CLAUDE ACCOUNTS"),
         &inventory,
-    ));
+    );
+    if let Some((card, height)) = inventory.last_mut() {
+        let (refresh, refresh_height) = button(
+            LAB_ACCOUNTS_REFRESH,
+            if lab.collecting {
+                "Reading Claude accounts…"
+            } else {
+                "Refresh Claude accounts"
+            },
+            ActionId::new(LAB_ACCOUNTS_REFRESH),
+            inner,
+            !lab.collecting,
+        );
+        card.children.push(refresh);
+        *height += refresh_height + 4.0;
+        card.layout.height = Length::Fixed(*height);
+    }
+    cards.extend(inventory);
     for (index, account) in lab.accounts.rows.iter().enumerate() {
         let mut rows = vec![("Account".into(), account.label.clone())];
         rows.extend(account.facts.iter().cloned());

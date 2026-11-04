@@ -26,6 +26,13 @@
 //!   box over the composer goes past it; without that proof the line holds the key too.
 //! - [`Line::lose`] and [`Restarts`]: the one restart in place a lost line gets short of an act
 //!   submitted, or a doubling wait ([`Loss`]).
+//! - [`Line::restarted`] and [`Restarts::answered`]: what the host's word that it made the
+//!   restart comes to ([`Restarted`]), on the process the restart's own report names after it
+//!   (else the process the host names now): the line's program ended, and the restart made, where
+//!   that is another process than the one the line was written to, or where none is named at
+//!   either end, the word all there is to go on; with the line's own process named, nothing shows
+//!   the restart ended it, and the restart stands asked as a deferral does
+//!   ([`Restarts::deferred`]), spent once the line settles ([`Restarts::settled`]).
 //! - [`line_held`]: what the host is told ([`LineHeld`]).
 //!
 //! `LineCustody` (`aterm_models_harness::line_custody_model`) is bound to these functions by
@@ -141,8 +148,9 @@ pub const NOT_AT_REST: &str = "read:not-at-rest";
 /// What a line held last said where it is lost and waits, no restart asked ([`Line::lose`]).
 const LOST_WAITS: &str = "lost";
 
-/// What a line held last said where it is lost and a restart in place is asked for it, once,
-/// though a host's deferral has it asked again ([`Line::lose`]).
+/// What a line held last said where it is lost and a restart in place is asked for it
+/// ([`Line::lose`]), so a hold's record after the ask is written as the change it is. Whether the
+/// ask's own record stands is [`Line`]'s `restart_noted`, which no hold's record moves.
 const LOST_RESTARTING: &str = "lost:restarting";
 
 /// How a line held settled.
@@ -154,7 +162,8 @@ pub enum Settles {
     Person,
     /// A turn ran after it and `status` read the input clear.
     Turn,
-    /// Its program ended: a restart in place took, or another process holds the tab.
+    /// Its program ended: the host names another agent process than the one at the write (a
+    /// restart in place that took, [`Line::restarted`], an upgrade's move, the program's own end).
     Ended,
 }
 
@@ -194,6 +203,30 @@ pub enum LineHeld {
 
 /// The agent's process as the host names it (`IdleHost::agent_pid`, `IdleHost::agent_started`).
 pub type Process = (Option<u32>, Option<i64>);
+
+/// WHICH LINE HELD A RESTART IN PLACE IS ASKED FOR
+/// ([`super::policy::turn_end::Restart::InputLost`]'s `line`): the loop's wall clock when it took
+/// the line into custody, in Unix milliseconds, and how many lines the loop took into custody
+/// before it. Every ask of one line's restart carries the same, its first and each asked again
+/// after a deferral; another line's, a later loop's included, carries another. It is that
+/// restart's ask ([`super::policy::turn_end::RestartAsk::of`]), which the relaunch's record keeps
+/// once an ask claims the record (`St::ask`), so a restart asked again meets its own record by it,
+/// never by its cause alone (`relaunch::its_own`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LineAsk {
+    /// The loop's wall clock when it took the line into custody, Unix milliseconds.
+    pub at_ms: i64,
+    /// How many lines the loop took into custody before it.
+    pub nth: u32,
+}
+
+impl LineAsk {
+    /// The line's word, `<at_ms>.<nth>`, which its restart's ask names.
+    #[must_use]
+    pub fn word(self) -> String {
+        format!("{}.{}", self.at_ms, self.nth)
+    }
+}
 
 /// What a read shows of a line held: what its composer holds of it ([`LeftStands`], `None`
 /// where the read cannot say: no composer drawn, a dialog over it, or a glyph's cell unread),
@@ -300,10 +333,15 @@ pub enum GateRead {
 /// what the session gathers from the read, its own state and the host ([`Rest::gate`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Rest {
-    /// An idle phase its reader stands by (no turn running), a composer drawn, no dialog and no
-    /// frame torn mid-redraw.
-    pub idle: bool,
-    /// The composer shows no typed text (read only where `idle`).
+    /// The read is a turn's end its reader stands by, of whichever phase the policy writes a line
+    /// at (idle, a question, a limit's notice: no turn running and no box), a composer drawn, no
+    /// dialog and no frame torn mid-redraw.
+    pub turn_ended: bool,
+    /// The agent's own background work runs under that turn's end, as the read names it (a
+    /// monitor, a shell, a background agent or a workflow the turn left running): a restart in
+    /// place would end it, so the read is no rest while it runs.
+    pub working: bool,
+    /// The composer shows no typed text (read only where [`Self::turn_ended`]).
     pub clear: bool,
     /// A hold is on the session.
     pub halted: bool,
@@ -323,7 +361,8 @@ impl Rest {
     /// those ([`Self::stuck`]): it is asked of no read that is not at rest already.
     #[must_use]
     pub fn asks_jobs(&self) -> bool {
-        self.idle
+        self.turn_ended
+            && !self.working
             && self.clear
             && !self.halted
             && self.autopilot
@@ -392,8 +431,8 @@ impl Lane {
 /// Why a lost line gets no restart in place ([`Loss::Wait`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NoRestart {
-    /// A restart was made for a line since the last act submitted: a second loss is never
-    /// restarted again.
+    /// A restart was made for a line since the last act submitted, or stood asked when the line
+    /// settled ([`LostRestart::Unseen`]): a second loss is never restarted again.
     Again,
     /// The host did not make the restart asked (its step, or `-` where it answered none).
     Unmade(String),
@@ -413,26 +452,51 @@ pub enum Loss {
     Restart {
         /// When the line is looked at again where the restart is not made.
         until: Instant,
-        /// No record of the restart asked stands yet.
+        /// No record of the restart asked stands yet: none was asked for the line before, however
+        /// often a host's deferral has it asked again and whatever holds came between the asks.
         first: bool,
     },
-    /// A wait that writes nothing until `until`, the `waits`-th in a row, for `why`.
+    /// A wait that writes nothing until `until`, the loss's `waits`-th, for `why`.
     Wait {
         /// Why no restart is made.
         why: NoRestart,
-        /// When the line is looked at again.
+        /// When the line is looked at again: the next step of the line's waits in a row, which
+        /// the holds before the loss counted too.
         until: Instant,
-        /// The waits in a row before this one.
+        /// The waits of this loss before this one, on which its records are thinned (its first is
+        /// always due): a hold before the loss is none of them.
         waits: u32,
     },
+}
+
+/// WHAT THE HOST'S WORD THAT IT MADE THE RESTART IN PLACE ASKED FOR A LINE HELD COMES TO
+/// ([`Line::restarted`]): the word (`adopted`, `relaunched`, `continued`, `done`) is the host's
+/// claim; the process the restart's own report names after it, else the one the host names now,
+/// the evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Restarted {
+    /// The line's program ended: the process named is another than the one the line was written
+    /// to, or none is named at either end, where the host's word is all there is to go on. The
+    /// line settles [`Settles::Ended`] and the restart is made ([`Restarts::answered`]).
+    Ended,
+    /// The process named is the one the line was written to: nothing shows the restart ended it
+    /// (a relaunch in flight carried, the asker only adopted). The line stands held, written
+    /// again to no process, and the restart is neither made nor refused: it stands asked, and is
+    /// asked again on its back-off, as a deferral is ([`Restarts::deferred`]).
+    Stands,
 }
 
 /// What became of the restart in place asked for a line held since the last act submitted: either
 /// way, a line lost from here waits and writes nothing, and the host is asked no more.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LostRestart {
-    /// The host made it: a second loss is never restarted again.
+    /// The host made it, its word and another process named after it, or none named at either
+    /// end ([`Restarts::answered`]): a second loss is never restarted again.
     Made,
+    /// The line settled while the restart asked for it stood deferred ([`Restarts::settled`]):
+    /// the host may have made it unseen (a restart whose signal went answers a deferral where the
+    /// process it started has yet to register), so a second loss is never restarted again either.
+    Unseen,
     /// The host did not make it (its step, or `-` where it answered none): a repeated failure
     /// calls for a different approach, so it is not asked again at each due.
     Unmade(String),
@@ -440,15 +504,29 @@ pub enum LostRestart {
 
 /// WHAT THE HOST ANSWERED TO THE RESTART IN PLACE ASKED FOR A LOST LINE SINCE THE LAST ACT
 /// SUBMITTED, if it answered: one answer per line short of an act submitted, made or refused
-/// ([`Line::lose`]); a deferral is no answer, and the restart is asked again.
+/// ([`Line::lose`]). A deferral is no answer: the restart stands asked, and is asked again while
+/// the line stands held; a line that settles meanwhile spends it ([`LostRestart::Unseen`]), as
+/// the host may have made it unseen.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Restarts(Option<LostRestart>);
+pub struct Restarts {
+    /// What the host answered, if it did.
+    answer: Option<LostRestart>,
+    /// The restart was asked, and deferred, since its last answer ([`Self::deferred`]).
+    standing: bool,
+}
 
 impl Restarts {
     /// What became of the restart asked since the last act submitted.
     #[must_use]
     pub fn get(&self) -> Option<&LostRestart> {
-        self.0.as_ref()
+        self.answer.as_ref()
+    }
+
+    /// Whether the restart asked for the line held stands deferred, unanswered
+    /// ([`Self::deferred`]).
+    #[must_use]
+    pub fn standing(&self) -> bool {
+        self.standing && self.answer.is_none()
     }
 
     /// What [`Line::lose`] and [`Lane::asks_host`] take as spent.
@@ -456,10 +534,17 @@ impl Restarts {
         if armed(Fault::CustodyRestartAgain) {
             return None;
         }
-        self.0.as_ref()
+        self.answer.as_ref()
     }
 
-    /// The host made the restart asked for a lost line.
+    /// WHAT THE HOST'S WORD THAT IT MADE THE RESTART ASKED FOR THE LINE HELD (`line`) COMES TO, on
+    /// the process the restart's own report names after it (`left`), else the one the host names
+    /// now (`named`) ([`Line::restarted`]): where the line's program ended ([`Restarted::Ended`]:
+    /// another process named, or none at either end, the word all there is), or no line is held,
+    /// the restart is made ([`Self::made`]); where the process the line was written to is named
+    /// ([`Restarted::Stands`]), nothing is answered: the restart stands asked, and is asked again
+    /// on its back-off, as a deferral is ([`Self::deferred`]). The word with the line's own
+    /// process named books no restart: this is the one way to [`LostRestart::Made`].
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -468,11 +553,127 @@ impl Restarts {
             project = "conformance_custody::project"
         )
     )]
-    pub fn made(&mut self) {
-        self.0 = Some(LostRestart::Made);
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "LineCustody",
+            action = "RestartStands",
+            project = "conformance_custody::project"
+        )
+    )]
+    pub fn answered(
+        &mut self,
+        line: Option<&Line>,
+        left: Option<Process>,
+        named: Option<Process>,
+    ) -> Restarted {
+        let restarted = line.map_or(Restarted::Ended, |line| line.restarted(left, named));
+        match restarted {
+            Restarted::Ended => self.made(),
+            Restarted::Stands => self.deferred(),
+        }
+        restarted
     }
 
-    /// The host refused the restart asked for a lost line, or answered none (`step`: its step).
+    /// The host made the restart asked for a lost line: its word, and another process named
+    /// after it, or none at either end ([`Self::answered`]).
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "LineCustody",
+            action = "RestartMade",
+            project = "conformance_custody::project"
+        )
+    )]
+    fn made(&mut self) {
+        self.answer = Some(LostRestart::Made);
+        self.standing = false;
+    }
+
+    /// THE RESTART ASKED FOR THE LINE HELD STANDS ASKED, UNANSWERED: the host deferred it
+    /// (`wait:…`, `busy:another-sweep`; another `busy:` step, a state directory that cannot hold
+    /// the sweep's lock, is a refusal: [`Self::unmade`]), or answered it with its word while the
+    /// line's own process is named ([`Restarted::Stands`]). It is asked again on its back-off
+    /// while the line stands held; the host may have made it all the same (a restart whose signal
+    /// went answers a deferral where the process it started has yet to register), so a line that
+    /// settles meanwhile spends it ([`Self::settled`]).
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "LineCustody",
+            action = "RestartDeferred",
+            project = "conformance_custody::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "LineCustody",
+            action = "RestartStands",
+            project = "conformance_custody::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "LineCustody",
+            action = "RestartMadeDeferred",
+            project = "conformance_custody::project"
+        )
+    )]
+    pub fn deferred(&mut self) {
+        if self.answer.is_none() {
+            self.standing = true;
+        }
+    }
+
+    /// THE LINE HELD SETTLED ([`Settles`], `Session::custody_ended`): a restart that stood asked
+    /// for it ([`Self::deferred`]) is spent ([`LostRestart::Unseen`]), whatever settled it, since
+    /// the host may have made it unseen: a loss from here, short of an act submitted, waits
+    /// ([`NoRestart::Again`]), so a line is never restarted twice for one restart the host made
+    /// and answered as a deferral.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "LineCustody",
+            action = "LookDrawn",
+            project = "conformance_custody::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "LineCustody",
+            action = "LookPerson",
+            project = "conformance_custody::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "LineCustody",
+            action = "SeesEnded",
+            project = "conformance_custody::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "LineCustody",
+            action = "TurnSettles",
+            project = "conformance_custody::project"
+        )
+    )]
+    pub fn settled(&mut self) {
+        if self.standing() && !armed(Fault::CustodySettleKeepsAsked) {
+            self.answer = Some(LostRestart::Unseen);
+        }
+        self.standing = false;
+    }
+
+    /// The host refused the restart asked for a lost line, or answered none (`step`: its step):
+    /// any answer but a success word, a `wait:…` or `busy:another-sweep` (a `refused:…`, another
+    /// `busy:` step), or no answer.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -482,7 +683,8 @@ impl Restarts {
         )
     )]
     pub fn unmade(&mut self, step: Option<&str>) {
-        self.0 = Some(LostRestart::Unmade(step.unwrap_or("-").to_string()));
+        self.answer = Some(LostRestart::Unmade(step.unwrap_or("-").to_string()));
+        self.standing = false;
     }
 
     /// An act was submitted: a line lost from here may be restarted for again.
@@ -503,7 +705,7 @@ impl Restarts {
         )
     )]
     pub fn submitted(&mut self) {
-        self.0 = None;
+        *self = Self::default();
     }
 }
 
@@ -524,6 +726,11 @@ pub struct Line {
     said: Option<String>,
     /// The waits in a row with no clock of the custody's own ([`custody_step`]).
     waits: u32,
+    /// The waits the line made lost ([`Loss::Wait`]), on which their records are thinned.
+    lost_waits: u32,
+    /// The record of the restart in place asked for the line was written ([`Loss::Restart`]'s
+    /// `first`): it is written once for the line, whatever holds come between the asks.
+    restart_noted: bool,
     /// A turn was read running since the write, or since a `status` read after one last found
     /// the input not clear ([`Self::took`], [`Self::outlasted`]).
     ran: bool,
@@ -572,6 +779,8 @@ impl Line {
             process,
             said: Some(hold_said(held, word.unwrap_or("-"))),
             waits: 0,
+            lost_waits: 0,
+            restart_noted: false,
             ran: false,
             drawn: None,
             lost: false,
@@ -713,6 +922,58 @@ impl Line {
             (self.process, now),
             (Some((Some(was), _)), Some((Some(is), _))) if was != is
         )
+    }
+
+    /// The agent's process at the write, as the host named it (`(None, None)` where it named
+    /// none): the process a restart in place for the line is of
+    /// ([`super::policy::turn_end::Restart::InputLost`]).
+    #[must_use]
+    pub fn process(&self) -> Process {
+        self.process.unwrap_or((None, None))
+    }
+
+    /// WHAT THE HOST'S WORD THAT IT MADE THE RESTART IN PLACE COMES TO ([`Restarted`]), on the
+    /// process the restart's own report names after it (`left`: the process it started where it
+    /// made one, the one it was asked by where it carried a relaunch in flight or only adopted),
+    /// else, where its report names none, the process the host names now (`named`), whose kept
+    /// snapshot may lag a restart it made: [`Restarted::Stands`] where that is the very process
+    /// the line was written to, which nothing shows a restart ended (the custody settles only on
+    /// evidence, and that process may still hold the line); else [`Restarted::Ended`], the line's
+    /// program ended (another process named, as [`Self::ended`] reads it), or no process named at
+    /// the write or after the word, the host's word all the evidence there is.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "LineCustody",
+            action = "RestartMade",
+            project = "conformance_custody::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "LineCustody",
+            action = "RestartStands",
+            project = "conformance_custody::project"
+        )
+    )]
+    #[must_use]
+    pub fn restarted(&self, left: Option<Process>, named: Option<Process>) -> Restarted {
+        let names = |p: &Process| p.0.is_some();
+        let (first, then) = if armed(Fault::CustodyRestartBySnapshot) {
+            (named, left)
+        } else {
+            (left, named)
+        };
+        let now = first.filter(names).or(then);
+        match (self.process, now) {
+            (Some((Some(was), _)), Some((Some(is), _)))
+                if was == is && !armed(Fault::CustodyRestartOnWord) =>
+            {
+                Restarted::Stands
+            }
+            _ => Restarted::Ended,
+        }
     }
 
     /// A turn was read running after the line (`Session::took`).
@@ -872,9 +1133,10 @@ impl Line {
 
     /// THE LINE IS LOST ([`CustodyGate::Lost`]) at `now`: the first time since the last act
     /// submitted (`restarts`), where `lane` makes one, a restart in place ([`Loss::Restart`],
-    /// `first` until its record is written, as a host's deferral has it asked again); else a
-    /// doubling wait that writes nothing ([`Loss::Wait`]), its step the next of the line's waits
-    /// in a row (which the holds before it counted too, and the restart's asks leave alone),
+    /// `first` at its first ask alone, however often a host's deferral has it asked again and
+    /// whatever holds' records come between); else a doubling wait that writes nothing
+    /// ([`Loss::Wait`]), its step the next of the line's waits in a row (which the holds before it
+    /// counted too, and the restart's asks leave alone), counted the loss's own for its records,
     /// and the line lost for good to the loop ([`Self::is_lost`], what the host is told).
     #[cfg_attr(
         any(test, debug_assertions),
@@ -894,7 +1156,7 @@ impl Line {
     )]
     pub fn lose(&mut self, restarts: &Restarts, lane: &Lane, now: Instant) -> Loss {
         let none = match restarts.spent() {
-            Some(LostRestart::Made) => Some(NoRestart::Again),
+            Some(LostRestart::Made | LostRestart::Unseen) => Some(NoRestart::Again),
             Some(LostRestart::Unmade(step)) => Some(NoRestart::Unmade(step.clone())),
             None if !lane.relaunch => Some(NoRestart::RelaunchOff),
             None if !lane.host => Some(NoRestart::NoHost),
@@ -906,12 +1168,19 @@ impl Line {
         match none {
             Some(why) => {
                 self.waits = waits.saturating_add(1);
+                let nth = self.lost_waits;
+                self.lost_waits = nth.saturating_add(1);
                 self.said = Some(LOST_WAITS.to_string());
                 self.lost = true;
-                Loss::Wait { why, until, waits }
+                Loss::Wait {
+                    why,
+                    until,
+                    waits: nth,
+                }
             }
             None => {
-                let first = self.said.as_deref() != Some(LOST_RESTARTING);
+                let first = !self.restart_noted;
+                self.restart_noted = true;
                 self.said = Some(LOST_RESTARTING.to_string());
                 Loss::Restart { until, first }
             }

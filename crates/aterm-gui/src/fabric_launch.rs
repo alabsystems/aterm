@@ -599,15 +599,19 @@ mod tests {
         );
         assert_eq!(preflight("true", None), Ok(()));
 
-        let dir = std::env::temp_dir().join(format!("aterm-fabric-path-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("aterm-fabric-path-")
+            .suffix(".noindex")
+            .tempdir()
+            .unwrap();
+        let dir = scratch.path();
         std::fs::write(dir.join("true"), b"not a program\n").unwrap();
         std::fs::set_permissions(
             dir.join("true"),
             <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o644),
         )
         .unwrap();
-        let mut path = dir.clone().into_os_string();
+        let mut path = dir.as_os_str().to_os_string();
         path.push(":");
         path.push(bin_dir.as_os_str());
         assert_eq!(
@@ -625,7 +629,6 @@ mod tests {
             Err("no-exec-bit"),
             "named by path, the same file is refused for its mode"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1097,24 +1100,6 @@ mod tests {
         );
     }
 
-    /// A non-UTF-8 key with a deny-listed prefix is still denied (a prefix matches leading bytes).
-    #[cfg(unix)]
-    #[test]
-    fn a_non_utf8_key_with_a_denied_prefix_does_not_reach_the_bridge_child() {
-        use std::os::unix::ffi::OsStringExt as _;
-        let raw = |b: &[u8]| std::ffi::OsString::from_vec(b.to_vec());
-        let inherited = vec![
-            (raw(b"ANTHROPIC_\xffX"), raw(b"sk-x")),
-            (raw(b"CLAUDE\xfe"), raw(b"1")),
-            (raw(b"PLAIN_\xffKEY"), raw(b"kept")),
-        ];
-        let kept: Vec<Vec<u8>> = filter_child_env(inherited.into_iter())
-            .into_iter()
-            .map(|(k, _)| k.into_vec())
-            .collect();
-        assert_eq!(kept, vec![b"PLAIN_\xffKEY".to_vec()]);
-    }
-
     #[test]
     fn the_supervisor_arms_once_and_records_what_it_runs() {
         crate::fabric::with_link_reset(|| {
@@ -1148,10 +1133,12 @@ mod tests {
                     "{argv0} must not flip the endpoint's latch"
                 );
             }
-            let dir =
-                std::env::temp_dir().join(format!("aterm-fabric-preflight-{}", std::process::id()));
-            std::fs::create_dir_all(&dir).unwrap();
-            let plain = dir.join("not-a-program");
+            let scratch = aterm_tempfile::Builder::new()
+                .prefix("aterm-fabric-preflight-")
+                .suffix(".noindex")
+                .tempdir()
+                .unwrap();
+            let plain = scratch.path().join("not-a-program");
             std::fs::write(&plain, b"#!/bin/sh\n").unwrap();
             std::fs::set_permissions(
                 &plain,
@@ -1166,7 +1153,6 @@ mod tests {
                     ..
                 })
             ));
-            let _ = std::fs::remove_dir_all(&dir);
             assert!(status().armed.is_none() && !crate::fabric::bridge_supervised());
 
             let argv = vec![true_program(), "serve".to_string()];

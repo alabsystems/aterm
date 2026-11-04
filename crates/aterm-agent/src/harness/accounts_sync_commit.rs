@@ -317,6 +317,7 @@ impl Store {
         }
         let before = state.clone();
         let mut events = edit(&mut state)?;
+        let auth_changed = auth_scope::clear(&mut state);
         let old_state = read(&self.state_file(), MAX_STATE_BYTES)?;
         let new_state = if state != before || (!events.is_empty() && old_state.is_none()) {
             drop_stale_sessions(&mut state, now);
@@ -338,7 +339,7 @@ impl Store {
             logins: Image::default(),
             ledger: self.ledger_image(&events)?,
             roster: Image::default(),
-            wake: Some(events.iter().any(Event::wakes)),
+            wake: Some(auth_changed || events.iter().any(Event::wakes)),
         };
         self.publish_plan(held, None, plan, &events, || Ok(()))?;
         super::super::journal::publish(&notes);
@@ -839,8 +840,46 @@ impl Store {
             state.machine = id;
         }
         let before = (state.clone(), logins.clone());
+        let managed_target = target.as_ref().filter(|_| !state.contextual_auth);
+        let raw_before = managed_target
+            .map(|target| {
+                target.before.map_or_else(
+                    || Ok(Roster::default()),
+                    |text| Roster::parse_for(self.cli, text),
+                )
+            })
+            .transpose()?;
+        let raw_after = managed_target
+            .map(|target| {
+                target.after.map_or_else(
+                    || Ok(Roster::default()),
+                    |text| Roster::parse_for(self.cli, text),
+                )
+            })
+            .transpose()?;
+        auth_scope::begin(&mut state, raw_before.as_ref(), &mut logins);
         let mut events = edit(&mut state, &mut logins)?;
+        let final_raw = if state.pending_auth.is_empty() {
+            None
+        } else {
+            target
+                .as_ref()
+                .map(|target| {
+                    target.after.map_or(Ok(Roster::default()), |text| {
+                        Roster::parse_for(self.cli, text)
+                    })
+                })
+                .transpose()?
+        };
+        events.extend(self.finalize_auth(&mut state, &mut logins, final_raw.as_ref())?);
         advance_renewal_generations(&before.1, &mut logins, &events)?;
+        let auth_changed = auth_scope::finish(
+            &mut state,
+            &before.1,
+            raw_after.as_ref(),
+            &mut logins,
+            &events,
+        )?;
         advance_sign_in_receipts(&before.1, &mut logins, &state, &events)?;
         let old_state = read(&self.state_file(), MAX_STATE_BYTES)?;
         let old_logins = read(&self.logins_file(), MAX_LOGINS_BYTES)?;
@@ -889,7 +928,7 @@ impl Store {
                 .unwrap_or_default(),
             wake: match wake {
                 WakeRule::Always => None,
-                WakeRule::Events => Some(events.iter().any(Event::wakes)),
+                WakeRule::Events => Some(auth_changed || events.iter().any(Event::wakes)),
             },
         };
         self.publish_plan(held, roster.as_deref(), plan, &events, auxiliary)?;

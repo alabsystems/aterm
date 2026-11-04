@@ -175,48 +175,75 @@ pub(crate) fn snapshot_after_read(
 }
 
 impl crate::App {
-    pub(crate) fn network_state_deadline(&self) -> Option<std::time::Instant> {
-        self.network_source.as_ref()?;
-        if self.lab_page_shown() {
-            return Some(
-                self.network_next_poll
-                    .unwrap_or_else(std::time::Instant::now),
-            );
-        }
+    /// Whether a visible window draws the Network State band (the deck) or its lens: what the
+    /// lab's account rows are for.
+    fn network_band_drawn(&self) -> bool {
         let deck_shown = self.stats_bars_form() == crate::stats_deck::StatsBars::Deck;
-        self.windows
-            .values()
-            .any(|window| {
-                !window.occluded
-                    && ((deck_shown && crate::stats_deck::stats_drawn_on(window))
-                        || window.stats_lens.open.is_some_and(|lens| {
-                            lens.focus == crate::stats_paint::Instrument::NetworkState
-                        }))
-            })
-            .then(|| {
-                self.network_next_poll
-                    .unwrap_or_else(std::time::Instant::now)
-            })
+        self.windows.values().any(|window| {
+            !window.occluded
+                && ((deck_shown && crate::stats_deck::stats_drawn_on(window))
+                    || window.stats_lens.open.is_some_and(|lens| {
+                        lens.focus == crate::stats_paint::Instrument::NetworkState
+                    }))
+        })
+    }
+
+    pub(crate) fn network_state_deadline(&self) -> Option<std::time::Instant> {
+        let due = || {
+            self.network_next_poll
+                .unwrap_or_else(std::time::Instant::now)
+        };
+        if self.network_source.is_none() {
+            // With no network source the band still carries the lab's account cells, which
+            // the feed reprojects once a minute ([`crate::lab_deck::Feed::EVERY`]); the Lab
+            // page draws none of them.
+            return (self.lab_deck_feed.live && self.network_band_drawn()).then(due);
+        }
+        (self.lab_page_shown() || self.network_band_drawn()).then(due)
     }
 
     pub(crate) fn service_network_state(&mut self, now: std::time::Instant) {
         if self.network_next_poll.is_some_and(|due| now < due) {
             return;
         }
-        self.network_next_poll = Some(now + std::time::Duration::from_secs(1));
-        let Some(read) = self.network_source.as_ref() else {
+        // The lab's account rows, as the feed's own thread last projected them: never waited
+        // on, and asked only while drawn, since the ask is what starts and keeps the feed.
+        let drawn = self.lab_deck_feed.live && self.network_band_drawn();
+        let lab = if drawn {
+            self.lab_deck_feed.latest(&self.lab_deck)
+        } else {
+            None
+        };
+        let snapshot = if let Some(read) = self.network_source.as_ref() {
+            self.network_next_poll = Some(now + std::time::Duration::from_secs(1));
+            snapshot_after_read(
+                read(),
+                &self.network_snapshot,
+                &mut self.network_source_busy,
+                aterm_time::unix_millis(),
+            )
+        } else if drawn {
+            // The first look comes back soon, since the feed's thread starts on it; then once a
+            // projection.
+            let next = if self.lab_deck_feed.held_any() {
+                crate::lab_deck::Feed::EVERY
+            } else {
+                std::time::Duration::from_secs(1)
+            };
+            self.network_next_poll = Some(now + next);
+            self.network_snapshot.clone()
+        } else {
+            // Nothing draws the rows: no poll is owed, and the next drawn turn looks at once.
+            self.network_next_poll = None;
             return;
         };
-        let snapshot = snapshot_after_read(
-            read(),
-            &self.network_snapshot,
-            &mut self.network_source_busy,
-            aterm_time::unix_millis(),
-        );
-        if snapshot.as_ref() == self.network_snapshot.as_ref() {
+        if snapshot.as_ref() == self.network_snapshot.as_ref() && lab.is_none() {
             return;
         }
         self.network_snapshot = snapshot;
+        if let Some(lab) = lab {
+            self.lab_deck = lab;
+        }
         if self.lab_page_shown() {
             self.publish_native_lab_state();
         }
@@ -248,6 +275,8 @@ pub(crate) enum Target {
     Unverified,
     Accounts,
     Secrets,
+    /// One lab account's row ([`crate::lab_deck::DeckAccount::id`]), on the Shared State line.
+    LabAccount(u64),
 }
 
 pub(crate) fn height_px(scale: f64) -> usize {
@@ -378,7 +407,11 @@ fn status_summary(snapshot: &NetworkStateSnapshot) -> String {
     }
 }
 
-pub(crate) fn targets(snapshot: &NetworkStateSnapshot) -> Vec<Target> {
+/// Every selectable cell, the lab's account rows after Secrets in the band's order.
+pub(crate) fn targets_with(
+    snapshot: &NetworkStateSnapshot,
+    lab: &crate::lab_deck::LabDeck,
+) -> Vec<Target> {
     let mut targets = vec![Target::Overview, Target::Local];
     let mut peers: Vec<_> = snapshot.network.peers.iter().collect();
     peers.sort_by_key(|p| p.slot);
@@ -387,11 +420,17 @@ pub(crate) fn targets(snapshot: &NetworkStateSnapshot) -> Vec<Target> {
         targets.push(Target::Unverified);
     }
     targets.extend([Target::Accounts, Target::Secrets]);
+    targets.extend(lab.rows.iter().map(|row| Target::LabAccount(row.id)));
     targets
 }
 
-pub(crate) fn step(snapshot: &NetworkStateSnapshot, target: Target, forward: bool) -> Target {
-    let all = targets(snapshot);
+pub(crate) fn step(
+    snapshot: &NetworkStateSnapshot,
+    lab: &crate::lab_deck::LabDeck,
+    target: Target,
+    forward: bool,
+) -> Target {
+    let all = targets_with(snapshot, lab);
     let index = all.iter().position(|value| *value == target).unwrap_or(0);
     all[if forward {
         (index + 1) % all.len()
@@ -410,6 +449,43 @@ fn observed_reachability(visibility: Visibility, reachability: Reachability) -> 
 
 pub(crate) fn details(snapshot: &NetworkStateSnapshot, target: Target) -> Vec<(String, String)> {
     details_with_caption(snapshot, target, capture_place_caption().as_ref())
+}
+
+/// [`details`] with the lab's account rows: a lab account's own rows, and the overview's count.
+pub(crate) fn details_lab(
+    snapshot: &NetworkStateSnapshot,
+    lab: &crate::lab_deck::LabDeck,
+    target: Target,
+) -> Vec<(String, String)> {
+    details_lab_with_caption(snapshot, lab, target, capture_place_caption().as_ref())
+}
+
+/// [`details_lab`] with the frame's captured place words.
+pub(crate) fn details_lab_with_caption(
+    snapshot: &NetworkStateSnapshot,
+    lab: &crate::lab_deck::LabDeck,
+    target: Target,
+    caption: Option<&PlaceCaption>,
+) -> Vec<(String, String)> {
+    if let Target::LabAccount(id) = target {
+        let mut rows = lab.details(id);
+        rows.push((
+            "Evidence".into(),
+            "The lab registry and journal as this Mac last read them; no provider was asked".into(),
+        ));
+        return rows;
+    }
+    let mut rows = details_with_caption(snapshot, target, caption);
+    if target == Target::Overview
+        && let Some(line) = lab.overview()
+    {
+        let at = rows
+            .iter()
+            .position(|(name, _)| name == "History")
+            .map_or(rows.len(), |i| i + 1);
+        rows.insert(at, line);
+    }
+    rows
 }
 
 pub(crate) fn details_with_caption(
@@ -514,6 +590,10 @@ pub(crate) fn details_with_caption(
             ),
         )),
         Target::Accounts => rows.extend(account_service_details(snapshot)),
+        Target::LabAccount(_) => rows.push((
+            "Account".into(),
+            "Lab account rows are read with the lab journal".into(),
+        )),
         Target::Secrets => rows.extend(secret_service_details(&snapshot.services.secrets)),
         Target::Overview => {
             rows.push((
@@ -528,7 +608,10 @@ pub(crate) fn details_with_caption(
             rows.extend(secret_service_details(&snapshot.services.secrets));
         }
     }
-    if matches!(target, Target::Peer(_) | Target::Accounts | Target::Secrets) {
+    if matches!(
+        target,
+        Target::Peer(_) | Target::Accounts | Target::Secrets | Target::LabAccount(_)
+    ) {
         // Keep the selected peer's evidence or service status before general
         // network context when the lens has limited height.
         rows.rotate_left(context_rows);
@@ -695,6 +778,7 @@ pub(crate) fn paint_with_inks(
     g: &DeckGeom,
     top: f32,
     snapshot: &NetworkStateSnapshot,
+    lab: &crate::lab_deck::LabDeck,
     caption: Option<&PlaceCaption>,
     inks: &aterm_vitals::ink::VitalsInks,
     dwc: bool,
@@ -977,8 +1061,109 @@ pub(crate) fn paint_with_inks(
         Target::Secrets,
         snapshot.services.secrets.refresh_failed,
     );
+    let lab_x = secrets_cell_x + 8.0 * scale + 2.0 * gap;
+    paint_lab_accounts(&mut p, &mut hits, lab, (lab_x, second_y), g.w, scale, dwc);
     p.prims.push(DrawPrim::ClipPop);
     (p.prims, hits)
+}
+
+/// Where the lab's account cells go on the Shared State line, in the band's own pitch: the
+/// word, then one 8 pt cell per account every 14 pt, then `+N` for the rows that do not fit.
+const LAB_PITCH_PT: f32 = 14.0;
+/// The band's right margin, pt: no cell starts closer to the edge than this.
+const LAB_MARGIN_PT: f32 = 12.0;
+
+/// The lab's account cells after Secrets (`docs/DESIGN-alab-lab-model-2026-11-01.md` §8, "As built
+/// (Stats deck rows, task sd)"): each an 8 pt square in the band's cell form, its rim this Mac's
+/// ink where this Mac prefers the account and the machine's otherwise, filled with the heat of
+/// its binding window's use (the over-max cap's ink at a wall), hollow with no current reading.
+/// It takes no row: the band's height is fixed.
+fn paint_lab_accounts(
+    p: &mut Painter<'_>,
+    hits: &mut Vec<Hit>,
+    lab: &crate::lab_deck::LabDeck,
+    (x, y): (f32, f32),
+    w: f32,
+    scale: f32,
+    dwc: bool,
+) {
+    use crate::lab_deck::Cell;
+    if lab.is_empty() {
+        return;
+    }
+    let inks = *p.inks;
+    let word = "Lab accounts";
+    let cells_x = x + p.ui_text_w(word, false) + 7.0 * scale;
+    let side = 8.0 * scale;
+    let pitch = LAB_PITCH_PT * scale;
+    let total = lab.rows.len() + lab.more;
+    let fits = |n: usize| {
+        let more = if n < total {
+            p.ui_text_w(&format!("+{}", total - n), false) + 4.0 * scale
+        } else {
+            0.0
+        };
+        cells_x + n as f32 * pitch + more <= w - LAB_MARGIN_PT * scale
+    };
+    let mut shown = lab.rows.len();
+    while shown > 0 && !fits(shown) {
+        shown -= 1;
+    }
+    if shown == 0 {
+        return;
+    }
+    p.ui_text(x, y + 3.0 * scale, word.into(), inks.words2, false);
+    for (index, row) in lab.rows.iter().take(shown).enumerate() {
+        let cx = cells_x + index as f32 * pitch;
+        let rim = if row.here { inks.aterm } else { inks.machine };
+        p.prims.push(DrawPrim::Stroke {
+            x: cx,
+            y: y - side / 2.0,
+            w: side,
+            h: side,
+            radius: 0.0,
+            width: scale.max(1.0),
+            color: rgba(rim, 255),
+        });
+        let (fill, step) = match row.cell {
+            Cell::Unknown => (None, 0),
+            Cell::Used(x10) => {
+                let step = aterm_vitals::ink::heat_step(f32::from(x10) / 1000.0);
+                (Some(inks.heat[usize::from(step)]), step)
+            }
+            Cell::AtLimit => (Some(inks.over), 6),
+        };
+        if let Some(fill) = fill {
+            let h = if dwc {
+                aterm_vitals::ink::dwc_height(side.round() as u32, step) as f32
+            } else {
+                side
+            };
+            p.prims
+                .push(panel(cx, y + side / 2.0 - h, side, h, 0.0, rgba(fill, 255)));
+        }
+        hits.insert(
+            0,
+            Hit {
+                rect: (
+                    cx - 3.0 * scale,
+                    y - 6.0 * scale,
+                    14.0 * scale,
+                    12.0 * scale,
+                ),
+                kind: HitKind::Network(Target::LabAccount(row.id)),
+            },
+        );
+    }
+    if shown < total {
+        p.ui_text(
+            cells_x + shown as f32 * pitch,
+            y + 3.0 * scale,
+            format!("+{}", total - shown),
+            inks.words2,
+            false,
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1204,7 +1389,15 @@ mod tests {
             font_px: 14.0,
         };
         let inks = crate::stats_deck::cached_inks([20, 20, 20], [230, 230, 230], [100, 180, 200]);
-        let (prims, _) = paint_with_inks(&g, 170.0, &snapshot, None, &inks, false);
+        let (prims, _) = paint_with_inks(
+            &g,
+            170.0,
+            &snapshot,
+            &crate::lab_deck::LabDeck::default(),
+            None,
+            &inks,
+            false,
+        );
         assert!(prims.iter().any(|prim| matches!(prim,
             DrawPrim::Text { s, .. } if s == "Waiting · 1 known"
         )));
@@ -1363,11 +1556,27 @@ mod tests {
             font_px: 14.0,
         };
         let inks = crate::stats_deck::cached_inks([20, 20, 20], [230, 230, 230], [100, 180, 200]);
-        let before = paint_with_inks(&g, 170.0, &snapshot, None, &inks, false);
+        let before = paint_with_inks(
+            &g,
+            170.0,
+            &snapshot,
+            &crate::lab_deck::LabDeck::default(),
+            None,
+            &inks,
+            false,
+        );
         let before_summary = summary(&snapshot);
         let before_details = details(&snapshot, Target::Overview);
         snapshot.network.retention_limited = true;
-        let limited = paint_with_inks(&g, 170.0, &snapshot, None, &inks, false);
+        let limited = paint_with_inks(
+            &g,
+            170.0,
+            &snapshot,
+            &crate::lab_deck::LabDeck::default(),
+            None,
+            &inks,
+            false,
+        );
         assert_ne!(summary(&snapshot), before_summary);
         assert_ne!(
             crate::stats_deck::prims_fp(&limited.0),
@@ -1416,19 +1625,53 @@ mod tests {
             font_px: 14.0,
         };
         let inks = crate::stats_deck::cached_inks([20, 20, 20], [230, 230, 230], [100, 180, 200]);
-        let first = paint_with_inks(&g, 170.0, &snapshot, None, &inks, false).1;
+        let first = paint_with_inks(
+            &g,
+            170.0,
+            &snapshot,
+            &crate::lab_deck::LabDeck::default(),
+            None,
+            &inks,
+            false,
+        )
+        .1;
         snapshot.network.peers.reverse();
         snapshot.network.peers[0].reachability = Reachability::Unknown;
-        let second = paint_with_inks(&g, 170.0, &snapshot, None, &inks, false).1;
+        let second = paint_with_inks(
+            &g,
+            170.0,
+            &snapshot,
+            &crate::lab_deck::LabDeck::default(),
+            None,
+            &inks,
+            false,
+        )
+        .1;
         assert_eq!(first, second);
         snapshot.network.via_local_process = Some(42);
-        let (relayed, relayed_hits) = paint_with_inks(&g, 170.0, &snapshot, None, &inks, false);
+        let (relayed, relayed_hits) = paint_with_inks(
+            &g,
+            170.0,
+            &snapshot,
+            &crate::lab_deck::LabDeck::default(),
+            None,
+            &inks,
+            false,
+        );
         assert_eq!(second, relayed_hits);
         assert!(relayed.iter().any(|prim| {
             matches!(prim, DrawPrim::Text { s, face, .. }
                 if s.contains("via local aterm") && *face != crate::widget::TextFace::Mono)
         }));
-        assert_eq!(step(&snapshot, Target::Local, true), Target::Peer(2));
+        assert_eq!(
+            step(
+                &snapshot,
+                &crate::lab_deck::LabDeck::default(),
+                Target::Local,
+                true
+            ),
+            Target::Peer(2)
+        );
     }
 
     #[test]
@@ -1443,8 +1686,15 @@ mod tests {
             };
             let inks =
                 crate::stats_deck::cached_inks([20, 20, 20], [230, 230, 230], [100, 180, 200]);
-            let (prims, hits) =
-                paint_with_inks(&g, 170.0 * scale, &inactive_snapshot(), None, &inks, false);
+            let (prims, hits) = paint_with_inks(
+                &g,
+                170.0 * scale,
+                &inactive_snapshot(),
+                &crate::lab_deck::LabDeck::default(),
+                None,
+                &inks,
+                false,
+            );
             for prim in &prims {
                 if let DrawPrim::Text { face, px, .. } = prim {
                     assert_ne!(*face, crate::widget::TextFace::Mono);
@@ -1606,7 +1856,7 @@ mod tests {
             ServiceAvailability::Cached
         );
         assert!(
-            !targets(&snapshot)
+            !targets_with(&snapshot, &crate::lab_deck::LabDeck::default())
                 .iter()
                 .any(|t| matches!(t, Target::Peer(_)))
         );
@@ -1651,11 +1901,27 @@ mod tests {
                 for relay in [None, Some(42)] {
                     snapshot.network.via_local_process = relay;
                     snapshot.network.history = HistoryState::Ready;
-                    let ready = paint_with_inks(&g, top, &snapshot, None, &inks, false);
+                    let ready = paint_with_inks(
+                        &g,
+                        top,
+                        &snapshot,
+                        &crate::lab_deck::LabDeck::default(),
+                        None,
+                        &inks,
+                        false,
+                    );
                     let ready_summary = summary(&snapshot);
                     assert!(!local_warning(&ready.0, &ready.1, scale, inks.over));
                     snapshot.network.history = HistoryState::Unavailable;
-                    let failed = paint_with_inks(&g, top, &snapshot, None, &inks, false);
+                    let failed = paint_with_inks(
+                        &g,
+                        top,
+                        &snapshot,
+                        &crate::lab_deck::LabDeck::default(),
+                        None,
+                        &inks,
+                        false,
+                    );
                     assert!(local_warning(&failed.0, &failed.1, scale, inks.over));
                     assert_eq!(failed.1, ready.1);
                     assert_ne!(summary(&snapshot), ready_summary);
@@ -1727,12 +1993,28 @@ mod tests {
             snapshot.network.visibility = visibility;
             snapshot.network.history = HistoryState::Ready;
             snapshot.network.retention_limited = false;
-            let ready = paint_with_inks(&g, 170.0, &snapshot, None, &inks, false);
+            let ready = paint_with_inks(
+                &g,
+                170.0,
+                &snapshot,
+                &crate::lab_deck::LabDeck::default(),
+                None,
+                &inks,
+                false,
+            );
             for history in [HistoryState::Restoring, HistoryState::Unavailable] {
                 snapshot.network.history = history;
                 for limited in [false, true] {
                     snapshot.network.retention_limited = limited;
-                    let painted = paint_with_inks(&g, 170.0, &snapshot, None, &inks, false);
+                    let painted = paint_with_inks(
+                        &g,
+                        170.0,
+                        &snapshot,
+                        &crate::lab_deck::LabDeck::default(),
+                        None,
+                        &inks,
+                        false,
+                    );
                     assert_eq!(painted.1, ready.1);
                     assert_eq!(
                         local_warning(&painted.0, &painted.1, 1.0, inks.over),
@@ -1913,6 +2195,62 @@ mod tests {
                 &expired,
             ));
         }
+    }
+
+    /// The shipped wake with no network source: the lab's account rows alone own the band's
+    /// poll, only while the band or its lens is drawn, and the feed is asked only then.
+    /// Negative controls: asking the feed unconditionally takes the held rows while hidden (the
+    /// first `lab_deck` assertion); keeping the old `network_source?` gate leaves the drawn
+    /// deadline `None`; polling every second after the first projection breaks the `EVERY` step.
+    #[test]
+    fn with_no_network_source_the_lab_rows_wake_the_band_only_while_drawn() {
+        let mut app = crate::App::headless_for_test();
+        let wid = *app.windows.keys().next().expect("window");
+        app.config
+            .sys
+            .get_or_insert_with(Default::default)
+            .stats_bars = Some("off".into());
+        app.network_source = None;
+        let rows = crate::lab_deck::LabDeck {
+            more: 3,
+            ..Default::default()
+        };
+        let now = std::time::Instant::now();
+        assert_eq!(
+            app.network_state_deadline(),
+            None,
+            "test feeds are not live"
+        );
+        app.lab_deck_feed.live = true;
+        assert_eq!(app.network_state_deadline(), None, "nothing draws the band");
+        app.service_network_state(now);
+        assert_eq!(app.network_next_poll, None);
+        app.lab_deck_feed.hold(rows.clone());
+        app.service_network_state(now);
+        assert!(
+            app.lab_deck.is_empty() && app.lab_deck.more == 0,
+            "a hidden band asks nothing"
+        );
+        assert!(app.open_network_lens());
+        assert!(app.network_state_deadline().is_some());
+        app.service_network_state(now);
+        assert_eq!(app.lab_deck.as_ref(), &rows);
+        assert_eq!(
+            app.network_next_poll,
+            Some(now + crate::lab_deck::Feed::EVERY),
+            "a projection is held: once a minute"
+        );
+        assert_eq!(
+            app.network_state_deadline(),
+            Some(now + crate::lab_deck::Feed::EVERY)
+        );
+        app.close_stats_lens(wid);
+        assert_eq!(app.network_state_deadline(), None);
+        app.service_network_state(now + crate::lab_deck::Feed::EVERY);
+        assert_eq!(app.network_next_poll, None, "hidden again: no poll owed");
+        app.lab_deck_feed.live = false;
+        assert!(app.open_network_lens());
+        assert_eq!(app.network_state_deadline(), None);
     }
 
     #[test]

@@ -162,7 +162,7 @@ src/tests_pwsh_keys.rs	test_powershell_ctrl_e_accepts_a_suggestion_only_at_the_e
   `test_prepare_wsl_env_carries_path_translated_wslenv`, is retired by `injection-shape`, which
   calls `pev`. The spec is kept because `injection-shape` is stated in terms of `pev`.
 - A test listed under both layers in §2 (such as `the_typed_rekey_sets_the_globals_the_marks_read`,
-  `test_prepare_wsl_argv_execs_the_bash_rcfile` or `every_posix_script_is_a_loader_around_one_body`)
+  `test_wsl_launcher_starts_bash_on_the_rcfile_and_any_other_shell_plainly` or `every_posix_script_is_a_loader_around_one_body`)
   is deleted only after **both** its Rust spec and its `sh-*` spec are proved. Until then, split it, so
   that its Rust half goes with the Rust proof and its live-shell half stays.
 - Of the 160 covered tests, 40 can be retired by Rust proofs alone once their gaps close. The other 120
@@ -183,24 +183,24 @@ Status 2026-10-16: deleted `test_scripts_contain_prompt_override`, `test_spawned
    against `lf_only` output.
 3. **(Fixed 2026-10-28.) `lf_only` did not remove lone CR.** `lf_only` now normalizes both `"\r\n"`
    and lone `'\r'` to `"\n"`, so no `'\r'` byte can survive on disk.
-4. **The content-address isolation claim is too strong.**
-   `a_foreign_build_cannot_change_what_this_builds_tabs_source` says this build's tabs are safe
-   "whatever a foreign build wrote". With a warm memo, `ensure_cached` only stats
-   `root/<ADDR>/aterm_shell_integration.zsh`, so a write *into* `root/<own address>` is served without
-   being re-verified. The true spec (`content-address-isolation`) needs the precondition that foreign
-   writes stay outside `root/<ADDR>`. A content-addressed foreign build satisfies it; a person editing
-   the folder does not. Only a process's first prepare (the cold path) replaces a damaged folder.
+4. **(Resolved.) Content-address isolation states its foreign-write precondition explicitly.**
+   `a_foreign_build_cannot_change_what_this_builds_tabs_source` documents `content-address-isolation`'s
+   precondition that foreign writes stay outside `root/<ADDR>` (as content-addressed foreign builds
+   do), and verifies both sides: writes outside `root/<ADDR>` leave both warm and cold memos serving
+   verified scripts, while an out-of-band edit inside `root/<ADDR>` on a sibling file is left un-reverified
+   by the warm memo and repaired by a cold memo (`install_script_set`) or after root deletion.
 5. **Resolved: the cache-dir containment check no longer silently passes when unresolvable or under a
    temp root.** `test_cache_dir_is_the_per_user_cache_outside_the_containment_write_roots` calls
    `aterm_spec::host::could_not_run` instead of returning early.
 6. **Resolved: `cfg(windows)` gate removed from `ShellType::detect` tests.** Windows backslash paths
    (`C:\Program Files\PowerShell\7\pwsh.exe`, `C:\Windows\System32\wsl.exe`, `C:\Windows\System32\CMD.EXE`)
    run unconditionally on every host.
-7. **Substring pins sample behaviour weakly.** `test_prepare_wsl_argv_execs_the_bash_rcfile` and the
-   static pins of POWERSHELL, FISH and ZSH are substring checks on embedded code, so a comment that
-   contains the needle satisfies them. The fish tests had to work around this by filtering out comment
-   lines. `script-const-lints` restates the meaningful ones as decidable predicates over non-comment
-   lines.
+7. **(Resolved.) Static script lints filter comment lines and WSL uses live `/bin/sh` execution.**
+   `test_prepare_wsl_argv_execs_the_bash_rcfile` was replaced by the live execution test
+   `test_wsl_launcher_starts_bash_on_the_rcfile_and_any_other_shell_plainly`, and static checks on
+   `POWERSHELL`, `FISH`, `ZSH`, and `BASH` (`powershell_code()`, `installed_zsh()`, `installed_bash()`,
+   and `test_an_unmanaged_aterm_bin_is_never_put_on_path`) evaluate non-comment code lines matching
+   `script-const-lints`.
 8. **Seven zsh lanes are macOS-only.** The skip-equals-pass half closed with the init design's S2: a
    missing zsh, fish, pwsh or pty-capable `script` now ends COULD NOT RUN. What remains: seven live zsh
    tests in `src/tests_loader.rs` and their `spawn_live_zsh_from` are `#[cfg(target_os = "macos")]` and

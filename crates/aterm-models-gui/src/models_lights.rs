@@ -11,12 +11,12 @@ use aterm_spec::derive::*;
 /// toggle's end is on show (`phase` 2: its notice or refusal), the click back after an arrival.
 ///
 /// Claude's cycle is the ring `Answer` walks, as `lab footers` measured it on Claude Code 2.1.317
-/// (`docs/measured/claude-mode-cycle-2026-11-03.md`): bypass, auto, manual, accept edits, plan and
-/// round to bypass in a session started with bypass; auto, manual, accept edits, plan and round to
-/// auto in one started without it (`bypass_in` 0). The narrower rings are kept reachable, not
-/// measured: one whose cycle has no auto (`auto_in` 0) goes from bypass to manual, and one with
-/// neither from plan to manual. From bypass a click on `yolo` presses through auto, an expected
-/// mode short of its goal, to manual.
+/// and 2.1.318 (`docs/measured/claude-mode-cycle-2026-11-03.md`): bypass, auto, manual, accept
+/// edits, plan and round to bypass in a session started with bypass; auto, manual, accept edits,
+/// plan and round to auto in one started without it (`bypass_in` 0). The narrower rings are kept
+/// reachable, not measured: one whose cycle has no auto (`auto_in` 0) goes from bypass to manual,
+/// and one with neither from plan to manual. From bypass a click on `yolo` presses through auto,
+/// an expected mode short of its goal, to manual.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn claude_mode_toggle_model() -> Model {

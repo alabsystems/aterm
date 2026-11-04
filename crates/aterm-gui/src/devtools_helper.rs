@@ -4402,6 +4402,16 @@ pub(crate) mod live {
         "kCGWindowNumber",
     ];
 
+    /// The window-list keys [`windows_owned_by`] reads: a window's owner name, its number, and
+    /// whether it is on screen (a key the list carries only for a window on screen,
+    /// `docs/measured/unc-alert-window-list-2026-11-03.md`). None needs a Screen Recording
+    /// grant; a window's title, which does, is never read.
+    pub(crate) const OWNER_KEYS: [&str; 3] = [
+        "kCGWindowOwnerName",
+        "kCGWindowNumber",
+        "kCGWindowIsOnscreen",
+    ];
+
     pub(crate) const WORKSPACE_NAMES: [&str; 3] = [
         "NSWorkspaceDidActivateApplicationNotification",
         "NSWorkspaceApplicationKey",
@@ -5458,6 +5468,67 @@ pub(crate) mod live {
             }
             windows
         }
+    }
+
+    /// The windows of the window list now (desktop elements left out), on screen or not, whose
+    /// owner's name is one of `owners`: each window's number and whether it is on screen, read in
+    /// one WindowServer call; `None` when the list, a key or a listed window's number could not
+    /// be read, so a read that saw nothing is never taken for a list without those windows. A
+    /// window ordered out stays in this list off screen until it is gone
+    /// (`docs/measured/unc-alert-window-list-2026-11-03.md`). Owner names, numbers and the
+    /// on-screen key need no Screen Recording grant; no title is read. Callable from any thread:
+    /// System State's Local Network alert watch calls it on its lane worker in the window process
+    /// (`system_state_access`), never on the main thread, since the call waits on WindowServer.
+    pub(crate) fn windows_owned_by(owners: &[&str]) -> Option<Vec<(u32, bool)>> {
+        let [name_key, number_key, on_screen_key] = OWNER_KEYS.map(appkit::nsstring);
+        let (Some(name_key), Some(number_key), Some(on_screen_key)) =
+            (name_key, number_key, on_screen_key)
+        else {
+            return None;
+        };
+        aterm_objc::autoreleasepool(|_| {
+            // SAFETY: any thread. `CGWindowListCopyWindowInfo` takes no pointer and touches no
+            // AppKit state: it copies WindowServer's window list into a new +1 CFArray (the Copy
+            // rule) that only this call holds, adopted here and released once. Its NSDictionaries,
+            // NSStrings and NSNumbers are immutable Foundation objects, which Foundation lets any
+            // thread read; they are read with `-count`, `-objectAtIndex:` and `-objectForKey:`
+            // (+0 each), the owner name by `nsstring_to_rust` (nil or a live NSString, the value
+            // the list keeps under its owner-name key), the number by `-integerValue` and the
+            // on-screen flag, a CFBoolean (toll-free bridged to NSNumber) when the key is there, by
+            // `-boolValue`, and anything they autorelease goes to this thread's own pool.
+            unsafe {
+                let list = Obj::from_owned(CGWindowListCopyWindowInfo(
+                    consts::CG_WINDOW_LIST_ALL_NON_DESKTOP,
+                    consts::CG_NULL_WINDOW_ID,
+                ))?;
+                let mut windows = Vec::new();
+                for i in 0..appkit::send_usize(list.id(), sel!(count)) {
+                    let window = appkit::send_id_usize(list.id(), sel!(objectAtIndex:), i);
+                    if window.is_null() {
+                        continue;
+                    }
+                    let owner = appkit::send_id_id(window, sel!(objectForKey:), name_key.id());
+                    if owner.is_null()
+                        || !owners.contains(&appkit::nsstring_to_rust(owner).as_str())
+                    {
+                        continue;
+                    }
+                    let number = appkit::send_id_id(window, sel!(objectForKey:), number_key.id());
+                    if number.is_null() {
+                        return None;
+                    }
+                    let number =
+                        u32::try_from(appkit::send_isize(number, sel!(integerValue))).ok()?;
+                    let on_screen =
+                        appkit::send_id_id(window, sel!(objectForKey:), on_screen_key.id());
+                    windows.push((
+                        number,
+                        !on_screen.is_null() && appkit::send_bool(on_screen, sel!(boolValue)),
+                    ));
+                }
+                Some(windows)
+            }
+        })
     }
 
     /// # Safety

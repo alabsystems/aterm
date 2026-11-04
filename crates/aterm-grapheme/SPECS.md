@@ -187,14 +187,33 @@ tests/uax29_conformance.rs	where_unicode_segmentation_disagreed_this_crate_follo
 - S1 has 6 primary tests and carries the official `GraphemeBreakTest` corpus; it is also the
   segmentation half of S2, S3, S11, S12, S20, S21 and L1.
 
-## 4. Proof order
+## 4. Tests that are not spec samples
+
+None: all 46 live `#[test]` functions map to one of the 29 specs in §1.
+
+## 5. Implied specs that look wrong, or disagree with the code
+
+1. **Two width rules disagree on every lone control.** `grapheme_display_width_inner` returns 1
+   for a lone C0, DEL or C1 (`tests::single_cluster_widths` pins NUL, ESC and DEL), while
+   `char_width` and `GridColumns` give a control 0 columns. `tests/emoji_data.rs` filters
+   controls out to agree (S19's `¬c.is_control()`). The owner should pick one rule.
+2. *(Resolved)* **Mislabelled prose.** The misleading ZWJ comment in
+   `grapheme_iter::test_boundary_class_reuse_across_clusters` has been removed.
+3. **Missing oracles.** S4 and S5 cannot be stated against the UCD until
+   `GraphemeBreakProperty.txt`, `DerivedCoreProperties.txt` (InCB) and `EastAsianWidth.txt` are
+   vendored in `tests/data` and the table generator's zero-width rule is a Clean def.
+4. **A test seam stands in for a cost spec.** W5's test reads the `#[cfg(test)]` `ROLE_LOOKUPS`
+   thread_local. The spec needs a ghost counter, which no gap row names (closest: 15); the seam
+   goes once W5 is proved.
+
+## 6. Proof order
 
 Every spec needs `char`/`&str` carriers (gap 1) besides gap 0.
 
 1. **S16** (gaps 0, 1): range matches on `char`, the first `char`-carrier probe.
 2. **S7**, the bounds lemma for every width spec, then **S6** (gaps 0, 1, 3).
-3. **S5, S13, S15, S4**: table equalities decidable by evaluation over every scalar once tables
-   are carriers. S13 and S15 have their oracles; S5 and S4 wait on §5.2. **S14** is the shared
+3. **S5, S13, S15, S4, P1**: table equalities decidable by evaluation over every scalar once tables
+   are carriers. S13, S15 and P1 have their oracles; S5 and S4 wait on §5.3. **S14** is the shared
    lemma for S13 and S15.
 4. **S8**, then **S9** (case analysis over S5, S6, S13 and S16 plus a `chars()` walk), then
    **S10** (cross-crate `TextShapingConfig`, gap 12).
@@ -203,28 +222,5 @@ Every spec needs `char`/`&str` carriers (gap 1) besides gap 0.
 6. **S18**, **S20**, **S21**; **S19** after S9 and S17's local step cases; **S17** last, as a
    cross-crate refinement against aterm-core's `handler_write` (gaps 10, 12).
 7. **W1 → W2 → W3 → W4** (generic closures, gap 11), then **W5** (ghost state).
-
-1. **Two width rules disagree on every lone control.** `grapheme_display_width_inner` returns 1 by an
-   explicit branch for a lone C0/DEL/C1 (`tests::single_cluster_widths` pins it for NUL, ESC and
-   DEL), while `char_width('\x00') = 0` and `GridColumns` gives a control 0 columns. So
-   `grapheme_display_width` and `str_grid_columns` disagree on every lone control;
-   `tests/emoji_data.rs` filters controls out to stay green (S19's `¬c.is_control()`). The owner
-   should pick one rule.
-2. *(Resolved)* **Mislabelled prose.** The misleading ZWJ comment in
-   `grapheme_iter::test_boundary_class_reuse_across_clusters` has been removed.
-3. **Missing oracles.** S4 and S5 cannot be stated against the UCD until `GraphemeBreakProperty.txt`,
-   `DerivedCoreProperties.txt` and `EastAsianWidth.txt` are vendored beside the files already in
-   `tests/data`, and the generator's zero-width rule is written as a Clean def.
-4. **A runtime seam stands in for a cost spec.** W5's tests read the `ROLE_LOOKUPS` thread_local. The
-   spec needs a ghost counter, which no audit §7 row names; once W5 is Certified the seam goes.
-
-1. **Two width rules disagree on every lone control.** `grapheme_display_width_inner` returns 1
-   for a lone C0, DEL or C1 (`tests::single_cluster_widths` pins NUL, ESC and DEL), while
-   `char_width` and `GridColumns` give a control 0 columns. `tests/emoji_data.rs` filters
-   controls out to agree (S19's `¬c.is_control()`). The owner should pick one rule.
-2. **Missing oracles.** S4 and S5 cannot be stated against the UCD until
-   `GraphemeBreakProperty.txt`, `DerivedCoreProperties.txt` (InCB) and `EastAsianWidth.txt` are
-   vendored in `tests/data` and the table generator's zero-width rule is a Clean def.
-3. **A test seam stands in for a cost spec.** W5's test reads the `#[cfg(test)]` `ROLE_LOOKUPS`
-   thread_local. The spec needs a ghost counter, which no gap row names (closest: 15); the seam
-   goes once W5 is proved.
+8. **H1** (Liang hyphenation patterns and identifier exclusion), then **L1** (prose and code
+   line-break opportunities over S1 and H1, generic width callback, gap 11).

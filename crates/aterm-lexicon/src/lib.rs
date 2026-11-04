@@ -1296,9 +1296,19 @@ fn char_count_le_3(s: &str) -> bool {
 
 /// FNV-1a over the key's UTF-8 bytes — the [`Match::form_hash`] source. Kept
 /// byte-level (not char-level) so the hash of a `&str` slice never allocates.
+///
+/// Spelled out with aterm_hash's offset and prime rather than a call to
+/// `aterm_hash::fnv1a_64`, as this crate's floor in the Trust lane needs: to the
+/// lane that call is an unproved callee, and with it this fold loses its proved
+/// row. `the_form_hash_folds_as_aterm_hash_does` holds the two folds equal.
 #[inline]
 fn fnv1a64(s: &str) -> u64 {
-    aterm_hash::fnv1a_64(s.as_bytes())
+    let mut h = aterm_hash::FNV64_OFFSET;
+    for b in s.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(aterm_hash::FNV64_PRIME);
+    }
+    h
 }
 
 /// Maximal run of token characters starting at `i`, treating an apostrophe or
@@ -1386,17 +1396,30 @@ fn right_suppresses(chars: &[char], j: usize) -> bool {
         || ((c == '.' || c == '-') && j + 1 < n && chars[j + 1].is_alphanumeric())
 }
 
-/// Strip a trailing English possessive (`'s` / `'`) from a token, if present.
+/// How many possessive suffixes [`strip_possessive`] tries.
+const POSSESSIVE_COUNT: usize = 4;
+
+/// The possessive suffixes, in the order [`strip_possessive`] tries them: a stem's form variant
+/// is its suffix's place here, counted from 1.
+const POSSESSIVES: [&str; POSSESSIVE_COUNT] = ["'s", "\u{2019}s", "'", "\u{2019}"];
+
+/// Strip a trailing English possessive (`'s` / `'`) from a token, if present, with its form
+/// variant (1 to [`POSSESSIVE_COUNT`]).
 #[inline]
 fn strip_possessive(token: &str) -> Option<(&str, u8)> {
     if !matches!(token.as_bytes().last(), Some(b's' | b'\'' | 0x99)) {
         return None;
     }
-    for (variant, suf) in ["'s", "\u{2019}s", "'", "\u{2019}"].into_iter().enumerate() {
+    // Indexed under its bound, which the prover sees, so the index and the count are proved;
+    // an enumerate index it cannot bound left `variant + 1` refuted.
+    let mut tried = 0;
+    while tried < POSSESSIVE_COUNT {
+        let suf = POSSESSIVES[tried];
+        tried += 1;
         if let Some(stem) = token.strip_suffix(suf)
             && !stem.is_empty()
         {
-            return Some((stem, variant as u8 + 1));
+            return Some((stem, tried as u8));
         }
     }
     None
@@ -1717,5 +1740,29 @@ mod tests {
         let hits = ungated.scan("qwxromcat", &ScanOptions::default());
         assert_eq!(hits.len(), 1);
         assert_eq!(ungated.lang_code(primary_lang(hits[0].langs)), "ro");
+    }
+
+    /// The form hash is aterm_hash's FNV-1a/64 over the key's bytes: the spelled-out
+    /// fold and `aterm_hash::fnv1a_64` agree, and FNV-1a's published vectors hold.
+    #[test]
+    fn the_form_hash_folds_as_aterm_hash_does() {
+        assert_eq!(fnv1a64(""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a64("a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a64("foobar"), 0x8594_4171_f739_67e8);
+        for s in ["", "a", "cat", "chat's", "cat\u{2019}s", "猫", "ⲙⲟⲩⲥⲉ"] {
+            assert_eq!(fnv1a64(s), aterm_hash::fnv1a_64(s.as_bytes()), "{s:?}");
+        }
+    }
+
+    /// A possessive's form variant is its suffix's place in [`POSSESSIVES`], from 1; a suffix
+    /// that would leave no stem is passed over.
+    #[test]
+    fn possessive_variants_count_from_one_in_suffix_order() {
+        assert_eq!(strip_possessive("cat's"), Some(("cat", 1)));
+        assert_eq!(strip_possessive("cat\u{2019}s"), Some(("cat", 2)));
+        assert_eq!(strip_possessive("cats'"), Some(("cats", 3)));
+        assert_eq!(strip_possessive("cats\u{2019}"), Some(("cats", 4)));
+        assert_eq!(strip_possessive("'s"), None, "no stem");
+        assert_eq!(strip_possessive("cat"), None);
     }
 }

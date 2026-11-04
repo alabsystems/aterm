@@ -47,13 +47,8 @@ fn usage(account: &str, full: bool) -> IdentifiedUsage {
     }
 }
 
-fn weekly_session() -> Session<'static> {
-    let mut session = session(
-        Cli::Codex,
-        Supervisor::Own,
-        Mode::Early,
-        Path::new("/opt/codex"),
-    );
+fn weekly_session(world: &World) -> Session<'_> {
+    let mut session = session(Cli::Codex, Supervisor::Own, Mode::Early, &world.exe);
     session.point = Point::Wall {
         window: "seven_day".into(),
         at: Some(NOW),
@@ -97,11 +92,147 @@ fn native_auth(path: &Path, account: &str) {
     .unwrap();
 }
 
+/// A PIN ON ANOTHER ROW HOLDS A HANDOFF BEFORE ANY PROVIDER READ: its writer takes no target under
+/// a pin, so a session on `main` under a pin on `work` reads nothing and proposes nothing, however
+/// often its control retries. A PIN ON THE SESSION'S OWN ROW ENDS AT ITS WALL: the session moves,
+/// and the writer takes it. CONTROL: with no pin it moves.
+#[test]
+fn a_pin_on_another_row_holds_the_handoff_before_any_provider_read() {
+    let pin = |world: &World, label: &str| {
+        world
+            .seat()
+            .store(Cli::Codex)
+            .transact(NOW, &mut None, |state| {
+                state.active = Some(label.to_string());
+                state.pinned = true;
+                Ok(Vec::new())
+            })
+            .unwrap();
+    };
+    let source = Identity::from_native("source", "user");
+    let (world, reader) = fixture("quota-pinned-elsewhere");
+    pin(&world, "work");
+    let proposal = codex_rotation::prepare(
+        &world.seat(),
+        &weekly_session(&world),
+        &source,
+        &reader,
+        Duration::from_secs(60),
+    );
+    assert!(matches!(proposal, Ok(None)), "{proposal:?}");
+    assert!(reader.calls.borrow().is_empty(), "{:?}", reader.calls);
+    assert!(world.load(Cli::Codex).pinned, "the owner's pin stands");
+
+    let (world, reader) = fixture("quota-pinned-here");
+    pin(&world, "main");
+    let proposal = codex_rotation::prepare(
+        &world.seat(),
+        &weekly_session(&world),
+        &source,
+        &reader,
+        Duration::from_secs(60),
+    )
+    .unwrap()
+    .expect("its own wall ends the pin");
+    assert_eq!(proposal.destination.label, "work");
+    assert!(!world.load(Cli::Codex).pinned, "the wall ended the pin");
+
+    let (world, reader) = fixture("quota-unpinned");
+    let proposal = codex_rotation::prepare(
+        &world.seat(),
+        &weekly_session(&world),
+        &source,
+        &reader,
+        Duration::from_secs(60),
+    )
+    .unwrap();
+    assert!(proposal.is_some(), "CONTROL");
+}
+
+/// A LOW ROW IS NO HANDOFF'S TARGET, AS ITS WRITER REFUSES ONE: with `work` low the session proposes
+/// nothing and reads no usage of `work`, rather than selecting a row the writer would refuse.
+/// CONTROL: with `work` at room it is selected.
+#[test]
+fn a_low_row_is_no_handoffs_target() {
+    let source = Identity::from_native("source", "user");
+    let (world, reader) = fixture("quota-low-target");
+    world
+        .seat()
+        .store(Cli::Codex)
+        .transact(NOW, &mut None, |state| {
+            Ok(accounts::note_sample(
+                state,
+                "work",
+                Sample {
+                    session_pct: Some(95),
+                    session_reset: Some(NOW + 7200),
+                    at: NOW,
+                    ..Sample::default()
+                },
+                NOW,
+            ))
+        })
+        .unwrap();
+    let work = world.work_dir(Cli::Codex).join("auth.json");
+    let proposal = codex_rotation::prepare(
+        &world.seat(),
+        &weekly_session(&world),
+        &source,
+        &reader,
+        Duration::from_secs(60),
+    )
+    .unwrap();
+    assert!(proposal.is_none(), "{proposal:?}");
+    assert!(!reader.calls.borrow().contains(&work), "{:?}", reader.calls);
+    let (world, reader) = fixture("quota-room-target");
+    let proposal = codex_rotation::prepare(
+        &world.seat(),
+        &weekly_session(&world),
+        &source,
+        &reader,
+        Duration::from_secs(60),
+    )
+    .unwrap();
+    assert_eq!(
+        proposal.map(|proposal| proposal.destination.label),
+        Some("work".to_string()),
+        "CONTROL"
+    );
+}
+
 #[test]
 fn selected_quota_guard_requires_pool_commit_both_identities_and_current_policy() {
     use crate::harness::codex_renewal::{self as renewal, Intent, Phase, Purpose, Receipt};
-    for changed in 0..6 {
+    for changed in 0..7 {
         let (world, reader) = fixture("quota-selected-guard");
+        if changed == 6 {
+            let roster = accounts::Roster::load_for(
+                Cli::Codex,
+                &world.cfg.join(Cli::Codex.accounts().roster_file),
+            )
+            .unwrap();
+            let work = PathBuf::from(roster.row("work").unwrap().dir.as_ref().unwrap());
+            for home in [world.home.join(".codex"), work] {
+                std::fs::create_dir_all(&home).unwrap();
+                std::fs::write(
+                    home.join("config.toml"),
+                    "cli_auth_credentials_store='file'\n",
+                )
+                .unwrap();
+            }
+            world
+                .seat()
+                .store(Cli::Codex)
+                .transact(NOW, &mut None, |state| {
+                    Ok(accounts::note_auth(
+                        state,
+                        "work",
+                        accounts::Auth::SignedOut,
+                        NOW,
+                    ))
+                })
+                .unwrap();
+        }
         let mut env = crate::harness::cli::Env::from_process().unwrap();
         env.home = Some(world.home.clone());
         env.state = world.state.clone();
@@ -109,7 +240,7 @@ fn selected_quota_guard_requires_pool_commit_both_identities_and_current_policy(
         env.now = NOW;
         let proposal = codex_rotation::prepare(
             &world.seat(),
-            &weekly_session(),
+            &weekly_session(&world),
             &Identity::from_native("source", "user"),
             &reader,
             Duration::from_secs(60),
@@ -201,6 +332,66 @@ fn selected_quota_guard_requires_pool_commit_both_identities_and_current_policy(
                     .unwrap();
             }
             4 => std::fs::remove_file(&proposal.new_auth).unwrap(),
+            6 => {
+                let store = world.seat().store(Cli::Codex);
+                let records = store
+                    .read_account_records(
+                        Some(&world.cfg.join(Cli::Codex.accounts().roster_file)),
+                        NOW,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    records.state.account("work").auth,
+                    accounts::Auth::SignedOut
+                );
+                let generation = records
+                    .logins
+                    .get("work")
+                    .map(|binding| binding.renewal_generation);
+                let raw = records.raw_roster.row("work").unwrap();
+                let context = store
+                    .capture_auth_context(records.roster.row("work").unwrap())
+                    .unwrap();
+                let events = store
+                    .transact_logins(NOW, &mut None, |state, logins| {
+                        accounts::stage_auth(
+                            state,
+                            raw,
+                            logins,
+                            context,
+                            accounts::Auth::SignedOut,
+                            NOW,
+                        );
+                        Ok(Vec::new())
+                    })
+                    .unwrap();
+                assert!(
+                    events
+                        .iter()
+                        .all(|event| event.kind != accounts::Kind::Auth)
+                );
+                assert_eq!(
+                    store
+                        .load_logins(NOW)
+                        .unwrap()
+                        .0
+                        .get("work")
+                        .map(|binding| binding.renewal_generation),
+                    generation
+                );
+                assert!(
+                    proposal
+                        .plan
+                        .clone()
+                        .commit_native(
+                            NOW,
+                            &receipt.id,
+                            &codex_rotation::receipt_binding(&receipt).unwrap()
+                        )
+                        .line
+                        .is_none()
+                );
+            }
             _ => {
                 world
                     .seat()
@@ -225,7 +416,7 @@ fn selected_quota_guard_requires_pool_commit_both_identities_and_current_policy(
         // Source identity, immutable receipt and owner pin changes still refuse it.
         rollback.native_prepare = receipt.native_prepare.clone();
         let restoration = codex_rotation::with_rollback_writer(&env, &rollback, |_| Ok(true));
-        if matches!(changed, 0 | 4 | 5) {
+        if matches!(changed, 0 | 4 | 5 | 6) {
             assert_eq!(restoration, Ok(Some(true)));
         } else {
             assert!(restoration.is_err());
@@ -251,7 +442,7 @@ fn terminal_quota_receipts_retire_only_their_exact_pool_binding() {
         env.now = NOW;
         let proposal = codex_rotation::prepare(
             &world.seat(),
-            &weekly_session(),
+            &weekly_session(&world),
             &Identity::from_native("source", "user"),
             &reader,
             Duration::from_secs(60),
@@ -289,6 +480,8 @@ fn terminal_quota_receipts_retire_only_their_exact_pool_binding() {
             revoked: false,
         };
         proposal.commit(&receipt, NOW).unwrap();
+        native_auth(&receipt.old_auth, "source");
+        native_auth(&receipt.new_auth, "target");
         receipt.phase = phase.clone();
         receipt.launch_attempted = attempted;
         if phase == Phase::Consumed {
@@ -296,6 +489,9 @@ fn terminal_quota_receipts_retire_only_their_exact_pool_binding() {
             receipt.launch_attempted = true;
         }
         renewal::with_receipt_writer(&env, |_| renewal::write_receipt(&env, &receipt)).unwrap();
+        if phase != Phase::Consumed {
+            assert!(renewal::record_completed_rotation(&env, &receipt).is_err());
+        }
         let allowed = phase == Phase::Consumed || (phase == Phase::Retired && !attempted);
         let mut wrong = receipt.clone();
         wrong.native_prepare.push_str(" changed");
@@ -314,6 +510,51 @@ fn terminal_quota_receipts_retire_only_their_exact_pool_binding() {
                     .is_empty()
             );
             assert_eq!(world.load(Cli::Codex).rotations, [NOW]);
+            if phase == Phase::Consumed {
+                assert!(
+                    !world.load(Cli::Codex).proven,
+                    "consumption is not completion"
+                );
+                assert!(renewal::record_completed_rotation(&env, &wrong).is_err());
+                native_auth(&receipt.new_auth, "changed-target");
+                assert!(renewal::record_completed_rotation(&env, &receipt).is_err());
+                assert!(!world.load(Cli::Codex).proven);
+                native_auth(&receipt.new_auth, "target");
+                let active = world.load(Cli::Codex).active;
+                let store = world.seat().store(Cli::Codex);
+                store
+                    .transact_logins(NOW, &mut None, |state, _| {
+                        state.active = Some("main".into());
+                        Ok(Vec::new())
+                    })
+                    .unwrap();
+                assert_eq!(
+                    codex_rotation::with_consumed_member_writer(&env, &receipt, |_, _| Ok(true)),
+                    Ok(Some(true))
+                );
+                native_auth(&receipt.new_auth, "changed-target");
+                assert!(
+                    codex_rotation::with_consumed_member_writer(&env, &receipt, |_, _| Ok(true))
+                        .is_err()
+                );
+                native_auth(&receipt.new_auth, "target");
+                store
+                    .transact_logins(NOW, &mut None, |state, _| {
+                        state.active = active.clone();
+                        Ok(Vec::new())
+                    })
+                    .unwrap();
+                assert_eq!(
+                    renewal::record_completed_rotation(&env, &receipt),
+                    Ok(Some(()))
+                );
+                assert!(world.load(Cli::Codex).proven);
+                assert!(world.load(Cli::Codex).canary.is_none());
+                assert_eq!(
+                    renewal::record_completed_rotation(&env, &receipt),
+                    Ok(Some(()))
+                );
+            }
         } else {
             assert!(renewal::retire_pool_record(&env, &receipt).is_err());
             assert_eq!(
@@ -328,13 +569,46 @@ fn terminal_quota_receipts_retire_only_their_exact_pool_binding() {
                 1
             );
         }
+        if phase == Phase::Ready {
+            let mut changed = receipt.clone();
+            changed.native_prepare.push_str(" changed");
+            assert!(renewal::cancel_unexecuted_rotation(&env, &changed, "work").is_err());
+            let mut executed = receipt.clone();
+            executed.launch_attempted = true;
+            assert!(renewal::cancel_unexecuted_rotation(&env, &executed, "work").is_err());
+            let retired = renewal::cancel_unexecuted_rotation(&env, &receipt, "work")
+                .unwrap()
+                .unwrap();
+            assert_eq!(retired.phase, Phase::Retired);
+            assert!(retired.revoked);
+            assert_eq!(world.load(Cli::Codex).active.as_deref(), Some("main"));
+            assert!(world.load(Cli::Codex).canary.is_none());
+            assert!(
+                world
+                    .seat()
+                    .store(Cli::Codex)
+                    .load_logins(NOW)
+                    .unwrap()
+                    .0
+                    .native_rotations
+                    .is_empty()
+            );
+            assert_eq!(
+                renewal::cancel_unexecuted_rotation(&env, &receipt, "work"),
+                Ok(Some(retired.clone()))
+            );
+            assert_eq!(
+                renewal::cancel_unexecuted_rotation(&env, &retired, "work"),
+                Ok(Some(retired))
+            );
+        }
     }
 }
 
 #[test]
 fn quota_proposal_binds_fresh_identities_and_defers_the_pool_commit() {
     let (world, reader) = fixture("quota-proposal");
-    let s = weekly_session();
+    let s = weekly_session(&world);
     let expected = Identity::from_native("source", "user");
     let proposal = codex_rotation::prepare(
         &world.seat(),
@@ -364,7 +638,7 @@ fn quota_proposal_binds_fresh_identities_and_defers_the_pool_commit() {
 #[test]
 fn native_quota_commit_retries_charge_once_and_refuse_a_different_binding() {
     let (world, reader) = fixture("quota-commit-retry");
-    let s = weekly_session();
+    let s = weekly_session(&world);
     let expected = Identity::from_native("source", "user");
     let prepare = || {
         codex_rotation::prepare(
@@ -395,10 +669,56 @@ fn native_quota_commit_retries_charge_once_and_refuse_a_different_binding() {
 }
 
 #[test]
+fn concurrent_native_plans_follow_the_proven_target_without_another_rotation() {
+    let (world, reader) = fixture("quota-concurrent-follow");
+    let first_session = weekly_session(&world);
+    let mut next_session = weekly_session(&world);
+    next_session.sid = "next-native-session";
+    let expected = Identity::from_native("source", "user");
+    let prepare = |session: &Session<'_>| {
+        codex_rotation::prepare(
+            &world.seat(),
+            session,
+            &expected,
+            &reader,
+            Duration::from_secs(60),
+        )
+        .unwrap()
+        .unwrap()
+        .plan
+    };
+    let first = prepare(&first_session);
+    let next = prepare(&next_session);
+    let id = "a".repeat(32);
+    let next_id = "c".repeat(32);
+    let binding = "b".repeat(64);
+    assert!(first.commit_native(NOW, &id, &binding).line.is_some());
+    assert!(
+        next.clone()
+            .commit_native(NOW, &next_id, &binding)
+            .line
+            .is_none(),
+        "a pending canary still owns admission"
+    );
+    let store = world.seat().store(Cli::Codex);
+    store
+        .transact(NOW, &mut None, |state| {
+            Ok(accounts::prove(state, "work", NOW).into_iter().collect())
+        })
+        .unwrap();
+    assert!(
+        next.commit_native(NOW, &next_id, &binding).line.is_some(),
+        "a successful canary lets the already-prepared session follow the same target"
+    );
+    assert_eq!(world.load(Cli::Codex).rotations, [NOW]);
+    assert_eq!(store.load_logins(NOW).unwrap().0.native_rotations.len(), 2);
+}
+
+#[test]
 fn native_quota_retry_cannot_override_a_later_selection_or_unusable_target() {
     for change in 0..4 {
         let (world, reader) = fixture("quota-retry-revoked");
-        let s = weekly_session();
+        let s = weekly_session(&world);
         let expected = Identity::from_native("source", "user");
         let prepare = || {
             codex_rotation::prepare(
@@ -419,13 +739,16 @@ fn native_quota_retry_cannot_override_a_later_selection_or_unusable_target() {
         assert!(first.commit_native(NOW, &id, &binding).line.is_some());
         let store = world.seat().store(Cli::Codex);
         store
-            .transact_logins(NOW, &mut None, |state, _| {
+            .transact_logins(NOW, &mut None, |state, logins| {
                 match change {
                     0 => state.pinned = true,
                     1 => state.active = Some("main".into()),
                     2 => {
-                        return Ok(accounts::note_auth(
+                        return Ok(stage_current_auth(
+                            &world,
+                            Cli::Codex,
                             state,
+                            logins,
                             "work",
                             accounts::Auth::SignedOut,
                             NOW,
@@ -474,7 +797,7 @@ fn quota_proposal_refuses_wrong_source_restored_quota_and_unusable_destinations(
                 reader.answers.insert(work, usage("source", false));
             }
         }
-        let s = weekly_session();
+        let s = weekly_session(&world);
         let result = codex_rotation::prepare(
             &world.seat(),
             &s,
@@ -501,7 +824,7 @@ fn disabled_rotation_and_an_expired_budget_make_no_provider_requests() {
             )
             .unwrap();
         }
-        let s = weekly_session();
+        let s = weekly_session(&world);
         let result = codex_rotation::prepare(
             &world.seat(),
             &s,
@@ -523,7 +846,7 @@ fn disabled_rotation_and_an_expired_budget_make_no_provider_requests() {
 fn native_exec_proposal_uses_fresh_shared_account_reads_and_typed_dispatch() {
     use crate::harness::codex_exec_handoff::ExecCommand;
     let (world, reader) = fixture("exec-quota-proposal");
-    let request = weekly_session();
+    let request = weekly_session(&world);
     let program = std::env::current_exe().unwrap();
     let image = crate::harness::native_act::Image::at(&program).unwrap();
     let source = Identity::from_native("source", "user");
@@ -540,6 +863,7 @@ fn native_exec_proposal_uses_fresh_shared_account_reads_and_typed_dispatch() {
     let proposal = codex_rotation::prepare_exec(
         &world.seat(),
         &request,
+        &world.exe,
         &source,
         &reader,
         Duration::from_secs(60),

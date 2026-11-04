@@ -230,7 +230,7 @@ const BASH_PATCHES: [Archive; aterm_uds::host::bash::PATCHES.len()] = {
 pub const MICROSOFT_TEAM: &str = "UBF8T346G9";
 
 /// Every row, in the order a run provides them.
-pub const ROWS: [Row; 14] = [
+pub const ROWS: [Row; 15] = [
     Row {
         name: "openssl-signing",
         tool: Some("openssl-signing"),
@@ -241,6 +241,31 @@ pub const ROWS: [Row; 14] = [
                 sha256: "603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a",
                 bytes: 53_279_637,
             },
+        },
+    },
+    Row {
+        name: "cpython",
+        tool: Some("cpython"),
+        install: Install::Unpack {
+            archives: &[
+                Archive {
+                    platform: "macos-aarch64",
+                    url: "https://github.com/astral-sh/python-build-standalone/releases/download/20261013/cpython-{v}-aarch64-apple-darwin-install_only.tar.gz",
+                    sha256: "709f419d175eb015f810b68aa54bdae1d776c9824cb362aa701c93b0a9f2a9e7",
+                    bytes: 26_814_582,
+                },
+                Archive {
+                    platform: "macos-x86_64",
+                    url: "https://github.com/astral-sh/python-build-standalone/releases/download/20261013/cpython-{v}-x86_64-apple-darwin-install_only.tar.gz",
+                    sha256: "e09bce050cf075e777d1a802c4a11b6d43d54291b5f76911887173b28ad9c9fd",
+                    bytes: 27_005_136,
+                },
+            ],
+            strip: 1,
+            anchor: Anchor::Sha256,
+            keep: &["lib/python3.14/LICENSE.txt"],
+            cap: None,
+            holds: Holds::Program,
         },
     },
     Row {

@@ -4,6 +4,7 @@
 use super::*;
 use crate::age::Identity;
 use crate::commons::binding::Request as BindingRequest;
+use crate::crossing::RecordsBound;
 use crate::membership_log::untaken::ReceivedFrames;
 use crate::membership_log::{Body as RecordBody, Entrant, Log, Store, encode_records};
 use std::cell::Cell;
@@ -184,7 +185,14 @@ fn a_pinned_known_owner_is_offered_again_when_the_current_store_lost_it() {
         slot.on_file = Some(1);
     }
     assert_eq!(
-        apply_records(&running.shared, "team", staged, true).status,
+        apply_records(
+            &running.shared,
+            "team",
+            staged,
+            true,
+            Some(RecordsBound::uncrossed())
+        )
+        .status,
         204
     );
     assert_eq!(std::fs::read(&path).unwrap(), first_two);
@@ -250,9 +258,14 @@ fn a_streamed_pull_owner_survives_loss_from_the_current_store() {
         slot.on_file = Some(1);
     }
     assert_eq!(
-        apply_pulled_records(&running.shared, "team", staged)
-            .1
-            .status,
+        apply_pulled_records(
+            &running.shared,
+            "team",
+            staged,
+            Some(RecordsBound::uncrossed())
+        )
+        .1
+        .status,
         204
     );
     assert_eq!(std::fs::read(&path).unwrap(), first_two);
@@ -273,8 +286,12 @@ fn a_readable_pull_keeps_the_original_unreadable_frame_for_its_note() {
     let unknown = crate::membership_log::with_kind_code(&records[2], 0xee);
     let unread = aterm_digest::Sha256::digest(&unknown);
     let bytes = [records[1].bytes(), &unknown].concat();
-    let (sent, reply) =
-        apply_pulled_records(&running.shared, "team", received(&running.shared, &bytes));
+    let (sent, reply) = apply_pulled_records(
+        &running.shared,
+        "team",
+        received(&running.shared, &bytes),
+        Some(RecordsBound::uncrossed()),
+    );
     assert_eq!(reply.status, 204);
     let state = running.shared.lock_server_state();
     let store = &state.records["team"].store;
@@ -307,7 +324,12 @@ fn a_layout_invalid_pull_is_not_empty_and_applies_no_prefix() {
     assert_eq!(staged.byte_len(), bytes.len());
     assert!(staged.whole().is_none());
     assert!(staged.readable().is_empty());
-    let (_, reply) = apply_pulled_records(&running.shared, "team", staged);
+    let (_, reply) = apply_pulled_records(
+        &running.shared,
+        "team",
+        staged,
+        Some(RecordsBound::uncrossed()),
+    );
     assert_eq!(std::fs::read(&path).unwrap(), before);
     assert_eq!(fsx::stamp(&path), stamp);
     assert!(
@@ -330,6 +352,7 @@ fn completed_pull_candidates_keep_admission_capacity_and_unrooted_verdicts() {
         &running.shared,
         "team",
         received(&running.shared, records[0].bytes()),
+        Some(RecordsBound::uncrossed()),
     );
     assert_eq!(reply.status, 403);
     assert!(running.shared.lock_server_state().records.is_empty());
@@ -338,6 +361,7 @@ fn completed_pull_candidates_keep_admission_capacity_and_unrooted_verdicts() {
         &running.shared,
         crate::ALAB_VAULT,
         received(&running.shared, records[1].bytes()),
+        Some(RecordsBound::uncrossed()),
     );
     assert_eq!(reply.status, 422);
     assert!(running.shared.lock_server_state().records.is_empty());
@@ -359,6 +383,7 @@ fn completed_pull_candidates_keep_admission_capacity_and_unrooted_verdicts() {
         &running.shared,
         crate::ALAB_VAULT,
         received(&running.shared, records[0].bytes()),
+        Some(RecordsBound::uncrossed()),
     );
     assert_eq!(reply.status, 507);
     assert_eq!(running.shared.lock_server_state().records.len(), MAX_VAULTS);
@@ -380,6 +405,7 @@ fn a_pull_write_failure_keeps_its_candidate_out_of_the_current_store() {
         &running.shared,
         "team",
         received(&running.shared, records[1].bytes()),
+        Some(RecordsBound::uncrossed()),
     );
     running.shared.writes_fail.store(false, Ordering::SeqCst);
     assert_eq!(reply.status, 500);

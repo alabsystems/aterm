@@ -650,7 +650,11 @@ fn a_save_after_the_first_check_still_refuses_the_edit() {
 #[cfg(target_vendor = "apple")]
 #[test]
 fn a_lock_refused_for_another_reason_is_not_waited_on() {
-    const NAME: &str = "atomic_file::tests::a_lock_refused_for_another_reason_is_not_waited_on";
+    // This test's own name as libtest filters it: its module path below the crate.
+    let name = format!(
+        "{}::a_lock_refused_for_another_reason_is_not_waited_on",
+        module_path!().split_once("::").expect("a crate's module").1
+    );
     const STAGE_ENV: &str = "ATERM_UDS_TEST_LOCK_DENIED";
     if let Some(dir) = std::env::var_os(STAGE_ENV) {
         let target = Path::new(&dir).join("aterm.toml");
@@ -669,7 +673,7 @@ fn a_lock_refused_for_another_reason_is_not_waited_on() {
         crate::spawnfd::command("/usr/bin/sandbox-exec")
             .args(["-p", "(version 1)(allow default)(deny file-lock)"])
             .arg(std::env::current_exe().expect("the test binary"))
-            .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+            .args(["--exact", &name, "--nocapture", "--test-threads=1"])
             .env(STAGE_ENV, &scratch.0),
         2 * crate::deadline::ECHO_HANG,
     );

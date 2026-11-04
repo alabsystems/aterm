@@ -1717,7 +1717,7 @@ pub fn plan_or_apply_only(
         send(env, job, agent_archive.as_ref().map(|a| &a.archive))
     });
     // Every host's key calls share one agh client, so agh paces the run's key writes.
-    let key_calls = super::github::KeyCalls::new(env.sys);
+    let key_calls = super::github::KeyCalls::new(env.sys, &env.paths);
     for (job, outcome) in jobs.iter().zip(outcomes) {
         match outcome {
             Ok(mut report) => {
@@ -2406,7 +2406,7 @@ fn after_run(env: &Env<'_>, inv: &Inventory, host: &Host, report: HostReport, so
         host,
         report,
         source,
-        &super::github::KeyCalls::new(env.sys),
+        &super::github::KeyCalls::new(env.sys, &env.paths),
     );
 }
 
@@ -3279,7 +3279,7 @@ pub fn github_revoke(env: &Env<'_>, name: &str) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let ids: Vec<u64> = state.github_keys.iter().map(|(_, id)| *id).collect();
-    let deleted = match super::github::revoke_via(env.sys, github, &ids) {
+    let deleted = match super::github::revoke_via(env.sys, &env.paths, github, &ids) {
         Ok(deleted) => deleted,
         Err(why) => {
             errln!("aterm machines github revoke: {}: {why}", host.name);
@@ -3311,7 +3311,8 @@ pub fn github_revoke(env: &Env<'_>, name: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `aterm machines github login`: prompt for the `[github]` token and store it in Keychain.
+/// `aterm machines github login`: prompt for the `[github]` token and store it in the
+/// controller's `keys/github_token` (0600), never the login keychain.
 #[must_use = "handle or propagate the command's exit status"]
 pub fn github_login(env: &Env<'_>) -> ExitCode {
     let inv = match load(env) {
@@ -3323,13 +3324,13 @@ pub fn github_login(env: &Env<'_>) -> ExitCode {
         return ExitCode::from(2);
     };
     if github.keys_via() == super::inventory::KeysVia::AghFleet {
-        // Under 5b the key calls read agh.toml's fleet profile and never this keychain item, so
+        // Under 5b the key calls read agh.toml's fleet profile and never this token file, so
         // a token stored here would go unused while the login said otherwise.
         errln!(
             "aterm machines github login: keys = \"agh-fleet\" reads agh.toml's fleet profile, \
-             not the login keychain: agh auth add fleet --file PATH --tier dev (a token of \
-             {}'s with the {} scope); to store a keychain token for keys = \"gh\" or \
-             \"agh-inline\", set that first",
+             not keys/github_token: agh auth add fleet --file PATH --tier dev (a token of \
+             {}'s with the {} scope); to store a token for keys = \"gh\" or \"agh-inline\", \
+             set that first",
             github.account,
             super::github::KEY_SCOPE
         );
@@ -3358,13 +3359,14 @@ pub fn github_login(env: &Env<'_>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match super::github::login(env.sys, &github.account, token) {
+    let token_file = env.paths.github_token();
+    match super::github::login(env.sys, &token_file, &github.account, token) {
         Ok(()) => {
             outln!(
-                "stored {}'s GitHub token in the login keychain ({}); host keys register \
-                 with it from the next apply",
+                "stored {}'s GitHub token in {} (0600); host keys register with it from the \
+                 next apply",
                 github.account,
-                super::github::TOKEN_HOST
+                token_file.display()
             );
             ExitCode::SUCCESS
         }
@@ -5690,24 +5692,7 @@ mod tests {
     }
 
     fn with_token(sys: &Fake) {
-        sys.stat_of(
-            crate::items::github::CLT_GIT,
-            crate::port::Stat {
-                uid: 0,
-                gid: 0,
-                mode: 0o755,
-                dir: false,
-                symlink: false,
-                len: 1,
-            },
-        );
-        crate::git_credential::script::holds(
-            sys,
-            None,
-            super::super::github::TOKEN_HOST,
-            "fleetbot",
-            MACHINE_TOKEN,
-        );
+        super::super::github_keys_tests::holds_token(sys, &paths(), MACHINE_TOKEN);
         sys.on_github_rest(
             crate::port::RestMethod::Get,
             "/user",
@@ -5902,7 +5887,7 @@ mod tests {
     /// `fake` on loopback (plan §17).
     fn over_agh(hosts: &[&Host], fake: &agh_fake::FakeGithub) -> Fake {
         let (sys, _token) =
-            super::super::github_keys_tests::inline_on(controller(hosts, false), fake);
+            super::super::github_keys_tests::inline_on(controller(hosts, false), &paths(), fake);
         names(
             &sys,
             hosts,
@@ -5927,7 +5912,7 @@ mod tests {
         let e = env(&sys);
         let inv = inventory_of(&sys);
         // `run`'s loop: every host's report through the one `KeyCalls` it opens.
-        let key_calls = super::super::github::KeyCalls::new(&sys);
+        let key_calls = super::super::github::KeyCalls::new(&sys, &paths());
         for (host, body) in [(&a, ALICE_OLD), (&b, ALICE_NEW)] {
             after_run_with(
                 &e,
@@ -6010,17 +5995,6 @@ mod tests {
             (true, false, ExitCode::from(2)),
         ] {
             let sys = controller(&[&a], github);
-            sys.stat_of(
-                crate::items::github::CLT_GIT,
-                crate::port::Stat {
-                    uid: 0,
-                    gid: 0,
-                    mode: 0o755,
-                    dir: false,
-                    symlink: false,
-                    len: 1,
-                },
-            );
             sys.answer(Some(MACHINE_TOKEN));
             sys.on_github_rest(
                 crate::port::RestMethod::Get,
@@ -6031,20 +6005,13 @@ mod tests {
                     body: br#"{"login":"fleetbot"}"#.to_vec(),
                 }),
             );
-            let approve = crate::git_credential::script::approves(&sys, None);
-            crate::git_credential::script::holds(
-                &sys,
-                None,
-                super::super::github::TOKEN_HOST,
-                "fleetbot",
-                MACHINE_TOKEN,
-            );
+            let stores = format!("write {} 600", paths().github_token().display());
             let mut e = env(&sys);
             e.tty = tty;
             assert_eq!(github_login(&e), code, "tty {tty}, github {github}");
             let calls = sys.calls();
             assert_eq!(
-                calls.contains(&approve),
+                calls.contains(&stores),
                 code == ExitCode::SUCCESS,
                 "{calls:?}"
             );
@@ -6075,17 +6042,6 @@ mod tests {
                 &[&a],
                 &format!("[github]\naccount = \"fleetbot\"\nkeys = \"{keys}\"\n"),
             );
-            sys.stat_of(
-                crate::items::github::CLT_GIT,
-                crate::port::Stat {
-                    uid: 0,
-                    gid: 0,
-                    mode: 0o755,
-                    dir: false,
-                    symlink: false,
-                    len: 1,
-                },
-            );
             sys.answer(Some(MACHINE_TOKEN));
             sys.on_github_rest(
                 crate::port::RestMethod::Get,
@@ -6096,20 +6052,13 @@ mod tests {
                     body: br#"{"login":"fleetbot"}"#.to_vec(),
                 }),
             );
-            let approve = crate::git_credential::script::approves(&sys, None);
-            crate::git_credential::script::holds(
-                &sys,
-                None,
-                super::super::github::TOKEN_HOST,
-                "fleetbot",
-                MACHINE_TOKEN,
-            );
+            let stores = format!("write {} 600", paths().github_token().display());
             let mut e = env(&sys);
             e.tty = true;
             assert_eq!(github_login(&e), code, "{keys}");
             let calls = sys.calls();
             let stored = code == ExitCode::SUCCESS;
-            assert_eq!(calls.contains(&approve), stored, "{keys}: {calls:?}");
+            assert_eq!(calls.contains(&stores), stored, "{keys}: {calls:?}");
             assert_eq!(
                 calls.iter().any(|c| c.starts_with("ask")),
                 stored,
@@ -6565,8 +6514,7 @@ mod tests {
                 "xcode-select: error: Unable to get active developer directory.",
             )
         };
-        let curl =
-            "/usr/bin/curl --disable --proto =https -sSI --max-time 20 https://swscan.apple.com/";
+        let catalog = "/usr/sbin/softwareupdate -l";
         let plain = |sys: &Fake| here_report(sys, Mode::Apply, None, None, HereOutput::Plain);
         let class = |why: Unfinished| Some(ExitCode::from(why.code().unwrap()));
 
@@ -6593,13 +6541,12 @@ mod tests {
         let unreached = mac();
         unreached
             .on("/usr/bin/xcode-select -p", none_selected())
-            .on(curl, Ran::exit(6, "curl: (6) Could not resolve host"));
+            .on(catalog, Ran::exit(1, "catalog network unavailable"));
         assert!(plain(&unreached).err() == class(Unfinished::Catalog));
 
         // Another install holds the placeholder.
         let busy = mac();
         busy.on("/usr/bin/xcode-select -p", none_selected())
-            .on(curl, Ran::ok("HTTP/1.1 404 Not Found\r\n\r\n"))
             .running(&["/usr/sbin/softwareupdate"])
             .file(crate::items::developer::PLACEHOLDER, b"");
         assert!(plain(&busy).err() == class(Unfinished::Busy));
@@ -6610,7 +6557,7 @@ mod tests {
         planted
             .file(baseline, b"schema = 1\n")
             .on("/usr/bin/xcode-select -p", none_selected())
-            .on(curl, Ran::exit(6, "curl: (6) Could not resolve host"));
+            .on(catalog, Ran::exit(1, "catalog network unavailable"));
         assert!(plain(&planted).err() == class(Unfinished::Catalog));
 
         // What the root half cannot even start is said as the other class, never in its words.
@@ -6761,8 +6708,8 @@ mod tests {
                 ),
             )
             .on(
-                "/usr/bin/curl --disable --proto =https -sSI --max-time 20 https://swscan.apple.com/",
-                Ran::exit(6, "curl: (6) Could not resolve host"),
+                "/usr/sbin/softwareupdate -l",
+                Ran::exit(1, "catalog network unavailable"),
             )
             .on("/usr/sbin/scutil --get ComputerName", Ran::ok("m42\n"))
             .on("/usr/sbin/scutil --get LocalHostName", Ran::ok("m42\n"));

@@ -1249,7 +1249,11 @@ fn undo_target(
 }
 
 /// What the epoch tender remembers between passes ([`TendMark`]): when each audience first became
-/// due here, and when this Mac first saw each newest epoch, and saw it settled.
+/// due here; for each newest epoch another Mac minted that this Mac first saw as a prefix of its
+/// minter's batch, when it first saw it and when it let the audience go (once the batch settled,
+/// or past the settle grace); the same for each newest `[everyone]` epoch that held the other
+/// audiences while its batch could still decide a Mac with no seat; and when it first saw each
+/// removal a due waits on. A head that arrived settled has no line.
 fn epoch_mark_file(paths: &Paths) -> PathBuf {
     paths.dir.join("epoch-tend")
 }
@@ -1367,39 +1371,125 @@ pub fn reseal_waits(paths: &Paths) -> crate::Result<Vec<String>> {
 }
 
 /// [`tend_epochs_at`] at the wall clock, and what it signed posted to every server this Mac
-/// reaches: the subscriber's pass after it pulls records. Best effort: a pass that fails here
-/// tries again on the next.
+/// reaches within one exchange ([`super::admit::post_records_to_servers_by`]).
 ///
 /// # Errors
 /// As [`tend_epochs_at`].
 pub fn tend_epochs(paths: &Paths) -> crate::Result<Vec<Record>> {
-    tend_epochs_by(paths, None)
-}
-
-/// [`tend_epochs`], what it signed posted by `posts_by` (one exchange from when it posts where
-/// none is given, [`super::admit::post_records_to_servers_by`]): a deadline the pass's other
-/// posts share.
-///
-/// # Errors
-/// As [`tend_epochs_at`].
-pub(super) fn tend_epochs_by(
-    paths: &Paths,
-    posts_by: Option<Instant>,
-) -> crate::Result<Vec<Record>> {
     let now_ms = aterm_time::unix_millis().unwrap_or(0);
     let signed = tend_epochs_at(paths, now_ms)?;
     if !signed.is_empty() {
+        let _ = super::admit::post_records_to_servers_by(paths, super::fan_out::one_exchange());
+    }
+    Ok(signed)
+}
+
+/// One vault pass's re-keys at `now_ms`: the ranked wrap-gap closer
+/// ([`log_entries::close_wrap_gaps`]), then the ranked tender ([`tend_epochs_at`]), the second
+/// whether or not the first fails. Every log member's subscriber runs it after each records pull,
+/// whatever its vault's source ([`vault_pass`]): an exchange signs nothing, so outside a person's
+/// act this is where a wrap gap closes and a due re-key is minted. Returns what they signed,
+/// already in this Mac's records, nothing posted.
+///
+/// # Errors
+/// As [`log_entries::close_wrap_gaps`] and [`tend_epochs_at`]; the gap closer's error, once the
+/// tender ran.
+pub fn vault_pass_at(paths: &Paths, now_ms: u64) -> crate::Result<Vec<Record>> {
+    let closed = log_entries::close_wrap_gaps(paths, now_ms);
+    let tended = tend_epochs_at(paths, now_ms);
+    let mut signed = closed?;
+    signed.extend(tended?);
+    Ok(signed)
+}
+
+/// [`vault_pass_at`] at the wall clock, what it signed posted to every server this Mac reaches
+/// by `posts_by` (one exchange from when it posts where none is given,
+/// [`super::admit::post_records_to_servers_by`]): a deadline the subscriber pass's other posts
+/// share. Best effort: a pass that fails here tries again on the next.
+pub(super) fn vault_pass(paths: &Paths, posts_by: Option<Instant>) {
+    let now_ms = aterm_time::unix_millis().unwrap_or(0);
+    if vault_pass_at(paths, now_ms).is_ok_and(|signed| !signed.is_empty()) {
         let by = posts_by.unwrap_or_else(super::fan_out::one_exchange);
         let _ = super::admit::post_records_to_servers_by(paths, by);
     }
-    Ok(signed)
 }
 
 #[cfg(test)]
 thread_local! {
     /// The negative control of the ranks: while set, every member's turn is the first, at once,
-    /// as every Mac's exchange-time repair once minted.
+    /// and every holder of a wrap gap closes it at its first look, as every Mac's exchange-time
+    /// repair once signed.
     pub(super) static UNRANKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The negative control of the removal's grace: while set, every other Mac's grace counts from
+    /// the audience's clock, however long before the removal it waits on that started.
+    pub(super) static GRACE_FROM_DUE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The negative control of a settled head: while set, every newest epoch another Mac minted
+    /// moves the ranks to when this Mac first saw it, as a head arriving mid-countdown once did.
+    pub(super) static HEADS_MOVE_RANKS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// The negative control of the authoring recheck: while set, the signing look checks no
+    /// rank, grace or settledness and re-keys every audience [`Log::rekey_dues`] names, however
+    /// its heads changed since the scheduling observation.
+    pub(super) static STALE_AUTHORING: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// The negative control of the bounded settle grace: while set, the grace does not let an
+    /// audience go while [`Log::undecided`] names a Mac there, as before, so a whole batch that
+    /// ends in `Wrap`s holds the audience until its minter signs again.
+    pub(super) static UNDECIDED_HOLDS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// The negative control of `[everyone]`'s hold on other audiences: while set, a re-key waits
+    /// only on its own audience's newest epochs, as before, so a re-key of a host list or Commons
+    /// over a prefix of `[everyone]`'s batch drops a Mac with no seat that batch may still wrap.
+    pub(super) static EVERYONE_UNREAD: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Whether [`UNDECIDED_HOLDS`] holds `audience` past the settle grace: it is set and
+/// [`Log::undecided`] names a Mac there for `mine`.
+#[cfg(test)]
+fn undecided_holds(log: &Log, audience: &EpochAudience, mine: Option<&Recipient>) -> bool {
+    UNDECIDED_HOLDS.with(std::cell::Cell::get)
+        && mine.is_some_and(|mine| !log.undecided(audience, mine).is_empty())
+}
+
+#[cfg(not(test))]
+const fn undecided_holds(_: &Log, _: &EpochAudience, _: Option<&Recipient>) -> bool {
+    false
+}
+
+#[cfg(test)]
+fn everyone_unread() -> bool {
+    EVERYONE_UNREAD.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+const fn everyone_unread() -> bool {
+    false
+}
+
+#[cfg(test)]
+fn grace_from_due() -> bool {
+    GRACE_FROM_DUE.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+const fn grace_from_due() -> bool {
+    false
+}
+
+#[cfg(test)]
+fn heads_move_ranks(log: &Log, epoch: &RecordId, me: &MemberId) -> bool {
+    HEADS_MOVE_RANKS.with(std::cell::Cell::get)
+        && log.get(epoch).is_some_and(|record| record.actor() != me)
+}
+
+#[cfg(not(test))]
+const fn heads_move_ranks(_: &Log, _: &RecordId, _: &MemberId) -> bool {
+    false
 }
 
 /// `me`'s turn for `due` ([`RekeyDue::turn`]).
@@ -1426,18 +1516,26 @@ fn turn_of(
 /// - the audience's clock starts when this Mac first sees it due, and holds while it stays due,
 ///   whatever new head arrives; it clears only once the audience is due no more;
 /// - a remover acts its rank's [`log_entries::GAP_STEP_MS`] after the clock; every other Mac
-///   waits [`log_entries::REMOVER_GRACE_MS`] more, for the remover's own rotation to arrive;
-///   with no remover that can carry the audience, its carriers rank with no grace;
-/// - a rank's steps count from the later of the clock and when this Mac first saw every newest
-///   epoch settled, so a head that settles late does not put every rank past due at once;
+///   waits [`log_entries::REMOVER_GRACE_MS`] from when it first saw the removals the due waits
+///   on ([`RekeyDue::removals`]), for the remover's own rotation to arrive, so a removal that
+///   finds the audience due already still gets its grace; with no remover that can carry the
+///   audience, its carriers rank with no grace;
 /// - an epoch another Mac minted whose batch this Mac may hold only a prefix of
 ///   ([`Log::unsettled`]) holds the audience, until it settles or
 ///   [`log_entries::SETTLE_GRACE_MS`] after this Mac first saw it (a minter whose batch ends in
-///   `Wrap`s and falls silent).
+///   `Wrap`s and falls silent: no record marks a batch's end, so a whole one reads as a prefix
+///   until its minter signs again); a rank's steps then count from when it let the audience go,
+///   so a head that settles late does not put every rank past due at once. A head that arrives
+///   settled moves no rank;
+/// - every audience but `[everyone]` is held the same way by `[everyone]`'s newest epochs while
+///   their batch may still decide a Mac with no seat ([`Log::undecided`]): a re-key reads
+///   `[everyone]`'s leave-out for each audience and would drop that Mac for good. Past the grace
+///   what it mints leaves such a Mac out, as a removal's own rotation does.
 ///
 /// A ranked Mac that cannot open every newest epoch signs nothing, and the next rank acts a step
-/// later. It looks without the state lock and takes it only to sign, looking again under it.
-/// Returns the records it signed, already in this Mac's records.
+/// later. What it mints carries the recipients a batch may still wrap ([`Log::in_flight`]). It
+/// looks without the state lock and takes it only to sign, looking again under it. Returns the
+/// records it signed, already in this Mac's records.
 ///
 /// # Errors
 /// Local state cannot be read or written, or a record fails to open or sign.
@@ -1477,52 +1575,142 @@ fn ready_rekeys(
 ) -> (TendMark, Vec<EpochAudience>) {
     let mut mark = TendMark::default();
     let membership = log.membership();
+    let mine = membership.get(me).map(|member| member.binding.recipient());
+    let dues = log.rekey_dues();
+    let (waited_to, waits) = if dues
+        .iter()
+        .any(|due| due.audience != EpochAudience::Everyone)
+    {
+        everyone_wait(log, me, mine.as_ref(), earlier, &mut mark, now_ms)
+    } else {
+        (0, false)
+    };
     let mut ready = Vec::new();
-    for due in &log.rekey_dues() {
+    for due in &dues {
         let tag = audience_tag(&due.audience);
         // A clock set back since never puts first sight in the future.
         let first = earlier.due.get(&tag).copied().unwrap_or(now_ms).min(now_ms);
         mark.due.insert(tag, first);
         let unsettled = log_entries::unsettled_of_others(log, &due.newest, me);
         let mut from = first;
-        let mut settled = true;
+        let mut held = false;
         for epoch in &due.newest {
-            if log.get(epoch).is_some_and(|record| record.actor() == me) {
+            let holding = unsettled.contains(epoch);
+            let Some((seen, start)) = earlier.seen.get(epoch).copied().or_else(|| {
+                if holding {
+                    Some((now_ms, 0))
+                } else {
+                    heads_move_ranks(log, epoch, me).then_some((now_ms, now_ms))
+                }
+            }) else {
+                // Settled at first sight: it never held the audience, so it moves no rank.
                 continue;
-            }
-            let (seen, was) = earlier.seen.get(epoch).copied().unwrap_or((now_ms, 0));
-            let seen = seen.min(now_ms);
-            let at = if !unsettled.contains(epoch) {
-                if was == 0 { now_ms } else { was.min(now_ms) }
-            } else if now_ms >= seen.saturating_add(log_entries::SETTLE_GRACE_MS) {
-                seen.saturating_add(log_entries::SETTLE_GRACE_MS)
-            } else {
-                settled = false;
-                0
             };
-            let kept = if unsettled.contains(epoch) { 0 } else { at };
-            mark.seen.insert(*epoch, (seen, kept));
-            from = from.max(at);
+            let (seen, start) =
+                if start == 0 && holding && undecided_holds(log, &due.audience, mine.as_ref()) {
+                    (seen.min(now_ms), 0)
+                } else {
+                    settle_clock(seen, start, holding, now_ms)
+                };
+            mark.seen.insert(*epoch, (seen, start));
+            held |= start == 0;
+            from = from.max(start);
+        }
+        // Its re-key reads `[everyone]`'s leave-out too ([`everyone_wait`]).
+        if due.audience != EpochAudience::Everyone && !everyone_unread() {
+            held |= waits;
+            from = from.max(waited_to);
+        }
+        let mut removed_at = first;
+        for target in &due.removals {
+            let at = earlier
+                .removal
+                .get(target)
+                .copied()
+                .unwrap_or(now_ms)
+                .min(now_ms);
+            mark.removal.insert(*target, at);
+            removed_at = removed_at.max(at);
+        }
+        if grace_from_due() {
+            removed_at = first;
         }
         let Some(turn) = turn_of(due, &membership, me) else {
             continue;
         };
         let spread =
             log_entries::GAP_STEP_MS.saturating_mul(u64::try_from(turn.rank).unwrap_or(u64::MAX));
-        let grace = if turn.after_grace {
-            log_entries::REMOVER_GRACE_MS
+        let after_grace = if turn.after_grace {
+            removed_at.saturating_add(log_entries::REMOVER_GRACE_MS)
         } else {
             0
         };
-        let at = first
-            .saturating_add(grace)
-            .saturating_add(spread)
-            .max(from.saturating_add(spread));
-        if settled && now_ms >= at {
+        let at = from.max(after_grace).saturating_add(spread);
+        if !held && now_ms >= at {
             ready.push(due.audience.clone());
         }
     }
     (mark, ready)
+}
+
+/// A clock of [`TendMark`] for an epoch another Mac minted, carried on to `now_ms` from first
+/// sight `seen` and `start`: `start` is when the epoch let the audience go, set once to `now_ms`
+/// when it no longer holds (`holding`: its batch may still be a prefix here) or to first sight
+/// plus [`log_entries::SETTLE_GRACE_MS`] once that passed, and zero while it holds. A clock set
+/// back since never puts either in the future.
+fn settle_clock(seen: u64, start: u64, holding: bool, now_ms: u64) -> (u64, u64) {
+    let seen = seen.min(now_ms);
+    let start = if start != 0 {
+        start.min(now_ms)
+    } else if !holding {
+        now_ms
+    } else if now_ms >= seen.saturating_add(log_entries::SETTLE_GRACE_MS) {
+        seen.saturating_add(log_entries::SETTLE_GRACE_MS)
+    } else {
+        0
+    };
+    (seen, start)
+}
+
+/// How `[everyone]`'s newest epochs hold every other audience's re-key: one another Mac minted,
+/// whose batch this Mac may hold only a prefix of, holds them while that batch may still wrap a
+/// Mac with no seat ([`Log::undecided`] for `mine`), since a re-key reads `[everyone]`'s
+/// leave-out for its own audience too ([`log_entries::carried_audience_recipients`]) and would
+/// drop that Mac for good from an audience that wraps it. It holds until the batch settles or
+/// no Mac is left undecided, or [`log_entries::SETTLE_GRACE_MS`] after this Mac first saw it, as
+/// an audience's own newest epoch does; each such epoch's clock is kept in `mark`'s `wait`.
+/// Returns when the last of them let go (the re-keys' ranks count from then) and whether one
+/// still holds.
+fn everyone_wait(
+    log: &Log,
+    me: &MemberId,
+    mine: Option<&Recipient>,
+    earlier: &TendMark,
+    mark: &mut TendMark,
+    now_ms: u64,
+) -> (u64, bool) {
+    let newest = log.newest_epochs(&EpochAudience::Everyone);
+    let unsettled = log_entries::unsettled_of_others(log, &newest, me);
+    let undecided = !unsettled.is_empty()
+        && mine.is_some_and(|mine| !log.undecided(&EpochAudience::Everyone, mine).is_empty());
+    let mut waited_to = 0;
+    let mut waits = false;
+    for epoch in &newest {
+        let holding = undecided && unsettled.contains(epoch);
+        let Some((seen, start)) = earlier
+            .wait
+            .get(epoch)
+            .copied()
+            .or_else(|| holding.then_some((now_ms, 0)))
+        else {
+            continue;
+        };
+        let (seen, start) = settle_clock(seen, start, holding, now_ms);
+        mark.wait.insert(*epoch, (seen, start));
+        waits |= start == 0;
+        waited_to = waited_to.max(start);
+    }
+    (waited_to, waits)
 }
 
 fn tend_ready_epochs(
@@ -1535,17 +1723,19 @@ fn tend_ready_epochs(
     let active_recipients_of = |log: &Log| -> crate::Result<BTreeSet<Recipient>> {
         let local_roster = log_entries::local_swarm_roster_for_log(paths, log)?;
         let membership = log.membership();
+        // A Mac whose `[everyone]` `Wrap` a batch may still deliver is no Mac left out.
+        let flight = log.in_flight(&EpochAudience::Everyone, &me_recipient);
         Ok(membership
             .members()
             .iter()
             .filter(|(actor, m)| {
-                !log.recipient_is_removed(&m.binding.recipient())
+                let recipient = m.binding.recipient();
+                !log.recipient_is_removed(&recipient)
                     && !membership.member_node_removed(m)
-                    && !log.audience_left_out(&EpochAudience::Everyone, actor)
-                    && !log.audience_left_out_recipient(
-                        &EpochAudience::Everyone,
-                        &m.binding.recipient(),
-                    )
+                    && (flight.contains(&recipient)
+                        || (!log.audience_left_out(&EpochAudience::Everyone, actor)
+                            && !log
+                                .audience_left_out_recipient(&EpochAudience::Everyone, &recipient)))
                     && !local_roster
                         .as_ref()
                         .is_some_and(|r| log_entries::member_denied_by_roster(r, m))
@@ -1569,6 +1759,15 @@ fn tend_ready_epochs(
         // A pull or a retry may have changed the due's heads, carriers or membership.
         // Recheck every scheduling prerequisite before signing from this observation.
         let (_, still) = ready_rekeys(&log, &actor, mark, now_ms);
+        #[cfg(test)]
+        let still = if STALE_AUTHORING.with(std::cell::Cell::get) {
+            log.rekey_dues()
+                .into_iter()
+                .map(|due| due.audience)
+                .collect()
+        } else {
+            still
+        };
         if still.is_empty() {
             return Ok((Vec::new(), false));
         }
@@ -1579,6 +1778,8 @@ fn tend_ready_epochs(
             .iter()
             .any(|audience| log_entries::reseal_ready(&opened, audience));
         let mut minted = Vec::new();
+        // Read before the first epoch this pass mints, as `opened` was.
+        let flight = log_entries::Flight::of_batch(&log, &opened, &actor);
         device.with_seed(|writer_seed| {
             let author = AuthorCtx {
                 actor: &actor,
@@ -1589,6 +1790,7 @@ fn tend_ready_epochs(
             log_entries::coalesce_concurrent_commons_epochs(
                 &mut log,
                 &opened,
+                &flight,
                 &author,
                 &active,
                 &mut minted,
@@ -1597,6 +1799,7 @@ fn tend_ready_epochs(
             log_entries::rotate_host_lists(
                 &mut log,
                 &opened,
+                &flight,
                 &author,
                 &BTreeSet::new(),
                 &mut minted,
@@ -1619,23 +1822,30 @@ fn tend_ready_epochs(
     Ok(minted)
 }
 
-/// Each held epoch can name at most one due audience and one seen clock. A `due` line
-/// takes at most 90 bytes and a `seen` line 112 (64 hex digits per id, 20 decimal digits
-/// per timestamp, prefixes, spaces and newline). Keep every clock a bounded log can
-/// produce: forgetting an oversized mark would restart its grace on every pass.
-const MAX_TEND_MARK: usize = crate::membership_log::MAX_HELD_RECORDS * (90 + 112);
+/// A held record is an epoch, which can name one due audience, one seen clock and one wait
+/// clock, a `Remove`, which can name one removal clock, or neither. A `due` line takes at most
+/// 90 bytes, a `seen` or `wait` line 112 and a `removal` line 126 (64 hex digits per id, 96 per
+/// actor, 20 decimal digits per timestamp, prefixes, spaces and newline), so an epoch's 314
+/// bytes bound either kind. Keep every clock a bounded log can produce: forgetting an oversized
+/// mark would restart its grace on every pass.
+const MAX_TEND_MARK: usize = crate::membership_log::MAX_HELD_RECORDS * (90 + 112 + 112);
 
 /// One read of [`epoch_mark_file`] ([`tend_epochs_at`]): each due audience's clock by
-/// [`audience_tag`], and each newest epoch another Mac minted, by id, with when this Mac first
-/// saw it and when it first saw it settled (zero while it is not).
+/// [`audience_tag`]; each newest epoch another Mac minted that this Mac first saw as a prefix of
+/// its minter's batch, by id, with when it first saw it and when it let the audience go (zero
+/// while it holds it); the same two for each newest `[everyone]` epoch that held the other
+/// audiences while its batch could still decide a Mac with no seat ([`everyone_wait`]); and
+/// when this Mac first saw each removal a due waits on, by the Mac taken out.
 #[derive(Default)]
 struct TendMark {
     due: BTreeMap<[u8; 32], u64>,
     seen: BTreeMap<RecordId, (u64, u64)>,
+    wait: BTreeMap<RecordId, (u64, u64)>,
+    removal: BTreeMap<MemberId, u64>,
 }
 
-/// [`TendMark`] from its lines, `due <tag> <ms>` and `seen <epoch> <ms> <ms>`; a line of another
-/// shape is skipped.
+/// [`TendMark`] from its lines, `due <tag> <ms>`, `seen <epoch> <ms> <ms>`,
+/// `wait <epoch> <ms> <ms>` and `removal <actor> <ms>`; a line of another shape is skipped.
 fn read_tend_mark(paths: &Paths) -> TendMark {
     let mut mark = TendMark::default();
     let Ok(Some(bytes)) = fsx::read_private(&epoch_mark_file(paths), MAX_TEND_MARK) else {
@@ -1647,6 +1857,11 @@ fn read_tend_mark(paths: &Paths) -> TendMark {
     let hex = |word: &str| {
         let mut out = [0u8; 32];
         (word.len() == 64 && aterm_codec::hex::decode_into(word.as_bytes(), &mut out))
+            .then_some(out)
+    };
+    let actor = |word: &str| {
+        let mut out = [0u8; 48];
+        (word.len() == 96 && aterm_codec::hex::decode_into(word.as_bytes(), &mut out))
             .then_some(out)
     };
     let ms = |word: &str| {
@@ -1662,11 +1877,19 @@ fn read_tend_mark(paths: &Paths) -> TendMark {
                     mark.due.insert(tag, at);
                 }
             }
-            ["seen", epoch, seen, settled] => {
-                if let (Some(epoch), Some(seen), Some(settled)) =
-                    (hex(epoch), ms(seen), ms(settled))
-                {
-                    mark.seen.insert(epoch, (seen, settled));
+            [kind @ ("seen" | "wait"), epoch, seen, start] => {
+                if let (Some(epoch), Some(seen), Some(start)) = (hex(epoch), ms(seen), ms(start)) {
+                    let clocks = if *kind == "seen" {
+                        &mut mark.seen
+                    } else {
+                        &mut mark.wait
+                    };
+                    clocks.insert(epoch, (seen, start));
+                }
+            }
+            ["removal", target, at] => {
+                if let (Some(target), Some(at)) = (actor(target), ms(at)) {
+                    mark.removal.insert(target, at);
                 }
             }
             _ => {}
@@ -1683,10 +1906,18 @@ fn write_tend_mark(paths: &Paths, mark: &TendMark) -> crate::Result<()> {
             aterm_codec::hex::encode_lower(tag)
         ));
     }
-    for (epoch, (seen, settled)) in &mark.seen {
+    for (kind, clocks) in [("seen", &mark.seen), ("wait", &mark.wait)] {
+        for (epoch, (seen, start)) in clocks {
+            text.push_str(&format!(
+                "{kind} {} {seen} {start}\n",
+                aterm_codec::hex::encode_lower(epoch)
+            ));
+        }
+    }
+    for (target, at) in &mark.removal {
         text.push_str(&format!(
-            "seen {} {seen} {settled}\n",
-            aterm_codec::hex::encode_lower(epoch)
+            "removal {} {at}\n",
+            aterm_codec::hex::encode_lower(target)
         ));
     }
     fsx::write_atomic(&epoch_mark_file(paths), text.as_bytes(), 0o600)
@@ -1789,20 +2020,6 @@ pub fn test_put_everyone(paths: &Paths, name: &str, value: &[u8]) -> crate::Resu
         let _ = post_records_to_servers(paths);
     }
     Ok(epoch)
-}
-
-/// One automatic pass of a vault's re-keys at `now_ms`, kept on this Mac: the wrap-gap closer
-/// ([`log_entries::close_wrap_gaps`]) and then the epoch tender ([`tend_epochs_at`]), as the
-/// subscriber runs them after it pulls records, with nothing posted. The stand-in other crates'
-/// tests run where a Mac's subscriber would. Returns the records it signed.
-///
-/// # Errors
-/// As [`tend_epochs_at`].
-#[cfg(any(test, debug_assertions))]
-pub fn test_tend_at(paths: &Paths, now_ms: u64) -> crate::Result<Vec<Record>> {
-    let mut signed = log_entries::close_wrap_gaps(paths, now_ms)?;
-    signed.extend(tend_epochs_at(paths, now_ms)?);
-    Ok(signed)
 }
 
 /// One member as `aterm members list` prints it ([`member_list`]).

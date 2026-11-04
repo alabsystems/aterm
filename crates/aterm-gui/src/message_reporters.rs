@@ -5217,14 +5217,16 @@ pub(crate) fn accounts_sheet_conflict_entry(
         "",
         "sheet-conflict",
         "The account sheet has conflicting rows",
-        Why::OnlyYou(Reason::new(
-            "rows give one address different assignments, so no pool adds it until they agree",
-        )),
-        Then::step("Give each address one assignment in the account sheet"),
+        Why::Spent {
+            tried: Reason::new("read the rest of the sheet"),
+            reason: Reason::new(
+                "rows give one address different assignments, so no pool adds it until they agree",
+            ),
+        },
+        Then::step("Run aterm harness accounts table to read the rows"),
     )
     .severity(Severity::Info)
-    .resurface(Resurface::WAIT)
-    .restated_at_once();
+    .resurface(Resurface::WAIT);
     for conflict in conflicts
         .iter()
         .take(aterm_messages::exceptions::MORE_LINES)
@@ -5490,61 +5492,39 @@ const fn title_word(cli: aterm_agent::harness::accounts::Cli) -> &'static str {
 /// so each CLI's entry stands apart. A renewal that stops for a person is its sign-in task's
 /// entry ([`accounts_sign_in_entry_for`]). A CLI whose renewals cannot approve its page by
 /// themselves (`Cli::renews_headlessly`: Grok Build's, whose page answers a headless browser with
-/// a block page, so the upkeep starts none of its renewals) asks the person instead, naming each
-/// row's sign-in on a terminal (`accounts login`); the host passes it only the due logins no
-/// sign-in task names yet, since that task's entry already asks for the same sign-in.
+/// a block page, so the upkeep starts none of its renewals) stays due, and its entry says so,
+/// asking no one; the read of its pool shows the step on demand. The host passes it only the due
+/// logins no sign-in task names yet, since that task's entry already names them.
 pub(crate) fn accounts_due_entry_for(
     cli: aterm_agent::harness::accounts::Cli,
     labels: &[String],
 ) -> Option<Entry> {
-    use aterm_agent::harness::accounts::SignInAction;
     if cli == aterm_agent::harness::accounts::Cli::Claude {
         return accounts_due_entry(labels);
     }
-    let first = labels.first()?;
+    labels.first()?;
     let word = title_word(cli);
     let what = match labels.len() {
         1 => format!("{word} login due for renewal"),
         n => format!("{n} {word} logins due for renewal"),
     };
-    if !cli.renews_headlessly() {
-        let mut entry = Entry::new(
-            Family::Accounts,
-            cli.id(),
-            "due",
-            &what,
-            Why::OnlyYou(Reason::new(
-                "Its sign-in page blocks aterm's headless browser, so only your sign-in renews a login",
-            )),
-            Then::step(SignInAction::Login.next_step(cli, first)),
-        )
-        .severity(Severity::Info)
-        .resurface(Resurface::WAIT)
-        .more(format!("{} logins:", cli.connector().product));
-        for label in labels
-            .iter()
-            .take(aterm_messages::exceptions::MORE_LINES - 1)
-        {
-            entry = entry.more(format!(
-                "{label}: {}",
-                SignInAction::Login.next_step(cli, label)
-            ));
+    let why = if cli.renews_headlessly() {
+        Why::Spent {
+            tried: Reason::new("renews each due login that names an email in the background"),
+            reason: Reason::new("none of them has renewed these logins yet"),
         }
-        return Some(entry.log_line(format!(
-            "accounts cli={} need=due n={}",
-            cli.id(),
-            labels.len()
-        )));
-    }
+    } else {
+        Why::Spent {
+            tried: Reason::new("starts no renewal of these logins"),
+            reason: Reason::new("so they stay due"),
+        }
+    };
     let mut entry = Entry::new(
         Family::Accounts,
         cli.id(),
         "due",
         &what,
-        Why::Spent {
-            tried: Reason::new("renews each due login that names an email in the background"),
-            reason: Reason::new("none of them has renewed these logins yet"),
-        },
+        why,
         Then::step(format!("{ACCOUNTS_READ} --cli {}", cli.id())),
     )
     .severity(Severity::Info)
@@ -5568,29 +5548,23 @@ pub(crate) fn accounts_due_entry_for(
 /// the mailbox's configuration changed), so it asks no one to; it names its product and steps to
 /// the read of its pool (`--cli`). A renewal that stops for a person is its sign-in task's entry
 /// ([`accounts_sign_in_entry_for`]). A CLI whose renewals cannot approve its page by themselves
-/// (`Cli::renews_headlessly`: Grok Build's, whose renewal the upkeep never starts) is signed in
-/// again by the person, so its entry names the row's sign-in on a terminal (`accounts login`).
+/// (`Cli::renews_headlessly`: Grok Build's, whose renewal the upkeep never starts) says aterm signs
+/// none of its rows in, and asks no one either: the read of its pool shows the step on demand.
 pub(crate) fn accounts_wrong_entry_for(
     cli: aterm_agent::harness::accounts::Cli,
     labels: &[String],
 ) -> Option<Entry> {
-    use aterm_agent::harness::accounts::SignInAction;
     if cli == aterm_agent::harness::accounts::Cli::Claude {
         return accounts_wrong_entry(labels);
     }
     let first = labels.first()?;
-    let (then, again) = if cli.renews_headlessly() {
-        (
-            format!("{ACCOUNTS_READ} --cli {}", cli.id()),
-            "aterm signs the row in again by itself".to_string(),
-        )
+    let then = format!("{ACCOUNTS_READ} --cli {}", cli.id());
+    let again = if cli.renews_headlessly() {
+        "aterm signs the row in again by itself".to_string()
     } else {
-        (
-            SignInAction::Login.next_step(cli, first),
-            format!(
-                "aterm signs no {} row in by itself",
-                cli.connector().product
-            ),
+        format!(
+            "aterm signs no {} row in by itself",
+            cli.connector().product
         )
     };
     let mut entry = Entry::new(
@@ -5622,29 +5596,31 @@ pub(crate) fn accounts_wrong_entry_for(
     )))
 }
 
-/// The remaining human step of a pool's sign-in that stopped for a person, a background
-/// renewal's or one a person ran (the window starts no Grok Build renewal), without its URL or
-/// code.
+/// The fact for later that a pool's sign-in stopped for a person, a background renewal's or one a
+/// person ran (the window starts no Grok Build renewal), without its URL or code: the journal
+/// records it and Messages lists it on demand, and each row's remaining step is in the read of the
+/// pool.
 pub(crate) fn accounts_sign_in_entry_for(
     cli: aterm_agent::harness::accounts::Cli,
     tasks: &[(String, aterm_agent::harness::accounts::SignInAction)],
 ) -> Option<Entry> {
-    let (first, action) = tasks.first()?;
+    tasks.first()?;
     let mut entry = Entry::new(
         Family::Accounts,
         cli.id(),
         "sign-in",
-        &format!("{} sign-in needs you", title_word(cli)),
-        Why::OnlyYou(Reason::new(
-            "Its sign-in stopped for a person before a new login could be bound",
-        )),
-        Then::step(action.next_step(cli, first)),
+        &format!("{} sign-in stopped", title_word(cli)),
+        Why::Spent {
+            tried: Reason::new("started the sign-in"),
+            reason: Reason::new("it stopped before a new login could be bound"),
+        },
+        Then::step(format!("{ACCOUNTS_READ} --cli {}", cli.id())),
     )
     .severity(Severity::Info)
-    .resurface(Resurface::WAIT)
-    .restated_at_once();
-    for (label, action) in tasks.iter().take(aterm_messages::exceptions::MORE_LINES) {
-        entry = entry.more(format!("{label}: {}", action.next_step(cli, label)));
+    .resurface(Resurface::WAIT);
+    let labels: Vec<String> = tasks.iter().map(|(label, _)| label.clone()).collect();
+    for line in labels_lines("Stopped: ", &labels, aterm_messages::exceptions::MORE_LINES) {
+        entry = entry.more(line);
     }
     Some(entry.log_line(format!(
         "accounts cli={} need=sign-in n={}",

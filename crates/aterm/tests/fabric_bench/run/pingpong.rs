@@ -433,6 +433,7 @@ pub(super) fn describe(row: TallyRow) -> &'static str {
         TallyRow::ClearInFlight => "of the dir's: the entry's removal (`clear_in_flight`)",
         TallyRow::ClearPostSeq => "of the dir's: the reservation forgotten (`clear_post_seq`)",
         TallyRow::AppendSelfAcked => "of the dir's: the landed offset (`append_self_acked`)",
+        TallyRow::LogpinFence => "of the dir's: the mirror pin's fence, once an open (`logpin`)",
         TallyRow::WakeEvent => "wake: an aterm event queued while the loop was parked",
         TallyRow::WakeRecord => "wake: a broker record queued while the loop was parked",
         TallyRow::QueuedEvent => "queued: an aterm event queued while the loop worked",

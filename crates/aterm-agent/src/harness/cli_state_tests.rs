@@ -214,7 +214,7 @@ fn unreadable_pools_refuse_statistics_before_provider_io() {
                 let mut out = Vec::new();
                 let mut err = Vec::new();
                 assert_eq!(
-                    run_accounts_stats_of(cli, &env, json, &mut out, &mut err),
+                    run_accounts_stats_of((cli, Launch::default()), &env, json, &mut out, &mut err),
                     ExitCode::from(1)
                 );
                 assert!(!err.is_empty());

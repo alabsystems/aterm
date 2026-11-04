@@ -112,3 +112,32 @@ fn the_refusals_an_agent_can_act_on_say_what_to_do() {
         "ERR askpass refused"
     );
 }
+
+/// A read of a nonblocking stream says `WouldBlock` at once, so an answer that arrives here was
+/// waited for in `poll(2)`, where a host that ends cannot pass it by.
+#[cfg(unix)]
+#[test]
+fn an_answer_is_waited_for_in_poll() {
+    let (near, far) = aterm_uds::kept_out(crate::CtlStream::pair).unwrap();
+    near.set_nonblocking(true).unwrap();
+    let answering = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(20));
+        (&far).write_all(b"ok\n").unwrap();
+        far
+    });
+    let answer = read_answer_within(&near, Duration::from_secs(60)).unwrap();
+    assert_eq!(answer.as_bytes(), b"ok\n");
+    drop(answering.join().unwrap());
+}
+
+/// An answer left behind by a host that has closed is still read, though macOS then refuses the
+/// timeout option.
+#[cfg(unix)]
+#[test]
+fn an_answer_outlives_the_host_that_sent_it() {
+    let (near, far) = aterm_uds::kept_out(crate::CtlStream::pair).unwrap();
+    (&far).write_all(b"ERR refused\n").unwrap();
+    drop(far);
+    let answer = read_answer_within(&near, Duration::from_secs(60)).unwrap();
+    assert_eq!(answer.as_bytes(), b"ERR refused\n");
+}

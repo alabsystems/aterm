@@ -1866,7 +1866,7 @@ pub fn cli_login_refusal(name: &str) -> Option<String> {
     Some(format!(
         "{name} is {whose}'s login, which no vault carries: its refresh token is single-use and \
          rotates, so a copy on another machine signs one of them out; sign each machine in once \
-         (aterm ai login) and keep only the account names in the vault (ai-accounts.csv)"
+         (aterm ai login); the lab registry (`aterm db alab`) keeps the account names"
     ))
 }
 

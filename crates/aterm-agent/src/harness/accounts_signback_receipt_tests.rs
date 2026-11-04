@@ -273,8 +273,9 @@ fn sign_back_case(operation: i64, case: i64) -> [bool; 4] {
                     NOW - 20,
                 );
             }
-            Ok(accounts::note_auth(
+            Ok(accounts::note_auth_in_context(
                 state,
+                logins,
                 "account",
                 accounts::Auth::SignedOut,
                 NOW - 10,
@@ -309,6 +310,18 @@ fn sign_back_case(operation: i64, case: i64) -> [bool; 4] {
             accounts::note_signed_back(state, logins, "account", at)
         }
     };
+    let publication_files = [
+        store.state_file(),
+        store.logins_file(),
+        store.ledger_path(),
+        store.wake_path(),
+        store.state_witness_file(),
+        store.logins_witness_file(),
+        path.clone(),
+        store.dir.join("sync-commit.json"),
+        store.dir.join("sync-commit.seen"),
+    ];
+    let publication_before = publication_files.each_ref().map(|path| fs::read(path).ok());
     let result = store.transact_logins(NOW, &mut None, |state, logins| {
         if case == 2 {
             return Ok(accounts::note_auth(
@@ -343,7 +356,32 @@ fn sign_back_case(operation: i64, case: i64) -> [bool; 4] {
         }
         Ok(events)
     });
-    assert_eq!(result.is_err(), matches!(case, 6 | 7 | 17));
+    assert_eq!(
+        result.is_err(),
+        matches!(case, 6 | 7 | 17 | 19),
+        "operation {operation}, case {case}"
+    );
+    if case == 19 {
+        // A success observed before this transaction's replacement cannot publish either
+        // the old result or the new binding. Its waiting owners therefore keep their holds.
+        assert_eq!(
+            publication_files.each_ref().map(|path| fs::read(path).ok()),
+            publication_before
+        );
+        let unchanged = store.load_logins(NOW).unwrap().0;
+        assert_eq!(unchanged, before);
+        assert_eq!(unchanged.generation_clock, before.generation_clock);
+        assert_eq!(unchanged.sign_in_clock, before.sign_in_clock);
+        assert_eq!(unchanged.sign_in_receipts, before.sign_in_receipts);
+        let records = store.read_account_records(Some(&path), NOW).unwrap();
+        let account = records.state.account("account");
+        assert_eq!(
+            account.current_auth(records.roster.row("account").unwrap()),
+            accounts::Auth::SignedOut
+        );
+        assert_eq!(account.auth_at, Some(NOW - 10));
+        assert!(!store.sync_needs_recovery());
+    }
     let receipt_fenced = if result.is_ok() && case != 19 {
         let completed = store.load_logins(NOW).unwrap().0;
         // Default publication already creates a metadata binding. A receipt
@@ -455,7 +493,13 @@ fn sign_back_case(operation: i64, case: i64) -> [bool; 4] {
                         } else {
                             accounts::forget_account(state, logins, "account");
                         }
-                        accounts::note_auth(state, "account", accounts::Auth::SignedOut, NOW);
+                        accounts::note_auth_in_context(
+                            state,
+                            logins,
+                            "account",
+                            accounts::Auth::SignedOut,
+                            NOW,
+                        );
                         Ok(if case == 22 {
                             success(state, logins, NOW)
                         } else {

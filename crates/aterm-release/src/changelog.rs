@@ -8,6 +8,10 @@ use crate::ledger::{Error, Result};
 /// The changelog's repo-root-relative path: the one hand-written source of release notes.
 pub const CHANGELOG_FILE: &str = "CHANGELOG.md";
 
+/// The head of the line `ship harness-bump` (and `ship release --bump`'s version commit) writes
+/// under `[Unreleased]`: generated, so it never counts as a section's release notes.
+pub const HARNESS_ENTRY_HEAD: &str = "- **Harness versions since v";
+
 /// What the pre-claim gate learned about a section: `entries`, the count of top-level bullets in the real body, for the transcript only.
 #[derive(Debug)]
 pub struct GateSummary {
@@ -96,11 +100,12 @@ pub fn gate_section(text: &str, section: &str) -> Result<GateSummary> {
         )));
     }
     let body = real_body(text, section);
-    if body.is_empty() {
+    if body.iter().all(|l| l.starts_with(HARNESS_ENTRY_HEAD)) {
         return Err(Error::new(format!(
             "the [{section}] section of {CHANGELOG_FILE} has no release notes — add a \
              hand-written \"### Added/Changed/Fixed\" entry before cutting (comments, \
-             blank lines and bare ### scaffolds do not count)"
+             blank lines, bare ### scaffolds and the generated harness-versions line do not \
+             count)"
         )));
     }
     if let Some((start, end)) = section_span(text, section) {

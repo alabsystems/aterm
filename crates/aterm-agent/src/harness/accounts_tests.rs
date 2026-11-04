@@ -9617,3 +9617,36 @@ fn held_by_rows_never_need_local_sign_in_or_admit_rotation_target() {
         Err(Lost::NotACandidate)
     );
 }
+
+/// A LOGIN BELONGS TO THE ROW THAT HOLDS IT NOW: once a row takes the default login another row left,
+/// that row's `was` no longer makes it the login's. CONTROL: a login no row holds is the row's that
+/// left it, and two that left it stay two, for a caller to refuse.
+#[test]
+fn a_login_belongs_to_the_row_that_holds_it_before_any_that_left_it() {
+    let row = |label: &str, dir: Option<&str>, was: Vec<Option<&str>>| Row {
+        label: label.into(),
+        dir: dir.map(str::to_owned),
+        was: was.into_iter().map(|w| w.map(str::to_owned)).collect(),
+        ..Row::default()
+    };
+    let labels = |rows: Vec<&Row>| -> Vec<String> {
+        rows.into_iter().map(|row| row.label.clone()).collect()
+    };
+    let moved = Roster {
+        rows: vec![
+            row("displaced", Some("/l/displaced"), vec![None]),
+            row("now-default", None, vec![Some("/l/old")]),
+        ],
+    };
+    assert_eq!(labels(moved.rows_of_login(None)), ["now-default"]);
+    assert_eq!(labels(moved.rows_of_login(Some("/l/old"))), ["now-default"]);
+    let left = Roster {
+        rows: vec![
+            row("a", Some("/l/a"), vec![None]),
+            row("b", Some("/l/b"), vec![None]),
+        ],
+    };
+    assert_eq!(labels(left.rows_of_login(Some("/l/a"))), ["a"], "CONTROL");
+    assert_eq!(labels(left.rows_of_login(None)), ["a", "b"], "CONTROL");
+    assert!(left.rows_of_login(Some("/l/none")).is_empty(), "CONTROL");
+}

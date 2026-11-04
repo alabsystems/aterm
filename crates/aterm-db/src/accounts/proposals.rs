@@ -68,6 +68,16 @@ impl Proposals {
             None => crate::documents::application::observe_store(&self.paths, descriptor, read),
         }
     }
+    /// [`Self::snapshot`] where the proposal table is declared here: `None` where nothing declared
+    /// it, this Mac having set up no account catalog, and every other failure remains an error.
+    pub fn snapshot_if_declared(&self) -> Result<Option<Snapshot>> {
+        crate::documents::application::observe_store_if_here(
+            &self.paths,
+            descriptor,
+            self.deadline,
+            |session: &Session<'_>, store: &Store, _| Self::snapshot_from_store(session, store),
+        )
+    }
     /// Project an already opened proposal store without reopening or enrolling
     /// its catalog. The caller keeps the authenticated session alive.
     pub(crate) fn snapshot_from_store(session: &Session<'_>, store: &Store) -> Result<Snapshot> {

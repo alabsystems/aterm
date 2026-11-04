@@ -1731,6 +1731,7 @@ impl PresenceAxis {
 /// The lens for `c`'s instrument.
 fn lab_network_doc(
     snapshot: Option<&aterm_types::network_state::NetworkStateSnapshot>,
+    lab: Option<&crate::lab_deck::LabDeck>,
     target: crate::network_deck::Target,
     caption: Option<&crate::network_deck::PlaceCaption>,
     metrics: &FaceMetrics,
@@ -1738,7 +1739,9 @@ fn lab_network_doc(
 ) -> LensDoc<'static> {
     let empty = aterm_types::network_state::NetworkStateSnapshot::default();
     let snapshot = snapshot.unwrap_or(&empty);
-    let mut rows = crate::network_deck::details_with_caption(snapshot, target, caption);
+    let empty_lab = crate::lab_deck::LabDeck::default();
+    let lab = lab.unwrap_or(&empty_lab);
+    let mut rows = crate::network_deck::details_lab_with_caption(snapshot, lab, target, caption);
     // A selected service needs its own scope before generic network guidance.
     // Keep Scope in the complete report, but present it once in the lens header.
     let scope = if target == crate::network_deck::Target::Accounts {
@@ -1851,17 +1854,31 @@ fn lab_network_doc(
         name: "Network State",
         sources: vec![if target == crate::network_deck::Target::Accounts {
             "Local observation of the Commons account catalog".into()
+        } else if matches!(target, crate::network_deck::Target::LabAccount(_)) {
+            "The lab registry and journal as this Mac last read them".into()
         } else {
             "This machine's local observer and retained authenticated history".into()
         }],
         explainer: scope.unwrap_or_else(|| {
             if matches!(target, crate::network_deck::Target::Peer(_)) {
                 "↑/↓: machine or service. Outbound addresses are historical.".into()
+            } else if matches!(target, crate::network_deck::Target::LabAccount(_)) {
+                "Account cell: the heat of its most used window; the over-max ink at its limit; hollow with no current reading; this Mac's rim where this Mac prefers it. ↑/↓: machine, service or account.".into()
             } else {
                 "Filled peer: reachable; hollow peer: unconfirmed. Warnings: peer = unknown visibility, local = partial history, service = refresh failed. ↑/↓: machine or service; ←/→: instrument. Reachability grants no account or secret access.".into()
             }
         }),
-        answer: Some(("Now", crate::network_deck::summary_with_caption(snapshot, caption), InkKind::Words2)),
+        answer: Some((
+            "Now",
+            match target {
+                crate::network_deck::Target::LabAccount(id) => lab.row(id).map_or_else(
+                    || "No longer among the lab's rows".into(),
+                    |row| row.summary.clone(),
+                ),
+                _ => crate::network_deck::summary_with_caption(snapshot, caption),
+            },
+            InkKind::Words2,
+        )),
         sections,
         two_order: Vec::new(),
         keeps_first: true,
@@ -1993,6 +2010,7 @@ mod network_tests {
         });
         let doc = lab_network_doc(
             Some(&snapshot),
+            None,
             crate::network_deck::Target::Peer(1),
             None,
             metrics,
@@ -5494,6 +5512,7 @@ pub(crate) fn lay_lens(
             let doc = if lens.focus == Instrument::NetworkState {
                 lab_network_doc(
                     input.network,
+                    input.lab,
                     input.network_target,
                     input.network_place,
                     metrics,
@@ -5635,6 +5654,7 @@ impl crate::App {
         DeckInput {
             network: Some(self.network_snapshot.as_ref()),
             network_place: f.network_place.as_ref(),
+            lab: Some(self.lab_deck.as_ref()),
             network_target: self
                 .windows
                 .get(&wid)
@@ -5685,6 +5705,7 @@ impl crate::App {
         self.network_snapshot.network.accounts_exchange.hash(&mut h);
         crate::network_deck::hash_peer_reachability(&self.network_snapshot, &mut h);
         self.network_snapshot.services.hash(&mut h);
+        self.lab_deck_feed.revision().hash(&mut h);
         if lens.focus == Instrument::NetworkState {
             f.network_place.hash(&mut h);
         }
@@ -6290,6 +6311,7 @@ impl crate::App {
                     ws.stats_lens.retire_input();
                     ws.stats_lens.network_target = crate::network_deck::step(
                         &self.network_snapshot,
+                        &self.lab_deck,
                         ws.stats_lens.network_target,
                         matches!(key, Key::Named(NamedKey::ArrowDown)),
                     );
@@ -6355,7 +6377,7 @@ impl crate::App {
         if open.focus == Instrument::NetworkState {
             let target = self.windows.get(&wid)?.stats_lens.network_target;
             return Some(
-                crate::network_deck::details(&self.network_snapshot, target)
+                crate::network_deck::details_lab(&self.network_snapshot, &self.lab_deck, target)
                     .into_iter()
                     .map(|(name, value)| format!("{name}: {value}"))
                     .collect::<Vec<_>>()

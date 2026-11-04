@@ -889,19 +889,19 @@ mod tests {
     #[test]
     fn srgb_linear_table_matches_powf_within_one_ulp() {
         let table = relative_luminance_table();
-        for i in 0..256 {
+        for (i, &got) in table.linear.iter().enumerate() {
             let n = i as f32 / 255.0;
             let expected = if n <= 0.03928 {
                 n / 12.92
             } else {
                 ((n + 0.055) / 1.055).powf(2.4)
             };
-            let ulp = table.linear[i].to_bits().abs_diff(expected.to_bits());
+            let ulp = got.to_bits().abs_diff(expected.to_bits());
             assert!(
                 ulp <= 1,
                 "channel byte {i}: got {:08x} ({}), expected {:08x} ({expected}), ulp={ulp}",
-                table.linear[i].to_bits(),
-                table.linear[i],
+                got.to_bits(),
+                got,
                 expected.to_bits(),
             );
         }

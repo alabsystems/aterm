@@ -851,12 +851,10 @@ mod tests {
         .expect("the declaring thread");
         let want = linux_slice_ns(Role::Interactive).unwrap();
         if declared.0 != want {
-            eprintln!(
-                "kernel ignored the slice request (runtime {} ns): pre-6.12 EEVDF, \
-                 the hint is a no-op here",
+            aterm_spec::host::could_not_run(format!(
+                "kernel ignored the slice request (runtime {} ns): pre-6.12 EEVDF",
                 declared.0
-            );
-            return;
+            ));
         }
         assert_ne!(
             declared.1 & SCHED_FLAG_RESET_ON_FORK,
@@ -885,9 +883,11 @@ mod tests {
     #[test]
     fn only_below_default_work_with_both_ends_real_is_spawned_behind_a_clamp() {
         use std::os::unix::fs::PermissionsExt as _;
-        let dir = std::env::temp_dir().join(format!("aterm-qos-launcher-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir(&dir).unwrap();
+        let tmp = aterm_tempfile::Builder::new()
+            .prefix("aterm-qos-launcher-")
+            .tempdir()
+            .unwrap();
+        let dir = tmp.path();
         let launcher = dir.join("taskpolicy");
         std::fs::write(&launcher, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -927,7 +927,6 @@ mod tests {
             ["/bin/sh"],
             "no launcher, no wrapper"
         );
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A `Background` child really starts below the inherited band (pri 31).

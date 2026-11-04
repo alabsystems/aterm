@@ -224,10 +224,16 @@ pub(super) fn sign_genesis(
             }
             let wire = store.encode();
             let _ = super::save_records(paths, &wire)?;
-            if matches!(admin.config.source, Source::Url(_)) {
+            if matches!(admin.config.source, Source::Url(_))
+                && let Ok(bound) = super::records_bound(paths, &store)
+            {
                 let urls = super::ledger_publish::candidate_server_urls(paths, &admin.config, &[]);
-                let _ =
-                    super::fan_out::post_records_to(&urls, &wire, super::fan_out::one_exchange());
+                let _ = super::fan_out::post_records_to(
+                    &urls,
+                    &wire,
+                    bound,
+                    super::fan_out::one_exchange(),
+                );
             }
             let _ = super::sync(paths, None);
         }

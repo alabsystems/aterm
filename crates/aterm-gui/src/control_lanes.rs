@@ -191,13 +191,14 @@ impl Outbox {
         }
     }
 
-    /// The explicit host fixture pauses only a completed Ready reply, never a
-    /// waiting/error response or any native capability-bearing payload.
+    /// The explicit host fixture pauses only a completed account preparation,
+    /// never a waiting/error response or an execution grant.
     #[cfg(all(unix, debug_assertions))]
-    pub(super) fn fixture_renewal_ready(&self) -> bool {
+    pub(super) fn fixture_account_prepared(&self) -> bool {
         matches!(self.segments.front(), Some(Segment::Bytes(bytes))
             if bytes.starts_with(b"OK codex-renewal state=ready id=")
-                || bytes.starts_with(b"OK codex-rotation state=ready id="))
+                || bytes.starts_with(b"OK codex-rotation state=ready id=")
+                || bytes.starts_with(b"OK codex-exec-handoff state=selected thread="))
     }
 
     fn owed(&self) -> bool {
@@ -343,7 +344,7 @@ impl Outbox {
     ) -> std::io::Result<bool> {
         let mut writer = stream;
         self.deliver_to(&mut writer, nonblocking, |timeout| {
-            stream.set_write_timeout(timeout)
+            super::arm_write(stream, timeout)
         })
     }
 

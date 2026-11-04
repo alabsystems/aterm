@@ -10956,6 +10956,7 @@ mod tests {
         const TOKEN: &str = "inert_repository_recovery_token";
         sys.stat_of(&user.home, stat(true, 0));
         sys.file(aterm_machines::items::github::CLT_GIT, b"inert git");
+        sys.file(&format!("{}/.local/bin/aterm", user.home), b"launcher");
         let token = format!("{}/.secrets/gh_access_token", user.home);
         sys.file(&token, TOKEN.as_bytes())
             .stat_of(&token, stat(false, TOKEN.len() as u64));

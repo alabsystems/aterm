@@ -55,18 +55,20 @@ pub fn swarm_roster_now(paths: &Paths) -> crate::Result<Option<SwarmRoster>> {
 /// [`swarm_roster`](super::swarm_roster) take their answer from: the configured source
 /// (`source.toml`), the state lock the deny list observes (`.lock`, whose presence and mode decide
 /// that read), the applied state (`state.toml`), this Mac's identity, the held envelope (`vault`)
-/// and the membership records. The vault folder holds others that change every few seconds and
-/// that these reads never open (the vault server's `served/`, `commons/`, the jobs' logs, the
+/// and the membership records entry and selected data. The vault folder holds others that
+/// change every few seconds and that these reads never open (the vault server's `served/`,
+/// `commons/`, the jobs' logs, the
 /// needs and answers queues), so a change to them reads nothing again.
-fn inputs(paths: &Paths) -> [PathBuf; 6] {
-    [
+fn inputs(paths: &Paths) -> Option<[PathBuf; 7]> {
+    Some([
         paths.source_file(),
         paths.lock_file(),
         paths.state_file(),
         paths.identity_file(),
         paths.cache_file(),
         paths.records_file(),
-    ]
+        paths.records_data_file().ok()?,
+    ])
 }
 
 /// What one input's metadata says of it. A vault write replaces the whole file
@@ -83,7 +85,7 @@ struct Stamp {
 
 /// The directory's identity and access metadata, without the content timestamps that an
 /// unrelated job or server write moves. A symlink here is refused by [`StateLock`], even when
-/// all six input paths still resolve to the files from an earlier read.
+/// all seven input paths still resolve to the files from an earlier read.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct DirectoryStamp {
     dev: u64,
@@ -114,7 +116,7 @@ fn stamp_inputs(paths: &Paths) -> Option<InputStamps> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(_) => return None,
     };
-    let files = inputs(paths)
+    let files = inputs(paths)?
         .iter()
         .map(|path| match std::fs::symlink_metadata(path) {
             Ok(meta) => Some(Some(Stamp {
@@ -247,7 +249,7 @@ mod tests {
     /// A reader standing in for the vault's: the lines of the vault folder's `records`.
     fn lines(paths: &Paths, reads: &AtomicUsize) -> crate::Result<Option<Vec<String>>> {
         reads.fetch_add(1, Ordering::SeqCst);
-        let text = std::fs::read_to_string(paths.records_file()).unwrap();
+        let text = std::fs::read_to_string(paths.records_data_file()?)?;
         Ok(Some(text.lines().map(str::to_owned).collect()))
     }
 
@@ -256,6 +258,31 @@ mod tests {
         fsx::ensure_private_dir(&paths.dir).unwrap();
         fsx::write_atomic(&paths.records_file(), b"m60\n", 0o600).unwrap();
         paths
+    }
+
+    #[test]
+    fn a_memo_observes_current_data_and_refuses_a_missing_layout_file() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let paths = vault(root.path());
+        let data = crate::records_storage::write_path(&paths.records_file(), true)
+            .unwrap()
+            .to_path_buf();
+        let memo = Memo::new();
+        let reads = AtomicUsize::new(0);
+        assert_eq!(
+            memo.read(&paths, |p| lines(p, &reads)).unwrap(),
+            Some(vec!["m60".to_owned()])
+        );
+        let directory = fsx::stamp(&paths.records_file());
+        std::fs::write(&data, b"m61-longer\n").unwrap();
+        assert_eq!(fsx::stamp(&paths.records_file()), directory);
+        assert_eq!(
+            memo.read(&paths, |p| lines(p, &reads)).unwrap(),
+            Some(vec!["m61-longer".to_owned()])
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        std::fs::rename(&data, paths.records_file().join("saved-current")).unwrap();
+        assert!(memo.read(&paths, |p| lines(p, &reads)).is_err());
     }
 
     /// A signed vault's warm deny list has the same directory refusal as a fresh read, and

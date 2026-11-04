@@ -2007,6 +2007,101 @@ fn land_contradicted_list_passes_only_on_the_contradiction_then_the_hold() {
     );
 }
 
+/// land-reworded's records to the second check's back-off, as Claude Code 2.1.318's run wrote
+/// them, `wait` the back-off: three nudges in all, the second straight after the work, so a count
+/// of nudges says nothing of where the chain has got to.
+fn reworded_to_its_back_off(wait: &str) -> Seen {
+    Seen {
+        journal: vec![
+            j(
+                4_200,
+                "CONTINUED seq=1 rule=land@v1 [aterm harness] Autopilot is Land:",
+            ),
+            j(7_600, "EVENT idle seq=2 Nothing left: the parser"),
+            j(
+                8_100,
+                "CONTINUED seq=2 rule=land-check@v1 [aterm harness] Land check:",
+            ),
+            j(11_600, "EVENT idle seq=3 The docs PR is still open."),
+            j(
+                11_600,
+                "WAITING seq=3 until=x 3 short turn(s) in a row: 8 min back-off",
+            ),
+            j(
+                492_100,
+                "CONTINUED seq=3 rule=land-nudge@v1 [aterm harness] Still landing:",
+            ),
+            j(
+                622_700,
+                "EVENT idle seq=4 Rebased the docs branch onto main",
+            ),
+            j(
+                623_200,
+                "CONTINUED seq=4 rule=land-nudge@v1 [aterm harness] Still landing:",
+            ),
+            j(626_800, "EVENT idle seq=5 Nothing left: the parser"),
+            j(
+                627_300,
+                "CONTINUED seq=5 rule=land-check@v1 [aterm harness] Land check:",
+            ),
+            j(
+                630_900,
+                "EVENT idle seq=6 The pull request for the docs is still open.",
+            ),
+            j(630_900, wait),
+        ],
+        ..Seen::default()
+    }
+}
+
+/// `s` with the nudge quoting the new words typed at `nudge`, and its yield held.
+fn reworded_held_at(mut s: Seen, nudge: i64) -> Seen {
+    s.journal.extend([
+        j(
+            nudge,
+            "CONTINUED seq=6 rule=land-nudge@v1 [aterm harness] Still landing:",
+        ),
+        j(nudge + 3_400, "EVENT idle seq=7 Nothing left: the parser"),
+        j(
+            nudge + 3_400,
+            "EXCEPTION seq=7 kind=stalled when=later Its program answers aterm's acts with the \
+             same reply and no work, so aterm types nothing more. => Open the tab and do what its \
+             last reply asks.",
+        ),
+        j(nudge + 3_400, "HOLD seq=7 point nothing why=policy"),
+    ]);
+    s
+}
+
+/// LAND-REWORDED'S WATCH: its hold comes after the nudge past its second check, so the back-off
+/// after that check is no end of it (Claude Code 2.1.318's runs stopped reading the tab at
+/// +691.9 s and +693.3 s, the hold at +875.1 s, leaving it unwatched). It runs to a minute past
+/// that hold, and a longer back-off takes the hold past the 16 min every other chain gets, so its
+/// hang detector sits past that.
+#[test]
+fn land_reworded_is_watched_past_the_hold_after_its_second_check() {
+    let tab = |s: &Seen| tab_of(Chain::LandReworded, s.clone());
+    let backed_off =
+        reworded_to_its_back_off("WAITING seq=6 until=x 2 short turn(s) in a row: 4 min back-off");
+    assert!(!finished(&tab(&backed_off), T0 + 691_900));
+    let held = reworded_held_at(backed_off, 871_700);
+    assert!(
+        finished(&tab(&held), T0 + 935_100) && !finished(&tab(&held), T0 + 935_099),
+        "a minute past the hold"
+    );
+    let longer =
+        reworded_to_its_back_off("WAITING seq=6 until=x 3 short turn(s) in a row: 8 min back-off");
+    assert!(
+        !finished(&tab(&longer), T0 + 1_000_000),
+        "inside the longer back-off, past 16 min"
+    );
+    let late = reworded_held_at(longer, 1_111_100);
+    assert!(
+        finished(&tab(&late), T0 + 1_174_500) && !finished(&tab(&late), T0 + 1_174_499),
+        "a minute past the hold the longer back-off put off"
+    );
+}
+
 /// land-hinted on this tree: its defense, the hinted check at that point, `LANDED`, landed.
 fn hinted_landed() -> Seen {
     let hint = hint_clause(HINTED).expect("a clause read open");

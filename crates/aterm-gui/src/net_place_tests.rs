@@ -207,8 +207,15 @@ fn paint_reads_the_cached_place_and_asks_for_no_read() {
         before,
         "the frame's capture asks for no read"
     );
-    let (prims, _) =
-        crate::network_deck::paint_with_inks(&g, 170.0, &snapshot, caption.as_ref(), &inks, false);
+    let (prims, _) = crate::network_deck::paint_with_inks(
+        &g,
+        170.0,
+        &snapshot,
+        &crate::lab_deck::LabDeck::default(),
+        caption.as_ref(),
+        &inks,
+        false,
+    );
     assert!(
         prims.iter().any(|prim| matches!(prim,
             crate::widget::DrawPrim::Text { s, .. } if *s == long || *s == short)),

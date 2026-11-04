@@ -59,7 +59,7 @@ certified `&self`/`&mut self` views); §6 says how to start before they close.
 
 ```tsv
 id	kind	functions	statement	subsumes	difficulty	blocking gaps
-append-at-contract	contract	EventLog::{append_at,total,head}	∀ g∈LogReach, op, ts: let (seq, ev) = g.append_at(op, ts), with g' the log afterwards. Then seq = Seq(T(g)+1), T(g') = T(g)+1 and g'.head() = seq. If |R(g)| < MAX: ev = None and R(g') = R(g) ++ [Event{seq, op, ts}]. If |R(g)| = MAX: ev = Some(R(g)[0]) and R(g') = tail(R(g)) ++ [Event{seq, op, ts}]. The stored event carries exactly the op and ts it was given.	conformance_temporal::append_at_records_seq_tick_and_op, conformance_kernel::real_append_at_spine_conforms_to_kernel_model	MEDIUM: &mut self, VecDeque push_back/pop_front/len/capacity/reserve_exact, Option<Event>, enum Op payloads, tuple return, saturating_add	1, 2, 4
+append-at-contract	contract	EventLog::{append_at,total,head}	∀ g∈LogReach, op, ts: let (seq, ev) = g.append_at(op, ts), with g' the log afterwards. Then seq = Seq(T(g)+1), T(g') = T(g)+1 and g'.head() = seq. If |R(g)| < MAX: ev = None and R(g') = R(g) ++ [Event{seq, op, ts}]. If |R(g)| = MAX: ev = Some(R(g)[0]) and R(g') = tail(R(g)) ++ [Event{seq, op, ts}]. The stored event carries exactly the op and ts it was given.	conformance_temporal::append_at_records_seq_tick_and_op, conformance_kernel::real_append_at_spine_conforms_to_kernel_model	MEDIUM: &mut self, VecDeque push_back/pop_front/len/capacity, Option<Event>, enum Op payloads, tuple return, saturating_add	1, 2, 4
 log-window-invariant	invariant	EventLog::{append_at,live,oldest_live,newest_live,head}	∀ g∈LogReach: |R(g)| = min(T(g), MAX); seqs(g) = [lo(g), …, T(g)], ascending and contiguous, so n∈1..=T(g) is live ⇔ lo(g) ≤ n (EvictOldestContiguous); head() = Seq(T(g)); T(g) > 0 ⇒ newest_live().seq = head() ∧ oldest_live().seq = Seq(lo(g)); T(g) = 0 ⇒ both are None; live() yields R(g) in order. Preserved by append_at (by append-at-contract). Corollaries: T ≤ MAX ⇒ lo = 1; T > MAX ⇒ lo = T−MAX+1.	conformance_eventlog::real_eventlog_conforms_to_ring_spec, conformance_eventlog::real_eventlog_eviction_conforms_to_ring_spec, conformance_evict_full::real_eventlog_live_set_is_contiguous_window, conformance_temporal::dropping_the_evicted_event_loses_seqs_control	MEDIUM: a type invariant over a private VecDeque<Event> plus a u64 counter, a quantified clause over ring contents, &self/&mut self views	1, 2, 5
 no-silent-loss	round-trip	EventLog::{append_at,live}	∀ n < u64::MAX, ∀ inputs [(op_i, ts_i) | i∈1..=n]: start from EventLog::default(), make the n append_at calls in order, and collect each Some(ev) into spilled. Then spilled ++ R(g) = [Event{seq: Seq(i), op: op_i, ts: ts_i} | i∈1..=n], so order is kept and no seq is lost or duplicated, and |spilled| = n.saturating_sub(MAX). This is NoSilentLoss for a host that tiers every returned event. Induction on n over append-at-contract.	conformance_temporal::append_at_spills_every_evicted_event_no_silent_loss	MEDIUM: induction over a call sequence, Vec/VecDeque content equality, enum payloads	1, 2, 5, 7
 ring-capacity-bound	invariant	EventLog::append_at	∀ g∈LogReach: g.ring.len() ≤ MAX ∧ g.ring.capacity() ≤ MAX, so the deque never exceeds MAX elements or reallocates past MAX when it fills (append_at pops the oldest element before pushing when len ≥ MAX).	src/lib.rs::event_log_ring_does_not_double_past_max	EASY: pop_front before push_back keeps len ≤ MAX at every push	1, 2, 11
@@ -193,42 +193,14 @@ Status 2026-10-28: 0 standalone non-spec tests remain; `conformance_kernel::a_ga
 8. **The raw test count is 26, and there are 25 live tests.** `tests/buffer_suite.rs` mentions
    `#[test]` only in a doc comment. A naive substring grep over-counts this crate by one.
 
-- **5.2 `ring-capacity-bound` rests on unspecified std behaviour.** `capacity ≤ MAX+1` holds only
-  if `VecDeque`'s amortized growth lands exactly on 65536 and `reserve_exact(1)` does not
-  over-allocate; std promises neither. Allocating `VecDeque::with_capacity(MAX + 1)` up front
-  and dropping the `reserve_exact` branch of `EventLog::append_at` makes the bound the code's own
-  (`len ≤ MAX+1` at every push, a corollary of `log-window-invariant`), at the cost of about
-  2 MiB per log from the start.
-- **5.3 `conformance_snapshot` checks a tautology.** It hard-codes `snapped = 1` and
-  `leaked = 0` into the observed state and checks `SnapshotIsolated` on that constant. Only its
-  text-equality asserts test the code; `snapshot-isolation` states what they sample.
-- **5.4 `conformance_subscribe` projects the test's cursor, not the code's.** Both tests track the
-  cursor themselves and hard-code `lost = 0`, so the guard comparison checks the test's own
-  projection. `conformance_cursor` reads the cursor back through `poll`; `poll-contract` states
-  the returned `Cursor`.
-- **5.5 The logarithmic-work test is loose and needs test-only instrumentation.**
-  `narrow_tail_line_operations_do_logarithmic_work` counts comparisons through the
-  `#[cfg(test)]` `LINE_ID_COMPARISONS` thread-local. Its bounds at 4096 lines
-  (`2 * usize::BITS` for a read, `usize::BITS` for a `SetLine`) are far above the 13 iterations
-  one lower bound takes. `line-lower-bound` states the loop's decreases bound instead; the
-  instrumentation goes with the test.
-- **5.6 Three test files restate the cap.** `conformance_eventlog.rs`, `conformance_evict_full.rs`
-  and `conformance_subscribe.rs` define `CAP = 1 << 16` instead of using
-  `aterm_buffer::MAX_LOG_EVENTS`.
-- **5.7 A "control" that is a positive sample.** `dropping_the_evicted_event_loses_seqs_control`
-  asserts only that after `MAX + 1000` appends the live window starts at seq 1001 and holds
-  `MAX` events: `log-window-invariant`'s corollary `lo = T − MAX + 1`. The loss it names is the
-  host's; `no-silent-loss` states the positive side (the returned `Some(ev)` is the only
-  remaining copy).
-
 ## 6. Proof order
 
 To start before gaps 1 and 2 close, cut each spec's scalar core into a pure `fn` over
 `u64`/`usize`, blocked only by gap 0 (and gap 3 for `min`/`saturating_*`), and prove the
 code-level spec over it once those gaps land.
 
-Runner-up: **`ring-capacity-bound`**. With the §5.2 pop-before-push fix in `record`
-(`VecDeque::with_capacity(MAX_LOG_ENTRIES)` and `if len == MAX { pop_front }`), `len ≤ MAX` holds at
-every step as a corollary of `log-window-invariant` without depending on std growth policy.
+Runner-up: **`ring-capacity-bound`**. With §5.2's pop-before-push guard in `EventLog::append_at`
+(`if self.ring.len() >= MAX_LOG_EVENTS { self.ring.pop_front() }`), `ring.len() ≤ MAX_LOG_EVENTS`
+holds at every push as a corollary of `log-window-invariant` without exceeding `MAX_LOG_EVENTS`.
 Defer **`cow-sharing`** (gap 8: `Arc`/`String` internals) and **`refines-kernel-family-models`**
 (gaps 10 and 12) to the end.

@@ -432,22 +432,30 @@ fn accounts_until(
             return failed_observation(now_ms, "Shared catalog metadata could not be read");
         }
     };
-    if !catalog
-        .entries
-        .get(&descriptor.scope.digest())
-        .is_some_and(|entry| {
-            entry.state == crate::catalog::State::Subscribed
-                && entry
-                    .declarations
-                    .iter()
-                    .all(|d| d.descriptor == descriptor)
-        })
-    {
-        return state(
-            ServiceAvailability::Unavailable,
-            now_ms,
-            "Account table is excluded, conflicting, or unavailable",
-        );
+    let blocker = match catalog.entries.get(&descriptor.scope.digest()) {
+        None => Some("No retained account catalog declaration; harness rosters are separate"),
+        Some(entry) => match entry.state {
+            crate::catalog::State::Conflict => {
+                Some("Account catalog declarations conflict; automatic access is withheld")
+            }
+            crate::catalog::State::Excluded => {
+                Some("Account catalog is excluded by local sharing policy")
+            }
+            crate::catalog::State::CreatorLimit => {
+                Some("Account catalog declaration exceeds its creator's table limit")
+            }
+            crate::catalog::State::Capacity => {
+                Some("Account catalog is waiting for local table capacity")
+            }
+            crate::catalog::State::Subscribed => entry
+                .declarations
+                .iter()
+                .any(|d| d.descriptor != descriptor)
+                .then_some("Account catalog declaration does not match this aterm's schema"),
+        },
+    };
+    if let Some(blocker) = blocker {
+        return state(ServiceAvailability::Unavailable, now_ms, blocker);
     }
     let store = match directory.path(descriptor.scope).and_then(|path| {
         crate::table::store::Store::observe_if_exists(&session, &path, descriptor.scope)
@@ -1557,6 +1565,143 @@ mod tests {
         assert_eq!(observation.http204_response, None);
         assert!(!observation.detail.contains("private"));
         assert_eq!(proposals.snapshot().unwrap().operations.len(), before);
+    }
+
+    #[test]
+    fn account_observation_distinguishes_catalog_blockers_without_changing_storage() {
+        use crate::{
+            accounts::proposals::Proposals,
+            catalog::{self, Descriptor, Directory, State},
+            table::{Scope, Session, store::Store, tests::Lab},
+        };
+        use aterm_secrets::{commons::roster::Role, fsx};
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let mut reasons = BTreeMap::new();
+        for case in [
+            "absent",
+            "excluded",
+            "disabled",
+            "conflict",
+            "creator",
+            "capacity",
+            "schema",
+            "unretained",
+            "usable",
+        ] {
+            let lab = Lab::new(&[Role::Writer]);
+            let paths = &lab.paths[0];
+            let config = paths.home.join("config.toml");
+            let bootstrap = lab.bootstrap(0);
+            let session = Session::open(&bootstrap).unwrap();
+            let directory = Directory::new(paths, bootstrap.trust());
+            let descriptor = Descriptor::application(
+                bootstrap.trust(),
+                "accounts",
+                "proposals",
+                if case == "schema" { 2 } else { 1 },
+            )
+            .unwrap();
+            aterm_journal::create_private_dir_durable(&paths.dir.join("commons/tables")).unwrap();
+            let scope = directory.catalog_scope();
+            let mut store = Store::join(&session, &directory.path(scope).unwrap(), scope).unwrap();
+            if case == "creator" {
+                for n in 0..catalog::PER_CREATOR {
+                    let earlier = Descriptor::application(
+                        bootstrap.trust(),
+                        "fixture",
+                        &format!("earlier-{n}"),
+                        1,
+                    )
+                    .unwrap();
+                    store
+                        .commit_catalog(&session, &earlier.encode().unwrap())
+                        .unwrap();
+                }
+            }
+            if case != "absent" {
+                store
+                    .commit_catalog(&session, &descriptor.encode().unwrap())
+                    .unwrap();
+            }
+            if case == "conflict" {
+                let mut incompatible = descriptor.clone();
+                incompatible.version = 2;
+                store
+                    .commit_catalog(&session, &incompatible.encode().unwrap())
+                    .unwrap();
+            }
+            drop(store);
+            if case == "capacity" {
+                for _ in 0..catalog::CATALOG_SLOTS {
+                    let scope = Scope::fresh(bootstrap.trust()).unwrap();
+                    Store::join(&session, &directory.path(scope).unwrap(), scope).unwrap();
+                }
+            }
+            if case == "excluded" {
+                fsx::write_atomic(
+                    &config,
+                    format!(
+                        "[commons]\nexclude_tables = ['{}']\n",
+                        aterm_codec::hex::encode_lower(&descriptor.scope.digest())
+                    )
+                    .as_bytes(),
+                    0o600,
+                )
+                .unwrap();
+            } else if case == "disabled" {
+                fsx::write_atomic(&config, b"[commons]\nenabled = false\n", 0o600).unwrap();
+            }
+            let catalog = directory.observe_with_config(&session, &config).unwrap();
+            let expected = match case {
+                "absent" => None,
+                "excluded" | "disabled" => Some(State::Excluded),
+                "conflict" => Some(State::Conflict),
+                "creator" => Some(State::CreatorLimit),
+                "capacity" => Some(State::Capacity),
+                _ => Some(State::Subscribed),
+            };
+            assert_eq!(
+                catalog
+                    .entries
+                    .get(&descriptor.scope.digest())
+                    .map(|e| e.state),
+                expected,
+                "{case} must exercise the actual catalog verdict"
+            );
+            drop(session);
+            drop(bootstrap);
+            if case == "usable" {
+                Proposals::at(paths.clone()).initialize().unwrap();
+            }
+            let before = table_storage_bytes(&paths.dir);
+            let observed = accounts_until(
+                paths,
+                &config,
+                1000,
+                Instant::now() + Duration::from_secs(60),
+            );
+            assert_eq!(table_storage_bytes(&paths.dir), before, "{case}");
+            assert!(!observed.refresh_failed, "{case}");
+            if case == "usable" {
+                assert_eq!(observed.availability, ServiceAvailability::Cached);
+                assert_eq!(observed.last_success_ms, Some(1000));
+            } else {
+                assert_eq!(
+                    observed.availability,
+                    ServiceAvailability::Unavailable,
+                    "{case}"
+                );
+                assert_eq!(observed.last_success_ms, None, "{case}");
+            }
+            reasons.insert(case, observed.detail);
+        }
+        assert_eq!(reasons["excluded"], reasons["disabled"]);
+        assert_eq!(
+            reasons.values().collect::<BTreeSet<_>>().len(),
+            reasons.len() - 1,
+            "distinct catalog blockers must not collapse into one ambiguous reason"
+        );
     }
 
     #[test]

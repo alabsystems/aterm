@@ -26,7 +26,7 @@ pub const USAGE: &str = "aterm db — encrypted embedded application databases (
   table <verb> ...                     typed ATT/1 tables: ls, schema, get, scan, history,\n\
                                        check, revert, export, apply, edit (table --help)\n\
   alab <verb> ...                      the ALab lab model: import, check, adopt (alab --help)\n\
-  commons-status                       local membership, control history and sharing setting\n\
+  commons-status                       local membership, history capacity, control and sharing\n\
   commons-lineage                      verified predecessor-to-current public writer identities\n\
   network-state                        local place, observer and retained history; never grants access\n\
   commons-authority                    inspect cached admin control metadata; changes nothing\n\
@@ -68,6 +68,8 @@ pub const USAGE: &str = "aterm db — encrypted embedded application databases (
   accounts-broker-inspect --file <path> inspect proposed grants offline; grants no rights\n\
   accounts-broker-refresh --grant <hex>\n\
                                       propose current bindings without changing producer identity\n\
+  accounts-broker-publish --grant <hex> --base <digest> --file <policy.toml>\n\
+                                      conditionally publish the exact reviewed refresh as root\n\
   accounts-request (--grant <hex> | --account <digest>) --request <hex> --file <private-json> [--seconds <1..60>]\n\
                                       one Google text request through a root-authorized broker grant\n\
   accounts-preview-csv --file <path>    exact inert candidates, without enrollment or writes\n\
@@ -235,7 +237,10 @@ pub fn run(words: &[String]) -> Result<Value> {
     }
     if matches!(
         command,
-        "accounts-broker-propose" | "accounts-broker-inspect" | "accounts-broker-refresh"
+        "accounts-broker-propose"
+            | "accounts-broker-inspect"
+            | "accounts-broker-refresh"
+            | "accounts-broker-publish"
     ) {
         return crate::accounts::broker::command::policy_command(command, options);
     }

@@ -124,12 +124,10 @@ fn controller(
             }),
         )
         .unwrap();
-    assert!(
-        outcome
-            .effects
-            .iter()
-            .any(|effect| matches!(effect, AppEffect::Harness(HarnessRequest::LabRefresh)))
-    );
+    assert!(outcome.effects.iter().any(|effect| matches!(
+        effect,
+        AppEffect::Harness(HarnessRequest::LabAccountsRefresh)
+    )));
     (runtime, instance, view)
 }
 
@@ -234,22 +232,28 @@ fn lab_route_shows_independent_cache_quota_and_recovery_observations() {
     assert!(label(&drawn, "lab/session/7/row/next-event").contains("2026-11-01T00:00:00Z"));
     assert!(label(&drawn, "lab/peer/7/row/machine").contains("fixture-peer"));
 
+    let refresh_button = drawn
+        .iter()
+        .find_map(|page| page.semantic(&UiKey::new(LAB_ACCOUNTS_REFRESH)))
+        .expect("the local Claude inventory offers its refresh");
+    assert_eq!(refresh_button.parent, Some(UiKey::new("lab/inventory")));
     let refresh = runtime
         .dispatch(
             instance,
             view,
             AppEvent::Action(ActionInvocation {
-                id: ActionId::new(LAB_REFRESH),
+                id: refresh_button
+                    .action
+                    .clone()
+                    .expect("refresh is actionable"),
                 value: None,
             }),
         )
         .unwrap();
-    assert!(
-        refresh
-            .effects
-            .iter()
-            .any(|effect| matches!(effect, AppEffect::Harness(HarnessRequest::LabRefresh)))
-    );
+    assert!(refresh.effects.iter().any(|effect| matches!(
+        effect,
+        AppEffect::Harness(HarnessRequest::LabAccountsRefresh)
+    )));
     let show = runtime
         .dispatch(
             instance,
@@ -498,22 +502,25 @@ fn a_lab_publication_replaces_unknown_facts_and_busy_refresh_never_starts_again(
     let (mut runtime, instance, view) = controller(unknown);
     let drawn = pages(&mut runtime, instance, view, 1200.0, 820.0);
     assert!(label(&drawn, "lab/service/secrets/row/secrets").contains("Unknown"));
+    let refresh_button = drawn
+        .iter()
+        .find_map(|page| page.semantic(&UiKey::new(LAB_ACCOUNTS_REFRESH)))
+        .expect("the account reader's progress stays in the Claude inventory");
+    assert!(!refresh_button.state.as_ref().expect("button state").enabled);
     let busy = runtime
         .dispatch(
             instance,
             view,
             AppEvent::Action(ActionInvocation {
-                id: ActionId::new(LAB_REFRESH),
+                id: ActionId::new(LAB_ACCOUNTS_REFRESH),
                 value: None,
             }),
         )
         .unwrap();
-    assert!(
-        !busy
-            .effects
-            .iter()
-            .any(|effect| matches!(effect, AppEffect::Harness(HarnessRequest::LabRefresh)))
-    );
+    assert!(!busy.effects.iter().any(|effect| matches!(
+        effect,
+        AppEffect::Harness(HarnessRequest::LabAccountsRefresh)
+    )));
 
     publish(&mut runtime, instance, view, fixture(), 2);
     let drawn = pages(&mut runtime, instance, view, 1200.0, 820.0);
@@ -580,6 +587,10 @@ fn lab_facts_remain_whole_in_wide_compact_and_scaled_settings() {
             );
             assert!(label(&drawn, "lab/session/7/row/claim-timing").contains("not rechecked"));
             assert!(label(&drawn, "lab/session/7/row/switch-blocker").contains("pinned"));
+            assert!(drawn.iter().any(|page| {
+                page.semantic(&UiKey::new(LAB_ACCOUNTS_REFRESH))
+                    .is_some_and(|button| !button.offscreen && button.action.is_some())
+            }));
         }
     }
 }

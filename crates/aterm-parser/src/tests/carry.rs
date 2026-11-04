@@ -354,6 +354,9 @@ fn can_sub_and_esc_still_reset_a_restored_state() {
     }
 }
 
+/// NEGATIVE CONTROL: `restore_carry` refuses every malformed or unreachable header/string carry
+/// (including `subparam_mask` bit `0` on `params[0]` and CSI colon state inside DCS headers)
+/// without mutating the target parser.
 #[test]
 fn restore_carry_refuses_every_invalid_carry() {
     let csi = |params: Vec<u16>| ParserCarry {
@@ -398,6 +401,37 @@ fn restore_carry_refuses_every_invalid_carry() {
             CarryRefusal::Params,
         ),
         (
+            "subparam_mask in DcsParam",
+            ParserCarry {
+                state: State::DcsParam,
+                params: vec![1, 2],
+                subparam_mask: 1 << 1,
+                ..ParserCarry::default()
+            },
+            CarryRefusal::FieldOutsideState,
+        ),
+        (
+            "subparam_mask in DcsIntermediate",
+            ParserCarry {
+                state: State::DcsIntermediate,
+                params: vec![1, 2],
+                subparam_mask: 1 << 1,
+                intermediates: vec![b'$'],
+                ..ParserCarry::default()
+            },
+            CarryRefusal::FieldOutsideState,
+        ),
+        (
+            "last_was_colon in DcsParam",
+            ParserCarry {
+                state: State::DcsParam,
+                params: vec![1],
+                last_was_colon: true,
+                ..ParserCarry::default()
+            },
+            CarryRefusal::FieldOutsideState,
+        ),
+        (
             "a final byte among DcsIntermediate's intermediates",
             ParserCarry {
                 state: State::DcsIntermediate,
@@ -419,6 +453,14 @@ fn restore_carry_refuses_every_invalid_carry() {
             "too many params",
             csi(vec![1; MAX_PARAMS + 1]),
             CarryRefusal::Params,
+        ),
+        (
+            "mask bit 0 on first parameter",
+            ParserCarry {
+                subparam_mask: 1,
+                ..csi(vec![1])
+            },
+            CarryRefusal::SubparamMask,
         ),
         (
             "mask bit at params.len()",
@@ -456,6 +498,14 @@ fn restore_carry_refuses_every_invalid_carry() {
             "a mask with no params",
             ParserCarry {
                 subparam_mask: 1,
+                ..csi(vec![])
+            },
+            CarryRefusal::SubparamMask,
+        ),
+        (
+            "a colon with no preceding parameter",
+            ParserCarry {
+                last_was_colon: true,
                 ..csi(vec![])
             },
             CarryRefusal::SubparamMask,
@@ -720,7 +770,7 @@ fn restore_carry_accepts_the_edge_of_every_bound() {
         ParserCarry {
             state: State::CsiParam,
             params: vec![u16::MAX; MAX_PARAMS],
-            subparam_mask: (1 << (MAX_PARAMS + 1)) - 1,
+            subparam_mask: (1 << (MAX_PARAMS + 1)) - 2,
             current_param: u32::MAX,
             param_started: true,
             last_was_colon: true,

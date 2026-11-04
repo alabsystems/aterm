@@ -320,7 +320,9 @@ fn shared_codex_refuses_verification_where_private_evidence_is_unavailable() {
     };
     assert_eq!(
         err,
-        "private shared-login evidence is unavailable on this platform"
+        ObservationError::Unavailable(
+            "private shared-login evidence is unavailable on this platform".into()
+        )
     );
     assert_eq!(local_principal(temp.path(), EMAIL), None);
 }
@@ -344,4 +346,51 @@ fn shared_codex_private_file_policy_and_absence_are_not_authentication() {
         .unwrap();
         assert!(verify_with(temp.path(), EMAIL, || panic!("public credential")).is_err());
     }
+}
+
+/// Unix only: these observations require owner-private credential snapshots.
+#[cfg(unix)]
+#[test]
+fn shared_codex_preserves_unread_and_rotated_attempts_without_reauthentication() {
+    let temp = aterm_tempfile::tempdir().unwrap();
+    for reading in [Reading::Unread, Reading::SignedOut, accepted()] {
+        let initial = document(EMAIL, "user-1");
+        write(temp.path(), &initial);
+        let result = verify_with(temp.path(), EMAIL, || reading.clone());
+        match &reading {
+            Reading::Unread => assert!(matches!(result, Err(ObservationError::Unavailable(_)))),
+            Reading::SignedOut => {
+                assert!(matches!(result, Err(ObservationError::RecoveryRequired(_))))
+            }
+            Reading::Usage(_) => assert!(result.unwrap().is_some()),
+        }
+        let mut rotated = initial.clone();
+        rotated.as_object_mut().unwrap().insert(
+            "last_refresh".into(),
+            Value::String("2026-11-04T12:00:00Z".into()),
+        );
+        let result = verify_with(temp.path(), EMAIL, || {
+            write(temp.path(), &rotated);
+            reading.clone()
+        });
+        assert!(matches!(result, Err(ObservationError::Unavailable(_))));
+        let proof = verify_with(temp.path(), EMAIL, accepted).unwrap().unwrap();
+        assert_eq!(proof.principal(), principal("account-1", "user-1").unwrap());
+        proof.check_current().unwrap();
+        assert_eq!(
+            std::fs::read(temp.path().join(AUTH_FILE)).unwrap(),
+            aterm_json::to_vec(&rotated).unwrap()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn shared_codex_broken_credential_link_is_unavailable_instead_of_missing() {
+    let temp = aterm_tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(temp.path().join("absent"), temp.path().join(AUTH_FILE)).unwrap();
+    let result = verify_with(temp.path(), EMAIL, || {
+        panic!("unsafe evidence must not reach provider")
+    });
+    assert!(matches!(result, Err(ObservationError::Unavailable(_))));
 }

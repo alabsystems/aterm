@@ -206,8 +206,24 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
         let _ = wake;
         None
     }
-    act fn restart(&self, why: &super::super::policy::turn_end::Restart) -> Option<String> {
-        let _ = why;
+    /// The restart in place `why`, asked as `ask` ([`super::super::policy::turn_end::RestartAsk`]:
+    /// the same at every ask of one restart), and the host's word for what it did.
+    act fn restart(
+        &self,
+        why: &super::super::policy::turn_end::Restart,
+        ask: &super::super::policy::turn_end::RestartAsk,
+    ) -> Option<String> {
+        let _ = (why, ask);
+        None
+    }
+    /// The agent's process the restart in place this host answered last ([`Self::restart`]) left
+    /// in the tab, as the restart's own report names it: the process it started where it made
+    /// one, the one it was asked by where it made none (a relaunch in flight carried, the asker
+    /// only adopted); `None` where the report names none, and the loop goes by the process the
+    /// host names now ([`Self::agent_pid`]). Asked at once after the host's word that it made the
+    /// restart, it is the restart's own evidence, which the host's kept snapshot may still lag
+    /// ([`crate::supervise::custody::Line::restarted`]).
+    fn restart_left(&self) -> Option<crate::supervise::custody::Process> {
         None
     }
     fn can_restart(&self) -> bool {

@@ -163,7 +163,7 @@ fn target_roots(tree: &Tree<'_>, out: &mut Vec<Finding>) -> BTreeMap<String, BTr
 /// Where Cargo looks, beside the manifest, for the root of a target of `kind` declared with
 /// `name` and no `path`; `own` when that name is the package's, which a binary's
 /// `src/main.rs` carries.
-fn where_cargo_looks(kind: &str, name: Option<&str>, own: bool) -> Vec<String> {
+pub(super) fn where_cargo_looks(kind: &str, name: Option<&str>, own: bool) -> Vec<String> {
     let dir = match kind {
         "bin" => "src/bin",
         "test" => "tests",

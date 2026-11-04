@@ -50,7 +50,7 @@ impl World {
         registered::reclaim_on(
             &self.home,
             SystemTime::now() + Duration::from_secs(4 * 24 * 60 * 60),
-            build_cache::RECLAIM_GONE,
+            build_cache::ReclaimAfter::CALM,
             None,
             &mut |_, _| true,
             &Fence::new(&clear),
@@ -257,7 +257,9 @@ fn an_ordinary_pending_deep_retirement_does_not_revoke_its_own_fence() {
     registered::stage_for_process_test(&world.home, &world.target, &stage);
     let receipt = registered::read(&world.path()).unwrap();
     let pending = receipt.pending.as_ref().unwrap();
-    let result = registered::remove_pending(&world.path(), &receipt, pending, None).unwrap();
+    let result =
+        registered::remove_pending(&world.path(), &receipt, pending, None, &Fence::default())
+            .unwrap();
     assert!(result.whole());
     assert!(!stage.exists());
     assert_eq!(registered::read(&world.path()).unwrap(), receipt);
@@ -403,7 +405,7 @@ fn a_pending_payload_hiding_custody_stays_unchanged_until_search_is_available() 
     let removed = registered::reclaim_on(
         &world.home,
         SystemTime::now() + Duration::from_secs(4 * 24 * 60 * 60),
-        build_cache::RECLAIM_GONE,
+        build_cache::ReclaimAfter::CALM,
         None,
         &mut |at, why| {
             asked.push((at.to_path_buf(), why));

@@ -1892,13 +1892,15 @@ fn a_mismatched_restart_preserves_the_current_advice() {
     let (a, idle) = ready("s-advice-mismatch");
     let before = idle.kept.lock().unwrap().account.advised.clone();
     assert_eq!(
-        idle.restart(&move_to("pool-a", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("pool-a", AccountAt::Wall))
+            .as_deref(),
         Some("wait:account-changed")
     );
     assert_eq!(idle.kept.lock().unwrap().account.advised, before);
     assert_eq!(a.asked("restart:"), 0);
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("adopted")
     );
     assert_eq!(a.asked("restart:"), 1);
@@ -1911,14 +1913,16 @@ fn a_busy_landing_gate_preserves_advice_for_retry() {
     let gate = Arc::clone(&idle.kept.lock().unwrap().account.landing);
     let held = gate.lock().unwrap();
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("wait:account-unverified")
     );
     assert_eq!(idle.kept.lock().unwrap().account.advised, before);
     assert_eq!(a.asked("restart:"), 0);
     drop(held);
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("adopted")
     );
     assert_eq!(a.asked("restart:"), 1);

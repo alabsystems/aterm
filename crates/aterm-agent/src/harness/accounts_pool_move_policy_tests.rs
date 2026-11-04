@@ -35,7 +35,7 @@ fn session_move_refuses_policy_already_stale_before_preparation() {
             .unwrap();
             let before = world.load(cli);
             let prepared = Cell::new(false);
-            let mut s = session(cli, Supervisor::Aterm, observed, Path::new("/opt/provider"));
+            let mut s = session(cli, Supervisor::Aterm, observed, &world.exe);
             s.point = Point::Wall {
                 window: "five_hour".into(),
                 at: Some(NOW - MIN),
@@ -109,12 +109,7 @@ fn prepared_session_move_refuses_a_target_renewed_in_the_same_directory() {
             store.wake_path(),
         ];
         let after = RefCell::new(None);
-        let s = session(
-            cli,
-            Supervisor::Aterm,
-            Mode::Early,
-            Path::new("/opt/provider"),
-        );
+        let s = session(cli, Supervisor::Aterm, Mode::Early, &world.exe);
         let result = super::session_move_using(&world.seat(), &s, |row| {
             let env = login_env(cli, row, &world.home).unwrap();
             let line = relaunch::pool_line(&s.relaunch, cli, &env).unwrap();
@@ -208,12 +203,7 @@ fn run_case(cli: Cli, follows: bool, case: i64) -> (bool, i64) {
     let after = RefCell::new(None);
     let rotations = Cell::new(0);
     let mut held = None;
-    let s = session(
-        cli,
-        Supervisor::Aterm,
-        Mode::Early,
-        Path::new("/opt/provider"),
-    );
+    let s = session(cli, Supervisor::Aterm, Mode::Early, &world.exe);
     if matches!(case, 23 | 24) {
         let mode = if case == 23 { "off" } else { "wall" };
         std::fs::write(

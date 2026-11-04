@@ -15,7 +15,7 @@ fn stored_stream(
         membership_log::{MAX_HELD_RECORDS, MAX_RECORDS_STREAM, decode_records},
     };
 
-    let Some(bytes) = fsx::read_private(&paths.records_file(), MAX_RECORDS_STREAM)? else {
+    let Some(bytes) = fsx::read_private(&paths.records_data_file()?, MAX_RECORDS_STREAM)? else {
         return Ok(aterm_json::Value::Null);
     };
     let records = match decode_records(bytes.as_slice()) {

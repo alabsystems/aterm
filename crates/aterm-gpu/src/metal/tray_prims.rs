@@ -75,40 +75,6 @@ impl WorkerDevice {
     }
 }
 
-/// A test's hold on every tray-prim build: a worker waits to build while one is held, so a test
-/// can ask while the build is certainly under way.
-#[cfg(test)]
-pub(crate) mod held {
-    use std::sync::{Condvar, Mutex, PoisonError};
-
-    static HELD: Mutex<bool> = Mutex::new(false);
-    static RELEASED: Condvar = Condvar::new();
-
-    /// The hold, released when dropped.
-    pub(crate) struct Hold;
-
-    /// Hold every build until the [`Hold`] drops.
-    pub(crate) fn hold() -> Hold {
-        *HELD.lock().unwrap_or_else(PoisonError::into_inner) = true;
-        Hold
-    }
-
-    impl Drop for Hold {
-        fn drop(&mut self) {
-            *HELD.lock().unwrap_or_else(PoisonError::into_inner) = false;
-            RELEASED.notify_all();
-        }
-    }
-
-    /// Wait while a build is held.
-    pub(super) fn wait() {
-        let mut held = HELD.lock().unwrap_or_else(PoisonError::into_inner);
-        while *held {
-            held = RELEASED.wait(held).unwrap_or_else(PoisonError::into_inner);
-        }
-    }
-}
-
 /// Compile `tray_prims.metal` for `dev` and build its two pipelines.
 fn build_pipelines(dev: &Device) -> Result<BuiltPipelines, String> {
     let lib = super::pipelines::compile_library(dev, ShaderLibrary::TrayPrims)?;
@@ -339,5 +305,39 @@ impl MetalTrayPrims {
         pass.set_fragment_buffer(&staged.law, law_slot as usize);
         pass.set_fragment_buffer(&staged.stream, prims_slot as usize);
         pass.draw_instanced(PrimitiveType::TriangleStrip, 4, staged.count)
+    }
+}
+
+/// A test's hold on every tray-prim build: a worker waits to build while one is held, so a test
+/// can ask while the build is certainly under way.
+#[cfg(test)]
+pub(crate) mod held {
+    use std::sync::{Condvar, Mutex, PoisonError};
+
+    static HELD: Mutex<bool> = Mutex::new(false);
+    static RELEASED: Condvar = Condvar::new();
+
+    /// The hold, released when dropped.
+    pub(crate) struct Hold;
+
+    /// Hold every build until the [`Hold`] drops.
+    pub(crate) fn hold() -> Hold {
+        *HELD.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        Hold
+    }
+
+    impl Drop for Hold {
+        fn drop(&mut self) {
+            *HELD.lock().unwrap_or_else(PoisonError::into_inner) = false;
+            RELEASED.notify_all();
+        }
+    }
+
+    /// Wait while a build is held.
+    pub(super) fn wait() {
+        let mut held = HELD.lock().unwrap_or_else(PoisonError::into_inner);
+        while *held {
+            held = RELEASED.wait(held).unwrap_or_else(PoisonError::into_inner);
+        }
     }
 }

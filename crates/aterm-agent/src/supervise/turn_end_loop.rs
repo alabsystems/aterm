@@ -12,7 +12,7 @@ use super::super::policy::turn_end::{
     ANSWERS_OFF, AccountAnswer, AccountAt, CREDITS_HOLD_MODEL_TOLD, CREDITS_HOLD_TOLD, Composer,
     ComposerRead, Conversation, CreditsCarry, GoAheadVerdict, LOGIN_SHARED_LOOK, MENU_DIVERTS,
     OWN_WORDS_STAND, ProbeGate, RULE_ACCOUNT, RULE_INPUT_LOST, RULE_LAND, RULE_LEFT, RULE_LOGIN,
-    RULE_USAGE_PROBE, RecordTurn, Restart, TRY_ANSWER_SLACK, WAKE_KEPT, account_hold,
+    RULE_USAGE_PROBE, RecordTurn, Restart, RestartAsk, TRY_ANSWER_SLACK, WAKE_KEPT, account_hold,
     act_turn_work, budget_frees, conversation_mark, decide_turn_end, decide_turn_end_traced,
     done_row_work, is_wait_resume, outage_of, reads_conversation,
 };
@@ -301,14 +301,20 @@ pub(super) const UNDRAWN_INPUT_HANG: Duration = Duration::from_secs(60);
 /// drawn after it (in order, their text came after the line); a turn read running after it
 /// ([`custody::Line::ran`]), once `status` reads the input clear on a read that shows none of it
 /// ([`Session::custody_turned`]; a read that cannot say what the composer holds keeps the turn's
-/// evidence for the next that can); or its program's end, a restart's or any other. A move of the
+/// evidence for the next that can); or its program's end, a restart's or any other: the host names
+/// another process than the one it was written to ([`custody::Line::ended`]). A move of the
 /// screen, a new point, an epoch, a stall's thaw, an edge, an Off park, or a busy spell with no
 /// turn read running in it (a break's reads, a frame being drawn) settles nothing. A line the
 /// worker read ([`custody::Held::Read`]) and drew none of [`ECHO_HANG`] on, at rest, gets a
-/// restart in place ([`Restart::InputLost`]): the PTY holds no copy of it, and the process that
-/// might ends, so the point resumed is decided and written once. Where no restart can be made,
-/// where the host refused one, and after one already was, it is a doubling wait that writes
-/// nothing ([`custody::custody_step`]), and the host's upgrade may move the process
+/// restart in place of the process it was written to ([`Restart::InputLost`]): the PTY holds no
+/// copy of it, and the process that might ends, so the point resumed is decided and written once.
+/// The host's word that it made the restart is made only where the restart's own report, else the
+/// host, then names another process, or none at either end ([`custody::Restarts::answered`]);
+/// with the line's own process named, nothing shows it ended, and it is asked again on its
+/// back-off ([`Session::restart_agent`]); a restart that stands asked so, or deferred, is spent
+/// once the line settles ([`custody::Restarts::settled`]). Where no restart can
+/// be made, where the host refused one, and after one already was, it is a doubling wait that
+/// writes nothing ([`custody::custody_step`]), and the host's upgrade may move the process
 /// ([`LineHeld::Lost`]). A break of the agent's own background work is no point: a person's
 /// keys, its program's end and a turn after it settle a line there too, but its draw is kept as
 /// evidence ([`custody::Line::drawn`]) for the point the spell ends on to hand back, or to settle
@@ -323,9 +329,23 @@ pub(super) struct Custody {
     by: OwnBy,
     /// The rule the write ran under, for its records.
     rule: String,
+    /// The ask of this line's restart in place, the same at its every ask
+    /// ([`Restart::InputLost`]'s `line`).
+    ask: custody::LineAsk,
 }
 
 impl Custody {
+    /// The line `text` held since `now`, for a test.
+    #[cfg(test)]
+    pub(super) fn of(text: &str, now: Instant) -> Self {
+        Self {
+            line: custody::Line::formed(text, 0, None, None, None, now),
+            by: OwnBy::Line,
+            rule: String::new(),
+            ask: custody::LineAsk { at_ms: 0, nth: 0 },
+        }
+    }
+
     /// Whether `shown` (a draft a read saw) is the line held.
     pub(super) fn is(&self, shown: &str) -> bool {
         self.line.is(shown)
@@ -511,32 +531,6 @@ impl LeftLine {
     /// which a turn shows.
     fn went(&self, screen: &Screen) -> bool {
         self.stands != LeftStands::Nothing && self.human.is_some() && self.human == screen.human_seq
-    }
-}
-
-#[cfg(test)]
-mod left_line_tests {
-    use super::*;
-
-    /// WENT TAKES A COUNT THAT STOOD STILL: a host with no key count at all says nothing of who
-    /// cleared the composer, though "no count" equals "no count".
-    #[test]
-    fn a_line_goes_only_on_a_count_that_held() {
-        let line = |stands, human| LeftLine {
-            text: String::new(),
-            point_key: String::new(),
-            stands,
-            human,
-        };
-        let on = |human_seq| Screen {
-            human_seq,
-            ..Screen::default()
-        };
-        assert!(line(LeftStands::Whole, Some(3)).went(&on(Some(3))));
-        assert!(line(LeftStands::Part, Some(3)).went(&on(Some(3))));
-        assert!(!line(LeftStands::Whole, Some(3)).went(&on(Some(4))));
-        assert!(!line(LeftStands::Nothing, Some(3)).went(&on(Some(3))));
-        assert!(!line(LeftStands::Whole, None).went(&on(None)));
     }
 }
 
@@ -1279,18 +1273,29 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// When a person last typed into the session ([`Self::person_ago`]): their last key, or the
-    /// draft a read saw, unless that draft is the line this loop wrote and left ([`OwnLine`]),
-    /// which is no person's however late its program draws it.
+    /// draft a read saw, unless that draft is this loop's own words ([`Self::own_words`]), which are
+    /// no person's however late its program draws them.
     pub(super) fn person_at(&self) -> Option<Instant> {
         let draft = self
             .draft_seen
             .as_ref()
-            .filter(|(draft, _)| {
-                !self.own_line.as_ref().is_some_and(|own| own.is(draft))
-                    && !self.custody.as_ref().is_some_and(|c| c.is(draft))
-            })
+            .filter(|(draft, _)| !self.own_words(draft))
             .map(|(_, at)| *at);
         self.person.max(draft)
+    }
+
+    /// WHETHER `shown` (A DRAFT A READ SAW) IS THIS LOOP'S OWN WORDS: the line it wrote and left
+    /// ([`OwnLine`]) or holds in [`Custody`], whitespace aside, or a line headed by aterm's own
+    /// upgrade words (`upgrade::own_words`). No person typed them, so no person's grace waits on
+    /// them; the policy's draft step finishes the loop's own act or asks about it. Text that is only
+    /// a part of such a line is not among them: a person's draft can be (a `k`, a `keep going` under
+    /// a longer line left, a `[a` before an upgrade's head), and a line still drawing is the echo's
+    /// to wait out (`Echo::Arriving`). A person's key still holds what stands (`Session::person`),
+    /// and words a person joined to such a line make it none of these ([`OwnLine::joined_in`]).
+    fn own_words(&self, shown: &str) -> bool {
+        crate::harness::upgrade::own_words(shown)
+            || self.own_line.as_ref().is_some_and(|own| own.is(shown))
+            || self.custody.as_ref().is_some_and(|c| c.is(shown))
     }
 
     /// Return the submit count and conversation mark for `screen` ([`conversation_mark`]).
@@ -2578,7 +2583,19 @@ impl<C: Ctl> Session<'_, C> {
 
     /// Whether the composer holds a PERSON'S draft, judged where it is DRAWN: the cell of its
     /// first glyph, or of the glyph after it where the program draws its caret over the first
-    /// ([`crate::supervise::screen::composer_glyph_cell`]).
+    /// ([`crate::supervise::screen::composer_glyph_cell`]). Where the program draws a grey
+    /// suggestion (`placeholder`), that cell is read WHEREVER THE CURSOR STANDS, however many rows
+    /// the text has. A plain glyph is typed text. A grey one is a suggestion only with the cursor
+    /// home on it ([`cursor_home`]); with the cursor anywhere else it says neither, so this answers
+    /// `None`: that is a frame read before its program placed the cursor (Muse Code's bottom pane,
+    /// Claude Code's launch frame, `fabric_world`'s `174640090a`), or a person's own text drawn grey
+    /// (Claude Code 2.1.268 draws a voice transcript still forming `dimColor`, the cursor after it,
+    /// read from its source). No read tells those apart, and the two wrong acts are an Enter on a
+    /// suggestion and a line typed over a person's words, so nothing is done until the frame says
+    /// more: [`Composer::Unknown`] holds the point, the wait's own steps look again
+    /// (`Session::wait_for_next`), and the host's guards hold ([`Self::cell_saw`]). A `None` is
+    /// likewise an unread cell, or a reply inside an unfinished frame. A key the window measured
+    /// holds the point whatever this reads (the policy's person).
     pub(in crate::supervise) fn composer_draft(
         &mut self,
         composer: Option<&(usize, Vec<String>)>,
@@ -2586,29 +2603,13 @@ impl<C: Ctl> Session<'_, C> {
         hint_fg: Option<&str>,
         screen: &Screen,
     ) -> Option<bool> {
-        let grey = placeholder && screen.cursor_col == 2;
-        self.composer_typed(composer, grey, hint_fg, screen)
-    }
-
-    /// [`Self::composer_draft`], `grey` whether a lone first line may be a grey suggestion, which
-    /// only its glyph's cell then tells from typed text.
-    fn composer_typed(
-        &mut self,
-        composer: Option<&(usize, Vec<String>)>,
-        grey: bool,
-        hint_fg: Option<&str>,
-        screen: &Screen,
-    ) -> Option<bool> {
         let Some((caret, lines)) = composer else {
             return Some(false);
         };
-        if lines.iter().skip(1).any(|l| !l.is_empty()) {
-            return Some(true);
-        }
         if lines.first().is_none_or(String::is_empty) {
-            return Some(false);
+            return Some(lines.iter().skip(1).any(|l| !l.is_empty()));
         }
-        if !grey {
+        if !placeholder {
             return Some(true);
         }
         let row = (screen.first + caret).to_string();
@@ -2618,23 +2619,41 @@ impl<C: Ctl> Session<'_, C> {
                 .filter(|r| r.ok())
                 .map(|r| r.stdout)
         })?;
-        crate::supervise::screen::cell_is_placeholder(&cell, hint_fg)
-            .map(|placeholder| !placeholder)
+        match crate::supervise::screen::cell_is_placeholder(&cell, hint_fg)? {
+            false => Some(true),
+            true if cursor_home(*caret, lines, screen) => Some(false),
+            true => None,
+        }
     }
 
-    /// What the loop reads of the composer's cells on `screen` ([`Self::composer_draft`],
+    /// [`Self::composer_draft`] of `reading`'s composer, and what its glyph's cell told is what the
+    /// loop saw ([`Self::cell_saw`]): the read a decision makes ([`Self::composer_read`]) and a break
+    /// of the agent's own background work (`Session::host_steps_in_background`), where what the
+    /// host's guards hold ([`Self::occupancy_guards`]) is no decision's to set.
+    pub(super) fn composer_typed(
+        &mut self,
+        reading: &aterm_phase::Reading,
+        screen: &Screen,
+    ) -> Option<bool> {
+        let reader = reading.program.reader();
+        let typed = self.composer_draft(
+            reading.composer.as_ref(),
+            reader.placeholder(),
+            reader.placeholder_fg(),
+            screen,
+        );
+        self.cell_saw(reading.composer.as_ref(), typed);
+        typed
+    }
+
+    /// What the loop reads of the composer's cells on `screen` ([`Self::composer_typed`],
     /// [`Self::menu_colours`]).
     pub(super) fn composer_read(
         &mut self,
         reading: &aterm_phase::Reading,
         screen: &Screen,
     ) -> ComposerRead {
-        let typed = self.composer_draft(
-            reading.composer.as_ref(),
-            reading.program.reader().placeholder(),
-            reading.program.reader().placeholder_fg(),
-            screen,
-        );
+        let typed = self.composer_typed(reading, screen);
         let menu_fg = match reading.program {
             Program::Claude if typed == Some(true) => self.menu_colours(screen),
             Program::Claude
@@ -2646,6 +2665,60 @@ impl<C: Ctl> Session<'_, C> {
             | Program::Generic => None,
         };
         ComposerRead { typed, menu_fg }
+    }
+
+    /// WHAT THE GLYPH'S CELL SAW ([`Self::composer_typed`]) of the composer's text, `typed` its verdict.
+    /// Typed text is a draft seen (`Session::draft_seen`) from this read on, the same text keeping
+    /// its first sight: else the policy, which reads the same cell, would judge a draft no grace
+    /// holds, and its draft step would send it. Text the cell reads as a grey suggestion or a hint,
+    /// the cursor home on it, is no draft, whatever an earlier read took it for (a read with the
+    /// cursor past it, or over a row its redraw had not yet cleared): the draft seen goes, so neither
+    /// the policy's grace nor the host's guards hold it. A read that could not say changes no draft
+    /// seen, and with none seen its text stands as one: the host's guards hold as the door does, which
+    /// reads no verdict as a draft (`Session::door_draft`). Whether a draft seen is a person's is
+    /// [`Self::person_at`]'s to say.
+    fn cell_saw(&mut self, composer: Option<&(usize, Vec<String>)>, typed: Option<bool>) {
+        let Some((_, lines)) = composer else {
+            return;
+        };
+        let text = lines.join("\n");
+        match typed {
+            Some(true) => {
+                let at = match self.draft_seen.take() {
+                    Some((seen, at)) if seen == text => at,
+                    _ => self.fx.mono(),
+                };
+                self.draft_seen = Some((text, at));
+            }
+            Some(false) if !text.is_empty() => self.draft_seen = None,
+            Some(false) => {}
+            None => {
+                if self.draft_seen.is_none() {
+                    self.draft_seen = Some((text, self.fx.mono()));
+                }
+            }
+        }
+    }
+
+    /// THE COMPOSER AS THE HOST'S GUARDS ARE TO HOLD IT ([`Self::occupancy_guards`], `draft_seen`) at
+    /// a step no decision reads it: [`Self::composer_typed`] of `reading`'s composer on `screen`, once
+    /// for a text and a cursor its cell has said of ([`Self::guards_told`]), so a screen ticking over
+    /// the same composer asks no cell at each move. A read that could not say is asked again, and so
+    /// is a composer whose draft a read has since let go: the text may have left and come back.
+    pub(super) fn composer_for_guards(&mut self, reading: &aterm_phase::Reading, screen: &Screen) {
+        let told = |s: &Self| {
+            reading.composer.as_ref().map(|(_, lines)| {
+                (
+                    lines.join("\n"),
+                    screen.cursor_row,
+                    screen.cursor_col,
+                    s.draft_seen.is_some(),
+                )
+            })
+        };
+        if self.guards_told != told(self) && self.composer_typed(reading, screen).is_some() {
+            self.guards_told = told(self);
+        }
     }
 
     /// THE LINE THIS LOOP LEFT AT `point`, WRITTEN BY `by` ([`LeftLine`], [`OwnLine`]): looked at
@@ -2769,8 +2842,8 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// [`LeftStands`] on `screen`, or `None` where this read cannot say: no composer drawn, a dialog
-    /// over it, or a glyph's cell unread. A suggestion is told by its cell wherever the cursor stands:
-    /// a read with the cursor away from it is no typed text, and the next read back would be text gone.
+    /// over it, a glyph's cell unread, or grey with the cursor off it ([`Self::composer_draft`]). What
+    /// stood stands until a read says: a read with the cursor away from a suggestion is no text gone.
     fn left_stands(&mut self, screen: &Screen, text: &str) -> Option<LeftStands> {
         let reading = self
             .reader(&screen.rows)
@@ -2783,7 +2856,7 @@ impl<C: Ctl> Session<'_, C> {
         let reader = reading.program.reader();
         let (grey, hint_fg) = (reader.placeholder(), reader.placeholder_fg());
         Some(
-            match self.composer_typed(reading.composer.as_ref(), grey, hint_fg, screen)? {
+            match self.composer_draft(reading.composer.as_ref(), grey, hint_fg, screen)? {
                 false => LeftStands::Nothing,
                 true if whole => LeftStands::Whole,
                 true => LeftStands::Part,
@@ -3789,6 +3862,8 @@ impl<C: Ctl> Session<'_, C> {
                 "withheld"
             } else if !review.unattended() {
                 "attended"
+            } else if self.draft_held == Some(Composer::Unknown) {
+                "composer-unknown"
             } else {
                 "policy"
             })
@@ -4140,7 +4215,17 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// The restart the policy asked for, made by the host and journaled `HOST seq=<n> restart:<why>
-    /// step=<word>`.
+    /// step=<word>`. The host's success word is its claim, and the process the restart's own
+    /// report names after it (`IdleHost::restart_left`), else the one the host names now, its
+    /// evidence ([`custody::Line::restarted`]): a line held in [`Custody`] settles with its
+    /// program where that is another process than the one it was written to, or where none is
+    /// named at either end (the word all there is), and a restart for that line
+    /// ([`Restart::InputLost`]) is made only there ([`custody::Restarts::answered`]); with the
+    /// line's own process named, nothing shows it ended, the restart stands asked, and it is asked
+    /// again on its back-off as a deferral is ([`Self::restart_later`], its step
+    /// [`super::super::journal::LINE_RESTART_STANDS`]). Any other restart is booked on the word,
+    /// the line held standing where its process is named: such a restart names no process, and
+    /// asked again it would end the process a restart it made started.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn restart_agent(
         &mut self,
@@ -4172,7 +4257,8 @@ impl<C: Ctl> Session<'_, C> {
                 at
             }
         };
-        let step = opts.idle_host.as_ref().and_then(|h| h.restart(why));
+        let ask = RestartAsk::of(why, asked_unix);
+        let step = opts.idle_host.as_ref().and_then(|h| h.restart(why, &ask));
         if let Some(step) = &step
             && restart_note_due(self.restart_waits)
         {
@@ -4186,13 +4272,39 @@ impl<C: Ctl> Session<'_, C> {
             .map(|s| s.split_once(':').map_or(s, |(head, _)| head));
         match (word, step.as_deref()) {
             (Some("adopted" | "relaunched" | "continued" | "done"), _) => {
+                // The word is the host's claim; for a line held in custody the evidence is the
+                // process the restart's own report names after it, else the one the host names
+                // now (`custody::Line::restarted`): only another one is its program ended, and
+                // only that is the line's restart made (`custody::Restarts::answered`).
+                let (left, named) = if self.custody.is_some() {
+                    let left = opts.idle_host.as_ref().and_then(|h| h.restart_left());
+                    (left, self.host_process())
+                } else {
+                    (None, None)
+                };
+                let line = self.custody.as_ref().map(|c| &c.line);
+                let restarted = if matches!(why, Restart::InputLost { .. }) {
+                    self.input_lost.answered(line, left, named)
+                } else {
+                    line.map_or(custody::Restarted::Ended, |l| l.restarted(left, named))
+                };
+                let stands = restarted == custody::Restarted::Stands;
+                if stands && matches!(why, Restart::InputLost { .. }) {
+                    // Nothing shows the process the line was written to ended: the line's restart
+                    // stands asked, and is asked again on its back-off, as a deferral's is.
+                    let step = format!(
+                        "{} ({})",
+                        step.as_deref().unwrap_or("-"),
+                        super::super::journal::LINE_RESTART_STANDS
+                    );
+                    return self.restart_later(seq, why, &step, None, review);
+                }
                 self.restart_waits = 0;
                 self.restart_run = None;
                 self.memory_refused = false;
-                // The process that might hold a line held in custody ended with this restart.
-                self.custody_ended(seq, Settles::Ended, review);
-                if matches!(why, Restart::InputLost) {
-                    self.input_lost.made();
+                if !stands {
+                    // The process that might hold a line held in custody ended with this restart.
+                    self.custody_ended(seq, Settles::Ended, review);
                 }
                 let r = if matches!(why, Restart::Account { .. }) {
                     self.turn_end_reread_relaunched(&point.screen, opts)
@@ -4232,7 +4344,7 @@ impl<C: Ctl> Session<'_, C> {
                         Some(over) => format!("the agent, for its memory: {}", over.fact()),
                         None => "the agent, for its critical-memory banner".to_string(),
                     },
-                    Restart::InputLost => {
+                    Restart::InputLost { .. } => {
                         "the agent, for the line it read and drew none of".to_string()
                     }
                     Restart::Model { to } => format!("relaunch --model {to}"),
@@ -4305,7 +4417,7 @@ impl<C: Ctl> Session<'_, C> {
                         (None, Restart::Account { to, at }) => {
                             approvals::account_switch_reason(to, *at)
                         }
-                        (None, Restart::InputLost) => {
+                        (None, Restart::InputLost { .. }) => {
                             super::super::journal::LINE_READ_UNDRAWN.to_string()
                         }
                         (None, _) => "the turn-end policy".to_string(),
@@ -4354,7 +4466,7 @@ impl<C: Ctl> Session<'_, C> {
             _ => {
                 self.restart_waits = 0;
                 self.restart_run = None;
-                if matches!(why, Restart::InputLost) {
+                if matches!(why, Restart::InputLost { .. }) {
                     // Refused or not answered: the loss waits from here, never asked again
                     // (`Self::custody_lost`).
                     self.input_lost.unmade(step.as_deref());
@@ -4473,7 +4585,8 @@ impl<C: Ctl> Session<'_, C> {
         held.unwrap_or(otherwise)
     }
 
-    /// A restart that must wait ([`TurnEndTiming::restart_backoff`]).
+    /// A restart that must wait ([`TurnEndTiming::restart_backoff`]); the restart of a line held
+    /// ([`Restart::InputLost`]) stands asked meanwhile ([`custody::Restarts::deferred`]).
     fn restart_later(
         &mut self,
         seq: u64,
@@ -4489,6 +4602,11 @@ impl<C: Ctl> Session<'_, C> {
         let mut until = now + pause;
         if let Some(at) = cut_at.filter(|&at| at > now) {
             until = until.min(at);
+        }
+        if matches!(why, Restart::InputLost { .. }) {
+            // The line's restart stands asked: spent should the line settle before it is made
+            // (`custody::Restarts::settled`), as the host may have made it unseen.
+            self.input_lost.deferred();
         }
         let why = format!("restart:{} waits: {step}", why.word());
         if restart_note_due(self.restart_waits.saturating_sub(1)) {
@@ -4736,6 +4854,11 @@ impl<C: Ctl> Session<'_, C> {
             .as_ref()
             .map(|h| (h.agent_pid(), h.agent_started()));
         let line = custody::Line::formed(text, human, word.as_deref(), noted, process, now);
+        let ask = custody::LineAsk {
+            at_ms: self.now_unix_ms(),
+            nth: self.lines_held,
+        };
+        self.lines_held = self.lines_held.saturating_add(1);
         let word = word.unwrap_or_else(|| "-".to_string());
         review.note(&format!(
             "SKIPPED seq={} rule={rule} typed, not submitted ({why}): `{}`; {} (input={word})",
@@ -4747,6 +4870,7 @@ impl<C: Ctl> Session<'_, C> {
             line,
             by: OwnBy::Line,
             rule: rule.to_string(),
+            ask,
         });
         self.custody_rearm();
         Ok(())
@@ -4861,11 +4985,12 @@ impl<C: Ctl> Session<'_, C> {
     /// The line held in [`Custody`] settled at content seq `seq`, as `settles` says: one `NOTE`
     /// ([`super::super::journal::LINE_SETTLED`]), and no write holds on it from here. Where its
     /// program ended, no draw of it comes: the line left and the loop's own line of its text go
-    /// with it.
+    /// with it. A restart that stood asked for it is spent ([`custody::Restarts::settled`]).
     pub(super) fn custody_ended(&mut self, seq: u64, settles: Settles, review: &mut dyn Review) {
         let Some(c) = self.custody.take() else {
             return;
         };
+        self.input_lost.settled();
         if settles == Settles::Ended {
             if self.left_line.as_ref().is_some_and(|l| c.is(&l.text)) {
                 self.left_line = None;
@@ -5023,11 +5148,16 @@ impl<C: Ctl> Session<'_, C> {
     /// ([`custody::Line::ended`]): the host names another agent process than the one at the write
     /// (`IdleHost::agent_pid`). The host is asked whether a line is held or not.
     fn custody_process_ended(&self) -> bool {
-        let process = self
-            .stall_host
-            .as_ref()
-            .map(|h| (h.agent_pid(), h.agent_started()));
+        let process = self.host_process();
         self.custody.as_ref().is_some_and(|c| c.line.ended(process))
+    }
+
+    /// The agent's process as the host names it now (`IdleHost::agent_pid`,
+    /// `IdleHost::agent_started`; `None`: no host).
+    fn host_process(&self) -> Option<custody::Process> {
+        self.stall_host
+            .as_ref()
+            .map(|h| (h.agent_pid(), h.agent_started()))
     }
 
     /// WHETHER A LINE HELD IN [`Custody`] HOLDS `action`'s WRITE AT `point` (`rule`, the act's),
@@ -5141,21 +5271,32 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// WHAT THE READ `fresh` OF A LINE HELD IN [`Custody`] SAYS OF REST, for the core's judgment
-    /// ([`custody::Rest`]): an idle phase its reader stands by (no turn running), a composer drawn
-    /// with no typed text, no dialog and no frame torn mid-redraw, no hold on the session, the
-    /// session's word Cruise or Land, the person's grace past, and no background call of the
-    /// agent's standing that the host reads (`IdleHost::background_jobs`, which names one making
-    /// no progress). The composer's text is read only where the rest is drawn, and the host is
-    /// asked of its background calls only where everything else is at rest
-    /// ([`custody::Rest::asks_jobs`]).
+    /// ([`custody::Rest`]): a turn's end its reader stands by, of every phase the policy writes a
+    /// line at (idle, a question, a limit's notice, as a point is decided at:
+    /// [`super::super::policy::turn_end::turn_ended`]), so a line lost at a question or after a
+    /// limit's reset is judged as one lost at an idle point; none of the agent's own work running
+    /// under it as the read names it (`ScreenReader::work_running`: for Claude Code the work it
+    /// runs in its own process, `aterm_phase::phase::in_process_work`, which no process row names,
+    /// and a shell or a monitor the turn left running, never a workflow's progress row, which
+    /// outlives its workflow), since a restart in place would end it: a question asked over a
+    /// monitor, or a limit's notice drawn over a background agent, reads as its phase and is no
+    /// rest while the work runs, and the relaunch reads the same screen again before its signal
+    /// (`relaunch::restart_as`); a composer drawn with no typed text, no dialog and no frame torn
+    /// mid-redraw; no hold on the session, the session's word Cruise or Land, the person's grace
+    /// past, and no background call of the agent's standing that the host reads
+    /// (`IdleHost::background_jobs`, which names one making no progress). Every part the screen
+    /// says is read off the one read `fresh`. The composer's text is read only where the turn's
+    /// end is drawn, and the host is asked of its background calls only where everything else is
+    /// at rest ([`custody::Rest::asks_jobs`]).
     fn custody_at_rest(&mut self, fresh: &Turn, opts: &SuperviseOpts) -> custody::Rest {
         let rows = &fresh.screen.rows;
         let reader = self.reader(rows);
-        let idle = fresh.phase == Phase::Idle
+        let turn_ended = super::super::policy::turn_end::turn_ended(&fresh.phase)
             && reader.phase_authoritative(rows, &fresh.phase)
             && reader.composer(rows).is_some()
             && reader.prompt(rows).is_none()
             && !reader.frame_torn(rows);
+        let working = reader.work_running(rows).is_some();
         let Some(text) = self.custody.as_ref().map(|c| c.line.text().to_string()) else {
             return custody::Rest::default();
         };
@@ -5166,9 +5307,11 @@ impl<C: Ctl> Session<'_, C> {
             .into_iter()
             .chain(fresh.screen.human.ago())
             .min();
-        let clear = idle && self.left_stands(&fresh.screen, &text) == Some(LeftStands::Nothing);
+        let clear =
+            turn_ended && self.left_stands(&fresh.screen, &text) == Some(LeftStands::Nothing);
         let mut rest = custody::Rest {
-            idle,
+            turn_ended,
+            working,
             clear,
             halted: self.halted,
             autopilot: self.autopilot(opts) != Autopilot::Off,
@@ -5188,14 +5331,16 @@ impl<C: Ctl> Session<'_, C> {
     /// THE LINE HELD IN [`Custody`] IS LOST ([`CustodyGate::Lost`]): the worker read it and drew
     /// none of it a minute on, at rest. The core decides what it comes to
     /// ([`custody::Line::lose`]): the first time since the last act submitted, a restart in place
-    /// ([`Restart::InputLost`], as a memory restart's: [`Self::restart_agent`]), its `NOTE`
-    /// written once; where none can be made (relaunch off, no host, a host that makes none for
-    /// this program, asked only where nothing else already says none: each its own `WAITING`
-    /// words) a doubling wait that writes nothing, its step the next of the line's waits in a
-    /// row. A host's deferral (`wait:…`) is asked again as the restart's back-off says, its
-    /// records the restart's own, thinned ([`restart_note_due`]); a refusal or no answer is asked
-    /// once ([`custody::LostRestart::Unmade`]), and a loss after a restart made
-    /// ([`custody::LostRestart::Made`]) is never restarted again: both wait, as a repeated
+    /// of the process the line was written to ([`Restart::InputLost`], as a memory restart's:
+    /// [`Self::restart_agent`]), its `NOTE` written once; where none can be made (relaunch off,
+    /// no host, a host that makes none for this program, asked only where nothing else already
+    /// says none: each its own `WAITING` words) a doubling wait that writes nothing, its step the
+    /// next of the line's waits in a row. A host's deferral (`wait:…`), and its success word while
+    /// the line's own process is named after it, are asked again as the restart's back-off says,
+    /// their records the restart's own, thinned ([`restart_note_due`]); a refusal or no answer is
+    /// asked once ([`custody::LostRestart::Unmade`]), and a loss after a restart made
+    /// ([`custody::LostRestart::Made`]), or after a line settled while its restart stood asked
+    /// ([`custody::LostRestart::Unseen`]), is never restarted again: each waits, as a repeated
     /// failure calls for a different approach. A line that waits so is lost for good to the loop
     /// ([`custody::Line::is_lost`]), which tells the host so ([`LineHeld::Lost`]): its upgrade,
     /// whose move ends the process, may go.
@@ -5228,6 +5373,12 @@ impl<C: Ctl> Session<'_, C> {
             return Ok(());
         };
         let loss = c.line.lose(&self.input_lost, &lane, now);
+        // The restart in place for this line, of the process it was written to, asked for this
+        // line at its every ask.
+        let asked = Restart::InputLost {
+            of: c.line.process(),
+            line: c.ask,
+        };
         let undrawn = super::super::journal::LINE_READ_UNDRAWN;
         let unmade = super::super::journal::LINE_RESTART_UNMADE;
         let (until, no_restart) = match &loss {
@@ -5263,8 +5414,8 @@ impl<C: Ctl> Session<'_, C> {
             }
             custody::Loss::Restart { first, .. } => {
                 // One record of the restart asked for the line, however often a host's deferral
-                // has it asked again: each ask's own records are the restart's (`HOST`,
-                // `WAITING`), thinned.
+                // has it asked again and whatever holds' records come between the asks: each
+                // ask's own records are the restart's (`HOST`, `WAITING`), thinned.
                 if first {
                     review.note(&format!(
                         "NOTE seq={seq} rule={rule} {undrawn} {read_s} s on (input=clear, at \
@@ -5278,7 +5429,7 @@ impl<C: Ctl> Session<'_, C> {
                 };
                 self.restart_agent(
                     point,
-                    &Restart::InputLost,
+                    &asked,
                     RULE_INPUT_LOST,
                     otherwise,
                     opts,
@@ -6977,5 +7128,31 @@ pub(super) fn journaled_relaunch(
     JournaledRelaunch {
         made: made.map(|ms: i64| ms.div_euclid(1000)),
         waiting: run.map(|ms| ms.div_euclid(1000)),
+    }
+}
+
+#[cfg(test)]
+mod left_line_tests {
+    use super::*;
+
+    /// WENT TAKES A COUNT THAT STOOD STILL: a host with no key count at all says nothing of who
+    /// cleared the composer, though "no count" equals "no count".
+    #[test]
+    fn a_line_goes_only_on_a_count_that_held() {
+        let line = |stands, human| LeftLine {
+            text: String::new(),
+            point_key: String::new(),
+            stands,
+            human,
+        };
+        let on = |human_seq| Screen {
+            human_seq,
+            ..Screen::default()
+        };
+        assert!(line(LeftStands::Whole, Some(3)).went(&on(Some(3))));
+        assert!(line(LeftStands::Part, Some(3)).went(&on(Some(3))));
+        assert!(!line(LeftStands::Whole, Some(3)).went(&on(Some(4))));
+        assert!(!line(LeftStands::Nothing, Some(3)).went(&on(Some(3))));
+        assert!(!line(LeftStands::Whole, None).went(&on(None)));
     }
 }

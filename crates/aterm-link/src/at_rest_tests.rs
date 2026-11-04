@@ -595,37 +595,134 @@ fn a_retired_log_keeps_the_key_it_was_refused_with() {
     assert_ne!(std::fs::read(s.key()).expect("new"), OTHER);
 }
 
-/// A log that opens is not given up, and neither is one a broker holds; both stay as they were.
+/// A log that opens is not given up, and neither is one a broker holds: every file beside each is
+/// byte for byte as it was, `<log>.id` included, as the refusal says, because the retire asks
+/// astream's open check, which writes nothing (`broker.check-open`). NEGATIVE CONTROL: the probe
+/// the retire made before it, an open closed at once, rewrites `<log>.id` on the same logs.
 #[test]
 fn a_log_that_opens_or_is_held_is_not_retired() {
+    use astream_broker::BrokerLog;
     let s = sealed();
     let identity = {
-        let log = astream_broker::BrokerLog::open_encrypted_bound(s.log(), KEY).expect("opens");
+        let log = BrokerLog::open_encrypted_bound(s.log(), KEY).expect("opens");
         log.identity().to_string()
     };
-    let before = s.but_for_the_last_run();
+    let before = s.snapshot();
     let why = retire(&s.log(), Backups::INERT).expect_err("it opens");
     assert!(why.contains("nothing to give up"), "{why}");
-    assert_eq!(s.but_for_the_last_run(), before);
-    let log = astream_broker::BrokerLog::open_encrypted_bound(s.log(), KEY).expect("opens");
+    assert_eq!(s.snapshot(), before, "every file as it was, `.id` included");
+    let mut log = BrokerLog::open_encrypted_bound(s.log(), KEY).expect("opens");
     assert_eq!(log.identity().to_string(), identity, "the same log");
+    log.close_clean().expect("closed");
     drop(log);
+    assert_ne!(
+        s.snapshot(),
+        before,
+        "NEGATIVE CONTROL: an open closed at once rewrites `.id`"
+    );
 
     let plain = Scratch::new();
     plain.fill(None, 1);
+    let before = plain.snapshot();
     let why = retire(&plain.log(), Backups::INERT).expect_err("it opens");
     assert!(why.contains("nothing to give up"), "{why}");
+    assert_eq!(
+        plain.snapshot(),
+        before,
+        "every file as it was, `.id` included"
+    );
 
     let holder =
         durability::open(&plain.log(), None, Durability::Ordered, Some([7; 16])).expect("open");
+    let before = plain.snapshot();
     let why = retire(&plain.log(), Backups::INERT).expect_err("held");
     assert!(why.contains("held by a running broker"), "{why}");
+    assert_eq!(plain.snapshot(), before, "a held log as it was");
     drop(holder);
+
+    let before = plain.snapshot();
+    let mut log =
+        BrokerLog::open_with(plain.log(), astream_broker::Durability::Strict).expect("opens");
+    log.close_clean().expect("closed");
+    drop(log);
+    assert_ne!(
+        plain.snapshot(),
+        before,
+        "NEGATIVE CONTROL: an open closed at once rewrites `.id`"
+    );
 
     let none = Scratch::new();
     let why = retire(&none.log(), Backups::INERT).expect_err("no log");
     assert!(why.contains("bus.log"), "{why}");
     assert!(!none.key().exists());
+}
+
+/// A LOG A CRASH LEFT MID-SEAL IS KEPT FOR A START: a seal's switch a crash stopped after its
+/// marker is finished by the next open before it reads the log, so whether the log opens is not
+/// known yet, and the retire refuses it, naming the step, with every file as it was. CONTROL: a
+/// start finishes the switch (its seal finds the log sealed), and the retire then refuses the
+/// sealed log as one that opens.
+#[test]
+fn a_log_a_crash_left_mid_seal_is_kept_for_a_start() {
+    let s = Scratch::new();
+    s.fill(None, 3);
+    s.plant_key(&KEY);
+    astream_broker::BrokerLog::seal_plaintext_stopped_at_its_switch(s.log(), KEY)
+        .expect("stopped at its switch");
+    let before = s.snapshot();
+    assert!(
+        before.iter().any(|(name, _)| name == "bus.log.sealmove"),
+        "a switch to finish: {:?}",
+        before.iter().map(|(name, _)| name).collect::<Vec<_>>()
+    );
+    let why = retire(&s.log(), Backups::INERT).expect_err("a start finishes the switch first");
+    assert!(
+        why.contains("an offline seal's switch a crash stopped"),
+        "{why}"
+    );
+    assert!(why.contains("start the broker"), "{why}");
+    assert_eq!(s.snapshot(), before, "every file as it was");
+
+    let prepared = prepare(&s.log(), Backups::INERT).expect("CONTROL: a start");
+    assert_eq!(
+        prepared.key.as_ref().map(Key::bytes),
+        Some(KEY),
+        "the log is served under its key"
+    );
+    assert!(is_sealed(&s.log()), "the start finished the switch");
+    let why = retire(&s.log(), Backups::INERT).expect_err("it opens");
+    assert!(why.contains("nothing to give up"), "{why}");
+}
+
+/// A LOG NO START COULD OPEN FOR WRITING IS GIVEN UP, as one that does not open: a start opens the
+/// log read-write, and so does astream's open check, so a log at mode 0400 is refused there as the
+/// start refuses it, and the retire moves it aside. While the check opened the log read-only this
+/// failed: the retire refused it, "opens as it stands, so there is nothing to give up". CONTROL: a
+/// Strict open refuses it, `PermissionDenied`. Root writes past a mode, so as root the log opens
+/// and is refused.
+#[test]
+fn a_log_no_start_could_open_for_writing_is_retired() {
+    let s = Scratch::new();
+    s.fill(None, 1);
+    std::fs::set_permissions(s.log(), std::fs::Permissions::from_mode(0o400)).expect("0400");
+    if astream_sys::euid() == 0 {
+        let why = retire(&s.log(), Backups::INERT).expect_err("root opens it");
+        assert!(why.contains("nothing to give up"), "{why}");
+        return;
+    }
+    let Err(refused) =
+        astream_broker::BrokerLog::open_with(s.log(), astream_broker::Durability::Strict)
+    else {
+        panic!("CONTROL: a start opened a log at 0400 for writing");
+    };
+    assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{refused}");
+    let retired = retire(&s.log(), Backups::INERT).expect("a log no start can open is given up");
+    assert!(
+        retired.moved.iter().any(|name| name == "bus.log"),
+        "{:?}",
+        retired.moved
+    );
+    assert!(!s.log().exists(), "the next start begins a new log");
 }
 
 /// A log's rules, by aterm's shape and small enough for a tick to cut: the bulk stream by its

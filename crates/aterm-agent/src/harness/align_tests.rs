@@ -214,10 +214,10 @@ const ESCAPE_STAGE: &str = "ATERM_ALIGN_ESCAPE_STAGE";
 /// The escape test's capture ([`escaped_holder_stage`]).
 #[cfg(unix)]
 fn escaped_pipe_command(done: &Path, exited: &Path, escaped: &Path) -> Command {
-    let mut cmd = Command::new(std::env::current_exe().expect("the test binary"));
+    let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().expect("the test binary"));
     cmd.args([
         "--exact",
-        "harness::align::tests::escaped_holder_stage",
+        "harness::align::tests::escaped_descendant_holding_stdout_cannot_retain_a_reader_thread",
         "--nocapture",
         "--test-threads=1",
         "--quiet",
@@ -244,12 +244,8 @@ fn settle_until(observed: &CaptureLifecycleObservation, ready: impl Fn() -> bool
 }
 
 #[cfg(unix)]
-#[test]
-fn escaped_holder_stage() {
+fn escaped_holder_stage() -> ! {
     use std::os::unix::ffi::OsStrExt as _;
-    if std::env::var_os(ESCAPE_STAGE).is_none() {
-        return;
-    }
     let path = |var: &str| {
         let path = std::env::var_os(var).expect("the staged paths");
         std::ffi::CString::new(path.as_bytes()).expect("a path with no NUL")
@@ -416,6 +412,9 @@ fn assert_capture_return_conforms(
 #[cfg(unix)]
 #[test]
 fn escaped_descendant_holding_stdout_cannot_retain_a_reader_thread() {
+    if std::env::var_os(ESCAPE_STAGE).is_some() {
+        escaped_holder_stage();
+    }
     let tmp = temp_dir("escaped-stdout");
     let done = tmp.path().join("done");
     let exited = tmp.path().join("exited");

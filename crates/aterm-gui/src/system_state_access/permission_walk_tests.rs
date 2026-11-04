@@ -17,6 +17,7 @@ use crate::permission_walk::{
     GRANT_POLL, REOPEN_MARKER, Started, Subject, UNREAD_WAIT, Walk, WalkLane, WalkReach,
     leave_reopen_in, take_reopen_in,
 };
+use crate::system_state_access::LOCAL_NETWORK_ALERT_BASELINE_WAIT;
 use aterm_containment::DevToolGrant;
 use aterm_containment::consent::FdaState;
 
@@ -837,6 +838,446 @@ fn the_walk_says_it_goes_before_local_network_only_when_it_starts() {
             .all(|line| !line.contains("the walk goes first")),
         "{said:?}"
     );
+}
+
+thread_local! {
+    /// What the Local Network step did with its alert watch, in order: `start <revision>`, `arm`
+    /// and `cancel` (`StepsReach::start_local_network_alert_watch`, `…arm…`, `…cancel…`), and its
+    /// `trigger`.
+    static ALERT_WATCH: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Whether the alert watch's first read is in
+    /// (`StepsReach::local_network_alert_baseline_in`).
+    static BASELINE_IN: Cell<bool> = const { Cell::new(true) };
+    /// The answer the alert watch left for the window
+    /// (`StepsReach::take_local_network_alert_answer`).
+    static ALERT_ANSWER: Cell<Option<u64>> = const { Cell::new(None) };
+    /// How many times the LAN readers were told Local Network's answer moved.
+    static LAN_MOVED: Cell<u32> = const { Cell::new(0) };
+}
+
+fn watch_did(what: impl Into<String>) {
+    ALERT_WATCH.with(|did| did.borrow_mut().push(what.into()));
+}
+
+fn watch_calls() -> Vec<String> {
+    ALERT_WATCH.with(|did| did.borrow().clone())
+}
+
+fn lan_moved() -> u32 {
+    LAN_MOVED.with(Cell::get)
+}
+
+/// The access record's Local Network lines this thread's steps wrote.
+fn local_network_records() -> Vec<(u64, Access, AccessOutcome)> {
+    records()
+        .into_iter()
+        .filter(|(_, access, _)| *access == Access::LocalNetwork)
+        .collect()
+}
+
+/// A first launch on a fresh Mac at revision 1, which the person's own Turn On macOS Access…
+/// press admitted (`App::person_asked_for_access`), so the first walk may start by itself, whose
+/// Local Network step's quiet moment has come, the person at System State with the keyboard at
+/// rest: the step's alert watch is a recorder ([`ALERT_WATCH`]) whose first read is in while
+/// [`BASELINE_IN`] says so (at once, unless the test says otherwise) and whose answer the test
+/// leaves in [`ALERT_ANSWER`], its trigger names a LAN when `lan` says so, and the LAN readers'
+/// looks are counted. A touch reads within any span of 5 s or more, so the alert's hold counts
+/// the person's time from the first look 5 s after its trigger. Nothing runs on another thread.
+fn watched(lan: bool) -> App {
+    STEPS_QUIET.with(|quiet| quiet.set(true));
+    LAN_PROBE.with(|probe| probe.set(None));
+    ALERT_ANSWER.with(|answer| answer.set(None));
+    BASELINE_IN.with(|baseline| baseline.set(true));
+    ALERT_WATCH.with(|did| did.borrow_mut().clear());
+    LAN_MOVED.with(|moved| moved.set(0));
+    let mut app = walk_app();
+    app.access_steps.set_reach(StepsReach {
+        recorded: |_, _| None,
+        quiet: |_, _| STEPS_QUIET.with(Cell::get),
+        take_local_network_probe: || LAN_PROBE.with(Cell::take),
+        trigger_local_network: if lan {
+            || {
+                watch_did("trigger");
+                true
+            }
+        } else {
+            || {
+                watch_did("trigger");
+                false
+            }
+        },
+        start_local_network_alert_watch: |revision| {
+            watch_did(format!("start {revision}"));
+            true
+        },
+        local_network_alert_baseline_in: || BASELINE_IN.with(Cell::get),
+        arm_local_network_alert_watch: || watch_did("arm"),
+        take_local_network_alert_answer: || ALERT_ANSWER.with(Cell::take),
+        cancel_local_network_alert_watch: || watch_did("cancel"),
+        lan_answer_moved: || LAN_MOVED.with(|moved| moved.set(moved.get() + 1)),
+        ..app.access_steps.reach
+    });
+    app.person_asked_for_access();
+    approve(&mut app, 1);
+    assert!(
+        app.person_permission_admission_stands(),
+        "precondition: the person's press admits the walk"
+    );
+    app.devtools_helper.note_cold_start();
+    app.user_input_recent = |within| within >= Duration::from_secs(5);
+    app
+}
+
+/// The pages of the walk under way, if one is.
+fn walk_pages(app: &App) -> Option<Vec<Subject>> {
+    app.permission_walk
+        .walk()
+        .map(|walk| walk.subjects().to_vec())
+}
+
+/// The Local Network alert watch's answer ends the alert's hold in the turn that drains it, long
+/// before the person's 30 s: the step starts the watch for its revision before its trigger, which
+/// arms it; the hold stands with no look of the window list armed on the main thread (the hold's
+/// own look, a `RECHECK_EVERY` while the person's time is not yet counted, is the steps' next
+/// deadline), and once the watch leaves its answer the window's gestures are down, the watch is
+/// stopped, the LAN readers look again, nothing more is recorded, and the first walk starts in
+/// that turn, its page with it. NEGATIVE CONTROL: with `App::on_local_network_alert_answered`
+/// draining the answer but leaving the hold (its `end_local_network_hold` taken out), the walk
+/// waits on; with the consent lanes' turn not draining the answer before the walk's look
+/// (`App::tick_consent_lanes`), the walk waits for a wake no test sends.
+#[test]
+fn the_alert_watchs_answer_ends_the_local_network_hold_in_the_turn_that_drains_it() {
+    use crate::devtools_helper::RECHECK_EVERY;
+    let walking = Some(vec![Subject::FullDiskAccess, Subject::DeveloperTools]);
+    let t0 = Instant::now();
+    let mut app = watched(true);
+    let fda_opens = test_arms::fda_counts().0;
+    app.tick_consent_lanes(t0);
+    assert_eq!(
+        watch_calls(),
+        ["start 1", "trigger", "arm"],
+        "the watch starts before the trigger, which arms it"
+    );
+    assert_eq!(
+        local_network_records(),
+        [(1, Access::LocalNetwork, AccessOutcome::Triggered)]
+    );
+    let moved = lan_moved();
+    assert!(app.access_gesture_up(t0), "its alert's hold stands");
+    assert_eq!(
+        app.next_access_step_deadline(t0),
+        Some(t0 + RECHECK_EVERY),
+        "no look of the window list is armed on the main thread"
+    );
+    let waiting = t0 + Duration::from_secs(1);
+    app.tick_consent_lanes(waiting);
+    assert!(app.access_gesture_up(waiting), "no answer: the hold stands");
+    assert_eq!(walk_pages(&app), None, "no page beside the alert");
+
+    let answered = t0 + Duration::from_secs(2);
+    ALERT_ANSWER.with(|answer| answer.set(Some(1)));
+    app.tick_consent_lanes(answered);
+    assert!(
+        !app.access_gesture_up_beside_walk(answered),
+        "the alert was answered: the hold is over"
+    );
+    assert_eq!(walk_pages(&app), walking, "the walk starts in that turn");
+    assert_eq!(
+        test_arms::fda_counts().0,
+        fda_opens + 1,
+        "its page comes up"
+    );
+    assert_eq!(lan_moved(), moved + 1, "the LAN readers look again");
+    assert_eq!(
+        watch_calls(),
+        ["start 1", "trigger", "arm", "cancel"],
+        "the watch is stopped"
+    );
+    assert_eq!(
+        local_network_records(),
+        [(1, Access::LocalNetwork, AccessOutcome::Triggered)],
+        "nothing more is recorded: the answer is not known"
+    );
+}
+
+/// With no answer from the alert watch (no alert seen after the trigger, the alert still up, or a
+/// window list it could not read), the Local Network alert's hold runs as on main: it ends once
+/// the person has been at the Mac 30 s counted from their first touch after the ask, and the walk
+/// starts as it ends; the hold's end stops the watch, once. An answer drained after that ends
+/// nothing more and moves no LAN reader. NEGATIVE CONTROL: with
+/// `AccessSteps::end_local_network_hold` not stopping the watch, no stop reaches it; with
+/// `App::on_local_network_alert_answered` not asking whether its watch's hold still stands (its
+/// `local_network_watch` and `local_network_alert` checks taken out), the answer after the hold's
+/// end moves the LAN readers again.
+#[test]
+fn with_no_answer_the_local_network_hold_runs_the_persons_30_s_and_stops_its_watch() {
+    let walking = Some(vec![Subject::FullDiskAccess, Subject::DeveloperTools]);
+    let t0 = Instant::now();
+    let mut app = watched(true);
+    app.tick_consent_lanes(t0);
+    let moved = lan_moved();
+    let touched = t0 + Duration::from_secs(5);
+    app.tick_consent_lanes(touched);
+    let last = touched + LOCAL_NETWORK_ALERT_HOLD - Duration::from_millis(1);
+    app.tick_consent_lanes(last);
+    assert!(
+        app.access_gesture_up(last),
+        "the hold stands until the person has had 30 s with the alert"
+    );
+    assert_eq!(walk_pages(&app), None, "no page beside the alert");
+    assert_eq!(
+        watch_calls(),
+        ["start 1", "trigger", "arm"],
+        "the watch goes on"
+    );
+
+    let over = touched + LOCAL_NETWORK_ALERT_HOLD;
+    app.tick_consent_lanes(over);
+    assert_eq!(
+        walk_pages(&app),
+        walking,
+        "the person's 30 s are up: the walk starts"
+    );
+    assert_eq!(
+        watch_calls(),
+        ["start 1", "trigger", "arm", "cancel"],
+        "the hold's end stops the watch"
+    );
+    ALERT_ANSWER.with(|answer| answer.set(Some(1)));
+    app.tick_consent_lanes(over + Duration::from_secs(1));
+    assert_eq!(
+        lan_moved(),
+        moved,
+        "an answer once the hold is over moves nothing"
+    );
+    assert_eq!(
+        watch_calls(),
+        ["start 1", "trigger", "arm", "cancel"],
+        "and stops nothing again"
+    );
+}
+
+/// An answer the alert watch leaves for a watch other than the one the hold's trigger started
+/// ends nothing: the hold stands. NEGATIVE CONTROL: with `App::on_local_network_alert_answered`
+/// not matching the answer's revision to the hold's watch, it ends the hold at once.
+#[test]
+fn an_answer_for_another_watch_does_not_end_the_local_network_hold() {
+    let t0 = Instant::now();
+    let mut app = watched(true);
+    app.tick_consent_lanes(t0);
+    let moved = lan_moved();
+    let later = t0 + Duration::from_secs(2);
+    ALERT_ANSWER.with(|answer| answer.set(Some(2)));
+    app.tick_consent_lanes(later);
+    assert!(app.access_gesture_up(later), "the hold stands");
+    assert_eq!(walk_pages(&app), None, "no page beside the alert");
+    assert_eq!(lan_moved(), moved, "no LAN reader moved");
+    assert_eq!(watch_calls(), ["start 1", "trigger", "arm"]);
+}
+
+/// A Local Network trigger that named no LAN asked nothing and takes no hold, so it stops the
+/// alert watch it started just before it. The LAN re-probe's heard answer, which ends a hold
+/// another way, stops that hold's watch too. NEGATIVE CONTROL: with the trigger's no-LAN arm not
+/// stopping the watch, it reads on; with `AccessSteps::end_local_network_hold` not stopping it,
+/// the re-probe's answer leaves it reading.
+#[test]
+fn a_hold_that_ends_without_the_alert_watch_stops_it() {
+    use crate::system_state_access::LocalNetworkProbe;
+    let t0 = Instant::now();
+    let mut app = watched(false);
+    app.tick_consent_lanes(t0);
+    assert_eq!(
+        watch_calls(),
+        ["start 1", "trigger", "cancel"],
+        "no LAN named: the watch it started is stopped, never armed"
+    );
+    assert!(
+        !app.access_steps.local_network_alert_up(),
+        "and no hold is taken"
+    );
+
+    let mut app = watched(true);
+    app.tick_consent_lanes(t0);
+    let heard = t0 + Duration::from_secs(3);
+    LAN_PROBE.with(|probe| probe.set(Some((1, LocalNetworkProbe::Refused))));
+    app.on_local_network_probe_ready(heard);
+    assert!(
+        !app.access_steps.local_network_alert_up(),
+        "the re-probe's answer ends the hold"
+    );
+    assert_eq!(
+        watch_calls(),
+        ["start 1", "trigger", "arm", "cancel"],
+        "and stops its watch"
+    );
+}
+
+/// The Local Network trigger waits for its alert watch's first read, so the baseline is read
+/// before the connect can raise the alert: at the step's moment the watch starts and the trigger
+/// does not go; meanwhile the alert counts as up for the window's gestures (the dialog slot stays
+/// held, the walk waits, nothing is recorded), the page's headline names no step, since no alert
+/// is up yet, and the wait's end is the steps' next deadline. Once the first read is in, the
+/// trigger goes in that turn, arms the watch and raises the hold from there, which the headline
+/// then names. NEGATIVE CONTROL: a step that triggers just after starting the watch, without
+/// waiting for its first read (`fire_local_network_trigger` in place of the wait), triggers at
+/// `t0`; a headline that reads the wait as an alert (`local_network_alert_up()` in place of
+/// `local_network_alert.is_some()`) names Local Network during the wait.
+#[test]
+fn the_local_network_trigger_waits_for_its_alert_watchs_first_read() {
+    let t0 = Instant::now();
+    let mut app = watched(true);
+    BASELINE_IN.with(|baseline| baseline.set(false));
+    app.tick_consent_lanes(t0);
+    assert_eq!(
+        watch_calls(),
+        ["start 1"],
+        "no trigger before the first read"
+    );
+    assert_eq!(local_network_records(), [], "nothing recorded yet");
+    assert!(
+        app.access_gesture_up(t0),
+        "the alert counts as up meanwhile"
+    );
+    assert_eq!(
+        app.system_state_access_step(),
+        None,
+        "no alert is up yet: the headline names no step"
+    );
+    assert_eq!(
+        app.next_access_step_deadline(t0),
+        Some(t0 + LOCAL_NETWORK_ALERT_BASELINE_WAIT),
+        "the wait's end"
+    );
+    let still = t0 + Duration::from_millis(400);
+    app.tick_consent_lanes(still);
+    assert_eq!(watch_calls(), ["start 1"], "still waiting");
+    assert_eq!(walk_pages(&app), None, "no page while the trigger waits");
+
+    let read = t0 + Duration::from_millis(500);
+    BASELINE_IN.with(|baseline| baseline.set(true));
+    app.tick_consent_lanes(read);
+    assert_eq!(
+        watch_calls(),
+        ["start 1", "trigger", "arm"],
+        "the first read is in: the trigger goes and arms the watch"
+    );
+    assert_eq!(
+        local_network_records(),
+        [(1, Access::LocalNetwork, AccessOutcome::Triggered)]
+    );
+    assert_eq!(
+        app.access_steps
+            .local_network_alert
+            .map(|alert| alert.asked),
+        Some(read),
+        "the hold runs from the trigger"
+    );
+    assert_eq!(
+        app.system_state_access_step(),
+        Some(Access::LocalNetwork),
+        "the alert is up: the headline names it"
+    );
+}
+
+/// A first read that does not come back within `LOCAL_NETWORK_ALERT_BASELINE_WAIT` (a
+/// WindowServer that holds the worker's read) lets the trigger go without the watch: the watch is
+/// stopped, never armed, and the hold ends only by the re-probe's answer or the person's time,
+/// which an answer left later does not change. NEGATIVE CONTROL: a wait with no end of its own
+/// (its `now < by` taken out) never triggers.
+#[test]
+fn a_first_read_that_does_not_come_back_lets_the_trigger_go_without_the_watch() {
+    let t0 = Instant::now();
+    let mut app = watched(true);
+    BASELINE_IN.with(|baseline| baseline.set(false));
+    app.tick_consent_lanes(t0);
+    let gave_up = t0 + LOCAL_NETWORK_ALERT_BASELINE_WAIT;
+    app.tick_consent_lanes(gave_up);
+    assert_eq!(
+        watch_calls(),
+        ["start 1", "cancel", "trigger"],
+        "the watch is stopped and the trigger goes, unarmed"
+    );
+    assert_eq!(
+        local_network_records(),
+        [(1, Access::LocalNetwork, AccessOutcome::Triggered)]
+    );
+    let later = gave_up + Duration::from_secs(2);
+    ALERT_ANSWER.with(|answer| answer.set(Some(1)));
+    app.tick_consent_lanes(later);
+    assert!(app.access_gesture_up(later), "the hold stands");
+}
+
+/// A trigger waiting for its watch's first read is dropped when the swarm is switched off: the
+/// watch is stopped, no alert counts as up, a network move told before it stays told, and the
+/// step, which never asked, is not done, so it runs again at its next moment once the swarm is
+/// back on. A wait whose approved revision gives way to another, or whose `[privacy]` switch
+/// goes off, is dropped the same way, and the step asks for the revision that stands. NEGATIVE
+/// CONTROL: with `AccessSteps::end_local_network_hold` leaving `local_network_done` as it was,
+/// the step reads done and never starts again; with the step spending the network move as it
+/// starts the watch, not as the trigger goes, the dropped wait spent it; with
+/// `App::local_network_trigger_waits` not reading the `[privacy]` switches, the wait goes on
+/// and triggers.
+#[test]
+fn a_trigger_waiting_for_its_first_read_is_dropped_when_the_swarm_goes_off() {
+    use std::sync::atomic::Ordering;
+    let t0 = Instant::now();
+    let mut app = watched(true);
+    BASELINE_IN.with(|baseline| baseline.set(false));
+    app.access_steps
+        .network_moved
+        .store(true, Ordering::Release);
+    app.tick_consent_lanes(t0);
+    assert_eq!(watch_calls(), ["start 1"]);
+    let swarm = app.config.swarm.take();
+    app.config.swarm = Some(crate::app_config::SwarmConfig {
+        enabled: Some(false),
+    });
+    let off = t0 + Duration::from_millis(200);
+    app.tick_consent_lanes(off);
+    assert_eq!(watch_calls(), ["start 1", "cancel"], "the watch is stopped");
+    assert!(
+        !app.access_steps.local_network_alert_up(),
+        "no alert counts as up"
+    );
+    assert!(
+        app.access_steps.network_moved.load(Ordering::Acquire),
+        "the move told before the wait stays told"
+    );
+    assert_eq!(local_network_records(), [], "nothing was asked");
+    app.config.swarm = swarm;
+    let on = off + Duration::from_millis(200);
+    app.tick_consent_lanes(on);
+    assert_eq!(
+        watch_calls(),
+        ["start 1", "cancel", "start 1"],
+        "the step runs again"
+    );
+
+    let other = on + Duration::from_millis(200);
+    app.person_asked_for_access();
+    approve(&mut app, 2);
+    app.tick_consent_lanes(other);
+    assert_eq!(
+        watch_calls(),
+        ["start 1", "cancel", "start 1", "cancel", "start 2"],
+        "another revision: the wait is dropped and the step asks for that one"
+    );
+
+    let switched = other + Duration::from_millis(200);
+    if let Some(privacy) = app.config.privacy.as_mut() {
+        privacy.notice = Some(false);
+    }
+    BASELINE_IN.with(|baseline| baseline.set(true));
+    app.tick_consent_lanes(switched);
+    assert_eq!(
+        watch_calls(),
+        [
+            "start 1", "cancel", "start 1", "cancel", "start 2", "cancel"
+        ],
+        "a [privacy] switch off: the wait is dropped, and nothing triggers"
+    );
+    assert_eq!(local_network_records(), [], "nothing was asked");
 }
 
 /// `aterm doctor`'s Developer Tools hand-over is `permissions walk now devtools`: once

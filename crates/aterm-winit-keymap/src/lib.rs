@@ -383,7 +383,11 @@ mod tests {
             ),
             Some(Key::Named(NamedKey::NumpadEnd))
         );
-        for centre in [unidentified(), WinitKey::Named(WinitNamed::Clear)] {
+        for centre in [
+            unidentified(),
+            WinitKey::Dead(None),
+            WinitKey::Named(WinitNamed::Clear),
+        ] {
             assert_eq!(
                 map_numpad_key(
                     PhysicalKey::Code(KeyCode::Numpad5),
@@ -435,6 +439,17 @@ mod tests {
             ),
             None
         );
+        for non_begin in [ch(""), ch("55"), ch("a"), WinitKey::Named(WinitNamed::Tab)] {
+            assert_eq!(
+                map_numpad_key(
+                    PhysicalKey::Code(KeyCode::Numpad5),
+                    &non_begin,
+                    KeyLocation::Numpad
+                ),
+                None,
+                "{non_begin:?} on physical Numpad5 must not become NumpadBegin"
+            );
+        }
         assert_eq!(
             map_numpad_key(
                 PhysicalKey::Code(KeyCode::Numpad1),
@@ -463,20 +478,30 @@ mod tests {
             ),
             None
         );
-        assert_eq!(
-            map_numpad_key(
-                PhysicalKey::Code(KeyCode::Numpad5),
-                &ch("5"),
-                KeyLocation::Standard
-            ),
-            None
-        );
+        for loc in [KeyLocation::Standard, KeyLocation::Left, KeyLocation::Right] {
+            assert_eq!(
+                map_numpad_key(PhysicalKey::Code(KeyCode::Numpad5), &ch("5"), loc),
+                None
+            );
+            assert_eq!(
+                map_numpad_key(PhysicalKey::Code(KeyCode::Numpad5), &unidentified(), loc),
+                None
+            );
+        }
     }
 
     #[test]
     fn character_logical_key_maps_through() {
         assert_eq!(map_logical_key(&ch("a")), Some(Key::Character('a')));
-        assert_eq!(map_logical_key(&ch("ab")), None);
+        for rejected in [
+            ch(""),
+            ch("ab"),
+            ch("e\u{0301}"),
+            WinitKey::Dead(None),
+            unidentified(),
+        ] {
+            assert_eq!(map_logical_key(&rejected), None, "{rejected:?}");
+        }
     }
 
     #[test]
@@ -574,5 +599,11 @@ mod tests {
         for other in [KeyCode::KeyA, KeyCode::CapsLock, KeyCode::Meta, KeyCode::Fn] {
             assert_eq!(physical_modifier_twin(PhysicalKey::Code(other)), None);
         }
+        assert_eq!(
+            physical_modifier_twin(PhysicalKey::Unidentified(
+                aterm_window::keyboard::NativeKeyCode::Unidentified
+            )),
+            None
+        );
     }
 }

@@ -270,6 +270,7 @@ fn claim(dir: &std::path::Path) -> (Ledger, super::super::Held) {
         claim,
         key: key(),
         own: None,
+        cohort: false,
     };
     (ledger, held)
 }

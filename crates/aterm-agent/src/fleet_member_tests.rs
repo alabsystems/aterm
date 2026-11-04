@@ -4356,10 +4356,9 @@ fn a_leave_names_each_tab_this_machine_holds_on_another_mac() {
         ..Opts::default()
     };
     ok(join(&member.places, &opts, &code));
-    drop(serving);
+    let listener = serving.take();
     let node = member::node_id(&member.places.state).unwrap();
     let sid = "s-0123456789abcdef0123";
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
     let _holding = Listener::with_rows(
         listener,
         &issuer.places.state,

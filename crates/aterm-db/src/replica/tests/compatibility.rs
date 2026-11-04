@@ -579,6 +579,7 @@ fn quiet_rounds(measured: u32, catalog: bool) {
     let peer = pair.lab.bootstrap(1);
     let request = peer.request().unwrap();
     let witness = peer.log_witness().unwrap().expect("a log-backed peer");
+    let witness = aterm_secrets::membership_log::encode_records(witness.records());
     let check = |logs: &crate::control::WitnessLogs| {
         logs.check(peer.trust(), &request, &witness).unwrap();
     };

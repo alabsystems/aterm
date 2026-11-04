@@ -560,7 +560,9 @@ fn guid_of_volume_path(path: &[u16]) -> Option<String> {
     text.get(..HEAD.len())
         .filter(|head| head.eq_ignore_ascii_case(HEAD))?;
     let guid = text.get(HEAD.len() - 1..HEAD.len() + 37)?;
+    let tail = text.get(HEAD.len() + 37..)?;
     let shaped = guid.ends_with('}')
+        && (tail.is_empty() || tail.starts_with('\\'))
         && guid[1..37].char_indices().all(|(i, c)| {
             if [8, 13, 18, 23].contains(&i) {
                 c == '-'
@@ -987,8 +989,14 @@ fn is_volume_root(fd: BorrowedHandle<'_>) -> Result<bool> {
     let bytes: Vec<u8> = buf.iter().flat_map(|word| word.to_ne_bytes()).collect();
     let name_at = offset_of!(ffi::FILE_NAME_INFO, FileName);
     let name_len = u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    if !name_len.is_multiple_of(2) {
+        return Err(Errno(ffi::ERROR_INVALID_DATA));
+    }
+    let name_end = name_at
+        .checked_add(name_len)
+        .ok_or(Errno(ffi::ERROR_INVALID_DATA))?;
     let name: Vec<u16> = bytes
-        .get(name_at..name_at + name_len)
+        .get(name_at..name_end)
         .ok_or(Errno(ffi::ERROR_INVALID_DATA))?
         .chunks_exact(2)
         .map(|pair| u16::from_ne_bytes([pair[0], pair[1]]))
@@ -1143,9 +1151,15 @@ fn mounts_volume(fd: BorrowedHandle<'_>, kind: FileType) -> Result<bool> {
         ffi::MOUNT_POINT_REPARSE_HEADER,
         SubstituteNameLength
     ))?;
-    let start = size_of::<ffi::MOUNT_POINT_REPARSE_HEADER>() + offset;
+    if !length.is_multiple_of(2) {
+        return Err(invalid);
+    }
+    let start = size_of::<ffi::MOUNT_POINT_REPARSE_HEADER>()
+        .checked_add(offset)
+        .ok_or(invalid)?;
+    let end = start.checked_add(length).ok_or(invalid)?;
     let target: Vec<u16> = bytes
-        .get(start..start + length)
+        .get(start..end)
         .ok_or(invalid)?
         .chunks_exact(2)
         .map(|pair| u16::from_ne_bytes([pair[0], pair[1]]))
@@ -1404,6 +1418,9 @@ impl Dir {
         let size = i64_at(offset_of!(E, EndOfFile))?;
         let allocation = i64_at(offset_of!(E, AllocationSize))?;
         let next = u32_at(offset_of!(E, NextEntryOffset))? as usize;
+        if !(name_len as usize).is_multiple_of(2) {
+            return Err(bad());
+        }
         let name: Vec<u16> = field(name_at, name_len as usize)?
             .chunks_exact(2)
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))

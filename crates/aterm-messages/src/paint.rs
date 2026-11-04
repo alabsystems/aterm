@@ -91,11 +91,17 @@ impl MeterSpan {
     }
 }
 
-/// Width in pixels of a pastel fill's darker edge line for cell width `cell_w`.
+/// Width in pixels of a pastel fill's darker edge line for cell width `cell_w`:
+/// an eighth of the cell, rounded half up, and at least one pixel.
 #[inline]
 #[must_use]
 pub(crate) const fn edge_line_px(cell_w: usize) -> usize {
-    let w = (cell_w + 4) / 8;
+    // `(cell_w + 4) / 8` without the sum, which passes `usize::MAX` for the widest cells.
+    let w = if cell_w % 8 >= 4 {
+        cell_w / 8 + 1
+    } else {
+        cell_w / 8
+    };
     if w > 1 { w } else { 1 }
 }
 
@@ -403,7 +409,9 @@ impl RowPaint<'_> {
         })
     }
 
-    /// Pastel edge line pixel coverage when a pixel-drawn bar ends inside the row.
+    /// Pastel edge line pixel coverage when a pixel-drawn bar ends inside the row;
+    /// `None` too for an edge whose position in 1/[`ROW`] pixels passes `u64` (a
+    /// product that takes a window over 2^32 pixels wide), which no line is placed at.
     #[must_use]
     pub(crate) fn edge_line(&self) -> Option<EdgeLine> {
         let q = self.surface.edge?;
@@ -413,8 +421,11 @@ impl RowPaint<'_> {
         let unit = u64::from(ROW);
         let win_w = self.span.win_w();
         let share = |v: u64| f64::from(u32::try_from(v).unwrap_or(u32::MAX)) / f64::from(ROW);
-        let exact = u64::from(q) * win_w;
-        let width = u64::try_from(edge_line_px(self.span.geom.cell_w)).unwrap_or(1) * unit;
+        let exact = u64::from(q).checked_mul(win_w)?;
+        // A width past `u64` is wider than `exact`, so `lo` is 0 either way.
+        let width = u64::try_from(edge_line_px(self.span.geom.cell_w))
+            .unwrap_or(1)
+            .saturating_mul(unit);
         let (lo, hi) = (exact.saturating_sub(width), exact);
         if hi <= lo {
             return None;
@@ -423,7 +434,9 @@ impl RowPaint<'_> {
         let end = hi.div_ceil(unit).min(win_w);
         let mut coverage = Vec::new();
         for p in first..end {
-            let (p0, p1) = (p * unit, (p + 1) * unit);
+            // `p < hi.div_ceil(unit)`, so `p * unit < hi`; `(p + 1) * unit` passes `u64` only
+            // above `hi`, and both `min`s below read it as `hi`.
+            let (p0, p1) = (p.saturating_mul(unit), (p + 1).saturating_mul(unit));
             let line = p1.min(hi).saturating_sub(p0.max(lo));
             let filled = p1.min(exact).saturating_sub(p0);
             if line == 0 || filled == 0 {
@@ -1195,6 +1208,32 @@ mod tests {
                     .is_none()
             );
         }
+    }
+
+    /// The edge line is an eighth of the cell rounded half up, and at least one
+    /// pixel, for every cell width up to `usize::MAX`.
+    #[test]
+    fn the_edge_line_is_an_eighth_of_any_cell() {
+        for cell_w in 0..=4096usize {
+            assert_eq!(edge_line_px(cell_w), ((cell_w + 4) / 8).max(1), "{cell_w}");
+        }
+        // The widest cells, where `cell_w + 4` passes `usize::MAX`: 8k + 7 and 8k + 4 round up.
+        assert_eq!(edge_line_px(usize::MAX), usize::MAX / 8 + 1);
+        assert_eq!(edge_line_px(usize::MAX - 3), usize::MAX / 8 + 1);
+        assert_eq!(edge_line_px(usize::MAX - 4), usize::MAX / 8);
+    }
+
+    /// An edge whose position in 1/ROW pixels passes `u64` draws no line.
+    #[test]
+    fn an_edge_past_u64_draws_no_line() {
+        let now = Instant::now();
+        let c = center(vec![bar(420)], now);
+        let p = present(&c, 80);
+        let m = c.motion(&p, now, Look::STILL);
+        let mut r = paint(&p, None, window(80), &m, false).swap_remove(0);
+        assert!(r.edge_line().is_some());
+        r.span.geom.win_w = usize::MAX;
+        assert!(r.edge_line().is_none());
     }
 
     /// Every glyph a message may carry has a drawn icon: the glyph cell never

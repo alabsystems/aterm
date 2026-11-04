@@ -1452,13 +1452,59 @@ fn precheck_with_judge(
 /// sources moved since the previous public release carries a bumped `HARNESS_VER`.
 ///
 /// # Errors
-/// A harness owes a bump, the ledger or origin's tags cannot be read, or the previous release's
-/// commit is not in this clone.
+/// A harness owes a bump, or as [`harness_versions_base`].
 pub fn harness_versions_gate_at(
     git: &dyn GitRunner,
     commit: &str,
     version: &str,
 ) -> Result<String> {
+    match harness_versions_base(git, commit, version)? {
+        None => Ok("harness versions: no earlier public release to compare".to_string()),
+        Some((release, released)) => {
+            crate::harness_versions::gate(git, (&release, &released), commit)
+        }
+    }
+}
+
+/// The harness versions question for a `--bump` that has not run yet (a dry run asks it of
+/// `commit`, main's tip before the bump): the version commit writes every bump the window owes
+/// ([`crate::harness_versions::apply`]), so what is owed is said, never refused.
+///
+/// # Errors
+/// As [`harness_versions_base`], or git cannot diff the window.
+pub fn harness_versions_bump_writes_at(
+    git: &dyn GitRunner,
+    commit: &str,
+    version: &str,
+) -> Result<String> {
+    let Some((release, released)) = harness_versions_base(git, commit, version)? else {
+        return Ok("harness versions: no earlier public release to compare".to_string());
+    };
+    let owed = crate::harness_versions::owed_between(git, &released, commit)?;
+    if owed.is_empty() {
+        return crate::harness_versions::gate(git, (&release, &released), commit);
+    }
+    let names: Vec<String> = owed
+        .iter()
+        .map(|o| format!("alab {} harness {}.{}", o.harness.cli(), o.to.0, o.to.1))
+        .collect();
+    Ok(format!(
+        "harness versions since v{release}: the bump commit writes {}",
+        names.join(", ")
+    ))
+}
+
+/// The public release that opened release `version`'s harness window, and its commit, as
+/// `commit`'s ledger and origin's tags name them; `None` where none precedes `version`.
+///
+/// # Errors
+/// The ledger or origin's tags cannot be read, the ledger names earlier releases none of which
+/// shipped, or the previous release's commit is not in this clone.
+fn harness_versions_base(
+    git: &dyn GitRunner,
+    commit: &str,
+    version: &str,
+) -> Result<Option<(String, String)>> {
     let ledger_text = GateTree::Commit { git, commit }.text(crate::ledger::LEDGER_FILE)?;
     let listing = git_ok(git, &["ls-remote", "--tags", "origin"]).map_err(|e| {
         Error::new(format!(
@@ -1469,7 +1515,7 @@ pub fn harness_versions_gate_at(
     let Some((release, released)) =
         crate::harness_versions::previous_release(&ledger_text, version, &listing.stdout_utf8())?
     else {
-        return Ok("harness versions: no earlier public release to compare".to_string());
+        return Ok(None);
     };
     if !git
         .git(&["cat-file", "-e", &format!("{released}^{{commit}}")])?
@@ -1481,7 +1527,7 @@ pub fn harness_versions_gate_at(
             short(&released)
         )));
     }
-    crate::harness_versions::gate(git, (&release, &released), commit)
+    Ok(Some((release, released)))
 }
 
 /// The line for what [`handoff_fixture_gate_at`] found.

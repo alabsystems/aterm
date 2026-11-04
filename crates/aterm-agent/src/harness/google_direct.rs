@@ -92,7 +92,14 @@ pub(super) fn approve(
         }
         for url in browser.navigation_commits(&page).map_err(Error::Browser)? {
             if url.split(['?', '#']).next() == Some("https://antigravity.google/oauth-callback") {
-                return request.callback(&url).map_err(|_| Error::Callback);
+                let code = request.callback(&url).map_err(|_| Error::Callback)?;
+                if !(ctx.current)() {
+                    return Err(Error::Configuration);
+                }
+                let session = browser
+                    .into_pending_session(ctx.home)
+                    .map_err(Error::Browser)?;
+                return Ok(code.with_session(session));
             }
         }
         let view = match browser.evaluate(&page, oauth::VENDOR_PAGE_JS, false) {
@@ -163,7 +170,8 @@ pub(super) fn approve(
             Some("identifier") => identifier_sent = true,
             Some("password") => password_sent = true,
             Some("totp") => totp_sent = true,
-            Some("consent") => browser.save_session(ctx.home).map_err(Error::Browser)?,
+            // The callback captures the final cookies; canonical native verification commits them.
+            Some("consent") => {}
             Some("mailbox") => {
                 let code = google_federation::verification_mail_from(
                     ctx.identity,

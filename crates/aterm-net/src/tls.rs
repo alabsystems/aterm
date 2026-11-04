@@ -391,7 +391,7 @@ where
     let tcp_up = aterm_uds::kept_out(|| tcp_down.try_clone())?;
 
     let _ = aterm_uds::keep_out_of_children(&local);
-    let mut local_up = aterm_uds::kept_out(|| local.try_clone())?;
+    let local_up = aterm_uds::kept_out(|| local.try_clone())?;
     let mut local_down = local;
 
     let shared = Arc::new(RelayShared {
@@ -464,7 +464,9 @@ where
             let mut buf = [0u8; 16 * 1024];
             let mut graceful = false;
             'up: loop {
-                match local_up.read(&mut buf) {
+                // A caller's copy of the local end can outlive this relay, whose return waits on
+                // this thread: a read that missed that end's shutdown would wait on its own close.
+                match aterm_uds::hangup::Awake(&local_up).read(&mut buf) {
                     Ok(0) => {
                         graceful = true;
                         break 'up;

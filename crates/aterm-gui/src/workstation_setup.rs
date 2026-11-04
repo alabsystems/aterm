@@ -433,6 +433,11 @@ pub(crate) struct Host {
     /// A tab that starts the install, or one adopted alive from an earlier aterm, clears it; a
     /// newer build's launch starts without it, as its own automatic tab may open.
     pub(crate) developer_tools_unfinished: bool,
+    /// A package pass said `c-toolchain: missing` while an install of the tools was on its way
+    /// ([`App::developer_tools_on_their_way`]): its only-you entry waits, since it would ask a
+    /// person to start what aterm is doing, and is filed only if that install goes without them
+    /// ([`App::settle_missing_tools_exception`]).
+    pub(crate) c_toolchain_missing_held: bool,
     /// Whether Low Data Mode holds the tools' download back, as the network watch reads it or the
     /// tab's program said: the automatic tab waits while it does, unspent. `None`: unread.
     pub(crate) developer_tools_low_data: Option<bool>,
@@ -510,6 +515,7 @@ impl Host {
             developer_tools_session: Vec::new(),
             developer_tools_attempt: None,
             developer_tools_unfinished: mark.opened(),
+            c_toolchain_missing_held: false,
             developer_tools_mark: mark,
             developer_tools_probe: (!headless && !cfg!(test)).then_some(
                 crate::clt_install::installing_now as fn() -> crate::clt_install::Reading,

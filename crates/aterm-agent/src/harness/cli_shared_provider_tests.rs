@@ -99,6 +99,7 @@ fn shared_provider_retry_requires_typed_no_start_not_a_failure_string() {
     ));
     for outcome in [
         Outcome::Hung,
+        Outcome::Unverified("not started".into()),
         Outcome::Failed,
         Outcome::Exited(None),
         Outcome::OffPin,

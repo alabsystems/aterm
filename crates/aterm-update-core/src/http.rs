@@ -3080,17 +3080,24 @@ mod tests {
     }
 
     /// What a fresh attempt's quick stall bound (`--speed-time`) is cut to behind
-    /// [`start_transfer`]'s curl.
+    /// [`start_transfer`]'s curl, for a run whose subject is that stall.
     #[cfg(all(unix, any(debug_assertions, feature = "dev-seams")))]
     const FRESH_STALL_SECS: u32 = 2;
 
+    /// What every other attempt's quick stall bound is raised to behind that curl: the test's
+    /// server sends each byte it was scripted to, so a stall there is a hang, never a budget.
+    #[cfg(all(unix, any(debug_assertions, feature = "dev-seams")))]
+    const STALL_HANG_SECS: u32 = 60;
+
     /// Start a [`Transfer`] of a `size`-byte payload on `lane`, with `stale` already standing
-    /// at the destination when given.
+    /// at the destination when given. A fresh attempt's quick stall bound is cut to
+    /// `fresh_stall` seconds, and a resumed one's raised to [`STALL_HANG_SECS`].
     #[cfg(all(unix, any(debug_assertions, feature = "dev-seams")))]
     fn start_transfer(
         lane: &'static str,
         size: usize,
         stale: Option<&[u8]>,
+        fresh_stall: u32,
         script: fn(usize) -> Answer,
     ) -> Transfer {
         use std::io::{Read as _, Write as _};
@@ -3192,11 +3199,12 @@ mod tests {
             &wrapper,
             format!(
                 "#!/bin/sh\nunset http_proxy HTTP_PROXY https_proxy HTTPS_PROXY all_proxy ALL_PROXY\n\
-                 fresh=1\nfor a do [ \"$a\" = --continue-at ] && fresh=0; done\n\
+                 stall={fresh_stall}\n\
+                 for a do [ \"$a\" = --continue-at ] && stall={STALL_HANG_SECS}; done\n\
                  n=$#; i=0; prev=\nfor a do\n  i=$((i+1))\n  [ $i -eq 1 ] && set --\n  \
                  if [ $i -eq $n ]; then set -- \"$@\" http://127.0.0.1:{port}/a-1.bin; \
-                 elif [ $fresh = 1 ] && [ \"$prev\" = --speed-time ] && [ \"$a\" = {quick} ]; \
-                 then set -- \"$@\" {FRESH_STALL_SECS}; \
+                 elif [ \"$prev\" = --speed-time ] && [ \"$a\" = {quick} ]; \
+                 then set -- \"$@\" $stall; \
                  else set -- \"$@\" \"$a\"; fi\n  prev=$a\ndone\nexec /usr/bin/curl \"$@\"\n"
             ),
         )
@@ -3296,8 +3304,8 @@ mod tests {
             hold: n == 0,
         };
         let mut runs = [
-            start_transfer("part", SIZE, None, script),
-            start_transfer("dest", SIZE, None, script),
+            start_transfer("part", SIZE, None, FRESH_STALL_SECS, script),
+            start_transfer("dest", SIZE, None, FRESH_STALL_SECS, script),
         ];
         for run in &mut runs {
             let lane = run.lane;
@@ -3326,11 +3334,11 @@ mod tests {
         const MOVING: usize = 20 << 20;
         const STEP: usize = (1 << 20) + 1024;
         const SHORT: usize = 4 << 20;
-        let mut moving = start_transfer("part", MOVING, None, |_| Answer::Body {
+        let mut moving = start_transfer("part", MOVING, None, STALL_HANG_SECS, |_| Answer::Body {
             send: STEP,
             hold: false,
         });
-        let mut short = start_transfer("part", SHORT, None, |_| Answer::Body {
+        let mut short = start_transfer("part", SHORT, None, STALL_HANG_SECS, |_| Answer::Body {
             send: 1000,
             hold: false,
         });
@@ -3361,7 +3369,7 @@ mod tests {
     fn bytes_already_at_the_destination_are_never_continued() {
         const SIZE: usize = 4 << 20;
         let stale = vec![0xEE_u8; 2 << 20];
-        let mut run = start_transfer("dest", SIZE, Some(&stale), |n| {
+        let mut run = start_transfer("dest", SIZE, Some(&stale), STALL_HANG_SECS, |n| {
             if n == 0 {
                 Answer::Busy
             } else {

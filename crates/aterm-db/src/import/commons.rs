@@ -152,6 +152,18 @@ impl Imports {
             None => crate::documents::application::observe_store(&self.paths, descriptor, read),
         }
     }
+    /// [`Self::snapshot`] where the import table is declared here: `None` where nothing declared
+    /// it, this Mac having set up no account catalog, and every other failure remains an error.
+    pub fn snapshot_if_declared(&self) -> Result<Option<Snapshot>> {
+        crate::documents::application::observe_store_if_here(
+            &self.paths,
+            descriptor,
+            self.deadline,
+            |session: &crate::table::Session<'_>, store: &crate::table::store::Store, scope| {
+                Ok(Log::read_with(session, store, scope, decode)?.snapshot())
+            },
+        )
+    }
     /// Compare the validated CSV with retained sources without publishing,
     /// replacing or selecting one. The report contains no source cell values.
     pub fn compare(&self, path: &Path) -> Result<Value> {

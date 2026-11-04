@@ -5,6 +5,7 @@
 //! past. No network, publication, identity creation or credential output.
 //! `history` locates causal first drops in raw retained wrap sets without a key;
 //! `epoch <id>` inspects one historical epoch with the existing local identity.
+//! `policy` reads the published control audience from an existing cached admin.
 
 #[cfg(unix)]
 mod probe {
@@ -24,12 +25,35 @@ mod probe {
     const MAX_EPOCHS: usize = 8;
     const MAX_HISTORY_EPOCHS: usize = 256;
     const MAX_CONTEXT_RECORDS: usize = 256;
-    const USAGE: &str = "usage: commons_epoch_probe [history | epoch <record-id>]";
+    const USAGE: &str = "usage: commons_epoch_probe [history | epoch <record-id> | policy]";
 
     enum Selection {
         Current,
         History,
         Epoch(RecordId),
+        Policy,
+    }
+
+    fn policy(paths: &Paths) -> Result<Value> {
+        let inspection = client::admin_cached(paths)?.inspect_commons_control()?;
+        let audience = inspection.audience.as_ref().map(|audience| match audience {
+            aterm_secrets::text::Audience::Everyone => json!({ "kind": "everyone" }),
+            aterm_secrets::text::Audience::Hosts(hosts) => {
+                json!({ "kind": "hosts", "hosts": hosts })
+            }
+        });
+        Ok(json!({
+            "schema": 1, "kind": "commons-published-policy",
+            "scope": "cached-authenticated-admin-snapshot",
+            "vault_version": inspection.vault_version,
+            "published_audience": audience,
+            "descriptor": inspection.descriptor.map(|trust| json!({
+                "network_id": aterm_codec::hex::encode_lower(&trust.network),
+                "authority": aterm_codec::hex::encode_lower(&trust.authority),
+                "genesis": aterm_codec::hex::encode_lower(&trust.genesis),
+            })),
+            "grants_membership": false,
+        }))
     }
 
     fn label(log: &Log, recipient: Recipient) -> Value {
@@ -314,6 +338,7 @@ mod probe {
         let selection = match args.as_slice() {
             [] => Selection::Current,
             [mode] if mode == "history" => Selection::History,
+            [mode] if mode == "policy" => Selection::Policy,
             [mode, id] if mode == "epoch" => Selection::Epoch(
                 aterm_codec::hex::decode_vec(id.as_bytes())
                     .and_then(|bytes| bytes.try_into().ok())
@@ -322,6 +347,9 @@ mod probe {
             _ => return Err(io::Error::other(USAGE).into()),
         };
         let paths = Paths::live()?;
+        if matches!(selection, Selection::Policy) {
+            return policy(&paths);
+        }
         let Some(_guard) = client::try_commons_source_read(&paths)? else {
             return Ok(
                 json!({"available": false, "reason": "vault observation lock absent or busy", "grants_membership": false}),
@@ -345,7 +373,7 @@ mod probe {
                 .cloned()
                 .unwrap_or_default(),
             Selection::Epoch(id) => vec![id],
-            Selection::History => unreachable!(),
+            Selection::History | Selection::Policy => unreachable!(),
         };
         if selected.len() > MAX_EPOCHS {
             return Err(
@@ -377,6 +405,36 @@ mod probe {
             commons::binding::Request,
             membership_log::{Entrant, MemberId},
         };
+
+        #[test]
+        fn policy_reads_only_existing_published_metadata_without_values() {
+            use aterm_secrets::text::Audience;
+            let root = aterm_tempfile::tempdir().unwrap();
+            let paths = Paths::for_home(&root.path().join("owner"));
+            assert!(policy(&paths).is_err());
+            assert!(!paths.home.exists());
+            let vault = root.path().join("vault");
+            client::test_create_unbound(&paths, vault.to_str().unwrap(), None, Some("m1")).unwrap();
+            let admin = client::admin_cached(&paths).unwrap();
+            let mut doc = admin.doc.clone();
+            doc.set_entry(
+                &Audience::Hosts(vec!["m1".into()]),
+                aterm_secrets::commons::ENTRY,
+                b"private-control-value",
+            )
+            .unwrap();
+            client::admin_publish(&paths, &admin, &doc).unwrap();
+            let before = std::fs::read(&vault).unwrap();
+            let observed = policy(&paths).unwrap();
+            assert_eq!(
+                observed["published_audience"],
+                json!({ "kind": "hosts", "hosts": ["m1"] })
+            );
+            assert!(observed["descriptor"].is_null());
+            assert_eq!(observed["grants_membership"], json!(false));
+            assert!(!observed.to_string().contains("private-control-value"));
+            assert_eq!(std::fs::read(&vault).unwrap(), before);
+        }
 
         fn entrant(tag: u8) -> (Identity, [u8; 32], [u8; 16], MemberId, Entrant) {
             let identity = Identity::from_secret_bytes([tag + 64; 32]);

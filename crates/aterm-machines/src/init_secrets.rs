@@ -4480,7 +4480,7 @@ pub(crate) mod tests {
         let github_after = |rows: &[ItemReport]| {
             let auth = rows
                 .iter()
-                .find(|row| row.family == "github")
+                .find(|row| row.family == "github" && !row.id.starts_with("init.github.keychain@"))
                 .expect("the GitHub rows are still produced");
             assert!(
                 auth.why
@@ -4548,6 +4548,7 @@ pub(crate) mod tests {
                 len: 0,
             },
         );
+        crate::git_credential::script::unconfigured(&sys, &user("alice", 501));
         if let Some(profile) = github {
             const INIT_TOML: &str = "/Users//alice/.config/aterm/init.toml";
             sys.file(INIT_TOML, profile).stat_of(
@@ -4563,7 +4564,6 @@ pub(crate) mod tests {
             );
             let alice = user("alice", 501);
             crate::git_credential::script::unconfigured(&sys, &alice);
-            crate::git_credential::script::holds_nothing(&sys, Some(&alice));
         }
         sys
     }
@@ -4598,7 +4598,7 @@ pub(crate) mod tests {
         };
         let github = |rows: &[ItemReport]| {
             rows.iter()
-                .find(|row| row.family == "github")
+                .find(|row| row.family == "github" && !row.id.starts_with("init.github.keychain@"))
                 .cloned()
                 .expect("the GitHub row")
         };
@@ -4697,7 +4697,7 @@ pub(crate) mod tests {
             let rows = engine::run(&all, Mode::Apply, &sys, &context, &mut NoJournal);
             let github = rows
                 .iter()
-                .find(|row| row.family == "github")
+                .find(|row| row.family == "github" && !row.id.starts_with("init.github.keychain@"))
                 .expect("the GitHub row");
             let waits = |row: &ItemReport| matches!(row.stood_aside, Some(StoodAside::Waiting(_)));
             assert_eq!(waits(&rows[0]), running, "running {running}: {rows:?}");

@@ -850,12 +850,17 @@ fn a_handle_names_its_volume_by_its_guid() {
         read(r"\\?\volume{6140fc3b-044f-43d7-b060-cb98170c7a63}\").as_deref(),
         Some("{6140fc3b-044f-43d7-b060-cb98170c7a63}")
     );
+    assert_eq!(
+        read(r"\\?\volume{6140fc3b-044f-43d7-b060-cb98170c7a63}"),
+        Some("{6140fc3b-044f-43d7-b060-cb98170c7a63}".to_owned())
+    );
     for not_one in [
         r"\\?\C:\Users\x",
         r"\\?\Volume{6140fc3b-044f-43d7-b060-cb98170c7a6}\",
         r"\\?\Volume{6140fc3b-044f-43d7-b060-cb98170c7a6g}\",
         r"\\?\Volume{6140fc3b-044f-43d7-b060-cb98170c7a63\",
         r"\\?\Volume{6140fc3b0044f-43d7-b060-cb98170c7a63}\",
+        r"\\?\Volume{6140fc3b-044f-43d7-b060-cb98170c7a63}extra",
     ] {
         assert_eq!(read(not_one), None, "{not_one}");
     }
@@ -1191,6 +1196,8 @@ fn errors_keep_gone_apart_from_everything_else() {
         std::io::Error::from(Errno::NOENT).kind(),
         ErrorKind::NotFound
     );
+    assert!(Errno::NOENT.is_noent() && !Errno::NOENT.is_inval());
+    assert!(Errno::INVAL.is_inval() && !Errno::INVAL.is_noent());
     assert_eq!(std::io::Error::from(Errno::NOENT).raw_os_error(), Some(2));
     const ERROR_INVALID_DRIVE: i32 = 15;
     const ERROR_BAD_NETPATH: i32 = 53;

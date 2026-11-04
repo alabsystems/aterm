@@ -61,8 +61,8 @@ fn a_call_and_a_signal_cross_a_private_dbus_daemon() {
     let addresses = address::parse(line.trim()).unwrap();
 
     {
-        let mut caller = Connection::open(&addresses).unwrap();
-        let mut callee = Connection::open(&addresses).unwrap();
+        let mut caller = Connection::open_within(&addresses, HANG).unwrap();
+        let mut callee = Connection::open_within(&addresses, HANG).unwrap();
         assert_ne!(caller.unique_name(), callee.unique_name());
         assert_eq!(caller.server_guid(), callee.server_guid());
         let callee_name = callee.unique_name().to_owned();

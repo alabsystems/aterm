@@ -472,4 +472,84 @@ mod tests {
         assert!(narrow.try_consume_slot(stale, 99_999, &clock));
         assert!(narrow.try_consume("response", 100, &clock));
     }
+
+    /// NEGATIVE CONTROL: `restore_snapshot` clamps non-finite (`NaN`, `±∞`), negative, and `-0.0`
+    /// balances to `+0.0` and over-capacity balances to `capacity_bytes`, while `earliest_refill`
+    /// and `PolicyEngine` snapshot helpers round-trip declared buckets in first-declaration order.
+    #[test]
+    fn snapshot_restore_clamps_invalid_balances_and_tracks_earliest_refill() {
+        let mut bucket = TokenBucket::from_config(&rl("x", 100, 10, 0));
+        assert_eq!(
+            bucket.snapshot(),
+            BucketSnapshot {
+                tokens: 100.0,
+                last_refill: None
+            }
+        );
+
+        let clock = FakeClock::new();
+        let t0 = clock.now();
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -25.0, -0.0] {
+            bucket.restore_snapshot(BucketSnapshot {
+                tokens: bad,
+                last_refill: Some(t0),
+            });
+            let snap = bucket.snapshot();
+            assert_eq!(snap.tokens.to_bits(), 0.0_f64.to_bits(), "bad={bad}");
+            assert_eq!(snap.last_refill, Some(t0));
+        }
+
+        bucket.restore_snapshot(BucketSnapshot {
+            tokens: 250.0,
+            last_refill: None,
+        });
+        assert_eq!(
+            bucket.snapshot(),
+            BucketSnapshot {
+                tokens: 100.0,
+                last_refill: None
+            }
+        );
+
+        let mut engine = crate::engine::PolicyEngine::new(two_bucket_policy());
+        assert_eq!(engine.earliest_refill(), None);
+        assert!(engine.rate_limit_try_consume("palette", 4, &clock));
+        assert_eq!(engine.earliest_refill(), Some(t0));
+
+        clock.advance(Duration::from_millis(50));
+        let t1 = clock.now();
+        assert!(engine.rate_limit_try_consume("response", 30, &clock));
+        assert_eq!(engine.earliest_refill(), Some(t0));
+
+        let saved = engine.bucket_snapshots();
+        assert_eq!(
+            saved,
+            vec![
+                BucketSnapshot {
+                    tokens: 70.0,
+                    last_refill: Some(t1)
+                },
+                BucketSnapshot {
+                    tokens: 6.0,
+                    last_refill: Some(t0)
+                },
+            ]
+        );
+
+        let mut restored = crate::engine::PolicyEngine::new(two_bucket_policy());
+        restored.restore_bucket_snapshots(&saved[..1]);
+        assert_eq!(
+            restored.bucket_snapshots(),
+            vec![
+                saved[0],
+                BucketSnapshot {
+                    tokens: 10.0,
+                    last_refill: None
+                },
+            ]
+        );
+        restored.restore_bucket_snapshots(&saved);
+        assert_eq!(restored.bucket_snapshots(), saved);
+        assert_eq!(restored.earliest_refill(), Some(t0));
+    }
 }

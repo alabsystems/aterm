@@ -1312,8 +1312,65 @@ pub(crate) fn cmd_custody(term: &Arc<Mutex<Terminal>>) -> String {
     )
 }
 
+const MODE_KEYS: [&str; 14] = [
+    "alt_screen",
+    "cursor_visible",
+    "app_cursor_keys",
+    "app_keypad",
+    "bracketed_paste",
+    "mouse_mode",
+    "mouse_encoding",
+    "insert_mode",
+    "auto_wrap",
+    "origin_mode",
+    "kitty_keyboard",
+    "modify_other_keys",
+    "focus_reporting",
+    "sync_output",
+];
+
+const fn const_bytes_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+const _: () = {
+    let mut i = 0;
+    while i < MODE_KEYS.len() {
+        let key = MODE_KEYS[i].as_bytes();
+        assert!(!key.is_empty(), "empty mode key");
+        let mut b = 0;
+        while b < key.len() {
+            assert!(
+                key[b].is_ascii_lowercase() || key[b] == b'_',
+                "mode key must be lowercase snake_case"
+            );
+            b += 1;
+        }
+        let mut j = i + 1;
+        while j < MODE_KEYS.len() {
+            assert!(
+                !const_bytes_eq(key, MODE_KEYS[j].as_bytes()),
+                "duplicate mode key"
+            );
+            j += 1;
+        }
+        i += 1;
+    }
+};
+
 /// `modes` -> `OK <n>\n` then `n` `key=value` lines, one per introspected mode.
 pub(crate) fn cmd_modes(term: &Arc<Mutex<Terminal>>) -> String {
+    use aterm_types::keyboard::KeyboardMode as KM;
     use aterm_types::mouse::{MouseEncoding, MouseMode};
     let t = term_lock(term);
     let m = t.modes();
@@ -1334,7 +1391,6 @@ pub(crate) fn cmd_modes(term: &Arc<Mutex<Terminal>>) -> String {
         _ => "unknown",
     };
     let kbd = t.keyboard_mode();
-    use aterm_types::keyboard::KeyboardMode as KM;
     let mut kitty = Vec::new();
     if kbd.contains(KM::DISAMBIGUATE_ESC_CODES) {
         kitty.push("disambiguate");
@@ -1357,25 +1413,27 @@ pub(crate) fn cmd_modes(term: &Arc<Mutex<Terminal>>) -> String {
         kitty.join(",")
     };
     let modify_other_keys = kbd.xterm_modify_other_keys_level();
-    let lines = [
-        format!("alt_screen={}", t.is_alternate_screen()),
-        format!("cursor_visible={}", t.cursor_visible()),
-        format!("app_cursor_keys={}", m.application_cursor_keys),
-        format!("app_keypad={}", m.application_keypad),
-        format!("bracketed_paste={}", m.bracketed_paste),
-        format!("mouse_mode={mouse_mode}"),
-        format!("mouse_encoding={mouse_encoding}"),
-        format!("insert_mode={}", m.insert_mode),
-        format!("auto_wrap={}", m.auto_wrap),
-        format!("origin_mode={}", m.origin_mode),
-        format!("kitty_keyboard={kitty_str}"),
-        format!("modify_other_keys={modify_other_keys}"),
-        format!("focus_reporting={}", m.focus_reporting),
-        format!("sync_output={}", m.synchronized_output),
+    let values: [String; MODE_KEYS.len()] = [
+        t.is_alternate_screen().to_string(),
+        t.cursor_visible().to_string(),
+        m.application_cursor_keys.to_string(),
+        m.application_keypad.to_string(),
+        m.bracketed_paste.to_string(),
+        mouse_mode.to_string(),
+        mouse_encoding.to_string(),
+        m.insert_mode.to_string(),
+        m.auto_wrap.to_string(),
+        m.origin_mode.to_string(),
+        kitty_str,
+        modify_other_keys.to_string(),
+        m.focus_reporting.to_string(),
+        m.synchronized_output.to_string(),
     ];
-    let mut out = format!("OK {}\n", lines.len());
-    for l in &lines {
-        out.push_str(l);
+    let mut out = format!("OK {}\n", MODE_KEYS.len());
+    for (key, value) in MODE_KEYS.into_iter().zip(values) {
+        out.push_str(key);
+        out.push('=');
+        out.push_str(&value);
         out.push('\n');
     }
     out
@@ -3215,38 +3273,50 @@ mod tests {
     #[test]
     fn modes_frames_its_count_over_distinct_key_lines() {
         let term = term_with(&[]);
-        let out = super::cmd_modes(&term);
-        let mut lines = out.lines();
-        let count: usize = lines
-            .next()
-            .and_then(|header| header.strip_prefix("OK "))
-            .and_then(|n| n.parse().ok())
-            .unwrap_or_else(|| panic!("an `OK <n>` header: {out}"));
-        let keys: std::collections::BTreeSet<&str> = lines
-            .map(|l| l.split_once('=').map(|(k, _)| k).expect("key=value"))
-            .collect();
-        assert_eq!(keys.len(), count, "{out}");
         assert_eq!(
-            keys,
-            std::collections::BTreeSet::from([
-                "alt_screen",
-                "app_cursor_keys",
-                "app_keypad",
-                "auto_wrap",
-                "bracketed_paste",
-                "cursor_visible",
-                "focus_reporting",
-                "insert_mode",
-                "kitty_keyboard",
-                "modify_other_keys",
-                "mouse_encoding",
-                "mouse_mode",
-                "origin_mode",
-                "sync_output",
-            ]),
-            "{out}"
+            super::cmd_modes(&term),
+            concat!(
+                "OK 14\n",
+                "alt_screen=false\n",
+                "cursor_visible=true\n",
+                "app_cursor_keys=false\n",
+                "app_keypad=false\n",
+                "bracketed_paste=false\n",
+                "mouse_mode=none\n",
+                "mouse_encoding=x10\n",
+                "insert_mode=false\n",
+                "auto_wrap=true\n",
+                "origin_mode=false\n",
+                "kitty_keyboard=none\n",
+                "modify_other_keys=0\n",
+                "focus_reporting=false\n",
+                "sync_output=false\n",
+            )
         );
-        assert!(out.ends_with('\n'), "{out}");
+
+        term.lock().unwrap().process(
+            b"\x1b[?1049h\x1b[?25l\x1b[?1h\x1b=\x1b[?2004h\x1b[?1003h\x1b[?1006h\x1b[4h\x1b[?7l\x1b[?6h\x1b[>31u\x1b[>4;2m\x1b[?1004h\x1b[?2026h",
+        );
+        assert_eq!(
+            super::cmd_modes(&term),
+            concat!(
+                "OK 14\n",
+                "alt_screen=true\n",
+                "cursor_visible=false\n",
+                "app_cursor_keys=true\n",
+                "app_keypad=true\n",
+                "bracketed_paste=true\n",
+                "mouse_mode=any\n",
+                "mouse_encoding=sgr\n",
+                "insert_mode=true\n",
+                "auto_wrap=false\n",
+                "origin_mode=true\n",
+                "kitty_keyboard=disambiguate,report_events,report_alternates,report_all_keys,report_text\n",
+                "modify_other_keys=2\n",
+                "focus_reporting=true\n",
+                "sync_output=true\n",
+            )
+        );
     }
 
     #[test]

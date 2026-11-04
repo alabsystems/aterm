@@ -2559,7 +2559,8 @@ fn ctls_own_timeout_bounds_a_fleet_survey_where_it_is_shorter() {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clear();
-        run_survey(&parts(line), None, None, total, &local).expect("a read");
+        // The code says whether a host answered; this test reads only the bound it asked with.
+        let _answered = run_survey(&parts(line), None, None, total, &local).expect("a read");
         assert_eq!(
             *ASKED_WITHIN.lock().unwrap_or_else(|p| p.into_inner()),
             [within],
@@ -2570,7 +2571,8 @@ fn ctls_own_timeout_bounds_a_fleet_survey_where_it_is_shorter() {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .clear();
-    crate::remote::run("m7", &parts("survey"), Some(Some(secs(1))), &local).expect("a read");
+    let _answered =
+        crate::remote::run("m7", &parts("survey"), Some(Some(secs(1))), &local).expect("a read");
     assert_eq!(
         *ASKED_WITHIN.lock().unwrap_or_else(|p| p.into_inner()),
         [secs(1)],

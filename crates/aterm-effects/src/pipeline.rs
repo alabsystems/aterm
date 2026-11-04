@@ -793,24 +793,6 @@ impl EffectsPipeline {
         self.companion.note_bell(self.now());
     }
 
-    /// A kitty command was typed (`sit`, `kitty jump`, `good kitty`).
-    #[cfg(test)]
-    pub fn note_trick(&mut self, trick: aterm_lexicon::Trick, confirmed: bool) {
-        self.companion.note_trick(self.now(), trick, confirmed);
-    }
-
-    /// The typed line turned into prose, or was aborted.
-    #[cfg(test)]
-    pub const fn revoke_trick(&mut self) {
-        self.companion.revoke_trick();
-    }
-
-    /// The whole submitted line was pet talk.
-    #[cfg(test)]
-    pub fn note_trick_submit(&mut self) {
-        self.companion.note_trick_submit(self.now());
-    }
-
     /// Embedded host observed wheel/PgUp while an alternate-screen tui is active.
     #[inline]
     pub const fn note_matrix_rain_alt_scroll(&mut self) {
@@ -3480,18 +3462,20 @@ mod tests {
         idle(&mut p, &mut term, &mut input, 60, 50.0);
         assert_eq!(p.companion.brain().pending_trick(), None);
 
-        p.note_trick(Trick::Roll, false);
+        let now = p.now();
+        p.companion_mut().note_trick(now, Trick::Roll, false);
         assert_eq!(p.companion.brain().pending_trick(), Some(Trick::Roll));
         assert!(
             p.companion.needs_frames() && p.is_active(),
             "the latch asks for the frames that perform it"
         );
-        p.revoke_trick();
+        p.companion_mut().revoke_trick();
         assert_eq!(p.companion.brain().pending_trick(), None);
-        p.revoke_trick(); // idempotent: the listener revokes with nothing pending
+        p.companion_mut().revoke_trick(); // idempotent: the listener revokes with nothing pending
 
         let sprites = free_sprites(&input).clone();
-        p.note_trick(Trick::Roll, true);
+        let now = p.now();
+        p.companion_mut().note_trick(now, Trick::Roll, true);
         assert_eq!(p.companion.brain().pending_trick(), Some(Trick::Roll));
         assert!(matches!(p.wake(), Wake::Frames));
         assert_eq!(free_sprites(&input), sprites, "a note draws nothing");
@@ -3514,7 +3498,8 @@ mod tests {
             idle(&mut p, &mut term, &mut input, 1, 33.0);
             materialize_pet(&mut p, &mut term, &mut input);
             if pet_talk {
-                p.note_trick_submit();
+                let now = p.now();
+                p.companion_mut().note_trick_submit(now);
             }
             run_command_block(&mut p, &mut term, &mut input, 127);
             assert_eq!(

@@ -1013,3 +1013,33 @@ fn retained_request_evidence_conforms_through_withdrawal_and_quarantine() {
         );
     }
 }
+
+/// A PROPOSAL TABLE NOBODY DECLARED IS NO FAILURE TO READ ONE: `snapshot_if_declared` is `None` on a
+/// Mac with no Commons, and in a Commons that declared only another table, where `snapshot` refuses.
+/// CONTROL: once declared, it reads what `snapshot` reads.
+#[test]
+fn a_proposal_table_nobody_declared_reads_as_none() {
+    let lab = Lab::new(&[Role::Writer]);
+    let db = app(&lab, 0);
+    let no_commons = aterm_secrets::client::Paths::for_home(&lab._home.path().join("no-commons"));
+    assert!(
+        Proposals::at(no_commons)
+            .snapshot_if_declared()
+            .unwrap()
+            .is_none(),
+        "no Commons"
+    );
+    let source = lab._home.path().join("first.csv");
+    std::fs::write(&source, "email,google\nfirst@example.com,1\n").unwrap();
+    crate::import::commons::Imports::at(lab.paths[0].clone())
+        .apply(&source, [41; 16])
+        .unwrap();
+    assert!(db.snapshot().is_err(), "PRECONDITION: undeclared");
+    assert!(
+        db.snapshot_if_declared().unwrap().is_none(),
+        "another table"
+    );
+    db.write([1; 16], vec![account("initial")]).unwrap();
+    let declared = db.snapshot_if_declared().unwrap().expect("declared");
+    assert_eq!(declared.cells, db.snapshot().unwrap().cells, "CONTROL");
+}

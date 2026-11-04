@@ -262,6 +262,7 @@ fn stamp(file: &Path) -> Option<Stamp> {
 /// read it at.
 pub struct LocalLog {
     file: PathBuf,
+    paths: Option<aterm_secrets::client::Paths>,
     aux_files: Vec<PathBuf>,
     read: Reader,
     held: Mutex<Option<Held>>,
@@ -279,7 +280,7 @@ impl LocalLog {
     #[must_use]
     pub fn of(paths: &aterm_secrets::client::Paths) -> Self {
         let from = paths.clone();
-        Self::reading(
+        let mut log = Self::reading(
             paths.records_file(),
             vec![
                 paths.dir.join("state.toml"),
@@ -295,7 +296,9 @@ impl LocalLog {
                 let roster = aterm_secrets::client::local_swarm_roster_for_log(&from, log)?;
                 Ok(Some(log_member_keys_with_roster(log, roster.as_ref())))
             }),
-        )
+        );
+        log.paths = Some(paths.clone());
+        log
     }
 
     /// The store file `file`, founded on the genesis `network` names: a test's lab of its own.
@@ -319,6 +322,7 @@ impl LocalLog {
     fn reading(file: PathBuf, aux_files: Vec<PathBuf>, read: Reader) -> Self {
         Self {
             file,
+            paths: None,
             aux_files,
             read,
             held: Mutex::new(None),
@@ -337,7 +341,11 @@ impl LocalLog {
     /// lets in a key the log held out.
     pub fn keys(&self) -> Option<Arc<MemberKeys>> {
         // Taken before the read: a write between the two moves the next stamp.
-        let file_stamp = stamp(&self.file)?;
+        let file = match &self.paths {
+            Some(paths) => paths.records_data_file().ok()?,
+            None => self.file.clone(),
+        };
+        let file_stamp = stamp(&file)?;
         let aux_stamps: Vec<Option<Stamp>> = self.aux_files.iter().map(|p| stamp(p)).collect();
         let mut held = self
             .held
@@ -831,6 +839,40 @@ mod tests {
             log_member_keys_with_roster(log_now, Some(&r_stale_and_left_out));
         assert!(keys_stale_and_left_out.holds_out(&node_0.key()));
         assert!(keys_stale_and_left_out.holds_out(&node_7_pre.key()));
+
+        // A crossed source also fences this small local file. The same warm reader must
+        // follow the selected data, observe another rotation, and refuse missing custody.
+        aterm_secrets::fsx::write_atomic(
+            &paths.records_file().with_extension("crossed"),
+            b"crossed\n",
+            0o600,
+        )
+        .unwrap();
+        let node_3 = NodeIdentity::from_seed(&"a1".repeat(16), &[0x77; 32]).unwrap();
+        assert!(ensure_local_node_key_in_log(
+            &paths,
+            &node_3,
+            Some(&keys_after_m7_out)
+        ));
+        assert!(paths.records_file().is_dir());
+        let keys_after_3 = local_log.keys().expect("keys in the fenced layout");
+        assert!(keys_after_3.admits(&node_3.key()));
+        assert!(keys_after_3.holds_out(&node_2.key()));
+        let node_4 = NodeIdentity::from_seed(&"a1".repeat(16), &[0x88; 32]).unwrap();
+        assert!(ensure_local_node_key_in_log(
+            &paths,
+            &node_4,
+            Some(&keys_after_3)
+        ));
+        let keys_after_4 = local_log.keys().expect("keys after fenced rotation");
+        assert!(keys_after_4.admits(&node_4.key()));
+        assert!(keys_after_4.holds_out(&node_3.key()));
+        std::fs::rename(
+            paths.records_data_file().unwrap(),
+            paths.records_file().join("saved-current"),
+        )
+        .unwrap();
+        assert!(local_log.keys().is_none());
 
         running.stop();
     }

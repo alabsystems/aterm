@@ -4331,6 +4331,10 @@ fn the_script_set_has_one_sixteen_hex_address() {
     }
 }
 
+/// NEGATIVE CONTROL: under `content-address-isolation`'s precondition (foreign writes stay outside
+/// `root/<own address>`, as content-addressed foreign builds do), both warm and cold memos serve
+/// verified scripts; an out-of-band edit *inside* `root/<own address>` is NOT re-verified on the
+/// warm memo path (`!script_set_matches(&ours)`), whereas a cold memo or a deleted root repairs it.
 #[test]
 fn a_foreign_build_cannot_change_what_this_builds_tabs_source() {
     let tmp = aterm_tempfile::tempdir().unwrap();
@@ -4363,6 +4367,20 @@ fn a_foreign_build_cannot_change_what_this_builds_tabs_source() {
     assert_eq!(
         std::fs::read_to_string(root.join("aterm_shell_integration.zsh")).unwrap(),
         foreign
+    );
+
+    // Violating the precondition (an out-of-band edit inside `ours` on a file `ensure_cached` does
+    // not stat) leaves the warm memo serving `ours`, while a cold memo repairs `ours`.
+    std::fs::write(ours.join("bash/rcfile"), "# out-of-band edit\n").unwrap();
+    assert_eq!(injected_dir(&warm), ours);
+    assert!(
+        !script_set_matches(&ours),
+        "warm memo stats only the entry sentinel and does not re-verify sibling files"
+    );
+    assert_eq!(injected_dir(&Mutex::new(None)), ours);
+    assert!(
+        script_set_matches(&ours),
+        "cold memo verifies the full script set and replaces a damaged folder"
     );
 
     std::fs::remove_dir_all(&root).unwrap();

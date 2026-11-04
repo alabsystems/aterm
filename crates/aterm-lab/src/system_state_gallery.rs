@@ -392,13 +392,13 @@ pub fn parse_frame_name(name: &str) -> Option<(String, Look, Size, Option<u64>)>
 }
 
 /// Whether the executable at `aterm` names the seam `seam`: a build that reads it carries its
-/// name. A file that cannot be read names nothing.
-fn names_seam(aterm: &Path, seam: &str) -> bool {
-    let Ok(bytes) = crate::util::read_regular_file(aterm) else {
-        return false;
-    };
+/// name.
+/// # Errors
+/// The executable could not be read, which says nothing of its seams.
+fn names_seam(aterm: &Path, seam: &str) -> std::io::Result<bool> {
+    let bytes = crate::util::read_program(aterm)?;
     let needle = seam.as_bytes();
-    bytes.windows(needle.len()).any(|w| w == needle)
+    Ok(bytes.windows(needle.len()).any(|w| w == needle))
 }
 
 /// One judged frame.
@@ -1171,7 +1171,12 @@ pub fn cmd_system_state_gallery(args: &[String]) -> Res {
         .map_err(|e| Fail::exit(3, format!("system-state-gallery: {e}")))?;
     let fixtures = chosen_fixtures(&all, &a)?;
     let aterm = instance::resolve_aterm(a.aterm.clone()).map_err(|e| Fail::exit(3, e))?;
-    let seam = names_seam(&aterm, MOTION_SEAM);
+    let seam = names_seam(&aterm, MOTION_SEAM).map_err(|e| {
+        Fail::exit(
+            3,
+            format!("system-state-gallery: cannot read {}: {e}", aterm.display()),
+        )
+    })?;
     if !a.at.is_empty() && !seam {
         return Err(Fail::exit(
             3,

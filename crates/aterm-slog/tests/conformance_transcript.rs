@@ -857,7 +857,14 @@ pub fn walk(seed: u64, n: usize, broken: Broken) -> Result<BTreeSet<&'static str
     }
     for i in 0..n {
         let step = POOL[rng.index(POOL.len())];
-        match apply(&m, &mut j, step).map_err(|e| format!("seed {seed} step {i} {step:?}: {e}"))? {
+        match apply(&m, &mut j, step).map_err(|e| {
+            let records = j.log.window().collect::<Vec<_>>();
+            let recent = &records[records.len().saturating_sub(24)..];
+            let original = records.iter().filter(|record|
+                Some(record.node) == j.tracker.turn() && record.op == Op::Open).collect::<Vec<_>>();
+            format!("seed {seed} step {i} {step:?}: {e}\nsource={:?} tracker={:?} tx={:?}\ncurrent original={original:#?}\nrecent={recent:#?}",
+                j.state(), j.tracker.view(j.now), j.tracker.tx_view())
+        })? {
             Some(path) if path.is_empty() => {
                 ran.insert("(a row the join ignored)");
             }

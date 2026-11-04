@@ -1469,20 +1469,9 @@ fn each_line_that_signs_a_row_in_names_its_own_verb() {
     let (code, out, err) = acc(add("w3", Some("w3@example.com")), &env, &host);
     assert_eq!(code, exit(0), "{out}{err}");
     let (_, report, _) = acc(AccountsCmd::Report { json: false }, &env, &host);
-    for (label, verb, reason) in [
-        (
-            "w3",
-            "renew",
-            "w3: not-enrolled (no login made yet: aterm signs it in by itself; `aterm harness \
-             accounts renew w3` runs that now)",
-        ),
-        (
-            "plain",
-            "login",
-            "plain: not-enrolled (no login made yet: run `aterm harness accounts login plain`)",
-        ),
-    ] {
-        assert!(report.contains(reason), "{reason}\n{report}");
+    for (label, verb) in [("w3", "renew"), ("plain", "login")] {
+        let step = format!("`aterm harness accounts {verb} {label}`");
+        assert!(report.contains(&step), "{step}\n{report}");
         let (code, _, err) = acc(
             AccountsCmd::Use {
                 label: label.into(),

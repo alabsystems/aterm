@@ -3,7 +3,7 @@
 
 //! Multi-leg `await inbox|agent|edit` client loop ([`await_task::DEFAULT_TOTAL`]).
 
-use std::io::{self, BufReader};
+use std::io;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
@@ -111,7 +111,7 @@ fn socket_leg(sock: &str, origin: TargetOrigin, request: &str, wait: Duration) -
         }
         Err(e) => return Leg::Failed(e),
     }
-    let mut reader = BufReader::new(&stream);
+    let mut reader = super::reply_on(&stream);
     let mut status = String::new();
     match read_status_line(&mut reader, &mut status) {
         Ok(0) => {

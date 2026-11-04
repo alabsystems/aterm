@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
-use crate::checkout::tests::{Repos, rewrites, subcommands};
+use crate::checkout::tests::{Repos, rewrites, subcommands, unrouted};
 use crate::items::defaults::tests::{ctx, user};
 use crate::model::{ItemReport, Mode, Outcome};
 use crate::port::spawns::Spawns;
@@ -788,6 +788,7 @@ fn the_submodule_is_checked_out_only_where_that_loses_nothing() {
     assert!(matches!(item.probe(&sys, &ctx), Probe::Ok { .. }));
     let record = sys.record();
     assert_eq!(rewrites(&record), Vec::<String>::new());
+    assert_eq!(unrouted(&record), Vec::<String>::new());
     assert!(
         record
             .iter()

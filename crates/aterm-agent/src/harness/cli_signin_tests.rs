@@ -211,6 +211,11 @@ impl AccountsHost for SignInHost {
         let mut approver = Approves(&self.handed);
         match &self.script {
             Script::Kimi(script) => {
+                #[cfg(unix)]
+                assert!(
+                    req.recovery.is_some(),
+                    "admitted Kimi plan lost its recovery identity"
+                );
                 std::fs::write(req.staging.join(".stand-in"), script).expect("script");
                 let exe = std::env::current_exe().expect("test exe");
                 let lead: Vec<OsString> = [
@@ -226,7 +231,7 @@ impl AccountsHost for SignInHost {
                     req,
                     (&exe, &lead),
                     None,
-                    None,
+                    Some(Path::new(login_drive::SANDBOX_EXEC)),
                     &move |name| (name == "HOME").then(|| home.clone().into_os_string()),
                     &mut approver,
                     Duration::from_secs(60),
@@ -2514,15 +2519,14 @@ fn codex_default_completion_respects_signed_out_state() {
     std::fs::write(&path, original).unwrap();
     let store = env.accounts_store_for(Cli::Codex).unwrap();
     std::fs::create_dir_all(&store.dir).unwrap();
-    let mut state = accounts::State::default();
-    state.accounts.insert(
-        "main".into(),
-        accounts::Account {
-            auth: accounts::Auth::SignedOut,
-            ..Default::default()
-        },
+    std::fs::write(env.home.as_ref().unwrap().join(".codex/auth.json"), "{}").unwrap();
+    crate::ai::testing::current_codex_auth(
+        &store,
+        &path,
+        "main",
+        accounts::Auth::SignedOut,
+        env.now,
     );
-    std::fs::write(store.state_file(), state.to_json()).unwrap();
     let result = default_completion::complete(&env, None, |_| Some("owner@example.test".into()));
     assert!(matches!(result, Ok(None)), "{result:?}");
     assert_eq!(read(&path), original);

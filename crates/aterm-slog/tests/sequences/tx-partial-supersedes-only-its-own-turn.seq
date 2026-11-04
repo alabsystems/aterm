@@ -1,8 +1,8 @@
 seq v=1 rig=transcript program=claude build=2.1.311
 # Fix E1: a partial source supersedes only a turn it opened itself. Its prompt
 # v2 ends its own t1 superseded and opens t2. Under the screen's turn t3, which
-# took v3, a prompt with another vref only shares it, and its end only amends:
-# the screen closes t3.
+# took v3, a prompt with another vref only shares it. Its end remains raw vendor
+# evidence, without amending v3's metrics: the screen closes t3.
 state partial
 bind 0
 see idle
@@ -25,7 +25,6 @@ pass 100
 tx prompt v4
 expect tx vref=v4 mapped=t3
 tx end
-expect amend t3 turn vdur_ms=4200 by=vendor src=transcript conf=strong
 expect turn=t3
 see idle
 wait 1000

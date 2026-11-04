@@ -178,6 +178,12 @@ pub trait Source: Send + Sync {
     fn pending(&self) -> bool {
         false
     }
+
+    /// Whether `aterm.toml` turns the source off (`[alab] roster = false`), so the lab is not read
+    /// and no lab names this Mac whatever the registry says.
+    fn turned_off(&self) -> bool {
+        false
+    }
 }
 
 static INSTALLED: OnceLock<Box<dyn Source>> = OnceLock::new();
@@ -191,6 +197,7 @@ pub fn install(source: Box<dyn Source>) -> bool {
 thread_local! {
     static OVERRIDE: std::cell::RefCell<Option<Arc<Lab>>> = const { std::cell::RefCell::new(None) };
     static PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static TURNED_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Whether the lab this process may hold could not be read yet ([`Source::pending`]): a Mac the
@@ -211,6 +218,24 @@ pub(crate) fn while_pending<T>(f: impl FnOnce() -> T) -> T {
     PENDING.with(|cell| cell.set(true));
     let out = f();
     PENDING.with(|cell| cell.set(false));
+    out
+}
+
+/// Whether the installed [`Source`] is turned off ([`Source::turned_off`]).
+fn turned_off() -> bool {
+    #[cfg(test)]
+    if TURNED_OFF.with(std::cell::Cell::get) {
+        return true;
+    }
+    INSTALLED.get().is_some_and(|source| source.turned_off())
+}
+
+/// Run `f` with this thread's source [`turned_off`].
+#[cfg(test)]
+pub(crate) fn while_turned_off<T>(f: impl FnOnce() -> T) -> T {
+    TURNED_OFF.with(|cell| cell.set(true));
+    let out = f();
+    TURNED_OFF.with(|cell| cell.set(false));
     out
 }
 
@@ -284,6 +309,7 @@ pub fn fleet_for(lab: &Lab, cli: Cli, existing: Option<&Roster>) -> Option<Fleet
         (ra.is_none(), ra, &a.label).cmp(&(rb.is_none(), rb, &b.label))
     });
     let mut accounts: Vec<FleetAccount> = Vec::with_capacity(mine.len());
+    let mut clashes = Vec::new();
     for (account, _) in mine {
         let kept = existing.and_then(|roster| {
             let mut rows = roster.rows.iter().filter(|row| account.is_row(row));
@@ -300,10 +326,11 @@ pub fn fleet_for(lab: &Lab, cli: Cli, existing: Option<&Roster>) -> Option<Fleet
                     .iter()
                     .any(|row| row.label == label && !account.is_row(row))
             });
-        if held_by_another
-            || accounts::label_refusal(&label).is_some()
-            || accounts.iter().any(|a| a.label == label)
-        {
+        if held_by_another {
+            clashes.push((label, account.email.clone()));
+            continue;
+        }
+        if accounts::label_refusal(&label).is_some() || accounts.iter().any(|a| a.label == label) {
             continue;
         }
         accounts.push(fleet_account(account, cli, &me, label, Class::Preferred));
@@ -322,6 +349,7 @@ pub fn fleet_for(lab: &Lab, cli: Cli, existing: Option<&Roster>) -> Option<Fleet
         accounts,
         alab: Some(me),
         known,
+        clashes,
         ..FleetRoster::default()
     })
 }
@@ -386,9 +414,15 @@ pub(super) fn chosen(
     }
     if named.is_some() {
         return fleet.map(Some).ok_or_else(|| {
-            "the lab registry names no machine for this Mac yet (its facts row binds none, or \
-             this Mac does not hold the registry), so the `alab` source has nothing to read"
-                .to_owned()
+            if turned_off() {
+                "`[alab] roster = false` in aterm.toml turns the lab source off, so the `alab` \
+                 source has nothing to read"
+                    .to_owned()
+            } else {
+                "the lab registry names no machine for this Mac yet (its facts row binds none, or \
+                 this Mac does not hold the registry), so the `alab` source has nothing to read"
+                    .to_owned()
+            }
         });
     }
     Ok(fleet)

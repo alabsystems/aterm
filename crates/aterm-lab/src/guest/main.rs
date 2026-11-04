@@ -8,6 +8,8 @@
 //!   number, owner name, owner pid, layer and bounds need no Screen Recording grant; its title,
 //!   which does, is never read): the first sweep's windows as `base` lines, then each window that
 //!   appears (`new`) and goes (`gone`).
+//! - `reader OUT`: the words of each dialog that comes up, read through Accessibility (the person
+//!   base's grant) and never answered: nothing is posted ([`reader`]).
 //! - `person OUT [--password PW] [--admin NAME:PW] [--sheet reopen|later] [--app EXE]`: the
 //!   person at the guest's console. A one-point pointer move every [`NUDGE`] (a posted HID event, which resets
 //!   `HIDIdleTime`: each input's line carries the idle clock read just before it and the read
@@ -46,9 +48,9 @@
 //!   `enrol HOME AUTHORITY`: the guest steps that are more than one command ([`steps`]); each
 //!   ends by itself.
 //!
-//! The first five and `captures` write a record: every line starts with its kind and the guest's
+//! The first six and `captures` write a record: every line starts with its kind and the guest's
 //! clock in epoch ms, and is flushed as written; the lane reads them (`mac_nux::read_census`,
-//! `read_person`, `read_watch`, `read_procs`, `mac_nux::phrase::read_desk`,
+//! `read_reader`, `read_person`, `read_watch`, `read_procs`, `mac_nux::phrase::read_desk`,
 //! `mac_nux::capture::read_shots`). Each of them runs until it is killed.
 
 #![deny(unsafe_code)]
@@ -111,7 +113,7 @@ fn main() {
 }
 
 fn run(args: &[String]) -> Result<(), String> {
-    let usage = "usage: aterm-lab-guest census OUT | person OUT [--password PW] [--admin NAME:PW] [--sheet reopen|later] [--app EXE] | watch FILE OUT [--kill PID --when-running MASK] | procs EXE OUT | captures EXE DIR OUT SOURCE=FILE... | capture EXE DIR OUT KEY [WORDS...] | member HOME LISTEN OUT [--allow NAME] [--advertise SERVICE] | browse SECS DIR SERVICE... | dns-sd SECS OUT ARG... | arrivals SEED JOINER FILE... | enrol HOME AUTHORITY";
+    let usage = "usage: aterm-lab-guest census OUT | reader OUT | person OUT [--password PW] [--admin NAME:PW] [--sheet reopen|later] [--app EXE] | watch FILE OUT [--kill PID --when-running MASK] | procs EXE OUT | captures EXE DIR OUT SOURCE=FILE... | capture EXE DIR OUT KEY [WORDS...] | member HOME LISTEN OUT [--allow NAME] [--advertise SERVICE] | browse SECS DIR SERVICE... | dns-sd SECS OUT ARG... | arrivals SEED JOINER FILE... | enrol HOME AUTHORITY";
     match args.first().map(String::as_str) {
         Some("census") => census(&Out::open(args.get(1).ok_or(usage)?)?),
         Some("person") => {
@@ -151,6 +153,7 @@ fn run(args: &[String]) -> Result<(), String> {
             };
             watch(file, &out, kill)
         }
+        Some("reader") => reader(&Out::open(args.get(1).ok_or(usage)?)?),
         Some("procs") => {
             let exe = args.get(1).ok_or(usage)?;
             procs(exe, &Out::open(args.get(2).ok_or(usage)?)?)
@@ -309,6 +312,55 @@ fn census(out: &Out) -> Result<(), String> {
             out.line("gone", &gone.to_string());
         }
         known = ids;
+    }
+}
+
+/// The owners whose windows `reader` reads: [`ACTS_ON`]'s dialogs, not System Settings itself (a
+/// page, not a question).
+fn read_by_reader(owner: &str) -> bool {
+    ACTS_ON.contains(&owner) && owner != "System Settings"
+}
+
+/// What `reader` writes for one dialog owner's windows now: `None` while its reading is the one
+/// it last wrote (`last`), or is empty, so each alert's words go into the record once per change.
+/// Pure.
+fn reader_line(last: Option<&str>, reading: &str) -> Option<String> {
+    (!reading.is_empty() && last != Some(reading)).then(|| reading.to_owned())
+}
+
+/// `reader OUT`: the words of every dialog that comes up ([`read_by_reader`]), read through
+/// Accessibility and never acted on: no pointer move, key or click is posted, so `HIDIdleTime`
+/// keeps running as it does with nobody at the console. Each owner's reading is written as a
+/// `words <pid> <owner>: <controls>` line whenever it changes ([`describe`], with no password
+/// known, so none is typed).
+fn reader(out: &Out) -> Result<(), String> {
+    out.line(
+        "reader",
+        &format!("trusted={}", if ax::trusted() { "yes" } else { "no" }),
+    );
+    let nobody = Credentials {
+        password: String::new(),
+        admin: None,
+        account: Vec::new(),
+    };
+    let mut last: BTreeMap<i32, String> = BTreeMap::new();
+    loop {
+        let windows = cg::on_screen().unwrap_or_default();
+        let owners: BTreeMap<i32, String> = windows
+            .iter()
+            .filter(|w| read_by_reader(&w.owner))
+            .map(|w| (w.pid, w.owner.clone()))
+            .collect();
+        last.retain(|pid, _| owners.contains_key(pid));
+        for (pid, owner) in &owners {
+            let nodes = ax::nodes(*pid);
+            let reading = describe(&nodes, 0..nodes.len(), &nobody);
+            if let Some(line) = reader_line(last.get(pid).map(String::as_str), &reading) {
+                out.line("words", &format!("{pid} {owner}: {line}"));
+                last.insert(*pid, line);
+            }
+        }
+        std::thread::sleep(SWEEP);
     }
 }
 
@@ -2734,6 +2786,32 @@ mod ax {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_reader_writes_each_dialogs_words_once_per_change_and_reads_no_settings_page() {
+        let alert = "AXWindow; AXStaticText \"Background Items Added\"";
+        assert_eq!(
+            reader_line(None, alert).as_deref(),
+            Some(alert),
+            "a new alert"
+        );
+        assert_eq!(
+            reader_line(Some(alert), alert),
+            None,
+            "the same words again"
+        );
+        let next = "AXWindow; AXStaticText \"aterm would like to\"";
+        assert_eq!(
+            reader_line(Some(alert), next).as_deref(),
+            Some(next),
+            "changed"
+        );
+        assert_eq!(reader_line(None, ""), None, "nothing read");
+        assert!(read_by_reader("UserNotificationCenter"));
+        assert!(read_by_reader("CoreServicesUIAgent"));
+        assert!(!read_by_reader("System Settings"), "a page, not a question");
+        assert!(!read_by_reader("aterm"), "the app's own windows");
+    }
 
     #[test]
     fn the_person_waits_for_the_idle_clock_to_run_its_quiet_before_an_input() {

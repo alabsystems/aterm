@@ -192,7 +192,7 @@ fn transposed(m: &Model) -> Model {
     let transpose = |e: &Expr| scalar_form(e, &vars);
     let mut m = m.clone();
     for action in &mut m.actions {
-        action.guard = action.guard.as_ref().map(&transpose);
+        action.guard = action.guard.as_ref().map(transpose);
         for update in &mut action.updates {
             update.expr = transpose(&update.expr);
         }

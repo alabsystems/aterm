@@ -28,6 +28,7 @@ mod admit;
 mod bounded;
 mod chain_cache;
 mod continuity;
+mod control_recovery;
 mod creation;
 pub mod custodian;
 mod enrollment;
@@ -69,6 +70,10 @@ pub use admit::{
 };
 pub use bounded::{join_if_unchanged_until, sync_reader_until};
 pub use continuity::{Split, SplitBy, seat_splits, splits};
+pub use control_recovery::{
+    CommonsRecovery, CommonsRecoveryCapacity, CommonsRecoveryPlan, CommonsRecoveryRecipient,
+    plan_commons_control_recovery, restore_commons_control,
+};
 pub use enrollment::{admin_cached, admin_cached_until};
 pub use entry::{
     EntryObservation, EntrySnapshot, EntryVersion, VerifiedEntry, observe_verified_entry,
@@ -93,7 +98,9 @@ pub use handover::{
     take_handover_hold, write_from_bundle,
 };
 pub use http204_observation::{VaultHttp204Response, observe_http204_response};
-pub use inspection::CommonsControlInspection;
+pub use inspection::{
+    CommonsControlInspection, MembershipHistoryInspection, inspect_membership_history_until,
+};
 pub use ledger_publish::{
     MergedHeads, ObservedHead, extend_parent_spine, ledger_publish_environment,
     merge_diverged_heads, publish_to_servers, read_server_heads, verify_approved_in_served_head,
@@ -121,9 +128,10 @@ pub use remove::{
     ListedMac, MemberRemoval, RemovedNote, RemovedNotes, UndoOffer, UndoShare, member_list,
     read_after_cutoff_lines, remove_member, removed_notes, removes_by_log, reseal_waits,
     revoke_by_log, tend_epochs, tend_epochs_at, undo_offers, undo_removals, vault_admin_named,
+    vault_pass_at,
 };
 #[cfg(any(test, debug_assertions))]
-pub use remove::{test_put_everyone, test_remove_unposted, test_tend_at};
+pub use remove::{test_put_everyone, test_remove_unposted};
 pub use retirement::{
     Retirement, Revocation, StolenRevocation, admin_retire, admin_revoke, admin_revoke_stolen,
     machine_named_in_vault, repair_half_done_revokes, rotate_fleet_code_text,
@@ -156,6 +164,8 @@ mod join_tests;
 mod log_entries_tests;
 #[cfg(test)]
 mod own_head_tests;
+#[cfg(test)]
+mod parent_history_tests;
 #[cfg(test)]
 mod peer_candidates_tests;
 #[cfg(test)]
@@ -264,9 +274,25 @@ impl Paths {
         self.dir.join("served")
     }
 
-    /// Where this machine keeps its verified membership-record log.
+    /// The logical entry for this machine's verified membership-record log. Resolve its data
+    /// with [`Self::records_data_file`]; an entry that fenced older writers is a directory.
     pub fn records_file(&self) -> PathBuf {
         self.dir.join("records")
+    }
+
+    /// The current data file selected by the records entry, without changing storage.
+    ///
+    /// # Errors
+    /// The layout is pending, unsafe, missing its current file, inconsistent with its pin, or
+    /// requires a larger reader capacity than this build supports.
+    pub fn records_data_file(&self) -> crate::Result<PathBuf> {
+        crate::records_storage::data_path(&self.records_file())
+    }
+
+    /// The crossed mark beside [`Self::records_file`] ([`crate::crossing::Mark`]): stored once
+    /// this Mac's log crosses, never removed.
+    pub(crate) fn crossed_file(&self) -> PathBuf {
+        self.dir.join("records.crossed")
     }
 }
 
@@ -649,7 +675,13 @@ impl StateLock {
     }
 
     fn take(paths: &Paths) -> crate::Result<StateLock> {
-        Self::take_at(paths, &paths.lock_file())
+        Self::take_at(paths, &paths.lock_file())?.recovered(paths)
+    }
+
+    /// Finish only a storage transition a previous writer already prepared.
+    fn recovered(self, paths: &Paths) -> crate::Result<Self> {
+        crate::records_storage::recover_pending(&paths.records_file())?;
+        Ok(self)
     }
 
     /// [`StateLock::take`] of the lock file at `path` in `paths.dir` ([`publish_lock`]).
@@ -685,7 +717,7 @@ impl StateLock {
             reason = "the non-blocking take of StateLock, whose Drop releases by LOCK_UN (File::unlock)"
         )]
         match file.try_lock() {
-            Ok(()) => Ok(Some(StateLock(file))),
+            Ok(()) => StateLock(file).recovered(paths).map(Some),
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
             Err(std::fs::TryLockError::Error(e)) => {
                 Err(Error::new(format!("{}: {e}", path.display())))
@@ -3027,16 +3059,17 @@ fn records_store_for(
     })
 }
 
-/// Load this machine's persisted membership-record [`crate::membership_log::Store`] (empty when
-/// `paths.records_file()` does not exist yet). A file this build refuses as a whole keeps the
-/// records it still takes ([`crate::membership_log::Store::recover`]), and the next write
+/// Load this machine's persisted membership-record [`crate::membership_log::Store`] (empty
+/// before its first records file). A pinned layout with missing data is an error. A file this
+/// build refuses as a whole keeps the records it still takes
+/// ([`crate::membership_log::Store::recover`]), and the next write
 /// replaces it, so one refused record never stops this Mac taking records. A file past
 /// [`crate::membership_log::MAX_RECORDS_STREAM`] (a build that bounded its store by count alone
 /// could write one) keeps the records its first that many bytes hold.
 ///
 /// # Errors
-/// `source.toml` cannot be read or parsed, `records` cannot be read, or this build's ALab genesis
-/// digest is malformed.
+/// `source.toml` cannot be read or parsed, the records layout is unavailable, the data cannot
+/// be read, or this build's ALab genesis digest is malformed.
 pub fn load_records(paths: &Paths) -> crate::Result<crate::membership_log::Store> {
     let (vault, store) = records_store(paths)?;
     records_cache::read(paths, vault, store)
@@ -3080,8 +3113,70 @@ fn write_record_buffered(
     buffered.flush()
 }
 
+/// Write `store` to `paths.records_file()`: where it holds more records than a build before
+/// the fence takes ([`crate::crossing::past_legacy`]), the crossed mark is stored first, so no
+/// records file passes that bound without it.
+///
+/// # Errors
+/// The mark cannot be stored (the file is then left as it was), or the file cannot be written.
 fn write_records(paths: &Paths, store: &crate::membership_log::Store) -> crate::Result<()> {
-    write_record_file(&paths.records_file(), |writer| store.write_encoded(writer))
+    let crosses = crate::crossing::past_legacy(
+        store
+            .log()
+            .map_or(0, crate::membership_log::Log::held_count),
+    );
+    let mark = crossing_mark(paths);
+    // MUTANT (`crate::crossing::Faults::mark_after_take`): the file first, then the mark.
+    #[cfg(test)]
+    if crosses && crate::crossing::faults(mark.path()).mark_after_take {
+        write_record_file(&records_file_for_write(paths, store)?, |writer| {
+            store.write_encoded(writer)
+        })?;
+        return mark.store();
+    }
+    if crosses {
+        mark.store()?;
+    }
+    write_record_file(&records_file_for_write(paths, store)?, |writer| {
+        store.write_encoded(writer)
+    })
+}
+
+/// Isolate the old regular-file path before publishing custody that an older reader cannot hold.
+fn records_file_for_write(
+    paths: &Paths,
+    store: &crate::membership_log::Store,
+) -> crate::Result<crate::records_storage::WriteTarget> {
+    crate::records_storage::write_path(
+        &paths.records_file(),
+        crate::crossing::past_legacy(store.len()) || records_marked_crossed(paths)?,
+    )
+}
+
+/// This Mac's crossed mark ([`Paths::crossed_file`]).
+pub(crate) fn crossing_mark(paths: &Paths) -> crate::crossing::Mark {
+    crate::crossing::Mark::at(paths.crossed_file())
+}
+
+/// Whether this Mac has the durable, one-way crossed mark, without opening its records file.
+/// A caller with a verified snapshot must also preserve that snapshot's crossed bound.
+///
+/// # Errors
+/// The mark's path cannot be read.
+pub fn records_marked_crossed(paths: &Paths) -> crate::Result<bool> {
+    crossing_mark(paths).stored()
+}
+
+/// What this Mac states of its records ([`crate::crossing::RecordsBound`]), its log as `store`
+/// holds it.
+///
+/// # Errors
+/// The mark's path cannot be read.
+pub fn records_bound(
+    paths: &Paths,
+    store: &crate::membership_log::Store,
+) -> crate::Result<crate::crossing::RecordsBound> {
+    crate::crossing::stated(&crossing_mark(paths), store)
 }
 
 #[cfg(test)]
@@ -3090,16 +3185,108 @@ mod record_persistence_tests;
 
 /// Retain verified membership records offered over Commons control repair for `(network,
 /// authority)`, returning one durable acknowledgement per wire.
+/// The legacy database protocols carry no crossed-state metadata, so a crossed local store
+/// refuses them before acknowledging or retaining records.
 ///
 /// # Errors
-/// Local custody cannot be read or made durable.
+/// Local custody cannot be read or made durable, or the local history crossed the legacy bound.
 pub fn retain_records_for_commons(
     paths: &Paths,
     network: [u8; 16],
     authority: [u8; 32],
     wires: &[Vec<u8>],
 ) -> crate::Result<Vec<bool>> {
+    retain_records_for_commons_with(paths, network, authority, wires, || {})
+}
+
+fn require_legacy_commons_records(
+    paths: &Paths,
+    store: &crate::membership_log::Store,
+) -> crate::Result<()> {
+    if records_bound(paths, store)?.crossed {
+        return Err(Error::of_kind(
+            crate::ErrorKind::Refused,
+            "crossed membership history requires a newer Commons database protocol",
+        ));
+    }
+    Ok(())
+}
+
+/// Retain Commons membership records from a peer whose bound was negotiated before its records.
+/// Acknowledgements name durable, complete records; they do not assert that either peer is fresh.
+/// A crossed source's new complete records make this Mac crossed before they are written.
+/// Duplicate-only and waiting-only batches do not cross it, and waiting-only crossed batches
+/// are not retained. The caller must recheck its current bound before sending further records.
+///
+/// # Errors
+/// Local custody cannot be read or made durable, or either capacity cannot represent the
+/// other peer's possible history, or the batch exceeds the local record or byte bound.
+pub fn retain_bounded_records_for_commons(
+    paths: &Paths,
+    network: [u8; 16],
+    authority: [u8; 32],
+    source: crate::crossing::RecordsBound,
+    wires: &[Vec<u8>],
+) -> crate::Result<Vec<bool>> {
+    retain_commons_records_with(paths, network, authority, wires, Some(source), || {})
+}
+
+fn require_commons_source(
+    paths: &Paths,
+    store: &crate::membership_log::Store,
+    source: Option<crate::crossing::RecordsBound>,
+) -> crate::Result<()> {
+    if let Some(source) = source {
+        if !records_bound(paths, store)?.can_exchange(source) {
+            return Err(Error::of_kind(
+                crate::ErrorKind::Refused,
+                "Commons membership record capacities are incompatible",
+            ));
+        }
+        Ok(())
+    } else {
+        require_legacy_commons_records(paths, store)
+    }
+}
+
+// The callback lets a test interleave a writer after the initial read and before the lock.
+fn retain_records_for_commons_with(
+    paths: &Paths,
+    network: [u8; 16],
+    authority: [u8; 32],
+    wires: &[Vec<u8>],
+    before_lock: impl FnOnce(),
+) -> crate::Result<Vec<bool>> {
+    retain_commons_records_with(paths, network, authority, wires, None, before_lock)
+}
+
+fn retain_commons_records_with(
+    paths: &Paths,
+    network: [u8; 16],
+    authority: [u8; 32],
+    wires: &[Vec<u8>],
+    source: Option<crate::crossing::RecordsBound>,
+    before_lock: impl FnOnce(),
+) -> crate::Result<Vec<bool>> {
     let expected = crate::membership_log::Root { network, authority };
+    let prefetched = if source.is_some() {
+        let store = load_records(paths)?;
+        require_commons_source(paths, &store, source)?;
+        let bytes = wires
+            .iter()
+            .try_fold(0usize, |n, wire| n.checked_add(wire.len()));
+        if wires.len() > store.budgets().held
+            || bytes.is_none_or(|n| n > crate::membership_log::MAX_RECORDS_STREAM)
+        {
+            return Err(Error::of_kind(
+                crate::ErrorKind::Refused,
+                "Commons membership batch exceeds the record or byte bound",
+            ));
+        }
+        Some(store)
+    } else {
+        None
+    };
     let decoded: Vec<Option<crate::membership_log::Record>> = wires
         .iter()
         .map(|wire| {
@@ -3117,7 +3304,11 @@ pub fn retain_records_for_commons(
     if decoded.iter().all(Option::is_none) {
         return Ok(vec![false; wires.len()]);
     }
-    let known = load_records(paths)?;
+    let known = match prefetched {
+        Some(store) => store,
+        None => load_records(paths)?,
+    };
+    require_commons_source(paths, &known, source)?;
     if let Some(log) = known.log() {
         let crate::membership_log::Body::Genesis { root, .. } = log.genesis().body() else {
             return Ok(vec![false; wires.len()]);
@@ -3139,6 +3330,7 @@ pub fn retain_records_for_commons(
         }
         return Ok(held);
     }
+    before_lock();
     let Some(_lock) = StateLock::try_take_until(paths, Instant::now() + Duration::from_secs(2))?
     else {
         if held.iter().any(|&h| h) {
@@ -3147,6 +3339,7 @@ pub fn retain_records_for_commons(
         return Ok(held);
     };
     let mut store = load_records(paths)?;
+    require_commons_source(paths, &store, source)?;
     if let Some(log) = store.log() {
         let crate::membership_log::Body::Genesis { root, .. } = log.genesis().body() else {
             return Ok(vec![false; wires.len()]);
@@ -3156,6 +3349,16 @@ pub fn retain_records_for_commons(
         }
     }
     let before = store.inventory();
+    let complete_before = store
+        .log()
+        .map_or(0, crate::membership_log::Log::held_count);
+    let held_before: Vec<bool> = decoded
+        .iter()
+        .map(|r| {
+            r.as_ref()
+                .is_some_and(|rec| store.complete_bytes(rec.id()).is_some())
+        })
+        .collect();
     let complete =
         |id: &crate::membership_log::RecordId| store.log().and_then(|log| log.get(id)).is_some();
     for record in crate::membership_log::store::causal(decoded.iter().flatten().cloned(), complete)
@@ -3171,8 +3374,19 @@ pub fn retain_records_for_commons(
     if *root != expected || !log_entries::commons_log_matches_local_lineage(paths, log)? {
         return Ok(vec![false; wires.len()]);
     }
+    let taught_by_crossed = source.is_some_and(|bound| bound.crossed);
+    if taught_by_crossed && log.held_count() == complete_before {
+        if held_before.iter().any(|&held| held) {
+            aterm_durable::durable_dir(&paths.dir).map_err(|e| Error::new(e.to_string()))?;
+        }
+        return Ok(held_before);
+    }
     if store.inventory() != before {
-        write_records(paths, &store)?;
+        if taught_by_crossed {
+            write_taught_by_crossed(paths, &crossing_mark(paths), &store)?;
+        } else {
+            write_records(paths, &store)?;
+        }
     } else if decoded.iter().any(|r| {
         r.as_ref()
             .is_some_and(|rec| store.complete_bytes(rec.id()).is_some())
@@ -3244,6 +3458,20 @@ pub(crate) struct RecordsPass {
     /// cannot read is one, so such a pass did not read every record of the vault's newest
     /// (`readmit::admit_by_proof`).
     pub(crate) untaken: bool,
+    /// No server that answered stated a records bound compatible with the retained history
+    /// ([`crate::crossing`]). An old server can hold none of what came after the vault crossed,
+    /// even where this Mac has not crossed yet. A smaller server can likewise stop following
+    /// the history when this pass's merge crosses. Neither is evidence of the newest records;
+    /// compatible records it sent before the merge can still be retained.
+    pub(crate) unstated: bool,
+}
+
+impl RecordsPass {
+    /// Whether the pass read all of the vault's newest records: it left nothing a server sent
+    /// untaken, and a server able to exchange the retained history answered it.
+    pub(crate) const fn fresh(&self) -> bool {
+        !self.untaken && !self.unstated
+    }
 }
 
 /// What a bounded records pass ([`sync_records_until`]) keeps of its deadline, once its pulls end,
@@ -3296,6 +3524,8 @@ struct PeerRecords {
     needs: bool,
     /// Its boot id ([`transport::ReceivedRecordsAnswer::boot`]).
     boot: Option<String>,
+    /// What it stated of its records ([`transport::ReceivedRecordsAnswer::bound`]).
+    bound: transport::ReplyBound,
 }
 
 /// The records a peer sent, as a records pass holds them once every pull has ended.
@@ -3306,6 +3536,16 @@ enum Brought {
     /// more such large responses awaiting Store judgment are held at once than
     /// [`fan_out::reads_within`] reads whole at once.
     Judged(RecordsJudged),
+}
+
+impl Brought {
+    /// Whether the peer sent any record.
+    fn any(&self) -> bool {
+        match self {
+            Self::Unjudged(received) => received.byte_len() > 0,
+            Self::Judged(_) => true,
+        }
+    }
 }
 
 impl PeerRecords {
@@ -3319,6 +3559,7 @@ impl PeerRecords {
             received,
             needs,
             boot,
+            bound,
         } = answer;
         let records = if received.byte_len() > fan_out::RECORDS.peek {
             Brought::Judged(judge(received))
@@ -3329,6 +3570,7 @@ impl PeerRecords {
             records,
             needs,
             boot,
+            bound,
         }
     }
 }
@@ -3342,6 +3584,15 @@ impl PeerRecords {
 /// restarted since.
 /// A bounded caller (`deadline`) ends every exchange by it and posts nothing; otherwise the posts
 /// end by `posts_by`, or one exchange from when they start where none is given.
+///
+/// Every pull and post states this Mac's records bound ([`crate::crossing`]). Once its log
+/// crossed, or once a server that states it crossed sent records, the pass takes nothing from a
+/// server that stated no bound, as from one that failed, and posts only to servers that stated
+/// one. A Mac that has not crossed takes what crossed servers sent after the rest, and only where
+/// it grows the store's complete log: the mark is then stored before the records file holds any
+/// of it, and a crossed server's batch that brings nothing new, or only records waiting on a
+/// parent, is not taken and stores no mark. Crossed or not, the pass is fresh
+/// ([`RecordsPass::fresh`]) only where a server compatible with the retained history answered.
 fn sync_records_until(
     paths: &Paths,
     wait: Option<Duration>,
@@ -3353,13 +3604,18 @@ fn sync_records_until(
     use crate::membership_log::untaken::{Named, Noted, Sent};
 
     let config = configured(paths)?;
+    let mark = crossing_mark(paths);
     let Source::Url(primary_url) = &config.source else {
+        // A vault at a path has no server, so none before the fence.
         return Ok(RecordsPass {
             added: 0,
             untaken: false,
+            unstated: false,
         });
     };
     let local_store = load_records(paths)?;
+    let crossed_before = crate::crossing::crossed(&mark, &local_store)?;
+    let bound = crate::crossing::RecordsBound::of(local_store.budgets().held, crossed_before);
     let records_file = paths.records_file();
     let now = Instant::now();
     // The frontier of the store every pull below names `have` from: a pass notes what a server
@@ -3386,7 +3642,14 @@ fn sync_records_until(
     let primary_named = named(primary_url);
     let sub_ref = subscriber.as_deref();
     let fetch_primary = || {
-        transport::fetch_record_frames_sync(primary_url, &primary_named.ids, wait, total, sub_ref)
+        transport::fetch_record_frames_sync(
+            primary_url,
+            &primary_named.ids,
+            wait,
+            total,
+            sub_ref,
+            bound,
+        )
     };
     // A bounded pass browses for peers by its own deadline, not a fixed probe of its own.
     let bounded_browse = PeerDiscovery::direct(pulls_by);
@@ -3439,7 +3702,7 @@ fn sync_records_until(
                     peers,
                     within,
                     |url, left, limit| {
-                        transport::fetch_records_within(url, ids(url), left, sub_ref, limit)
+                        transport::fetch_records_within(url, ids(url), left, sub_ref, bound, limit)
                     },
                     |url, read| match read? {
                         transport::Pulled::Fetched(answer) => Ok(PeerRecords::of(answer, judge)),
@@ -3487,6 +3750,56 @@ fn sync_records_until(
         (primary, peers, peer_batches)
     };
 
+    // A server that states its log crossed and sent records may cross this Mac's
+    // ([`crate::crossing`]): then, and once it crossed, a server that stated no bound counts as
+    // one that failed, so nothing it sent is taken, noted or answered.
+    let crossing = !crossed_before
+        && (primary
+            .as_ref()
+            .is_ok_and(|answer| answer.bound.crossed() && answer.received.byte_len() > 0)
+            || peer_batches.iter().any(|(_, _, res)| {
+                res.as_ref()
+                    .is_ok_and(|peer| peer.bound.crossed() && peer.records.any())
+            }));
+    let unstated_source = |url: &str| {
+        Error::new(format!(
+            "{}: this Mac's membership log crossed the bound a build before the fence holds, and \
+             the server stated no records bound, so nothing it sent is taken",
+            transport::describe(url)
+        ))
+    };
+    let (primary, peer_batches) = if crossed_before || crossing {
+        let primary = primary.and_then(|answer| match answer.bound {
+            transport::ReplyBound::Unstated => Err(unstated_source(primary_url)),
+            transport::ReplyBound::Unheard | transport::ReplyBound::Stated(_) => Ok(answer),
+        });
+        let peer_batches: Vec<PeerRecordsFetch> = peer_batches
+            .into_iter()
+            .map(|(url, named_heads, res)| {
+                let res = res.and_then(|peer| match peer.bound {
+                    transport::ReplyBound::Unstated => Err(unstated_source(&url)),
+                    transport::ReplyBound::Unheard | transport::ReplyBound::Stated(_) => Ok(peer),
+                });
+                (url, named_heads, res)
+            })
+            .collect();
+        (primary, peer_batches)
+    } else {
+        (primary, peer_batches)
+    };
+    // Keep the answering bounds until ingestion ends: merging uncrossed branches can cross
+    // this Mac's log, making a previously compatible smaller server unable to follow it.
+    let answering_bounds: Vec<_> = primary
+        .as_ref()
+        .ok()
+        .and_then(|answer| answer.bound.stated())
+        .into_iter()
+        .chain(
+            peer_batches
+                .iter()
+                .filter_map(|(_, _, res)| res.as_ref().ok().and_then(|peer| peer.bound.stated())),
+        )
+        .collect();
     // A server that answered a pull naming a memo's heads left their closure out of its answer.
     let mut untaken = (primary.is_ok() && primary_named.heads > 0)
         || peer_batches
@@ -3503,9 +3816,11 @@ fn sync_records_until(
             sent.push((url.to_owned(), judged.stream, judged.whole));
             judged.batch
         };
-    let mut verified_batches = Vec::new();
-    // Each server that lacks this Mac's frontier, with the boot id its answer carried.
-    let mut push_urls: Vec<(String, Option<String>)> = Vec::new();
+    // Each batch, with whether a server that states its log crossed sent it.
+    let mut verified_batches: Vec<(Vec<crate::membership_log::Record>, bool)> = Vec::new();
+    // Each server that lacks this Mac's frontier, with the boot id its answer carried and what
+    // it stated of its records.
+    let mut push_urls: Vec<(String, Option<String>, transport::ReplyBound)> = Vec::new();
     let mut any_answered = false;
     let mut primary_err = None;
     let mut primary_refused = false;
@@ -3514,6 +3829,7 @@ fn sync_records_until(
             received,
             needs,
             boot,
+            bound,
         }) => {
             any_answered = true;
             if primary_named.heads > 0 {
@@ -3524,12 +3840,12 @@ fn sync_records_until(
             }
             if received.byte_len() == 0 {
                 if needs {
-                    push_urls.push((primary_url.clone(), boot));
+                    push_urls.push((primary_url.clone(), boot, bound));
                 }
             } else if let Some(batch) = offered(primary_url, judge(received)) {
-                verified_batches.push(batch);
+                verified_batches.push((batch, bound.crossed()));
                 if needs {
-                    push_urls.push((primary_url.clone(), boot));
+                    push_urls.push((primary_url.clone(), boot, bound));
                 }
             } else {
                 primary_refused = true;
@@ -3542,6 +3858,7 @@ fn sync_records_until(
             records,
             needs,
             boot,
+            bound,
         }) = res
         else {
             continue;
@@ -3561,15 +3878,15 @@ fn sync_records_until(
             None => {
                 any_answered = true;
                 if needs {
-                    push_urls.push((url, boot));
+                    push_urls.push((url, boot, bound));
                 }
             }
             Some(judged) => {
                 if let Some(batch) = offered(&url, judged) {
                     any_answered = true;
-                    verified_batches.push(batch);
+                    verified_batches.push((batch, bound.crossed()));
                     if needs {
-                        push_urls.push((url, boot));
+                        push_urls.push((url, boot, bound));
                     }
                 }
             }
@@ -3600,20 +3917,86 @@ fn sync_records_until(
         note(&local_store);
         return Err(err);
     }
+    let lock = bounded::take(paths, deadline)?;
+    let mut store = load_records(paths)?;
+    // Pulls run outside the writer lock. Another writer can cross while they are in flight;
+    // their earlier filtering and freshness judgment then describe the wrong side of the fence.
+    // Discard that pass before ingest or a fresh admission, even if its response was empty.
+    if !crossed_before && crate::crossing::crossed(&mark, &store)? {
+        return Err(Error::new(
+            "the membership log crossed while its records pull was in flight",
+        ));
+    }
+    let mut retained_bound = records_bound(paths, &store)?;
     let added = if verified_batches.is_empty() {
-        untaken |= note(&local_store);
+        untaken |= note(&store);
         0
     } else {
-        let _lock = bounded::take(paths, deadline)?;
-        let mut store = load_records(paths)?;
+        // MUTANT (`crate::crossing::Faults::mark_on_receipt`): the mark once a crossed log's
+        // server sent records, before the store shows it takes any.
+        #[cfg(test)]
+        if crossing
+            && verified_batches
+                .iter()
+                .any(|(_, from_crossed)| *from_crossed)
+            && crate::crossing::faults(mark.path()).mark_on_receipt
+        {
+            mark.store()?;
+        }
         let before = store.inventory();
         let rooted = store.log().is_some();
         let mut any_ingested = false;
         let mut last_ingest_err = None;
-        for batch in verified_batches {
+        // Whether the store took a batch a crossed log's server sent that brought it a record it
+        // lacked: the store is this pass's own until `write_records`, so the mark goes there,
+        // before the file holds such a record ([`write_taught_by_crossed`]).
+        let mut taught_by_crossed = false;
+        // What crossed logs' servers sent a Mac that has not crossed: taken after the rest, and
+        // only where it grows the complete log.
+        let mut from_crossed_logs = Vec::new();
+        for (batch, from_crossed) in verified_batches {
+            if from_crossed && !crossed_before {
+                from_crossed_logs.push(batch);
+                continue;
+            }
             match store.ingest_records(batch) {
-                Ok(_) => any_ingested = true,
+                Ok(brought) => {
+                    any_ingested = true;
+                    taught_by_crossed |= from_crossed && brought > 0;
+                }
                 Err(err) => last_ingest_err = Some(err),
+            }
+        }
+        if !from_crossed_logs.is_empty() {
+            // Into a copy, so a crossed log's batch that only brings records waiting on a parent
+            // is not taken and stores no mark: a record waits for any key that ever held a seat
+            // (`Log::insert`), a removed Mac's among them, with a parent that may never come, and
+            // it would cross this Mac for good though it never completes. An honest server answers
+            // every complete record past the ids this pull named, so its records wait here only on
+            // records this store can never take (`membership_log::untaken`), and the pass notes
+            // them untaken whether it holds them waiting or leaves them out.
+            let complete = |store: &crate::membership_log::Store| {
+                store
+                    .log()
+                    .map_or(0, crate::membership_log::Log::held_count)
+            };
+            let mut taught = store.clone();
+            for batch in from_crossed_logs {
+                match taught.ingest_records(batch) {
+                    Ok(_) => any_ingested = true,
+                    Err(err) => last_ingest_err = Some(err),
+                }
+            }
+            let grew = complete(&taught) > complete(&store);
+            // MUTANT (`crate::crossing::Faults::mark_on_waiting`): the copy taken, and the mark
+            // stored, where it brought any record, a waiting one among them.
+            #[cfg(test)]
+            let grew = grew
+                || (crate::crossing::faults(mark.path()).mark_on_waiting
+                    && !taught.inventory().is_subset(&store.inventory()));
+            if grew {
+                store = taught;
+                taught_by_crossed = true;
             }
         }
         if !any_ingested && let Some(err) = last_ingest_err {
@@ -3643,7 +4026,9 @@ fn sync_records_until(
         } else {
             0
         };
-        if added > 0 {
+        if added > 0 && taught_by_crossed {
+            write_taught_by_crossed(paths, &mark, &store)?;
+        } else if added > 0 {
             write_records(paths, &store)?;
         }
         // Against the store the lock holds, which is the file now: never a store read after the
@@ -3651,23 +4036,35 @@ fn sync_records_until(
         // lock found it, with no genesis, which no memo applies to, and it took nothing sent.
         if kept {
             untaken |= note(&store);
+            retained_bound = records_bound(paths, &store)?;
         } else {
             untaken |= !sent.is_empty();
         }
         added
     };
+    let stated = answering_bounds
+        .into_iter()
+        .any(|peer| retained_bound.can_exchange(peer));
+    drop(lock);
     if deadline.is_none()
         && !push_urls.is_empty()
         && let Ok(store) = load_records(paths)
         && store.log().is_some()
+        && let Ok(bound) = records_bound(paths, &store)
     {
         // Complete records only: a server keeps the records it holds waiting on a parent in
         // memory only and serves none of them (F23, rule 7), so they bought nothing on the wire.
         let frontier = sha256(&store.frontier().concat());
         let have = store.have();
+        // Post only to compatible servers. A crossed Mac's query also makes older servers
+        // refuse its body before reading it.
         let due: Vec<Due<'_>> = push_urls
             .iter()
-            .filter_map(|(url, boot)| {
+            .filter(|(_, _, stated)| match stated.stated() {
+                Some(peer) => bound.can_exchange(peer),
+                None => !bound.crossed,
+            })
+            .filter_map(|(url, boot, _)| {
                 let boot = boot.as_deref();
                 let (past, posting) = match Reposted::due(paths, url, &frontier, boot)? {
                     Repost::Whole { boot_reset } => (None, Posting::Whole { boot_reset }),
@@ -3698,7 +4095,7 @@ fn sync_records_until(
             .filter(|(_, body)| !body.is_empty())
             .collect();
         let by = posts_by.unwrap_or_else(fan_out::one_exchange);
-        let mut answers = fan_out::post_record_selections(&posts, by).into_iter();
+        let mut answers = fan_out::post_record_selections(&posts, bound, by).into_iter();
         for due in &due {
             // `answers` holds one answer for each non-empty body, in order.
             if due.past.as_deref().unwrap_or(&whole).is_empty()
@@ -3715,7 +4112,53 @@ fn sync_records_until(
             }
         }
     }
-    Ok(RecordsPass { added, untaken })
+    Ok(RecordsPass {
+        added,
+        untaken,
+        unstated: !stated,
+    })
+}
+
+/// Write `store`, which holds a record a crossed log's server taught this Mac
+/// ([`crate::crossing`]): the mark first, so the records file never holds such a record without
+/// it.
+///
+/// # Errors
+/// The mark cannot be stored (the file is then left as it was), or the file cannot be written.
+fn write_taught_by_crossed(
+    paths: &Paths,
+    mark: &crate::crossing::Mark,
+    store: &crate::membership_log::Store,
+) -> crate::Result<()> {
+    after_crossed_mark(mark, || write_records(paths, store))
+}
+
+/// Publish custody only after its source's durable crossed mark. The closure may also publish
+/// the configuration selecting those records, so no new reader can observe them without it.
+fn after_crossed_mark<T>(
+    mark: &crate::crossing::Mark,
+    publish: impl FnOnce() -> crate::Result<T>,
+) -> crate::Result<T> {
+    #[cfg(test)]
+    let faults = crate::crossing::faults(mark.path());
+    // MUTANT (`crate::crossing::Faults::mark_after_take`): the file first, then the mark.
+    #[cfg(test)]
+    if faults.mark_after_take {
+        let result = publish()?;
+        if faults.dies_between {
+            return Err(Error::new("a test's Mac died before its crossed mark"));
+        }
+        mark.store()?;
+        return Ok(result);
+    }
+    mark.store()?;
+    #[cfg(test)]
+    if faults.dies_between {
+        return Err(Error::new(
+            "a test's Mac died between its crossed mark and its records",
+        ));
+    }
+    publish()
 }
 
 /// How long a server that said it lacked this Mac's frontier, was posted the store, judged it
@@ -4121,6 +4564,13 @@ fn sync_repairing(
     sync_repairing_inner(paths, wait, repaired, &[], true, None, None)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The negative control of the vault pass's reach: while set, only a member whose vault is at
+    /// a URL runs it, as before the exchange stopped signing.
+    pub(crate) static URL_ONLY_PASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// [`sync`] with `extra_peers` as its candidates, mirroring diverged servers where
 /// `allow_mirror`; a subscriber's pass hands it the servers its browse found and where to
 /// keep what the source itself said (`subscribing`, [`sync_found`]). The records posts of the
@@ -4168,8 +4618,15 @@ fn sync_repairing_hearing(
     let browsed = subscribing.map(|(found, _)| found);
     if matches!(config.source, Source::Url(_)) {
         let _ = sync_records_inner(paths, None, extra_peers, browsed, posts_by);
-        log_entries::tend_wrap_gaps(paths, posts_by);
-        let _ = remove::tend_epochs_by(paths, posts_by);
+    }
+    // Every log member's vault pass, a vault at a path included: its records come from Commons
+    // exchanges, which sign nothing, so this is where its wrap gaps close and its re-keys mint.
+    #[cfg(test)]
+    let pass = !URL_ONLY_PASS.with(std::cell::Cell::get) || matches!(config.source, Source::Url(_));
+    #[cfg(not(test))]
+    let pass = true;
+    if pass {
+        remove::vault_pass(paths, posts_by);
     }
     let pending_records =
         log_entries::current_records_digest(paths, &config, &before) != before.records_digest;
@@ -4318,7 +4775,11 @@ fn sync_repairing_hearing(
                 });
                 if let Some(probed) = found.into_iter().max_by_key(|p| (p.seq, p.digest)) {
                     let take_peer = match &primary_result {
-                        Err(_) => probed.seq >= before.seq,
+                        Err(_) => {
+                            probed.seq > before.seq
+                                || (probed.seq == before.seq
+                                    && before.digest.is_none_or(|digest| digest == probed.digest))
+                        }
                         Ok(Fetched::Missing) => probed.seq > before.seq || before.seq == 0,
                         Ok(Fetched::NoNewer(_) | Fetched::Body(_)) => {
                             probed.seq > before.seq
@@ -4328,15 +4789,19 @@ fn sync_repairing_hearing(
                     if take_peer {
                         network_body = probed.network_body;
                         primary_result = Ok(Fetched::Body(probed.envelope));
-                    } else if let (Ok(Fetched::Body(primary_bytes)), Some((exact_env, exact_body))) =
-                        (&primary_result, exact_held_peer)
-                        && envelope::parse(primary_bytes).is_ok_and(|parsed| {
-                            parsed.seq == before.seq && Some(parsed.digest()) != before.digest
-                        })
+                    } else if let Some((exact_env, exact_body)) = exact_held_peer
+                        && match &primary_result {
+                            Err(_) => true,
+                            Ok(Fetched::Body(primary_bytes)) => envelope::parse(primary_bytes)
+                                .is_ok_and(|parsed| {
+                                    parsed.seq == before.seq
+                                        && Some(parsed.digest()) != before.digest
+                                }),
+                            Ok(Fetched::Missing | Fetched::NoNewer(_)) => false,
+                        }
                     {
-                        // When primary and a verified peer hold an equal-seq split while awaiting an
-                        // admin mirror, keep the non-admin reader steady on the verified head it
-                        // already applied instead of error-looping on primary's sibling fork.
+                        // An offline primary or an equal-seq split cannot hide the verified head
+                        // this reader already holds. Keep it steady until an admin merges the split.
                         network_body = exact_body;
                         primary_result = Ok(Fetched::Body(exact_env));
                     }
@@ -6088,7 +6553,7 @@ pub(super) fn admin_removed_in_log(
                 if let Ok(Some(denied)) = swarm_denied_nodes(paths) {
                     r.deny_nodes.extend(denied);
                 }
-                roster::overlay_log_membership(&log, &mut r);
+                roster::overlay_log_membership(&log, None, &mut r);
                 roster = Some(r);
             }
         }
@@ -9114,6 +9579,8 @@ pub struct Admin {
     pub config: Config,
     /// Authenticated baseline, unaffected by edits through the public draft.
     published_doc: Document,
+    /// Control metadata from the authenticated envelope, before the log overlay.
+    published_control: inspection::PublishedControl,
     /// The age recipients the opened version's own `[machines]` names, before the membership
     /// log's overlay adds the Macs a member let in: the Macs that version's lockers address.
     served_machines: BTreeSet<String>,
@@ -9133,8 +9600,9 @@ pub struct Admin {
     /// machine's copy put back links that version dropped).
     opened_pairs: usize,
     /// Bounded ancestor head digests (`[opened_head, ...prior_parents]`) for parent-CAS publishing.
-    #[cfg_attr(not(test), allow(dead_code))]
     opened_heads: Vec<[u8; 32]>,
+    /// A parented vault must not return to parentless publication.
+    parented: bool,
     /// How this Mac's log stood to the version opened: an edit is written to the log only from
     /// a base the log holds ([`log_entries::LogBase::Covers`]) or from one a writer with no seat
     /// published ([`log_entries::LogBase::Unstamped`], whose entries the edit's records import).
@@ -9158,6 +9626,16 @@ impl std::fmt::Debug for Admin {
 }
 
 impl Admin {
+    /// Immutable authenticated baseline, excluding edits to the public draft.
+    pub fn published_document(&self) -> &Document {
+        &self.published_doc
+    }
+
+    /// Entry from the authenticated snapshot, unaffected by edits to `doc`.
+    pub fn published_entry(&self, audience: &Audience, name: &str) -> Option<&crate::text::Entry> {
+        self.published_doc.entry(audience, name)
+    }
+
     /// Mark `name` in `audience` as a person's save (`aterm secrets set`): where the membership
     /// log holds concurrent values for it, the next publish settles them on the value the edited
     /// text gives it, even where that is the value every Mac already writes. Nothing else settles
@@ -9690,6 +10168,7 @@ pub fn admin_open_with_candidates(paths: &Paths, extra_urls: &[String]) -> crate
         commons_eligibility: crate::commons::membership::Eligibility::from_document(&doc),
         admissions,
         published_doc: doc.clone(),
+        published_control: inspection::PublishedControl::read(&opened.doc)?,
         served_machines,
         doc,
         config,
@@ -9704,6 +10183,7 @@ pub fn admin_open_with_candidates(paths: &Paths, extra_urls: &[String]) -> crate
             &[envelope.digest()],
             &[envelope.parents.as_slice()],
         ),
+        parented: !envelope.parents.is_empty(),
         log_base,
         resolve: BTreeSet::new(),
     })
@@ -9892,7 +10372,6 @@ fn seal_with_admissions_and_parents(
     parents: &[[u8; 32]],
     admissions: &admission::Ledger,
 ) -> crate::Result<Vec<u8>> {
-    let _ = parents;
     seal_stamped(
         name,
         seq,
@@ -9903,6 +10382,7 @@ fn seal_with_admissions_and_parents(
         handoff,
         admissions,
         None,
+        parents,
     )
 }
 
@@ -9922,6 +10402,7 @@ fn seal_stamped(
     handoff: &[([u8; 32], [u8; 64])],
     admissions: &admission::Ledger,
     stamp: Option<&str>,
+    parents: &[[u8; 32]],
 ) -> crate::Result<Vec<u8>> {
     admin_keys::validate_commons(doc, commons_seed)?;
     admissions.validate(doc, seq)?;
@@ -9960,15 +10441,15 @@ fn seal_stamped(
             armored: age::armor(&age::encrypt(&recipients, text)?),
         });
     }
-    // F1 (`DESIGN-fluid-swarm` §4.1): never write `parent:` lines on the wire so 0.145 Macs keep
-    // reading every published version (`envelope::parse` keeps reading `parent:` lines).
+    // Ordinary unparented vaults retain their legacy encoding. Conditional
+    // publication names its exact opened head, and parented vaults retain it.
     envelope::sign(
         &Unsigned {
             name: name.to_string(),
             seq,
             time: now(),
             handoff: handoff.to_vec(),
-            parents: Vec::new(),
+            parents: parents.to_vec(),
             lockers,
         },
         seed,
@@ -10038,6 +10519,41 @@ pub fn admin_publish(paths: &Paths, admin: &Admin, doc: &Document) -> crate::Res
     publish_as(paths, admin, doc, false, &[], false)
 }
 
+/// Publish only over the exact authenticated envelope opened by `admin`.
+/// Each receiving store compares that signed parent under its publication lock.
+/// Disconnected stores may still accept different children of the same parent;
+/// this is not global consensus. A successful call upgrades an unparented vault
+/// to parented publication, which requires a reader that understands parents.
+///
+/// # Errors
+/// Missing opened head, expired deadline, lost admin custody, changed source,
+/// changed receiving head or the normal sealing/publication failures. A lost
+/// response may follow a stored publication and must not be treated as rollback.
+pub fn admin_publish_conditional_until(
+    paths: &Paths,
+    admin: &Admin,
+    doc: &Document,
+    deadline: Instant,
+) -> crate::Result<Published> {
+    publish_as_with_removal(
+        paths,
+        admin,
+        doc,
+        false,
+        &[],
+        false,
+        &[],
+        None,
+        Some(deadline),
+        None,
+        true,
+    )
+}
+
+#[cfg(test)]
+#[path = "client/conditional_tests.rs"]
+mod conditional_tests;
+
 /// [`admin_publish`], also PUTting the signed envelope to explicit candidate server URLs
 /// (`docs/DESIGN-fluid-swarm-2026-10-28.md` F6).
 ///
@@ -10089,6 +10605,7 @@ fn admin_publish_revocation(
         None,
         None,
         Some((recipients, &mut retired)),
+        false,
     );
     let published = outcome.map_err(|error| {
         if retired.is_some() {
@@ -10286,6 +10803,7 @@ fn publish_as_with(
         found,
         deadline,
         None,
+        false,
     )
 }
 
@@ -10304,8 +10822,26 @@ fn publish_as_with_removal(
     found: Option<Found<'_>>,
     deadline: Option<Instant>,
     mut removing: Option<(&[Recipient], &mut Option<retirement::Retirement>)>,
+    exact_parent: bool,
 ) -> crate::Result<Published> {
     publication_current(deadline)?;
+    let parent = if exact_parent || admin.parented {
+        Some(
+            *admin
+                .opened_heads
+                .first()
+                .ok_or_else(|| Error::new("publication has no authenticated parent"))?,
+        )
+    } else {
+        None
+    };
+    let parents = if exact_parent {
+        parent.as_slice()
+    } else if admin.parented {
+        admin.opened_heads.as_slice()
+    } else {
+        &[]
+    };
     admin_keys::validate_commons_transition(&admin.published_doc, doc)?;
     if !custody_checked {
         custody_readable(paths, admin)?;
@@ -10410,6 +10946,7 @@ fn publish_as_with_removal(
                     &handoff,
                     &admissions,
                     stamp.as_deref(),
+                    parents,
                 )?;
                 let release = alab_release(&Retired::compiled(), &handoff, &new);
                 Ok((bytes, release, handoff.len()))
@@ -10427,6 +10964,7 @@ fn publish_as_with_removal(
                 &admin.handoff,
                 &admissions,
                 stamp.as_deref(),
+                parents,
             )?;
             (bytes, None, admin.handoff.len())
         };

@@ -46,6 +46,8 @@ pub struct Greeting {
 pub struct Joining<'a> {
     /// This Mac's Commons device.
     pub device: &'a Device,
+    /// Capacity and crossed state read from this device's actual local custody.
+    pub records_bound: crate::crossing::RecordsBound,
     /// This Mac's node key, in the run's `CI`.
     pub node: [u8; 32],
     /// The machine name it asks for.
@@ -284,12 +286,13 @@ pub fn run_noting_send<S: Read + Write + ?Sized>(
     wire::write_line(
         stream,
         &format!(
-            "run request={} node={} name={} nonce={} sig={} reads=2 ack=1",
+            "run request={} node={} name={} nonce={} sig={} reads=2 ack=1 records-bound={}",
             wire::b64(request.bytes()),
             wire::hex(&joining.node),
             wire::escape(&joining.name),
             wire::hex(&nonce),
-            wire::hex(signature.as_ref())
+            wire::hex(signature.as_ref()),
+            wire::escape(&joining.records_bound.value())
         ),
     )?;
     sending.sent = true;
@@ -379,12 +382,13 @@ pub fn prove<S: Read + Write + ?Sized>(
     wire::write_line(
         stream,
         &format!(
-            "prove request={} node={} name={} sig={} nodesig={} reads=2",
+            "prove request={} node={} name={} sig={} nodesig={} reads=2 records-bound={}",
             wire::b64(request.bytes()),
             wire::hex(&joining.node),
             wire::escape(&joining.name),
             wire::hex(signature.as_ref()),
-            wire::hex(&sign_node(&message))
+            wire::hex(&sign_node(&message)),
+            wire::escape(&joining.records_bound.value())
         ),
     )?;
     let line = wire::read_line(stream)?;

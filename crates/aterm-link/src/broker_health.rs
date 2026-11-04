@@ -93,10 +93,12 @@ pub fn in_band(h: &astream_broker::HelloHealth) -> String {
 /// Prefix of [`in_band`] for a poisoned log.
 pub const POISONED_ROW_WORD: &str = "POISONED";
 
-/// Format what the log holds, who is attached, and the flushes the broker's process has made
-/// (astream's `process_flushes`, `astream_sys::flush_tally` as the snapshot took it: calls, so
-/// a refused barrier and the full flush that answered it are one of each). A snapshot an older
-/// broker wrote carries no tally, and the row says so ([`NO_PROCESS_FLUSHES`]), never zeros.
+/// Format what the log holds, what of it the broker keeps decoded in memory ([`residency`]),
+/// who is attached, and the flushes the broker's process has made (astream's
+/// `process_flushes`, `astream_sys::flush_tally` as the snapshot took it: calls, so a refused
+/// barrier and the full flush that answered it are one of each). A snapshot an older broker
+/// wrote may carry no tally or no residency, and the row says so ([`NO_PROCESS_FLUSHES`],
+/// [`NO_RESIDENCY`]), never zeros.
 #[must_use]
 pub fn holds(h: &astream_broker::BrokerHealth) -> String {
     let flushed = match &h.process_flushes {
@@ -106,9 +108,13 @@ pub fn holds(h: &astream_broker::BrokerHealth) -> String {
         ),
         None => NO_PROCESS_FLUSHES.to_string(),
     };
+    let resident = h.resident.map_or_else(
+        || NO_RESIDENCY.to_string(),
+        |r| residency(r.records, r.bytes, h.retained_records),
+    );
     format!(
-        "{} record(s) in {}, {} subject(s), {} pending will(s), {} group commit(s); {} \
-         connection(s), {} parked tail(s); {flushed}",
+        "{} record(s) in {} ({resident}), {} subject(s), {} pending will(s), {} group \
+         commit(s); {} connection(s), {} parked tail(s); {flushed}",
         h.retained_records,
         bytes(h.retained_bytes),
         h.distinct_subjects,
@@ -118,6 +124,27 @@ pub fn holds(h: &astream_broker::BrokerHealth) -> String {
         h.parked_tails,
     )
 }
+
+/// `resident=<records>/<bytes> of <retained>`: of the `retained` records, the `records` the
+/// broker keeps decoded in memory and the bytes its residency budget charges them (subject and
+/// body, plus a fixed overhead each: astream's `Broker::residency`). It reads the rest back
+/// from the log file when a reader asks for them. The broker's start line and [`holds`] say it.
+#[must_use]
+pub fn residency(records: u64, charged: u64, retained: u64) -> String {
+    format!("resident={records}/{} of {retained}", bytes(charged))
+}
+
+/// [`residency`] of `broker` now, as its own `Broker::residency` counts it.
+#[must_use]
+pub fn residency_of(broker: &astream_broker::Broker) -> String {
+    let (records, charged, retained) = broker.residency();
+    let count = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+    residency(count(records), count(charged), count(retained))
+}
+
+/// [`holds`]'s residency for a snapshot that carries none: one an astream older than this
+/// build's wrote.
+pub const NO_RESIDENCY: &str = "its residency not in the snapshot";
 
 /// The end of [`holds`] for a snapshot that carries no process tally: one an astream older
 /// than this build's wrote.
@@ -635,6 +662,10 @@ mod tests {
             barrier: 13,
             plain: 2,
         });
+        health.resident = Some(astream_broker::Residency {
+            records: 2,
+            bytes: 300,
+        });
         let read = |writer| HealthRead {
             health: health.clone(),
             writer,
@@ -643,13 +674,12 @@ mod tests {
         assert!(!is_current(&read(HealthWriter::Serving), Some(8)));
         assert!(!is_current(&read(HealthWriter::Unknown), Some(7)));
         let unknown = snapshot_row(&read(HealthWriter::Unknown), Some(7), 61_000);
-        assert_eq!(
-            unknown,
-            "- (astream's <log>.health is pid 7's, and this host cannot tell whether it still \
-             serves the log, written 1m ago: 3 record(s) in 0 B, 0 subject(s), 0 pending \
-             will(s), 0 group commit(s); 0 connection(s), 0 parked tail(s); 11 full, 13 \
-             barrier and 2 plain flush(es) by its process since it started)",
-            "the broker process's flushes, each kind its own count"
+        assert!(unknown.starts_with("- "), "{unknown}");
+        assert!(unknown.contains("pid 7"), "{unknown}");
+        assert!(unknown.contains("resident=2/300 B of 3"), "{unknown}");
+        assert!(
+            unknown.contains("11 full, 13 barrier and 2 plain flush(es)"),
+            "{unknown}"
         );
         let other = snapshot_row(&read(HealthWriter::Serving), Some(8), 1_000);
         assert!(
@@ -657,11 +687,18 @@ mod tests {
             "{other}"
         );
         assert!(!other.contains(POISONED_ROW_WORD), "{other}");
-        // An older broker's snapshot: the same facts, its tally unknown, never read as zero.
+        // An older broker's snapshot: the same facts, its tally and its residency unknown,
+        // never read as zero.
         health.process_flushes = None;
+        health.resident = None;
         let older = holds(&health);
         assert!(older.ends_with(NO_PROCESS_FLUSHES), "{older}");
         assert!(!older.contains(" full,"), "{older}");
+        assert!(
+            older.starts_with(&format!("3 record(s) in 0 B ({NO_RESIDENCY}), ")),
+            "{older}"
+        );
+        assert!(!older.contains("resident="), "{older}");
     }
 
     #[test]

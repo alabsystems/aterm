@@ -8,11 +8,12 @@
 //!
 //! Every catchable signal whose default action ends a process with no core ([`PASSED_ON`]: the
 //! ones a supervisor, `timeout` or a person's `kill` sends) is passed on whenever it reaches the
-//! front. The keys' signals ([`KEYS`], SIGINT and SIGQUIT) are passed on only when the front does
-//! not lead its terminal's foreground job ([`key_passes`]): a terminal's ^C or ^\ goes to that
-//! whole job, the build with it, and a second copy would be its second press. A front of no
-//! terminal (an agent's shell, a supervisor's pipe) passes every one on; a front leading its
-//! terminal's job swallows one sent to its pid alone, as `system(3)` does.
+//! front. The keys' signals ([`KEYS`], SIGINT and SIGQUIT) are suppressed only when the controller
+//! and actual owned child share the terminal's foreground group ([`key_passes`]): a second copy
+//! would be a second press. A separate cohort cannot receive the controller's group key directly,
+//! and a signal sent to a background controller must pass on too. With no terminal or an
+//! unavailable group, pass it on. Ordinary pre-spawn policy assumes a shared group; native cohort
+//! launch explicitly queues keys before the child's separate group is known.
 //!
 //! A handler only notes the signal on a pipe, which is async-signal-safe; a thread of the front's
 //! own reads it and sends it on, once the build's pid is known (a signal that arrives while the
@@ -51,13 +52,37 @@ static NOTE_TO: AtomicI32 = AtomicI32::new(-1);
 /// The armed front's controlling terminal, held open, `-1` for none.
 static TERMINAL: AtomicI32 = AtomicI32::new(-1);
 
-/// Whether a key's signal reaches the build only through the front: `terminal` (the front's
-/// controlling terminal, `-1` for none) is no terminal whose foreground job this process's group
-/// is. Async-signal-safe: `tcgetpgrp` and `getpgrp` are.
+/// Group observed from the actual unreaped child. Zero keeps ordinary pre-spawn
+/// shared-group policy; -1 means unknown and cannot suppress a key. This snapshot
+/// supplies no signalling authority and is refreshed on stop acknowledgement.
+static TARGET_GROUP: AtomicI32 = AtomicI32::new(0);
+
+/// Suppress a key only when it would reach both the controller and actual child
+/// in the same foreground group. A separate worker never receives a terminal key
+/// directed at the controller's group. No terminal or unknown group passes every
+/// key. Before an ordinary spawn (and with no front), assume a shared group.
+/// Async-signal-safe:
+/// only an atomic read, tcgetpgrp and getpgrp; no child query in a signal handler.
 #[must_use]
 pub fn key_passes(terminal: RawFd) -> bool {
+    let target = TARGET_GROUP.load(Ordering::SeqCst);
     // SAFETY: two integer calls; a descriptor that is no terminal answers -1.
-    terminal < 0 || unsafe { libc::tcgetpgrp(terminal) != libc::getpgrp() }
+    terminal < 0
+        || target < 0
+        || unsafe {
+            let own = libc::getpgrp();
+            (target > 0 && target != own) || libc::tcgetpgrp(terminal) != own
+        }
+}
+
+/// Parent-side query while the owning caller still pins this unreaped child.
+/// It only selects key suppression, never a new signal target or release fact.
+fn observe_group(pid: u32) {
+    let group = libc::pid_t::try_from(pid).map_or(-1, |pid| {
+        // SAFETY: integer query, before the owning caller can reap this child.
+        unsafe { libc::getpgid(pid) }
+    });
+    TARGET_GROUP.store(if group > 1 { group } else { -1 }, Ordering::SeqCst);
 }
 
 /// This thread's `errno`.
@@ -255,6 +280,15 @@ impl Front {
     /// made: the build then runs with nothing passed on, as a plain child would.
     #[must_use]
     pub fn arm() -> Option<Front> {
+        Self::arm_with_group(0)
+    }
+
+    /// Native cohort birth has a separate group; even a key before aim must queue.
+    pub(super) fn arm_cohort() -> Option<Front> {
+        Self::arm_with_group(-1)
+    }
+
+    fn arm_with_group(initial_group: i32) -> Option<Front> {
         let turn = crate::platform::FORWARDING_TURN
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
@@ -271,6 +305,7 @@ impl Front {
             .name("build-front".to_owned())
             .spawn(move || forward(read, &theirs))
             .ok()?;
+        TARGET_GROUP.store(initial_group, Ordering::SeqCst);
         NOTE_TO.store(write.as_raw_fd(), Ordering::SeqCst);
         let terminal = {
             use std::os::unix::fs::OpenOptionsExt as _;
@@ -314,6 +349,7 @@ impl Front {
     /// metered) read just before each send, so a member it started since the last read is one
     /// it leaves.
     pub fn aim(&self, pid: u32, tree: Option<aterm_capacity::tree_meter::TreeWatch>) {
+        observe_group(pid);
         *self
             .shared
             .tree
@@ -330,33 +366,44 @@ impl Front {
     /// The reap's.
     pub fn reap(
         &self,
-        child: &mut aterm_uds::spawnfd::TransparentChild,
+        child: &mut aterm_uds::spawnfd::Child,
     ) -> std::io::Result<std::process::ExitStatus> {
-        let pid: libc::id_t = child.id();
-        loop {
-            let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
-            // SAFETY: `info` is one zeroed `siginfo_t`, live across the call; `WNOWAIT`
-            // leaves the child unreaped.
-            let seen = unsafe {
-                libc::waitid(
-                    libc::P_PID,
-                    pid,
-                    info.as_mut_ptr(),
-                    libc::WEXITED | libc::WNOWAIT,
-                )
-            };
-            if seen == 0
-                || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
-            {
-                break;
+        // A stop never disarms forwarding. If observation itself is unavailable,
+        // stop signalling before the fallback owned wait, as before; that wait
+        // still holds custody rather than interpreting the error as completion.
+        let _ = child.wait_exited();
+        self.reaped();
+        child.wait()
+    }
+
+    /// A stop acknowledgement can race an exit. Hold arriving signals while the
+    /// actual borrowed child restores its terminal and performs that owning wait.
+    pub fn acknowledge_job(
+        &self,
+        observed: aterm_uds::spawnfd::ChildObservation<'_>,
+    ) -> std::io::Result<Option<aterm_uds::spawnfd::ChildEvent>> {
+        let pid = observed.id();
+        self.set(Aim::Arming);
+        let event = observed.acknowledge();
+        match &event {
+            Ok(Some(aterm_uds::spawnfd::ChildEvent::Exited(_))) | Err(_) => self.reaped(),
+            _ => {
+                observe_group(pid);
+                self.set(libc::pid_t::try_from(pid).map_or(Aim::Reaped, Aim::Build));
             }
         }
+        event
+    }
+
+    /// An actual owning wait already consumed this child; never aim at its old pid.
+    pub fn reaped(&self) {
+        TARGET_GROUP.store(-1, Ordering::SeqCst);
         self.set(Aim::Reaped);
-        child.wait()
     }
 
     /// The build never started: a signal held for it ends this process at [`Self::disarm`].
     pub fn never(&self) {
+        TARGET_GROUP.store(-1, Ordering::SeqCst);
         self.set(Aim::Never);
     }
 
@@ -394,6 +441,7 @@ impl Front {
         }
         NOTE_TO.store(-1, Ordering::SeqCst);
         TERMINAL.store(-1, Ordering::SeqCst);
+        TARGET_GROUP.store(0, Ordering::SeqCst);
         drop(self.terminal.take());
         if matches!(
             *self

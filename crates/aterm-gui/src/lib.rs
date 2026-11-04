@@ -755,6 +755,7 @@ mod jumplist_recent;
 #[cfg(windows)]
 mod jumplist_win;
 mod lab_accounts;
+mod lab_deck;
 mod lab_screen;
 #[cfg(all(windows, debug_assertions))]
 pub use jumplist_win::the_shell_keeps_what_a_commit_puts_in_a_test_identitys_jump_list;
@@ -3535,6 +3536,13 @@ enum Wake {
     DevToolsProbeReady,
     #[cfg(target_os = "macos")]
     LocalNetworkProbeReady,
+    /// System State's Local Network alert watch moved: its first read came back, so the step's
+    /// trigger that waits for it goes in this turn's consent lanes
+    /// (`App::tick_local_network_step`), or it saw a new window of the alert's owner come and
+    /// then, with the person at the Mac, no window of that owner left
+    /// (`App::on_local_network_alert_answered`).
+    #[cfg(target_os = "macos")]
+    LocalNetworkAlertWatch,
     DebuggerAccessResult,
     DevToolsHandOver,
     ProtectedRead {
@@ -7395,6 +7403,9 @@ struct WindowState {
     os_window: Option<Arc<Window>>,
     #[cfg(any(test, feature = "bench-support"))]
     os_window_for_test: bool,
+    /// Full-screen toggle state for [`WindowState::os_window_for_test`].
+    #[cfg(test)]
+    fullscreen_for_test: std::cell::Cell<bool>,
     /// How many times [`WindowState::request_redraw`] asked for a frame.
     #[cfg(test)]
     redraw_requests_for_test: std::cell::Cell<u32>,
@@ -8543,6 +8554,8 @@ impl WindowState {
             os_window: None,
             #[cfg(any(test, feature = "bench-support"))]
             os_window_for_test: false,
+            #[cfg(test)]
+            fullscreen_for_test: std::cell::Cell::new(false),
             #[cfg(test)]
             redraw_requests_for_test: std::cell::Cell::new(0),
             present: None,
@@ -10079,6 +10092,9 @@ type HostResumeProbe = Box<dyn FnOnce(&App)>;
 
 struct App {
     network_snapshot: Arc<aterm_types::network_state::NetworkStateSnapshot>,
+    /// The Stats deck's lab account rows as last projected ([`lab_deck::Feed`]).
+    lab_deck: Arc<lab_deck::LabDeck>,
+    lab_deck_feed: lab_deck::Feed,
     network_source: Option<NetworkSnapshotSource>,
     network_source_busy: bool,
     network_next_poll: Option<Instant>,
@@ -10568,6 +10584,11 @@ struct App {
     fork_park_misses: Option<(u64, u8)>,
     #[cfg(unix)]
     preverify_read_waited: Option<(u64, std::time::Instant)>,
+    /// The pre-park read the sessionless wait held each kind of attempt for
+    /// (`App::sessionless_preverify_wait`): a read's passing end answers only an attempt that
+    /// waited for it.
+    #[cfg(unix)]
+    sessionless_waited: crate::app_update_handoff::SessionlessWaited,
     #[cfg(unix)]
     person_apply_held: Option<HeldPersonApply>,
     #[cfg(unix)]
@@ -11279,6 +11300,10 @@ impl App {
         // A `[privacy]` switch on again makes the launch's decisions it held first.
         self.resume_held_launch_steps(now);
         self.tick_macos_access_card(now);
+        // An answer the Local Network alert watch left is drained before the walk looks for its
+        // start, so a watch that saw no window of the alert's owner left lets the walk start in
+        // this turn (`App::on_local_network_alert_answered`).
+        self.on_local_network_alert_answered(now);
         // The permission walk starts before any step after Local Network takes the moment (a cold
         // first launch), once that step has run and its alert's hold is over
         // (`App::local_network_step_to_come`), or once that step alone has held it ready for
@@ -16149,6 +16174,8 @@ impl App {
             session_factory,
             proxy: None,
             network_snapshot: network_deck::inactive_snapshot(),
+            lab_deck: Arc::default(),
+            lab_deck_feed: lab_deck::Feed::default(),
             network_source: None,
             network_source_busy: false,
             network_next_poll: None,
@@ -16521,6 +16548,8 @@ impl App {
             fork_park_misses: None,
             #[cfg(unix)]
             preverify_read_waited: None,
+            #[cfg(unix)]
+            sessionless_waited: crate::app_update_handoff::SessionlessWaited::default(),
             #[cfg(unix)]
             person_apply_held: None,
             #[cfg(unix)]
@@ -20519,6 +20548,10 @@ impl App {
             Wake::DevToolsProbeReady => self.on_devtools_probe_ready(),
             #[cfg(target_os = "macos")]
             Wake::LocalNetworkProbeReady => self.on_local_network_probe_ready(Instant::now()),
+            #[cfg(target_os = "macos")]
+            Wake::LocalNetworkAlertWatch => {
+                self.on_local_network_alert_answered(Instant::now());
+            }
             Wake::DebuggerAccessResult => self.tick_debugger_access(),
             Wake::DevToolsHandOver => self.tick_devtools_hand_over(Instant::now()),
             Wake::WorkstationSetup(request) => self.offer_workstation_setup(request),
@@ -28682,6 +28715,8 @@ pub fn main_entry_with_network(
         session_factory,
         proxy: Some(proxy.clone()),
         network_snapshot,
+        lab_deck: Arc::default(),
+        lab_deck_feed: lab_deck::Feed::default(),
         network_source,
         network_source_busy,
         network_next_poll: None,
@@ -29100,6 +29135,8 @@ pub fn main_entry_with_network(
         fork_park_misses: None,
         #[cfg(unix)]
         preverify_read_waited: None,
+        #[cfg(unix)]
+        sessionless_waited: crate::app_update_handoff::SessionlessWaited::default(),
         #[cfg(unix)]
         person_apply_held: None,
         #[cfg(unix)]

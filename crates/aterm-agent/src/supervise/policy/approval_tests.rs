@@ -9678,9 +9678,10 @@ fn a_look_alike_of_the_chrome_intro_is_not_pressed_by_its_rule() {
             }
         }
     }
-    // The reader's guards, each on the intro's own reading: another program's (which an earlier
-    // guard hands to a person before the intro's arm), a phase that is no prompt, and a reading
-    // the reader does not vouch for are a person's.
+    // The reader's guards, each on the intro's own reading: another program's (Codex, Grok, Kimi
+    // and Generic by the supervisable guard before the intro's arm, Agy and Muse by the arm's own
+    // program check), a phase that is no prompt, and a reading the reader does not vouch for are
+    // a person's.
     let rows = phase_fixtures::screen(phase_fixtures::CHROME_INTRO);
     let read = aterm_phase::read(Some("claude"), &rows, None);
     assert_eq!(

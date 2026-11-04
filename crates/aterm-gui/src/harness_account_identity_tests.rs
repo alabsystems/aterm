@@ -370,6 +370,178 @@ fn recovery_counts_decline_a_judgment_after_same_label_binding_changes() {
     }
 }
 
+#[test]
+fn recovery_decisions_become_historical_when_revalidation_is_unavailable() {
+    use aterm_agent::harness::account_progress::{ProgressPhase, RECOVERY_HISTORY_PREFIX};
+    for (fault, name) in [
+        "missing seat",
+        "invalid roster",
+        "empty roster",
+        "missing roster",
+        "missing process identity",
+        "damaged state",
+        "damaged logins",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (a, mut idle, target, _) = setup_progress(Case {
+            default: false,
+            expected: 1,
+            initial: 1,
+            current: 1,
+            backup: false,
+            legacy: false,
+        });
+        let request = AdviceTurn::begin(&idle.kept).capture(&idle.kept).unwrap();
+        let mut judged = None;
+        let advice = idle.account_advice(usage_wall(), false, &mut judged);
+        assert_eq!(selected(&advice, &target), 1);
+        let common_details = idle
+            .read_account_progress(&request, usage_wall(), None, judged.as_mut())
+            .unwrap()
+            .value
+            .details;
+        let until = Instant::now() + Duration::from_secs(3600);
+        let alternatives = [
+            advice.unwrap(),
+            AccountAdvice::Resume {
+                cleared_at: a.clock(),
+            },
+            AccountAdvice::Wait { until },
+            AccountAdvice::Hold { until },
+        ];
+        let before: Vec<_> = alternatives
+            .iter()
+            .map(|advice| {
+                idle.read_account_progress(&request, usage_wall(), Some(advice), judged.as_mut())
+                    .unwrap()
+                    .value
+            })
+            .collect();
+        assert_eq!(before[0].phase, ProgressPhase::Ready);
+        assert_eq!(before[1].wall, None);
+        assert!(before[2].next_at.is_some());
+        assert!(before[3].next_at.is_some());
+        let roster_bytes = std::fs::read(a.roster_path()).unwrap();
+        let state_bytes = std::fs::read(a.store().state_file()).unwrap();
+        let logins_bytes = std::fs::read(a.store().logins_file()).ok();
+        let seat = Arc::clone(&idle.hooks.acts.account_seat);
+        let pid = idle.kept.lock().unwrap().snapshot.as_ref().unwrap().pid;
+        let env = a.procs.lock().unwrap().get(&pid).unwrap().clone();
+        match fault {
+            0 => idle.hooks.acts.account_seat = Arc::new(|| None),
+            1 => std::fs::write(a.roster_path(), "[[broken").unwrap(),
+            2 => std::fs::write(a.roster_path(), "").unwrap(),
+            3 => std::fs::remove_file(a.roster_path()).unwrap(),
+            4 => {
+                a.procs.lock().unwrap().remove(&pid);
+            }
+            5 => std::fs::write(a.store().state_file(), "{").unwrap(),
+            6 => std::fs::write(a.store().logins_file(), "{").unwrap(),
+            _ => unreachable!(),
+        }
+        let records = || {
+            [
+                a.roster_path(),
+                a.store().state_file(),
+                a.store().logins_file(),
+                a.store().ledger_path(),
+            ]
+            .map(|path| std::fs::read(path).ok())
+        };
+        let damaged = records();
+        // The same failed read still reports the independently observed limit when no
+        // recovery decision was offered; it supplies the refusal without pinning its prose.
+        let unadvised = idle
+            .read_account_progress(&request, usage_wall(), None, judged.as_mut())
+            .unwrap()
+            .value;
+        assert_eq!(unadvised.phase, ProgressPhase::Limited, "{name}");
+        assert!(unadvised.wall.is_some(), "{name}");
+        assert_eq!(unadvised.eligible, None, "{name}");
+        assert_eq!(unadvised.next_at, None, "{name}");
+        let finding = unadvised.details.last().unwrap();
+        let known = unadvised.known;
+        if fault == 4 {
+            assert_eq!(
+                known,
+                Some(3),
+                "the roster was read before process identity"
+            );
+        }
+        for (advice, before) in alternatives.iter().zip(&before) {
+            let progress = idle
+                .read_account_progress(&request, usage_wall(), Some(advice), judged.as_mut())
+                .unwrap()
+                .value;
+            assert_eq!(progress.phase, ProgressPhase::Unknown, "{name}");
+            assert_eq!(progress.known, known, "{name}");
+            assert_eq!(progress.eligible, None, "{name}");
+            assert_eq!(progress.next_at, None, "{name}");
+            assert_eq!(progress.wall, unadvised.wall, "{name}");
+            assert_eq!(progress.details.first(), Some(finding), "{name}");
+            assert_eq!(
+                progress.login_diagnostics, before.login_diagnostics,
+                "{name}"
+            );
+            for detail in before
+                .details
+                .iter()
+                .filter(|detail| !common_details.contains(detail))
+            {
+                assert!(
+                    progress
+                        .details
+                        .contains(&format!("{RECOVERY_HISTORY_PREFIX}{detail}")),
+                    "{name}"
+                );
+                assert!(!progress.details.contains(detail), "{name}");
+            }
+            assert_progress_projection(&progress, None);
+            let reply =
+                crate::harness_recovery_verb::cmd("recovery", true, || Ok(Some(progress.clone())));
+            let fields: std::collections::BTreeMap<_, _> = reply
+                .split_whitespace()
+                .filter_map(|word| word.split_once('='))
+                .collect();
+            assert_eq!(fields.get("phase"), Some(&"unknown"), "{name}: {reply}");
+            for field in ["target", "route", "eligible", "next_at"] {
+                assert_eq!(fields.get(field), Some(&"-"), "{name}: {reply}");
+            }
+        }
+        assert_eq!(records(), damaged, "{name}: observing never repairs files");
+        idle.hooks.acts.account_seat = seat;
+        a.procs.lock().unwrap().insert(pid, env);
+        std::fs::write(a.roster_path(), roster_bytes).unwrap();
+        std::fs::write(a.store().state_file(), state_bytes).unwrap();
+        if let Some(bytes) = logins_bytes {
+            std::fs::write(a.store().logins_file(), bytes).unwrap();
+        } else if fault == 6 {
+            std::fs::remove_file(a.store().logins_file()).unwrap();
+        }
+        let restored = records();
+        for (advice, before) in alternatives.iter().zip(&before) {
+            let recovered = idle
+                .read_account_progress(&request, usage_wall(), Some(advice), judged.as_mut())
+                .unwrap()
+                .value;
+            assert_eq!(recovered.phase, before.phase, "{name}");
+            assert_eq!(recovered.wall, before.wall, "{name}");
+            assert_eq!(recovered.known, before.known, "{name}");
+            assert_eq!(recovered.eligible, before.eligible, "{name}");
+            assert_eq!(
+                recovered.next_at.is_some(),
+                before.next_at.is_some(),
+                "{name}"
+            );
+            assert_eq!(recovered.details, before.details, "{name}");
+        }
+        assert_eq!(records(), restored, "{name}: recovery remains read-only");
+        assert_eq!(a.asked("restart:"), 0);
+    }
+}
+
 fn act_case(case: Case, hold: i64) -> [(&'static str, i64); 6] {
     let (a, idle, target, path) = setup(case);
     assert_eq!(selected(&idle.account(usage_wall()), &target), 1);
@@ -396,7 +568,7 @@ fn act_case(case: Case, hold: i64) -> [(&'static str, i64); 6] {
         a.store().wake_path(),
     ];
     let before = files.each_ref().map(|file| std::fs::read(file).ok());
-    let _ = idle.restart(&move_to(&target, AccountAt::Wall));
+    let _ = idle.restart_once(&move_to(&target, AccountAt::Wall));
     let started = i64::try_from(a.asked("restart:")).unwrap();
     let rotated = i64::try_from(a.state().rotations.len()).unwrap();
     let unchanged = i64::from(files.each_ref().map(|file| std::fs::read(file).ok()) == before);
@@ -547,7 +719,8 @@ fn a_profile_changed_between_selection_and_the_writer_refuses_the_move() {
         let before = std::fs::read(a.store().state_file()).unwrap();
         let ledger = a.ledger();
         assert_eq!(
-            idle.restart(&move_to(&target, AccountAt::Wall)).as_deref(),
+            idle.restart_once(&move_to(&target, AccountAt::Wall))
+                .as_deref(),
             Some("wait:account-changed")
         );
         assert_eq!(a.asked("restart:"), 0);

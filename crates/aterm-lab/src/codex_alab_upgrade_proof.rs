@@ -98,12 +98,12 @@ const UPGRADE_CONFIG_EXTRA: &str =
     "[tui]\nscreen_reader_detection_done = true\n\n[features]\ngoals = true\n";
 const NATIVE_GOAL_OBJECTIVE: &str = "align native codex goal";
 
-fn package_supports_auth_and_goal(package: &Path) -> bool {
-    crate::util::read_regular_file(&package.join("bin/codex")).is_ok_and(|bytes| {
-        bytes
-            .windows(b"CODEX_AUTH_PATH".len())
-            .any(|w| w == b"CODEX_AUTH_PATH")
-    })
+fn package_supports_auth_and_goal(package: &Path) -> Result<bool, Fail> {
+    let path = package.join("bin/codex");
+    let bytes = crate::util::read_program(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(bytes
+        .windows(b"CODEX_AUTH_PATH".len())
+        .any(|w| w == b"CODEX_AUTH_PATH"))
 }
 
 fn record_carries_auth_path(record: &J, auth_path: &Path) -> bool {
@@ -289,14 +289,14 @@ fn handoff(
             && Proof::record(leg, pid).as_ref().is_some_and(|after| same_custody(&before, after)),
     );
     if let Some(auth_path) = leg.auth_path.as_deref() {
-        if package_supports_auth_and_goal(old) {
+        if package_supports_auth_and_goal(old)? {
             proof.check(
                 "upgrade-only: the old image records isolated CODEX_AUTH_PATH outside CODEX_HOME",
                 record_carries_auth_path(&before, auth_path)
                     && !leg.home.join("auth.json").exists(),
             );
         }
-        if package_supports_auth_and_goal(new) {
+        if package_supports_auth_and_goal(new)? {
             proof.check(
                 "upgrade-only: the upgraded image preserves isolated CODEX_AUTH_PATH across live execve",
                 after

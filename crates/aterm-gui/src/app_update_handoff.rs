@@ -586,25 +586,27 @@ struct SessionlessFacts {
 }
 
 /// Whether the launched lane carries an attempt with no live terminal session, exactly as the
-/// lane choice ([`out_of_band_lane_refusal`]) will judge it. A cause the verdict cannot change
-/// is named before an unread verdict is waited for. A failed verdict is the attempt's own
-/// failure only on a kept image; a replaceable image leaves it to the cold lane, which lets a
-/// person's press relaunch and verify the stage again.
+/// lane choice ([`out_of_band_lane_refusal`]) will judge it. A cause of this process or machine,
+/// which nothing at the desk clears, is named before the desk's (no window, no restorable tab),
+/// so a renewal it refuses is counted however the desk stands; and a cause the verdict cannot
+/// change is named before an unread verdict is waited for. A failed verdict is the attempt's
+/// own failure only on a kept image; a replaceable image leaves it to the cold lane, which lets
+/// a person's press relaunch and verify the stage again.
 #[cfg(target_os = "macos")]
 #[must_use]
 const fn sessionless_lane(facts: SessionlessFacts) -> SessionlessLane {
-    if !facts.window {
-        return SessionlessLane::Cannot(NO_WINDOW);
-    }
-    if !facts.layout {
-        return SessionlessLane::Cannot(NO_RESTORABLE_TAB);
-    }
     let reachable = HandoffLaneFacts {
         grant_empty: true,
         ..facts.lane
     };
     if let Some(reason) = out_of_band_lane_refusal(reachable) {
         return SessionlessLane::Cannot(reason);
+    }
+    if !facts.window {
+        return SessionlessLane::Cannot(NO_WINDOW);
+    }
+    if !facts.layout {
+        return SessionlessLane::Cannot(NO_RESTORABLE_TAB);
     }
     if !facts.same_image {
         match facts.verdict {
@@ -626,17 +628,47 @@ const fn sessionless_lane(facts: SessionlessFacts) -> SessionlessLane {
 /// before an attempt with no live terminal session is classified
 /// (`App::sessionless_preverify_wait`). A signer wait is read again whenever it gets this far,
 /// since the roster gate before it lets it through only once a check reported since its read;
-/// any other passing cause only when its read began before the current wait (`wait_began`), so
-/// a read the wait started itself is never read again in a loop.
+/// any other passing cause unless the read is the one this kind of attempt waited for
+/// (`own_read`, a read's deadline being its identity: [`SessionlessWaited`]), so no attempt
+/// reads its own read again in a loop.
 #[cfg(unix)]
 #[must_use]
 fn reread_passing(
     reason: &str,
-    read_started: std::time::Instant,
-    wait_began: Option<std::time::Instant>,
+    read_deadline: std::time::Instant,
+    own_read: Option<std::time::Instant>,
 ) -> bool {
-    aterm_update::is_roster_confirmation_wait(reason)
-        || wait_began.is_none_or(|began| read_started < began)
+    aterm_update::is_roster_confirmation_wait(reason) || own_read != Some(read_deadline)
+}
+
+/// The pre-park read the sessionless wait held each kind of attempt for, known by its deadline
+/// (`App::sessionless_preverify_wait`). A read's passing end answers only an attempt that waited
+/// for it (a signer wait aside, read again once a check reported: [`reread_passing`]), so a
+/// person's press is never answered by a read only the automatic lane waited for, nor the lane
+/// by one only a press waited for; and a person's entry lives only as long as their held press
+/// (`App::run_held_person_apply`), so a later press never meets it.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SessionlessWaited {
+    /// The read the automatic lane last deferred for.
+    pub(crate) automatic: Option<std::time::Instant>,
+    /// The read a person's held press waits for.
+    pub(crate) person: Option<std::time::Instant>,
+}
+
+#[cfg(unix)]
+impl SessionlessWaited {
+    /// The entry of an attempt in `mode`.
+    pub(crate) const fn of(
+        &mut self,
+        mode: crate::native_updater_service::ApplyMode,
+    ) -> &mut Option<std::time::Instant> {
+        if mode.is_automatic() {
+            &mut self.automatic
+        } else {
+            &mut self.person
+        }
+    }
 }
 
 /// What [`crate::App::admit_update_handoff`] reads beside the live sessions.
@@ -8349,7 +8381,11 @@ impl App {
         }
     }
 
-    /// Hold a person's press for the candidate's pre-park read.
+    /// Hold a person's press for the candidate's pre-park read. Its row and its switch start
+    /// here: the sessionless wait holds a press before `start_unix_update_handoff` starts them
+    /// (a second start, as the fork lane's hold makes, changes nothing), and the press's end
+    /// (`Self::run_held_person_apply`) closes what this opened, so a person sees it installing
+    /// and how it ended.
     #[cfg(unix)]
     pub(crate) fn hold_person_apply(&mut self, held: crate::HeldPersonApply) {
         aterm_log::info!(
@@ -8360,6 +8396,9 @@ impl App {
                 .saturating_duration_since(std::time::Instant::now())
                 .as_millis()
         );
+        self.begin_update_installing(true);
+        let running = self.native_updater_service.snapshot().current_build;
+        self.record_update_switch_started(running, false, false);
         self.person_apply_held = Some(held);
     }
 
@@ -8401,6 +8440,7 @@ impl App {
                  staged build is now {staged:?}",
                 held.target_build
             );
+            self.sessionless_waited.person = None;
             self.retire_update_installing();
             self.record_update_switch_stopped(false, HELD_PRESS_SUPERSEDED);
             return;
@@ -8418,6 +8458,9 @@ impl App {
         if self.person_apply_held.is_some() {
             return;
         }
+        // The press ended, whichever way its run went (a preflight block, the fork lane, the
+        // read's answer): the read it waited for answers no later press.
+        self.sessionless_waited.person = None;
         let stopped = match &outcome {
             UpdateOutcome::Deferred { reason } => Some(reason.clone()),
             UpdateOutcome::Blocked { reasons } => {
@@ -8554,8 +8597,17 @@ impl App {
     /// A stage that waits for an update check to confirm its signer is held for that check, as
     /// the cold lane holds it ([`Self::cold_lane_verdict_gate`]), and read again only once a
     /// check reported since its last read. A read that ended without a verdict for any other
-    /// passing cause (which no cache keeps) is read again once per wait: a read this wait
-    /// started that ends so is the attempt's failure, tried again later, never a re-read loop.
+    /// passing cause (which no cache keeps) is read again unless this kind of attempt waited
+    /// for it ([`SessionlessWaited`]); an attempt the wait holds waits for the read in flight,
+    /// whoever started it. A window an earlier read spent answers nothing here: the attempt gets
+    /// a window of its own (the fork lane alone parks past its window). The read an attempt
+    /// waited for ending so ends the wait: the attempt fails, the automatic lane tries again
+    /// later and a person's next press checks again, each reading afresh, so no attempt re-reads
+    /// in a loop and a press is answered only by a read it waited for. A person's press on an
+    /// image a relaunch replaces, with no `--hold` pane a relaunch would close, goes on to the
+    /// cold lane instead, which verifies the stage again and relaunches for them unless it
+    /// refuses for its own reason (open tabs with session restore off;
+    /// [`Self::cold_lane_verdict_gate`]).
     #[cfg(unix)]
     fn sessionless_preverify_wait(
         &mut self,
@@ -8583,10 +8635,7 @@ impl App {
                 known.reason
             )));
         }
-        let wait_began = self
-            .preverify_read_waited
-            .filter(|&(target, _)| target == target_build)
-            .and_then(|(_, until)| until.checked_sub(crate::HANDOFF_PREVERIFY_READ_CEILING));
+        let own_read = *self.sessionless_waited.of(mode);
         let passing = self
             .handoff_preverify_in_flight
             .as_ref()
@@ -8595,7 +8644,7 @@ impl App {
                 let reason = read.ended_passing(now)?;
                 Some((
                     reason.to_string(),
-                    reread_passing(reason, read.started(), wait_began),
+                    reread_passing(reason, read.deadline, own_read),
                 ))
             });
         if let Some((reason, again)) = passing {
@@ -8604,10 +8653,23 @@ impl App {
                     |dmg_sha256| self.start_fresh_preverification(target_build, dmg_sha256),
                 );
             if !started {
-                return Some(crate::UpdateHandoffStartError::failed(format!(
-                    "{reason}; the update is tried again later"
-                )));
+                *self.sessionless_waited.of(mode) = None;
+                // The admission refuses a relaunch over `--hold` panes before the lane choice.
+                if !mode.is_automatic()
+                    && !self.launch_image_kept
+                    && self.handoff_exited_session_ids().is_empty()
+                {
+                    return None;
+                }
+                return Some(crate::UpdateHandoffStartError::failed(
+                    if mode.is_automatic() {
+                        format!("{reason}; the update is tried again later")
+                    } else {
+                        format!("{reason}; press again to check again")
+                    },
+                ));
             }
+            *self.sessionless_waited.of(mode) = self.in_flight_read_deadline();
             let until = now + crate::HANDOFF_PREVERIFY_READ_CEILING;
             self.preverify_read_waited = Some((target_build, until));
             return Some(if mode.is_automatic() {
@@ -8616,12 +8678,30 @@ impl App {
                 preverify_read_hold(target_build, PreverifyWaiter::SessionlessHandoff, until)
             });
         }
-        self.preverify_read_wait(
+        if self
+            .preverify_read_waited
+            .is_some_and(|(target, until)| target == target_build && now >= until)
+        {
+            self.preverify_read_waited = None;
+        }
+        let wait = self.preverify_read_wait(
             mode,
             target_build,
             true,
             PreverifyWaiter::SessionlessHandoff,
-        )
+        );
+        if wait.is_some() {
+            *self.sessionless_waited.of(mode) = self.in_flight_read_deadline();
+        }
+        wait
+    }
+
+    /// The deadline (a read's identity) of the pre-park read in flight, if any.
+    #[cfg(unix)]
+    fn in_flight_read_deadline(&self) -> Option<std::time::Instant> {
+        self.handoff_preverify_in_flight
+            .as_ref()
+            .map(|read| read.deadline)
     }
 
     /// The successor's handoff policy as every park follows it, from the passed pre-verification of exactly the targeted artifact.
@@ -9399,14 +9479,14 @@ fn update_admission_refusal(
         && let Some(why) = unavailable
     {
         format!(
-            "The update installs at the next launch: seamless handoff unavailable because {}, and this aterm never restarts in place.{}",
+            "The update waits for the next launch: seamless handoff unavailable because {}, and this aterm never restarts in place.{}",
             why.cause(),
             why.remedy(),
         )
     } else if reason == crate::native_update_admission::AdmissionBlock::KeptImageWithoutHandoff
         && let Some(why) = sessionless_refusal
     {
-        format!("The update installs at the next launch: {why}")
+        format!("The update waits for the next launch: {why}")
     } else {
         reason.message(facts)
     };
@@ -9512,7 +9592,7 @@ mod admission_refusal_detail_tests {
         .into_message();
         assert_eq!(
             message,
-            format!("The update installs at the next launch: {cause}")
+            format!("The update waits for the next launch: {cause}")
         );
         assert_eq!(
             update_admission_refusal(AdmissionBlock::KeptImageWithoutHandoff, kept, None, None)

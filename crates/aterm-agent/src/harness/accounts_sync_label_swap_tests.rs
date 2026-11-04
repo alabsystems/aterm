@@ -1600,7 +1600,6 @@ fn a_label_trade_between_renewed_rows_moves_each_accounts_record_and_renewal() {
     store
         .transact_logins(NOW, &mut None, |state, logins| {
             for (label, own, staged) in &staged_of {
-                let _ = accounts::note_auth(state, label, accounts::Auth::Ok, NOW);
                 logins.labels.insert(
                     (*label).into(),
                     accounts::Binding {
@@ -1610,6 +1609,8 @@ fn a_label_trade_between_renewed_rows_moves_each_accounts_record_and_renewal() {
                         ..accounts::Binding::default()
                     },
                 );
+                let _ =
+                    accounts::note_auth_in_context(state, logins, label, accounts::Auth::Ok, NOW);
             }
             Ok(Vec::new())
         })
@@ -1674,7 +1675,6 @@ fn a_new_account_at_a_departed_accounts_label_is_not_served_its_renewal() {
     let staged_text = signed_in(&staged, BEA);
     store
         .transact_logins(NOW, &mut None, |state, logins| {
-            let _ = accounts::note_auth(state, "m3-2", accounts::Auth::Ok, NOW);
             logins.labels.insert(
                 "m3-2".into(),
                 accounts::Binding {
@@ -1684,6 +1684,7 @@ fn a_new_account_at_a_departed_accounts_label_is_not_served_its_renewal() {
                     ..accounts::Binding::default()
                 },
             );
+            let _ = accounts::note_auth_in_context(state, logins, "m3-2", accounts::Auth::Ok, NOW);
             Ok(Vec::new())
         })
         .unwrap();
@@ -1740,19 +1741,6 @@ fn verified_account(staged: bool) -> (Desk, PathBuf, super::super::profile::Acco
     let key = super::super::profile::AccountKey::claude(id).unwrap();
     store
         .transact_logins(NOW, &mut None, |state, logins| {
-            let _ = accounts::note_auth(state, "m3-2", accounts::Auth::Ok, NOW);
-            let record = state.accounts.get_mut("m3-2").unwrap();
-            record.key = Some(key);
-            record.walls.insert(
-                "weekly".into(),
-                accounts::Wall {
-                    until: Some(NOW + 3600),
-                    at: NOW,
-                    by: "m3".into(),
-                    attempts: 1,
-                    cleared: false,
-                },
-            );
             logins.labels.insert(
                 "m3-2".into(),
                 accounts::Binding {
@@ -1764,6 +1752,19 @@ fn verified_account(staged: bool) -> (Desk, PathBuf, super::super::profile::Acco
                         Vec::new()
                     },
                     ..accounts::Binding::default()
+                },
+            );
+            let _ = accounts::note_auth_in_context(state, logins, "m3-2", accounts::Auth::Ok, NOW);
+            let record = state.accounts.get_mut("m3-2").unwrap();
+            record.key = Some(key);
+            record.walls.insert(
+                "weekly".into(),
+                accounts::Wall {
+                    until: Some(NOW + 3600),
+                    at: NOW,
+                    by: "m3".into(),
+                    attempts: 1,
+                    cleared: false,
                 },
             );
             Ok(Vec::new())
@@ -1820,6 +1821,12 @@ fn a_departing_accounts_provider_key_preserves_its_record_before_label_reuse() {
                 .row("m3-2")
                 .unwrap()
                 .clone();
+            let before_forecast = accounts::login_forecast(&old_row, &before_logins, &before_state);
+            assert!(before_forecast.is_some());
+            assert_eq!(
+                accounts::login_served_at(&old_row, &before_logins, &before_state),
+                Some(NOW + 1)
+            );
             let ann = desk.rows().row("m3").unwrap().clone();
             let profile = profile.replace(BEA, NEW_BEA);
             fs::write(dir.join(".claude.json"), &profile).unwrap();
@@ -1843,14 +1850,21 @@ fn a_departing_accounts_provider_key_preserves_its_record_before_label_reuse() {
             let mut expected = before_binding;
             expected.renewal_generation = binding.renewal_generation;
             expected.last_success_generation = 0;
-            assert_eq!(binding, &expected);
+            let mut retained = binding.clone();
+            expected.lifetime_scope = Default::default();
+            retained.lifetime_scope = Default::default();
+            assert_eq!(
+                retained, expected,
+                "the account retains its binding history"
+            );
             assert!(!logins.sign_in_receipts.contains_key("m3-2"));
             assert!(!logins.sign_in_receipts.contains_key(to));
             let bound = store.bound(&desk.rows(), NOW + 10).unwrap();
-            assert_eq!(
-                bound.row(to).unwrap().dir.as_deref(),
-                Some(text(&dir).as_str())
-            );
+            let row = bound.row(to).unwrap();
+            assert_eq!(row.dir.as_deref(), Some(text(&dir).as_str()));
+            assert_eq!(accounts::forecast(binding), before_forecast);
+            assert_eq!(accounts::login_forecast(row, &logins, &state), None);
+            assert_eq!(accounts::login_served_at(row, &logins, &state), None);
             if to != "m3-2" {
                 assert_ne!(state.account("m3-2").auth, accounts::Auth::Ok);
                 assert!(state.account("m3-2").walls.is_empty());
@@ -2068,11 +2082,6 @@ fn departing_provider_keys_can_trade_labels_without_erasing_either_source() {
     let cid_key = super::super::profile::AccountKey::claude(cid_id).unwrap();
     store
         .transact_logins(NOW + 1, &mut None, |state, logins| {
-            let events = accounts::note_auth(state, "m3-3", accounts::Auth::Ok, NOW + 1);
-            let walls = state.account("m3-2").walls.clone();
-            let record = state.accounts.get_mut("m3-3").unwrap();
-            record.key = Some(cid_key);
-            record.walls = walls;
             logins.labels.insert(
                 "m3-3".into(),
                 accounts::Binding {
@@ -2080,6 +2089,12 @@ fn departing_provider_keys_can_trade_labels_without_erasing_either_source() {
                     ..accounts::Binding::default()
                 },
             );
+            let events =
+                accounts::note_auth_in_context(state, logins, "m3-3", accounts::Auth::Ok, NOW + 1);
+            let walls = state.account("m3-2").walls.clone();
+            let record = state.accounts.get_mut("m3-3").unwrap();
+            record.key = Some(cid_key);
+            record.walls = walls;
             Ok(events)
         })
         .unwrap();

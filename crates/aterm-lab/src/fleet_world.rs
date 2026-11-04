@@ -161,9 +161,9 @@ pub struct Out {
 pub struct World {
     /// `/tmp/af.XXXXXX`.
     pub base: PathBuf,
-    /// `<base>/bin` directory holding `aterm` and fixture symlinks.
+    /// `<base>/bin` directory holding the app and fixture symlinks.
     pub bin: PathBuf,
-    /// The aterm under test.
+    /// The private, read-only copy of the aterm under test.
     pub aterm: PathBuf,
     /// The instances.
     pub insts: Vec<Inst>,
@@ -172,6 +172,33 @@ pub struct World {
     /// What one world's environment adds to [`world_env`]'s, by its root (`swarm partition`'s
     /// cut file and fleet seams).
     pub extra: std::collections::BTreeMap<PathBuf, Vec<(String, String)>>,
+}
+
+/// Copy one opened regular image, with bounded I/O and no shared writable inode.
+fn copy_image(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::io::Read as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let input = crate::util::open_regular_file(source)?;
+    let meta = input.metadata()?;
+    let limit = crate::util::MAX_LAB_PROGRAM_BYTES;
+    if meta.len() > limit {
+        return Err(std::io::Error::other(
+            "app image exceeds the lab program limit",
+        ));
+    }
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    if std::io::copy(&mut input.take(limit + 1), &mut output)? > limit {
+        return Err(std::io::Error::other(
+            "app image grew past the lab program limit",
+        ));
+    }
+    output.set_permissions(std::fs::Permissions::from_mode(
+        meta.permissions().mode() & 0o555,
+    ))
 }
 
 /// Returns the isolated environment variables for an instance world rooted at `root`, the
@@ -246,32 +273,65 @@ pub fn free_ports(n: usize) -> std::io::Result<Vec<u16>> {
 }
 
 impl World {
-    /// A fresh base with its `bin/`.
+    /// A fresh base with an app image that a concurrent build cannot replace.
     ///
     /// # Errors
-    /// The base or a link could not be made.
+    /// The layout or bounded image copy failed, or the copy did not print its version.
+    /// An unproven copy is retained because macOS may still be assessing its first exec.
     pub fn new(aterm: &Path, keep: bool) -> Result<World, String> {
         let base = crate::sys::make_temp_dir("/tmp/af.XXXXXX")
             .map(PathBuf::from)
             .map_err(|e| format!("cannot make the simulation's base under /tmp: {e}"))?;
         let bin = base.join("bin");
         let me = &crate::paths::paths().exe;
+        let image = base.join(".ubd/app.noindex/aterm");
         let made = std::fs::create_dir_all(&bin).and_then(|()| {
+            make_world(&base)?;
+            std::fs::create_dir_all(image.parent().expect("the image's directory"))?;
             for name in ["claude", "build-loop"] {
                 std::os::unix::fs::symlink(me, bin.join(name))?;
             }
-            std::os::unix::fs::symlink(aterm, bin.join("aterm"))
+            copy_image(aterm, &image)?;
+            std::os::unix::fs::symlink(&image, bin.join("aterm"))
         });
-        let world = World {
+        let mut world = World {
             base,
             bin,
-            aterm: aterm.to_path_buf(),
+            aterm: image,
             insts: Vec::new(),
             keep,
             extra: std::collections::BTreeMap::new(),
         };
         made.map_err(|e| format!("cannot lay out {}: {e}", world.bin.display()))?;
+        world.prove_image()?;
         Ok(world)
+    }
+
+    /// Prove execution before allowing the copied image's directory to be removed.
+    fn prove_image(&mut self) -> Result<(), String> {
+        let requested_keep = self.keep;
+        self.keep = true;
+        let mut cmd = aterm_uds::spawnfd::command(&self.aterm);
+        cmd.arg("--version")
+            .current_dir(&self.base)
+            .env_clear()
+            .envs(world_env(&self.base, &self.bin));
+        let result = aterm_uds::deadline::output_within(&mut cmd, HANG);
+        match result {
+            Ok(out) if out.status.success() && out.stdout.starts_with(b"aterm ") => {
+                self.keep = requested_keep;
+                Ok(())
+            }
+            other => Err(format!(
+                "the private image {} did not print its version; {} is kept: {}",
+                self.aterm.display(),
+                self.base.display(),
+                match other {
+                    Ok(out) => format!("{}: {}", out.status, String::from_utf8_lossy(&out.stderr)),
+                    Err(e) => e.to_string(),
+                }
+            )),
+        }
     }
 
     /// `<base>/mNN`.
@@ -612,6 +672,67 @@ pub fn open_fds(pids: &[i32]) -> std::collections::BTreeMap<i32, usize> {
 #[cfg(test)]
 mod tests {
     use super::open_fds;
+
+    fn ran(image: &std::path::Path) {
+        let mut child = aterm_uds::spawnfd::command(image)
+            .arg("image-ran")
+            .stdout(aterm_uds::spawnfd::Stdio::piped())
+            .spawn()
+            .expect("start the copied image");
+        aterm_uds::deadline::prints(&mut child, "image-ran", super::HANG);
+        assert!(child.wait().unwrap().success());
+    }
+
+    /// A build may rewrite its output in place as well as rename over it. The world's image
+    /// still executes afterwards; a symlink or hard link would observe the replacement.
+    #[test]
+    fn the_private_image_outlives_a_rewrite_of_the_build_output() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let mut scratch =
+            aterm_uds::deadline::KeptUntilRan::new(aterm_tempfile::tempdir().unwrap().keep());
+        let source = scratch.path().join("source");
+        let image = scratch.path().join("aterm");
+        aterm_uds::deadline::ad_hoc_copy(std::path::Path::new("/bin/echo"), &source);
+        super::copy_image(&source, &image).unwrap();
+        assert_ne!(
+            std::fs::metadata(&source).unwrap().ino(),
+            std::fs::metadata(&image).unwrap().ino()
+        );
+        assert_eq!(
+            std::fs::metadata(&image).unwrap().permissions().mode() & 0o222,
+            0
+        );
+        ran(&source);
+        ran(&image);
+        std::fs::write(&source, b"not an executable").unwrap();
+        ran(&image);
+        scratch.ran();
+    }
+
+    /// A copied program that does not produce the app's version cannot authorize cleanup.
+    #[test]
+    fn a_failed_version_probe_keeps_the_copied_image() {
+        let mut scratch =
+            aterm_uds::deadline::KeptUntilRan::new(aterm_tempfile::tempdir().unwrap().keep());
+        let image = scratch.path().join("aterm");
+        aterm_uds::deadline::ad_hoc_copy(std::path::Path::new("/bin/echo"), &image);
+        let mut world = super::World {
+            base: scratch.path().to_path_buf(),
+            bin: scratch.path().to_path_buf(),
+            aterm: image.clone(),
+            insts: Vec::new(),
+            keep: false,
+            extra: std::collections::BTreeMap::new(),
+        };
+        assert!(world.prove_image().is_err());
+        assert!(world.keep);
+        drop(world);
+        assert!(image.is_file());
+        // Explicit stdout proof makes removing this test's intentionally retained image safe.
+        ran(&image);
+        scratch.ran();
+    }
 
     /// A member's descriptors are counted from its table; a reaped one is left out.
     #[test]

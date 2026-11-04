@@ -119,29 +119,68 @@ impl RemoveHow {
     }
 }
 
+fn esc_field(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+fn unesc_field(s: &str) -> Option<String> {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        if c == '\\' {
+            out.push(match it.next()? {
+                '\\' => '\\',
+                't' => '\t',
+                'n' => '\n',
+                'r' => '\r',
+                _ => return None,
+            });
+        } else {
+            out.push(c);
+        }
+    }
+    Some(out)
+}
+
 impl Op {
     pub(crate) fn encode(&self) -> String {
         let b = |v: bool| if v { "1" } else { "0" };
         match self {
-            Op::Reach(p, r) => format!("reach\t{p}\t{}", b(*r)),
-            Op::Write(p, h) => format!("write\t{p}\t{}", h.word()),
-            Op::Unix(p, l) => format!("unix\t{p}\t{}", b(*l)),
+            Op::Reach(p, r) => format!("reach\t{}\t{}", esc_field(p), b(*r)),
+            Op::Write(p, h) => format!("write\t{}\t{}", esc_field(p), h.word()),
+            Op::Unix(p, l) => format!("unix\t{}\t{}", esc_field(p), b(*l)),
             Op::Udp => "udp".into(),
-            Op::Serve(d) => format!("serve\t{}", d.as_deref().unwrap_or("")),
-            Op::Mach(n) => format!("mach\t{n}"),
-            Op::PreferencePolicy(scope, n) => format!("preference-policy\t{scope}\t{n}"),
+            Op::Serve(None) => "serve".into(),
+            Op::Serve(Some(d)) => format!("serve\t{}", esc_field(d)),
+            Op::Mach(n) => format!("mach\t{}", esc_field(n)),
+            Op::PreferencePolicy(scope, n) => {
+                format!("preference-policy\t{}\t{}", esc_field(scope), esc_field(n))
+            }
             #[cfg(test)]
-            Op::ShmRead(n) => format!("shm-read\t{n}"),
-            Op::Signal(w) => format!("signal\t{w}"),
-            Op::Exec(w, s) => format!("exec\t{w}\t{s}"),
-            Op::Claude(p) => format!("claude\t{p}"),
+            Op::ShmRead(n) => format!("shm-read\t{}", esc_field(n)),
+            Op::Signal(w) => format!("signal\t{}", esc_field(w)),
+            Op::Exec(w, s) => format!("exec\t{}\t{}", esc_field(w), esc_field(s)),
+            Op::Claude(p) => format!("claude\t{}", esc_field(p)),
             Op::Tiocsti => "tiocsti".into(),
-            Op::Remove(p, h) => format!("remove\t{p}\t{}", h.word()),
-            Op::Meta(p, l) => format!("meta\t{p}\t{}", b(*l)),
+            Op::Remove(p, h) => format!("remove\t{}\t{}", esc_field(p), h.word()),
+            Op::Meta(p, l) => format!("meta\t{}\t{}", esc_field(p), b(*l)),
         }
     }
 
     fn decode(line: &str) -> Option<Op> {
+        if line.contains(['\n', '\r']) {
+            return None;
+        }
         let f: Vec<&str> = line.split('\t').collect();
         let b = |v: &str| match v {
             "1" => Some(true),
@@ -149,23 +188,24 @@ impl Op {
             _ => None,
         };
         Some(match f.as_slice() {
-            ["reach", p, r] => Op::Reach((*p).to_string(), b(r)?),
-            ["write", p, h] => Op::Write((*p).to_string(), WriteHow::from_word(h)?),
-            ["unix", p, l] => Op::Unix((*p).to_string(), b(l)?),
+            ["reach", p, r] => Op::Reach(unesc_field(p)?, b(r)?),
+            ["write", p, h] => Op::Write(unesc_field(p)?, WriteHow::from_word(h)?),
+            ["unix", p, l] => Op::Unix(unesc_field(p)?, b(l)?),
             ["udp"] => Op::Udp,
-            ["serve", d] => Op::Serve((!d.is_empty()).then(|| (*d).to_string())),
-            ["mach", n] => Op::Mach((*n).to_string()),
+            ["serve"] => Op::Serve(None),
+            ["serve", d] => Op::Serve(Some(unesc_field(d)?)),
+            ["mach", n] => Op::Mach(unesc_field(n)?),
             ["preference-policy", scope, n] => {
-                Op::PreferencePolicy((*scope).to_string(), (*n).to_string())
+                Op::PreferencePolicy(unesc_field(scope)?, unesc_field(n)?)
             }
             #[cfg(test)]
-            ["shm-read", n] => Op::ShmRead((*n).to_string()),
-            ["signal", w] => Op::Signal((*w).to_string()),
-            ["exec", w, s] => Op::Exec((*w).to_string(), (*s).to_string()),
-            ["claude", p] => Op::Claude((*p).to_string()),
+            ["shm-read", n] => Op::ShmRead(unesc_field(n)?),
+            ["signal", w] => Op::Signal(unesc_field(w)?),
+            ["exec", w, s] => Op::Exec(unesc_field(w)?, unesc_field(s)?),
+            ["claude", p] => Op::Claude(unesc_field(p)?),
             ["tiocsti"] => Op::Tiocsti,
-            ["remove", p, h] => Op::Remove((*p).to_string(), RemoveHow::from_word(h)?),
-            ["meta", p, l] => Op::Meta((*p).to_string(), b(l)?),
+            ["remove", p, h] => Op::Remove(unesc_field(p)?, RemoveHow::from_word(h)?),
+            ["meta", p, l] => Op::Meta(unesc_field(p)?, b(l)?),
             _ => return None,
         })
     }
@@ -1735,6 +1775,10 @@ mod tests {
         }
     }
 
+    /// NEGATIVE CONTROL: `Serve(None)` and `Serve(Some(""))` stay distinct across `encode`/`decode`,
+    /// fields holding tabs, newlines, carriage returns, or backslashes round-trip through the
+    /// line-framed spec file without splitting or spoofing operations, and malformed frames or
+    /// invalid backslash escapes decode as `None`.
     #[test]
     fn every_operation_crosses_into_the_jail_unchanged() {
         for c in plan(&world(true), "/tmp/at.x/a.sock", &["/tmp/at.y".into()]) {
@@ -1745,18 +1789,35 @@ mod tests {
                 c.label
             );
         }
-        let owned_shm = Op::ShmRead("/apple.cfprefs.owned-fixture".into());
-        assert_eq!(Op::decode(&owned_shm.encode()), Some(owned_shm));
+        let edge_ops = [
+            Op::ShmRead("/apple.cfprefs.owned-fixture".into()),
+            Op::Serve(None),
+            Op::Serve(Some(String::new())),
+            Op::Serve(Some("/tmp/dir\twith\ttabs\nand\\slashes\r".into())),
+            Op::Reach("/H/weird\t1\nudp\r\\file".into(), true),
+            Op::Write("/H/a\\t\\nb".into(), WriteHow::Replace),
+            Op::PreferencePolicy("scope\t1".into(), "domain\n2\\3".into()),
+            Op::Exec("recorder".into(), "/shim\tdir\nnext".into()),
+        ];
+        let spec_file: String = edge_ops
+            .iter()
+            .map(|op| format!("{}\n", op.encode()))
+            .collect();
+        let decoded: Vec<Option<Op>> = spec_file.lines().map(Op::decode).collect();
+        assert_eq!(decoded, edge_ops.into_iter().map(Some).collect::<Vec<_>>());
         for malformed in [
             "",
             "reach\t/p",
             "reach\t/p\t2",
             "reach\t/p\t1\textra",
+            "reach\t/p\\x\t1",
+            "reach\t/p\\\t1",
             "unix\t/p\ttrue",
             "meta\t/p\tx",
             "udp\textra",
+            "udp\nserve",
+            "udp\rserve",
             "tiocsti\textra",
-            "serve",
             "serve\t/d\textra",
         ] {
             assert_eq!(Op::decode(malformed), None, "{malformed:?}");

@@ -428,7 +428,7 @@ fn resolve_steward_own_label(paths: &Paths, doc: &Document) -> crate::Result<Opt
             .flatten()
             .and_then(|c| log_entries::trusted_local_log(paths, &c).ok().flatten())
         {
-            roster::overlay_log_membership(&log, r);
+            roster::overlay_log_membership(&log, None, r);
         }
     }
     let local_roster = roster::swarm_roster(paths).ok().flatten();
@@ -742,7 +742,7 @@ fn expire_denied_lease_holder(
         .flatten()
         .and_then(|c| log_entries::trusted_local_log(paths, &c).ok().flatten())
     {
-        roster::overlay_log_membership(&log, &mut roster);
+        roster::overlay_log_membership(&log, None, &mut roster);
     }
     let code_only: BTreeSet<String> = doc.code_only().into_iter().collect();
     let holder_denied = roster.is_label_denied(&lease.holder)

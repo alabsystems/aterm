@@ -38,7 +38,7 @@ fn main() {
             .status()
             .unwrap();
         assert!(status.success(), "nested {name}: {status}");
-        assert!(std::path::Path::new(&target).join("debug/deps").is_dir(), "nested {name} kept to its own target dir");
+        assert!(std::path::Path::new(&target).join("debug/libinner.rlib").is_file(), "nested {name} published its compiled library in the requested target dir");
     }
 }
 "#;
@@ -146,20 +146,21 @@ fn nested_build(hop: bool, verb: &str) {
     write(&shim, &format!("#!/bin/sh\n{block}{forwarding}"));
 
     let log = root.join("build.log");
+    let messages = root.join("build-messages.jsonl");
     let ledger = root.join("ledger");
     let ready = root.join("build-script-ready");
     let release = root.join("build-script-release");
     let mut command = aterm_uds::spawnfd::command("/bin/sh");
     command
         .arg(&shim)
-        .args(["--unverified", verb, "-q"])
+        .args(["--unverified", verb, "-q", "--message-format=json"])
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", &home)
         .env("PWD", &ws)
         .env("BC_SHIM", &shim)
         .current_dir(&ws)
-        .stdout(aterm_uds::spawnfd::Stdio::null())
+        .stdout(std::fs::File::create(&messages).unwrap())
         .stderr(std::fs::File::create(&log).unwrap());
     if hop {
         command
@@ -229,11 +230,35 @@ fn nested_build(hop: bool, verb: &str) {
     }
 
     let cache: PathBuf = atpkg::build_cache::build_dir(&atpkg::build_cache::cache_root(&home), &ws);
+    let script_outputs: Vec<PathBuf> = std::fs::read_to_string(&messages)
+        .unwrap()
+        .lines()
+        .map(|line| aterm_json::from_str::<aterm_json::Value>(line).expect("Cargo JSON message"))
+        .filter(|message| {
+            message.get("reason").and_then(aterm_json::Value::as_str)
+                == Some("build-script-executed")
+        })
+        .map(|message| {
+            PathBuf::from(
+                message
+                    .get("out_dir")
+                    .and_then(aterm_json::Value::as_str)
+                    .expect("actual build-script output directory"),
+            )
+        })
+        .collect();
     assert!(
-        cache.join("debug/deps").is_dir(),
-        "intermediates in the cache: {}",
-        cache.display()
+        !script_outputs.is_empty(),
+        "Cargo reported the actual build script's output"
     );
+    let cache = cache.canonicalize().unwrap();
+    for output in script_outputs {
+        assert!(
+            output.is_dir() && output.canonicalize().unwrap().starts_with(&cache),
+            "actual intermediates in the cache: {}",
+            output.display()
+        );
+    }
     assert!(
         ws.join("target/debug/outer").is_file(),
         "the binary in target/"
@@ -241,6 +266,10 @@ fn nested_build(hop: bool, verb: &str) {
     assert!(
         !ws.join("target/debug/deps").exists(),
         "no intermediates in target/"
+    );
+    assert!(
+        !ws.join("target/debug/build").exists(),
+        "no per-unit intermediates in target/"
     );
 }
 

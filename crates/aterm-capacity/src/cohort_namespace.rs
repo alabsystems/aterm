@@ -17,7 +17,7 @@ use aterm_dirfd::{self as fd, AsFd, FileType, Mode, OFlags, RenameFlags};
 use aterm_json::Value;
 
 const OLD: &str = "capacity";
-const BACKEND: &str = "capacity-v3.noindex";
+const BACKEND: &str = "capacity-v4.noindex";
 const ACTIVE: &str = "active.noindex";
 const RETIRED: &str = "retired.noindex";
 const PRIOR: &str = "prior";
@@ -77,7 +77,8 @@ pub struct Namespace {
     home: PathBuf,
     host: String,
     nonce: String,
-    // private root/home, container, old inode, fence, backend, header, readiness, two planes.
+    // Ledger identities followed by the original host-lock inode. Only leadership
+    // validates that last inode: losing leadership must not invalidate child custody.
     identities: Vec<Inode>,
 }
 
@@ -105,6 +106,13 @@ impl Namespace {
         let retired = child_dir(&backend, RETIRED)?;
         self.identities[9].check(&retired, true)?;
         Ok(retired)
+    }
+
+    pub(crate) fn open_host_lock(&self) -> io::Result<File> {
+        let backend = self.open_backend()?;
+        let lock = regular(&backend, crate::leadership::LOCK)?;
+        self.identities[10].check(&lock, false)?;
+        Ok(lock)
     }
     /// Prepare a fresh domain under an existing private home inside an existing private root.
     /// Neither path may be the account home or contain it. This does not redirect `Ledger::user`.
@@ -158,6 +166,9 @@ impl Namespace {
         let mut fence = create(&container, PRIOR)?;
         let mut header = create(&container, HEADER)?;
         let mut ready = create(&backend, PENDING)?;
+        let host_lock = create(&backend, crate::leadership::LOCK)?;
+        crate::leadership::prepare(&backend, &nonce)?;
+        aterm_durable::durable(&host_lock)?;
         let namespace = Self {
             root: home.join(&name),
             home,
@@ -175,6 +186,7 @@ impl Namespace {
                 Inode::read(&ready, false)?,
                 Inode::read(&active, true)?,
                 Inode::read(&retired, true)?,
+                Inode::read(&host_lock, false)?,
             ],
         };
         let text = namespace.encode(&root)?;
@@ -230,7 +242,7 @@ impl Namespace {
 
     fn encode(&self, private_root: &Path) -> io::Result<String> {
         aterm_json::to_string(&aterm_json::json!({
-            "v": 3,
+            "v": 4,
             "kind": "private-cohort",
             "root": path_text(private_root)?,
             "home": path_text(&self.home)?,
@@ -254,7 +266,7 @@ impl Namespace {
         let Some(parent) = dir.parent() else {
             return Ok(None);
         };
-        // Nested active claims are an explicit v3 shape. A missing/old header beneath the
+        // Nested active claims are an explicit shape. A missing/old header beneath the
         // reserved container is never an ordinary legacy ledger, even before record creation.
         let mut container = None;
         for (depth, path) in dir.ancestors().enumerate() {
@@ -277,9 +289,9 @@ impl Namespace {
         let text = match std::fs::symlink_metadata(&header_path) {
             Ok(_) => read(&directory(container)?, HEADER)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let named_backend = dir
-                    .file_name()
-                    .is_some_and(|name| name == BACKEND || name == "capacity-v2");
+                let named_backend = dir.file_name().is_some_and(|name| {
+                    name == BACKEND || name == "capacity-v3.noindex" || name == "capacity-v2"
+                });
                 let reserved_parent = container
                     .file_name()
                     .and_then(|name| name.to_str())
@@ -287,6 +299,7 @@ impl Namespace {
                 // The fence is a file, so looking for readiness *under* it only gets ENOTDIR.
                 // Protocol evidence also survives a lost fence and an interrupted preparation.
                 let sibling_evidence = exists(&container.join(BACKEND))?
+                    || exists(&container.join("capacity-v3.noindex"))?
                     || exists(&container.join("capacity-v2"))?
                     || exists(&container.join(PRIOR))?;
                 if named_backend || reserved_parent || sibling_evidence {
@@ -336,14 +349,14 @@ impl Namespace {
         };
         let build = || {
             (value.as_object()?.len() == 8).then_some(())?;
-            (value.get("v")?.as_u64()? == 3 && get("kind")? == "private-cohort").then_some(())?;
+            (value.get("v")?.as_u64()? == 4 && get("kind")? == "private-cohort").then_some(())?;
             let identities = value
                 .get("identities")?
                 .as_array()?
                 .iter()
                 .map(Inode::decode)
                 .collect::<Option<Vec<_>>>()?;
-            (identities.len() == 10).then_some(())?;
+            (identities.len() == 11).then_some(())?;
             let nonce = get("nonce")?.to_owned();
             (nonce.len() == 32 && nonce.bytes().all(|b| b.is_ascii_hexdigit())).then_some(())?;
             let namespace = Self {
@@ -365,8 +378,10 @@ impl Namespace {
         build().ok_or_else(|| refused("invalid cohort namespace header"))
     }
 
-    /// Recheck scope, every recorded physical identity, all three matching headers and the
+    /// Recheck scope, ledger physical identities, all three matching headers and the
     /// retained predecessor inode. A single predecessor entry prevents new admission.
+    /// The separately anchored host-lock identity is checked only by leadership;
+    /// its loss must not invalidate the custody of already-owned native children.
     ///
     /// # Errors
     /// Any scope, identity, type, privacy, header, readiness or predecessor check fails.
@@ -528,7 +543,7 @@ fn child_dir(parent: &File, name: impl fd::Arg) -> io::Result<File> {
     )?))
 }
 
-fn regular(parent: &File, name: &str) -> io::Result<File> {
+pub(crate) fn regular(parent: &File, name: &str) -> io::Result<File> {
     let file = File::from(fd::openat(
         parent,
         name,
@@ -539,7 +554,7 @@ fn regular(parent: &File, name: &str) -> io::Result<File> {
     Ok(file)
 }
 
-fn create(parent: &File, name: &str) -> io::Result<File> {
+pub(crate) fn create(parent: &File, name: &str) -> io::Result<File> {
     Ok(File::from(fd::openat(
         parent,
         name,

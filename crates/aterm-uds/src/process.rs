@@ -2087,6 +2087,14 @@ pub fn read_cmdline(pid: u32) -> Option<Vec<u8>> {
     cmdline_as_run(pid).map(|(bytes, _)| bytes)
 }
 
+/// `pid`'s `/proc/<pid>/environ`, at most 8 MiB: a longer read is unknown, never a prefix. The
+/// read is bounded, never sized: procfs `stat`s these files as empty.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[must_use]
+pub fn read_environ(pid: u32) -> Option<Vec<u8>> {
+    read_proc_bounded(pid, c"environ").filter(|bytes| bytes.len() <= PROCESS_ARGV_MAX)
+}
+
 /// The path `pid`'s program was exec'd from.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[must_use]

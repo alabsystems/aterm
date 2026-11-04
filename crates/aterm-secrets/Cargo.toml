@@ -57,6 +57,7 @@ aterm-netplace = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 aterm-journal.workspace = true
+aterm-dirfd.workspace = true
 # O_NOFOLLOW / O_NONBLOCK for admitted reads.
 libc = { workspace = true }
 # Exclusive private edit directories; unfinished drafts are explicitly kept.
@@ -77,6 +78,10 @@ aterm-codec = { workspace = true }
 aterm-models-db.workspace = true
 aterm-models-swarm.workspace = true
 aterm-spec.workspace = true
+
+[[example]]
+name = "commons_control_probe"
+test = true
 
 [[example]]
 name = "commons_epoch_probe"

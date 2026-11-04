@@ -1099,22 +1099,23 @@ fn a_roster_capsule_for_the_same_age_recipient_cannot_activate_another_writer() 
 }
 
 #[test]
-fn history_cache_crash_leftovers_preserve_full_capacity_and_allow_exact_overwrites() {
+fn history_cache_combines_source_bounds_and_preserves_overwrites_and_leftover_bounds() {
     let dir = aterm_tempfile::tempdir().unwrap();
     let first = history_name(&[1; 32]);
     let second = history_name(&[2; 32]);
     let third = history_name(&[3; 32]);
+    assert!(history_capacity(dir.path(), &first, usize::MAX, 1).is_err());
     std::fs::write(dir.path().join(&first), []).unwrap();
     std::fs::write(dir.path().join(&second), []).unwrap();
     for n in 0..32 {
         std::fs::write(dir.path().join(format!(".{first}.tmp.100.{n}")), []).unwrap();
     }
-    assert!(history_capacity(dir.path(), &first, 2).is_ok());
-    assert!(history_capacity(dir.path(), &third, 2).is_err());
+    assert!(history_capacity(dir.path(), &first, 1, 1).is_ok());
+    assert!(history_capacity(dir.path(), &third, 1, 1).is_err());
     std::fs::remove_file(dir.path().join(&second)).unwrap();
-    assert!(history_capacity(dir.path(), &third, 2).is_ok());
+    assert!(history_capacity(dir.path(), &third, 1, 1).is_ok());
     std::fs::write(dir.path().join("unknown"), []).unwrap();
-    assert!(history_capacity(dir.path(), &first, 2).is_err());
+    assert!(history_capacity(dir.path(), &first, 1, 1).is_err());
 }
 
 #[test]

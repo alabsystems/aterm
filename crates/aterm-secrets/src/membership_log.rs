@@ -1415,6 +1415,10 @@ pub struct Log {
     // Its pure evaluation is shared too; no disk observation or grant is cached.
     membership: Arc<OnceLock<Membership>>,
     effective: Arc<OnceLock<eval::Effective>>,
+    /// The quorum weighing of the held weighed records ([`eval::Weighing`]), which every
+    /// evaluation reads: `hold` lets it go only when it holds a weighed record, since a record of
+    /// another kind changes nothing it weighed. Clones share it until one holds a weighed record.
+    weighing: Arc<OnceLock<eval::Weighing>>,
 }
 
 /// What seats one Mac in a log: the genesis binding it as a founder, the held `Admit`s another Mac
@@ -1475,6 +1479,7 @@ impl Log {
             seats,
             membership: Arc::default(),
             effective: Arc::default(),
+            weighing: Arc::default(),
         })
     }
 
@@ -1826,13 +1831,18 @@ impl Log {
     )]
     pub fn membership(&self) -> Membership {
         self.membership
-            .get_or_init(|| eval::evaluate_with(self.history()))
+            .get_or_init(|| eval::evaluate_with(self.history(), self.weighing()))
             .clone()
     }
 
     fn effective(&self) -> &eval::Effective {
         self.effective
-            .get_or_init(|| eval::effective_records(self.history()))
+            .get_or_init(|| eval::effective_records(self.history(), self.weighing()))
+    }
+
+    /// The quorum weighing of the held records, weighed once while no weighed record arrives.
+    fn weighing(&self) -> &eval::Weighing {
+        self.weighing.get_or_init(|| eval::weigh(self.history()))
     }
 
     /// The cutoff of the quorum `Remove` of `actor` that F16's "Undo <actor>'s removals" row
@@ -1848,7 +1858,7 @@ impl Log {
     /// never vote. `None` where `actor` has no contested act or no entry in this log.
     #[must_use]
     pub fn undo_cutoff(&self, actor: &MemberId) -> Option<RecordId> {
-        eval::undo_cutoff(self.history(), actor)
+        eval::undo_cutoff(self.history(), self.weighing(), actor)
     }
 
     /// Where the quorum `Remove` of `actor` at [`Log::undo_cutoff`] stands: its voters, the
@@ -1856,7 +1866,7 @@ impl Log {
     /// such cutoff.
     #[must_use]
     pub fn undo(&self, actor: &MemberId) -> Option<Undo> {
-        let mut undo = eval::undo(self.history(), actor)?;
+        let mut undo = eval::undo(self.history(), self.weighing(), actor)?;
         undo.took_effect = self
             .membership()
             .quorums()
@@ -1897,21 +1907,21 @@ impl Log {
     /// good by a quorum `Remove`).
     #[must_use]
     pub fn historical_seat_entry(&self, binding: &Binding) -> Option<RecordId> {
-        eval::historical_seat_entry(self.history(), binding)
+        eval::historical_seat_entry(self.history(), self.weighing(), binding)
     }
 
     /// Whether `binding` holds a founding or effective admitted seat in this log (even if later
     /// retired by an ordinary `Remove`, unless voided out for good by a quorum `Remove`).
     #[must_use]
     pub fn has_historical_seat(&self, binding: &Binding) -> bool {
-        eval::has_historical_seat(self.history(), binding)
+        eval::has_historical_seat(self.history(), self.weighing(), binding)
     }
 
     /// Whether `actor` holds a founding or non-void, authorized, non-cut-off admitted seat in
     /// this log (including actors later retired by an ordinary or quorum `Remove`).
     #[must_use]
     pub fn has_known_actor(&self, actor: &MemberId) -> bool {
-        eval::has_known_actor(self.history(), actor)
+        eval::has_known_actor(self.history(), self.weighing(), actor)
     }
 
     /// Historical Commons writer bindings eligible to authenticate table records sealed under
@@ -1928,7 +1938,7 @@ impl Log {
         else {
             return None;
         };
-        let writers = eval::historical_bindings_for_epoch(self.history(), idx)?;
+        let writers = eval::historical_bindings_for_epoch(self.history(), self.weighing(), idx)?;
         Some((*generation, writers))
     }
 
@@ -2062,11 +2072,25 @@ impl Log {
         self.held_bytes().saturating_add(self.waiting_bytes())
     }
 
+    /// Wire bytes of held and waiting records plus the reachability index's bytes.
+    /// A cache of decoded logs counts both rather than only the input wire.
+    #[must_use]
+    pub fn footprint(&self) -> usize {
+        self.total_bytes().saturating_add(self.reach.bytes())
+    }
+
     fn hold(&mut self, record: Record) {
         // The evaluation goes first: an `Effective` shares the index's chunks, and a lone log
         // whose cache let go of it extends its last chunk in place.
         self.membership = Arc::default();
         self.effective = Arc::default();
+        #[cfg(test)]
+        let carried = eval::MUTANT.get() == Some(eval::Mutant::CarryAcross(record.kind()));
+        #[cfg(not(test))]
+        let carried = false;
+        if record.kind().weighed() && !carried {
+            self.weighing = Arc::default();
+        }
         let at = self.order.len();
         self.reach
             .push(record.parents().iter().map(|parent| self.held[parent]));

@@ -146,6 +146,9 @@ fn on_lan(log: &Log, mac: Mac, tag: u8, name: &str, at: u64) -> Decision {
         log,
         &ME.id(),
         &Proven {
+            reader: crate::members::bundle::Reader::BoundedLog(
+                crate::crossing::RecordsBound::uncrossed(),
+            ),
             request: &request,
             node: node(tag),
             name,
@@ -277,6 +280,7 @@ fn a_split_the_node_key_proves_is_recorded_for_a_person_since_a_remove_cannot_fo
                 &log,
                 &ME.id(),
                 &Proven {
+                    reader: crate::members::bundle::Reader::BoundedLog(crate::crossing::RecordsBound::uncrossed()),
                     request: &request,
                     node: node(110),
                     name: "m110",
@@ -325,6 +329,9 @@ fn a_split_the_node_key_proves_is_recorded_for_a_person_since_a_remove_cannot_fo
 /// A Mac that asks as `m7` and proves `node_key` from another host on the member's home ALab LAN.
 fn asked_on_lan(request: &DeviceRequest, node_key: [u8; 32]) -> Proven<'_> {
     Proven {
+        reader: crate::members::bundle::Reader::BoundedLog(
+            crate::crossing::RecordsBound::uncrossed(),
+        ),
         request,
         node: node_key,
         name: "m7",

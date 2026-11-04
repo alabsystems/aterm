@@ -94,8 +94,8 @@ fn a_short_volume_is_reclaimed_first_then_waited_for() {
             Arc::clone(&their_order),
         );
         let mut relief = Reclaim::of(
-            Box::new(move |mount, _stopped| {
-                assert_eq!(mount, Path::new("/Volumes/scratch"));
+            Box::new(move |room: super::Room<'_>, _stopped| {
+                assert_eq!(room.mount, Path::new("/Volumes/scratch"));
                 pass_order.lock().expect("order").push("reclaim");
                 pass_m.set(image(40, 22));
                 (
@@ -634,7 +634,7 @@ fn a_build_directory_emptied_while_it_waits_sizes_its_claim_again() {
 /// once an interrupt came it removes nothing.
 #[test]
 fn the_runs_own_pass_keeps_its_directories_and_frees_the_rest() {
-    use crate::build_cache::{RECLAIM_GONE_UNDER_PRESSURE, build_dir, cache_root, reclaim_watched};
+    use crate::build_cache::{ReclaimAfter, build_dir, cache_root, reclaim_watched};
     let dir = crate::testdir::dir("admit-disk-own-pass");
     let home = dir.join("home");
     let root = cache_root(&home);
@@ -661,7 +661,7 @@ fn the_runs_own_pass_keeps_its_directories_and_frees_the_rest() {
             &root,
             Some(&home),
             later,
-            RECLAIM_GONE_UNDER_PRESSURE,
+            ReclaimAfter::UNDER_PRESSURE,
             None,
             &mut super::recorder(own, &halt, &mut removed),
         );
@@ -684,6 +684,49 @@ fn the_runs_own_pass_keeps_its_directories_and_frees_the_rest() {
     want.sort();
     assert_eq!(pass(&[], false), want);
     assert!(!own.exists() && !holding.exists());
+}
+
+/// A CLAIM THAT DOES NOT FIT IS NOT A VOLUME BELOW ITS FLOOR: a relief asks for the hour's wait on
+/// a live worktree's stale parts only where nothing stands above the floor. Above it, the wait
+/// stays three days, while a gone workspace's build directory goes as it does below.
+#[test]
+fn a_claims_relief_waits_the_hour_only_below_the_floor() {
+    use crate::build_cache::{
+        RECLAIM_GONE_UNDER_PRESSURE, RECLAIM_STALE, RECLAIM_STALE_UNDER_PRESSURE,
+    };
+    let relieved = |above_floor: u64| {
+        let seen = std::sync::Arc::new(Mutex::new(None));
+        let theirs = std::sync::Arc::clone(&seen);
+        let mut relief = Reclaim::of(
+            Box::new(move |room: super::Room<'_>, _stopped| {
+                *theirs.lock().expect("seen") = Some(room.after);
+                (0, Vec::new(), Vec::new())
+            }),
+            Box::new(|_, _, _| None),
+            Box::new(|_, _| Vec::new()),
+        );
+        let short = aterm_capacity::Shortfall {
+            shorts: vec![aterm_capacity::Short::Disk {
+                need: 20 * GIB,
+                mount: PathBuf::from("/Volumes/scratch"),
+                above_floor,
+                floor: 10 * GIB,
+                reserved: GIB,
+            }],
+            holders: Vec::new(),
+        };
+        aterm_capacity::Relief::relieve(&mut relief, &short, &mut |_| {}, &|| false);
+        let seen = seen.lock().expect("seen").take();
+        seen.expect("the pass ran")
+    };
+
+    let after = relieved(12 * GIB);
+    assert_eq!(after.gone, RECLAIM_GONE_UNDER_PRESSURE);
+    assert_eq!(after.stale, RECLAIM_STALE);
+
+    let after = relieved(0);
+    assert_eq!(after.gone, RECLAIM_GONE_UNDER_PRESSURE);
+    assert_eq!(after.stale, RECLAIM_STALE_UNDER_PRESSURE);
 }
 
 /// Set, the test binary is [`standin_claims_disk_until_interrupted`], its ledger and run under

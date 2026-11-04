@@ -61,7 +61,7 @@ fn serve(
         let Ok((conn, _)) = listener.accept() else {
             return;
         };
-        let mut reader = std::io::BufReader::new(&conn);
+        let mut reader = super::super::reply_on(&conn);
         let mut request = String::new();
         if reader.read_line(&mut request).unwrap_or(0) == 0 {
             continue;
@@ -98,7 +98,7 @@ fn stop(sock: &std::path::Path) {
 /// read the `OK subscribe` status line through the reader the relay keeps
 /// using (which may already hold the frames behind it).
 #[cfg(unix)]
-fn handshake(stream: &CtlStream, reader: &mut BufReader<&CtlStream>, request: &str) {
+fn handshake(stream: &CtlStream, reader: &mut super::super::Reply<'_>, request: &str) {
     let mut writer = stream;
     writer.write_all(request.as_bytes()).expect("send");
     let mut status = String::new();
@@ -112,7 +112,7 @@ fn handshake(stream: &CtlStream, reader: &mut BufReader<&CtlStream>, request: &s
 #[cfg(unix)]
 fn relay<'b>(
     stream: &'b CtlStream,
-    reader: &mut BufReader<&'b CtlStream>,
+    reader: &mut super::super::Reply<'b>,
     dialed: &str,
     server: Option<u32>,
     request: &str,
@@ -830,7 +830,7 @@ fn a_fallen_back_stream_asks_the_next_successor_for_its_new_sessions_anchors_onl
         seen_tx.clone(),
     );
     let stream = CtlStream::connect(&sock).expect("connect");
-    let mut reader = BufReader::new(&stream);
+    let mut reader = super::super::reply_on(&stream);
     handshake(&stream, &mut reader, request);
     old.join().unwrap();
     let first_path = sock.clone();
@@ -841,7 +841,7 @@ fn a_fallen_back_stream_asks_the_next_successor_for_its_new_sessions_anchors_onl
             let Ok((conn, _)) = listener.accept() else {
                 return;
             };
-            let mut reader = std::io::BufReader::new(&conn);
+            let mut reader = super::super::reply_on(&conn);
             let mut request = String::new();
             if reader.read_line(&mut request).unwrap_or(0) == 0 {
                 continue;
@@ -923,7 +923,7 @@ fn conn_after(
 fn a_write_that_fails_reads_the_refusal_the_successor_left() {
     let big = format!("subscribe @s-a cursor {}\n", "x".repeat(4 << 20));
     let ask = |client: &CtlStream| {
-        let mut reader = BufReader::new(client);
+        let mut reader = super::super::reply_on(client);
         ask_once(client, &mut reader, None, &big)
     };
     let (_d, client) = conn_after("rd-ask-busy", |conn| {
@@ -946,7 +946,7 @@ fn a_write_that_fails_reads_the_refusal_the_successor_left() {
             .unwrap();
         assert!(request.starts_with("subscribe"), "{request}");
     });
-    let mut reader = BufReader::new(&client);
+    let mut reader = super::super::reply_on(&client);
     assert!(
         matches!(ask_once(&client, &mut reader, None, "subscribe @s-a cursor\n"), Answer::Line(l) if l.is_empty())
     );
@@ -976,7 +976,7 @@ fn a_successor_that_closes_on_the_resume_is_asked_again_and_never_a_silent_exit_
             seen_tx,
         );
         let stream = CtlStream::connect(&sock).expect("connect");
-        let mut reader = BufReader::new(&stream);
+        let mut reader = super::super::reply_on(&stream);
         handshake(&stream, &mut reader, &request);
         old.join().unwrap();
         let listener = aterm_uds::CtlListener::bind(&sock).unwrap();
@@ -1078,7 +1078,7 @@ fn a_busy_successor_is_asked_again_and_the_stream_resumes() {
         seen_tx,
     );
     let stream = CtlStream::connect(&sock).expect("connect");
-    let mut reader = BufReader::new(&stream);
+    let mut reader = super::super::reply_on(&stream);
     handshake(&stream, &mut reader, request);
     old.join().unwrap();
     let listener = aterm_uds::CtlListener::bind(&sock).unwrap();
@@ -1189,7 +1189,7 @@ fn a_forwarded_stream_follows_its_hosts_successor_not_the_relay() {
             server
         });
         let stream = CtlStream::connect(&relay_sock).expect("connect");
-        let mut reader = BufReader::new(&stream);
+        let mut reader = super::super::reply_on(&stream);
         handshake(&stream, &mut reader, request);
         let mut out = Vec::new();
         let code = relay_subscription(
@@ -1281,7 +1281,7 @@ fn a_later_successor_is_judged_against_the_hangup_it_follows() {
             seen_tx.clone(),
         );
         let stream = CtlStream::connect(&sock).expect("connect");
-        let mut reader = BufReader::new(&stream);
+        let mut reader = super::super::reply_on(&stream);
         handshake(&stream, &mut reader, &request);
         old.join().unwrap();
         std::fs::rename(&s1.sock, &sock).expect("S1 takes the path");
@@ -1453,7 +1453,7 @@ fn a_refusal_is_judged_by_the_process_that_gave_it() {
             seen_tx.clone(),
         );
         let stream = CtlStream::connect(&old_sock).expect("connect");
-        let mut reader = BufReader::new(&stream);
+        let mut reader = super::super::reply_on(&stream);
         handshake(&stream, &mut reader, request);
         old.join().unwrap();
         let p1_listener = aterm_uds::CtlListener::bind(&fixed).unwrap();
@@ -1463,7 +1463,7 @@ fn a_refusal_is_judged_by_the_process_that_gave_it() {
                 let Ok((conn, _)) = p1_listener.accept() else {
                     return;
                 };
-                let mut reader = std::io::BufReader::new(&conn);
+                let mut reader = super::super::reply_on(&conn);
                 let mut request = String::new();
                 if reader.read_line(&mut request).unwrap_or(0) == 0 {
                     continue;
@@ -1826,7 +1826,7 @@ fn a_relaunch_between_the_old_servers_exit_and_the_relays_read_is_fresh() {
         let stream = CtlStream::connect(&sock).expect("connect");
         let server = server_pid(&stream);
         assert_eq!(server, Some(old_pid), "{case}: the old instance serves");
-        let mut reader = BufReader::new(&stream);
+        let mut reader = super::super::reply_on(&stream);
         handshake(&stream, &mut reader, request);
         if case == "no watch" {
             old.crash();
@@ -1915,7 +1915,7 @@ fn a_relaunch_after_a_later_legs_server_crashed_is_judged_by_that_exit() {
         seen_tx,
     );
     let stream = CtlStream::connect(&sock).expect("connect");
-    let mut reader = BufReader::new(&stream);
+    let mut reader = super::super::reply_on(&stream);
     handshake(&stream, &mut reader, request);
     old.join().unwrap();
     std::fs::rename(&s1.sock, &sock).expect("S1 takes the path");
@@ -2218,7 +2218,7 @@ fn a_stream_cut_for_an_exec_follows_the_same_pid_to_its_fresh_listener() {
         );
         let stream = CtlStream::connect(&sock).expect("connect");
         let accepted_through = listener_at(&path);
-        let mut reader = BufReader::new(&stream);
+        let mut reader = super::super::reply_on(&stream);
         handshake(&stream, &mut reader, request);
         stop(&sock);
         retired.join().unwrap();
@@ -2277,7 +2277,7 @@ fn a_pid_pin_whose_process_has_ended_unreaped_is_gone_at_once() {
         listener.is_some(),
         "a listener identity: the pin may follow"
     );
-    let mut reader = BufReader::new(&stream);
+    let mut reader = super::super::reply_on(&stream);
     handshake(&stream, &mut reader, "subscribe @s-old events\n");
     let Served::Child(child) = &mut old.process else {
         unreachable!("spawned as this process's child")
@@ -2319,7 +2319,7 @@ fn a_subscription_by_an_untied_local_number_is_not_followed() {
         seen_tx.clone(),
     );
     let stream = CtlStream::connect(&sock).expect("connect");
-    let mut reader = BufReader::new(&stream);
+    let mut reader = super::super::reply_on(&stream);
     handshake(&stream, &mut reader, request);
     old.join().unwrap();
     let successor = fake_server(
@@ -2366,7 +2366,7 @@ fn serve_by(
         let Ok((conn, _)) = listener.accept() else {
             return;
         };
-        let mut reader = std::io::BufReader::new(&conn);
+        let mut reader = super::super::reply_on(&conn);
         let mut request = String::new();
         if reader.read_line(&mut request).unwrap_or(0) == 0 {
             continue;
@@ -2411,7 +2411,7 @@ fn a_stream_whose_instance_said_bye_quit_ends_at_once_with_75() {
         tx,
     );
     let stream = CtlStream::connect(&sock).expect("connect");
-    let mut reader = BufReader::new(&stream);
+    let mut reader = super::super::reply_on(&stream);
     handshake(&stream, &mut reader, request);
     old.join().unwrap();
     let started = Instant::now();
@@ -2456,7 +2456,7 @@ fn a_deliberate_end_by_a_live_server_is_still_exit_0_and_immediate() {
         tx,
     );
     let stream = CtlStream::connect(&sock).expect("connect");
-    let mut reader = BufReader::new(&stream);
+    let mut reader = super::super::reply_on(&stream);
     handshake(&stream, &mut reader, request);
     let started = Instant::now();
     let (code, _) = relay(
@@ -2588,7 +2588,7 @@ fn an_explicit_timeout_bounds_the_wait_for_a_successor() {
         let mut looks = 0;
         while let Ok((conn, _)) = listener.accept() {
             let mut request = String::new();
-            let _ = BufReader::new(&conn).read_line(&mut request);
+            let _ = std::io::BufReader::new(&conn).read_line(&mut request);
             if request.starts_with("stop") {
                 break;
             }
@@ -2644,7 +2644,7 @@ fn an_explicit_timeout_bounds_the_wait_for_a_successor() {
         tx,
     );
     let stream = CtlStream::connect(&sock).expect("connect");
-    let mut reader = BufReader::new(&stream);
+    let mut reader = super::super::reply_on(&stream);
     handshake(&stream, &mut reader, request);
     old.join().unwrap();
     let started = Instant::now();

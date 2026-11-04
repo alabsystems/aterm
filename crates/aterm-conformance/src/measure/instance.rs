@@ -1113,15 +1113,22 @@ mod tests {
             .expect("the helper's pid");
         let helper: i32 = line.trim().parse().expect("a pid");
         end_with_helpers(&mut child);
-        let presence = aterm_uds::process::process_presence(helper);
-        drop(held);
-        assert!(
+        // The helper's end must happen once its signals are sent, but a loaded machine can take
+        // longer than the two graces to show it: wait on the hang detector, with the pipe still
+        // held so only the drop's signals can end it.
+        let ended = Budget::from_now(MUST_HAPPEN.as_secs()).await_event("the helper's end", || {
+            let presence = aterm_uds::process::process_presence(helper);
             matches!(
                 presence,
                 aterm_uds::process::ProcessPresence::Absent
                     | aterm_uds::process::ProcessPresence::Exited
-            ),
-            "the helper (pid {helper}) outlived its instance: {presence:?}"
+            )
+            .then_some(())
+        });
+        drop(held);
+        assert!(
+            ended.is_ok(),
+            "the helper (pid {helper}) outlived its instance: {ended:?}"
         );
     }
 

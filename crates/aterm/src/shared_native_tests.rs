@@ -718,6 +718,31 @@ fn native_preparation_and_signed_assignment_are_distinct_and_keep_old_pool() {
     }
 }
 
+/// A MACHINE THAT SET UP NO ACCOUNT CATALOG HAS NONE TO READ, WHICH IS NO FAILURE: `shared_accounts::
+/// read` says so of a home with no Commons (`aterm-db`'s `snapshot_if_declared` tests hold a Commons
+/// that declared neither table to the same `None`). CONTROL: a Commons that declared the proposal
+/// table and not the import table reads, with its history incomplete and the missing table named.
+#[test]
+fn a_commons_that_declared_no_account_catalog_reads_as_none() {
+    let (temp, paths, _config) = successor_fixture();
+    assert_eq!(
+        crate::shared_accounts::read(&temp.path().join("no-commons")),
+        Ok(None)
+    );
+    let catalog = crate::shared_accounts::read(&paths[0].home)
+        .unwrap()
+        .expect("CONTROL: a declared table");
+    assert!(!catalog.history_complete, "CONTROL");
+    assert!(
+        catalog
+            .source_errors
+            .iter()
+            .any(|why| why.starts_with("imports: ")),
+        "CONTROL: {:?}",
+        catalog.source_errors
+    );
+}
+
 #[test]
 fn native_raw_intake_attaches_reference_without_grant_or_secret_output() {
     let (_temp, approved, _config) = fixture(Provider::Google, false);
@@ -783,7 +808,9 @@ fn typed_native_key_intake_fills_a_missing_method_without_new_authority() {
             .unwrap(),
         aterm_db::accounts::activations::State::Ready(approved.decision)
     );
-    let catalog = crate::shared_accounts::read(&approved.paths.home).unwrap();
+    let catalog = crate::shared_accounts::read(&approved.paths.home)
+        .unwrap()
+        .expect("a declared catalog");
     assert!(catalog.rows.iter().any(|row| {
         row.key == key
             && row

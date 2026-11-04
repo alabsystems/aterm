@@ -140,6 +140,20 @@ pub(in crate::harness) fn retained_directory_owner<'a>(
     Ok(None)
 }
 
+/// Whether `was` lists the directory `dir`, as [`retained_directory_owner`] compares directories.
+pub(in crate::harness) fn lists_directory(
+    was: &[Option<String>],
+    dir: &str,
+) -> Result<bool, String> {
+    let wanted = Location::of(Some(dir), None)?;
+    for kept in was.iter().flatten() {
+        if wanted.conflicts(&Location::of(Some(kept), None)?) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// The label of a row of `rows`, whatever its label, whose explicit directory is this one, as
 /// [`retained_directory_owner`] compares directories.
 /// Unknown filesystem ownership refuses instead of treating a failed lookup as separation.

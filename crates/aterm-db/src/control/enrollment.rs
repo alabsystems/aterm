@@ -19,6 +19,7 @@ pub(super) fn client(
     proof: Option<&NodeProof>,
     repair: &mut Repair,
 ) -> Result<Report> {
+    endpoint.require_legacy_records()?;
     let paths = endpoint
         .paths
         .as_ref()
@@ -33,6 +34,7 @@ pub(super) fn client(
     {
         return Err(Error::new("pending device custody changed"));
     }
+    endpoint.require_legacy_records()?;
     send_frame(stream, &endpoint.hello)?;
     let hello = repair.receive_answer(stream, Side::Initiator)?;
     let peer = authenticate(endpoint.trust, endpoint.actor, proof, &hello)?;
@@ -232,6 +234,7 @@ pub(super) fn serve(
     hello: &[u8],
     repair: &mut Repair,
 ) -> Result<Report> {
+    endpoint.require_legacy_records()?;
     if hello.len() != HELLO_FIXED
         || &hello[..4] != b"ACE1"
         || hello[4..20] != endpoint.trust.network
@@ -265,6 +268,7 @@ pub(super) fn serve(
     if log_backed {
         client::check_log_commons_enrollment(paths, endpoint.trust, request.binding())
             .map_err(failure)?;
+        endpoint.require_legacy_records()?;
         send_frame(stream, &endpoint.hello)?;
         let (mut pending, challenge) =
             Pending::issue(&request, endpoint.trust.network, endpoint.trust.authority)
@@ -287,6 +291,7 @@ pub(super) fn serve(
                 .map_err(failure)?;
         let mut wire = b"ACW2".to_vec();
         wire.extend_from_slice(&aterm_secrets::membership_log::encode_records(&chain));
+        endpoint.require_legacy_records()?;
         send_frame(stream, &wire)?;
         lease.prepare(endpoint.trust, actor);
         lease.authenticated = Some(authenticated_at);
@@ -304,6 +309,7 @@ pub(super) fn serve(
             .check_commons_enrollment(&bootstrap, &journal, request.binding())
             .map_err(failure)?;
     }
+    endpoint.require_legacy_records()?;
     send_frame(stream, &endpoint.hello)?;
     let (mut pending, challenge) =
         Pending::issue(&request, endpoint.trust.network, endpoint.trust.authority)
@@ -322,6 +328,7 @@ pub(super) fn serve(
             .bytes()
             .to_vec()
     };
+    endpoint.require_legacy_records()?;
     send_frame(stream, &wire)?;
     lease.prepare(endpoint.trust, actor);
     lease.authenticated = Some(authenticated_at);
@@ -331,7 +338,7 @@ pub(super) fn serve(
     })
 }
 
-fn local_authority(
+pub(super) fn local_authority(
     endpoint: &Endpoint,
     paths: &client::Paths,
 ) -> Result<(client::Admin, Bootstrap)> {

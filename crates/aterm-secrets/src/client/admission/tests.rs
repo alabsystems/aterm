@@ -264,7 +264,7 @@ pub(crate) fn admission_transition(state: &ModelState, action: &str) -> ModelSta
                 true,
                 &admin.doc,
                 &admin.handoff,
-                &admin.opened_heads,
+                &[],
                 &Ledger::default().retained(&admin.doc).unwrap(),
             )
             .unwrap();

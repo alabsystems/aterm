@@ -100,6 +100,7 @@ fn exchange<T>(
 
 fn joining<'a>(device: &'a Device, node: [u8; 32], name: &str) -> Joining<'a> {
     Joining {
+        records_bound: crate::crossing::RecordsBound::uncrossed(),
         device,
         node,
         name: name.into(),
@@ -204,6 +205,91 @@ fn a_bundle_round_trips_its_fields_and_files() {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].value.as_slice(), value.as_bytes());
     assert!(Bundle::decode(&text.as_slice()[1..]).is_err());
+}
+
+#[test]
+fn log_bundles_preserve_explicit_source_bounds_and_legacy_absence() {
+    use crate::crossing::RecordsBound;
+    let root = aterm_tempfile::tempdir().unwrap();
+    let (_, joiner) = mac(root.path(), "j");
+    let (_, member) = mac(root.path(), "m");
+    let request = joiner.request(TRUST.network, TRUST.authority).unwrap();
+    let allowed = member
+        .with_seed(|seed| Allowed::sign(request.binding(), "j", seed))
+        .unwrap();
+    for source in [
+        None,
+        Some(RecordsBound::of(4096, false)),
+        Some(RecordsBound::of(8192, true)),
+    ] {
+        let mut bundle =
+            Bundle::decode(files_bundle(&allowed, "synthetic").unwrap().as_slice()).unwrap();
+        bundle.handed = Handed::Log {
+            source,
+            admit: [7; 32],
+            records: b"opaque record framing".to_vec(),
+        };
+        let wire = bundle.encode().unwrap();
+        assert!(wire.as_slice().starts_with(if source.is_some() {
+            b"alab-join-bundle/3\n"
+        } else {
+            b"alab-join-bundle/2\n"
+        }));
+        let Handed::Log {
+            source: decoded,
+            admit,
+            records,
+        } = Bundle::decode(wire.as_slice()).unwrap().handed
+        else {
+            panic!("a log bundle must remain a log bundle");
+        };
+        assert_eq!(decoded, source);
+        assert_eq!(admit, [7; 32]);
+        assert_eq!(records, b"opaque record framing");
+    }
+}
+
+#[test]
+fn bounded_log_bundle_refuses_malformed_missing_or_downgraded_bounds() {
+    use crate::crossing::RecordsBound;
+    let root = aterm_tempfile::tempdir().unwrap();
+    let (_, joiner) = mac(root.path(), "j");
+    let (_, member) = mac(root.path(), "m");
+    let request = joiner.request(TRUST.network, TRUST.authority).unwrap();
+    let allowed = member
+        .with_seed(|seed| Allowed::sign(request.binding(), "j", seed))
+        .unwrap();
+    let mut bundle =
+        Bundle::decode(files_bundle(&allowed, "synthetic").unwrap().as_slice()).unwrap();
+    bundle.handed = Handed::Log {
+        source: Some(RecordsBound::of(8192, true)),
+        admit: [7; 32],
+        records: b"opaque record framing".to_vec(),
+    };
+    let wire = bundle.encode().unwrap();
+    let wire = std::str::from_utf8(wire.as_slice()).unwrap();
+    for replacement in [
+        "",
+        "records-bound 1 0 crossed\n",
+        "records-bound 1 08192 crossed\n",
+        "records-bound 2 8192 crossed\n",
+        "records-bound 1 8192 unknown\n",
+        "records-bound 1 8192 crossed extra\n",
+        "records-bound 1 4294967296 crossed\n",
+        "records-bound 1 8192 crossed\nrecords-bound 1 8192 crossed\n",
+    ] {
+        let invalid = wire.replacen("records-bound 1 8192 crossed\n", replacement, 1);
+        assert!(
+            Bundle::decode(invalid.as_bytes()).is_err(),
+            "{replacement:?}"
+        );
+    }
+    let downgrade = wire.replacen("alab-join-bundle/3", "alab-join-bundle/2", 1);
+    assert!(Bundle::decode(downgrade.as_bytes()).is_err());
+    if let Handed::Log { source, .. } = &mut bundle.handed {
+        *source = Some(RecordsBound::of(0, false));
+    }
+    assert!(bundle.encode().is_err());
 }
 
 #[test]

@@ -1466,6 +1466,17 @@ fn health_json(b: &BrokerView, now_ms: u64) -> J {
                         ])
                     }),
                 ),
+                // What of the log the broker keeps decoded in memory, as the holds row's
+                // `resident=` quotes it; null in a snapshot an older broker wrote.
+                (
+                    "resident",
+                    h.resident.map_or(J::Null, |r| {
+                        J::Obj(vec![
+                            ("records", J::Num(r.records)),
+                            ("bytes", J::Num(r.bytes)),
+                        ])
+                    }),
+                ),
             ])
         }
     };
@@ -8397,6 +8408,10 @@ mod tests {
             barrier: 2,
             plain: 1,
         });
+        h.resident = Some(astream_broker::Residency {
+            records: 2,
+            bytes: 400,
+        });
         let read = |writer, h: &BrokerHealth| HealthRead {
             health: h.clone(),
             writer,
@@ -8405,25 +8420,45 @@ mod tests {
         assert_eq!(
             row(&r).as_deref(),
             Some(
-                "5 record(s) in 2.0 KiB, 3 subject(s), 0 pending will(s), 0 group commit(s); 4 \
-                 connection(s), 0 parked tail(s); 7 full, 2 barrier and 1 plain flush(es) by its \
-                 process since it started (astream's <log>.health, written 1m ago)"
+                "5 record(s) in 2.0 KiB (resident=2/400 B of 5), 3 subject(s), 0 pending \
+                 will(s), 0 group commit(s); 4 connection(s), 0 parked tail(s); 7 full, 2 \
+                 barrier and 1 plain flush(es) by its process since it started (astream's \
+                 <log>.health, written 1m ago)"
             )
         );
-        // `--json` carries every fact the row shows, the process's tally among them; an older
-        // broker's snapshot, which carries none, reads null there and says so in the row.
+        // `--json` carries every fact the row shows, the process's tally and the residency
+        // among them; an older broker's snapshot, which carries neither, reads null there and
+        // says so in the row.
         assert!(
             render_json(&r).contains(r#""process_flushes":{"full":7,"barrier":2,"plain":1}"#),
             "{}",
             render_json(&r)
         );
+        assert!(
+            render_json(&r).contains(r#""resident":{"records":2,"bytes":400}"#),
+            "{}",
+            render_json(&r)
+        );
         let mut older = h.clone();
         older.process_flushes = None;
+        older.resident = None;
         r.broker.snapshot = Some(Ok(read(HealthWriter::Serving, &older)));
         assert!(
             render_json(&r).contains(r#""process_flushes":null"#),
             "{}",
             render_json(&r)
+        );
+        assert!(
+            render_json(&r).contains(r#""resident":null"#),
+            "{}",
+            render_json(&r)
+        );
+        assert!(
+            row(&r)
+                .expect("a row")
+                .contains(crate::broker_health::NO_RESIDENCY),
+            "{:?}",
+            row(&r)
         );
         assert!(
             row(&r)

@@ -244,6 +244,20 @@ pub mod fault {
         /// no input read proved the worker read: the box can receive the queued line before its
         /// answer.
         CustodyAnswersWithoutRead,
+        /// [`Line::restarted`](crate::supervise::custody::Line::restarted) takes the host's word
+        /// that it made the restart where it names the process the line was written to: the line
+        /// settles with no program ended, its restart spent, and it is written again to the process
+        /// that may still hold it.
+        CustodyRestartOnWord,
+        /// [`Line::restarted`](crate::supervise::custody::Line::restarted) goes by the process the
+        /// host names now before the one the restart's own report names: a restart made while the
+        /// host's kept snapshot still names the process it ended reads as nothing ended, so the
+        /// line stands held and the restart is asked again where the report said it was made.
+        CustodyRestartBySnapshot,
+        /// [`Restarts::settled`](crate::supervise::custody::Restarts::settled) leaves a restart
+        /// that stood asked when the line settled unspent: one the host made and answered as a
+        /// deferral is asked again for the next loss, a second restart for the line.
+        CustodySettleKeepsAsked,
     }
 
     thread_local! {
@@ -340,6 +354,9 @@ pub(crate) mod fault {
         CustodyTurnUnreadable,
         CustodyAnswersComposer,
         CustodyAnswersWithoutRead,
+        CustodyRestartOnWord,
+        CustodyRestartBySnapshot,
+        CustodySettleKeepsAsked,
     }
 
     /// The shipped build: never armed.

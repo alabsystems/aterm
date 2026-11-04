@@ -13,6 +13,11 @@ use aterm_agent::harness::{
 };
 use std::time::Instant;
 
+#[path = "codex_exec_operation.rs"]
+mod operation;
+pub(super) use operation::Operation;
+pub(super) use operation::{cancel_owner, pending, retain_claim};
+
 const WAITING: &str = "OK codex-exec-handoff state=waiting\n";
 
 #[derive(Debug)]
@@ -34,6 +39,18 @@ enum Progress {
 }
 
 impl Preparation {
+    fn invalidate_selection(&self, receipt: &codex_renewal::Receipt) {
+        if self.intent != receipt.intent {
+            return;
+        }
+        let mut progress = self.progress.lock().unwrap_or_else(|p| p.into_inner());
+        if matches!(&*progress, Progress::Selected(proposal, _)
+            if proposal.successor().is_some_and(|next| receipt.matches_successor(&next)))
+        {
+            *progress = Progress::Retry(Instant::now());
+        }
+    }
+
     fn matches(
         &self,
         source: &ExecSource,
@@ -51,6 +68,9 @@ impl Preparation {
 }
 
 pub(crate) fn serve(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> String {
+    if line.split_ascii_whitespace().next() != Some("prepare") {
+        return operation::serve(ctx, master, line);
+    }
     let Some(codex_renewal::Request::Prepare(intent)) =
         codex_renewal::Request::parse_rotation(line)
     else {

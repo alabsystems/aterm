@@ -418,17 +418,291 @@ pub struct TrackerView {
     pub last_close: Option<LastClose>,
 }
 
+/// The provenance of the current node's interruption, separate from future vendor facts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Interruption {
+    #[default]
+    None,
+    Screen,
+    Vendor,
+    Unknown,
+}
+
+impl Interruption {
+    const fn confirmed(self) -> bool {
+        matches!(self, Self::Screen | Self::Vendor)
+    }
+}
+
+/// Unclamped observations of one exact claimed node, independent of ring retention.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ClaimInterval {
+    node: Node,
+    begin: u64,
+    prior_end: Option<u64>,
+    continuous: bool,
+}
+
+impl ClaimInterval {
+    fn from_carry(
+        fields: &[(&str, &str)],
+        turn: Option<Node>,
+    ) -> Option<(Option<Self>, Option<u64>)> {
+        let (node, encoded) = carry_one(fields, "raw")?.split_once(',')?;
+        if encoded.len() > 24 {
+            return None;
+        }
+        let bytes = aterm_codec::base64::decode_strict(encoded.as_bytes()).ok()?;
+        if bytes.len() != 17 || bytes[16] & !3 != 0 {
+            return None;
+        }
+        let begin = u64::from_le_bytes(bytes[..8].try_into().ok()?);
+        let fence = u64::from_le_bytes(bytes[8..16].try_into().ok()?);
+        let continuous = bytes[16] & 1 != 0;
+        let prior_end = (bytes[16] & 2 != 0).then_some(fence);
+        if prior_end == Some(0) || prior_end.is_none() && fence != 0 {
+            return None;
+        }
+        let interval = if node == "-" {
+            if begin != 0 || continuous {
+                return None;
+            }
+            None
+        } else {
+            let node =
+                Node::parse(node).filter(|node| Some(*node) == turn && node.lvl == Lvl::Turn)?;
+            if begin == 0 || prior_end.is_some_and(|end| end >= begin) {
+                return None;
+            }
+            Some(Self {
+                node,
+                begin,
+                prior_end,
+                continuous,
+            })
+        };
+        Some((interval, prior_end))
+    }
+
+    fn carry_into(interval: Option<Self>, end: Option<u64>, out: &mut String) {
+        let fence = interval.map_or(end, |span| span.prior_end);
+        let (node, begin, continuous) = interval.map_or_else(
+            || ("-".to_owned(), 0, false),
+            |span| (span.node.to_string(), span.begin, span.continuous),
+        );
+        // The active node owns its predecessor fence; otherwise retain the last end.
+        let mut bytes = Vec::with_capacity(17);
+        bytes.extend_from_slice(&begin.to_le_bytes());
+        bytes.extend_from_slice(&fence.unwrap_or(0).to_le_bytes());
+        bytes.push(u8::from(continuous) | (u8::from(fence.is_some()) << 1));
+        out.push_str(&format!(
+            " raw={node},{}",
+            aterm_codec::base64::encode(&bytes).expect("fixed 17-byte claim metadata")
+        ));
+    }
+}
+
+/// One vendor interruption; a mapped/amended log reference is not its authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VendorInterrupt {
+    vref: Option<ShortId>,
+    prompt: u64,
+    at: u64,
+    source: Option<TxMark>,
+    bound: Option<(Node, Src)>,
+    valid: bool,
+}
+
+fn carry_one<'a>(fields: &[(&str, &'a str)], key: &str) -> Option<&'a str> {
+    let mut values = fields
+        .iter()
+        .filter(|(name, _)| *name == key)
+        .map(|(_, value)| *value);
+    let value = values.next()?;
+    values.next().is_none().then_some(value)
+}
+
+fn carry_desync_valid(fields: &[(&str, &str)]) -> bool {
+    let mut values = fields
+        .iter()
+        .filter(|(key, _)| *key == "tx_ds")
+        .map(|(_, value)| *value);
+    matches!(
+        (values.next(), values.next()),
+        (None, None) | (Some("0" | "1"), None)
+    )
+}
+
+fn carried_cur_qualified(fields: &[(&str, &str)], through: Option<TxMark>) -> bool {
+    if [
+        "tx_fp", "tx_off", "tx_id", "tx_st", "tx_v", "tx_vt", "tx_vp", "tx_ve",
+    ]
+    .iter()
+    .any(|name| fields.iter().filter(|(key, _)| key == name).count() > 1)
+    {
+        return false;
+    }
+    let get = |key| carry_one(fields, key);
+    let decimal = |key| {
+        get(key).is_none_or(|value| {
+            !value.is_empty()
+                && value.bytes().all(|byte| byte.is_ascii_digit())
+                && value.parse::<u64>().is_ok()
+        })
+    };
+    carry_desync_valid(fields)
+        && decimal("tx_vp")
+        && decimal("tx_ve")
+        && get("tx_v").is_none_or(|value| ShortId::new(value).is_some() && through.is_some())
+        && get("tx_vt")
+            .is_none_or(|value| Node::parse(value).is_some_and(|node| node.lvl == Lvl::Turn))
+        && get("tx_st").is_none_or(|value| TxState::from_word(value).is_some())
+}
+
+impl VendorInterrupt {
+    fn carry_into(self, through: Option<TxMark>, out: &mut String) {
+        let shared = self.source.zip(through).filter(|(source, mark)| {
+            source.fp == mark.fp && source.id == mark.id && source.off <= mark.off
+        });
+        let mut bytes = Vec::with_capacity(29);
+        bytes.extend_from_slice(&self.prompt.to_le_bytes());
+        bytes.extend_from_slice(&self.at.to_le_bytes());
+        let vref = if let Some((source, _)) = shared.filter(|_| self.vref.is_some()) {
+            bytes.extend_from_slice(&source.off.to_le_bytes());
+            let (node, origin) = self.bound.map_or((0, 0), |(node, origin)| {
+                (node.n, if origin == Src::Screen { 2 } else { 4 })
+            });
+            bytes.extend_from_slice(&node.to_le_bytes());
+            bytes.push(u8::from(self.valid) | origin);
+            self.vref
+                .expect("shared proof has its vendor reference")
+                .to_string()
+        } else {
+            bytes.push(0);
+            "-".to_owned()
+        };
+        out.push_str(&format!(
+            " vi={vref},{}",
+            aterm_codec::base64::encode(&bytes).expect("at most 29-byte vendor metadata")
+        ));
+    }
+
+    fn payload(value: &str) -> Option<(&str, Vec<u8>)> {
+        let (vref, encoded) = value.split_once(',')?;
+        if encoded.len() > 40 {
+            return None;
+        }
+        let bytes = aterm_codec::base64::decode_strict(encoded.as_bytes()).ok()?;
+        matches!(bytes.len(), 17 | 29).then_some((vref, bytes))
+    }
+
+    fn from_carry(fields: &[(&str, &str)], through: Option<TxMark>) -> Result<Option<Self>, ()> {
+        if !fields.iter().any(|(key, _)| *key == "vi") {
+            return Ok(None);
+        }
+        let read = || {
+            let (vref, bytes) = Self::payload(carry_one(fields, "vi")?)?;
+            let prompt = u64::from_le_bytes(bytes[..8].try_into().ok()?);
+            let at = u64::from_le_bytes(bytes[8..16].try_into().ok()?);
+            if bytes.len() == 17 {
+                if vref != "-" || bytes[16] != 0 || prompt == 0 || prompt > at {
+                    return None;
+                }
+                return Some(Self {
+                    vref: None,
+                    prompt,
+                    at,
+                    source: None,
+                    bound: None,
+                    valid: false,
+                });
+            }
+            // The shared file identity and quality must be unambiguous, even though
+            // the older join decoder accepts its established first-match fields.
+            for key in ["tx_fp", "tx_off", "tx_st"] {
+                carry_one(fields, key)?;
+            }
+            if fields.iter().filter(|(key, _)| *key == "tx_id").count() > 1 {
+                return None;
+            }
+            if !carry_desync_valid(fields) {
+                return None;
+            }
+            if !matches!(carry_one(fields, "tx_st")?, "on" | "partial") {
+                return None;
+            }
+            let mut source = through?;
+            source.off = u64::from_le_bytes(bytes[16..24].try_into().ok()?);
+            if source.off > through?.off {
+                return None;
+            }
+            let node = u32::from_le_bytes(bytes[24..28].try_into().ok()?);
+            let flags = bytes[28];
+            if flags & !7 != 0 {
+                return None;
+            }
+            let bound = match (node, flags & 6) {
+                (0, 0) => None,
+                (0, _) | (_, 0 | 6) => return None,
+                (n, origin) => Some((
+                    Node { lvl: Lvl::Turn, n },
+                    if origin == 2 {
+                        Src::Screen
+                    } else {
+                        Src::Transcript
+                    },
+                )),
+            };
+            Some(Self {
+                vref: Some(ShortId::new(vref)?),
+                prompt,
+                at,
+                source: Some(source),
+                bound,
+                valid: flags & 1 != 0,
+            })
+        };
+        read().map(Some).ok_or(())
+    }
+
+    /// Only independently decoded extents survive malformed or duplicated proof tokens.
+    fn unknown_from_carry(fields: &[(&str, &str)]) -> Option<Self> {
+        let mut extent: Option<(u64, u64)> = None;
+        for (_, value) in fields.iter().filter(|(key, _)| *key == "vi") {
+            let (_, bytes) = Self::payload(value)?;
+            let prompt = u64::from_le_bytes(bytes[..8].try_into().ok()?);
+            let at = u64::from_le_bytes(bytes[8..16].try_into().ok()?);
+            if prompt == 0 || at == 0 {
+                return None;
+            }
+            let (prompt, at) = (prompt.min(at), prompt.max(at));
+            extent = Some(extent.map_or((prompt, at), |(lo, hi)| (lo.min(prompt), hi.max(at))));
+        }
+        extent.map(|(prompt, at)| Self {
+            vref: None,
+            prompt,
+            at,
+            source: None,
+            bound: None,
+            valid: false,
+        })
+    }
+}
+
 /// The turn tracker of one agent run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TurnTracker {
     run: Node,
+    proof_unique: bool,
     turn: Option<Node>,
     step: Option<Held>,
     word: Verdict,
     settle: Option<Settle>,
-    interrupted: bool,
-    /// The screen reported the interrupt since the last verdict published to [`Self::observe`]
-    /// (the host reports it with the verdict it reads off the same screen): an approval step that
+    interrupted: Interruption,
+    claim_interval: Option<ClaimInterval>,
+    claim_end: Option<u64>,
+    /// A screen or proven current vendor binding reported the interrupt since the last verdict
+    /// published to [`Self::observe`]: an approval step that
     /// verdict closes was declined. Never carried: the host reports it and publishes the verdict
     /// under one hold of the session's timeline.
     interrupt_fresh: bool,
@@ -469,16 +743,33 @@ pub struct TurnTracker {
 const UNTAKEN_MAX: usize = 8;
 
 impl TurnTracker {
+    fn invalidate_vendor_interrupt(&mut self) {
+        if let Some(pending) = self.tx.interrupt.as_mut() {
+            pending.valid = false;
+            if self.interrupted == Interruption::Vendor
+                && pending
+                    .bound
+                    .is_some_and(|(node, _)| Some(node) == self.turn)
+            {
+                self.interrupted = Interruption::Unknown;
+                self.interrupt_fresh = false;
+            }
+        }
+    }
+
     /// A tracker for the agent run `run` (already open in the log).
     #[must_use]
     pub const fn new(run: Node) -> TurnTracker {
         TurnTracker {
             run,
+            proof_unique: true,
             turn: None,
             step: None,
             word: Verdict::Unknown,
             settle: None,
-            interrupted: false,
+            interrupted: Interruption::None,
+            claim_interval: None,
+            claim_end: None,
             interrupt_fresh: false,
             pending_ledger: None,
             last_input: None,
@@ -658,30 +949,61 @@ impl TurnTracker {
             return self.wake_at();
         }
         self.settle_if_due(log, at);
+        let pending_claim = self
+            .tx
+            .interrupt
+            .is_some_and(|pending| pending.bound.is_none())
+            || claimed == Claimed::Rested && self.interrupted != Interruption::None;
         if self.screen_turns
             || (self.tx.state == Some(TxState::On)
                 && (!self.tx.stopped || engine_edge && at.wall_ms <= self.tx.read_ms)
-                && !(claimed == Claimed::Rested && self.interrupted))
+                && !pending_claim)
         {
             return self.wake_at();
         }
-        let out = match claimed {
-            Claimed::Working => {
-                self.begin(log, at, engine_edge, may_open);
-                return self.wake_at();
-            }
-            Claimed::Rested if self.interrupted => TurnOut::Interrupted,
-            Claimed::Rested => TurnOut::Done,
-            Claimed::Failed => TurnOut::Error,
-        };
-        if let Some(turn) = self
-            .turn
-            .filter(|t| !self.untaken_at(*t, at) || self.interrupted && !self.untaken_after(*t, at))
-        {
+        if claimed == Claimed::Working {
+            self.begin(log, at, engine_edge, may_open);
+            return self.wake_at();
+        }
+        let raw_interval = self.claim_interval.filter(|span| {
+            Some(span.node) == self.turn && self.original_claim_interval(log, *span)
+        });
+        if let Some(turn) = self.turn.filter(|t| {
+            !self.untaken_at(*t, at)
+                || self.interrupted != Interruption::None && !self.untaken_after(*t, at)
+        }) {
+            // An older rest that cannot close this owner must not consume the
+            // pending interruption that its own later rest still needs.
+            let vendor_out = (claimed == Claimed::Rested)
+                .then(|| self.vendor_claim_outcome(log, at))
+                .flatten();
+            let out = match claimed {
+                Claimed::Rested if self.interrupted.confirmed() => TurnOut::Interrupted,
+                Claimed::Rested if self.interrupted == Interruption::Unknown => TurnOut::Unknown,
+                Claimed::Rested => vendor_out.unwrap_or(TurnOut::Done),
+                Claimed::Failed => TurnOut::Error,
+                Claimed::Working => unreachable!("working was handled before close eligibility"),
+            };
             self.untaken.retain(|&(n, _)| n != turn);
+            let raw_end = at.wall_ms;
             let at = tx_close_at(log, turn, at);
             let close = Close::new(Out::Turn(out), Src::Engine, Conf::Claim);
             self.close_turn_with(log, close, out, (None, false, false), at);
+            self.claim_end = raw_interval
+                .filter(|span| span.continuous && span.begin < raw_end)
+                .map(|_| raw_end);
+            if claimed == Claimed::Failed
+                && raw_interval.is_some_and(|span| {
+                    self.tx.interrupt.is_some_and(|pending| {
+                        span.begin <= pending.prompt && pending.at <= raw_end
+                    })
+                })
+            {
+                self.tx.interrupt = None;
+            }
+        } else {
+            // A rest with no owned interval cannot stand in for a missing close.
+            self.claim_end = None;
         }
         self.wake_at()
     }
@@ -694,6 +1016,7 @@ impl TurnTracker {
         engine_edge: bool,
         may_open: &mut dyn FnMut() -> bool,
     ) {
+        let mut continuous = true;
         // The engine drew a new turn while the claim's own runs: that one's end was lost.
         if engine_edge
             && let Some(t) = self.turn
@@ -702,22 +1025,174 @@ impl TurnTracker {
                 .turn()
                 .is_some_and(|o| o.node == t && (o.src, o.conf) == (Src::Engine, Conf::Claim))
         {
+            continuous = false;
+            self.claim_end = None;
             let close = Close::new(Out::Turn(TurnOut::Unknown), Src::Engine, Conf::Claim);
             let at = tx_close_at(log, t, at);
             self.close_turn_with(log, close, TurnOut::Unknown, (None, false, false), at);
         }
         // A partial transcript's turn no beginning took holds this span, running or closed.
         if self.turn.is_none_or(|t| self.untaken_at(t, at)) && self.take_untaken(at).is_some() {
+            self.claim_interval = None;
+            self.claim_end = None;
             return;
         }
         // A turn the claim did not open runs (a carried one, an exact transcript's after its
         // reader stopped), or the run's bucket refuses.
-        if self.turn.is_some() || !may_open() {
+        if self.turn.is_some() {
+            return;
+        }
+        if !may_open() {
+            self.claim_end = None;
             return;
         }
         let run_t = log.open_entry(self.run).map_or(0, |e| e.t);
         let floor = run_t.max(log.state().last[1].as_ref().map_or(0, |c| c.t));
         self.ensure_turn_as(log, Src::Engine, Conf::Claim, no_earlier(at, floor));
+        self.claim_interval = self
+            .turn
+            .filter(|node| {
+                log.open_entry(*node)
+                    .is_some_and(|open| open.t == at.wall_ms)
+            })
+            .map(|node| ClaimInterval {
+                node,
+                begin: at.wall_ms,
+                prior_end: self.claim_end,
+                continuous: self.proof_unique
+                    && continuous
+                    && self.claim_end.is_none_or(|end| end < at.wall_ms),
+            });
+    }
+
+    /// Resolve only the vendor interval that this raw claim can actually name.
+    fn vendor_claim_outcome(&mut self, log: &Log, at: Stamp) -> Option<TurnOut> {
+        let pending = self.tx.interrupt?;
+        let node = self.turn?;
+        if pending.bound.is_some_and(|(bound, _)| bound == node) {
+            self.tx.interrupt = None;
+            return Some(if self.vendor_binding_proven(log, pending) {
+                TurnOut::Interrupted
+            } else {
+                TurnOut::Unknown
+            });
+        }
+        let (lo, hi) = (
+            pending.prompt.min(pending.at),
+            pending.prompt.max(pending.at),
+        );
+        let source_ok = self.vendor_source_proven(pending);
+        let uncertain = !pending.valid || !source_ok || pending.prompt >= pending.at;
+        if at.wall_ms < lo {
+            return None;
+        }
+        if pending
+            .vref
+            .is_some_and(|vref| Self::conflicting_vref(log, node, vref))
+        {
+            // Temporal containment cannot bind another vendor turn to this named claim.
+            if hi <= at.wall_ms {
+                self.tx.interrupt = None;
+            }
+            return None;
+        }
+        let Some(span) = self.claim_interval.filter(|span| span.node == node) else {
+            if uncertain || pending.at <= at.wall_ms {
+                if hi <= at.wall_ms {
+                    self.tx.interrupt = None;
+                }
+                return Some(TurnOut::Unknown);
+            }
+            return None;
+        };
+        if hi < span.begin {
+            self.tx.interrupt = None;
+            return None;
+        }
+        let begin_ok = span.begin < pending.prompt
+            || span.begin == pending.prompt
+                && span.prior_end.is_some_and(|end| end < pending.prompt);
+        let qualified = pending.valid
+            && source_ok
+            && span.continuous
+            && span.begin > 0
+            && span.begin < at.wall_ms
+            && begin_ok
+            && pending.prompt < pending.at
+            && pending.at <= at.wall_ms
+            && self.original_claim_interval(log, span);
+        // Invalid evidence describes only an uncertain extent. Every overlapping
+        // claim stays unknown, including one ending before an overloaded extent's end.
+        if uncertain {
+            if at.wall_ms >= hi {
+                self.tx.interrupt = None;
+            }
+            return Some(TurnOut::Unknown);
+        }
+        // A future interruption still belongs to a later close, never this earlier rest.
+        if pending.at > at.wall_ms {
+            return None;
+        }
+        self.tx.interrupt = None;
+        Some(if qualified {
+            TurnOut::Interrupted
+        } else {
+            TurnOut::Unknown
+        })
+    }
+
+    fn vendor_source_proven(&self, pending: VendorInterrupt) -> bool {
+        pending
+            .source
+            .zip(self.tx.through)
+            .is_some_and(|(source, mark)| {
+                mark.fp == source.fp && mark.id == source.id && mark.off >= source.off
+            })
+            && self.proof_unique
+            && !self.tx.desync
+            && matches!(self.tx.state, Some(TxState::On | TxState::Partial))
+    }
+
+    fn original_claim_interval(&self, log: &Log, span: ClaimInterval) -> bool {
+        self.proof_unique
+            && log.window().any(|record| {
+                record.node == span.node
+                    && record.op == Op::Open
+                    && record.par == Some(self.run)
+                    && record.src == Src::Engine
+                    && record.conf == Conf::Claim
+                    && record.t == span.begin
+            })
+    }
+
+    fn vendor_binding_proven(&self, log: &Log, pending: VendorInterrupt) -> bool {
+        pending.valid
+            && self.vendor_source_proven(pending)
+            && self.vendor_original_binding(log, pending)
+    }
+
+    fn vendor_original_binding(&self, log: &Log, pending: VendorInterrupt) -> bool {
+        self.proof_unique
+            && pending.bound.is_some_and(|(node, origin)| {
+                Some(node) == self.turn
+                    && log.window().any(|record| {
+                        record.node == node
+                            && record.op == Op::Open
+                            && record.par == Some(self.run)
+                            && record.src == origin
+                            && match origin {
+                                Src::Screen => {
+                                    self.tx.state == Some(TxState::On)
+                                        && (self.screen_turns
+                                            || self.interrupted == Interruption::Vendor)
+                                }
+                                Src::Transcript => pending.vref.is_some_and(|vref| {
+                                    record.f.get(Key::Vref) == Some(&Val::Id(vref))
+                                }),
+                                _ => false,
+                            }
+                    })
+            })
     }
 
     /// Whether `t` is a partial transcript's turn no beginning has taken, opened within
@@ -755,7 +1230,7 @@ impl TurnTracker {
     /// The screen reported the turn interrupted (`aterm_phase::turn::interrupted`): its idle close is `out=interrupted`, and an approval step the next published verdict closes was declined (Claude Code's `⎿  Interrupted · What should Claude do instead?` under the call its box asked about: the person's Esc, or the box's own "No"), unless an act bound to it said otherwise.
     pub const fn note_interrupted(&mut self) {
         if self.turn.is_some() {
-            self.interrupted = true;
+            self.interrupted = Interruption::Screen;
             self.interrupt_fresh = true;
         }
     }
@@ -920,8 +1395,19 @@ impl TurnTracker {
             self.turn
                 .map_or_else(|| "none".to_string(), |t| t.to_string()),
             self.word.word(),
-            u8::from(self.interrupted)
+            u8::from(self.interrupted.confirmed())
         );
+        let origin = match self.interrupted {
+            Interruption::None => "n",
+            Interruption::Screen => "s",
+            Interruption::Vendor => "v",
+            Interruption::Unknown => "u",
+        };
+        s.push_str(&format!(" irq={origin}"));
+        if !self.proof_unique {
+            s.push_str(" cq=0");
+        }
+        ClaimInterval::carry_into(self.claim_interval, self.claim_end, &mut s);
         if let Verdict::Prompt(b) = self.word {
             s.push_str(" box=");
             s.push_str(b.word());
@@ -996,6 +1482,10 @@ impl TurnTracker {
         }
         let kv: Vec<(&str, &str)> = toks.filter_map(|t| t.split_once('=')).collect();
         let get = |k: &str| kv.iter().find(|(key, _)| *key == k).map(|(_, v)| *v);
+        let proof_unique = carry_one(&kv, "run").is_some()
+            && carry_one(&kv, "turn").is_some()
+            && !kv.iter().any(|(key, value)| *key == "cq" && *value != "1")
+            && kv.iter().filter(|(key, _)| *key == "cq").count() <= 1;
         let parse_u64 = |v: &str| {
             (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
                 .then(|| v.parse::<u64>().ok())
@@ -1011,11 +1501,16 @@ impl TurnTracker {
             "prompt" => Verdict::Prompt(BoxWord::from_wire(get("box")?)),
             w => Verdict::from_agent_word(w, None),
         };
-        let interrupted = match get("interrupted")? {
-            "0" => false,
-            "1" => true,
-            _ => return None,
+        let mut interrupted = match (carry_one(&kv, "interrupted"), carry_one(&kv, "irq")) {
+            (Some("0"), None | Some("n")) => Interruption::None,
+            (Some("1"), Some("s")) => Interruption::Screen,
+            (Some("1"), Some("v")) => Interruption::Vendor,
+            (Some("0"), Some("u")) => Interruption::Unknown,
+            _ => Interruption::Unknown,
         };
+        if kv.iter().filter(|(key, _)| *key == "irq").count() > 1 {
+            interrupted = Interruption::Unknown;
+        }
         let step = match get("step") {
             None => None,
             Some(n) => {
@@ -1090,18 +1585,52 @@ impl TurnTracker {
                 fresh(w).then(|| (Actor::from_word(by), rebase(w, now), c))
             }
         };
+        let (claim_interval, claim_end) =
+            ClaimInterval::from_carry(&kv, turn).unwrap_or((None, None));
+        let (claim_interval, claim_end) = if proof_unique {
+            (claim_interval, claim_end)
+        } else {
+            (None, None)
+        };
+        let mut tx = TxJoin::from_carry(&get, now);
+        // Retained first-match ownership is not evidence for a fresh vendor fact.
+        // A later actual Prompt may establish a fresh join; an Interrupt may not.
+        if !carried_cur_qualified(&kv, tx.through) {
+            tx.cur = None;
+            tx.lose(1);
+        }
+        tx.interrupt = match VendorInterrupt::from_carry(&kv, tx.through) {
+            Ok(pending) => pending,
+            Err(()) => {
+                tx.lose(1);
+                VendorInterrupt::unknown_from_carry(&kv)
+            }
+        };
+        if interrupted == Interruption::Vendor
+            && !tx.interrupt.is_some_and(|pending| {
+                pending.valid && pending.bound.is_some_and(|(node, _)| Some(node) == turn)
+            })
+        {
+            interrupted = Interruption::Unknown;
+        }
+        if !proof_unique && interrupted.confirmed() {
+            interrupted = Interruption::Unknown;
+        }
         Some(TurnTracker {
             run,
+            proof_unique,
             turn,
             step,
             word,
             settle,
             interrupted,
+            claim_interval,
+            claim_end,
             interrupt_fresh: false,
             pending_ledger,
             last_input,
             last_close: None,
-            tx: TxJoin::from_carry(&get, now),
+            tx,
             bound: None,
             lead: None,
             opens: 0,
@@ -1115,8 +1644,39 @@ impl TurnTracker {
         if self.turn.is_some_and(|t| !log.is_open(t)) {
             self.turn = None;
             self.settle = None;
-            self.interrupted = false;
+            self.interrupted = Interruption::None;
+            self.claim_interval = None;
+            self.claim_end = None;
             self.interrupt_fresh = false;
+        }
+        if self
+            .tx
+            .interrupt
+            .is_some_and(|pending| pending.bound.is_some_and(|(node, _)| !log.is_open(node)))
+        {
+            self.tx.interrupt = None;
+        }
+        if self.tx.interrupt.is_some_and(|pending| {
+            pending.bound.is_some() && !self.vendor_original_binding(log, pending)
+        }) {
+            if let Some(pending) = self.tx.interrupt.as_mut() {
+                pending.bound = None;
+                pending.valid = false;
+            }
+            if self.interrupted == Interruption::Vendor {
+                self.interrupted = Interruption::Unknown;
+                self.interrupt_fresh = false;
+            }
+        }
+        if self.interrupted == Interruption::Vendor {
+            let proven = self
+                .tx
+                .interrupt
+                .is_some_and(|pending| self.vendor_binding_proven(log, pending));
+            if !proven {
+                self.interrupted = Interruption::Unknown;
+                self.interrupt_fresh = false;
+            }
         }
         if self.step.as_ref().is_some_and(|s| !log.is_open(s.node)) {
             self.forget_step();
@@ -1179,7 +1739,12 @@ impl TurnTracker {
 
     fn settle_now(&mut self, log: &mut Log, s: Settle, now: Stamp, ctl: bool) {
         self.settle = None;
-        let (out, conf) = settle_out(s.cause, self.interrupted);
+        let (out, conf) = settle_out(s.cause, self.interrupted.confirmed());
+        let out = if self.interrupted == Interruption::Unknown {
+            TurnOut::Unknown
+        } else {
+            out
+        };
         let wall = self
             .step
             .as_ref()
@@ -1277,7 +1842,11 @@ impl TurnTracker {
             .fields(f);
         let node = log.open(open, at).ok()?;
         self.turn = Some(node);
-        self.interrupted = false;
+        self.interrupted = Interruption::None;
+        self.claim_interval = None;
+        if src != Src::Engine {
+            self.claim_end = None;
+        }
         self.interrupt_fresh = false;
         self.pending_ledger = None;
         Some(node)
@@ -1402,8 +1971,18 @@ impl TurnTracker {
         let Some(turn) = self.turn.take() else {
             return;
         };
+        if self
+            .tx
+            .interrupt
+            .is_some_and(|pending| pending.bound.is_some_and(|(node, _)| node == turn))
+            || self.screen_turns
+        {
+            self.tx.interrupt = None;
+        }
         self.settle = None;
-        self.interrupted = false;
+        self.interrupted = Interruption::None;
+        self.claim_interval = None;
+        self.claim_end = None;
         self.interrupt_fresh = false;
         if self.step.as_ref().is_some_and(|h| h.under_turn) {
             self.forget_step();
@@ -1646,6 +2225,7 @@ struct TxJoin {
     through: Option<TxMark>,
     floor_ms: u64,
     cur: Option<VTurn>,
+    interrupt: Option<VendorInterrupt>,
     /// Transcript steps by call id: open, or closed by their turn's cascade
     /// and owed a result (A1: never carried; rebuilt from the log).
     tools: Vec<(ShortId, Node, Kind)>,
@@ -1672,6 +2252,7 @@ impl TxJoin {
             through: None,
             floor_ms: 0,
             cur: None,
+            interrupt: None,
             tools: Vec::new(),
             state: None,
             refuted: None,
@@ -1690,6 +2271,9 @@ impl TxJoin {
     }
 
     fn carry_into(&self, s: &mut String) {
+        if let Some(pending) = self.interrupt {
+            pending.carry_into(self.through, s);
+        }
         if let Some(m) = self.through {
             s.push_str(&format!(" tx_fp={:016x} tx_off={}", m.fp, m.off));
             if let Some((dev, ino)) = m.id {
@@ -1762,6 +2346,7 @@ impl TxJoin {
             through,
             floor_ms: now.wall_ms,
             cur: cur.filter(|_| through.is_some()),
+            interrupt: None,
             tools: Vec::new(),
             state: get("tx_st").and_then(TxState::from_word),
             refuted: get("tx_ref").and_then(WallKind::from_name),
@@ -1870,6 +2455,9 @@ impl TurnTracker {
             self.bind(log, pos, len, floor_ms, state, now);
             return self.wake_at();
         }
+        if matches!(ev, TxEvent::Lost { .. } | TxEvent::Overflow { .. }) {
+            self.invalidate_vendor_interrupt();
+        }
         let row = !matches!(
             ev,
             TxEvent::Wall { .. } | TxEvent::Lost { .. } | TxEvent::Overflow { .. } | TxEvent::Flush
@@ -1917,17 +2505,12 @@ impl TurnTracker {
             | TxEvent::Lost { .. }
             | TxEvent::Overflow { .. }
             | TxEvent::Flush => {}
-            TxEvent::Prompt { vref } => self.tx_prompt(log, vref, state, conf, row, now),
+            TxEvent::Prompt { vref } => {
+                self.tx_prompt(log, vref, state, conf, row, now);
+                self.vendor_observation(log, vref, "working", None, conf, row);
+            }
             TxEvent::Interrupt => {
-                // An unmeasured source may end its own vendor turn below,
-                // but must not change the screen turn's eventual outcome.
-                // A claim's turn has no screen to say it, so there the
-                // source is the only witness.
-                if state == TxState::On {
-                    self.note_interrupted();
-                } else {
-                    self.tx_interrupt_claimed(log);
-                }
+                self.tx_interrupt_claimed(log, state, row, pos);
                 if let Some(v) = self.tx.cur.filter(|v| v.end_ms.is_none()) {
                     self.tx.cur = Some(VTurn {
                         end_ms: Some(row.wall_ms),
@@ -1977,6 +2560,9 @@ impl TurnTracker {
         if kept {
             self.say_state(log, state, None, now);
             return;
+        }
+        if self.tx.through.is_some() {
+            self.invalidate_vendor_interrupt();
         }
         self.tx.through = Some(TxMark {
             fp: pos.fp,
@@ -2084,6 +2670,59 @@ impl TurnTracker {
         let _ = f.set(Key::Vref, Val::Id(vref));
         let amend = Amend::new(Kind::Turn, Src::Transcript, conf, f).by(Actor::Vendor);
         let _ = log.amend(node, amend, at);
+    }
+
+    fn conflicting_vref(log: &Log, node: Node, vref: ShortId) -> bool {
+        Self::turn_segment(log, node).is_some_and(
+            |(_, fields)| matches!(fields.get(Key::Vref), Some(Val::Id(held)) if *held != vref),
+        )
+    }
+
+    /// Preserve vendor facts separately from a claim's single identity and outcome.
+    /// A candidate association is not a parent edge or proof that this vendor owns the span.
+    fn vendor_observation(
+        &self,
+        log: &mut Log,
+        vref: ShortId,
+        word: &'static str,
+        metrics: Option<[u64; 3]>,
+        conf: Conf,
+        row: Stamp,
+    ) {
+        let mut fields = Fields::new();
+        if let Some(field) = BoundedToken::new(Key::Field, "vendor-turn") {
+            let _ = fields.set(Key::Field, Val::Tok(field));
+        }
+        let _ = fields.set(Key::Vref, Val::Id(vref));
+        let _ = fields.set(Key::State, Val::Word(word));
+        if let Some(node) = self
+            .tx
+            .cur
+            .filter(|v| v.vref == vref)
+            .and_then(|v| v.node)
+            .filter(|node| Self::conflicting_vref(log, *node, vref))
+        {
+            if let Some(parent) = ShortId::new(&node.to_string()) {
+                let _ = fields.set(Key::Parent, Val::Id(parent));
+            }
+            let _ = fields.set(Key::Why, Val::Word("ambiguous"));
+        }
+        if let Some(metrics) = metrics {
+            for (key, value) in [
+                (Key::VdurMs, metrics[0]),
+                (Key::TokIn, metrics[1]),
+                (Key::TokOut, metrics[2]),
+            ] {
+                let _ = fields.set(key, Val::U(value));
+            }
+        }
+        let _ = log.mark(
+            Mark::new(Kind::Meta, Src::Transcript, conf)
+                .at(self.run)
+                .by(Actor::Vendor)
+                .fields(fields),
+            row,
+        );
     }
 
     /// THE CLAIM'S CLOSED TURN A LATE PROMPT NAMES: of the run's closed turns the program's claim
@@ -2296,28 +2935,68 @@ impl TurnTracker {
         }
     }
 
-    /// AN ESC ON A CLAIM'S TURN: the program's claim has no interrupted state and a codex screen
-    /// reads nothing, so a source read `state=partial` is that turn's one witness: read while the
-    /// claim's turn its vendor turn names runs (or the turn its prompt opened before the claim's
-    /// `working`, fix E1), the turn closes `out=interrupted` at its rest. A
-    /// screen's turn keeps the screen's outcome, and a turn a rest already closed keeps `done`
-    /// (only an exact source refines a closed turn's outcome, `amend_refines_out`).
-    fn tx_interrupt_claimed(&mut self, log: &Log) {
-        let Some(node) = self
-            .tx
-            .cur
-            .filter(|v| v.end_ms.is_none())
-            .and_then(|v| v.node)
-        else {
+    /// Retain the vendor reference, original clocks and source watermark independently of
+    /// the possibly aliased mapped node. Only an original transcript-owned opening or the
+    /// measured source's current Screen channel can qualify immediately. Claimed nodes
+    /// instead require a complete raw interval at rest. A partial source never changes a
+    /// Screen outcome; a measured source cannot borrow an Engine node's amended reference.
+    fn tx_interrupt_claimed(&mut self, log: &Log, state: TxState, row: Stamp, pos: TxPos) {
+        let Some(vendor) = self.tx.cur.filter(|v| v.end_ms.is_none()) else {
             return;
         };
-        if Some(node) == self.turn
-            && (tx_owns(log, node)
-                || log.state().turn().is_some_and(|o| {
-                    o.node == node && (o.src, o.conf) == (Src::Engine, Conf::Claim)
-                }))
+        if state == TxState::Partial
+            && self.claim_end.is_some_and(|end| {
+                vendor.at_ms > 0 && vendor.at_ms <= row.wall_ms && row.wall_ms <= end
+            })
+            && log.state().last[1]
+                .as_ref()
+                .is_some_and(|closed| Some(closed.node) == vendor.node)
         {
-            self.note_interrupted();
+            // A known raw end, tied to the last closed owner, places this late
+            // partial fact wholly before any later interval. It cannot refine
+            // the closed outcome or overload a future vendor interruption.
+            return;
+        }
+        let original = vendor
+            .node
+            .filter(|node| Some(*node) == self.turn)
+            .and_then(|node| {
+                log.window()
+                    .find(|r| r.node == node && r.op == Op::Open && r.par == Some(self.run))
+            });
+        let bound = original.and_then(|open| {
+            let transcript =
+                open.src == Src::Transcript && open.f.get(Key::Vref) == Some(&Val::Id(vendor.vref));
+            let screen = state == TxState::On && self.screen_turns && open.src == Src::Screen;
+            (transcript || screen).then_some((open.node, open.src))
+        });
+        let unknown_screen = original
+            .filter(|open| state == TxState::On && open.src == Src::Screen && !self.screen_turns);
+        let mut pending = VendorInterrupt {
+            vref: Some(vendor.vref),
+            prompt: vendor.at_ms,
+            at: row.wall_ms,
+            source: Some(TxMark::of(pos)),
+            bound: bound.or_else(|| unknown_screen.map(|open| (open.node, open.src))),
+            valid: self.proof_unique && !self.tx.desync && unknown_screen.is_none(),
+        };
+        if let Some(previous) = self.tx.interrupt {
+            // One slot cannot assign multiple vendor interruptions. Keep only their
+            // uncertain extent; it can never become a confirmed interruption.
+            pending.prompt = pending.prompt.min(previous.prompt);
+            pending.at = pending.at.max(previous.at);
+            pending.valid = false;
+            pending.bound = previous.bound.filter(|binding| Some(*binding) == bound);
+            self.tx.lose(1);
+        }
+        self.tx.interrupt = Some(pending);
+        if pending.bound.is_some() && self.interrupted != Interruption::Screen {
+            self.interrupted = if pending.valid {
+                Interruption::Vendor
+            } else {
+                Interruption::Unknown
+            };
+            self.interrupt_fresh = pending.valid;
         }
     }
 
@@ -2329,40 +3008,51 @@ impl TurnTracker {
         let Some(v) = self.tx.cur.filter(|v| v.end_ms.is_none()) else {
             return;
         };
-        self.tx.cur = Some(VTurn {
-            end_ms: Some(row.wall_ms),
-            ..v
-        });
-        let Some(node) = v.node else {
-            return;
-        };
         // The screen can close and continue the same vendor turn more than once before its
         // end row arrives. Follow the dated end through every later continuation (§2.3).
-        let Some(node) = Self::tx_end_node(log, node, v, row.wall_ms) else {
-            self.tx.lose(1);
-            return;
-        };
+        let resolved = v
+            .node
+            .and_then(|node| Self::tx_end_node(log, node, v, row.wall_ms));
         self.tx.cur = Some(VTurn {
-            node: Some(node),
+            node: resolved,
             end_ms: Some(row.wall_ms),
             ..v
         });
+        self.vendor_observation(log, v.vref, "done", Some(n), conf, row);
+        let Some(node) = resolved else {
+            if v.node.is_some() {
+                self.tx.lose(1);
+            }
+            return;
+        };
+        let conflicting = Self::conflicting_vref(log, node, v.vref);
         let mut at = row;
         let open = Some(node) == self.turn && log.is_open(node);
         let screen_held = self.step.as_ref().is_some_and(|h| h.under_turn);
         // A partial source ends only the turn it opened (fix E1); the screen's settles it.
         if open && !screen_held && (state == TxState::On || tx_owns(log, node)) {
             let (out, oconf) = match self.settle.map(|s| s.cause) {
-                Some(c) => match settle_out(c, self.interrupted) {
+                Some(c) => match settle_out(c, self.interrupted.confirmed()) {
                     (o, Conf::Heuristic) => (o, Conf::Heuristic),
                     (o, _) => (o, conf),
                 },
-                None if self.interrupted => (TurnOut::Interrupted, conf),
+                None if self.interrupted.confirmed() => (TurnOut::Interrupted, conf),
+                None if self.interrupted == Interruption::Unknown => (TurnOut::Unknown, conf),
                 None => (TurnOut::Done, conf),
+            };
+            let out = if self.interrupted == Interruption::Unknown {
+                TurnOut::Unknown
+            } else {
+                out
             };
             at = tx_close_at(log, node, row);
             let close = Close::new(Out::Turn(out), Src::Transcript, oconf).by(Actor::Vendor);
             self.close_turn_with(log, close, out, (None, false, true), at);
+        }
+        // A measured source may close the screen's turn, but a different vendor
+        // identity cannot replace that turn's metrics. Its raw facts remain above.
+        if conflicting {
+            return;
         }
         let mut f = Fields::new();
         for (k, v) in [(Key::VdurMs, n[0]), (Key::TokIn, n[1]), (Key::TokOut, n[2])] {

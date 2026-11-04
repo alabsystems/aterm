@@ -3,6 +3,224 @@
 
 use super::*;
 
+pub(super) fn write_context_login(home: &Path, generation: i64) {
+    std::fs::create_dir_all(home).unwrap();
+    std::fs::write(
+        home.join("config.toml"),
+        "cli_auth_credentials_store='file'\n",
+    )
+    .unwrap();
+    let token = crate::harness::codex_app_login::tests::make_jwt(&aterm_json::json!({
+        "email": "fixture@example.test", "iat": generation,
+        "https://api.openai.com/auth": {
+            "chatgpt_user_id": "fixture-user", "chatgpt_account_id": "fixture-account"
+        }
+    }));
+    std::fs::write(
+        home.join("auth.json"),
+        aterm_json::to_vec(&aterm_json::json!({
+            "auth_mode": "chatgpt", "tokens": {"id_token": token, "access_token": token}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+struct ContextRead<'a> {
+    user_home: &'a Path,
+    signed_out: bool,
+    replace: bool,
+    contextual: bool,
+    calls: std::sync::Mutex<usize>,
+}
+
+impl UsageReader for ContextRead<'_> {
+    fn read(&self, _: Cli, _: &Path, _: Option<&str>, _: i64) -> Reading {
+        panic!("the pool must retain the observed request context")
+    }
+
+    fn read_observed(&self, cli: Cli, home: &Path, _: Option<&str>, _: i64) -> UsageObservation {
+        assert_eq!(cli, Cli::Codex);
+        *self.calls.lock().unwrap() += 1;
+        let context = crate::harness::codex_app_login::current_context(home, self.user_home);
+        assert!(context.is_some());
+        if self.replace {
+            write_context_login(home, 2);
+        }
+        UsageObservation {
+            reading: if self.signed_out {
+                Reading::SignedOut
+            } else {
+                plain_usage()
+            },
+            context: self.contextual.then_some(context).flatten(),
+        }
+    }
+}
+
+#[test]
+fn old_usage_and_signed_out_results_cannot_publish_after_same_directory_replacement() {
+    for signed_out in [false, true] {
+        for replace in [false, true] {
+            let world = World::new("usage-credential-replacement");
+            world.two(Cli::Codex);
+            world.on_main(Cli::Codex, &[]);
+            let home = world.home.join(Cli::Codex.accounts().default_home);
+            write_context_login(&home, 1);
+            let seat = world.seat();
+            let store = seat.store(Cli::Codex);
+            let seed = ContextRead {
+                user_home: &world.home,
+                signed_out: !signed_out,
+                replace: false,
+                contextual: true,
+                calls: std::sync::Mutex::new(0),
+            };
+            let before = pool_snapshot(&seat, Cli::Codex).unwrap();
+            poll_usage(
+                &seat,
+                Cli::Codex,
+                &before,
+                before.roster.row("main").unwrap(),
+                &seed,
+            )
+            .unwrap();
+            assert_eq!(*seed.calls.lock().unwrap(), 1);
+            let before = pool_snapshot(&seat, Cli::Codex).unwrap();
+            assert_eq!(
+                before
+                    .state
+                    .account("main")
+                    .current_auth(before.roster.row("main").unwrap()),
+                if signed_out {
+                    accounts::Auth::Ok
+                } else {
+                    accounts::Auth::SignedOut
+                }
+            );
+            let files = [
+                store.state_file(),
+                store.logins_file(),
+                store.ledger_path(),
+                store.wake_path(),
+            ];
+            let images = files.each_ref().map(|path| std::fs::read(path).ok());
+            let auth = std::fs::read(home.join("auth.json")).unwrap();
+            let read = ContextRead {
+                user_home: &world.home,
+                signed_out,
+                replace,
+                contextual: true,
+                calls: std::sync::Mutex::new(0),
+            };
+            let result = poll_usage(
+                &seat,
+                Cli::Codex,
+                &before,
+                before.roster.row("main").unwrap(),
+                &read,
+            );
+            assert_eq!(*read.calls.lock().unwrap(), 1);
+            let after = pool_snapshot(&seat, Cli::Codex).unwrap();
+            assert_eq!(after.roster, before.roster);
+            assert_eq!(after.logins, before.logins);
+            if replace {
+                assert!(result.is_err());
+                assert_ne!(std::fs::read(home.join("auth.json")).unwrap(), auth);
+                assert_eq!(
+                    files.each_ref().map(|path| std::fs::read(path).ok()),
+                    images
+                );
+                assert_eq!(
+                    after.state.account("main").auth,
+                    before.state.account("main").auth
+                );
+                assert_eq!(
+                    after.state.account("main").auth_at,
+                    before.state.account("main").auth_at
+                );
+                assert_eq!(
+                    after
+                        .state
+                        .account("main")
+                        .current_auth(after.roster.row("main").unwrap()),
+                    accounts::Auth::Unseen
+                );
+            } else {
+                assert!(result.is_ok());
+                assert_eq!(std::fs::read(home.join("auth.json")).unwrap(), auth);
+                assert_eq!(
+                    after
+                        .state
+                        .account("main")
+                        .current_auth(after.roster.row("main").unwrap()),
+                    if signed_out {
+                        accounts::Auth::SignedOut
+                    } else {
+                        accounts::Auth::Ok
+                    }
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_contextless_signed_out_result_cannot_adopt_legacy_history_even_with_a_login_file() {
+    let world = World::new("usage-unscoped-auth");
+    world.two(Cli::Codex);
+    world.on_main(Cli::Codex, &[]);
+    write_context_login(&world.home.join(Cli::Codex.accounts().default_home), 1);
+    let seat = world.seat();
+    let store = seat.store(Cli::Codex);
+    store
+        .transact_within(&accounts::LOCK_LADDER, NOW, &mut None, |state| {
+            Ok(accounts::note_auth(
+                state,
+                "main",
+                accounts::Auth::SignedOut,
+                NOW,
+            ))
+        })
+        .unwrap();
+    let before = pool_snapshot(&seat, Cli::Codex).unwrap();
+    let row = before.roster.row("main").unwrap();
+    assert_eq!(before.state.account("main").auth, accounts::Auth::SignedOut);
+    assert_eq!(
+        before.state.account("main").current_auth(row),
+        accounts::Auth::Unseen
+    );
+    let files = [
+        store.state_file(),
+        store.logins_file(),
+        store.ledger_path(),
+        store.wake_path(),
+    ];
+    let images = files.each_ref().map(|path| std::fs::read(path).ok());
+    let read = ContextRead {
+        user_home: &world.home,
+        signed_out: true,
+        replace: false,
+        contextual: false,
+        calls: std::sync::Mutex::new(0),
+    };
+    poll_usage(&seat, Cli::Codex, &before, row, &read).unwrap();
+    assert_eq!(*read.calls.lock().unwrap(), 1);
+    let after = pool_snapshot(&seat, Cli::Codex).unwrap();
+    assert_eq!(after.state.account("main"), before.state.account("main"));
+    assert_eq!(
+        after
+            .state
+            .account("main")
+            .current_auth(after.roster.row("main").unwrap()),
+        accounts::Auth::Unseen
+    );
+    assert_eq!(
+        files.each_ref().map(|path| std::fs::read(path).ok()),
+        images
+    );
+}
+
 pub(crate) fn usage_transition(
     state: &aterm_spec::interp::State,
     action: &str,
@@ -192,6 +410,7 @@ fn a_public_usage_poll_with_no_result_still_refuses_changed_policy() {
 
 /// A reader that keeps the homes it was asked about and answers `answer` for each.
 struct Reads<'a> {
+    user_home: &'a Path,
     homes: std::sync::Mutex<Vec<PathBuf>>,
     answer: &'a (dyn Fn(&Path) -> Reading + Sync),
 }
@@ -200,6 +419,22 @@ impl crate::harness::accounts_pool::UsageReader for Reads<'_> {
     fn read(&self, _: Cli, home: &Path, _: Option<&str>, _: i64) -> Reading {
         self.homes.lock().unwrap().push(home.to_path_buf());
         (self.answer)(home)
+    }
+
+    fn read_observed(
+        &self,
+        cli: Cli,
+        home: &Path,
+        expected_email: Option<&str>,
+        now: i64,
+    ) -> UsageObservation {
+        let context = (cli == Cli::Codex)
+            .then(|| crate::harness::codex_app_login::current_context(home, self.user_home))
+            .flatten();
+        UsageObservation {
+            reading: self.read(cli, home, expected_email, now),
+            context,
+        }
     }
 }
 
@@ -235,6 +470,7 @@ fn a_launch_reads_only_the_row_it_starts_on_and_reports_it() {
     world.on_main(Cli::Codex, &[]);
     let answer = |_: &Path| plain_usage();
     let reads = Reads {
+        user_home: &world.home,
         homes: std::sync::Mutex::default(),
         answer: &answer,
     };
@@ -275,6 +511,7 @@ fn a_read_that_shows_a_wall_moves_the_launch_to_the_next_row_and_reads_that() {
         }
     };
     let reads = Reads {
+        user_home: &world.home,
         homes: std::sync::Mutex::default(),
         answer: &answer,
     };
@@ -291,6 +528,7 @@ fn a_fresh_row_starts_with_no_read() {
     world.on_main(Cli::Codex, &[]);
     let answer = |_: &Path| plain_usage();
     let reads = Reads {
+        user_home: &world.home,
         homes: std::sync::Mutex::default(),
         answer: &answer,
     };
@@ -321,6 +559,7 @@ fn a_launch_reads_no_more_than_its_cap() {
     world.on_main(Cli::Codex, &[]);
     let answer = |_: &Path| spent_usage();
     let reads = Reads {
+        user_home: &world.home,
         homes: std::sync::Mutex::default(),
         answer: &answer,
     };
@@ -338,24 +577,31 @@ fn a_signed_out_row_is_read_only_when_nothing_else_serves() {
     let world = World::new("launch-signed-out");
     let work = world.two(Cli::Codex);
     world.on_main(Cli::Codex, &[]);
+    write_context_login(&world.home.join(Cli::Codex.accounts().default_home), 1);
+    write_context_login(&work, 1);
     let sign_out = |label: &str| {
-        let mut note = None;
-        world
-            .seat()
-            .store(Cli::Codex)
-            .transact_within(&accounts::LOCK_LADDER, NOW, &mut note, |state| {
-                Ok(accounts::note_auth(
-                    state,
-                    label,
-                    accounts::Auth::SignedOut,
-                    NOW,
-                ))
-            })
-            .expect("signed out");
+        let seat = world.seat();
+        let before = pool_snapshot(&seat, Cli::Codex).unwrap();
+        let read = ContextRead {
+            user_home: &world.home,
+            signed_out: true,
+            replace: false,
+            contextual: true,
+            calls: std::sync::Mutex::new(0),
+        };
+        poll_usage(
+            &seat,
+            Cli::Codex,
+            &before,
+            before.roster.row(label).unwrap(),
+            &read,
+        )
+        .unwrap();
     };
     sign_out("main");
     let answer = |_: &Path| plain_usage();
     let reads = Reads {
+        user_home: &world.home,
         homes: std::sync::Mutex::default(),
         answer: &answer,
     };
@@ -368,24 +614,31 @@ fn a_signed_out_row_is_read_only_when_nothing_else_serves() {
     );
 
     let world = World::new("launch-signed-out-all");
-    world.two(Cli::Codex);
+    let work = world.two(Cli::Codex);
     world.on_main(Cli::Codex, &[]);
-    let mut note = None;
-    world
-        .seat()
-        .store(Cli::Codex)
-        .transact_within(&accounts::LOCK_LADDER, NOW, &mut note, |state| {
-            let mut events = accounts::note_auth(state, "main", accounts::Auth::SignedOut, NOW);
-            events.extend(accounts::note_auth(
-                state,
-                "work",
-                accounts::Auth::SignedOut,
-                NOW,
-            ));
-            Ok(events)
-        })
-        .expect("both signed out");
+    write_context_login(&world.home.join(Cli::Codex.accounts().default_home), 1);
+    write_context_login(&work, 1);
+    for label in ["main", "work"] {
+        let seat = world.seat();
+        let before = pool_snapshot(&seat, Cli::Codex).unwrap();
+        let read = ContextRead {
+            user_home: &world.home,
+            signed_out: true,
+            replace: false,
+            contextual: true,
+            calls: std::sync::Mutex::new(0),
+        };
+        poll_usage(
+            &seat,
+            Cli::Codex,
+            &before,
+            before.roster.row(label).unwrap(),
+            &read,
+        )
+        .unwrap();
+    }
     let reads = Reads {
+        user_home: &world.home,
         homes: std::sync::Mutex::default(),
         answer: &answer,
     };

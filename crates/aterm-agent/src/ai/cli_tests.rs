@@ -1109,16 +1109,13 @@ fn codex_pool_store(b: &Box3) -> crate::harness::accounts::Store {
 }
 
 fn sign_main_out(b: &Box3, now: i64) {
-    codex_pool_store(b)
-        .transact_logins(now, &mut None, |state, _| {
-            Ok(crate::harness::accounts::note_auth(
-                state,
-                "main",
-                crate::harness::accounts::Auth::SignedOut,
-                now,
-            ))
-        })
-        .expect("sign `main` out");
+    crate::ai::testing::current_codex_auth(
+        &codex_pool_store(b),
+        &b.dir.path().join("accounts-codex.toml"),
+        "main",
+        crate::harness::accounts::Auth::SignedOut,
+        now,
+    );
 }
 
 fn pooled_env(b: &Box3, extra: &[(&str, &str)], tty: bool) -> Env {
@@ -1201,6 +1198,12 @@ fn a_codex_default_row_nothing_here_signs_in_hands_nobody_a_step() {
     let held = codex_default_only("held_by = \"m2\"\n");
     sign_main_out(&held, now);
     let due = codex_default_only("");
+    crate::ai::testing::current_codex_sign_in(
+        &codex_pool_store(&due),
+        &due.dir.path().join("accounts-codex.toml"),
+        "main",
+        now - 20,
+    );
     codex_pool_store(&due)
         .transact_logins(now - 10, &mut None, |_, logins| {
             crate::harness::accounts::note_login_notice(logins, "main", 2, now - 10);
@@ -1284,7 +1287,21 @@ fn with_no_terminal_a_login_under_a_refusing_pin_names_the_mend() {
     let main_out = codex_default_only("");
     pin_codex(&main_out, "work", now);
     sign_main_out(&main_out, now);
-    for (case, b) in [("work's login gone", &gone), ("main signed out", &main_out)] {
+    let main_due = codex_default_only("");
+    pin_codex(&main_due, "work", now);
+    std::fs::remove_file(main_due.home.join(".aterm/logins/codex/work/auth.json"))
+        .expect("work's login");
+    codex_pool_store(&main_due)
+        .transact_logins(now, &mut None, |_, logins| {
+            crate::harness::accounts::note_login_notice(logins, "main", 1, now);
+            Ok(Vec::new())
+        })
+        .expect("main due");
+    for (case, b) in [
+        ("work's login gone", &gone),
+        ("main signed out", &main_out),
+        ("main due", &main_due),
+    ] {
         let env = pooled_env(b, &[], false);
         let (row, f, _) = codex_look(&env);
         let pool = f.pool.as_ref().expect("codex pool");
@@ -1381,23 +1398,26 @@ fn under_a_pin_on_a_row_of_its_own_a_signed_out_default_row_signs_codex_out() {
 /// reads.
 fn codex_signs_in(b: &Box3) -> FakeRunner {
     let home = b.home.join(".codex");
-    FakeRunner::with(move |call| {
+    FakeRunner::with(|call| {
         Ok(if call.args == ["login", "status"] {
-            let token = crate::harness::codex_app_login::tests::make_chatgpt_jwt(
-                Some("own@example.com"),
-                "plus",
-                1_800_000_000 + 3600,
-            );
-            std::fs::create_dir_all(&home).expect("Codex's default home");
-            std::fs::write(
-                home.join("auth.json"),
-                aterm_json::json!({"tokens": {"access_token": token}}).to_string(),
-            )
-            .expect("the login Codex's sign-in wrote");
             ran(0, "Logged in using ChatGPT\n", "")
         } else {
             ran(0, "", "")
         })
+    })
+    .exiting(move |_| {
+        let token = crate::harness::codex_app_login::tests::make_chatgpt_jwt(
+            Some("own@example.com"),
+            "plus",
+            1_800_000_000 + 3600,
+        );
+        std::fs::create_dir_all(&home).expect("Codex's default home");
+        std::fs::write(
+            home.join("auth.json"),
+            aterm_json::json!({"tokens": {"access_token": token}}).to_string(),
+        )
+        .expect("the login Codex's sign-in wrote");
+        0
     })
 }
 
@@ -1877,4 +1897,28 @@ fn a_doctor_that_did_not_finish_a_fix_says_so_instead_of_offering_itself() {
         .expect(&after);
     assert!(health.contains("did not finish kimi"), "{health}");
     assert!(!health.contains("`aterm ai doctor`"), "{health}");
+}
+
+/// A MAC WHOSE ROSTER IS REFUSED IS A MAC THAT DOES NOT WORK, NOT ONE THAT WAS NEVER ASKED: the
+/// `refused` word a doctor answers counts in `coverage.of` and never in `coverage.working`. CONTROL:
+/// a word no doctor says is still dropped.
+#[test]
+fn a_refused_mac_counts_in_fleet_coverage_and_works_nowhere() {
+    let states = remote_states(
+        r#"{"clis":[{"id":"codex","state":"refused"},{"id":"claude","state":"ok"},
+                    {"id":"kimi","state":"sideways"}]}"#,
+    )
+    .expect("the states");
+    assert_eq!(
+        states,
+        vec![
+            ("codex".to_string(), "refused".to_string()),
+            ("claude".to_string(), "ok".to_string())
+        ],
+        "every word a doctor says, and no other"
+    );
+    assert!(
+        !WORKING.contains(&"refused"),
+        "a refused roster runs nothing"
+    );
 }

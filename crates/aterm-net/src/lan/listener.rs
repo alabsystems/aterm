@@ -239,6 +239,17 @@ impl Listener {
         self.recheck()?;
         Ok(connection)
     }
+
+    /// Whether a connection waits in this listener's queue within `timeout`, without accepting
+    /// it: a test's proof that a peer's handshake reached the queue, which the kernel may finish
+    /// after the peer's `connect` returns.
+    ///
+    /// # Errors
+    /// The wait on the socket fails.
+    #[cfg(any(test, debug_assertions))]
+    pub fn pending_within(&self, timeout: std::time::Duration) -> io::Result<bool> {
+        crate::slots::wait_listener_readable(&self.tcp, timeout)
+    }
 }
 
 #[cfg(test)]

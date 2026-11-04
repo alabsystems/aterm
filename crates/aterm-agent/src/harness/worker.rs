@@ -595,6 +595,30 @@ pub struct Admitted {
 }
 
 impl Admitted {
+    /// Prepare authentication after the program's installation has completed, retaining
+    /// its readiness and returning the guard needed to recheck the prepared starter.
+    ///
+    /// # Errors
+    /// Preparation failed, or the replacement starter fails the CLI's sign-in check.
+    pub fn prepare<T>(
+        self,
+        cli: &WorkerCli,
+        user: Option<&Path>,
+        prepare: impl FnOnce(Starter) -> Result<(Starter, T), String>,
+    ) -> Result<(Self, T), Refused> {
+        let (starter, guard) = prepare(self.starter).map_err(Refused::SignedOut)?;
+        if let Some(why) = cli.signed_out(&starter, user) {
+            return Err(Refused::SignedOut(why));
+        }
+        Ok((
+            Self {
+                starter,
+                readiness: self.readiness,
+            },
+            guard,
+        ))
+    }
+
     /// The starter the line carries.
     #[must_use]
     pub const fn starter(&self) -> &Starter {

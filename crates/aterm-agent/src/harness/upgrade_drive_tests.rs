@@ -4,7 +4,7 @@
 use super::super::relaunch::{
     Adopted, AtPrompt, CARRIED_DONE, CAUSE_ASKED, CAUSE_EXIT, CAUSE_HOST, CONTINUE_FENCE_TRIES,
     EXIT_LOOK, ExitRecord, MODEL_WAIT, NOBODY_ASKED, PERSON_FIRST, RELAUNCH_FENCE_TRIES,
-    RelaunchLineError, Restart, STALE_S, Snapshot, after_exit, after_host_ended,
+    RelaunchLineError, Restart, RestartAsk, STALE_S, Snapshot, after_exit, after_host_ended,
     after_host_ended_from, await_new, carry_on_with_tab_probe, continuation_session, exit_fallback,
     exit_record, fallback_origin, follow, line_for, look_at_exit, model_restart, owed,
     relaunch_by_parent, restart_from, resume, resume_as, resume_at_point, resumed_prompt,
@@ -3415,6 +3415,198 @@ fn a_tty_child_that_ends_is_said_with_its_slave_as_it_ran() {
         "its end, and its slave as it ran: {said}"
     );
     child.end();
+}
+
+/// Whether the process group `group` (> 1) has a member `kill` can signal: none once it
+/// answers `ESRCH`, or on Apple `EPERM` once only zombies are left (a Linux zombie answers until
+/// it is reaped).
+#[cfg(unix)]
+fn group_lives(group: i32) -> bool {
+    assert!(group > 1, "{group} names one group");
+    // SAFETY: a plain syscall taking no pointer; `group` > 1 names one process group, and
+    // signal 0 only asks whether it has a member to signal.
+    unsafe { libc::kill(-group, 0) == 0 }
+}
+
+/// Ends the process group `group` (> 1) where it has a live member as this looks, so a test
+/// that fails leaves no job of its running past it (a `sleep 600` for ten minutes): a group
+/// keeps its id while it has a member, so the id that look found live names that group still.
+#[cfg(unix)]
+fn end_group_left(group: i32) {
+    if group_lives(group) {
+        let _ = aterm_uds::process::kill_group_until_empty(group);
+    }
+}
+
+/// Panics, naming `what`, unless the process group `pgid` has no live member ([`group_lives`])
+/// within the hang detector, ending the group first ([`end_group_left`]) where it still has one.
+#[cfg(unix)]
+fn group_ends(pgid: u32, what: &str) {
+    let group = i32::try_from(pgid).expect("a group id");
+    let start = Instant::now();
+    while group_lives(group) {
+        if start.elapsed() >= aterm_spec::wait::MUST_HAPPEN {
+            end_group_left(group);
+            panic!("{what}: the group {pgid} still had a live member at the hang detector");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// A look that finds the child exited keeps its own slave reading where the exit had not begun
+/// when that reading was taken: the last reading from while the child ran, so the one a
+/// fixture's end must say (the only one that can show a slave dead before the exit).
+#[cfg(unix)]
+#[test]
+fn a_look_that_finds_the_exit_keeps_its_own_reading_from_before_it() {
+    let mut ran_with = Some("an older reading".to_string());
+    let exited = note_look(
+        &mut ran_with,
+        Some("this look's reading".to_string()),
+        Some(false),
+        Some(true),
+    );
+    assert!(exited, "the child had exited");
+    assert_eq!(ran_with.as_deref(), Some("this look's reading"));
+}
+
+/// A slave reading taken once the exit began, or where nothing says it had not, is never kept:
+/// on Apple the exit revokes the slave first, so it would blame the pty for any end.
+#[cfg(unix)]
+#[test]
+fn a_reading_from_once_the_exit_began_is_never_kept() {
+    for exiting in [Some(true), None] {
+        for exited in [Some(false), Some(true), None] {
+            let mut ran_with = Some("from while it ran".to_string());
+            let ended = note_look(&mut ran_with, Some("revoked".to_string()), exiting, exited);
+            assert_eq!(ended, exited != Some(false), "{exiting:?} {exited:?}");
+            assert_eq!(
+                ran_with.as_deref(),
+                Some("from while it ran"),
+                "exiting {exiting:?}, exited {exited:?}"
+            );
+        }
+    }
+}
+
+/// A [`TtyChild`] whose shell exits leaving a job of its group on its slave, one that ignores
+/// the hangup the exit sends, has that job ended when [`TtyChild::lives`] finds the exit: it
+/// looks without reaping the shell, so the session's end still finds the shell's group.
+#[cfg(unix)]
+#[test]
+fn a_tty_child_that_exits_leaving_a_job_has_the_job_ended() {
+    let sh = crate::test_program::kept("/bin/sh");
+    let sleeper = crate::test_program::kept("/bin/sleep");
+    let (master, slave, child) = aterm_pty::spawn_session_leader_on_pty(|slave| {
+        let tty = || slave.try_clone().map(std::process::Stdio::from);
+        let mut shell = std::process::Command::new(&sh);
+        shell
+            .args(["-c", "trap '' HUP; \"$1\" 600 & exit 0", "sh"])
+            .arg(&sleeper)
+            .stdout(tty()?)
+            .stderr(tty()?);
+        Ok(shell)
+    })
+    .expect("sh");
+    let mut child = TtyChild::on_pty(child, master, slave);
+    let pid = child.id();
+    let start = Instant::now();
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        loop {
+            child.lives("sh, leaving its job");
+            assert!(
+                start.elapsed() < aterm_spec::wait::MUST_HAPPEN,
+                "sh outlived the hang detector"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }))
+    .expect_err("sh exits");
+    let said = panic.downcast_ref::<String>().cloned().unwrap_or_default();
+    assert!(
+        said.contains("exited first (exit status: 0)"),
+        "its end: {said}"
+    );
+    group_ends(pid, "sh's job, on its slave");
+    child.end();
+}
+
+/// A [`PtyHost`] whose program exits leaving a job of its group on the pty, one that ignores the
+/// hangup the exit sends, ends that job with the session: the host looks at the exit without
+/// reaping its program, so `aterm_pty::end_session_on_pty` still finds the program's group. Its
+/// `sh` waits on a FIFO until the test has read its pid, so the host cannot end before
+/// [`PtyHost::hosted`] looks.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_pty_host_whose_program_exits_leaving_a_job_ends_the_job() {
+    use std::ffi::OsStr;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let dir = scratch("pty-host-job");
+    let fifo = dir.join("go");
+    let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).expect("a path");
+    // SAFETY: `c_fifo` is a NUL-terminated string that outlives the call, which only reads it.
+    assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0, "mkfifo");
+    let sh = crate::test_program::kept("/bin/sh");
+    let sleeper = crate::test_program::kept("/bin/sleep");
+    let argv = [
+        sh.as_os_str(),
+        OsStr::new("-c"),
+        OsStr::new("trap '' HUP; \"$1\" 600 & read _ < \"$2\"; exit 0"),
+        OsStr::new("sh"),
+        sleeper.as_os_str(),
+        fifo.as_os_str(),
+    ];
+    let mut host = PtyHost::spawn(&argv, &dir.join("pty-host.log"), &[]);
+    let leader = host.hosted("sh on the host's pty");
+    // A write end opens (`ENXIO` until then) once sh's read has the FIFO open.
+    let start = Instant::now();
+    let go = loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+        {
+            Ok(go) => break go,
+            Err(e) if e.raw_os_error() == Some(libc::ENXIO) => {
+                host.lives("sh, opening its FIFO");
+                assert!(
+                    start.elapsed() < aterm_spec::wait::MUST_HAPPEN,
+                    "sh never opened its FIFO; the pty host said:\n{}",
+                    host.said()
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => panic!("sh's FIFO: {e}"),
+        }
+    };
+    std::io::Write::write_all(&mut &go, b"go\n").expect("sh's line");
+    drop(go);
+    // The host ends the session for sh's exit, not for its stdin's end, which comes only after,
+    // and may exit once it has: so its log is read after each look at whether it has exited, and
+    // a host that exits without the line fails the test the moment it has (sh's job ended).
+    let group = i32::try_from(leader).expect("sh's group");
+    let start = Instant::now();
+    loop {
+        let gone = host.child.try_wait().expect("the pty host's status");
+        let said = host.said();
+        if said.contains("the hosted program exited first") {
+            break;
+        }
+        if let Some(status) = gone {
+            end_group_left(group);
+            panic!(
+                "the pty host exited first ({status}), never having seen sh exit; it said:\n{said}"
+            );
+        }
+        if start.elapsed() >= aterm_spec::wait::MUST_HAPPEN {
+            end_group_left(group);
+            panic!("the pty host never saw sh exit; it said:\n{said}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    host.end("the pty host, its program exited first");
+    group_ends(leader, "sh's job, on the host's pty");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// [`Job`] from `ps`'s numbers, recorded shapes.
@@ -10674,15 +10866,32 @@ fn a_restart_in_place_is_planned_on_the_same_program_and_carried_on_once() {
     };
     let claude = ["/opt/claude/bin/claude", "--verbose"];
     assert_eq!(
-        restart_from(&opts, &Restart::Memory, Err("no-foreground")).step,
+        restart_from(
+            &opts,
+            &Restart::Memory,
+            &ask_of(&Restart::Memory),
+            Err("no-foreground")
+        )
+        .step,
         "wait:no-foreground"
     );
     assert_eq!(
-        restart_from(&opts, &Restart::Memory, Ok(snap(&claude))).step,
+        restart_from(
+            &opts,
+            &Restart::Memory,
+            &ask_of(&Restart::Memory),
+            Ok(snap(&claude))
+        )
+        .step,
         "wait:no-session-record"
     );
     register(&opts.home, agent.id(), SESSION);
-    let r = restart_from(&opts, &Restart::Memory, Ok(snap(&claude)));
+    let r = restart_from(
+        &opts,
+        &Restart::Memory,
+        &ask_of(&Restart::Memory),
+        Ok(snap(&claude)),
+    );
     assert_eq!(
         (r.step.as_str(), r.session.as_str(), r.to.as_str()),
         ("would-restart", SESSION, "1.0.0(same)"),
@@ -10693,13 +10902,20 @@ fn a_restart_in_place_is_planned_on_the_same_program_and_carried_on_once() {
         ..snap(&claude)
     };
     assert_eq!(
-        restart_from(&opts, &Restart::Memory, Ok(other)).step,
+        restart_from(
+            &opts,
+            &Restart::Memory,
+            &ask_of(&Restart::Memory),
+            Ok(other)
+        )
+        .step,
         "wait:tab-identity-conflict"
     );
     assert_eq!(
         restart_from(
             &opts,
             &Restart::Memory,
+            &ask_of(&Restart::Memory),
             Ok(snap(&["/opt/claude/bin/claude", "-p", "hi"]))
         )
         .step,
@@ -10716,7 +10932,13 @@ fn a_restart_in_place_is_planned_on_the_same_program_and_carried_on_once() {
     };
     std::fs::write(state_path(&opts, SESSION), st.to_json()).expect("in flight");
     assert_eq!(
-        restart_from(&opts, &Restart::Memory, Ok(snap(&claude))).step,
+        restart_from(
+            &opts,
+            &Restart::Memory,
+            &ask_of(&Restart::Memory),
+            Ok(snap(&claude))
+        )
+        .step,
         "would-resume:exiting"
     );
     let _ = agent.kill();
@@ -10829,6 +11051,7 @@ fn a_memory_restart_asks_no_hand_chosen_model_of_a_launch_that_named_none() {
         restart_from(
             &opts,
             &Restart::Memory,
+            &ask_of(&Restart::Memory),
             Ok(snap(&["/opt/claude/bin/claude", "--verbose"]))
         )
         .step,
@@ -11322,6 +11545,7 @@ fn restart_driven(
     let r = crate::harness::relaunch::restart_as(
         &opts,
         why,
+        &ask_of(why),
         roster,
         Ok(snap),
         selected.as_ref(),
@@ -11395,6 +11619,754 @@ fn a_restart_in_place_signals_only_once_its_claim_is_written() {
         saved.line_dir.is_empty(),
         saved.line.contains("cd -- "),
         "a directory exactly where the line has no cd: {saved:?}"
+    );
+}
+
+/// The ask of a line the loop held ([`crate::supervise::custody::LineAsk`]), and of the next one
+/// it held, a minute on.
+#[cfg(unix)]
+const LINE_A: crate::supervise::custody::LineAsk = crate::supervise::custody::LineAsk {
+    at_ms: 1_762_000_000_000,
+    nth: 0,
+};
+/// [`LINE_A`]'s next line's ask.
+#[cfg(unix)]
+const LINE_B: crate::supervise::custody::LineAsk = crate::supervise::custody::LineAsk {
+    at_ms: 1_762_000_060_000,
+    nth: 1,
+};
+
+/// The Unix second a test's restart run was first asked at ([`ask_of`]).
+const RUN_AT: i64 = 1_762_000_000;
+
+/// The ask of `why` in the run first asked at [`RUN_AT`] ([`RestartAsk::of`]): the same at every
+/// ask of that restart.
+fn ask_of(why: &Restart) -> RestartAsk {
+    RestartAsk::of(why, RUN_AT)
+}
+
+/// The word a record a lost `line`'s restart claimed keeps (`St::ask`).
+#[cfg(unix)]
+fn line_word(line: crate::supervise::custody::LineAsk) -> String {
+    ask_of(&Restart::InputLost {
+        of: (None, None),
+        line,
+    })
+    .word()
+    .to_string()
+}
+
+/// The restart in place `why(agent)` of a stand-in agent asked by a window's host
+/// ([`Opts::hand_back`]) while the conversation's record `prior(agent, shell)` is in flight, driven
+/// for real ([`crate::harness::relaunch::restart_as`]): what it answers, the record saved after,
+/// the requests the tab's stand-in was asked, and whether the agent still runs.
+#[cfg(unix)]
+fn restart_over(
+    name: &str,
+    why: impl FnOnce(u32) -> Restart,
+    prior: impl FnOnce(u32, u32) -> St,
+) -> (Report, Option<St>, Vec<String>, bool) {
+    let Asks {
+        mut said,
+        asked,
+        runs,
+    } = restart_asked(name, |agent| vec![(why(agent), Scene::default())], prior);
+    let (r, saved) = said.pop().expect("the one ask");
+    (r, saved, asked, runs)
+}
+
+/// What the stand-in host's world holds for one ask of [`restart_asked`] while it runs: the
+/// screen its `text` answers, whether another sweep holds the sweep's lock, and the ask it comes
+/// as.
+#[cfg(unix)]
+#[derive(Clone, Default)]
+struct Scene {
+    /// The `text --json` body for this ask (`None`: the instance's own answer).
+    screen: Option<String>,
+    /// Another sweep holds the lock ([`sweep_lock`]) while the ask runs.
+    locked: bool,
+    /// The ask it comes as (`None`: its restart's in the run first asked at [`RUN_AT`],
+    /// [`ask_of`]).
+    ask: Option<RestartAsk>,
+}
+
+/// What [`restart_asked`] saw.
+#[cfg(unix)]
+struct Asks {
+    /// Each ask's report, and the record saved after it.
+    said: Vec<(Report, Option<St>)>,
+    /// The requests the tab's stand-in was asked, over every ask.
+    asked: Vec<String>,
+    /// Whether the agent still runs after the last ask.
+    runs: bool,
+}
+
+/// [`restart_over`] asked once per restart `whys(agent)` names, in order, of the one stand-in
+/// agent under the one record `prior(agent, shell)`, each in its [`Scene`].
+#[cfg(unix)]
+fn restart_asked(
+    name: &str,
+    whys: impl FnOnce(u32) -> Vec<(Restart, Scene)>,
+    prior: impl FnOnce(u32, u32) -> St,
+) -> Asks {
+    let dir = scratch(name);
+    let (sock, asked) = instance_with(&dir, Answers::default());
+    let opts = Opts {
+        sock: Some(sock),
+        only_sid: Some(TAB.to_string()),
+        hand_back: true,
+        ..drive(&dir)
+    };
+    seed_builds(&opts);
+    let mut shell = stand_in_shell();
+    let mut agent = parked_bare().spawn().expect("agent");
+    wait_exec(agent.id());
+    register(&opts.home, agent.id(), SESSION);
+    std::fs::create_dir_all(state_dir(&opts)).expect("state");
+    save(&opts, SESSION, &prior(agent.id(), shell.id()));
+    let launch = "claude-opus-5-5";
+    write_transcript(&opts.home, &[answer_at(launch, "2099-01-01T00:00:00Z")]);
+    let snap = Snapshot {
+        stored_login: false,
+        profile: Some(live_profile(&opts, None)),
+        tab: TAB.to_string(),
+        pid: agent.id(),
+        start: kernel_start(agent.id()).expect("lstart"),
+        shell: shell.id(),
+        program: PathBuf::from("/opt/claude/bin/claude"),
+        argv: ["/opt/claude/bin/claude", "--model", launch]
+            .iter()
+            .map(|w| (*w).to_string())
+            .collect(),
+        session: Some(SESSION.to_string()),
+        cwd: "/".to_string(),
+        version: Some("1.0.0".to_string()),
+        run: crate::harness::relaunch::AgentRun::Claude,
+        dialect: None,
+        login: None,
+        home: None,
+        claude_dir: None,
+    };
+    let screen_file = dir.join("t.screen");
+    let mut said = Vec::new();
+    for (why, scene) in whys(agent.id()) {
+        match &scene.screen {
+            Some(screen) => std::fs::write(&screen_file, screen).expect("the ask's screen"),
+            None => {
+                let _ = std::fs::remove_file(&screen_file);
+            }
+        }
+        let held = scene
+            .locked
+            .then(|| sweep_lock(&opts).expect("free").expect("a real run locks"));
+        let ask = scene.ask.clone().unwrap_or_else(|| ask_of(&why));
+        let r = crate::harness::relaunch::restart_as(
+            &opts,
+            &why,
+            &ask,
+            &crate::harness::accounts::Roster::default(),
+            Ok(snap.clone()),
+            None,
+            &Script::new(shell.id(), usize::MAX, Some(std::process::id())),
+        );
+        drop(held);
+        said.push((r, load(&opts, SESSION)));
+    }
+    let runs = agent.try_wait().ok().flatten().is_none();
+    let _ = agent.kill();
+    let _ = agent.wait();
+    let _ = shell.kill();
+    let _ = shell.wait();
+    let asked = asked.lock().map(|a| a.clone()).unwrap_or_default();
+    Asks { said, asked, runs }
+}
+
+/// A RESTART IN PLACE ASKED BY THE AGENT A RELAUNCH IN FLIGHT ALREADY LANDED IN IS MADE OF THAT
+/// AGENT (ATERM-KI-1101-3): the conversation's record is `Relaunched`, its relaunch the very
+/// process that asks (adopted, `relaunched_pid`, or not yet), its carry-on owed. Carrying that
+/// record ends nothing: its held wait finds the asker and answers `adopted` at once, and a loop
+/// that took that word for the restart asked would settle the line its asker still holds and
+/// write it again. So the asked restart supersedes the record: its claim is saved for the asker
+/// and the asker is signalled; a lost line's restart that names no process alike, the record
+/// another cause's. Negative control: the supersede dropped from `restart_as`: the record
+/// carried, `adopted`, nothing signalled, the asker still running.
+#[cfg(unix)]
+#[test]
+fn a_restart_asked_by_the_agent_a_relaunch_already_landed_in_is_made_of_it() {
+    let mut wrong = Vec::new();
+    for tag in ["input-lost", "input-lost-nameless", "memory"] {
+        for adopted in [true, false] {
+            let name = format!("landed-{tag}-{adopted}");
+            let why = |agent: u32| match tag {
+                "memory" => Restart::Memory,
+                "input-lost-nameless" => Restart::InputLost {
+                    of: (None, None),
+                    line: LINE_B,
+                },
+                _ => Restart::InputLost {
+                    of: (Some(agent), None),
+                    line: LINE_B,
+                },
+            };
+            let (r, saved, asked, runs) = restart_over(&name, why, |agent, _| St {
+                phase: Phase::Relaunched { at_s: now_s() },
+                pid: dead_pid(),
+                shell: std::process::id(),
+                tab: TAB.to_string(),
+                from: "2.1.281".to_string(),
+                to: "2.1.283".to_string(),
+                source: "managed".to_string(),
+                exited_at: now_s() - 3,
+                relaunched_pid: if adopted { agent } else { 0 },
+                ..St::default()
+            });
+            let signalled = asked.iter().any(|l| l.contains(" signal "));
+            let cause = if tag == "memory" {
+                "memory"
+            } else {
+                "input-lost"
+            };
+            let claimed = saved
+                .as_ref()
+                .is_some_and(|st| st.cause == cause && st.pid == r.pid && r.pid != 0);
+            let truthful = !runs || r.step.starts_with("wait:");
+            if !(signalled && claimed && truthful) {
+                wrong.push(format!(
+                    "{name}: {:?} signalled={signalled} claimed={claimed} runs={runs} saved={:?}",
+                    r.step,
+                    saved.map(|st| (st.phase, st.cause, st.pid, st.relaunched_pid))
+                ));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "each asker is signalled, under the asked restart's own claim: {wrong:#?}"
+    );
+}
+
+/// A LOST LINE'S RESTART THAT NAMES NO PROCESS, ASKED FIRST, IS MADE OF ITS ASKER OVER ANOTHER
+/// LINE'S LANDED RECORD (ATERM-KI-1101-3): the conversation's record is an earlier line's
+/// input-lost restart, `Relaunched` in the very process that asks (adopted, `relaunched_pid`, or
+/// not yet), and a later line written where the host named no process, read and drawn none of
+/// there, asks its own restart for the first time. That record is no restart of this line's:
+/// carried, its held wait finds the asker and answers `adopted`, nothing signalled, and the loop,
+/// which takes a nameless line's success word as its program's end, would settle the line its
+/// asker still holds and write it again. So the first ask supersedes it as any other cause's
+/// record: the asker is signalled under the asked restart's own claim, which names its line
+/// (`St::ask`). Only a record an ask of that line's restart claimed is carried
+/// ([`a_restart_asked_again_over_its_own_record_carries_it`]); a record that names no line's ask
+/// (empty) is no line's. Negative control: the line's ask ignored in `relaunch::its_own` (the
+/// cause alone): the record carried, `adopted`, the asker unsignalled.
+#[cfg(unix)]
+#[test]
+fn a_nameless_lost_lines_first_restart_over_another_lines_landed_record_is_made_of_its_asker() {
+    let mut wrong = Vec::new();
+    for (whose, record) in [("earlier", line_word(LINE_A)), ("none", String::new())] {
+        for adopted in [true, false] {
+            let name = format!("nameless-first-{whose}-{adopted}");
+            let (r, saved, asked, runs) = restart_over(
+                &name,
+                |_| Restart::InputLost {
+                    of: (None, None),
+                    line: LINE_B,
+                },
+                |agent, _| St {
+                    phase: Phase::Relaunched { at_s: now_s() },
+                    pid: dead_pid(),
+                    shell: std::process::id(),
+                    tab: TAB.to_string(),
+                    cause: "input-lost".to_string(),
+                    ask: record.clone(),
+                    exited_at: now_s() - 3,
+                    relaunched_pid: if adopted { agent } else { 0 },
+                    ..St::default()
+                },
+            );
+            let signalled = asked.iter().any(|l| l.contains(" signal "));
+            let claimed = saved.as_ref().is_some_and(|st| {
+                st.cause == "input-lost"
+                    && st.ask == line_word(LINE_B)
+                    && st.pid == r.pid
+                    && r.pid != 0
+            });
+            let truthful = !runs || r.step.starts_with("wait:");
+            if !(signalled && claimed && truthful) {
+                wrong.push(format!(
+                    "{name}: {:?} signalled={signalled} claimed={claimed} runs={runs} saved={:?}",
+                    r.step,
+                    saved.map(|st| (st.phase, st.cause, st.ask, st.pid, st.relaunched_pid))
+                ));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "each asker is signalled, under the asked restart's own claim: {wrong:#?}"
+    );
+}
+
+/// A NAMELESS LOST LINE'S RESTART WHOSE FIRST ASK WAS DEFERRED BEFORE ITS CLAIM IS MADE OF ITS
+/// ASKER WHEN ASKED AGAIN OVER AN EARLIER LINE'S LANDED RECORD (ATERM-KI-1101-3): two lines were
+/// written where the host named no process. The first's restart landed in the asker, and its
+/// record stands `Relaunched` there (adopted, `relaunched_pid`, or not yet), its carry-on owed,
+/// which the window's host holds while a line is held. The second, read and drawn none of there,
+/// asks its restart, and that first ask is deferred before it claims anything: another sweep
+/// holds the lock (`busy:another-sweep`), or the screen names the agent's own work at the signal
+/// (`wait:changed`). The record is still the first line's, and the loop asks again on its
+/// back-off with the same line's ask. That record is no restart of the second line's: carried,
+/// its held wait finds the asker and answers `adopted`, nothing signalled, and the loop, which
+/// takes a nameless line's success word as its program's end, would settle the line its asker
+/// still holds and write it again. So the re-ask supersedes it: the asker is signalled once,
+/// under the second line's own claim (`St::ask`). Before, the loop's re-ask said only that it
+/// was asked again (`again`), which the host took for the record being its own: `adopted`, nothing
+/// signalled. Negative control: the line's ask ignored in `relaunch::its_own` (the cause alone):
+/// the re-ask carries the earlier line's record.
+#[cfg(unix)]
+#[test]
+fn a_nameless_lost_lines_restart_deferred_before_its_claim_is_made_of_its_asker_when_asked_again() {
+    let working = idle_under(&[
+        "⏺ Done.",
+        "",
+        "✻ Worked for 5s · done 4:51 PM · 1 local agent still running",
+        "",
+    ]);
+    let nameless = Restart::InputLost {
+        of: (None, None),
+        line: LINE_B,
+    };
+    let mut wrong = Vec::new();
+    for (deferral, scene, deferred) in [
+        (
+            "sweep",
+            Scene {
+                locked: true,
+                ..Scene::default()
+            },
+            "busy:another-sweep",
+        ),
+        (
+            "work",
+            Scene {
+                screen: Some(working),
+                ..Scene::default()
+            },
+            "wait:changed",
+        ),
+    ] {
+        for adopted in [true, false] {
+            let name = format!("nameless-deferred-{deferral}-{adopted}");
+            let Asks { said, asked, runs } = restart_asked(
+                &name,
+                |_| {
+                    vec![
+                        (nameless.clone(), scene.clone()),
+                        (nameless.clone(), Scene::default()),
+                    ]
+                },
+                |agent, _| St {
+                    phase: Phase::Relaunched { at_s: now_s() },
+                    pid: dead_pid(),
+                    shell: std::process::id(),
+                    tab: TAB.to_string(),
+                    cause: "input-lost".to_string(),
+                    ask: line_word(LINE_A),
+                    exited_at: now_s() - 3,
+                    relaunched_pid: if adopted { agent } else { 0 },
+                    ..St::default()
+                },
+            );
+            let [(first, kept), (again, saved)] = said.as_slice() else {
+                panic!("{name}: two asks: {said:?}");
+            };
+            let stood = kept.as_ref().is_some_and(|st| {
+                st.ask == line_word(LINE_A) && matches!(st.phase, Phase::Relaunched { .. })
+            });
+            let signals = asked.iter().filter(|l| l.contains(" signal ")).count();
+            let claimed = saved.as_ref().is_some_and(|st| {
+                st.cause == "input-lost"
+                    && st.ask == line_word(LINE_B)
+                    && st.pid == again.pid
+                    && again.pid != 0
+            });
+            let truthful = !runs || again.step.starts_with("wait:");
+            if first.step != deferred || !stood || signals != 1 || !claimed || !truthful {
+                wrong.push(format!(
+                    "{name}: first {:?} (the earlier line's record stands: {stood}), again {:?} \
+                     signals={signals} claimed={claimed} runs={runs} saved={:?}",
+                    first.step,
+                    again.step,
+                    saved
+                        .as_ref()
+                        .map(|st| (&st.phase, &st.cause, &st.ask, st.pid))
+                ));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "each re-ask is signalled once, under its own line's claim: {wrong:#?}"
+    );
+}
+
+/// A RESTART FOR A LOST LINE IS MADE OF THE PROCESS THE LINE WAS WRITTEN TO AND OF NO OTHER: asked
+/// of a process that no longer holds the tab (a host whose word lags a restart it made, so the
+/// loop asks again), it answers [`crate::harness::relaunch::AGENT_CHANGED`], signals nothing and
+/// claims nothing, though the tab's agent is the relaunch the conversation's record landed in.
+/// Negative control: the guard dropped from `restart_as`: the record superseded and the tab's
+/// agent, which holds nothing of the line, signalled.
+#[cfg(unix)]
+#[test]
+fn a_restart_for_a_lost_line_is_made_of_its_process_alone() {
+    let (r, saved, asked, runs) = restart_over(
+        "asked-of-another",
+        |agent| Restart::InputLost {
+            of: (Some(agent + 1), None),
+            line: LINE_A,
+        },
+        |agent, _| St {
+            phase: Phase::Relaunched { at_s: now_s() },
+            pid: dead_pid(),
+            shell: std::process::id(),
+            tab: TAB.to_string(),
+            cause: "input-lost".to_string(),
+            ask: line_word(LINE_A),
+            exited_at: now_s() - 3,
+            relaunched_pid: agent,
+            ..St::default()
+        },
+    );
+    assert_eq!(
+        r.step,
+        crate::harness::relaunch::AGENT_CHANGED,
+        "{r:?} {asked:#?}"
+    );
+    assert!(runs, "the tab's agent still runs");
+    assert!(
+        !asked.iter().any(|l| l.contains(" signal ")),
+        "nothing signalled: {asked:#?}"
+    );
+    assert!(
+        saved.is_some_and(|st| matches!(st.phase, Phase::Relaunched { .. })),
+        "the record stands"
+    );
+}
+
+/// The `text --json` body of an idle Claude Code whose composer is empty under `above` (the
+/// caret at column 2 of its row, no person's input).
+#[cfg(unix)]
+fn idle_under(above: &[&str]) -> String {
+    let rule = "─".repeat(20);
+    let mut rows: Vec<String> = above.iter().map(|r| (*r).to_string()).collect();
+    rows.push(rule.clone());
+    let caret = rows.len();
+    rows.push("❯ ".to_string());
+    rows.push(rule);
+    rows.push("  ⏵⏵ auto mode on (shift+tab to cycle)".to_string());
+    let rows: Vec<String> = rows.iter().map(|r| format!("{r:?}")).collect();
+    format!(
+        r#"{{"rows":[{}],"cursor":{{"row":{caret},"col":2}},"seq":77,"human_ms":null,"first":0}}"#,
+        rows.join(",")
+    )
+}
+
+/// NO RESTART IN PLACE BUT THE MEMORY RESTART SIGNALS OVER THE AGENT'S OWN WORK ITS SCREEN NAMES
+/// AT THE SIGNAL (ATERM-KI-1101-3): the restart's own check before its signal reads the screen
+/// again, and a done row naming a background agent still running (` · 1 local agent still
+/// running`, at an idle turn's end or under a weekly limit's notice: work Claude Code runs in its
+/// own process, which no process row names) holds a lost line's restart, a model's move, its way
+/// back and an account move: `wait:changed`, nothing signalled, nothing claimed. The loop's read
+/// of the line's rest (`custody::Rest::working`) reads the same screen, but the screen can change
+/// between that read and the signal. A memory restart is the remedy for that very process's
+/// memory, whose in-process work its crash would end anyway: it signals over it. The wait Claude
+/// Code carries above its own wake with no done row drawn after it (`✻ Waiting for 1 dynamic
+/// workflow to finish` over a monitor's wake and a weekly limit's notice) holds them the same, and
+/// once its workflow's `⏺ Dynamic workflow "…" completed` row is drawn under it, nothing holds
+/// them. Control: each restart over the same screen with its done row naming no work, or its
+/// waited workflow completed, signals. Before, the check read only the processes under the agent
+/// and the composer, and every restart signalled over the running work; and the wait read as
+/// running after its workflow completed, holding every restart but the memory one there for as
+/// long as it stood the first glyph row.
+#[cfg(unix)]
+#[test]
+fn no_restart_but_the_memory_restart_signals_over_the_agents_own_work_its_screen_names() {
+    use crate::supervise::policy::turn_end::AccountAt;
+    const WEEKLY: &str =
+        "  ⎿  You've hit your weekly limit · resets Sep 19 at 11am (America/Los_Angeles)";
+    const WAITING: &str = "✻ Waiting for 1 dynamic workflow to finish";
+    let roster = two_accounts();
+    let mut wrong = Vec::new();
+    for (place, above) in [
+        ("idle", vec!["⏺ Done.", ""]),
+        ("limit", vec!["⏺ Running the A/B on m7 now.", WEEKLY, ""]),
+        ("carried", vec![WAITING, ""]),
+    ] {
+        for (tag, why) in [
+            ("memory", Restart::Memory),
+            (
+                "input-lost",
+                Restart::InputLost {
+                    of: (None, None),
+                    line: LINE_A,
+                },
+            ),
+            (
+                "model",
+                Restart::Model {
+                    to: "claude-sonnet-5-5".to_string(),
+                },
+            ),
+            (
+                "model-back",
+                Restart::ModelBack {
+                    to: Some("claude-sonnet-5-5".to_string()),
+                },
+            ),
+            (
+                "account",
+                Restart::Account {
+                    to: "work-2".to_string(),
+                    at: AccountAt::Wall,
+                },
+            ),
+        ] {
+            for working in [true, false] {
+                let ended: &[&str] = match (place, working) {
+                    ("carried", true) => &["⏺ Monitor event: \"lander\"", WEEKLY, ""],
+                    ("carried", false) => &[
+                        "⏺ Dynamic workflow \"Second review pass\" completed · 5s",
+                        WEEKLY,
+                        "",
+                    ],
+                    (_, true) => &[
+                        "✻ Worked for 5s · done 4:51 PM · 1 local agent still running",
+                        "",
+                    ],
+                    (_, false) => &["✻ Worked for 5s · done 4:51 PM", ""],
+                };
+                let mut rows = above.clone();
+                rows.extend_from_slice(ended);
+                let name = format!("own-work-{place}-{tag}-{working}");
+                let (r, saved, asked) = restart_driven(
+                    &name,
+                    &why,
+                    "claude-fable-5-1",
+                    None,
+                    None,
+                    None,
+                    &roster,
+                    Answers {
+                        screen: idle_under(&rows),
+                        ..Answers::default()
+                    },
+                    false,
+                    None,
+                );
+                let signalled = asked.iter().any(|l| l.contains(" signal "));
+                let signals = !working || tag == "memory";
+                let right = if signals {
+                    signalled
+                } else {
+                    !signalled && r.step == "wait:changed" && saved.is_none()
+                };
+                if !right {
+                    wrong.push(format!(
+                        "{name}: {:?} signalled={signalled} saved={:?}",
+                        r.step,
+                        saved.map(|st| (st.phase, st.cause))
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "the agent's own work holds every restart but the memory one: {wrong:#?}"
+    );
+}
+
+/// A RESTART IN PLACE ASKED WHILE THE CONVERSATION'S RECORD IS STILL EXITING THE ASKER IS THAT
+/// RECORD'S TO CARRY: its signal was sent, and carrying it waits for the asker's exit
+/// (`wait:exiting`), signals nothing more and answers no success word while the asker runs.
+#[cfg(unix)]
+#[test]
+fn a_restart_asked_while_its_asker_is_exiting_waits_on_that_exit() {
+    let (r, saved, asked, runs) = restart_over(
+        "exiting-asker",
+        |agent| Restart::InputLost {
+            of: (Some(agent), None),
+            line: LINE_A,
+        },
+        |agent, shell| St {
+            phase: Phase::Exiting { at_s: now_s() },
+            pid: agent,
+            shell,
+            tab: TAB.to_string(),
+            cause: "upgrade".to_string(),
+            ..St::default()
+        },
+    );
+    assert!(runs, "the asker still runs: {r:?}");
+    assert_eq!(r.step, "wait:exiting", "{r:?}");
+    assert!(
+        !asked.iter().any(|l| l.contains(" signal ")),
+        "nothing signalled: {asked:#?}"
+    );
+    assert!(
+        saved.is_some_and(|st| matches!(st.phase, Phase::Exiting { .. }) && st.cause == "upgrade"),
+        "the record stands"
+    );
+}
+
+/// A RESTART THAT NAMES NO PROCESS, ASKED AGAIN OVER ITS OWN RECORD, CARRIES IT: the restart's
+/// relaunch answered a wait (the process it started not yet registered within the held wait, or
+/// its ledger's evidence unread), so the loop asks it again on its back-off, and the
+/// conversation's record is that restart's own, `Relaunched` and landed in the asker (adopted, or
+/// not yet), claimed by an ask of that restart (`St::ask`, the [`RestartAsk`] every ask of it
+/// carries). Made over it, the restart would end the very process it started; carried, it adopts
+/// that process: `adopted`, nothing signalled, the asker running on, the record its own. A memory
+/// restart's, a model's move's and its way back's alike, each asked in the run that claimed it,
+/// and a lost line's whose line was written where the host named no process, asked again for the
+/// line an ask of it claimed the record for (`Restart::InputLost { of: (None, None), line }`),
+/// which [`crate::harness::relaunch::asked_of`] takes as asked of whatever process holds the tab:
+/// superseded, its re-ask would signal the process its first ask had started, a second relaunch
+/// for one line. Another restart's record of its cause is no record of this one's
+/// ([`a_nameless_lost_lines_first_restart_over_another_lines_landed_record_is_made_of_its_asker`],
+/// [`a_restart_asked_over_an_earlier_restarts_landed_record_of_its_cause_is_made_of_its_asker`]).
+/// Negative control: the own-record guard dropped from `supersedes`: each asker signalled under a
+/// new claim.
+#[cfg(unix)]
+#[test]
+fn a_restart_asked_again_over_its_own_record_carries_it() {
+    let mut wrong = Vec::new();
+    for (tag, cause) in [
+        ("memory", "memory"),
+        ("model", "model:claude-fable-5-2"),
+        ("model-back", "model-back:claude-opus-5-5"),
+        ("input-lost", "input-lost"),
+    ] {
+        for adopted in [true, false] {
+            let name = format!("own-{tag}-{adopted}");
+            let why = |_| match tag {
+                "memory" => Restart::Memory,
+                "model" => Restart::Model {
+                    to: "claude-fable-5-2".to_string(),
+                },
+                "input-lost" => Restart::InputLost {
+                    of: (None, None),
+                    line: LINE_A,
+                },
+                _ => Restart::ModelBack { to: None },
+            };
+            let own = why(0);
+            let (r, saved, asked, runs) = restart_over(&name, why, |agent, _| St {
+                phase: Phase::Relaunched { at_s: now_s() },
+                pid: dead_pid(),
+                shell: std::process::id(),
+                tab: TAB.to_string(),
+                cause: cause.to_string(),
+                ask: ask_of(&own).word().to_string(),
+                exited_at: now_s() - 3,
+                relaunched_pid: if adopted { agent } else { 0 },
+                ..St::default()
+            });
+            let signalled = asked.iter().any(|l| l.contains(" signal "));
+            let own = saved.as_ref().is_some_and(|st| {
+                st.cause == cause && matches!(st.phase, Phase::Relaunched { .. })
+            });
+            if signalled || !runs || !own || r.step != "adopted" {
+                wrong.push(format!(
+                    "{name}: {:?} signalled={signalled} runs={runs} saved={:?}",
+                    r.step,
+                    saved.map(|st| (st.phase, st.cause, st.pid, st.relaunched_pid))
+                ));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "each re-ask carries its own record, ending nothing: {wrong:#?}"
+    );
+}
+
+/// A RESTART ASKED OVER AN EARLIER RESTART'S LANDED RECORD OF ITS CAUSE IS MADE OF ITS ASKER
+/// (ATERM-KI-1101-3): the conversation's record is an earlier memory restart's, an earlier move
+/// onto the same model's or an earlier way back's, `Relaunched` in the very process that now asks
+/// (adopted, `relaunched_pid`, or not yet), its carry-on still owed (a line held in custody keeps
+/// it so past `CARRY_HOLD`), and the loop asks that restart again in a later run: Claude Code's
+/// critical-memory banner in the process the earlier restart started, say. That record is no
+/// restart of this ask's: carried, its held wait finds the asker and answers `adopted`, nothing
+/// signalled, and the loop books a restart that left the process it was asked for running (and,
+/// for a line held where the host named no process, settles that line as ended). So the ask
+/// supersedes it as any other cause's record: the asker is signalled under the asked restart's own
+/// claim, which keeps its ask (`St::ask`); a model's move or its way back, past the record, meets
+/// its own billing check, which this stand-in's profile refuses (`refused:model-…`), its word and
+/// never the carried record's. Only a record an ask of the same restart claimed is carried
+/// ([`a_restart_asked_again_over_its_own_record_carries_it`]). Before, the cause alone decided:
+/// each case answered `adopted`, `signalled=false`, the asker running (shown for the memory
+/// restart, adopted or not). Negative control: the ask ignored in `relaunch::its_own` (the cause
+/// alone): the record carried, `adopted`, the asker unsignalled.
+#[cfg(unix)]
+#[test]
+fn a_restart_asked_over_an_earlier_restarts_landed_record_of_its_cause_is_made_of_its_asker() {
+    let mut wrong = Vec::new();
+    for (tag, cause, why) in [
+        ("memory", "memory", Restart::Memory),
+        (
+            "model",
+            "model:claude-fable-5-2",
+            Restart::Model {
+                to: "claude-fable-5-2".to_string(),
+            },
+        ),
+        (
+            "model-back",
+            "model-back:claude-opus-5-5",
+            Restart::ModelBack { to: None },
+        ),
+    ] {
+        let earlier = RestartAsk::of(&why, RUN_AT - 600);
+        for adopted in [true, false] {
+            let name = format!("earlier-{tag}-{adopted}");
+            let (r, saved, asked, runs) = restart_over(
+                &name,
+                |_| why.clone(),
+                |agent, _| St {
+                    phase: Phase::Relaunched { at_s: now_s() },
+                    pid: dead_pid(),
+                    shell: std::process::id(),
+                    tab: TAB.to_string(),
+                    cause: cause.to_string(),
+                    ask: earlier.word().to_string(),
+                    exited_at: now_s() - 3,
+                    relaunched_pid: if adopted { agent } else { 0 },
+                    ..St::default()
+                },
+            );
+            let signalled = asked.iter().any(|l| l.contains(" signal "));
+            let claimed = saved
+                .as_ref()
+                .is_some_and(|st| st.ask == ask_of(&why).word() && st.pid == r.pid && r.pid != 0);
+            let truthful = !runs || r.step.starts_with("wait:");
+            // A model's move is refused here for its billing past the record (the stand-in's
+            // profile bills it to credits): its own word, never the carried record's `adopted`.
+            let made = if tag == "memory" {
+                signalled && claimed && truthful
+            } else {
+                r.step.starts_with("refused:model-") && !signalled
+            };
+            if !made {
+                wrong.push(format!(
+                    "{name}: {:?} signalled={signalled} claimed={claimed} runs={runs} saved={:?}",
+                    r.step,
+                    saved.map(|st| (st.phase, st.cause, st.ask, st.pid, st.relaunched_pid))
+                ));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "each asker is signalled, under the asked restart's own claim: {wrong:#?}"
     );
 }
 
@@ -12170,9 +13142,15 @@ fn a_relative_claude_home_is_followed_by_the_relaunch_and_the_restart_in_place()
         claude_dir: None,
     };
     record(&claude_dir, agent.id(), &start, &work);
-    let restarted = restart_from(&opts, &Restart::Memory, Ok(snap.clone())).step;
+    let restarted = restart_from(
+        &opts,
+        &Restart::Memory,
+        &ask_of(&Restart::Memory),
+        Ok(snap.clone()),
+    )
+    .step;
     record(&claude_dir, agent.id(), &start, &dir.join("elsewhere"));
-    let moved = restart_from(&opts, &Restart::Memory, Ok(snap)).step;
+    let moved = restart_from(&opts, &Restart::Memory, &ask_of(&Restart::Memory), Ok(snap)).step;
     let _ = agent.kill();
     let _ = agent.wait();
     let _ = shell.kill();
@@ -12230,6 +13208,7 @@ fn a_restart_in_place_records_the_directory_a_relative_homes_agent_files_under()
     let r = crate::harness::relaunch::restart_as(
         &opts,
         &Restart::Memory,
+        &ask_of(&Restart::Memory),
         &crate::harness::accounts::Roster::default(),
         Ok(snap),
         None,
@@ -12335,6 +13314,7 @@ fn a_restart_in_place_types_the_usage_tap_under_the_switch_and_writes_no_setting
         let r = crate::harness::relaunch::restart_as(
             &opts,
             why,
+            &ask_of(why),
             roster,
             Ok(snap),
             selected.as_ref(),
@@ -12746,7 +13726,14 @@ fn the_relaunch_keeps_a_snapshot_of_a_tabs_own_program_and_relaunches_nothing() 
         Err(NoPlan::Refused { what, .. }) => Err(what),
         Err(NoPlan::Wait(why)) => Err(format!("wait:{why}")),
     };
-    let restart = restart_with(&opts, &Restart::Memory, Ok(snap.clone()), &execd).step;
+    let restart = restart_with(
+        &opts,
+        &Restart::Memory,
+        &ask_of(&Restart::Memory),
+        Ok(snap.clone()),
+        &execd,
+    )
+    .step;
     let dry = Opts {
         dry_run: true,
         ..opts.clone()
@@ -12761,6 +13748,7 @@ fn the_relaunch_keeps_a_snapshot_of_a_tabs_own_program_and_relaunches_nothing() 
     let restart_control = restart_with(
         &dry,
         &Restart::Memory,
+        &ask_of(&Restart::Memory),
         Ok(with_shell.clone()),
         &PaneProgram::under(pid, shell.id()),
     )
@@ -14734,6 +15722,7 @@ fn a_restarts_line_is_judged_by_the_block_it_was_typed_into() {
             crate::harness::relaunch::restart_with(
                 &opts,
                 &Restart::Memory,
+                &ask_of(&Restart::Memory),
                 Ok(snap.clone()),
                 &Script::new(shell.id(), usize::MAX, None),
             )
@@ -16728,15 +17717,18 @@ fn zsh_image() -> aterm_uds::deadline::KeptUntilRan {
 /// A child leading a session on a pseudo-terminal whose descriptors stay open only for the
 /// child's life, rather than leaking a `/dev/ptmx` slot per test. Its session ends only through
 /// `aterm_pty::end_session_on_pty`, by [`TtyChild::end`] or its drop (a panic's unwinding
-/// included): the pty's foreground group and the child's own group killed and the child reaped
-/// while the master is read, then the slave closed, then the master, the pty's last.
+/// included), or by [`TtyChild::lives`] once the child has exited: the child's own group killed
+/// (and the pty's foreground group while the child runs) and the child reaped while the master
+/// is read, then the slave closed, then the master, the pty's last. Nothing reaps the child
+/// before that ([`TtyChild::lives`] looks at its exit without reaping it), so its group is found
+/// even once it has exited, a job of it holding the slave included.
 #[cfg(unix)]
 pub(super) struct TtyChild {
     child: std::process::Child,
     master: Option<std::os::fd::OwnedFd>,
     slave: Option<std::os::fd::OwnedFd>,
-    /// What [`slave_left`] read of the slave at [`TtyChild::lives`]'s last look that found the
-    /// child running.
+    /// What [`slave_left`] read of the slave at [`TtyChild::lives`]'s last look from before the
+    /// child's exit began ([`note_look`]).
     ran_with: Option<String>,
     image: Option<aterm_uds::deadline::KeptUntilRan>,
 }
@@ -16767,12 +17759,15 @@ impl TtyChild {
     /// Ends the child's session and its pty ([`TtyChild`]), panicking where that fails.
     pub(super) fn end(mut self) {
         let what = format!("the session of {}", self.child.id());
-        self.end_session().unwrap_or_else(|e| panic!("{what}: {e}"));
+        if let Err(e) = self.end_session() {
+            panic!("{what}: {e}");
+        }
     }
 
-    fn end_session(&mut self) -> std::io::Result<()> {
+    /// The child's status once its session has ended here; `None` where it had ended already.
+    fn end_session(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         let Some(master) = self.master.take() else {
-            return Ok(());
+            return Ok(None);
         };
         aterm_pty::end_session_on_pty(
             master,
@@ -16781,26 +17776,30 @@ impl TtyChild {
             aterm_spec::wait::MUST_HAPPEN,
             &mut |_| {},
         )
-        .map(drop)
+        .map(Some)
     }
 
     /// Panics, naming `what` the test waits for, once the child has exited, the moment it has,
-    /// not a hang detector later: with how it ended and what [`slave_left`] last read of its
-    /// slave while it still ran (on Apple a session leader's exit revokes its terminal, so a read
-    /// after the exit tells nothing of what ended it).
+    /// not a hang detector later, having ended its session: with how it ended and what
+    /// [`slave_left`] last read of its slave while it still ran, before its exit began (on Apple
+    /// a session leader's exit revokes its terminal before the leader is a zombie, so a read once
+    /// the exit began tells nothing of what ended it). The exit is looked at without reaping the
+    /// child ([`aterm_pty::child_exit_unreaped`]), so the session's end still finds the group it
+    /// led.
     pub(super) fn lives(&mut self, what: &str) {
+        let pid = self.child.id();
         let left = self.slave.as_ref().map(slave_left);
-        if let Some(status) = self.child.try_wait().expect("the child's status") {
-            let ran_with = self
-                .ran_with
-                .take()
-                .unwrap_or_else(|| "its slave was not read while it ran".to_string());
-            panic!(
-                "{what}: {} exited first ({status}); while it ran, {ran_with}",
-                self.child.id()
-            );
+        let exiting = aterm_sysprobe::jobs::exiting(pid);
+        let exited = aterm_pty::child_exit_unreaped(i32::try_from(pid).expect("a pid"));
+        if note_look(&mut self.ran_with, left, exiting, exited) {
+            let ended = match self.end_session() {
+                Ok(Some(status)) => status.to_string(),
+                Ok(None) => "its session had ended".to_string(),
+                Err(e) => format!("its session did not end: {e}"),
+            };
+            let ran_with = ran_with_said(self.ran_with.take());
+            panic!("{what}: {pid} exited first ({ended}); while it ran, {ran_with}");
         }
-        self.ran_with = left;
     }
 }
 
@@ -16809,6 +17808,31 @@ impl Drop for TtyChild {
     fn drop(&mut self) {
         let _ = self.end_session();
     }
+}
+
+/// One look at a child leading a pty's session, read in this order: `left`, what [`slave_left`]
+/// read of its slave; `exiting`, [`aterm_sysprobe::jobs::exiting`] (an exit sets that flag
+/// before it revokes the slave, so `Some(false)` says the exit had not begun at `left`'s read);
+/// `exited`, [`aterm_pty::child_exit_unreaped`]. Keeps `left` in `ran_with`, the last reading
+/// from while the child ran, where `exiting` clears it, the look that goes on to find the child
+/// exited included; and says whether the child has exited (or cannot be looked at).
+#[cfg(unix)]
+fn note_look(
+    ran_with: &mut Option<String>,
+    left: Option<String>,
+    exiting: Option<bool>,
+    exited: Option<bool>,
+) -> bool {
+    if exiting == Some(false) {
+        *ran_with = left;
+    }
+    exited != Some(false)
+}
+
+/// [`note_look`]'s last reading from while the child ran, as a fixture's end says it.
+#[cfg(unix)]
+fn ran_with_said(ran_with: Option<String>) -> String {
+    ran_with.unwrap_or_else(|| "its slave was not read while it ran".to_string())
 }
 
 /// What is left of a test's pty slave, read while a program on it still runs and said where it
@@ -16937,12 +17961,14 @@ fn host_a_pty_when_asked() {
     };
     // One write, a whole line of its own, which [`PtyHost::hosted`] reads.
     said(format!("\n{HOSTING}{}\n", child.id()).as_bytes());
+    let pid = i32::try_from(child.id()).expect("the hosted program's pid");
     aterm_pty::set_nonblocking(master.as_raw_fd(), true).expect("a nonblocking master");
     aterm_pty::set_nonblocking(libc::STDIN_FILENO, true).expect("a nonblocking stdin");
     let mut buf = [0_u8; 4096];
-    // What [`slave_left`] read of the slave at the last look that found the program running: a
-    // session leader's exit revokes its slave, so a read after it tells nothing.
-    let mut ran_with = "its slave was not read while it ran".to_string();
+    // What [`slave_left`] read of the slave at the last look from before the program's exit
+    // began ([`note_look`]): a session leader's exit revokes its slave on Apple before the
+    // leader is a zombie, so a read once the exit began tells nothing.
+    let mut ran_with = None;
     // Until the test closes its end of this host's stdin ([`PtyHost::end`], or the test's
     // exit), or the hosted program ends first.
     loop {
@@ -16950,12 +17976,16 @@ fn host_a_pty_when_asked() {
             said(&buf[..n]);
             continue;
         }
-        let left = slave_left(&slave);
-        if let Some(status) = child.try_wait().expect("the hosted program's status") {
-            eprintln!("the hosted program exited first: {status}; while it ran, {ran_with}");
+        let left = Some(slave_left(&slave));
+        let exiting = aterm_sysprobe::jobs::exiting(child.id());
+        // Looked at without reaping it, so the session's end below still finds the group it led
+        // (its status is said there, in [`ENDED`]'s line).
+        let exited = aterm_pty::child_exit_unreaped(pid);
+        if note_look(&mut ran_with, left, exiting, exited) {
+            let ran_with = ran_with_said(ran_with);
+            eprintln!("the hosted program exited first; while it ran, {ran_with}");
             break;
         }
-        ran_with = left;
         match std::io::Read::read(&mut std::io::stdin(), &mut buf) {
             Ok(0) => break,
             Err(e) if e.kind() != std::io::ErrorKind::WouldBlock => panic!("the host's stdin: {e}"),
@@ -24588,6 +25618,7 @@ fn a_restart_in_place_records_its_model_ask_only_with_the_line_that_asks_it() {
             crate::harness::relaunch::restart_with(
                 &opts,
                 &Restart::Memory,
+                &ask_of(&Restart::Memory),
                 Ok(snap.clone()),
                 &Script::new(shell.id(), usize::MAX, None),
             )

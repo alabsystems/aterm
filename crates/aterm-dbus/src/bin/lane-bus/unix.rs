@@ -11,11 +11,13 @@ use std::time::{Duration, Instant};
 
 use aterm_dbus::{Connection, Message, Type, Value, address};
 
-const CALL: Duration = Duration::from_secs(10);
-
 const LISTEN_LIMIT: Duration = Duration::from_secs(600);
 
 const HANG: Duration = Duration::from_secs(60);
+
+/// Every peer a verb calls is the lane's own compositor, bus or application, which must
+/// answer: its calls and connects wait on the hang detector, never a latency budget.
+const CALL: Duration = HANG;
 
 const POLL: Duration = Duration::from_millis(100);
 
@@ -437,8 +439,7 @@ fn a11y_bus() -> Result<Connection, Fail> {
     let addr = match std::env::var("AT_SPI_BUS_ADDRESS") {
         Ok(a) if !a.is_empty() => a,
         _ => {
-            let mut session =
-                Connection::session().map_err(|e| Fail::NotHere(format!("session bus: {e}")))?;
+            let mut session = session_bus()?;
             let body = call(
                 &mut session,
                 "org.a11y.Bus",
@@ -457,7 +458,14 @@ fn a11y_bus() -> Result<Connection, Fail> {
     };
     let addresses = address::parse(&addr)
         .map_err(|e| Fail::NotHere(format!("accessibility bus {addr}: {e}")))?;
-    Connection::open(&addresses).map_err(|e| Fail::NotHere(format!("accessibility bus: {e}")))
+    Connection::open_within(&addresses, CALL)
+        .map_err(|e| Fail::NotHere(format!("accessibility bus: {e}")))
+}
+
+fn session_bus() -> Result<Connection, Fail> {
+    address::session_bus()
+        .and_then(|addresses| Connection::open_within(&addresses, CALL))
+        .map_err(|e| Fail::NotHere(format!("session bus: {e}")))
 }
 
 fn object_ref(v: &Value) -> Option<(String, String)> {
@@ -1155,7 +1163,7 @@ fn seat(mutter: u32, app: &str, pid: u32, steps: &[Step]) -> Result<(), Fail> {
     if let Some(a11y) = a11y.as_mut() {
         await_focus(a11y, app, pid, false)?;
     }
-    let mut conn = Connection::session().map_err(|e| Fail::NotHere(format!("session bus: {e}")))?;
+    let mut conn = session_bus()?;
     let mut rd = None;
     for name in names_of(&mut conn, mutter) {
         if call(
@@ -1233,7 +1241,7 @@ fn seat(mutter: u32, app: &str, pid: u32, steps: &[Step]) -> Result<(), Fail> {
 }
 
 fn cast(mutter: u32, out: &Path) -> Result<(), Fail> {
-    let mut conn = Connection::session().map_err(|e| Fail::NotHere(format!("session bus: {e}")))?;
+    let mut conn = session_bus()?;
     let sc = names_of(&mut conn, mutter)
         .into_iter()
         .find(|name| {

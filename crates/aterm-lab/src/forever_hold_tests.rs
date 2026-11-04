@@ -541,6 +541,58 @@ fn lr_quotes_the_list_then_its_rewording() {
     );
 }
 
+/// LR ON A ROW THE PAGE DID NOT DRAW: a full run's tab past the page's first sessions, every read
+/// while `status` held the Open leg `-`, is judged on its hover and names the state line a skip.
+/// Negative controls: a page never read while the leg stood stays unobserved (a read before it
+/// does not count), so does a row drawn in one read and silent, and the hover's own words still
+/// fail it.
+#[test]
+fn lr_names_a_row_the_page_did_not_draw_a_skip() {
+    let (old, new) = (
+        format!("{OPEN_IN_REPORT}: {}", quoted(crate::forever::CHECK_LIST)),
+        format!(
+            "{OPEN_IN_REPORT}: {}",
+            quoted(crate::forever::REWORDED_LIST)
+        ),
+    );
+    let mut undrawn = reworded_seen(&new, None);
+    undrawn.window.page = vec![j(1_000, "-")];
+    undrawn.window.page_reads = vec![T0 + 40_000, T0 + 100_000];
+    match reworded(&undrawn, &cx()) {
+        Verdict::Pass(said) => assert!(
+            said.contains("the state line: SKIPPED") && said.contains("in 2 read(s)"),
+            "{said}"
+        ),
+        v => panic!("{v:?}"),
+    }
+    let mut before = undrawn.clone();
+    before.window.page_reads = vec![T0 + 20_000];
+    assert!(
+        matches!(reworded(&before, &cx()), Verdict::Unobserved(ref w) if w.contains("state line")),
+        "{:?}",
+        reworded(&before, &cx())
+    );
+    let mut once_drawn = undrawn.clone();
+    once_drawn
+        .window
+        .page
+        .push(j(40_000, "head=land-c: Window 2, tab 4\nstate=-"));
+    once_drawn.window.page.push(j(100_000, "-"));
+    assert!(
+        matches!(reworded(&once_drawn, &cx()), Verdict::Unobserved(ref w) if w.contains("state line")),
+        "{:?}",
+        reworded(&once_drawn, &cx())
+    );
+    let mut stale = reworded_seen(&old, None);
+    stale.window.page = undrawn.window.page.clone();
+    stale.window.page_reads = undrawn.window.page_reads.clone();
+    assert!(
+        matches!(reworded(&stale, &cx()), Verdict::Fail(ref w) if w.contains("hover")),
+        "{:?}",
+        reworded(&stale, &cx())
+    );
+}
+
 /// LR FAILS A BUILD WITHOUT THE QUOTE: the reader's family words a build without 4b says on the
 /// Open leg (`open work in its report: still open`, 13a's main), read while `status` held the
 /// Open leg, fail, before the second check and after it; the same words read while `status` held

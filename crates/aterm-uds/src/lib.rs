@@ -193,65 +193,8 @@ pub use win::{CtlListener, CtlStream};
 /// Leaving a file or a folder out of backups, behind an injected platform field.
 pub mod backup;
 
-/// Unix-only: the one writer of a whole file (a new temp beside it, its mode on the descriptor, synced, renamed) and aterm.toml's, under the config service's write lock.
-#[cfg(unix)]
+/// Bounded regular-file reads on every platform; on unix also the one writer of a whole file (a new temp beside it, its mode on the descriptor, synced, renamed) and aterm.toml's, under the config service's write lock.
 pub mod atomic_file;
-
-/// Elsewhere, only `atomic_file`'s bounded regular-file reads, which cross-platform callers
-/// (the manual's config and shim probes) already name: the writer and the config write lock
-/// above stay unix-only, as their modes and `flock` have no counterpart here.
-#[cfg(not(unix))]
-pub mod atomic_file {
-    use std::io::{self, Read as _};
-    use std::path::Path;
-
-    /// Maximum size in bytes of a configuration or state file read by `ConfigFile` (16 MiB).
-    pub const MAX_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
-
-    /// Read a regular file up to `max_bytes`, returning its bytes and open-handle metadata.
-    /// Symbolic links are followed. Use [`crate::regular_file::open`] when the final component
-    /// must itself be a regular file.
-    ///
-    /// # Errors
-    /// Returns an error if `path` cannot be opened, is not a regular file, or exceeds
-    /// `max_bytes`.
-    pub fn read_regular(path: &Path, max_bytes: u64) -> io::Result<(Vec<u8>, std::fs::Metadata)> {
-        let file = std::fs::File::open(path)?;
-        let meta = file.metadata()?;
-        if !meta.is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "not a regular file",
-            ));
-        }
-        if meta.len() > max_bytes {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("file exceeds {max_bytes} bytes"),
-            ));
-        }
-        let mut buf = Vec::new();
-        file.take(max_bytes.saturating_add(1))
-            .read_to_end(&mut buf)?;
-        if u64::try_from(buf.len()).unwrap_or(u64::MAX) > max_bytes {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("file exceeds {max_bytes} bytes"),
-            ));
-        }
-        Ok((buf, meta))
-    }
-
-    /// Read a regular UTF-8 file up to `max_bytes`.
-    ///
-    /// # Errors
-    /// Returns an error if `path` cannot be opened, is not a regular file, exceeds
-    /// `max_bytes`, or is not valid UTF-8.
-    pub fn read_regular_text(path: &Path, max_bytes: u64) -> io::Result<String> {
-        let (bytes, _) = read_regular(path, max_bytes)?;
-        String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-    }
-}
 
 /// This account's own home as the account database has it ([`account::home`]), whatever `$HOME` says: what a launchd job of this login runs with.
 #[cfg(unix)]
@@ -267,6 +210,8 @@ pub mod asleep;
 #[cfg(target_os = "macos")]
 mod darwin_loader;
 
+#[cfg(unix)]
+pub mod childwake;
 /// A deadline on a call that can block forever: in this process ([`deadline::Gate`], the shared [`deadline::TRUST`] gate) or in a child ([`deadline::output_until`]).
 #[cfg(not(target_arch = "wasm32"))]
 pub mod deadline;

@@ -26,7 +26,7 @@ fn trial(case: i64, action: &str) -> [i64; 5] {
             Ok(Vec::new())
         })
         .unwrap();
-    let mut s = session(cli, Supervisor::Aterm, Mode::Early, Path::new("/opt/codex"));
+    let mut s = session(cli, Supervisor::Aterm, Mode::Early, &world.exe);
     s.sid = "first";
     s.sample = None;
     s.point = Point::Wall {

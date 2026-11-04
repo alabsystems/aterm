@@ -1670,7 +1670,7 @@ fn sync_auto_reconciles_diverged_policy_servers_for_admin_and_keeps_member_stead
     .unwrap() else {
         panic!("held peer's envelope")
     };
-    super::super::sync_with(&bounded, held_bytes).unwrap();
+    super::super::sync_with(&bounded, held_bytes.clone()).unwrap();
     let held_digest = load_state(&bounded).unwrap().digest;
     super::super::bounded::sync_reader_with_candidates_until(
         &bounded,
@@ -1679,6 +1679,43 @@ fn sync_auto_reconciles_diverged_policy_servers_for_admin_and_keeps_member_stead
     )
     .expect("exact held peer remains readable through an equal-sequence split");
     assert_eq!(load_state(&bounded).unwrap().digest, held_digest);
+
+    // Both readers can recover the exact held head when the primary has lost
+    // its vault or is offline. The other sibling must not mask that peer merely
+    // because its digest sorts later.
+    let empty = start_loopback_server(&root.path().join("empty-primary"));
+    bounded_config.source = Source::Url(format!("http://{}/v1/team", empty.addr));
+    save_config(&bounded, &bounded_config).unwrap();
+    super::super::sync_with(&bounded, held_bytes).unwrap();
+    assert!(source_bound(
+        &bounded_config,
+        &load_state(&bounded).unwrap()
+    ));
+    let check_readers = || {
+        let outcome = sync_with_candidates(&bounded, None, &[url1.clone(), url2.clone()])
+            .expect("ordinary reader recovers the exact held head");
+        assert_eq!(load_state(&bounded).unwrap().digest, held_digest);
+        super::super::bounded::sync_reader_with_candidates_until(
+            &bounded,
+            Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+            &[url1.clone(), url2.clone()],
+        )
+        .expect("bounded reader recovers the exact held head");
+        assert_eq!(load_state(&bounded).unwrap().digest, held_digest);
+        outcome
+    };
+    assert!(matches!(check_readers(), SyncOutcome::PutBack { .. }));
+    let Fetched::Body(restored) =
+        transport::fetch(&bounded_config.source, None, aterm_spec::wait::MUST_HAPPEN).unwrap()
+    else {
+        panic!("ordinary reader repairs the empty primary")
+    };
+    assert_eq!(
+        Some(envelope::parse(&restored).unwrap().digest()),
+        held_digest
+    );
+    empty.stop();
+    assert!(matches!(check_readers(), SyncOutcome::Unchanged { .. }));
 
     // 2. Admin `st2`'s plain `sync(&st2, None)` (with NO extra_urls — reading `policy.servers`
     //    from the admin locker automatically!) reconciles the split into `seq = 5`!
@@ -1855,7 +1892,7 @@ fn parse_v0_145_envelope_grammar(bytes: &[u8]) -> Result<(String, u64, usize), S
 }
 
 #[test]
-fn a_c7_build_seals_no_parent_line() {
+fn ordinary_unparented_publication_keeps_legacy_format_and_explicit_parents_are_signed() {
     let dir = aterm_tempfile::tempdir().expect("tempdir");
     let srv_store = dir.path().join("srv");
     std::fs::create_dir_all(&srv_store).unwrap();
@@ -1872,9 +1909,8 @@ fn a_c7_build_seals_no_parent_line() {
     );
     assert!(envelope::parse(&seq1_bytes).unwrap().parents.is_empty());
 
-    // Seq 2 via `admin_publish` (after seq 1 already sits in cache) and seq 3 via direct
-    // `seal_with_admissions_and_parents` given explicit non-empty `parents`: neither may emit a
-    // `parent:` line under F1 (`DESIGN-fluid-swarm` §4.1).
+    // Ordinary publication retains the unparented format; explicitly supplying
+    // parents opts into the parent guard and must sign those exact digests.
     let opened = admin_open(&st).expect("admin open");
     let mut doc = opened.doc.clone();
     doc.set_entry(&Audience::Everyone, "note", b"v2").unwrap();
@@ -1902,16 +1938,9 @@ fn a_c7_build_seals_no_parent_line() {
         &opened.admissions,
     )
     .expect("seal seq 3");
-    let seq3_text = std::str::from_utf8(&sealed_explicit).expect("utf8");
-    assert!(
-        !seq3_text.lines().any(|l| l.starts_with("parent:")),
-        "seal_with_admissions_and_parents must never write parent: lines"
-    );
-    assert!(
-        envelope::parse(&sealed_explicit)
-            .unwrap()
-            .parents
-            .is_empty()
+    assert_eq!(
+        envelope::parse(&sealed_explicit).unwrap().parents,
+        vec![seq2_env.digest()]
     );
 
     srv.stop();

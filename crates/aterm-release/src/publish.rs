@@ -6102,7 +6102,7 @@ pub(crate) fn verified_release_bundle_with_inputs(
     };
     let store = artifact::store(repo).map_err(Error::new)?;
     let complete = artifact::read(&store, &built.key)
-        .map_err(&refuse)?
+        .map_err(refuse)?
         .ok_or_else(|| {
             refuse(format!(
                 "the release cache ({}) holds no COMPLETE bundle {}",

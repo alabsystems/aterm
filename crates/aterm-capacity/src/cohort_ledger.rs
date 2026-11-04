@@ -379,7 +379,8 @@ pub(super) fn scan(
         if !matches!(
             name,
             "." | ".." | LOCK | ".ready" | "active.noindex" | "retired.noindex"
-        ) {
+        ) && !crate::leadership::metadata_name(name.as_bytes())
+        {
             return Err(refused("unknown cohort backend child"));
         }
     }
@@ -611,6 +612,18 @@ pub(super) fn claim_state(
 }
 
 impl Laid {
+    pub(crate) fn check_cohort_namespace(&self, expected: &Namespace) -> io::Result<()> {
+        expected.validate()?;
+        let custody = self
+            .custody
+            .as_ref()
+            .ok_or_else(|| refused("host leadership requires actual cohort custody"))?;
+        if &custody.namespace != expected {
+            return Err(refused("claim belongs to a different capacity namespace"));
+        }
+        self.check_custody()
+    }
+
     pub(crate) fn cohort_closure_ref(&self) -> io::Result<crate::CohortClosureRef> {
         use std::os::unix::fs::MetadataExt as _;
         self.check_custody()?;
@@ -1339,6 +1352,55 @@ pub(super) mod tests {
         );
         assert!(matches!(waiter.poll(&f.machine), Polled::Admitted(_)));
         assert!(!path.exists());
+    }
+
+    /// On a cohort-aware ledger `--admit now` only polls, and a poll that met another admission
+    /// holding the ledger's lock is no refusal: it waits its turn, saying so, and is admitted
+    /// once the lock is let go. NEGATIVE CONTROL: a forced request refused at the held lock ends
+    /// before any wait line.
+    #[test]
+    fn a_forced_request_waits_its_turn_at_the_cohort_ledgers_lock() {
+        let f = Fixture::new();
+        assert!(f.ledger.cohort_aware().unwrap());
+        let turn = f.ledger.try_turn().unwrap().expect("free");
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let ledger = f.ledger.clone();
+        let forcing = std::thread::spawn(move || {
+            crate::admit_with(
+                &ledger,
+                &Fixed::new(Reading::of_gib(64, 40, 8)),
+                Need::new("forced").mem_gib(1),
+                crate::Admit::Now,
+                crate::Pace {
+                    poll: std::time::Duration::from_millis(5),
+                    line_every: std::time::Duration::ZERO,
+                },
+                &mut |line| {
+                    let _ = tx.send(line.to_owned());
+                },
+            )
+            .map(|claim| claim.record().held.is_some())
+        });
+        let line = rx
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("its lock line");
+        let held_turn = crate::Short::Turn { holder: None }.to_string();
+        assert!(
+            line.contains("forced") && line.contains(&held_turn),
+            "{line:?}"
+        );
+        assert!(!forcing.is_finished(), "it waits while the lock is held");
+        drop(turn);
+        aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "its admission", || {
+            forcing.is_finished().then_some(())
+        });
+        assert!(
+            forcing
+                .join()
+                .unwrap()
+                .expect("admitted once the lock is let go"),
+            "held"
+        );
     }
 
     #[test]

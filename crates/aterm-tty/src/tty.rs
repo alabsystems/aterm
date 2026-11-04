@@ -160,6 +160,7 @@ pub(crate) const RESET_ORDER: [(Modes, &[u8]); 7] = [
 ];
 
 /// The order modes are set in again after a suspension: the reverse of [`RESET_ORDER`].
+#[cfg(any(unix, test, debug_assertions))]
 pub(crate) fn set_order(modes: Modes, kitty: u8) -> impl Iterator<Item = Mode> {
     [
         Mode::AltScreen,
@@ -177,11 +178,13 @@ pub(crate) fn set_order(modes: Modes, kitty: u8) -> impl Iterator<Item = Mode> {
 /// The bytes that set `mode` on a terminal where the modes in `set` (which lacks it) are set, a
 /// kitty entry among them carrying `kitty`'s flags: entering the alternate screen carries that
 /// entry onto it.
+#[cfg(any(unix, test, debug_assertions))]
 pub(crate) fn enable_bytes(mode: Mode, set: Modes, kitty: u8) -> Vec<u8> {
     carry_kitty(mode, set, kitty, mode.set_bytes())
 }
 
 /// The bytes that put `mode` back where the modes in `set` (which hold it) are set: leaving the alternate screen carries a kitty entry back to the main screen.
+#[cfg(any(unix, test, debug_assertions))]
 pub(crate) fn disable_bytes(mode: Mode, set: Modes, kitty: u8) -> Vec<u8> {
     carry_kitty(mode, set, kitty, mode.reset_bytes().to_vec())
 }
@@ -189,6 +192,7 @@ pub(crate) fn disable_bytes(mode: Mode, set: Modes, kitty: u8) -> Vec<u8> {
 /// `switch`, the bytes that enter or leave the alternate screen, between popping the
 /// kitty entry from the screen left and pushing it onto the one entered, when one is
 /// set; any other mode's bytes as they are.
+#[cfg(any(unix, test, debug_assertions))]
 fn carry_kitty(mode: Mode, set: Modes, kitty: u8, switch: Vec<u8>) -> Vec<u8> {
     if mode != Mode::AltScreen || !set.contains(Modes::KITTY_KEYS) {
         return switch;

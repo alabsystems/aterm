@@ -1181,9 +1181,8 @@ fn the_ladder_gives_up_words_then_the_name_then_the_icon() {
     );
 }
 
-/// SPEC §1'S TABLE: Claude Code with the top-effort key's tag and v2.1.305 lays each rung from the width the
-/// table names, the next one a column short; a ghost adds 4 to every need, no tail takes 13 off;
-/// below the last resort, nothing.
+/// Each label's cells plus the fixed chrome budget determine its first fitting width.
+/// A ghost adds four cells, removing the tail frees thirteen, and the last resort stays fixed.
 #[test]
 fn the_ladder_lays_the_specs_tiers_at_the_specs_widths() {
     let tail = claude_tail();
@@ -1196,11 +1195,13 @@ fn the_ladder_lays_the_specs_tiers_at_the_specs_widths() {
     let tailed = |w: usize| tailed_run(w - 12, &tail).span(KeyFace::default());
     let ghost = |w: usize| plain_run(w).span(GHOST);
     let plain = |w: usize| plain_run(w).span(KeyFace::default());
+    let labels: [usize; LABEL_TIERS] =
+        std::array::from_fn(|tier| label_face(&paint, tier).expect("a known CLI build").len);
     let table = [
-        ("T0", 75),
-        ("T1", 68),
-        ("T2", 60),
-        ("T3", 49),
+        ("T0", labels[0] + 40),
+        ("T1", labels[1] + 40),
+        ("T2", labels[2] + 40),
+        ("T3", labels[3] + 40),
         ("T4", 39),
         ("T4 icon", 32),
         ("T4 bare", 26),
@@ -1222,22 +1223,27 @@ fn the_ladder_lays_the_specs_tiers_at_the_specs_widths() {
         );
     }
     assert_eq!(
-        rung_at(tailed(80)),
+        rung_at(tailed(table[0].1 + 5)),
         "T0",
-        "the 80-column pane shows the whole label"
+        "room beyond the widest label shows it whole"
     );
-    // With the ⬆️'s 3 cells the lockup's name goes before the CLI's build: a 60-column pane keeps
-    // the running build beside the offer (`alab v0.4 (v2.1.305)`, the lockup's icon alone).
-    // CONTROL: the order without the name's rung lays T3, the build gone.
+    // With the arrow, the lockup's name goes before the CLI's build.
+    // CONTROL: keeping that name drops the build at the icon rung's first fitting width.
     let up = SwitchPaint {
         cli_ver: Inline::new("2.1.305"),
         ..arrow_paint(UpState::Ready)
     };
     let up_at = |w: usize| rung_name(lay_top(tailed(w), Some(up), lockup).map(|l| l.rung));
-    assert_eq!(up_at(63), "T2", "the arrow's 3 more");
-    assert_eq!(up_at(62), "T2 icon", "a column short: the name goes first");
-    assert_eq!(up_at(60), "T2 icon", "60 columns keep the build");
-    let (rungs, n) = ladder(tailed(60), Some(up), lockup);
+    let named_build = labels[2] + 43;
+    let icon_build = labels[2] + 36;
+    assert_eq!(up_at(named_build), "T2", "the arrow's three more");
+    assert_eq!(
+        up_at(named_build - 1),
+        "T2 icon",
+        "a column short: the name goes first"
+    );
+    assert_eq!(up_at(icon_build), "T2 icon", "the icon keeps the build");
+    let (rungs, n) = ladder(tailed(icon_build), Some(up), lockup);
     let full = CliMark::Claude.lockup_cells(Build::Vendor);
     let named: Vec<Rung> = rungs[..n]
         .iter()
@@ -1251,9 +1257,9 @@ fn the_ladder_lays_the_specs_tiers_at_the_specs_widths() {
         })
         .collect();
     assert_eq!(
-        rung_name(first_fit(tailed(60), &named)),
+        rung_name(first_fit(tailed(icon_build), &named)),
         "T3",
-        "CONTROL: the name kept, the build goes at 60"
+        "CONTROL: keeping the name drops the build"
     );
     for w in 22..=25 {
         assert_eq!(rung_at(tailed(w)), "last resort", "{w}: in the run");
@@ -2911,7 +2917,7 @@ fn arrow_paint(state: UpState) -> SwitchPaint {
 /// right-aligned to that blank; its hit takes it and both blanks. An asked move's one-cell `◐`
 /// takes the first of those cells with the second blank, and the close runs on from there as
 /// rule (`◐ ───`): one blank either side of it, as of the ⬆️. The ladder keeps it on every rung,
-/// three cells more: an 80-column pane lays T0 with it too, a 77-column one T1 with it. CONTROL:
+/// three cells more for the same label and chrome. CONTROL:
 /// with no arrow the label ends at the close's blank.
 #[test]
 fn the_arrow_ends_the_rule_a_blank_from_its_close() {
@@ -2992,13 +2998,15 @@ fn the_arrow_ends_the_rule_a_blank_from_its_close() {
         rung_name(lay_top(span, Some(paint), lockup).map(|l| l.rung))
     };
     let ready = arrow_paint(UpState::Ready);
+    let labels: [usize; LABEL_TIERS] =
+        std::array::from_fn(|tier| label_face(&ready, tier).expect("a known CLI build").len);
     // The arrow's 3 cells more on every rung, and the lockup's name gone before the CLI's build.
     for (name, need) in [
-        ("T0", 78),
-        ("T1", 71),
-        ("T2", 63),
-        ("T2 icon", 56),
-        ("T3 icon", 45),
+        ("T0", labels[0] + 43),
+        ("T1", labels[1] + 43),
+        ("T2", labels[2] + 43),
+        ("T2 icon", labels[2] + 36),
+        ("T3 icon", labels[3] + 36),
         ("T4 icon", 35),
         ("T4 bare", 29),
     ] {
@@ -3014,9 +3022,13 @@ fn the_arrow_ends_the_rule_a_blank_from_its_close() {
         ..LIT
     };
     assert_eq!(
-        (rung_at(lit, 80), rung_at(ready, 80), rung_at(ready, 77)),
+        (
+            rung_at(lit, labels[0] + 40),
+            rung_at(ready, labels[0] + 43),
+            rung_at(ready, labels[0] + 42)
+        ),
         ("T0".to_owned(), "T0".to_owned(), "T1".to_owned()),
-        "80 columns: T0 with the arrow too; 77, T1 with it"
+        "the arrow needs three more cells; one short drops a tier"
     );
     let off = SwitchPaint {
         up: ready.up,
@@ -3132,10 +3144,6 @@ fn the_arrows_words_take_the_labels_own_cells() {
         },
         ..hovered
     };
-    assert!(
-        label.chars().count() < "updating to v2.1.310 \u{b7} after 1 shell".chars().count(),
-        "CONTROL: the asked verb's form is wider than the label: {label:?}"
-    );
     // Each form is shorter than the one before, so every one can be the first that fits: a verb's
     // form longer than the target and a short when (`v2.1.310 · now`, 14 cells, then `update to
     // v2.1.310`, 18) never would be. CONTROL: a long when keeps the verb's form.
@@ -3172,39 +3180,45 @@ fn the_arrows_words_take_the_labels_own_cells() {
         4,
         "CONTROL: a long when keeps the verb's form"
     );
-    for (w, paint, want) in [
-        (158, jobs, "update to v2.1.310 \u{b7} after 1 shell"),
-        (158, hovered, "v2.1.310 \u{b7} after background jobs"),
-        (100, jobs, "update to v2.1.310 \u{b7} after 1 shell"),
-        (76, jobs, "v2.1.310 \u{b7} after 1 shell"),
-        (76, hovered, "update to v2.1.310"),
-        (50, jobs, "v2.1.310"),
-        // An asked move's words say it is under way wherever they keep when it lands: its verb's
-        // form (36 cells) is one past the owner's 35-cell label, so `→` takes the verb's place,
-        // never the offer's bare words; a label of 9 cells (`alab v0.5`) holds the target alone.
-        (158, asked, "\u{2192} v2.1.310 \u{b7} after 1 shell"),
-        (76, asked, "\u{2192} v2.1.310 \u{b7} after 1 shell"),
-        (50, asked, "v2.1.310"),
-        // An idle tab's move lands now: the short when says more than the verb would.
-        (158, idle, "update to v2.1.310 \u{b7} now"),
-        (76, idle, "update to v2.1.310 \u{b7} now"),
-        (50, idle, "v2.1.310"),
-    ] {
-        let (_, still) = slot_top(
-            SwitchPaint {
-                hover: HoverAt::None,
-                ..paint
-            },
-            w,
-        );
-        let (_, over) = slot_top(paint, w);
-        assert_eq!(slot_of(&over).as_deref(), Some(want), "{w}: {want}");
-        assert_eq!(
-            laid_at(&over),
-            laid_at(&still),
-            "{w}: the switch and the tag stand where they stood"
-        );
+    let mut shortened = 0;
+    for paint in [jobs, hovered, asked, idle] {
+        let SlotWords(forms, required) =
+            up_forms(&paint.up, paint.jobs.as_str(), paint.press).expect("forms");
+        assert_eq!(required, 0, "these offers do not require a restart's words");
+        let forms: Vec<String> = forms
+            .iter()
+            .map(|form| form.iter().map(|(text, _)| text.as_str()).collect())
+            .collect();
+        for w in 40..=158 {
+            let (_, still) = slot_top(
+                SwitchPaint {
+                    hover: HoverAt::None,
+                    ..paint
+                },
+                w,
+            );
+            let Some((slot, _)) = still.switch.as_ref().and_then(|s| s.label.as_ref()) else {
+                continue;
+            };
+            let selected = forms
+                .iter()
+                .position(|form| form.chars().count() <= slot.len())
+                .expect("the target fits the resting label");
+            shortened += usize::from(selected > 0);
+            let (_, over) = slot_top(paint, w);
+            assert_eq!(
+                slot_of(&over).as_deref(),
+                Some(forms[selected].as_str()),
+                "{w}: the first whole form fitting the resting label"
+            );
+            assert_eq!(
+                laid_at(&over),
+                laid_at(&still),
+                "{w}: the switch and the tag stand where they stood"
+            );
+        }
     }
+    assert!(shortened > 0, "narrow labels must exercise shorter forms");
     let (key, over) = slot_top(jobs, 158);
     let inks = FaceInks::of(&jobs, Some(CardPalette::Cruise), blank(), key.mark_fg);
     let (cols, _) = over

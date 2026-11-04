@@ -13,6 +13,7 @@
 //! deadline however many of them hang.
 
 use super::*;
+use crate::crossing::RecordsBound;
 use crate::server::{ENVELOPE_PEEK, ENVELOPE_PULLS_AT_ONCE, PullSlots, RECORDS_PULLS_AT_ONCE};
 use crate::transport::Pulled;
 use std::panic::AssertUnwindSafe;
@@ -78,43 +79,47 @@ pub(super) fn one_exchange() -> Instant {
 }
 
 /// `POST <url>/records` of each `(url, records)` of `posts` at once ([`each_at_once`]), every post
-/// ending by `by`: what each server answered, in `posts`' order, as
-/// [`transport::post_records_answered`] tells it. One that starts past `by` dials nothing and
-/// answers [`crate::ErrorKind::TimedOut`], so every post a caller makes under one `by` ends by it.
+/// stating `bound` ([`crate::crossing`]) and ending by `by`: what each server answered, in
+/// `posts`' order, as [`transport::post_records_answered`] tells it. One that starts past `by`
+/// dials nothing and answers [`crate::ErrorKind::TimedOut`], so every post a caller makes under
+/// one `by` ends by it.
 pub(super) fn post_records(
     posts: &[(&str, &[u8])],
+    bound: RecordsBound,
     by: Instant,
 ) -> Vec<crate::Result<crate::Result<()>>> {
     each_at_once("vault-records", posts, |(url, records)| {
-        transport::post_records_answered_until(url, records, Some(by))
+        transport::post_records_answered_until(url, records, bound, Some(by))
     })
     .into_iter()
     .map(|answered| answered.unwrap_or_else(|| Err(Error::new("a records post panicked"))))
     .collect()
 }
 
-/// Post each immutable record selection under the one fan-out deadline.
+/// Post each immutable record selection, stating `bound`, under the one fan-out deadline.
 pub(super) fn post_record_selections(
     posts: &[(&str, &[crate::membership_log::Record])],
+    bound: RecordsBound,
     by: Instant,
 ) -> Vec<crate::Result<crate::Result<()>>> {
     each_at_once("vault-records", posts, |(url, records)| {
-        transport::post_record_selection_answered_until(url, records, Some(by))
+        transport::post_record_selection_answered_until(url, records, bound, Some(by))
     })
     .into_iter()
     .map(|answered| answered.unwrap_or_else(|| Err(Error::new("a records post panicked"))))
     .collect()
 }
 
-/// [`post_records`] of the same `records` to every one of `urls`, by `by`: each server's answer
-/// as [`transport::post_records`] gives it, in `urls`' order.
+/// [`post_records`] of the same `records` to every one of `urls`, stating `bound`, by `by`: each
+/// server's answer as [`transport::post_records`] gives it, in `urls`' order.
 pub(super) fn post_records_to(
     urls: &[String],
     records: &[u8],
+    bound: RecordsBound,
     by: Instant,
 ) -> Vec<crate::Result<()>> {
     let posts: Vec<(&str, &[u8])> = urls.iter().map(|url| (url.as_str(), records)).collect();
-    post_records(&posts, by)
+    post_records(&posts, bound, by)
         .into_iter()
         .map(|answered| answered.and_then(|judged| judged))
         .collect()
@@ -557,7 +562,12 @@ mod tests {
         listener.set_nonblocking(true).expect("nonblocking");
         let url = format!("http://{}/v1/alab", listener.local_addr().expect("addr"));
         let past = Instant::now();
-        let answered = transport::post_records_answered_until(&url, b"records", Some(past));
+        let answered = transport::post_records_answered_until(
+            &url,
+            b"records",
+            RecordsBound::uncrossed(),
+            Some(past),
+        );
         assert_eq!(
             answered.expect_err("timed out").kind(),
             crate::ErrorKind::TimedOut

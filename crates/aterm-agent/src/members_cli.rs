@@ -458,13 +458,17 @@ impl Me {
         })
     }
 
-    fn joining(&self) -> Joining<'_> {
-        Joining {
+    fn joining(&self) -> Result<Joining<'_>, String> {
+        let store = client::load_records(&self.paths).map_err(|error| error.to_string())?;
+        let records_bound =
+            client::records_bound(&self.paths, &store).map_err(|error| error.to_string())?;
+        Ok(Joining {
             device: &self.device,
+            records_bound,
             node: self.node,
             name: self.name.clone(),
             model: self.model.clone(),
-        }
+        })
     }
 }
 
@@ -683,7 +687,13 @@ fn join_tried(
         let _ = writeln!(out, "{}", allowed_words(&(reach.follow)(&me.paths.home)));
         return Tried::Ended(0);
     }
-    let joining = me.joining();
+    let joining = match me.joining() {
+        Ok(joining) => joining,
+        Err(error) => {
+            let _ = writeln!(err, "aterm members: {error}");
+            return Tried::Ended(1);
+        }
+    };
     let dial = reach.dial;
     // A phraseless join proves this Mac only where sharing is on: a proof a member takes writes
     // this Mac's vault and ~/.secrets, which `[swarm] enabled = false` (or a settings file aterm
@@ -1015,7 +1025,7 @@ pub fn ask_members(home: &Path) -> Result<usize, String> {
         .map_err(|error| error.to_string())?;
     ask_after_proof(proved_back(&me, &ats, None), || {
         let dial: &Dial<'_> = &dial;
-        let (heard, _) = join::ask_all(dial, &me.joining(), &ats);
+        let (heard, _) = join::ask_all(dial, &me.joining()?, &ats);
         if heard.is_empty() {
             return Err("no ALab member answers on this network".to_owned());
         }
@@ -1094,7 +1104,9 @@ fn proved_back(me: &Me, ats: &[String], until: Option<std::time::Instant>) -> Pr
     if *node.key().bytes() != me.node {
         return Proved::No;
     }
-    let joining = me.joining();
+    let Ok(joining) = me.joining() else {
+        return Proved::No;
+    };
     if let Ok(code) = read_join_code(&state)
         && let Ok(secret) = aterm_net::fleet::FleetSecret::new(&code.secret)
     {
@@ -1433,7 +1445,7 @@ mod tests {
     fn let_in(m1: &Mutex<Desk>, j: &Me, follow: &(dyn Fn(&Path) -> Follows + Sync)) -> String {
         let ((code, said), _) = with_member(m1, |dial| {
             let ats = [M1.to_owned()];
-            let (heard, missed) = join::ask_all(dial, &j.joining(), &ats);
+            let (heard, missed) = join::ask_all(dial, &j.joining().unwrap(), &ats);
             assert_eq!(heard.len(), 1, "{missed:?}");
             let words = allow(m1);
             let reach = Reach {
@@ -1508,7 +1520,7 @@ mod tests {
         let j = me(root.path(), "j");
         let (wrong, _) = with_member(&m1, |dial| {
             let ats = [M1.to_owned()];
-            let (heard, _) = join::ask_all(dial, &j.joining(), &ats);
+            let (heard, _) = join::ask_all(dial, &j.joining().unwrap(), &ats);
             assert_eq!(heard.len(), 1);
             let shown = allow(&m1);
             // A phrase of the list's words that the member does not show.
@@ -1532,7 +1544,7 @@ mod tests {
         assert!(client::config(&j.paths).expect("config").is_none());
         let (right, _) = with_member(&m1, |dial| {
             let ats = [M1.to_owned()];
-            let _ = join::ask_all(dial, &j.joining(), &ats);
+            let _ = join::ask_all(dial, &j.joining().unwrap(), &ats);
             let shown = allow(&m1);
             let reach = Reach {
                 browse: &|| Ok(ats.to_vec()),
@@ -1567,7 +1579,7 @@ mod tests {
         let j = me(root.path(), "j");
         let ((first, second), _) = with_member(&m1, |dial| {
             let ats = [M1.to_owned()];
-            let _ = join::ask_all(dial, &j.joining(), &ats);
+            let _ = join::ask_all(dial, &j.joining().unwrap(), &ats);
             let shown = SecretBytes::from(allow(&m1));
             let nobody = Reach {
                 browse: &|| Ok(Vec::new()),
@@ -1969,7 +1981,8 @@ mod tests {
         let proved = |until: Option<std::time::Instant>| {
             dialed.lock().unwrap().clear();
             let dial = crate::vault_join::dial_until(until, DIAL_WITHIN, &reach);
-            let tried = join::prove_first(&mac.paths, &dial, &mac.joining(), &sign_node, &ats);
+            let tried =
+                join::prove_first(&mac.paths, &dial, &mac.joining().unwrap(), &sign_node, &ats);
             (proof_outcome(tried), dialed.lock().unwrap().clone())
         };
 
@@ -2301,7 +2314,7 @@ mod tests {
         let j = me(root.path(), "j");
         let (tried, _) = with_member(&m1, |dial| {
             let ats = [M1.to_owned()];
-            let _ = join::ask_all(dial, &j.joining(), &ats);
+            let _ = join::ask_all(dial, &j.joining().unwrap(), &ats);
             let shown = SecretBytes::from(allow(&m1));
             let calls = std::sync::atomic::AtomicUsize::new(0);
             // The ask reaches the member; every dial after it finds the member gone.

@@ -69,36 +69,93 @@ pub struct Ready {
 /// `poll(2)`'s errno, other than `EINTR`.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn either(first: BorrowedFd<'_>, second: BorrowedFd<'_>) -> io::Result<Ready> {
-    #[repr(C)]
-    struct PollFd {
-        fd: i32,
-        events: i16,
-        revents: i16,
+    pair(first, second, None)?.ok_or_else(|| io::Error::other("indefinite readiness expired"))
+}
+
+/// Wait on either descriptor until an absolute deadline. `None` means expiry;
+/// bytes and kernel notifications remain for their actual readers. Interrupted
+/// waits keep the same deadline. Readability, hangup and error all wake.
+/// # Errors
+/// A poll error other than interruption.
+pub fn either_until(
+    first: BorrowedFd<'_>,
+    second: BorrowedFd<'_>,
+    deadline: std::time::Instant,
+) -> io::Result<Option<Ready>> {
+    pair(first, second, Some(deadline))
+}
+
+#[cfg_attr(trust_verify, trust::skip)]
+fn pair(
+    first: BorrowedFd<'_>,
+    second: BorrowedFd<'_>,
+    deadline: Option<std::time::Instant>,
+) -> io::Result<Option<Ready>> {
+    let mut fds = [read_pollfd(first), read_pollfd(second)];
+    Ok(poll_reads(&mut fds, deadline)?.then(|| Ready {
+        first: fds[0].revents != 0,
+        second: fds[1].revents != 0,
+    }))
+}
+
+/// Wait for any borrowed descriptor until an absolute deadline, without reading
+/// bytes or notifications. Returns the ready indices; an empty vector means
+/// expiry. Hangup/error also wake. The caller bounds the descriptor set.
+/// # Errors
+/// Empty or unrepresentable set, or poll error other than interruption.
+pub fn any_until(fds: &[BorrowedFd<'_>], deadline: std::time::Instant) -> io::Result<Vec<usize>> {
+    if fds.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "empty readiness set",
+        ));
     }
-    #[cfg(target_os = "linux")]
-    type Nfds = core::ffi::c_ulong;
-    #[cfg(not(target_os = "linux"))]
-    type Nfds = core::ffi::c_uint;
-    unsafe extern "C" {
-        fn poll(fds: *mut PollFd, nfds: Nfds, timeout: i32) -> i32;
+    let mut reads: Vec<_> = fds.iter().copied().map(read_pollfd).collect();
+    if !poll_reads(&mut reads, Some(deadline))? {
+        return Ok(Vec::new());
     }
-    const POLLIN: i16 = 0x1;
+    Ok(reads
+        .iter()
+        .enumerate()
+        .filter_map(|(i, fd)| (fd.revents != 0).then_some(i))
+        .collect())
+}
+
+fn read_pollfd(fd: BorrowedFd<'_>) -> libc::pollfd {
+    libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    }
+}
+
+#[cfg_attr(trust_verify, trust::skip)]
+fn poll_reads(fds: &mut [libc::pollfd], deadline: Option<std::time::Instant>) -> io::Result<bool> {
+    let count = fds
+        .len()
+        .try_into()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "readiness set too large"))?;
     loop {
-        let mut fds = [
-            PollFd {
-                fd: first.as_raw_fd(),
-                events: POLLIN,
-                revents: 0,
-            },
-            PollFd {
-                fd: second.as_raw_fd(),
-                events: POLLIN,
-                revents: 0,
-            },
-        ];
-        // SAFETY: two initialized pollfds that outlive the call, each naming a descriptor its
-        // `BorrowedFd` keeps open for it; `poll` reads and writes them and retains neither.
-        let ready = unsafe { poll(fds.as_mut_ptr(), 2, -1) };
+        let timeout = match deadline {
+            None => -1,
+            Some(deadline) => {
+                let Some(remaining) = deadline
+                    .checked_duration_since(std::time::Instant::now())
+                    .filter(|n| !n.is_zero())
+                else {
+                    return Ok(false);
+                };
+                let millis = remaining.as_millis()
+                    + u128::from(!remaining.subsec_nanos().is_multiple_of(1_000_000));
+                millis.min(i32::MAX as u128) as i32
+            }
+        };
+        for fd in &mut *fds {
+            fd.revents = 0;
+        }
+        // SAFETY: initialized pollfds outlive the call and name descriptors kept
+        // open by their callers' borrows. Poll retains no pointer; count matches.
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), count, timeout) };
         if ready < 0 {
             let error = io::Error::last_os_error();
             if error.kind() == io::ErrorKind::Interrupted {
@@ -106,12 +163,8 @@ pub fn either(first: BorrowedFd<'_>, second: BorrowedFd<'_>) -> io::Result<Ready
             }
             return Err(error);
         }
-        let found = Ready {
-            first: fds[0].revents != 0,
-            second: fds[1].revents != 0,
-        };
-        if found.first || found.second {
-            return Ok(found);
+        if fds.iter().any(|fd| fd.revents != 0) {
+            return Ok(true);
         }
     }
 }
@@ -134,7 +187,8 @@ pub enum Interest {
 
 /// Wait for `interest`, hangup or error without changing socket timeout options.
 /// Use a nonblocking operation after this call: readiness can be consumed by
-/// another reader/writer. Interrupted waits retain the original deadline.
+/// another reader/writer. Interrupted waits retain the original deadline. A deadline already
+/// past asks nothing and fails; one that passes during the wait still reports what `poll(2)` saw.
 ///
 /// # Errors
 /// Expiry, an invalid descriptor, or `poll(2)` errors other than interruption.
@@ -144,11 +198,26 @@ pub fn until(
     interest: Interest,
     deadline: std::time::Instant,
 ) -> io::Result<()> {
+    if std::time::Instant::now() >= deadline {
+        return Err(expired());
+    }
+    asked_until(fd, interest, deadline)
+}
+
+fn expired() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "readiness deadline")
+}
+
+/// [`until`], but `poll(2)` is asked at least once however late this is, and what it saw comes
+/// before the deadline: the deadline only ends a wait that found nothing.
+#[cfg_attr(trust_verify, trust::skip)]
+fn asked_until(
+    fd: BorrowedFd<'_>,
+    interest: Interest,
+    deadline: std::time::Instant,
+) -> io::Result<()> {
     loop {
-        let remaining = deadline
-            .checked_duration_since(std::time::Instant::now())
-            .filter(|n| !n.is_zero())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "readiness deadline"))?;
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         let millis =
             remaining.as_millis() + u128::from(!remaining.subsec_nanos().is_multiple_of(1_000_000));
         let timeout = millis.min(i32::MAX as u128) as i32;
@@ -169,12 +238,6 @@ pub fn until(
             }
             return Err(error);
         }
-        if std::time::Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "readiness deadline",
-            ));
-        }
         if descriptor.revents & libc::POLLNVAL != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -184,11 +247,109 @@ pub fn until(
         if descriptor.revents != 0 {
             return Ok(());
         }
+        if std::time::Instant::now() >= deadline {
+            return Err(expired());
+        }
     }
+}
+
+/// Waits in `poll(2)` until a read of `stream` has something to return, bytes, its end or an
+/// error, within the stream's `SO_RCVTIMEO`, or for as long as it takes with none. Takes nothing
+/// from the stream. The read after it does not sleep, and that is the point: on Darwin a read
+/// asleep in `recv(2)` on a Unix socket can miss a `shutdown(2)` of the connection and sleep on,
+/// and past its own timeout when this end was the one shut, where a wait in `poll(2)` sees it
+/// (`docs/measured/darwin-unix-shutdown-wakeup-2026-11-03.md`). A nonblocking stream waits here
+/// too, so one that means to come back at once reads without this.
+///
+/// # Errors
+/// `WouldBlock` once the timeout passes with nothing to read, as the read itself would say;
+/// `InvalidInput` for a descriptor `poll(2)` calls invalid, on a stream with a timeout;
+/// `poll(2)`'s errno; or the error of asking the stream for its timeout.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn for_read(stream: &crate::CtlStream) -> io::Result<()> {
+    use std::os::fd::AsFd as _;
+    let deadline = stream
+        .read_timeout()?
+        .and_then(|wait| std::time::Instant::now().checked_add(wait));
+    let Some(deadline) = deadline else {
+        return one(stream.as_fd());
+    };
+    asked_until(stream.as_fd(), Interest::Read, deadline).map_err(|error| {
+        if error.kind() == io::ErrorKind::TimedOut {
+            io::ErrorKind::WouldBlock.into()
+        } else {
+            error
+        }
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn many_readiness_preserves_bytes_and_reports_all_ready_indices() {
+        use super::*;
+        use std::{
+            io::{Read as _, Write as _},
+            os::fd::AsFd as _,
+        };
+        let (mut first, mut writer) = std::io::pipe().unwrap();
+        let (second, _quiet) = std::io::pipe().unwrap();
+        let (third, closed) = std::io::pipe().unwrap();
+        writer.write_all(b"x").unwrap();
+        drop(closed);
+        let found = any_until(
+            &[first.as_fd(), second.as_fd(), third.as_fd()],
+            std::time::Instant::now() + HANG,
+        )
+        .unwrap();
+        assert_eq!(found, [0, 2]);
+        let mut byte = [0];
+        first.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, *b"x");
+        assert!(
+            any_until(&[second.as_fd()], std::time::Instant::now())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            any_until(&[], std::time::Instant::now() + HANG)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn pair_deadline_preserves_bytes_and_hangup_still_wakes() {
+        use super::*;
+        use std::{
+            io::{Read as _, Write as _},
+            os::fd::AsFd as _,
+            time::Instant,
+        };
+        let (mut first, mut writer) = std::io::pipe().unwrap();
+        let (second, other) = std::io::pipe().unwrap();
+        writer.write_all(b"x").unwrap();
+        assert!(
+            either_until(first.as_fd(), second.as_fd(), Instant::now())
+                .unwrap()
+                .is_none()
+        );
+        let found = either_until(first.as_fd(), second.as_fd(), Instant::now() + HANG)
+            .unwrap()
+            .unwrap();
+        assert!(found.first);
+        let mut byte = [0u8; 1];
+        first.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, *b"x");
+        drop(other);
+        assert!(
+            either_until(first.as_fd(), second.as_fd(), Instant::now() + HANG)
+                .unwrap()
+                .unwrap()
+                .second
+        );
+    }
     #[test]
     fn scoped_nonblocking_restores_flags_after_an_operation_error() {
         use std::io::Read as _;
@@ -237,6 +398,85 @@ mod tests {
                 std::io::ErrorKind::TimedOut
             );
         }
+    }
+
+    /// Bytes and then the connection's end each end the wait for a read, and neither is taken.
+    #[test]
+    fn a_wait_for_a_read_ends_at_bytes_and_at_the_end_and_takes_neither() {
+        let (mut near, mut far) = crate::kept_out(UnixStream::pair).unwrap();
+        near.set_read_timeout(Some(HANG)).unwrap();
+        far.write_all(b"k").unwrap();
+        super::for_read(&near).unwrap();
+        let mut byte = [0];
+        near.read_exact(&mut byte).unwrap();
+        assert_eq!(&byte, b"k");
+        far.shutdown(std::net::Shutdown::Write).unwrap();
+        super::for_read(&near).unwrap();
+        assert_eq!(near.read(&mut byte).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_wait_for_a_read_past_its_timeout_says_what_the_read_would() {
+        let (near, far) = crate::kept_out(UnixStream::pair).unwrap();
+        near.set_read_timeout(Some(Duration::from_millis(1)))
+            .unwrap();
+        let (done, ended) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(super::for_read(&near));
+        });
+        let waited = ended.recv_timeout(HANG).expect("the timeout ends the wait");
+        assert_eq!(waited.unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        drop(far);
+    }
+
+    /// A byte already queued is the read's to return however short the timeout: `WouldBlock` for
+    /// it would tell the caller nothing came.
+    #[test]
+    fn a_queued_byte_comes_before_a_wait_for_a_reads_timeout() {
+        let (mut near, mut far) = crate::kept_out(UnixStream::pair).unwrap();
+        near.set_read_timeout(Some(Duration::from_nanos(1)))
+            .unwrap();
+        far.write_all(b"k").unwrap();
+        super::for_read(&near).expect("a byte waits to be read");
+        near.read_exact(&mut [0]).unwrap();
+    }
+
+    /// `poll(2)` is asked even past the deadline, and only there does a past deadline not end
+    /// the wait first: [`super::until`] says expired on the same stream.
+    #[test]
+    fn a_wait_already_past_its_deadline_still_asks() {
+        use std::os::fd::AsFd as _;
+        let (near, mut far) = crate::kept_out(UnixStream::pair).unwrap();
+        let past = std::time::Instant::now();
+        let (done, ended) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let asked = super::asked_until(near.as_fd(), super::Interest::Read, past);
+            let _ = done.send((asked, near));
+        });
+        let (asked, near) = ended
+            .recv_timeout(HANG)
+            .expect("the deadline ends the wait");
+        assert_eq!(asked.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        far.write_all(b"k").unwrap();
+        super::asked_until(near.as_fd(), super::Interest::Read, past).expect("a byte waits");
+        let expired = super::until(near.as_fd(), super::Interest::Read, past);
+        assert_eq!(expired.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    /// With no timeout the wait lasts until a byte comes: on a nonblocking stream a wait that
+    /// gave up early would show as the read's `WouldBlock`.
+    #[test]
+    fn a_wait_for_a_read_with_no_timeout_lasts_until_a_byte_comes() {
+        let (mut near, mut far) = crate::kept_out(UnixStream::pair).unwrap();
+        near.set_nonblocking(true).unwrap();
+        let (done, ended) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let read = super::for_read(&near).and_then(|()| near.read_exact(&mut [0]));
+            let _ = done.send(read);
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        far.write_all(b"k").unwrap();
+        ended.recv_timeout(HANG).expect("the wait ends").unwrap();
     }
 
     /// EACH SIDE WAKES THE WAIT, AND NEITHER IS READ: a byte on the first is

@@ -9467,8 +9467,16 @@ fn in_profile(
 /// vendor ([`row_browser_profile`], [`vendor_profile_dir`]), where a window's pass that never
 /// ran is made up first ([`super::browser_window::make_up_tidy`]); the mailbox configured for
 /// that email, its inbox rows chosen by the vendor's senders.
-#[derive(Debug, Clone)]
 pub struct VendorApprover {
+    /// Google identities share the harness root across native and federated providers.
+    #[cfg(unix)]
+    pub(super) google_state: PathBuf,
+    #[cfg(unix)]
+    pub(super) native_attempt: Option<super::google_federation::NativeAttempt>,
+    #[cfg(unix)]
+    pub(super) google_pending: Option<super::google_federation::PendingFederation>,
+    #[cfg(unix)]
+    pub(super) google_recovery: Option<super::google_federation::recovery::Journal>,
     /// Exact native account route, retained separately from the browser profile key.
     pub google_account: (super::accounts::Cli, String),
     /// Claude Code's store directory (`accounts::Store::shared_dir`).
@@ -9500,6 +9508,19 @@ pub struct VendorApprover {
     pub types_email: bool,
 }
 
+#[cfg(unix)]
+fn google_state_dir(shared_dir: &Path) -> PathBuf {
+    if shared_dir.file_name()
+        == Some(std::ffi::OsStr::new(
+            super::accounts::Cli::Claude.accounts().store_dir,
+        ))
+    {
+        shared_dir.parent().unwrap_or(shared_dir).into()
+    } else {
+        shared_dir.into()
+    }
+}
+
 impl VendorApprover {
     /// Use one already-authorized mailbox without discovering or merging any
     /// ambient credential source. The caller owns its authorization checks.
@@ -9514,6 +9535,14 @@ impl VendorApprover {
         let senders = cli.accounts().mail_senders;
         mailbox.senders = senders.iter().map(|sender| (*sender).to_owned()).collect();
         Self {
+            #[cfg(unix)]
+            google_state: google_state_dir(shared_dir),
+            #[cfg(unix)]
+            native_attempt: None,
+            #[cfg(unix)]
+            google_pending: None,
+            #[cfg(unix)]
+            google_recovery: None,
             google_account: (cli, label.to_owned()),
             shared_dir: shared_dir.to_owned(),
             label_key: vendor_label_key(cli, label),
@@ -9557,6 +9586,14 @@ impl VendorApprover {
         let mailbox_source = found.clone();
         let mailbox = found.filter(|cfg| cfg.is_configured_for(email));
         VendorApprover {
+            #[cfg(unix)]
+            google_state: google_state_dir(shared_dir),
+            #[cfg(unix)]
+            native_attempt: None,
+            #[cfg(unix)]
+            google_pending: None,
+            #[cfg(unix)]
+            google_recovery: None,
             google_account: (cli, label.to_owned()),
             shared_dir: shared_dir.to_path_buf(),
             label_key,
@@ -9585,6 +9622,96 @@ impl VendorApprover {
 }
 
 impl super::login_drive::Approver for VendorApprover {
+    #[cfg(unix)]
+    fn resume(
+        &mut self,
+        request: &super::login_drive::Request<'_>,
+        deadline: Instant,
+    ) -> Result<super::login_drive::Resume, String> {
+        self.google_pending = None;
+        self.google_recovery = None;
+        let Some(home) = self.home.as_deref() else {
+            return Ok(super::login_drive::Resume::Fresh);
+        };
+        let mut journal = match super::google_federation::recovery::Journal::open(request, home)? {
+            Some(journal) => journal,
+            None => return Ok(super::login_drive::Resume::Fresh),
+        };
+        self.google_pending = journal.resume(request, home, deadline)?;
+        let resumed = self.google_pending.is_some();
+        let seeded = journal.has_native_seed();
+        self.google_recovery = Some(journal);
+        if resumed {
+            Ok(super::login_drive::Resume::Completed(
+                super::login_drive::Outcome::SignedIn {
+                    email: self
+                        .google_pending
+                        .as_ref()
+                        .and_then(|pending| pending.verified_email())
+                        .map(str::to_owned),
+                    page: false,
+                },
+            ))
+        } else {
+            Ok(if seeded {
+                super::login_drive::Resume::NativeSeed
+            } else {
+                super::login_drive::Resume::Fresh
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    fn begin(&mut self, request: &super::login_drive::Request<'_>) -> Result<(), String> {
+        self.google_pending = None;
+        if let Some(journal) = &self.google_recovery {
+            journal.check_context(request)?;
+        }
+        let attempt = super::google_federation::NativeAttempt::capture(request);
+        self.google_state = attempt.state().to_owned();
+        self.native_attempt = Some(attempt);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn complete(
+        &mut self,
+        request: &super::login_drive::Request<'_>,
+        outcome: &super::login_drive::Outcome,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        if !matches!(outcome, super::login_drive::Outcome::SignedIn { .. }) {
+            self.google_pending = None;
+            return Ok(());
+        }
+        if let Some(journal) = self.google_recovery.as_mut() {
+            let home = self
+                .home
+                .as_deref()
+                .ok_or("Kimi recovery home is unavailable")?;
+            journal.capture(request, self.google_pending.as_ref(), home)?;
+        }
+        let pending = match self.google_pending.take() {
+            Some(pending) => Some(pending),
+            None => match self.google_recovery.as_mut() {
+                Some(journal) => Some(
+                    journal.pending(
+                        self.home
+                            .as_deref()
+                            .ok_or("Kimi recovery home is unavailable")?,
+                    )?,
+                ),
+                None => None,
+            },
+        };
+        match pending {
+            Some(pending) => {
+                pending.complete(request, outcome, deadline, self.google_recovery.as_ref())
+            }
+            None => Ok(()),
+        }
+    }
+
     #[cfg(unix)]
     fn approve(
         &mut self,

@@ -20,6 +20,7 @@ use crate::{
 };
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 const DESCRIPTOR_HEADER: usize = 4 + 16 + 32 + 1;
 const MAX_DESCRIPTOR: usize = DESCRIPTOR_HEADER + 3 * (4 + MAX_NODE);
@@ -61,6 +62,26 @@ fn established_files(paths: &Paths) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Check existing immutable custody against a proposed recovery's original
+/// root without creating files, opening a writer or ingesting a descriptor.
+pub(crate) fn validate_established_root(paths: &Paths, trust: Trust) -> Result<Journal> {
+    established_files(paths)?;
+    let pin = fsx::read_private(&paths.dir.join("commons/default.pin"), PIN_LEN)?;
+    let claim = fsx::read_private(&paths.dir.join("commons.claim"), PIN_LEN)?;
+    if pin
+        .as_ref()
+        .is_none_or(|bytes| bytes.as_slice() != pin_bytes(trust))
+        || claim
+            .as_ref()
+            .is_none_or(|bytes| bytes.as_slice() != claim_bytes(trust))
+    {
+        return Err(Error::new(
+            "Commons recovery differs from existing immutable custody",
+        ));
+    }
+    Journal::read_existing(&paths.dir.join("commons/control"), trust)
 }
 
 /// How long an observation waits for another local holder of `commons.lock`.
@@ -1507,13 +1528,14 @@ impl Bootstrap {
         Ok(client::trusted_commons_log(&self.paths, self.trust())?.is_some())
     }
 
-    /// Encode the minimal causal membership-log chain proving this device's historical seat for
-    /// `ACX2` peer authentication (`F18`).
+    /// Select the causal membership log proving this device's historical seat and any later
+    /// restored node or audience access. Keep the verified log typed: local custody may exceed
+    /// a legacy wire decoder's record limit, and each transport enforces its own wire bounds.
     ///
     /// # Errors
-    /// Local custody or device key cannot be read.
-    pub fn log_witness(&self) -> Result<Option<Vec<u8>>> {
-        type WitnessCacheEntry = ([u8; 32], Vec<u8>, Vec<u8>);
+    /// Local custody or device key cannot be read, or the selected evidence cannot form a log.
+    pub fn log_witness(&self) -> Result<Option<Arc<crate::membership_log::Log>>> {
+        type WitnessCacheEntry = ([u8; 32], Vec<u8>, Arc<crate::membership_log::Log>);
         static WITNESS_CACHE: std::sync::Mutex<std::collections::VecDeque<WitnessCacheEntry>> =
             std::sync::Mutex::new(std::collections::VecDeque::new());
 
@@ -1633,15 +1655,23 @@ impl Bootstrap {
                 chain = log.ancestor_closure(&targets);
             }
         }
-        let encoded = crate::membership_log::encode_records(&chain);
+        let mut records = chain.into_iter();
+        let genesis = records
+            .next()
+            .ok_or_else(|| Error::new("Commons log witness has no genesis"))?;
+        let mut witness = crate::membership_log::Log::new(genesis)?;
+        for record in records {
+            witness.insert(record)?;
+        }
+        let witness = Arc::new(witness);
         if let Ok(mut cache) = WITNESS_CACHE.lock() {
             cache.retain(|(d, b, _)| !(*d == heads_digest && *b == binding_bytes));
             if cache.len() >= 16 {
                 cache.pop_front();
             }
-            cache.push_back((heads_digest, binding_bytes, encoded.clone()));
+            cache.push_back((heads_digest, binding_bytes, witness.clone()));
         }
-        Ok(Some(encoded))
+        Ok(Some(witness))
     }
 
     /// Find historical authority approval for sealed control repair only. This
@@ -1861,7 +1891,8 @@ impl Bootstrap {
     }
 
     /// Authenticate a handoff completely before caching its encrypted bytes.
-    /// One entry per source roster bounds storage by the control journal cap.
+    /// One entry per control source or membership-log Commons epoch bounds storage by the sum
+    /// of those independently bounded domains.
     /// A failed durability barrier is uncertain; retrying revalidates the entry.
     pub fn import_history(
         &self,
@@ -1901,7 +1932,12 @@ impl Bootstrap {
                 .map_err(|e| Error::new(format!("history cache publication: {e}")))?;
             return Ok(saved);
         }
-        history_capacity(&dir, &name, super::journal::MAX_NODES)?;
+        history_capacity(
+            &dir,
+            &name,
+            super::journal::MAX_NODES,
+            crate::membership_log::MAX_HELD_RECORDS.min(crate::membership_log::MAX_KEYED_RECORDS),
+        )?;
         aterm_journal::write_private_durable(&dir, &name, wire)
             .map_err(|e| Error::new(format!("history cache publication: {e}")))?;
         Ok(handoff)
@@ -1949,7 +1985,15 @@ impl Bootstrap {
 
 // Preserve bounded crash leftovers without charging them as usable key slots.
 // Unknown files get the same small headroom; none are silently deleted.
-fn history_capacity(dir: &Path, target: &str, limit: usize) -> Result<()> {
+fn history_capacity(
+    dir: &Path,
+    target: &str,
+    control_sources: usize,
+    log_sources: usize,
+) -> Result<()> {
+    let limit = control_sources
+        .checked_add(log_sources)
+        .ok_or_else(|| Error::new("history cache source bound overflow"))?;
     let mut found = false;
     let mut records = 0;
     let mut auxiliary = 0;

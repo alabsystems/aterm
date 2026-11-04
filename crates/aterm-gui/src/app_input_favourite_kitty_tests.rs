@@ -173,11 +173,25 @@ fn an_invoke_that_asks_first_answers_ok_pending_and_a_second_is_refused() {
 #[test]
 fn a_declining_window_or_search_action_refuses_in_words() {
     let mut app = App::headless_for_test();
+    let wid = WindowId(0);
 
     let why = app
         .toggle_fullscreen()
         .expect_err("no OS window must refuse, not silently do nothing");
     assert!(why.contains("window"), "{why:?}");
+    app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
+    app.frontmost_window = None;
+    let why = app
+        .toggle_fullscreen()
+        .expect_err("no frontmost window must refuse");
+    assert!(why.contains("window"), "{why:?}");
+    app.frontmost_window = Some(wid);
+    app.toggle_fullscreen()
+        .expect("an on-screen window enters full screen");
+    assert!(app.windows[&wid].fullscreen_for_test.get());
+    app.toggle_fullscreen()
+        .expect("a second toggle exits full screen");
+    assert!(!app.windows[&wid].fullscreen_for_test.get());
 
     let why = app
         .migrate_active_tab_to_next_window()

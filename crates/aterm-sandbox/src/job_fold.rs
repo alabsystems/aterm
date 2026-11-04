@@ -140,5 +140,20 @@ mod tests {
         );
         assert_eq!(folded.JobMemoryLimit, baseline.JobMemoryLimit);
         assert_eq!(folded.IoInfo, baseline.IoInfo);
+
+        let mut max_bounds = baseline;
+        fold_job_limits(
+            &mut max_bounds,
+            &Limits {
+                cpu_seconds: Some(i64::MAX as u64),
+                address_space: Some(u64::MAX),
+                ..Limits::inherit()
+            },
+        );
+        assert_eq!(
+            max_bounds.BasicLimitInformation.PerProcessUserTimeLimit,
+            i64::MAX
+        );
+        assert_eq!(max_bounds.ProcessMemoryLimit, usize::MAX);
     }
 }

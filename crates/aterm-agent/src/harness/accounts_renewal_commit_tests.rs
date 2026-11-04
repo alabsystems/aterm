@@ -32,7 +32,13 @@ fn commit_case(cli: Cli, case: i64) -> [bool; 7] {
                 None,
                 NOW - 2,
             );
-            events.extend(note_auth(state, "account", Auth::SignedOut, NOW - 1));
+            events.extend(note_auth_in_context(
+                state,
+                logins,
+                "account",
+                Auth::SignedOut,
+                NOW - 1,
+            ));
             Ok(events)
         })
         .unwrap();

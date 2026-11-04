@@ -62,6 +62,26 @@ pub struct WindowSeen {
     pub wall_until: Option<Option<i64>>,
 }
 
+impl WindowSeen {
+    /// Project this retained reading at `now`: a passed wall is lifted and a passed reset
+    /// becomes unknown until read again. Unknown bounds and the original reading are kept.
+    #[must_use]
+    pub fn as_of(&self, now: i64) -> Self {
+        let mut window = self.clone();
+        if matches!(window.wall_until, Some(Some(until)) if until <= now) {
+            window.wall_until = None;
+        }
+        if let Some(Figure::Used {
+            reset: Some(reset), ..
+        }) = window.figure
+            && reset <= now
+        {
+            window.figure = Some(Figure::ResetUnread { reset });
+        }
+        window
+    }
+}
+
 /// One line of an account's history across Macs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Line {
@@ -169,6 +189,7 @@ fn percent(pct_x10: u16) -> String {
 /// (statusline)"; "7d reset 2026-11-02T00:00:00Z, not read since"; "7d at its limit until …".
 #[must_use]
 pub fn window_line(w: &WindowSeen, now: i64) -> String {
+    let w = w.as_of(now);
     let mut out = match &w.sub {
         Some(sub) => format!("{} (workspace {sub})", w.window),
         None => w.window.clone(),
@@ -274,6 +295,7 @@ pub fn rows_json(rows: &[Reported], now: i64) -> aterm_json::Value {
             .windows
             .iter()
             .map(|w| {
+                let w = w.as_of(now);
                 let (state, pct, reset) = match &w.figure {
                     Some(Figure::Used { pct_x10, reset }) => (
                         if reset.is_some() {
@@ -285,7 +307,8 @@ pub fn rows_json(rows: &[Reported], now: i64) -> aterm_json::Value {
                         *reset,
                     ),
                     Some(Figure::ResetUnread { reset }) => ("reset-unread", None, Some(*reset)),
-                    None => ("wall-only", None, None),
+                    None if w.wall_until.is_some() => ("wall-only", None, None),
+                    None => ("unknown", None, None),
                 };
                 json!({
                     "window": w.window,
@@ -297,7 +320,7 @@ pub fn rows_json(rows: &[Reported], now: i64) -> aterm_json::Value {
                         "t": t, "age_s": now - t, "by": by, "src": src,
                     })),
                     "wall_until": w.wall_until.map(|u| json!(u)),
-                    "line": window_line(w, now),
+                    "line": window_line(&w, now),
                 })
             })
             .collect();
@@ -501,6 +524,70 @@ mod tests {
             "7d reset at 1970-01-01T00:00:00Z, not read since, at its limit"
         );
         assert!(lines.iter().all(|l| !l.contains('@')));
+    }
+
+    /// A cached reading crossing its known reset is unknown in both report forms, while the
+    /// retained reading and its provenance stay intact.
+    /// NEGATIVE CONTROL: normalizing only `window_line` leaves JSON's state current and its
+    /// positive quota and wall fields present after the reset.
+    #[test]
+    fn cached_quota_reports_expire_together_without_changing_the_reading() {
+        let rows = vec![(
+            "one".into(),
+            "ac-0123456789abcdef".into(),
+            AccountSeen {
+                windows: vec![
+                    WindowSeen {
+                        window: "5h".into(),
+                        sub: None,
+                        figure: Some(Figure::Used {
+                            pct_x10: 1000,
+                            reset: Some(300),
+                        }),
+                        read: Some((200, "m17".into(), "statusline".into())),
+                        wall_until: Some(Some(300)),
+                    },
+                    WindowSeen {
+                        window: "7d".into(),
+                        sub: None,
+                        figure: None,
+                        read: None,
+                        wall_until: Some(Some(300)),
+                    },
+                ],
+                ..Default::default()
+            },
+        )];
+        let original = rows.clone();
+        let before = rows_json(&rows, 299);
+        let window = &before["one"]["windows"][0];
+        assert_eq!(window["state"].as_str(), Some("current"));
+        assert_eq!(window["used_pct_x10"].as_u64(), Some(1000));
+        assert_eq!(window["wall_until"].as_i64(), Some(300));
+        assert_eq!(
+            before["one"]["windows"][1]["state"].as_str(),
+            Some("wall-only")
+        );
+        for now in [300, 301] {
+            let json = rows_json(&rows, now);
+            let window = &json["one"]["windows"][0];
+            assert_eq!(window["state"].as_str(), Some("reset-unread"));
+            assert!(window["used_pct_x10"].is_null());
+            assert!(window["wall_until"].is_null());
+            assert_eq!(window["reset"].as_i64(), Some(300));
+            assert_eq!(window["read"]["t"].as_i64(), Some(200));
+            assert_eq!(window["read"]["by"].as_str(), Some("m17"));
+            assert_eq!(window["read"]["src"].as_str(), Some("statusline"));
+            let line = window["line"].as_str().unwrap();
+            assert!(line.contains("not read since"), "{line}");
+            assert!(!line.contains("100%") && !line.contains("at its limit"));
+            assert!(rows_text(&rows, now).contains(line));
+            let wall_only = &json["one"]["windows"][1];
+            assert_eq!(wall_only["state"].as_str(), Some("unknown"));
+            assert!(wall_only["wall_until"].is_null());
+            assert!(!wall_only["line"].as_str().unwrap().contains("at its limit"));
+        }
+        assert_eq!(rows, original);
     }
 
     fn roster(label: &str, email: &str) -> super::super::accounts::Roster {

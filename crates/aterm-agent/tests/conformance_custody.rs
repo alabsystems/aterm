@@ -7,28 +7,36 @@
 //! on [`Line::ended`], a turn's on [`Line::took`], [`Line::turned`] and [`Line::outlasted`],
 //! the gate's hold and loss on [`Line::gate_read`] and [`Rest::gate`], the loop's answer to a box
 //! over the composer on [`answer_goes`], the restart or the wait on [`Line::lose`] and
-//! [`Restarts`], and what the host is told on [`line_held`]. The worker's program, the person, the
-//! session's rest, the host's deferral and the clock are the model's environment, rendered into
-//! the reads, `status` words, rests, lanes and instants the core takes. At every state the core is
-//! probed on copies, so a look settles, a turn settles, a write is held or lost, a box's answer
-//! goes, a loss is restarted or waits, and the host is let type or move exactly where the model
-//! says. Each walk runs in the committed configuration and in each scenario (a host that serves no
-//! input word, no restart lane), under five renderings: the unread word
-//! (`pending`, `typeahead`), for the line queued or input queued behind it, or the unserved one
-//! (none, `-`); a draw whole, arriving, joined to a person's words, or garbled with no person's
-//! key; each read under the model's box over the composer (`dlg`), the line drawn under it or
-//! not, as one that cannot say what the composer holds: a dialog's (no composer text), a glyph's
-//! cell unread (the composer's text, no say of what it holds), or no composer drawn (no text, no
-//! key count); each cause of a read not at rest; each cause of no restart lane; and a clear read
-//! dated by the write's held-text note or not. Every read the turn's settle takes is probed, so a
-//! turn settles, outlasts or keeps the line exactly where the model says, under the box too.
+//! [`Restarts`], the host's word that it made the restart on [`Restarts::answered`] (the restart
+//! made, the line ended with its program, only where another process is named after it; with the
+//! line's own process named, it stands held and the restart stands asked), its deferral on
+//! [`Restarts::deferred`], a restart standing spent by its line's settle on [`Restarts::settled`],
+//! and what the host is told on [`line_held`]. The worker's program, the person, the session's
+//! rest, the process the host and the restart's report name, and the clock are the model's
+//! environment, rendered into the reads, `status` words, rests, lanes, processes and instants the
+//! core takes; the host's word after a restart names the process it left by the restart's report
+//! with the host's own naming still the process before (a kept snapshot lagging), or by the host
+//! alone, the report naming none. At every state the
+//! core is probed on copies, so a look settles, a turn settles, a write is held or lost, a box's
+//! answer goes, a loss is restarted or waits, and the host is let type or move exactly where the
+//! model says. Each walk runs in the committed configuration and in each scenario (a host that
+//! serves no input word, no restart lane), under six renderings: the unread word (`pending`,
+//! `typeahead`), for the line queued or input queued behind it, or the unserved one (none, `-`); a
+//! draw whole, arriving, joined to a person's words, or garbled with no person's key; each read
+//! under the model's box over the composer (`dlg`), the line drawn under it or not, as one that
+//! cannot say what the composer holds: a dialog's (no composer text), a glyph's cell unread (the
+//! composer's text, no say of what it holds), or no composer drawn (no text, no key count); each
+//! cause of a read not at rest; each cause of no restart lane; and a clear read dated by the
+//! write's held-text note or not. Every read the turn's settle takes is probed, so a turn settles,
+//! outlasts or keeps the line exactly where the model says, under the box too.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use aterm_agent::supervise::custody::{
     At, CustodyGate, ECHO_HANG, GateRead, Held, Lane, LeftStands, Line, LineHeld, Look, Loss,
-    LostRestart, Process, Rest, Restarts, Settles, Shows, Turned, answer_goes, line_held,
+    LostRestart, Process, Rest, Restarted, Restarts, Settles, Shows, Turned, answer_goes,
+    line_held,
 };
 use aterm_agent::supervise::occupancy::fault::{self, Fault};
 use aterm_models_harness::line_custody_model;
@@ -57,14 +65,16 @@ const STEP: Duration = Duration::from_millis(1);
 const NOTED: Duration = Duration::from_secs(50);
 
 /// The model's mutants, which no real step mirrors.
-const MUTANTS: [&str; 13] = [
+const MUTANTS: [&str; 15] = [
     "AnswersComposer",
     "AnswersWithoutRead",
     "HostOverStands",
     "LostWithinMinute",
     "RestartAgain",
     "RestartBehind",
+    "RestartTakenOnWord",
     "RestartUnread",
+    "SettleKeepsAsked",
     "SettleOnMove",
     "SettleWithoutTurn",
     "TurnSettlesUnderDialog",
@@ -74,7 +84,7 @@ const MUTANTS: [&str; 13] = [
 ];
 
 /// The steps the core performs, each on its anchored function.
-const ANCHORED: [&str; 19] = [
+const ANCHORED: [&str; 22] = [
     "AnswersBox",
     "AsksRestart",
     "BreakKeepsDraw",
@@ -84,7 +94,10 @@ const ANCHORED: [&str; 19] = [
     "HostUpgrades",
     "LookDrawn",
     "LookPerson",
+    "RestartDeferred",
     "RestartMade",
+    "RestartMadeDeferred",
+    "RestartStands",
     "RestartUnmade",
     "SeesEnded",
     "TurnOutlasted",
@@ -96,9 +109,8 @@ const ANCHORED: [&str; 19] = [
     "WritesRead",
 ];
 
-/// The program's, the person's, the session's, the clock's and the host's steps, which the core
-/// only sees.
-const ENVIRONMENT: [&str; 17] = [
+/// The program's, the person's, the session's and the clock's steps, which the core only sees.
+const ENVIRONMENT: [&str; 16] = [
     "DialogGoes",
     "DialogShows",
     "Minute",
@@ -113,7 +125,6 @@ const ENVIRONMENT: [&str; 17] = [
     "ReadsAndDraws",
     "ReadsAndDrops",
     "ReadsBehind",
-    "RestartDeferred",
     "Rests",
     "Stirs",
 ];
@@ -240,10 +251,15 @@ fn shows(st: &State, r: &Real, run: Run) -> Shows {
 }
 
 /// What the read at `st` says of rest: at rest where the model's `rest` is, else one cause of
-/// not, and the composer clear where it shows none of the line; a box over it is no rest.
+/// not (the agent's own background work running under the turn's end among them), and the
+/// composer clear where it shows none of the line. Under the box over the composer each read is
+/// as the shell judges it: a dialog drawn over the composer, or no composer drawn, is no turn's
+/// end; the composer's glyph cell unread is the turn's end the rest's cause says, its composer
+/// never clear, since the read cannot say what it holds ([`shows`]).
 fn rest(st: &State, shows: &Shows, run: Run) -> Rest {
     let mut rest = Rest {
-        idle: true,
+        turn_ended: true,
+        working: false,
         clear: false,
         halted: false,
         autopilot: true,
@@ -252,18 +268,19 @@ fn rest(st: &State, shows: &Shows, run: Run) -> Rest {
         stuck: false,
     };
     if st["rest"] == 0 {
-        match run.v % 5 {
-            0 => rest.idle = false,
+        match run.v % 6 {
+            0 => rest.turn_ended = false,
             1 => rest.halted = true,
             2 => rest.autopilot = false,
             3 => rest.person = Some(GRACE - Duration::from_secs(1)),
+            4 => rest.working = true,
             _ => rest.stuck = true,
         }
     }
-    if st["dlg"] == 1 {
-        rest.idle = false;
+    if st["dlg"] == 1 && run.v % 3 != 1 {
+        rest.turn_ended = false;
     }
-    rest.clear = rest.idle && shows.stands == Some(LeftStands::Nothing);
+    rest.clear = rest.turn_ended && shows.stands == Some(LeftStands::Nothing);
     rest
 }
 
@@ -288,8 +305,9 @@ fn lane(run: Run) -> Lane {
 /// minute), a turn read running, a break's kept draw, the line lost, and the restart asked.
 fn project(r: &Real) -> State {
     let restart = match r.restarts.get() {
+        None if r.restarts.standing() => 3,
         None => 0,
-        Some(LostRestart::Made) => 1,
+        Some(LostRestart::Made | LostRestart::Unseen) => 1,
         Some(LostRestart::Unmade(_)) => 2,
     };
     let Some(line) = &r.line else {
@@ -463,10 +481,36 @@ fn mirror(
             r.now += ECHO_HANG;
             true
         }
-        "RestartMade" => {
-            ev.step(action, || r.restarts.made());
-            r.line = None;
-            r.pid += 1;
+        "RestartMade" | "RestartStands" => {
+            // The host's word that it made the restart, and the process named after it: another
+            // one where the restart ended the line's program, the line's own where it stands. On
+            // odd renderings the restart's own report names it while the host still names the
+            // process before (a kept snapshot lagging the restart); on even ones the report names
+            // none and the host names it. What the word comes to is the core's to say, and the
+            // line goes only where it says so.
+            let was = r.process();
+            if action == "RestartMade" {
+                r.pid += 1;
+            }
+            let (left, named) = if run.v % 2 == 1 {
+                (Some((Some(r.pid), None)), was)
+            } else {
+                (None, r.process())
+            };
+            let (line, restarts) = (r.line.as_ref(), &mut r.restarts);
+            let restarted = ev.step(action, || restarts.answered(line, left, named));
+            if restarted == Restarted::Ended {
+                r.line = None;
+            }
+            true
+        }
+        "RestartDeferred" | "RestartMadeDeferred" => {
+            // A deferral's word; under the second, the restart was made all the same (its signal
+            // went, the process it started not yet registered): the host names another process.
+            if action == "RestartMadeDeferred" {
+                r.pid += 1;
+            }
+            ev.step(action, || r.restarts.deferred());
             true
         }
         "RestartUnmade" => {
@@ -486,7 +530,7 @@ fn mirror(
         }
         "DialogGoes" | "DialogShows" | "NextAct" | "PersonClears" | "ProgramDraws"
         | "ProgramDrops" | "ProgramReads" | "Queues" | "ReadsAndDraws" | "ReadsAndDrops"
-        | "ReadsBehind" | "RestartDeferred" | "Rests" | "Stirs" => true,
+        | "ReadsBehind" | "Rests" | "Stirs" => true,
         _ => held_step(action, st, r, run, ev),
     }
 }
@@ -497,8 +541,16 @@ fn held_step(action: &'static str, st: &State, r: &mut Real, run: Run, ev: &mut 
     let process = r.process();
     let now = r.now;
     let w = word(st, run);
+    let restarts = &mut r.restarts;
     let Some(line) = r.line.as_mut() else {
         return false;
+    };
+    // A settle spends a restart that stood asked for the line, in the settle's own window.
+    let spend = |settles: bool, restarts: &mut Restarts| {
+        if settles {
+            restarts.settled();
+        }
+        settles
     };
     let settled = match action {
         "TurnRuns" => {
@@ -511,27 +563,34 @@ fn held_step(action: &'static str, st: &State, r: &mut Real, run: Run, ev: &mut 
         }
         "LookDrawn" => {
             let kept = line.drawn();
-            let look = ev.step(action, || line.look(&shows, At::Point));
             let stands = if st["q"] == 1 && st["dlg"] == 0 {
                 Some(LeftStands::Nothing)
             } else {
                 kept
             };
-            matches!(look, Look::Settled(Settles::Drawn, s) if Some(s) == stands)
+            ev.step(action, || {
+                let look = line.look(&shows, At::Point);
+                let drawn = matches!(look, Look::Settled(Settles::Drawn, s) if Some(s) == stands);
+                spend(drawn, restarts)
+            })
         }
         "LookPerson" => {
             let at = [At::Point, At::Break][run.v % 2];
-            let look = ev.step(action, || line.look(&shows, at));
-            matches!(look, Look::Settled(Settles::Person, _))
+            ev.step(action, || {
+                let look = line.look(&shows, at);
+                spend(matches!(look, Look::Settled(Settles::Person, _)), restarts)
+            })
         }
-        "SeesEnded" => ev.step(action, || line.ended(process)),
+        "SeesEnded" => ev.step(action, || spend(line.ended(process), restarts)),
         "AnswersBox" => {
             // The loop reads `status` before testing whether a dialog answer passes custody. A
             // fresh clear word can therefore prove the held line read in this same step.
             let _ = line.gate_read(w, false, now);
             return ev.step(action, || answer_goes(line.held(), &shows));
         }
-        "TurnSettles" => ev.step(action, || line.turned(w, &shows)) == Turned::Settles,
+        "TurnSettles" => ev.step(action, || {
+            spend(line.turned(w, &shows) == Turned::Settles, restarts)
+        }),
         "TurnOutlasted" => {
             let turned = ev.step(action, || {
                 let turned = line.turned(w, &shows);
@@ -558,7 +617,7 @@ fn held_step(action: &'static str, st: &State, r: &mut Real, run: Run, ev: &mut 
         }
         "AsksRestart" | "WaitsLost" => {
             let (rest, lane) = (rest(st, &shows, run), lane(run));
-            let restarts = &r.restarts;
+            let restarts = &*restarts;
             let loss = ev.step(action, || match line.gate_read(w, true, now) {
                 GateRead::Again if rest.gate() == CustodyGate::Lost => {
                     Some(line.lose(restarts, &lane, now))
@@ -632,8 +691,8 @@ fn walk(m: &Model, strict: bool, run: Run, ev: &mut Ev) -> Walked {
     }
 }
 
-/// The renderings each configuration is walked under.
-const RENDERINGS: usize = 5;
+/// The renderings each configuration is walked under: one for each cause of a read not at rest.
+const RENDERINGS: usize = 6;
 
 /// The committed configuration and each scenario, under every rendering.
 fn runs(fault: Option<Fault>) -> Vec<Run> {
@@ -678,7 +737,7 @@ type Applies = fn(Run) -> bool;
 
 #[test]
 fn tier1_each_planted_defect_disagrees_where_the_model_says() {
-    let controls: [(Fault, Applies, Where); 11] = [
+    let controls: [(Fault, Applies, Where); 14] = [
         // A point's look settles a line no read shows, or none can say of: the model holds it.
         (
             Fault::CustodySettlesUnshown,
@@ -760,6 +819,28 @@ fn tier1_each_planted_defect_disagrees_where_the_model_says() {
             Fault::CustodyLostBehind,
             |run| run.served,
             |st, _| st["cust"] == 1 && st["bq"] == 1,
+        ),
+        // The host's word that it made the restart settles the line and books the restart made
+        // though the process the line was written to stands: the model holds the line, its
+        // restart standing unanswered, to be asked again.
+        (
+            Fault::CustodyRestartOnWord,
+            |run| run.served && run.lane,
+            |st, _| st["cust"] == 1 && st["asked"] == 0 && st["restart"] == 3 && st["ripe"] == 1,
+        ),
+        // The host's naming is taken before the restart's own report: a restart made while the
+        // host still names the process it ended reads as nothing ended, where the model ends the
+        // line with its program and books the restart made.
+        (
+            Fault::CustodyRestartBySnapshot,
+            |run| run.served && run.lane && run.v % 2 == 1,
+            |st, _| st["cust"] == 0 && st["asked"] == 0 && st["restart"] == 1,
+        ),
+        // A settle leaves the restart that stood asked for its line unspent: the model spends it.
+        (
+            Fault::CustodySettleKeepsAsked,
+            |run| run.served && run.lane,
+            |st, _| st["cust"] == 0 && st["restart"] == 1,
         ),
     ];
     let runs: Vec<(Fault, Where, Run)> = controls

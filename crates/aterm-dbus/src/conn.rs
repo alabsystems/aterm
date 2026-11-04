@@ -156,7 +156,20 @@ impl Connection {
     /// # Errors
     /// [`Error::Auth`], [`Error::Remote`], or [`Error::Timeout`] after [`HANDSHAKE_TIMEOUT`].
     pub fn handshake(stream: CtlStream, uid: u32, expect_guid: Option<&str>) -> Result<Self> {
-        let deadline = now().checked_add(HANDSHAKE_TIMEOUT);
+        Self::handshake_within(stream, uid, expect_guid, HANDSHAKE_TIMEOUT)
+    }
+
+    /// [`Connection::handshake`] bounded by `timeout` instead of [`HANDSHAKE_TIMEOUT`].
+    ///
+    /// # Errors
+    /// As [`Connection::handshake`], or [`Error::Timeout`] after `timeout`.
+    pub fn handshake_within(
+        stream: CtlStream,
+        uid: u32,
+        expect_guid: Option<&str>,
+        timeout: Duration,
+    ) -> Result<Self> {
+        let deadline = now().checked_add(timeout);
         Self::handshake_until(stream, uid, expect_guid, deadline)
     }
 

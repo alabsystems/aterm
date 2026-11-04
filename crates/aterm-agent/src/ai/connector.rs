@@ -776,7 +776,7 @@ pub const KIMI_SIGNIN: SignIn = SignIn {
         ("KIMI_CODE_NO_AUTO_UPDATE", "1"),
     ],
     no_opener: true,
-    no_desk: &[],
+    no_desk: &["macos"],
     types_email: false,
     headless_page: true,
 };

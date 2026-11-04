@@ -290,6 +290,44 @@ pub(super) fn settle(path: &Path) -> io::Result<Option<File>> {
     Ok(None)
 }
 
+/// WHAT [`settle`] WOULD DO, judged without doing it, for a check that writes nothing
+/// (`BrokerLog::check_open`, `check_open.rs`): `Ok(true)` when it would finish a switch (its
+/// marker is durable and the log is still the one it pins), `Ok(false)` when it would do
+/// nothing or only undo a staging no marker covers (which leaves the log and its own sidecars
+/// as they stand), and the refusal it would make: a marker this build does not read, or a log
+/// that changed since its marker ([`changed`]).
+pub(super) fn pending(path: &Path) -> io::Result<bool> {
+    let marker = beside(path, MARKER);
+    if !present(&marker)? {
+        return Ok(false);
+    }
+    let m = read_marker(&marker)?;
+    if present(&beside(path, STAGED))? {
+        if let Some(what) = changed_since(path, &m)? {
+            return Err(changed(path, &what));
+        }
+    }
+    Ok(true)
+}
+
+/// The refusal of a switch whose marker was made for a plaintext log that has since changed
+/// (`what` names the change, [`changed_since`]).
+fn changed(path: &Path, what: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "{}: the offline seal's switch this marker names was made for the plaintext log as \
+             it stood then, and {what} has changed since: something that does not finish a \
+             switch (an older astream) wrote to the log after the marker, or it was replaced. \
+             Finishing it would drop what was written, and the sidecars it replaced already \
+             cannot be put back with certainty, so the open refuses and moves nothing; the \
+             staged copy {} is stale",
+            beside(path, MARKER).display(),
+            beside(path, STAGED).display()
+        ),
+    )
+}
+
 /// UNDO a staging no marker covers: its sidecars and tmp files first, the staged log last,
 /// so a staged log is gone only once nothing staged is left beside it (and a crash in here
 /// leaves a staging the next open undoes again). The plaintext log is not touched.
@@ -319,20 +357,7 @@ fn complete(
     let staged = beside(path, STAGED);
     if present(&staged)? {
         if let Some(what) = changed_since(path, m)? {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "{}: the offline seal's switch this marker names was made for the plaintext \
-                     log as it stood then, and {what} has changed since: something that does \
-                     not finish a switch (an older astream) wrote to the log after the marker, \
-                     or it was replaced. \
-                     Finishing it would drop what was written, and the sidecars it replaced \
-                     already cannot be put back with certainty, so the open refuses and moves \
-                     nothing; the staged copy {} is stale",
-                    beside(path, MARKER).display(),
-                    staged.display()
-                ),
-            ));
+            return Err(changed(path, &what));
         }
     }
     let mask = m.mask;
@@ -470,13 +495,14 @@ pub(crate) enum Alter {
     State,
 }
 
-/// The seal's test seam: the crash tests stop it dead after a durable step, and the
-/// read-back's tests plant a difference in the staged copy (`alter`: where, and the bytes
+/// The seal's test seam: the crash tests stop it dead after a durable step (in a debug
+/// build too, for [`BrokerLog::seal_plaintext_stopped_at_its_switch`]), and the read-back's
+/// tests plant a difference in the staged copy (`alter`: where, and the bytes
 /// whose first one is flipped before that payload is sealed).
 #[cfg(all(feature = "at-rest", unix))]
 #[derive(Default)]
 pub(crate) struct Seam {
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     pub(crate) crash_after: Option<Step>,
     #[cfg(test)]
     pub(crate) alter: Option<(Alter, &'static [u8])>,
@@ -484,14 +510,14 @@ pub(crate) struct Seam {
 
 #[cfg(all(feature = "at-rest", unix))]
 impl Seam {
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     fn crash(&self, step: Step) -> io::Result<()> {
         if self.crash_after == Some(step) {
             return Err(io::Error::other(format!("injected crash after {step:?}")));
         }
         Ok(())
     }
-    #[cfg(not(test))]
+    #[cfg(not(any(test, debug_assertions)))]
     #[allow(clippy::unused_self)]
     const fn crash(&self, _step: Step) -> io::Result<()> {
         Ok(())
@@ -563,6 +589,39 @@ impl BrokerLog {
     /// - Any I/O error closing the plaintext log, writing the copy or switching it in.
     pub fn seal_plaintext(path: impl AsRef<Path>, key: [u8; 32]) -> io::Result<SealedLog> {
         seal(path.as_ref(), key, &Seam::default())
+    }
+}
+
+#[cfg(all(any(test, debug_assertions), feature = "at-rest", unix))]
+impl BrokerLog {
+    /// [`seal_plaintext`](Self::seal_plaintext) STOPPED DEAD once its marker
+    /// (`<log>.sealmove`) is durable, in a test or debug build only and never behind a cargo
+    /// feature: the log a crash at that moment leaves, a switch the next open finishes, which
+    /// [`check_open`](Self::check_open) answers
+    /// [`OpenCheck::Unsettled`]`(`[`InterruptedStep::SealSwitch`]`)`. An embedder's tests make
+    /// that log with it (aterm tests its `--retire-log` refusal of one so).
+    ///
+    /// # Errors
+    /// The seal's own error at a step before its marker ([`seal_plaintext`](Self::seal_plaintext)
+    /// names them), or `InvalidData` when the seal left no switch for an open to finish.
+    pub fn seal_plaintext_stopped_at_its_switch(
+        path: impl AsRef<Path>,
+        key: [u8; 32],
+    ) -> io::Result<()> {
+        let path = path.as_ref();
+        let seam = Seam {
+            crash_after: Some(Step::Marker),
+            #[cfg(test)]
+            alter: None,
+        };
+        match seal(path, key, &seam) {
+            Err(_) if pending(path)? => Ok(()),
+            Err(e) => Err(e),
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{}: the seal left no switch to finish", path.display()),
+            )),
+        }
     }
 }
 

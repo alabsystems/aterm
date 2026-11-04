@@ -659,12 +659,21 @@ impl HeldStore {
         base: u64,
         created: bool,
     ) -> io::Result<HeldStore> {
-        let path = held_path(log);
         let _ = crate::store::remove_file_path(&held_tmp_path(log));
         if created {
-            let _ = crate::store::remove_file_path(&path);
+            let _ = crate::store::remove_file_path(&held_path(log));
             return Ok(HeldStore::default());
         }
+        Self::read(log, key, base)
+    }
+
+    /// [`Self::load`]'s read of the store as it stands, which changes no file: the cut it
+    /// finds is only owed ([`Self::make_owed_cut`]). The store is opened read-write, for the
+    /// appends an open makes later, and nothing is written through it here: a check that
+    /// writes nothing (`BrokerLog::check_open`) reads it so too, so a store the open could
+    /// not append to is refused there as the open refuses it.
+    pub(crate) fn read(log: &Path, key: Option<AtRestRef<'_>>, base: u64) -> io::Result<HeldStore> {
+        let path = held_path(log);
         let Some(file) = open_sidecar(&path, u64::MAX, true, "held store")? else {
             return Ok(HeldStore::default());
         };

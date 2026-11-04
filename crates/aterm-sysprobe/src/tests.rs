@@ -111,12 +111,25 @@ fn every_proc_read_is_bounded_to_4_kib() {
     assert_eq!(linux::swap_pages(torn), None);
 }
 
+/// NEGATIVE CONTROL: unknown kernel pressure levels (`0`, `3`, `-1`) map to `None`, `Normal` is
+/// neither elevated nor critical, and `Warn` is elevated without being critical.
 #[test]
 fn kernel_pressure_levels_map_to_memory_levels() {
     assert_eq!(pressure_of(1), Some(MemoryLevel::Normal));
     assert_eq!(pressure_of(2), Some(MemoryLevel::Warn));
     assert_eq!(pressure_of(4), Some(MemoryLevel::Critical));
-    assert_eq!(pressure_of(3), None);
+    for unknown in [-1, 0, 3, 5, i64::MAX] {
+        assert_eq!(pressure_of(unknown), None);
+    }
+    assert_eq!(MemoryLevel::Normal.as_str(), "normal");
+    assert!(!MemoryLevel::Normal.is_elevated());
+    assert!(!MemoryLevel::Normal.is_critical());
+    assert_eq!(MemoryLevel::Warn.as_str(), "warn");
+    assert!(MemoryLevel::Warn.is_elevated());
+    assert!(!MemoryLevel::Warn.is_critical());
+    assert_eq!(MemoryLevel::Critical.as_str(), "critical");
+    assert!(MemoryLevel::Critical.is_elevated());
+    assert!(MemoryLevel::Critical.is_critical());
 }
 
 #[test]
@@ -2257,4 +2270,63 @@ fn the_os_major_version_is_the_leading_number() {
     assert_eq!(words(Some("macOS")).os_major(), None);
     assert_eq!(words(Some("macOS x.1")).os_major(), None);
     assert_eq!(words(None).os_major(), None);
+}
+
+/// NEGATIVE CONTROL: distinct byte values at every offset catch field swaps (`pgid` vs `measured`
+/// or `available_mib` vs `used_mib`) and shift typos, and `total_estimated_mib` saturates at
+/// `u64::MAX` instead of wrapping.
+#[test]
+fn group_and_machine_memory_wire_roundtrip_and_saturating_total() {
+    let distinct_group = GroupMemory {
+        pgid: 0x0403_0201,
+        measured: 0x0807_0605,
+        footprint_mib: 0x100f_0e0d_0c0b_0a09,
+    };
+    let group_bytes = distinct_group.encode_le();
+    assert_eq!(
+        group_bytes,
+        [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10,
+        ]
+    );
+    assert_eq!(GroupMemory::decode_le(group_bytes), distinct_group);
+    for boundary in [
+        GroupMemory {
+            pgid: 0,
+            measured: 0,
+            footprint_mib: 0,
+        },
+        GroupMemory {
+            pgid: u32::MAX,
+            measured: u32::MAX,
+            footprint_mib: u64::MAX,
+        },
+    ] {
+        assert_eq!(GroupMemory::decode_le(boundary.encode_le()), boundary);
+    }
+
+    let distinct_machine = MachineMemory {
+        available_mib: 0x0807_0605_0403_0201,
+        used_mib: 0x100f_0e0d_0c0b_0a09,
+    };
+    let machine_bytes = distinct_machine.encode_le();
+    assert_eq!(
+        machine_bytes,
+        [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10,
+        ]
+    );
+    assert_eq!(MachineMemory::decode_le(machine_bytes), distinct_machine);
+    assert_eq!(
+        distinct_machine.total_estimated_mib(),
+        0x0807_0605_0403_0201u64 + 0x100f_0e0d_0c0b_0a09u64
+    );
+    let saturated = MachineMemory {
+        available_mib: u64::MAX - 10,
+        used_mib: 100,
+    };
+    assert_eq!(saturated.total_estimated_mib(), u64::MAX);
+    assert_eq!(MachineMemory::decode_le(saturated.encode_le()), saturated);
 }

@@ -201,8 +201,8 @@ fn each_mac_writes_its_own_row_and_every_member_reads_each_ones_latest() {
 
     // The rows cross: each Mac reads both, each Mac's latest.
     repair_commons(&lab, 6);
-    for n in 0..2 {
-        let read = read(&lab.paths[n]).unwrap();
+    for (n, paths) in lab.paths[..2].iter().enumerate() {
+        let read = read(paths).unwrap();
         assert_eq!(counter(&read, &zero.me), Some(2), "Mac {n}");
         assert_eq!(counter(&read, &one.me), Some(1), "Mac {n}");
         assert_eq!(read.rows.len(), 2);
@@ -225,12 +225,9 @@ fn a_row_at_another_macs_key_is_inert() {
     let forged = command(&zero, &row(9, now)).unwrap();
     commit_ring(&lab.paths[1], D, now, &encode(&forged).unwrap());
     repair_commons_at(&lab, 6, &[now, now]);
-    for n in 0..2 {
+    for (n, paths) in lab.paths[..2].iter().enumerate() {
         assert_eq!(
-            counter(
-                &read_at(&lab.paths[n], now, Caps::default()).unwrap(),
-                &zero
-            ),
+            counter(&read_at(paths, now, Caps::default()).unwrap(), &zero),
             Some(1),
             "Mac {n}"
         );
@@ -742,8 +739,8 @@ fn split_sides_write_the_same_day_tables_and_a_heal_merges_them() {
     let me: Vec<_> = (0..3)
         .map(|n| read_at(&lab.paths[n], heal, caps).unwrap().me)
         .collect();
-    for n in 0..3 {
-        let read = read_at(&lab.paths[n], heal, caps).unwrap();
+    for (n, paths) in lab.paths[..3].iter().enumerate() {
+        let read = read_at(paths, heal, caps).unwrap();
         assert_eq!(
             me.iter()
                 .map(|machine| counter(&read, machine))
@@ -894,8 +891,8 @@ fn a_clock_back_from_running_ahead_reads_its_peers_and_never_forks_its_history()
     let marked = json!({"counter": next, "until": floor + DAY, "claims": ["back@example.invalid"]});
     write_at(&lab.paths[0], &marked, floor, caps).unwrap();
     repair_commons_at(&lab, 10, &[floor, floor]);
-    for n in 0..2 {
-        let read = read_at(&lab.paths[n], floor, caps).unwrap();
+    for (n, paths) in lab.paths[..2].iter().enumerate() {
+        let read = read_at(paths, floor, caps).unwrap();
         assert_eq!(read.writable, Ok(()), "Mac {n}");
         assert_eq!(
             claims_of(&read, &me[0]),
@@ -981,8 +978,8 @@ fn a_clock_set_back_days_then_righted_writes_on_in_its_own_tables() {
     let next = counter(&read_at(&lab.paths[0], right, caps).unwrap(), &me).map_or(1, |c| c + 1);
     write_at(&lab.paths[0], &row(next, right), right, caps).unwrap();
     repair_commons_at(&lab, 10, &[right, right]);
-    for n in 0..2 {
-        let read = read_at(&lab.paths[n], right, caps).unwrap();
+    for (n, paths) in lab.paths[..2].iter().enumerate() {
+        let read = read_at(paths, right, caps).unwrap();
         assert_eq!(read.writable, Ok(()), "Mac {n}");
         assert_eq!(counter(&read, &me), Some(next), "Mac {n}");
     }

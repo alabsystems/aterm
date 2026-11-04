@@ -28,6 +28,41 @@ const LEARN_DEADLINES: crate::wire::Deadlines = crate::wire::Deadlines {
     backstop: std::time::Duration::from_secs(10),
 };
 
+/// The bound a test set on each of `LEARN_DEADLINES`, in milliseconds (0: none set).
+#[cfg(all(unix, any(test, debug_assertions)))]
+static LEARN_DEADLINES_FOR_TEST_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Bound `me_once`'s connect, idle and whole request by `bound` instead of `LEARN_DEADLINES`,
+/// for this process.
+///
+/// A test whose loopback GitHub must answer `GET /user` sets the hang detector here: a loaded
+/// machine that outlasts the product's 10 s would otherwise read the fake as unreachable.
+#[cfg(all(unix, any(test, debug_assertions)))]
+#[doc(hidden)]
+pub fn set_learn_deadlines_for_test(bound: std::time::Duration) {
+    let ms = u64::try_from(bound.as_millis()).unwrap_or(u64::MAX).max(1);
+    LEARN_DEADLINES_FOR_TEST_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `LEARN_DEADLINES`, or the bound a test set with [`set_learn_deadlines_for_test`].
+#[cfg(unix)]
+fn learn_deadlines() -> crate::wire::Deadlines {
+    #[cfg(any(test, debug_assertions))]
+    match LEARN_DEADLINES_FOR_TEST_MS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => {}
+        ms => {
+            let bound = std::time::Duration::from_millis(ms);
+            return crate::wire::Deadlines {
+                connect: bound,
+                idle: bound,
+                backstop: bound,
+            };
+        }
+    }
+    LEARN_DEADLINES
+}
+
 /// Users and the rate limit.
 pub struct Users<'a> {
     gh: &'a Github,
@@ -49,7 +84,7 @@ impl<'a> Users<'a> {
         from_json(&answered.json()?)
     }
 
-    /// `me`, sent once under `LEARN_DEADLINES`: no retry, no secondary-limit wait. Vault
+    /// `me`, sent once under `learn_deadlines()`: no retry, no secondary-limit wait. Vault
     /// adoption learns a login with it (design §6.10), and its next call asks again.
     ///
     /// # Errors
@@ -59,7 +94,7 @@ impl<'a> Users<'a> {
         let route = RouteRequest::read(RouteTarget::Identity).with_as(Some(profile.to_string()));
         let call = Call::get("/user", route)
             .retry(Some(crate::retry::RetryPolicy::NONE))
-            .deadlines(LEARN_DEADLINES);
+            .deadlines(learn_deadlines());
         let answered = self.gh.call(&call)?;
         from_json(&answered.json()?)
     }

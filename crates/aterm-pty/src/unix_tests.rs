@@ -3514,3 +3514,343 @@ fn a_masters_drain_reads_at_most_sixteen_reads_a_round() {
         "the second round: the rest, then the end"
     );
 }
+
+/// A session leader whose program some process still holds open for writing as it execs
+/// (Linux's `ETXTBSY`, as when another thread forked a child while a copy was being written) is
+/// tried again on a fresh pty and spawns once the writer lets go.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_session_leader_whose_program_is_open_for_writing_spawns_once_it_is_let_go() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let scratch = aterm_tempfile::tempdir().expect("scratch");
+    let exe = scratch.path().join("true");
+    std::fs::copy("/bin/true", &exe).expect("a copy of true");
+    let writer = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&exe)
+        .expect("a writer of the copy");
+    let let_go = std::sync::Arc::new(AtomicBool::new(false));
+    let seen = std::sync::Arc::clone(&let_go);
+    aterm_uds::spawnfd::on_next_text_busy_pause(move || {
+        seen.store(true, Ordering::SeqCst);
+        drop(writer);
+    });
+    let _ = spawn_trace::take();
+    let spawned = spawn_session_leader_on_pty(|_slave| Ok(std::process::Command::new(&exe)));
+    let forked = spawn_trace::take();
+    let (master, slave, mut child) = spawned.expect("spawned once the writer let go");
+    let status = child.wait().expect("true, reaped");
+    end_session_on_pty(
+        master,
+        Some(slave),
+        &mut child,
+        aterm_spec::wait::MUST_HAPPEN,
+        &mut |_| {},
+    )
+    .expect("the session ends");
+    assert!(
+        let_go.load(Ordering::SeqCst),
+        "the first exec was refused and the spawn paused"
+    );
+    // At least two: a child another test thread forks while the writer is open holds it until
+    // its own exec, and can refuse a later try too.
+    assert!(
+        forked.len() >= 2,
+        "a refused fork, then at least one more, each onto a pty: {forked:?}"
+    );
+    assert!(status.success(), "true ran: {status}");
+}
+
+/// [`child_exit_unreaped`] reads a child running, then exited and not reaped, then reaped, and
+/// its reads reap nothing: the child's exit is still there for `wait` to take.
+#[test]
+fn a_childs_exit_is_read_without_reaping_it() {
+    use std::time::{Duration, Instant};
+    let mut cat = aterm_uds::spawnfd::command("/bin/cat")
+        .stdin(aterm_uds::spawnfd::Stdio::piped())
+        .stdout(aterm_uds::spawnfd::Stdio::null())
+        .stderr(aterm_uds::spawnfd::Stdio::null())
+        .spawn()
+        .expect("cat starts");
+    let pid = i32::try_from(cat.id()).expect("a pid");
+    let running = child_exit_unreaped(pid);
+    drop(cat.stdin.take());
+    let until = Instant::now() + HANG_DETECTOR;
+    while child_exit_unreaped(pid) != Some(true) && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let exited = child_exit_unreaped(pid);
+    let status = cat.wait().expect("cat, reaped");
+    assert_eq!(running, Some(false), "running");
+    assert_eq!(exited, Some(true), "exited, not reaped");
+    assert_eq!(child_exit_unreaped(pid), None, "reaped");
+    assert!(status.success(), "cat saw its end: {status}");
+}
+
+/// [`child_exit_unreaped`] reads a stopped child as running: Darwin's `waitid` reports a stop
+/// under `WEXITED` alone, and that report is not an exit.
+#[test]
+fn a_stopped_child_is_read_as_running() {
+    use std::time::{Duration, Instant};
+    let mut cat = aterm_uds::spawnfd::command("/bin/cat")
+        .stdin(aterm_uds::spawnfd::Stdio::piped())
+        .stdout(aterm_uds::spawnfd::Stdio::null())
+        .stderr(aterm_uds::spawnfd::Stdio::null())
+        .spawn()
+        .expect("cat starts");
+    let pid = i32::try_from(cat.id()).expect("a pid");
+    let id = libc::id_t::try_from(pid).expect("an id");
+    // SAFETY: a plain syscall taking no pointer; `pid` is this test's unreaped child.
+    unsafe { libc::kill(pid, libc::SIGSTOP) };
+    // Whether `pid` has a stop to report, read without taking it.
+    let stopped = || {
+        // SAFETY: every field of `siginfo_t` is an integer or a pointer, so all-zero is valid.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is a live, writable `siginfo_t`; `WNOWAIT` leaves the report in place.
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                id,
+                &raw mut info,
+                libc::WSTOPPED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        rc == 0 && info.si_signo == libc::SIGCHLD && info.si_code == libc::CLD_STOPPED
+    };
+    let until = Instant::now() + HANG_DETECTOR;
+    while !stopped() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let was_stopped = stopped();
+    let read = child_exit_unreaped(pid);
+    // SAFETY: a plain syscall taking no pointer; `pid` is still this test's unreaped child.
+    unsafe { libc::kill(pid, libc::SIGCONT) };
+    drop(cat.stdin.take());
+    let status = cat.wait().expect("cat, reaped");
+    assert!(was_stopped, "cat stopped");
+    assert_eq!(read, Some(false), "a stopped child, read as running");
+    assert!(status.success(), "cat saw its end once continued: {status}");
+}
+
+/// A session leader that exits leaving a job of its group on the slave, one that ignores the
+/// hangup the exit sends, is a zombie by the time [`end_session_on_pty`] looks, and its group
+/// is still ended: on Linux, where the exit revokes nothing, that job would keep the master
+/// from its end; on Apple, where the exit revokes the slave first, the master ends either way,
+/// so the test waits for the group to have no live member (`kill` answers `ESRCH`, or `EPERM`
+/// once only zombies are left; a Linux zombie answers until it is reaped).
+#[test]
+fn a_session_whose_leader_exited_leaving_its_group_on_the_slave_ends() {
+    use std::time::{Duration, Instant};
+    let (master, slave, mut leader) = spawn_session_leader_on_pty(|slave| {
+        let tty = || slave.try_clone().map(std::process::Stdio::from);
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", "trap '' HUP; sleep 600 & exit 0"])
+            .stdout(tty()?)
+            .stderr(tty()?);
+        Ok(cmd)
+    })
+    .expect("sh spawns onto a pty");
+    let pid = i32::try_from(leader.id()).expect("a pid");
+    let until = Instant::now() + HANG_DETECTOR;
+    while child_exit_unreaped(pid) != Some(true) && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let zombie = child_exit_unreaped(pid) == Some(true);
+    let ended = end_session_on_pty(
+        master,
+        Some(slave),
+        &mut leader,
+        aterm_spec::wait::MUST_HAPPEN,
+        &mut |_| {},
+    );
+    assert!(zombie, "sh exited, leaving its job");
+    let status = ended.expect("the session ends");
+    // SAFETY: a plain syscall taking no pointer; `pid` > 1 names the group sh led, and signal 0
+    // only asks whether it has a member to signal.
+    let group_lives = || unsafe { libc::kill(-pid, 0) } == 0;
+    let until = Instant::now() + HANG_DETECTOR;
+    while group_lives() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    if group_lives() {
+        // A group keeps its id while it has a member, so the id just found live names sh's group
+        // still: ended here, so a broken end leaves no `sleep 600` running past the test.
+        let _ = aterm_uds::process::kill_group_until_empty(pid);
+        panic!("the job in sh's group outlived the session's end by the hang detector");
+    }
+    assert!(status.success(), "sh exited 0: {status}");
+}
+
+/// A pty whose `grantpt` never returns by itself, as XNU's spins on a pty whose node could not
+/// be made (ATERM-KI-1028-4), is let go at [`GRANT_BOUND`] and replaced: the open returns a
+/// working pair on another pty, the stuck one held open until then: its master still answers by
+/// its name once the fresh pair is open (`pty_race::replaced`), which no other pty's churn can
+/// change, as it can which number the fresh pair gets. The open runs on a thread of its own (the
+/// seam is per thread), so the test can wait on it with the hang detector.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_pty_whose_grant_never_returns_is_let_go_and_replaced() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        pty_race::reset();
+        pty_race::grants_spin(1);
+        let pair = open_pty_pair();
+        let struck = pty_race::take_struck_grants();
+        let replaced = pty_race::take_replaced();
+        let slots = pty_race::take_let_go_slots();
+        pty_race::reset();
+        let _ = tx.send((pair, struck, replaced, slots));
+    });
+    let (pair, struck, replaced, slots) = rx
+        .recv_timeout(HANG_DETECTOR)
+        .expect("the open returns within the hang detector");
+    let (master, slave) = pair.expect("a pair in place of the stuck pty");
+    let name = pts_name(master).expect("the fresh pair's name");
+    // SAFETY: `slave` is a descriptor this test owns; `fstat` writes into `st`.
+    let answers = unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        libc::fstat(slave, &raw mut st) == 0
+    };
+    // SAFETY: closing the pair this test opened.
+    unsafe {
+        libc::close(slave);
+        libc::close(master);
+    }
+    assert_eq!(struck.len(), 1, "one grant spun: {struck:?}");
+    assert_eq!(
+        replaced,
+        vec![Some(struck[0].clone())],
+        "the stuck pty, held open, answering by its name, once the fresh pair was open"
+    );
+    assert_ne!(struck[0], name, "the fresh pair is on another pty");
+    assert!(answers, "the fresh pair's slave answers fstat");
+    assert_eq!(
+        slots,
+        vec![true],
+        "the master's slot held the watchdog's pipe when the open closed it: the number stayed \
+         reserved, never free for another open to take"
+    );
+}
+
+/// A grant that is only slow, as on an opener the scheduler keeps off its core (heavy load, a
+/// page-in, a stop), is never let go: it burns no CPU, where XNU's spin burns a core. Two
+/// grants in a row that sleep twice [`GRANT_BOUND`] before they run give the open the first
+/// napped pty, nothing replaced (let go, each would be replaced, and the second, with no
+/// replacement left, would fail the open).
+#[cfg(target_os = "macos")]
+#[test]
+fn a_grant_that_is_only_slow_is_never_let_go() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        pty_race::reset();
+        pty_race::grants_nap(2, GRANT_BOUND * 2);
+        let pair = open_pty_pair();
+        let napped = pty_race::take_napped_grants();
+        let replaced = pty_race::take_replaced();
+        pty_race::reset();
+        let _ = tx.send((pair, napped, replaced));
+    });
+    let (pair, napped, replaced) = rx
+        .recv_timeout(HANG_DETECTOR)
+        .expect("the open returns within the hang detector");
+    let name = pair.map_err(|e| e.to_string()).map(|(master, slave)| {
+        let name = pts_name(master).ok();
+        // SAFETY: closing the pair this test opened.
+        unsafe {
+            libc::close(slave);
+            libc::close(master);
+        }
+        name
+    });
+    assert_eq!(
+        name,
+        Ok(napped.first().cloned()),
+        "the open returns the napped pty (napped: {napped:?}, replaced: {replaced:?})"
+    );
+    assert!(replaced.is_empty(), "no pty replaced: {replaced:?}");
+    assert_eq!(napped.len(), 1, "one grant napped: {napped:?}");
+}
+
+/// A child forked while another thread holds the watchdog's lock (the watchdog in its scan, or
+/// an opener pushing its grant) has that lock held by a thread it does not have, and no
+/// watchdog: its grant goes unbounded, as `grantpt` alone does, and returns, never waiting on
+/// that lock. The child runs the grant on a stand-in that touches no descriptor, writes one
+/// byte and exits; the test waits for it with the hang detector and ends only that child.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_child_forked_while_the_watchdog_is_held_grants_without_it() {
+    let (master, slave) = open_pty_pair().expect("a pair, so the watchdog runs");
+    // SAFETY: closing the pair this test opened.
+    unsafe {
+        libc::close(slave);
+        libc::close(master);
+    }
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        grant_watch::holding_lock(|| {
+            let _ = held_tx.send(());
+            let _ = go_rx.recv();
+        });
+    });
+    held_rx
+        .recv_timeout(HANG_DETECTOR)
+        .expect("the holder has the watchdog's lock");
+    let mut ends = [0 as libc::c_int; 2];
+    // SAFETY: `ends` is two writable descriptor slots, which `pipe` fills on success.
+    assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0, "a pipe");
+    aterm_uds::spawnfd::pass_libnotify_gate();
+    // SAFETY: the child runs the grant on a stand-in that returns at once and touches no
+    // descriptor, then calls only `write` and `_exit`.
+    let pid = unsafe { libc::fork() };
+    if pid == 0 {
+        let ok = matches!(
+            grant_watch::grant(-1, |_| 0),
+            grant_watch::Granted::Returned(Ok(()))
+        );
+        // SAFETY: `ends[1]` is the pipe's write end, inherited; one byte from a live array.
+        unsafe {
+            libc::write(ends[1], [u8::from(ok)].as_ptr().cast(), 1);
+            libc::_exit(0);
+        }
+    }
+    drop(go_tx);
+    holder.join().expect("the holder lets go");
+    // SAFETY: closing the write end this process holds; the child holds its own.
+    unsafe { libc::close(ends[1]) };
+    let mut said = [0u8; 1];
+    let mut ready = libc::pollfd {
+        fd: ends[0],
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let until = std::time::Instant::now() + HANG_DETECTOR;
+    let got = loop {
+        let left = until.saturating_duration_since(std::time::Instant::now());
+        let ms = libc::c_int::try_from(left.as_millis()).unwrap_or(libc::c_int::MAX);
+        // SAFETY: `ready` is one live `pollfd`.
+        match unsafe { libc::poll(&raw mut ready, 1, ms) } {
+            1 => {
+                // SAFETY: one writable byte; `ends[0]` is the pipe's read end.
+                break unsafe { libc::read(ends[0], said.as_mut_ptr().cast(), 1) } == 1;
+            }
+            -1 if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => {}
+            _ => break false,
+        }
+    };
+    if !got {
+        // SAFETY: a plain syscall taking no pointer; `pid` is this test's own unreaped child.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+    let mut status = 0;
+    // SAFETY: `status` is a live int; `pid` is this test's own child, reaped once here.
+    unsafe {
+        libc::waitpid(pid, &raw mut status, 0);
+        libc::close(ends[0]);
+    }
+    assert!(
+        got,
+        "the forked child's grant returned within the hang detector"
+    );
+    assert_eq!(said[0], 1, "with the stand-in's success");
+}

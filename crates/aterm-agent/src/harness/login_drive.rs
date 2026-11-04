@@ -545,16 +545,50 @@ pub enum Approval {
     BotCheck(String),
 }
 
+/// What a resume operation established before a new native child is considered.
+pub enum Resume {
+    /// No completion from this admitted attempt was used.
+    Fresh,
+    /// A retained credential is staged for native refresh; its earlier effect remains consumed.
+    NativeSeed,
+    /// A retained native completion will be finalized and revalidated.
+    Completed(Outcome),
+}
+
 /// Approves a sign-in's page ([`drive`]): the headless browser, or a test's stand-in.
 pub trait Approver {
+    /// Resume an unpublished native completion before requiring or starting a native child.
+    /// A returned completion must be revalidated by `complete` before publication.
+    fn resume(&mut self, _request: &Request<'_>, _deadline: Instant) -> Result<Resume, String> {
+        Ok(Resume::Fresh)
+    }
+
+    /// Bind private finalization state to this exact native attempt before it starts.
+    /// This hook must not start provider authentication.
+    fn begin(&mut self, _request: &Request<'_>) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Approve `handoff`'s page, or say why not.
     fn approve(&mut self, handoff: &Handoff<'_>) -> Approval;
+
+    /// Finalize private browser state only after the native child has completed.
+    /// A failure prevents publication; non-success outcomes must discard pending state.
+    fn complete(
+        &mut self,
+        _request: &Request<'_>,
+        _outcome: &Outcome,
+        _deadline: Instant,
+    ) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// How a driven sign-in ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    /// It said it is done and exited 0: `email` where its done line named one, `page` where the
+    /// The native child completed successfully, or a retained completion was revalidated.
+    /// `email` from native completion or canonical revalidation, `page` where the
     /// approved page showed the row's email.
     SignedIn {
         /// The email the CLI's own report named.
@@ -580,8 +614,11 @@ pub enum Outcome {
     Failed,
     /// [`HANG`] ran out, and it was ended.
     Hung,
-    /// It did not run.
+    /// No provider action or retained completion was used.
     NotRun(String),
+    /// A provider action may have occurred, but its result is unverified.
+    /// This is not evidence that repeating the provider action is safe.
+    Unverified(String),
 }
 
 impl Outcome {
@@ -600,6 +637,7 @@ impl Outcome {
             Outcome::Failed => "failed".to_owned(),
             Outcome::Hung => "hung".to_owned(),
             Outcome::NotRun(_) => "not-run".to_owned(),
+            Outcome::Unverified(_) => "unverified".to_owned(),
         }
     }
 }
@@ -681,7 +719,7 @@ pub fn drive(spec: &Spec<'_>, approver: &mut dyn Approver) -> Drove {
         Ok(child) => child,
         Err(e) => {
             return Drove {
-                outcome: Outcome::NotRun(format!("it will not run: {e}")),
+                outcome: Outcome::NotRun(format!("{}: {e}", spec.program.display())),
                 host: None,
             };
         }
@@ -784,7 +822,7 @@ pub fn drive(spec: &Spec<'_>, approver: &mut dyn Approver) -> Drove {
                 Approval::NotRun(why) => {
                     end(&mut child);
                     return Drove {
-                        outcome: Outcome::NotRun(why),
+                        outcome: Outcome::Unverified(why),
                         host,
                     };
                 }
@@ -857,10 +895,82 @@ pub fn drive(spec: &Spec<'_>, approver: &mut dyn Approver) -> Drove {
     Drove { outcome, host }
 }
 
+/// Opaque identity of an admitted native recovery attempt. Pool writers bind
+/// its row and parent facts; shared-root admissions bind the exact consumed
+/// intent. The key alone grants no authority to perform or publish root effects.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryKey(pub(super) [u8; 32]);
+
+impl std::fmt::Debug for RecoveryKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RecoveryKey(opaque)")
+    }
+}
+
+type RecoveryCheck = dyn Fn(Option<[u8; 32]>) -> Result<(), String> + Send + Sync;
+
+/// Live authority retained alongside an admitted recovery key. Constructing a key
+/// alone cannot authorize root-scoped browser work or session publication.
+#[derive(Clone)]
+pub struct RecoveryAdmission {
+    key: RecoveryKey,
+    check: std::sync::Arc<RecoveryCheck>,
+    native_entry: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl RecoveryAdmission {
+    pub(super) fn new(
+        key: RecoveryKey,
+        native_entry: bool,
+        check: impl Fn(Option<[u8; 32]>) -> Result<(), String> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            key,
+            check: std::sync::Arc::new(check),
+            native_entry: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(native_entry)),
+        }
+    }
+
+    pub(super) fn key(&self) -> RecoveryKey {
+        self.key
+    }
+
+    fn enter_native(&self) -> bool {
+        self.native_entry
+            .compare_exchange(
+                true,
+                false,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    pub(super) fn current(&self, principal: Option<[u8; 32]>) -> Result<(), String> {
+        (self.check)(principal)
+    }
+}
+
+impl std::fmt::Debug for RecoveryAdmission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RecoveryAdmission(opaque)")
+    }
+}
+impl PartialEq for RecoveryAdmission {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key && std::sync::Arc::ptr_eq(&self.check, &other.check)
+    }
+}
+impl Eq for RecoveryAdmission {}
+
 /// One sign-in a renewal asks for ([`sign_in_live`]): the CLI, its route and pinned hosts for
 /// the row, and the staging directory it signs into.
 #[derive(Debug, Clone, Copy)]
 pub struct Request<'a> {
+    /// Optional admitted recovery identity; manual and unscoped flows carry none.
+    pub recovery: Option<RecoveryKey>,
+    /// A live root check, required for root-scoped recovery and browser publication.
+    pub admission: Option<&'a RecoveryAdmission>,
     /// The CLI.
     pub cli: Cli,
     /// The row's route ([`SignIn::route`]).
@@ -876,6 +986,16 @@ pub struct Request<'a> {
 }
 
 impl Request<'_> {
+    pub(super) fn check_admission(&self) -> Result<(), String> {
+        if let Some(admission) = self.admission {
+            if self.recovery != Some(admission.key()) {
+                return Err("native recovery admission differs from its key".into());
+            }
+            admission.current(None)?;
+        }
+        Ok(())
+    }
+
     fn signin(&self) -> Option<&'static SignIn> {
         self.cli.accounts().signin.as_ref()
     }
@@ -976,8 +1096,9 @@ pub fn no_desk_argv(program: &Path, lead: &[OsString]) -> Vec<OsString> {
 /// one, where the CLI's [`SignIn::no_opener`]), its other variables from `var`
 /// ([`child_env`]), its page handed to `approver`, within `hang`. Where the CLI's
 /// [`SignIn::no_desk`] names this system, the child runs under the sandbox `no_desk` names
-/// ([`no_desk_argv`]), and nothing runs where that is not a file, cannot apply its sandbox here
-/// ([`sandbox_refusal`]), or the program is not installed.
+/// ([`no_desk_argv`]). A retained completion is revalidated before native setup. Otherwise
+/// no child runs where its sandbox is not a file, cannot apply here ([`sandbox_refusal`]),
+/// or the program is not installed.
 pub fn sign_in_with(
     req: &Request<'_>,
     (program, lead): (&Path, &[OsString]),
@@ -997,23 +1118,74 @@ pub fn sign_in_with(
     if matches!(req.route.drive, Drive::NativeGoogle) {
         return not_run("native Google login requires its typed grant driver".into());
     }
+    let started = Instant::now();
+    let deadline = started
+        .checked_add(hang)
+        .unwrap_or_else(|| started + Duration::from_secs(86_400));
+    if Instant::now() >= deadline {
+        return not_run("native sign-in deadline expired".into());
+    }
+    if req
+        .admission
+        .is_some_and(|admission| !admission.enter_native())
+    {
+        return Drove {
+            outcome: Outcome::Unverified(
+                "retained native admission is read-only or already entered".into(),
+            ),
+            host: None,
+        };
+    }
+    if let Err(why) = req.check_admission() {
+        return not_run(why);
+    }
+    let retained = match approver.resume(req, deadline) {
+        Ok(Resume::Completed(outcome)) => {
+            return complete_sign_in(
+                req,
+                approver,
+                Drove {
+                    outcome,
+                    host: None,
+                },
+                deadline,
+                true,
+            );
+        }
+        Ok(Resume::Fresh) => false,
+        Ok(Resume::NativeSeed) => true,
+        Err(why) => {
+            return Drove {
+                outcome: Outcome::Unverified(why),
+                host: None,
+            };
+        }
+    };
+    let not_run = |why: String| Drove {
+        outcome: if retained {
+            Outcome::Unverified(why)
+        } else {
+            Outcome::NotRun(why)
+        },
+        host: None,
+    };
     let Drive::Lines {
         grammar,
         completion,
         ..
     } = &req.route.drive
     else {
-        let now = Instant::now();
-        let deadline = now
-            .checked_add(hang)
-            .unwrap_or_else(|| now + Duration::from_secs(86_400));
-        return super::codex_app_login::login_in_home(
+        if let Err(why) = approver.begin(req).and_then(|()| req.check_admission()) {
+            return not_run(why);
+        }
+        let drove = super::codex_app_login::login_in_home(
             req.staging,
             approver,
             req.hosts,
             req.row.email.as_deref(),
             deadline,
         );
+        return complete_sign_in(req, approver, drove, deadline, retained);
     };
     let sandbox = if signin.no_desk.contains(&std::env::consts::OS) {
         let Some(sandbox) = no_desk.filter(|sandbox| sandbox.is_file()) else {
@@ -1058,7 +1230,13 @@ pub fn sign_in_with(
     let env = child_env(req.cli, signin, req.staging, &path, var);
     let email = req.row.email.as_deref();
     let args = child_args(req.route, req.row.vendor.region);
-    drive(
+    if Instant::now() >= deadline {
+        return not_run("native sign-in deadline expired".into());
+    }
+    if let Err(why) = approver.begin(req).and_then(|()| req.check_admission()) {
+        return not_run(why);
+    }
+    let drove = drive(
         &Spec {
             program,
             lead,
@@ -1069,10 +1247,31 @@ pub fn sign_in_with(
             completion: *completion,
             hosts: req.hosts,
             email,
-            hang,
+            hang: deadline.saturating_duration_since(Instant::now()),
         },
         approver,
-    )
+    );
+    complete_sign_in(req, approver, drove, deadline, retained)
+}
+
+fn complete_sign_in(
+    req: &Request<'_>,
+    approver: &mut dyn Approver,
+    mut drove: Drove,
+    deadline: Instant,
+    retained: bool,
+) -> Drove {
+    if retained && let Outcome::NotRun(why) = &drove.outcome {
+        drove.outcome = Outcome::Unverified(why.clone());
+    }
+    if let Err(why) = req.check_admission() {
+        drove.outcome = Outcome::Unverified(why);
+        return drove;
+    }
+    if let Err(why) = approver.complete(req, &drove.outcome, deadline) {
+        drove.outcome = Outcome::Unverified(why);
+    }
+    drove
 }
 
 /// `req`'s sign-in on this machine: the CLI's own binary ([`program_of`]), under

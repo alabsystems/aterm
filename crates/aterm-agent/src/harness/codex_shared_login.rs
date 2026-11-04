@@ -4,6 +4,7 @@
 //! Fresh provider verification for an already staged, device-local Codex login.
 //! This reader imports no OAuth session and exposes no credential fingerprint.
 
+use super::super::cli::shared_provider::ObservationError;
 use super::*;
 
 /// Full provider identity, distinct from the abbreviated account display key.
@@ -151,7 +152,7 @@ pub fn verify_in_home(
     expected: &str,
     wait: Duration,
     now: i64,
-) -> Result<Option<VerifiedLogin>, String> {
+) -> Result<Option<VerifiedLogin>, ObservationError> {
     verify_with(home, expected, || {
         read_login_with(
             home,
@@ -168,15 +169,20 @@ fn verify_with(
     home: &Path,
     expected: &str,
     read: impl FnOnce() -> Reading,
-) -> Result<Option<VerifiedLogin>, String> {
-    if !auth_path_in_home(home).exists() {
-        return Ok(None);
+) -> Result<Option<VerifiedLogin>, ObservationError> {
+    match std::fs::symlink_metadata(auth_path_in_home(home)) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => {
+            return Err(ObservationError::Unavailable(
+                "staged Codex credential is unavailable".into(),
+            ));
+        }
     }
-    let bytes = snapshot(home)?;
-    let (email, principal, plan) = identity(bytes.expose(), expected)?;
-    if !matches!(read(), Reading::Usage(_)) {
-        return Err("provider has not verified the staged Codex login".into());
-    }
+    let bytes = snapshot(home).map_err(ObservationError::Unavailable)?;
+    let (email, principal, plan) =
+        identity(bytes.expose(), expected).map_err(ObservationError::RecoveryRequired)?;
+    let reading = read();
     let proof = VerifiedLogin {
         home: home.to_owned(),
         bytes,
@@ -184,8 +190,20 @@ fn verify_with(
         principal,
         plan,
     };
-    proof.check_current()?;
-    Ok(Some(proof))
+    // A native refresh or concurrent writer may have replaced even a rejected
+    // snapshot. Reobserve those bytes before asking for another authentication.
+    proof
+        .check_current()
+        .map_err(ObservationError::Unavailable)?;
+    match reading {
+        Reading::Usage(_) => Ok(Some(proof)),
+        Reading::Unread => Err(ObservationError::Unavailable(
+            "provider has not verified the staged Codex login".into(),
+        )),
+        Reading::SignedOut => Err(ObservationError::RecoveryRequired(
+            "provider confirmed the staged Codex login is signed out".into(),
+        )),
+    }
 }
 
 #[cfg(test)]

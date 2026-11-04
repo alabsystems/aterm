@@ -229,11 +229,11 @@ pub struct OutputInfo {
 }
 
 impl OutputInfo {
-    /// Total bytes of the produced image.
+    /// Total bytes of the produced image, saturating on `usize` overflow.
     #[must_use]
     #[inline]
     pub const fn buffer_size(&self) -> usize {
-        self.line_size * self.height as usize
+        self.line_size.saturating_mul(self.height as usize)
     }
 }
 

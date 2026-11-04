@@ -1,32 +1,36 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-scene: spec recovery from its 6 unit tests
+# aterm-scene: spec recovery from its 12 unit tests
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 2 tests it
-> deleted are gone, and the spec rows no longer cite those tests. Counts below are reconciled
-> with current `main` (2026-10-28).
+> Status 2026-11-03: reconciled with current `main` (adding `mix-rgb-contract` and the four
+> integer `motion` specs for MOT-1's `src/motion.rs`, and removing the deleted
+> `scene_rgb_and_tile_rect_const_helpers` note from §4).
 
-> Status 2026-10-16: this is the crate's migration worklist. Each of the 11 specs below is
+> Status 2026-10-16: this is the crate's migration worklist. Each of the 16 specs below is
 > proved through Trust/Clean about the compiled Rust function, and then the tests it
 > subsumes are deleted. Every test in this crate samples a spec (§4), so no test is
 > deleted ahead of its proof.
 
-Source: `crates/aterm-scene` (read only). Every `#[test]` is mapped: `src/atlas.rs` has 1 and
-`src/vector.rs` has 5, for 6 in all (`src/lib.rs` has 0). Code reached: `clampf`,
-`smoothstep`, `fill_path`, `fill_scanline`, `fill_path_fixed`, `add_span`,
-`BBox::{empty,add,pixel_range}`, `sanitize`, `flatten_path`, `flatten_cubic`, `parse_path`, and in
-`src/atlas.rs`, `Tile::{new,over,over_run,pixels}`.
+Source: `crates/aterm-scene` (read only). Every `#[test]` is mapped: `src/lib.rs` has 1,
+`src/atlas.rs` has 1, `src/motion.rs` has 5, and `src/vector.rs` has 5, for 12 in all. Code
+reached: `clampf`, `smoothstep`, `mix_rgb`, `fill_path`, `fill_scanline`, `fill_path_fixed`,
+`add_span`, `BBox::{empty,add,pixel_range}`, `sanitize`, `flatten_path`, `flatten_cubic`,
+`parse_path`, `atlas::Tile::{new,over,over_run,pixels}`, and in `src/motion.rs`,
+`ease_out_quad`, `ease_out_cubic`, `ease_in_out_cubic`, `frac`, `frac_fine`, `glide_span`,
+`glide`, `Spring::{critical,underdamped,omega,zeta,at,settle_ms}`, and
+`Cadence::{hz,per_second,frame_at,frame_start,next_frame}`.
 
-Result: **11 specs**, covering **6 of 6 tests**. **0 tests are not spec samples** (§4).
+Result: **16 specs**, covering **12 of 12 tests**. **0 tests are not spec samples** (§4).
 Five specs serve as pure or structural lemmas with no primary test (`clampf-contract`,
 `smoothstep-contract`, `flatten-cubic-contract`, `fill-scanline-refines-subsample-model`,
 `parse-path-roundtrip`).
 
 ## 0. Notation used in the statements
 
-Every spec is over IEEE-754 binary32 with round-to-nearest-even, so each needs a Clean `f32` model.
-The rows count that under gap 3; the audit's §7 has no float row yet.
+The float rasterizer and RGB specs are over IEEE-754 binary32 with round-to-nearest-even (counted
+under gap 3 until Clean adds an `f32` row); the `motion-*` specs are pure fixed-point/integer
+contracts with no float dependency.
 
 - `lattice(px,py)` = the 16 sample points `(px + (i+0.5)/4, py + (j+0.5)/4)` for `i,j ∈ 0..4`, the
   lattice `Tile::fill_quad` also uses.
@@ -65,6 +69,11 @@ Lean-discharged rows) blocks every row.
 id	kind	functions	statement	subsumes	difficulty	blocking gaps
 clampf-contract	contract	clampf	∀ v, lo, hi : f32, with r = clampf(v,lo,hi). (a) ¬v.is_nan() ∧ lo ≤ hi ⇒ lo ≤ r ≤ hi, where r = hi if v > hi, r = lo if v < lo, and r = v bitwise otherwise. (b) ¬v.is_nan() ∧ lo > hi ⇒ r = lo (the documented misuse fallback). (c) v.is_nan() ⇒ r.is_nan(), so callers must sanitize first (§5.4).	-	EASY: f32 comparisons and if/else only; straight-line and panic-free. Needs an IEEE f32 carrier with a NaN case.	0,3,5,6
 smoothstep-contract	contract	smoothstep, clampf	∀ t : f32 with ¬t.is_nan(): smoothstep(t) = smoothstep(clampf(t,0,1)); t ≤ 0 ⇒ smoothstep(t) = 0.0; t ≥ 1 ⇒ smoothstep(t) = 1.0 exactly; 0 ≤ smoothstep(t) ≤ 1. Monotone: ∀ t1 ≤ t2 (both non-NaN), smoothstep(t1) ≤ smoothstep(t2). Monotonicity under f32 rounding of t·t·(3−2t) must be proved over the f32 model, or dropped if it is false.	-	EASY-MEDIUM: f32 mul/sub and a call to clampf (callee-ensures composition); straight-line. Monotonicity is the hard part.	0,3,4,5,6
+mix-rgb-contract	contract	mix_rgb	∀ a, b : u32, t : f32: mix_rgb(a, b, t) & !0x00ff_ffff = 0. Let u = 1.0 if t > 1.0, t if t > 0.0, else 0.0 (so NaN and t ≤ 0 map to u = 0.0): u = 0.0 ⇒ mix_rgb(a, b, t) = a & 0x00ff_ffff, u = 1.0 ⇒ mix_rgb(a, b, t) = b & 0x00ff_ffff, and each channel c ∈ {16, 8, 0} equals ⌊fl(ca + (cb − ca)·u) + 0.5⌋ & 0xff.	lib.rs::clampf_smoothstep_and_mix_rgb_handle_bounds_and_nan	EASY: non-capturing/single-float closure over three constant shifts, f32 clamp with NaN → 0.0, panic-free.	0,3,5,6
+motion-easings-q16	contract	motion::{ease_out_quad,ease_out_cubic,ease_in_out_cubic}	∀ e ∈ {ease_out_quad, ease_out_cubic, ease_in_out_cubic}, u : u32: e(0) = 0, ∀ u ≥ ONE: e(u) = ONE, 0 ≤ e(u) ≤ ONE, and ∀ u1 ≤ u2: e(u1) ≤ e(u2). Symmetry: ∀ u ≤ ONE: ease_in_out_cubic(ONE − u) = ONE − ease_in_out_cubic(u).	motion.rs::easings_hit_their_ends_and_rise_monotonically	EASY: pure u32/u64 fixed-point polynomial shifts and TryFrom with no loops or floats.	0,3,5,6
+motion-glide	contract	motion::{frac,frac_fine,glide_span,glide}	∀ t, span : Duration: frac(t, span) ∈ 0..=ONE and frac_fine(t, span) ∈ 0..=ONE, with span = 0 ⇒ ONE and t = 0 ∧ span > 0 ⇒ 0. ∀ from, to : u16: GLIDE ≤ glide_span(from, to) ≤ GLIDE_MAX, glide_span(from, to) = glide_span(to, from), and ∀ from, to ≤ 1000: glide(from, to, 0) = from, glide(from, to, glide_span(from, to)) = to, and glide(from, to, t) ∈ 0..=1000.	motion.rs::a_glide_spans_its_floor_per_point_and_ceiling	EASY-MEDIUM: core::time::Duration millis/micros conversions, u64/u128/i64 bounded arithmetic, and composition with ease_out_quad.	0,1,3,4,6,12
+motion-spring	no-panic + contract	motion::Spring::{critical,underdamped,omega,zeta,at,settle_ms}	∀ omega, zeta, t_ms : u32: critical(omega).zeta() = ONE, underdamped(omega, zeta).zeta() = min(zeta, ONE − 1), neither at(t_ms) nor settle_ms() panics (intermediate Q32 Euler step widened to i128 and clamped to i64), at(0) = 0, ∀ t_ms ≥ SPRING_MAX_MS: at(t_ms) = ONE as i32, and settle_ms() ≤ SPRING_MAX_MS.	motion.rs::a_critical_spring_arrives_without_passing_its_rest; motion.rs::an_underdamped_spring_overshoots_once_and_settles	MEDIUM: bounded 0..SPRING_MAX_MS loop over SpringState { x, v } with i128 multiply-accumulate clamped to i64 and unsigned abs_diff rest check.	0,1,2,3,4,6,7
+motion-cadence	no-panic + contract	motion::Cadence::{hz,per_second,frame_at,frame_start,next_frame}	∀ r : u16: Cadence::hz(r).per_second() = max(r, 1). ∀ c : Cadence, s, t : u64: t ≤ s ⇒ c.frame_at(s, t) = 0; c.frame_at(s, t) = min(⌊(t −_sat s)·hz / 1000⌋, u64::MAX); c.next_frame(s, t) never panics; ∀ t < u64::MAX: c.next_frame(s, t) > t; and when t ≥ s and c.next_frame(s, t) < u64::MAX and c.frame_at(s, t) < u64::MAX, c.frame_at(s, c.next_frame(s, t)) = c.frame_at(s, t) + 1.	motion.rs::a_cadence_keeps_its_grid	EASY-MEDIUM: pure const u64/u128 saturating ratio and div_ceil arithmetic; no loops or floats.	0,1,2,3,5,6
 over-run-is-over-fold	equivalence	atlas::Tile::over_run, atlas::Tile::over	∀ tile, x, y, n, rgb, a: over_run(x,y,n,rgb,a) has the same effect on tile.pixels() as over(x+k,y,rgb,a) for k = 0..n in order; when a ≤ 0 ∨ a.is_nan(), both leave tile.pixels() unchanged. The opaque fast path (sa ≥ 1, straight quad copy) is byte-identical to the general mix: oa = 1, so the mix reduces to the source exactly. The i64 clip of [x,x+n) to [0,w) never overflows and equals over's per-pixel bounds check. Requires removing trust::skip from Tile::over.	atlas.rs::nan_alpha_leaves_painted_pixels_unchanged	MEDIUM: &mut Tile with the invariant px.len() = w·h·4, a bounded for loop, local closures, f32→u8 saturating casts, i32/i64/u32 casts, copy_from_slice.	0,1,2,3,5,7,13
 flatten-cubic-contract	contract	vector::flatten_cubic	∀ finite p0..p3 with every coordinate in [−COORD_LIMIT, COORD_LIMIT]: flatten_cubic calls emit exactly n times, where n = 1 if err ≤ FLATTEN_TOL and n = clampf(ceil(sqrt(err/FLATTEN_TOL)),1,64) otherwise, so 1 ≤ n ≤ 64. The k-th call is (q_{k−1}, q_k), where q_0 = p0 and q_k is the f32 Bernstein evaluation at k/n. The chain closes exactly: q_n = p3 bitwise, because at t = 1 the weights are 0,0,0,1. All q_k are finite. This is a lemma for the subsample model and for implicit closure in flatten_path (cur = p3).	(none; lemma)	MEDIUM: bounded for loop 1..=n, a generic impl FnMut emit (higher-order spec), f32 sqrt/ceil/abs/max, f32→u32 cast.	0,3,5,7,11,13
 parse-path-language	contract	vector::parse_path	∀ d: &str: parse_path(d) = Some(v) ⇔ PathTok(d) succeeds (every number token parses as f32), its token sequence matches (Letter Num*)* with every Letter ∈ {M,L,C,Z}, and no number precedes the first letter. Each M or L group has 2k numbers with k ≥ 1, each C group has 6k numbers with k ≥ 1, and each Z group has none. Then v is the concatenation of the group expansions: M gives Move(first pair) followed by a Line for each later pair; L gives a Line per pair; C gives a Cubic per 6-tuple; Z gives Close. Otherwise the result is None: unsupported letters, a bare M/L/C, a dangling argument count, a malformed number and numbers after Z all give None. "" gives Some([]). parse_path never panics: indices stay at UTF-8 char boundaries because tokens consume only ASCII, and every iteration either advances i or returns.	vector.rs::parse_path_roundtrips_the_asset_grammar	MEDIUM: a &str/as_bytes byte loop with a manual index, str::get(s..i), f32 FromStr (needs a parse model), Vec<f32>/Vec<PathCmd> push/clear, chunks_exact with slice patterns, an FnMut flush closure taking &mut Vec, Option<char> state, char classification.	0,1,3,5,7,13
@@ -83,7 +92,13 @@ deleted only when its primary spec and every spec under `also` are proved.
 
 ```tsv
 file	test	primary	also
+src/lib.rs	clampf_smoothstep_and_mix_rgb_handle_bounds_and_nan	mix-rgb-contract	clampf-contract, smoothstep-contract
 src/atlas.rs	nan_alpha_leaves_painted_pixels_unchanged	over-run-is-over-fold	fill-path-noop-guards
+src/motion.rs	easings_hit_their_ends_and_rise_monotonically	motion-easings-q16	
+src/motion.rs	a_glide_spans_its_floor_per_point_and_ceiling	motion-glide	motion-easings-q16
+src/motion.rs	a_critical_spring_arrives_without_passing_its_rest	motion-spring	
+src/motion.rs	an_underdamped_spring_overshoots_once_and_settles	motion-spring	
+src/motion.rs	a_cadence_keeps_its_grid	motion-cadence	
 src/vector.rs	even_odd_holes_work	fill-path-coverage-geometry	fill-scanline-refines-subsample-model
 src/vector.rs	fill_path_fixed_matches_float_frame	fill-path-fixed-refines-fill-path	fill-path-noop-guards
 src/vector.rs	degenerate_paths_are_safe	fill-path-noop-guards	fill-path-total-and-bounded
@@ -93,19 +108,18 @@ src/vector.rs	parse_path_roundtrips_the_asset_grammar	parse-path-language	parse-
 
 ## 3. Coverage
 
-- 6 live tests mapped. All 6 map to a spec, and none is a non-spec check.
-- One test retires on a cheap spec: `parse_path_roundtrips_the_asset_grammar`
-  (`parse-path-language`).
+- 12 live tests mapped. All 12 map to a spec, and none is a non-spec check.
+- The four `motion-*` specs in `src/motion.rs` are pure integer/fixed-point contracts (5 tests) that
+  do not depend on a float model; `parse_path_roundtrips_the_asset_grammar` also retires on
+  `parse-path-language`.
 - The three `fill_path` behaviour tests (`even_odd_holes_work`, `out_of_range_coords_clamp` and the
   coverage half of `fill_path_fixed_matches_float_frame`) all sit behind
-  `fill-scanline-refines-subsample-model`, so that proof is the crate's bottleneck.
+  `fill-scanline-refines-subsample-model`, so that proof is the rasterizer's bottleneck.
   `fill-path-coverage-geometry` adds real geometry on top of it.
 
 ## 4. Tests that are not spec samples
 
-`src/lib.rs::scene_rgb_and_tile_rect_const_helpers` has no row: it checks the `pack_rgb24`/
-`unpack_rgb24`, `blend_rgb24_u8` and `encode_tile_rect_le`/`decode_tile_rect_le` helpers, which no
-spec in §1 states.
+None.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 

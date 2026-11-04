@@ -91,8 +91,8 @@ pub(crate) fn parent_is_real_dir(path: &Path) -> bool {
     }
 }
 
-/// The mug's files, under three roots.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The mug's files, under three roots, and how to read whether a folder is on this Mac's disk.
+#[derive(Clone, Debug)]
 pub struct Paths {
     /// aterm's state directory (`~/Library/Application Support/aterm`).
     pub state_dir: PathBuf,
@@ -100,6 +100,10 @@ pub struct Paths {
     pub home: PathBuf,
     /// aterm's logs directory (`~/Library/Logs/aterm`).
     pub logs_dir: PathBuf,
+    /// Whether a folder is on a volume local to this Mac: [`crate::launchd::on_local_volume`] in
+    /// [`Self::from_env`]'s, and a fixed answer in a test's, which can then stand for a network
+    /// home ([`Self::launch_agents_local`]).
+    pub local_volume: fn(&Path) -> bool,
 }
 
 impl Paths {
@@ -110,7 +114,15 @@ impl Paths {
             state_dir: aterm_types::dirs::state_dir()?,
             home: aterm_types::dirs::home_dir()?,
             logs_dir: aterm_types::dirs::logs_dir()?,
+            local_volume: crate::launchd::on_local_volume,
         })
+    }
+
+    /// Whether [`Self::launch_agents`] is on a volume local to this Mac ([`Self::local_volume`]):
+    /// where it is not, the home is a network one that another Mac may read at the same time.
+    #[must_use]
+    pub fn launch_agents_local(&self) -> bool {
+        (self.local_volume)(&self.launch_agents())
     }
 
     /// The mode on disk ([`crate::state`]).
@@ -194,6 +206,7 @@ mod tests {
             state_dir: PathBuf::from("/s"),
             home: PathBuf::from("/h"),
             logs_dir: PathBuf::from("/l"),
+            local_volume: |_| true,
         };
         assert_eq!(paths.state_file(), PathBuf::from("/s/acaffiene.state"));
         assert_eq!(paths.lock_file(), PathBuf::from("/s/acaffiene.lock"));
@@ -216,6 +229,21 @@ mod tests {
         assert_eq!(
             paths.startup_off_file("x.y"),
             PathBuf::from("/s/acaffiene/x.y.startup-off")
+        );
+    }
+
+    /// The login's paths read whether a folder is on this Mac's disk, as `statfs` says: a
+    /// temporary folder is, and on macOS a path `statfs` cannot read is not, so a home whose
+    /// LaunchAgents cannot be read is judged as a network one.
+    #[test]
+    fn the_logins_paths_read_the_volume() {
+        let paths = Paths::from_env().expect("a home");
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        assert!((paths.local_volume)(dir.path()), "a temporary folder");
+        #[cfg(target_os = "macos")]
+        assert!(
+            !(paths.local_volume)(&dir.path().join("missing")),
+            "a path statfs cannot read"
         );
     }
 
@@ -242,6 +270,7 @@ mod tests {
             state_dir: root.path().join("real-state"),
             home: root.path().join("home"),
             logs_dir: root.path().join("logs"),
+            local_volume: |_| true,
         };
         crate::trouble::note_at(&real, "disk full", 10).expect("note real trouble");
         assert_eq!(crate::trouble::read(&real).map(|t| t.since), Some(10));
@@ -276,6 +305,7 @@ mod tests {
             state_dir: aliased_state,
             home: root.path().join("aliased-home"),
             logs_dir: root.path().join("aliased-logs"),
+            local_volume: |_| true,
         };
 
         assert_eq!(crate::trouble::read(&aliased), None);

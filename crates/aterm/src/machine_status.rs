@@ -241,8 +241,14 @@ pub(crate) enum Vault {
 pub(crate) enum Clt {
     NotHere,
     Present,
+    /// aterm's own Command Line Tools tab is installing them (`clt-shim.installing`).
     Installing,
-    Missing,
+    /// Missing, and nothing installs them now: no tab of aterm's is on its way (never opened, a
+    /// person stopped it, or this account may not install them). `may_install`: the account is
+    /// one of the Mac's administrators (or its groups did not read), the shim's own test.
+    Missing {
+        may_install: bool,
+    },
 }
 
 /// The AI CLIs, as `aterm ai status`'s look and health read them.
@@ -567,12 +573,23 @@ pub(crate) fn tools_area(clt: Clt, toolset: &Result<Option<ItemReport>, String>)
                 "aterm finishes the install; git and the compilers work once it does",
             );
         }
-        Clt::Missing => {
+        // Nothing installs them now, so the step is a person's: the install asks for an
+        // administrator's password, which no agent types.
+        Clt::Missing { may_install: true } => {
+            return Area::due(
+                NAME,
+                "Apple's Command Line Tools are missing, and nothing is installing them",
+                Who::Person,
+                "Install\u{2026} on System State, or `aterm init --only base.clt` in a terminal \
+                 (your Mac password once)",
+            );
+        }
+        Clt::Missing { may_install: false } => {
             return Area::due(
                 NAME,
                 "Apple's Command Line Tools are missing",
-                Who::Aterm,
-                "aterm installs them first, in its own Command Line Tools tab",
+                Who::Person,
+                "only an administrator of this Mac can install them",
             );
         }
         Clt::NotHere | Clt::Present => {}
@@ -959,7 +976,9 @@ fn read_clt() -> Clt {
     {
         Clt::Installing
     } else {
-        Clt::Missing
+        Clt::Missing {
+            may_install: aterm_uds::account::administrator() != Some(false),
+        }
     }
 }
 

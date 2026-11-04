@@ -16,7 +16,7 @@ parallel = 8
 
 # The GitHub machine user the hosts' keys are registered with (design §7). Create the
 # account, uncomment this, then `aterm machines github login` keeps its token (one with
-# the admin:public_key scope) in this Mac's login keychain.
+# the admin:public_key scope) in keys/github_token (0600), never the login keychain.
 # [github]
 # account = "your-lab-bot"
 "#;

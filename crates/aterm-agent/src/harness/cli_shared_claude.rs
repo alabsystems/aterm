@@ -5,6 +5,7 @@
 //! local metadata; this module requires the provider to accept the exact token.
 
 use super::super::super::{accounts, profile};
+use super::ObservationError;
 use aterm_http::{Client, Method, ProxyMode, Trust};
 use aterm_json::Value;
 use aterm_uds::secret::Secret;
@@ -42,9 +43,16 @@ fn profile_value(value: &Value) -> Result<ClaudeProfile, String> {
 
 /// One bounded request to the vendor's canonical OAuth profile endpoint.
 /// Redirects are not followed by `aterm-http`.
-pub fn read_claude_profile(token: &str, wait: Duration) -> Result<ClaudeProfile, String> {
-    if wait.is_zero() || !token_valid(token) {
-        return Err("invalid OAuth profile request".into());
+pub fn read_claude_profile(token: &str, wait: Duration) -> Result<ClaudeProfile, ObservationError> {
+    if !token_valid(token) {
+        return Err(ObservationError::RecoveryRequired(
+            "invalid OAuth profile request".into(),
+        ));
+    }
+    if wait.is_zero() {
+        return Err(ObservationError::Unavailable(
+            "OAuth profile deadline expired".into(),
+        ));
     }
     let mut header = b"Bearer ".to_vec();
     header.extend_from_slice(token.as_bytes());
@@ -57,13 +65,27 @@ pub fn read_claude_profile(token: &str, wait: Duration) -> Result<ClaudeProfile,
         .limit(256 * 1024)
         .backstop(wait)
         .send(&[])
-        .map_err(|_| "provider profile request did not complete")?;
-    if response.status() != 200 {
-        return Err("provider refused the staged OAuth token".into());
+        .map_err(|_| {
+            ObservationError::Unavailable("provider profile request did not complete".into())
+        })?;
+    profile_response(response.status(), response.body())
+}
+
+fn profile_response(status: u16, body: &[u8]) -> Result<ClaudeProfile, ObservationError> {
+    if status == 401 {
+        return Err(ObservationError::RecoveryRequired(
+            "provider rejected the staged OAuth token".into(),
+        ));
     }
-    let value = aterm_json::from_slice(response.body())
-        .map_err(|_| "provider profile response is unreadable")?;
-    profile_value(&value)
+    if status != 200 {
+        return Err(ObservationError::Unavailable(format!(
+            "provider profile verification unavailable (HTTP {status})"
+        )));
+    }
+    let value = aterm_json::from_slice(body).map_err(|_| {
+        ObservationError::Unavailable("provider profile response is unreadable".into())
+    })?;
+    profile_value(&value).map_err(ObservationError::Unavailable)
 }
 
 fn token_valid(token: &str) -> bool {
@@ -100,13 +122,16 @@ pub(super) fn verify_credentials(
     bytes: &[u8],
     email: &str,
     now: i64,
-    read: impl FnOnce(&str) -> Result<ClaudeProfile, String>,
-) -> Result<ClaudeProfile, String> {
-    let token = access_token(bytes, now)?;
-    let token = std::str::from_utf8(token.expose()).map_err(|_| "staged token is not text")?;
+    read: impl FnOnce(&str) -> Result<ClaudeProfile, ObservationError>,
+) -> Result<ClaudeProfile, ObservationError> {
+    let token = access_token(bytes, now).map_err(ObservationError::RecoveryRequired)?;
+    let token = std::str::from_utf8(token.expose())
+        .map_err(|_| ObservationError::RecoveryRequired("staged token is not text".into()))?;
     let profile = read(token)?;
     if !accounts::email_matches(&profile.email, email) {
-        return Err("provider profile names a different approved account".into());
+        return Err(ObservationError::RecoveryRequired(
+            "provider profile names a different approved account".into(),
+        ));
     }
     Ok(profile)
 }
@@ -118,6 +143,39 @@ mod tests {
     use std::cell::Cell;
 
     #[test]
+    fn canonical_profile_outage_is_distinct_from_a_rejected_token() {
+        let valid = br#"{"account":{"uuid":"id","email":"approved@example.test"},"organization":{"uuid":"org"}}"#;
+        assert!(profile_response(200, valid).is_ok());
+        assert!(matches!(
+            profile_response(401, valid),
+            Err(ObservationError::RecoveryRequired(_))
+        ));
+        for status in [201, 302, 400, 403, 404, 408, 429, 500, 502, 503] {
+            assert!(
+                matches!(
+                    profile_response(status, valid),
+                    Err(ObservationError::Unavailable(_))
+                ),
+                "status {status}"
+            );
+        }
+        for body in [b"not json".as_slice(), b"{}".as_slice()] {
+            assert!(matches!(
+                profile_response(200, body),
+                Err(ObservationError::Unavailable(_))
+            ));
+        }
+        assert!(matches!(
+            read_claude_profile("synthetic", Duration::ZERO),
+            Err(ObservationError::Unavailable(_))
+        ));
+        assert!(matches!(
+            read_claude_profile("bad\r\nheader", Duration::from_secs(1)),
+            Err(ObservationError::RecoveryRequired(_))
+        ));
+    }
+
+    #[test]
     fn shared_claude_requires_fresh_provider_identity_not_local_status_metadata() {
         let bytes = aterm_json::to_vec(
             &json!({"claudeAiOauth":{"accessToken":"synthetic", "expiresAt":4102444800000_u64}}),
@@ -125,7 +183,7 @@ mod tests {
         .unwrap();
         assert!(
             verify_credentials(&bytes, "approved@example.test", 1_800_000_000, |_| Err(
-                "rejected by provider".into()
+                ObservationError::RecoveryRequired("rejected by provider".into())
             ))
             .is_err()
         );
@@ -159,7 +217,7 @@ mod tests {
             assert!(
                 verify_credentials(&bytes, "approved@example.test", 1_800_000_000, |_| {
                     called.set(true);
-                    Err("must not execute".into())
+                    Err(ObservationError::Unavailable("must not execute".into()))
                 })
                 .is_err()
             );

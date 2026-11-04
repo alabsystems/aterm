@@ -129,6 +129,117 @@ fn args(owned: &[String]) -> Vec<&str> {
     owned.iter().map(String::as_str).collect()
 }
 
+#[test]
+fn a_json_input_file_sends_a_body_larger_than_the_argument_limit() {
+    let w = World::new("api-input-large", true);
+    let file = w.root.path().join("request.json");
+    let padding = "x".repeat(2 * 1024 * 1024);
+    let body = aterm_json::json!({
+        "ref": "refs/tags/from-file",
+        "sha": common::MAIN_SHA,
+        "draft": true,
+        "count": 7,
+        "padding": padding,
+    });
+    let text = body.to_string();
+    std::fs::write(&file, &text).unwrap();
+    let ran = w.run(&["api", REFS, "-X", "POST", "--input", file.to_str().unwrap()]);
+    assert_eq!(ran.exit, 0, "{}", ran.stderr);
+    let bodies = w.fake.bodies();
+    let sent = bodies.last().unwrap();
+    assert_eq!(sent.len, u64::try_from(text.len()).unwrap());
+    assert_eq!(
+        sent.sha256,
+        format!(
+            "sha256:{}",
+            aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(text.as_bytes()))
+        )
+    );
+    assert!(
+        sent.json.is_none(),
+        "large bodies retain only a digest in the fake"
+    );
+    assert_eq!(w.writes(), [format!("POST {REFS}")]);
+}
+
+#[test]
+fn invalid_json_input_files_send_nothing_and_do_not_expose_contents() {
+    let w = World::new("api-input-invalid", true);
+    let malformed = w.root.path().join("malformed.json");
+    std::fs::write(&malformed, "private-input-sentinel").unwrap();
+    let binary = w.root.path().join("binary.json");
+    std::fs::write(&binary, [0xff, 0xfe]).unwrap();
+    let oversized = w.root.path().join("oversized.json");
+    std::fs::File::create(&oversized)
+        .unwrap()
+        .set_len(8 * 1024 * 1024 + 1)
+        .unwrap();
+    for path in [malformed, binary, oversized, w.root.path().to_path_buf()] {
+        for dry in [false, true] {
+            let mut argv = vec!["api", REFS, "-X", "POST", "--input", path.to_str().unwrap()];
+            if dry {
+                argv.push("--dry-run");
+            }
+            let ran = w.run(&argv);
+            assert_eq!(ran.exit, 10, "{}", ran.stderr);
+            assert!(!ran.stderr.contains("private-input-sentinel"));
+        }
+    }
+    assert!(w.writes().is_empty());
+    assert!(w.intents().is_empty());
+}
+
+#[test]
+fn a_json_input_is_not_read_for_get_or_when_fields_are_also_supplied() {
+    let w = World::new("api-input-conflict", true);
+    let missing = w.root.path().join("absent.json");
+    for argv in [
+        vec!["api", REFS, "--input", missing.to_str().unwrap()],
+        vec![
+            "api",
+            REFS,
+            "-X",
+            "POST",
+            "--input",
+            missing.to_str().unwrap(),
+            "-f",
+            "ref=x",
+        ],
+    ] {
+        w.run(&argv).usage();
+    }
+    assert!(w.writes().is_empty());
+    assert!(w.intents().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_writerless_fifo_is_not_a_json_input_file() {
+    let w = World::new("api-input-fifo", true);
+    let fifo = w.root.path().join("input.fifo");
+    let mut command = aterm_uds::spawnfd::command("mkfifo");
+    command.arg(&fifo);
+    let made = aterm_uds::deadline::outputs_until(
+        &mut [&mut command],
+        std::time::Instant::now() + common::HANG,
+        common::HANG,
+    )
+    .pop()
+    .unwrap()
+    .unwrap();
+    assert!(made.status.success());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let ran = w.run(&["api", REFS, "-X", "POST", "--input", fifo.to_str().unwrap()]);
+        let _ = tx.send((ran.exit, w.writes()));
+    });
+    let (exit, writes) = rx
+        .recv_timeout(common::HANG)
+        .expect("a FIFO is refused without waiting for a writer");
+    assert_eq!(exit, 10);
+    assert!(writes.is_empty());
+}
+
 /// `-F` carries the JSON type a REST body needs (a pull request's `draft`), and `-f` keeps
 /// the same words a string, the control that `-F` alone typed them.
 #[test]

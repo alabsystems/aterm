@@ -90,6 +90,8 @@ pub mod native_act;
 pub mod native_keys;
 #[cfg(unix)]
 mod native_launch;
+#[cfg(unix)]
+mod pending_native_store;
 #[cfg(all(unix, debug_assertions))]
 pub use native_launch::{
     FixtureStage as NativeLauncherFixtureStage, fixture_entry as native_launcher_fixture_entry,

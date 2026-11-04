@@ -159,16 +159,17 @@ impl Spring {
     }
 
     fn step(self, s: SpringState) -> SpringState {
-        let omega = i64::from(self.omega);
+        let omega = i128::from(self.omega);
         let omega_sq = (omega * omega) >> 16;
-        let damping = (2 * i64::from(self.zeta) * omega) >> 16;
-        let one = 1_i64 << 32;
-        let accel = ((omega_sq * (one - s.x)) >> 16) - ((damping * s.v) >> 16);
-        let v = s.v + accel / 1000;
-        SpringState {
-            x: s.x + v / 1000,
-            v,
-        }
+        let damping = (2 * i128::from(self.zeta) * omega) >> 16;
+        let one = 1_i128 << 32;
+        let accel =
+            ((omega_sq * (one - i128::from(s.x))) >> 16) - ((damping * i128::from(s.v)) >> 16);
+        let v = (i128::from(s.v) + accel / 1000).clamp(i128::from(i64::MIN), i128::from(i64::MAX))
+            as i64;
+        let x = (i128::from(s.x) + i128::from(v) / 1000)
+            .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
+        SpringState { x, v }
     }
 
     /// Where the spring stands `t_ms` after it starts, Q16 of the way from 0 to [`ONE`] (above
@@ -191,14 +192,14 @@ impl Spring {
     /// [`SPRING_MAX_MS`]. A motion that draws it ends here.
     #[must_use]
     pub fn settle_ms(self) -> u32 {
-        let near = 1_i64 << 20;
-        let still = 1_i64 << 26;
+        let near = 1_u64 << 20;
+        let still = 1_u64 << 26;
         let one = 1_i64 << 32;
         let mut s = SpringState { x: 0, v: 0 };
         let mut since = None;
         for ms in 0..SPRING_MAX_MS {
             s = self.step(s);
-            let resting = (one - s.x).abs() <= near && s.v.abs() <= still;
+            let resting = one.abs_diff(s.x) <= near && s.v.unsigned_abs() <= still;
             match (resting, since) {
                 (true, None) => since = Some(ms + 1),
                 (false, Some(_)) => since = None,
@@ -237,11 +238,17 @@ impl Cadence {
         self.hz
     }
 
-    /// The frame showing at `t_ms` of a motion that starts at `start_ms` (frame 0 until its start).
+    /// The frame showing at `t_ms` of a motion that starts at `start_ms` (frame 0 until its start,
+    /// saturating at `u64::MAX`).
     #[must_use]
     pub const fn frame_at(self, start_ms: u64, t_ms: u64) -> u64 {
         let since = t_ms.saturating_sub(start_ms) as u128;
-        (since * self.hz as u128 / 1000) as u64
+        let frame = since * self.hz as u128 / 1000;
+        if frame > u64::MAX as u128 {
+            u64::MAX
+        } else {
+            frame as u64
+        }
     }
 
     /// When frame `frame` of a motion that starts at `start_ms` begins.
@@ -255,13 +262,21 @@ impl Cadence {
         })
     }
 
-    /// When the frame after the one showing at `t_ms` begins: always after `t_ms`.
+    /// When the frame after the one showing at `t_ms` begins: always after `t_ms` (saturating at
+    /// `u64::MAX`).
     #[must_use]
     pub const fn next_frame(self, start_ms: u64, t_ms: u64) -> u64 {
         if t_ms < start_ms {
             return self.frame_start(start_ms, 1);
         }
-        self.frame_start(start_ms, self.frame_at(start_ms, t_ms) + 1)
+        let since = (t_ms - start_ms) as u128;
+        let next = since * self.hz as u128 / 1000 + 1;
+        let ms = (next * 1000).div_ceil(self.hz as u128);
+        start_ms.saturating_add(if ms > u64::MAX as u128 {
+            u64::MAX
+        } else {
+            ms as u64
+        })
     }
 }
 
@@ -354,9 +369,12 @@ mod tests {
         assert_eq!(spring.at(SPRING_MAX_MS), ONE as i32);
     }
 
+    /// NEGATIVE CONTROL: extreme `omega = u32::MAX` springs saturate intermediate Q32 steps
+    /// without overflowing `i64` in `at` or `settle_ms` and settle to `ONE` at `SPRING_MAX_MS`.
     #[test]
     fn an_underdamped_spring_overshoots_once_and_settles() {
         let spring = Spring::underdamped(14 * ONE, 39_322);
+        assert_eq!(spring.omega(), 14 * ONE);
         let peak = (0..1_000).map(|t| spring.at(t)).max().unwrap_or(0);
         // ζ = 0.6 overshoots by e^(−πζ/√(1−ζ²)) ≈ 9.5 %.
         let over = f64::from(peak - ONE as i32) / f64::from(ONE);
@@ -373,8 +391,18 @@ mod tests {
             "never critical"
         );
         assert_eq!(spring.at(321), spring.at(321), "one integer every time");
+
+        for extreme in [Spring::critical(u32::MAX), Spring::underdamped(u32::MAX, 0)] {
+            let _ = extreme.at(1);
+            let _ = extreme.at(SPRING_MAX_MS - 1);
+            assert_eq!(extreme.at(SPRING_MAX_MS), ONE as i32);
+            assert!(extreme.settle_ms() <= SPRING_MAX_MS);
+        }
     }
 
+    /// NEGATIVE CONTROL: high-rate cadences (`hz > 1000`) at large timestamps saturate
+    /// `frame_at` at `u64::MAX` instead of truncating `u128 as u64` and keep `next_frame > t_ms`
+    /// for all `t_ms < u64::MAX` without overflowing `frame_at + 1`.
     #[test]
     fn a_cadence_keeps_its_grid() {
         let spin = Cadence::SPINNER;
@@ -396,5 +424,12 @@ mod tests {
             assert_eq!(spin.frame_at(0, next), spin.frame_at(0, t) + 1, "{t}");
         }
         assert_eq!(Cadence::hz(0).per_second(), 1);
+
+        let fast = Cadence::hz(2_000);
+        let far = 1_u64 << 63;
+        assert_eq!(fast.frame_at(0, far), u64::MAX);
+        assert_eq!(fast.next_frame(0, far), far + 1);
+        assert_eq!(fast.frame_at(0, u64::MAX), u64::MAX);
+        assert_eq!(fast.next_frame(0, u64::MAX), u64::MAX);
     }
 }

@@ -5,7 +5,7 @@
 //! discarded by a named control recovery restrict only their signing identity.
 //! Neither proof acquires payload or writer authority here.
 
-use super::{Scope, Session};
+use super::{Envelope, Scope, Session};
 use crate::{
     Error, Result,
     crypto::{MAX_OPERATION, Reader},
@@ -80,6 +80,9 @@ impl Conflict {
 
     /// Retain an authentic old proof without treating an overruled recovery as
     /// current authority. Replay must survive a later control-history choice.
+    /// What the bytes settle ([`Claim::read`]) is asked first; then whether
+    /// `scope` is this session's trust context, whether the recovery still
+    /// discards the source, and whether the signer is a registered identity.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -89,56 +92,25 @@ impl Conflict {
         )
     )]
     pub(crate) fn restore(session: &Session<'_>, scope: Scope, wire: &[u8]) -> Result<Self> {
-        if wire.len() > MAX_CONFLICT {
-            return Err(Error::new("table conflict certificate exceeds its bound"));
-        }
-        let mut reader = Reader::new(wire);
-        let mut sources = Vec::new();
-        let mut discarded = None;
-        let mut active = true;
-        let headers = match reader.take(5)? {
-            b"ACTF1" => {
-                let first = Self::source(&mut reader)?;
-                let end = wire.len() - reader.remaining();
-                sources.push(end - first.len()..end);
-                let second = Self::source(&mut reader)?;
-                let end = wire.len() - reader.remaining();
-                sources.push(end - second.len()..end);
-                reader.end()?;
-                let a = session.envelope(scope, first)?;
-                let b = session.envelope(scope, second)?;
-                let fork = Fork::between(&a.header, &b.header).ok_or_else(|| {
-                    Error::new("table certificate has no contradictory actor claims")
-                })?;
-                if a.header.id != fork.first || b.header.id != fork.second {
-                    return Err(Error::new(
-                        "table conflict sources are not canonically ordered",
-                    ));
-                }
-                vec![a.header, b.header]
-            }
-            b"ACTQ1" => {
-                let recovery = reader.array()?;
-                let source = Self::source(&mut reader)?;
-                let end = wire.len() - reader.remaining();
-                sources.push(end - source.len()..end);
-                reader.end()?;
-                let envelope = session.envelope(scope, source)?;
-                if !session.discarded_by(&envelope, recovery) {
+        let (claim, sources) = Claim::read(scope, wire)?;
+        session.context(scope)?;
+        let (headers, discarded, active) = match claim {
+            Claim::Fork(headers) => (Vec::from(headers), None, true),
+            Claim::Discarded { recovery, source } => {
+                if !session.discarded_by(&source, recovery) {
                     return Err(Error::new(
                         "table restriction lacks a matching signed recovery",
                     ));
                 }
-                active = session.discarded_source(&envelope)?;
-                discarded = Some(Discarded {
-                    header: envelope.header.clone(),
-                    roster: envelope.roster,
-                    epoch: envelope.epoch,
-                    authored_ms: envelope.authored_ms,
-                });
-                vec![envelope.header]
+                let active = session.discarded_source(&source)?;
+                let discarded = Discarded {
+                    header: source.header.clone(),
+                    roster: source.roster,
+                    epoch: source.epoch,
+                    authored_ms: source.authored_ms,
+                };
+                (vec![source.header], Some(discarded), active)
             }
-            _ => return Err(Error::new("unknown table conflict certificate")),
         };
         session.check_known_actor(&headers[0].actor)?;
         Ok(Self {
@@ -148,14 +120,6 @@ impl Conflict {
             discarded,
             active,
         })
-    }
-
-    fn source<'a>(reader: &mut Reader<'a>) -> Result<&'a [u8]> {
-        let len = u32::from_le_bytes(reader.array()?) as usize;
-        if len > MAX_OPERATION {
-            return Err(Error::new("table conflict source exceeds its bound"));
-        }
-        reader.take(len)
     }
 
     pub(crate) fn from_pair(
@@ -232,3 +196,75 @@ impl Conflict {
         &self.wire
     }
 }
+
+/// What a certificate's bytes settle with no session: its framing and bounds,
+/// each source's protocol, scope, signature and causal shape, and for a fork the
+/// contradiction astream's [`Fork::between`] recognizes, its two sources in the
+/// order that names them. A certificate stored in a person's `table.astream`
+/// reads through this at every open, so these are the rules and the bytes a
+/// later build must keep. Whose trust context the scope is, whether a recovery
+/// still discards the source and whether the signer was ever registered are the
+/// session's questions ([`Conflict::restore`]).
+enum Claim<'w> {
+    Fork([Header; 2]),
+    Discarded {
+        recovery: Digest,
+        source: Envelope<'w>,
+    },
+}
+impl<'w> Claim<'w> {
+    /// The claim `wire` makes under `scope`, and each source's byte range in it.
+    fn read(scope: Scope, wire: &'w [u8]) -> Result<(Self, Vec<Range<usize>>)> {
+        if wire.len() > MAX_CONFLICT {
+            return Err(Error::new("table conflict certificate exceeds its bound"));
+        }
+        let mut reader = Reader::new(wire);
+        let mut sources = Vec::new();
+        let claim = match reader.take(5)? {
+            b"ACTF1" => {
+                let first = Self::source(&mut reader)?;
+                let end = wire.len() - reader.remaining();
+                sources.push(end - first.len()..end);
+                let second = Self::source(&mut reader)?;
+                let end = wire.len() - reader.remaining();
+                sources.push(end - second.len()..end);
+                reader.end()?;
+                let a = Envelope::parse(scope, first)?;
+                let b = Envelope::parse(scope, second)?;
+                let fork = Fork::between(&a.header, &b.header).ok_or_else(|| {
+                    Error::new("table certificate has no contradictory actor claims")
+                })?;
+                if a.header.id != fork.first || b.header.id != fork.second {
+                    return Err(Error::new(
+                        "table conflict sources are not canonically ordered",
+                    ));
+                }
+                Self::Fork([a.header, b.header])
+            }
+            b"ACTQ1" => {
+                let recovery = reader.array()?;
+                let source = Self::source(&mut reader)?;
+                let end = wire.len() - reader.remaining();
+                sources.push(end - source.len()..end);
+                reader.end()?;
+                Self::Discarded {
+                    recovery,
+                    source: Envelope::parse(scope, source)?,
+                }
+            }
+            _ => return Err(Error::new("unknown table conflict certificate")),
+        };
+        Ok((claim, sources))
+    }
+
+    fn source(reader: &mut Reader<'w>) -> Result<&'w [u8]> {
+        let len = u32::from_le_bytes(reader.array()?) as usize;
+        if len > MAX_OPERATION {
+            return Err(Error::new("table conflict source exceeds its bound"));
+        }
+        reader.take(len)
+    }
+}
+
+#[cfg(test)]
+mod tests;

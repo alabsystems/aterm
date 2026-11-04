@@ -43,8 +43,8 @@ fn materialize_from_line_roundtrip_ascii() {
         );
     }
 
-    for i in 5..10 {
-        assert_eq!(mat.cells[i], Cell::default(), "non-default cell at col {i}");
+    for (i, cell) in (5..).zip(&mat.cells[5..10]) {
+        assert_eq!(*cell, Cell::default(), "non-default cell at col {i}");
     }
 }
 

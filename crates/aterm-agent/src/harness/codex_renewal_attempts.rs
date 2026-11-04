@@ -70,6 +70,73 @@ impl<'a> ReceiptWriter<'a> {
         Self { env, _guard: guard }
     }
 
+    pub(super) fn release_unexecuted_rotation(
+        &self,
+        receipt: &Receipt,
+        target: &str,
+    ) -> Result<(), &'static str> {
+        let binding = super::super::codex_rotation::receipt_binding(receipt)?;
+        let store = self
+            .env
+            .accounts_store_for(accounts::Cli::Codex)
+            .ok_or("store")?;
+        store
+            .transact_logins_held(self._guard, self.env.now, &mut None, |state, logins| {
+                match logins.native_rotations.get(&receipt.id) {
+                    None => return Ok(Vec::new()),
+                    Some(current) if current != &binding => {
+                        return Err("rotation binding changed".into());
+                    }
+                    Some(_) => {}
+                }
+                Ok(if state.pinned {
+                    Vec::new()
+                } else {
+                    accounts::strike(
+                        state,
+                        target,
+                        &receipt.sid,
+                        &accounts::Strike::NotMoved(
+                            "native reservation cancelled before execution".into(),
+                        ),
+                        self.env.now,
+                    )
+                })
+            })
+            .map_err(|_| "rotation-reservation-release")?;
+        self.retire_pool_record(receipt)?;
+        Ok(())
+    }
+
+    pub(super) fn prove_completed_rotation(
+        &self,
+        receipt: &Receipt,
+        target: &str,
+    ) -> Result<(), &'static str> {
+        if receipt.intent.purpose != super::Purpose::WeeklyQuota
+            || receipt.phase != Phase::Consumed
+            || receipt.accepted_turn.as_deref() != Some(receipt.intent.wall.as_str())
+            || super::read_receipt(self.env, &receipt.id).as_ref() != Some(receipt)
+        {
+            return Err("rotation-not-consumed");
+        }
+        let store = self
+            .env
+            .accounts_store_for(accounts::Cli::Codex)
+            .ok_or("store")?;
+        store
+            .transact_logins_held(self._guard, self.env.now, &mut None, |state, _| {
+                if state.active.as_deref() != Some(target) {
+                    return Err("completed rotation is no longer selected".into());
+                }
+                Ok(accounts::prove(state, target, self.env.now)
+                    .into_iter()
+                    .collect())
+            })
+            .map_err(|_| "rotation-completion")?;
+        Ok(())
+    }
+
     /// Retire pool deduplication only after the matching root is durably
     /// consumed, or retired without ever attempting native execution. A crash
     /// between terminal publication and cleanup is retried by the next reader.

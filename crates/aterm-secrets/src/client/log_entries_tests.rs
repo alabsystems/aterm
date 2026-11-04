@@ -33,13 +33,13 @@ pub(super) fn join_host(paths: &Paths, source: &str, host: &str) {
 }
 
 /// The vault pass's ranked wrap-gap closer and epoch tender on `paths` alone
-/// ([`remove::test_tend_at`]), at first sight and then a thousand gap steps on, past every grace
+/// ([`remove::vault_pass_at`]), at first sight and then a thousand gap steps on, past every grace
 /// and rank: what a Commons exchange's repair once signed at once.
 pub(super) fn vault_passes(paths: &Paths) -> Vec<Record> {
     let now = aterm_time::unix_millis().unwrap_or(0);
     let mut signed = Vec::new();
     for at in [now, now + 1_000 * log_entries::GAP_STEP_MS] {
-        signed.extend(remove::test_tend_at(paths, at).expect("the vault pass looks"));
+        signed.extend(remove::vault_pass_at(paths, at).expect("the vault pass looks"));
     }
     signed
 }
@@ -950,7 +950,7 @@ impl<'a> CommonsLogHarness<'a> {
                 let now = aterm_time::unix_millis().unwrap_or(0);
                 for at in [now, now + 1_000 * log_entries::GAP_STEP_MS] {
                     for p in macs {
-                        remove::test_tend_at(p, at).expect("the vault pass looks");
+                        remove::vault_pass_at(p, at).expect("the vault pass looks");
                         carry();
                     }
                 }
@@ -1285,6 +1285,15 @@ fn a_log_behind_the_envelope_never_writes_an_older_value() {
 
 #[test]
 fn an_edit_by_an_admin_with_no_seat_in_the_log_survives_the_mirror() {
+    no_seat_edit_survives_mirror(false);
+}
+
+#[test]
+fn a_parented_edit_survives_the_automatic_log_mirror() {
+    no_seat_edit_survives_mirror(true);
+}
+
+fn no_seat_edit_survives_mirror(parented: bool) {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"v1".as_slice())]);
     let (m22, m7) = (&macs.m22, &macs.m7);
 
@@ -1303,6 +1312,16 @@ fn an_edit_by_an_admin_with_no_seat_in_the_log_survives_the_mirror() {
         admin_publish_admin(m22, &admin, &doc, "m9").unwrap();
     }
     join_host(&m9, &format!("{}#{}", macs.url, macs.signer), "m9");
+    if parented {
+        let admin = admin_open(m22).unwrap();
+        admin_publish_conditional_until(
+            m22,
+            &admin,
+            &admin.doc,
+            Instant::now() + Duration::from_secs(60),
+        )
+        .unwrap();
+    }
     {
         let admin = admin_open(&m9).unwrap();
         let mut doc = admin.doc.clone();
@@ -1311,9 +1330,16 @@ fn an_edit_by_an_admin_with_no_seat_in_the_log_survives_the_mirror() {
         admin_publish(&m9, &admin, &doc).expect("m9 edits shared");
     }
 
-    // m22, the seated admin, mirrors: the edit stays in the envelope a 0.145 Mac reads, reaches
-    // the log, and m7 writes it.
+    let before_mirror = envelope::parse(&std::fs::read(m9.cache_file()).unwrap())
+        .unwrap()
+        .digest();
+    // m22, the seated admin, mirrors: the edit stays in the envelope, reaches
+    // the log, and m7 writes it. An explicit upgrade keeps the parent guard.
     let _ = admin_mirror_log(m22, &[]).expect("admin_mirror_log");
+    if parented {
+        let mirrored = envelope::parse(&std::fs::read(m22.cache_file()).unwrap()).unwrap();
+        assert!(mirrored.parents.contains(&before_mirror));
+    }
     let m7_id = read_identity(m7).unwrap().unwrap();
     let (_, view) = envelope_view(&macs.url, &m7_id);
     assert_eq!(
@@ -2575,7 +2601,8 @@ fn log_witness_skips_inert_admit_concurrent_remove_excludes_epoch_writer_and_adm
         .log_witness()
         .unwrap()
         .expect("m8 log witness");
-    let decoded = crate::membership_log::decode_records(&witness_wire).unwrap();
+    let decoded =
+        crate::membership_log::decode_records(&encode_records(witness_wire.records())).unwrap();
     let mut iter = decoded.into_iter();
     let mut verify_log = Log::new(iter.next().unwrap()).unwrap();
     for r in iter {
@@ -2700,7 +2727,8 @@ fn log_witness_skips_inert_admit_concurrent_remove_excludes_epoch_writer_and_adm
         .log_witness()
         .unwrap()
         .expect("m9 log witness");
-    let decoded9 = crate::membership_log::decode_records(&witness9_wire).unwrap();
+    let decoded9 =
+        crate::membership_log::decode_records(&encode_records(witness9_wire.records())).unwrap();
     let mut iter9 = decoded9.into_iter();
     let mut verify_log9 = Log::new(iter9.next().unwrap()).unwrap();
     for r in iter9 {
@@ -2925,7 +2953,11 @@ pub(super) fn hand(
             node: request.binding().recipient().0,
             name: allowed.name(),
             allowed,
-            reads_log,
+            reader: if reads_log {
+                crate::members::bundle::Reader::LegacyLog
+            } else {
+                crate::members::bundle::Reader::Files
+            },
             restore: false,
             held: None,
         },
@@ -2978,7 +3010,11 @@ fn a_bundle_built_under_the_desks_hold_names_the_policys_servers() {
                 node: request.binding().recipient().0,
                 name: allowed.name(),
                 allowed: &allowed,
-                reads_log,
+                reader: if reads_log {
+                    crate::members::bundle::Reader::LegacyLog
+                } else {
+                    crate::members::bundle::Reader::Files
+                },
                 restore: false,
                 held: Some(&hold),
             },
@@ -3297,7 +3333,11 @@ pub(super) fn hand_result(
             node: request.binding().recipient().0,
             name: allowed.name(),
             allowed,
-            reads_log,
+            reader: if reads_log {
+                crate::members::bundle::Reader::LegacyLog
+            } else {
+                crate::members::bundle::Reader::Files
+            },
             restore: false,
             held: None,
         },
@@ -3379,7 +3419,7 @@ fn a_mac_the_log_removed_is_not_let_back_in_by_a_members_allow() {
             node: [0x41; 32],
             name: allowed3.name(),
             allowed: &allowed3,
-            reads_log: true,
+            reader: crate::members::bundle::Reader::LegacyLog,
             restore: false,
             held: None,
         },
@@ -3391,16 +3431,10 @@ fn a_mac_the_log_removed_is_not_let_back_in_by_a_members_allow() {
     drop(macs.root);
 }
 
-/// A Mac that asked under `m99999` leaves the next Mac a label: every later Allow on that log
-/// used to fail (`m100000` is no label an `Admit` carries) with no fallback, since `hand_over`
-/// passed the log path's error on. A log path that fails now hands F10's files, as where no log
-/// applies, and says why.
-///
-/// NEGATIVE CONTROL: in `hand_over`, pass a log-path error on (`Err(error) => return
-/// Err(error)`): the run with an unreadable records file fails and the `"the fallback hands
-/// files"` expect fails.
+/// A Mac that asks under `m99999` leaves the next Mac a valid label. A request that cannot
+/// enter the log is refused without handing the vault's files or recording an admission.
 #[test]
-fn a_log_path_that_fails_hands_f10s_files_and_m99999_leaves_a_label() {
+fn a_failed_log_path_is_refused_and_m99999_leaves_a_label() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
     let m7 = &macs.m7;
     let (_, request, allowed) = newcomer(macs.root.path(), m7, "m99999");
@@ -3421,7 +3455,7 @@ fn a_log_path_that_fails_hands_f10s_files_and_m99999_leaves_a_label() {
     assert!(crate::membership_log::is_label(&label), "{label}");
 
     // An Admit the log refuses (a request bound to another Commons network, which the desk turns
-    // away before a run): the log path fails, and F10's files go instead.
+    // away before a run): the log path fails without a files fallback.
     let stray = Paths::for_home(&macs.root.path().join("stray"));
     machine_identity(&stray).expect("identity");
     let request3 = crate::commons::bootstrap::Device::open(&stray)
@@ -3434,16 +3468,7 @@ fn a_log_path_that_fails_hands_f10s_files_and_m99999_leaves_a_label() {
         .device()
         .with_seed(|seed| crate::members::Allowed::sign(request3.binding(), "m41", seed))
         .unwrap();
-    let handout = hand_result(m7, &request3, &allowed3, true).expect("the fallback hands files");
-    assert!(!handout.logged);
-    assert!(
-        handout
-            .note
-            .as_deref()
-            .is_some_and(|note| note.contains("log path failed")),
-        "{:?}",
-        handout.note
-    );
+    assert!(hand_result(m7, &request3, &allowed3, true).is_err());
     assert!(
         load_records(m7)
             .unwrap()
@@ -3457,6 +3482,252 @@ fn a_log_path_that_fails_hands_f10s_files_and_m99999_leaves_a_label() {
 
     macs.server.stop();
     drop(macs.root);
+}
+
+fn filled_join_log(member: &Paths, count: usize) -> crate::membership_log::Log {
+    use crate::membership_log::Body;
+    let bootstrap = Bootstrap::required(member).unwrap();
+    let request = bootstrap.request().unwrap();
+    let mut log = load_records(member).unwrap().log().unwrap().clone();
+    bootstrap
+        .device()
+        .with_seed(|seed| {
+            while log.held_count() < count {
+                let count = log.held_count();
+                let record = log
+                    .draft(
+                        &request.binding().actor(),
+                        count as u64 + 10,
+                        Body::Name {
+                            name: format!("join-source-{count}"),
+                        },
+                    )
+                    .sign(seed, *request.binding().incarnation())?;
+                log.insert(record)?;
+            }
+            Ok::<(), crate::Error>(())
+        })
+        .unwrap();
+    log
+}
+
+#[test]
+fn join_reader_capacity_is_checked_before_and_after_admission() {
+    use crate::crossing::RecordsBound;
+    use crate::members::bundle::{Handed, Reader};
+    use crate::members::desk::Handing;
+    use crate::membership_log::{LEGACY_RECORDS, RecordBudgets};
+    const LARGER: RecordBudgets = RecordBudgets {
+        held: 8192,
+        ..RecordBudgets::PRODUCTION
+    };
+    LARGER.within(|| {
+        let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
+        let member = &macs.m7;
+        let log = filled_join_log(member, LEGACY_RECORDS - 1);
+        save_records(member, &encode_records(log.records())).unwrap();
+        let before = std::fs::read(member.records_file()).unwrap();
+        assert!(!records_marked_crossed(member).unwrap());
+        let (_, request, allowed) = newcomer(macs.root.path(), member, "m40");
+        let hand_to = |reader| {
+            hand_over(
+                member,
+                &Handing {
+                    request: &request,
+                    node: *request.binding().writer(),
+                    name: allowed.name(),
+                    allowed: &allowed,
+                    reader,
+                    restore: false,
+                    held: None,
+                },
+            )
+        };
+        for reader in [
+            Reader::LegacyLog,
+            Reader::BoundedLog(RecordsBound::of(4096, false)),
+        ] {
+            assert!(hand_to(reader).is_err());
+            assert!(
+                std::fs::read(member.records_file()).unwrap() == before,
+                "a refused phrase admission must not change records"
+            );
+            assert!(!records_marked_crossed(member).unwrap());
+            let proven = crate::client::Proven {
+                request: &request,
+                node: *request.binding().writer(),
+                name: allowed.name(),
+                reader,
+                fleet: true,
+                lan: true,
+                fresh: true,
+                book: crate::client::Book {
+                    moved_seats_read: true,
+                    ..crate::client::Book::default()
+                },
+            };
+            let proof_result =
+                crate::client::admit_by_proof(member, &proven, aterm_time::unix_millis().unwrap());
+            assert!(
+                std::fs::read(member.records_file()).unwrap() == before,
+                "a refused proof admission must not change records"
+            );
+            assert!(!records_marked_crossed(member).unwrap());
+            assert!(matches!(
+                proof_result,
+                Ok(crate::client::Readmit::Refused(_))
+            ));
+        }
+        let proven = crate::client::Proven {
+            request: &request,
+            node: *request.binding().writer(),
+            name: allowed.name(),
+            reader: Reader::BoundedLog(RecordsBound::here(false)),
+            fleet: true,
+            lan: true,
+            fresh: true,
+            book: crate::client::Book {
+                moved_seats_read: true,
+                ..crate::client::Book::default()
+            },
+        };
+        assert!(matches!(
+            crate::client::admit_by_proof(member, &proven, aterm_time::unix_millis().unwrap())
+                .unwrap(),
+            crate::client::Readmit::Let { .. }
+        ));
+        let handout = hand_to(Reader::BoundedLog(RecordsBound::here(false))).unwrap();
+        assert!(handout.logged);
+        let Handed::Log { source, .. } = crate::members::Bundle::decode(handout.bundle.as_slice())
+            .unwrap()
+            .handed
+        else {
+            panic!("bounded reader requires the log bundle");
+        };
+        assert_eq!(source, Some(RecordsBound::here(true)));
+        assert!(records_marked_crossed(member).unwrap());
+        let after = std::fs::read(member.records_data_file().unwrap()).unwrap();
+        assert!(hand_to(Reader::LegacyLog).is_err());
+        assert_eq!(
+            std::fs::read(member.records_data_file().unwrap()).unwrap(),
+            after
+        );
+        macs.server.stop();
+    });
+}
+
+#[test]
+fn join_bundles_keep_waiting_records_local_and_fit_the_advertised_history() {
+    use crate::crossing::RecordsBound;
+    use crate::members::bundle::{Handed, Reader};
+    use crate::members::desk::Handing;
+    use crate::membership_log::{Body, LEGACY_RECORDS, RecordBudgets, decode_records};
+    RecordBudgets {
+        held: 8192,
+        ..RecordBudgets::PRODUCTION
+    }
+    .within(|| {
+        let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
+        let member = &macs.m7;
+        let mut log = filled_join_log(member, LEGACY_RECORDS - 16);
+        let complete = encode_records(log.records());
+        let bootstrap = Bootstrap::required(member).unwrap();
+        let author = bootstrap.request().unwrap();
+        let pending = bootstrap
+            .device()
+            .with_seed(|seed| {
+                let mut pending = Vec::new();
+                for n in 0..33 {
+                    let record = log
+                        .draft(
+                            &author.binding().actor(),
+                            10_000 + n,
+                            Body::Name {
+                                name: format!("join-waiting-{n}"),
+                            },
+                        )
+                        .sign(seed, *author.binding().incarnation())?;
+                    log.insert(record.clone())?;
+                    if n > 0 {
+                        pending.push(record);
+                    }
+                }
+                Ok::<_, crate::Error>(encode_records(&pending))
+            })
+            .unwrap();
+        save_records(member, &complete).unwrap();
+        save_records(member, &pending).unwrap();
+        let (joining, request, allowed) = newcomer(macs.root.path(), member, "waiting-joiner");
+        let mut received = None;
+        for reader in [
+            Reader::LegacyLog,
+            Reader::BoundedLog(RecordsBound::of(4096, false)),
+        ] {
+            let handout = hand_over(
+                member,
+                &Handing {
+                    request: &request,
+                    node: *request.binding().writer(),
+                    name: allowed.name(),
+                    allowed: &allowed,
+                    reader,
+                    restore: false,
+                    held: None,
+                },
+            )
+            .unwrap();
+            let bundle = crate::members::Bundle::decode(handout.bundle.as_slice()).unwrap();
+            let proven = crate::client::Proven {
+                request: &request,
+                node: *request.binding().writer(),
+                name: allowed.name(),
+                reader,
+                fleet: true,
+                lan: true,
+                fresh: true,
+                book: crate::client::Book {
+                    moved_seats_read: true,
+                    ..crate::client::Book::default()
+                },
+            };
+            let crate::client::Readmit::Let { bundle: proof, .. } =
+                crate::client::admit_by_proof(member, &proven, aterm_time::unix_millis().unwrap())
+                    .unwrap()
+            else {
+                panic!("the complete admission fits the reader");
+            };
+            let proof = crate::members::Bundle::decode(proof.as_slice()).unwrap();
+            let source = load_records(member).unwrap();
+            assert!(source.len() > LEGACY_RECORDS);
+            assert!(source.complete_inventory().len() <= LEGACY_RECORDS);
+            assert_eq!(source.len() - source.complete_inventory().len(), 32);
+            for bundle in [&bundle, &proof] {
+                let Handed::Log { records, .. } = &bundle.handed else {
+                    panic!("the join hands a log");
+                };
+                let offered =
+                    decode_records(records).expect("uncrossed history fits a legacy reader");
+                assert_eq!(
+                    offered
+                        .iter()
+                        .map(|r| *r.id())
+                        .collect::<std::collections::BTreeSet<_>>(),
+                    source.complete_inventory()
+                );
+            }
+            received = Some(bundle);
+        }
+        RecordBudgets::PRODUCTION.within(|| {
+            write_from_log_bundle(&joining, &received.unwrap()).unwrap();
+            let retained = load_records(&joining).unwrap();
+            assert_eq!(retained.len(), retained.complete_inventory().len());
+            assert_eq!(
+                std::fs::read(joining.home.join(".secrets/shared")).unwrap(),
+                b"everyone-v1"
+            );
+        });
+        macs.server.stop();
+    });
 }
 
 /// A log bundle whose genesis `seed` signs, founded by a synthetic member that admits the Mac at
@@ -3559,6 +3830,7 @@ fn forged_log_bundle(
         allowed: crate::members::Allowed::sign(request.binding(), "m40", &founder_seed)
             .expect("allowed"),
         handed: crate::members::bundle::Handed::Log {
+            source: None,
             admit: *admit.id(),
             records: encode_records(log.records()),
         },
@@ -3597,9 +3869,8 @@ fn a_new_mac_takes_alabs_genesis_only_from_keys_its_build_names() {
 
     let joiner = Paths::for_home(&root.path().join("j"));
     let forged = forged_log_bundle(&joiner, &forger_seed, forger, vec![vault], b"forged");
-    let error =
-        write_from_log_bundle(&joiner, &forged).expect_err("a genesis only the bundle names");
-    assert!(error.to_string().contains("records"), "{error}");
+    write_from_log_bundle(&joiner, &forged).expect_err("a genesis only the bundle names");
+    assert!(!joiner.records_file().exists());
     assert!(!joiner.home.join(".secrets/gh-token").exists());
     assert!(config(&joiner).unwrap().is_none(), "no vault configured");
 
@@ -4641,7 +4912,7 @@ fn a_busy_member_ends_a_log_run_with_the_refusal_inside_the_ask_exchanges_bound(
                 node: [0x40; 32],
                 name: allowed.name(),
                 allowed: &allowed,
-                reads_log: true,
+                reader: crate::members::bundle::Reader::LegacyLog,
                 restore: false,
                 held: None,
             },

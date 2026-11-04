@@ -23,6 +23,7 @@ fn offhome_done_cannot_close_a_valid_pending_request() {
     assert_eq!(before[0].state, desk::RowState::Asking);
     let device = device(&f.fake.root, "queued");
     let joining = Joining {
+        records_bound: aterm_secrets::crossing::RecordsBound::uncrossed(),
         device: &device,
         node: [7; 32],
         name: "queued".to_owned(),

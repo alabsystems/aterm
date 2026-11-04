@@ -142,9 +142,27 @@ pub struct BrokerHealth {
     /// (one from before the tally joined the file, under the same header): the counts
     /// are unknown, never zero.
     pub process_flushes: Option<astream_sys::FlushTally>,
+    /// What of the retained history the log keeps decoded in memory when the snapshot
+    /// was taken ([`Broker::residency`](crate::Broker::residency)): every retained record
+    /// with no residency budget, the hot window at the head under one
+    /// ([`OpenOptions::resident_budget`](crate::OpenOptions::resident_budget)). `None` in
+    /// a snapshot an older build wrote (one from before residency joined the file, under
+    /// the same header): unknown, never zero.
+    pub resident: Option<Residency>,
     /// `Some(reason)` while the log is POISONED: it refuses every write until it is
     /// reopened ([`Broker::poisoned`](crate::Broker::poisoned)).
     pub poisoned: Option<String>,
+}
+
+/// The retained records a log keeps decoded in memory ([`BrokerHealth::resident`]), as
+/// the residency tier counts them; the rest are read back from the log file on demand.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Residency {
+    /// Retained records held decoded.
+    pub records: u64,
+    /// The bytes the residency budget charges them: subject and body, plus a fixed
+    /// overhead each.
+    pub bytes: u64,
 }
 
 impl Default for BrokerHealth {
@@ -178,6 +196,7 @@ impl Default for BrokerHealth {
             parked_tails: 0,
             flushes: FlushCounts::default(),
             process_flushes: None,
+            resident: None,
             poisoned: None,
         }
     }
@@ -191,6 +210,12 @@ fn tally_counts(t: &astream_sys::FlushTally) -> [(&'static str, u64); 3] {
         ("process_flush_barrier", t.barrier),
         ("process_flush_plain", t.plain),
     ]
+}
+
+/// The keys of [`BrokerHealth::resident`], each with its count: written together or (by
+/// an older build) not at all.
+fn residency_counts(r: &Residency) -> [(&'static str, u64); 2] {
+    [("resident_records", r.records), ("resident_bytes", r.bytes)]
 }
 
 /// Whether the broker that wrote a `<log>.health` still serves its log
@@ -305,9 +330,9 @@ impl BrokerHealth {
     }
 
     /// The file's text: its first line, `astream-broker-health 1` (the format's
-    /// version), then one `key=value` line each, the process's flush tally when it is
-    /// known, the poison's reason (when there is one) last. Every key
-    /// [`parse`](Self::parse) needs is always written.
+    /// version), then one `key=value` line each, the process's flush tally and the
+    /// log's residency when they are known, the poison's reason (when there is one)
+    /// last. Every key [`parse`](Self::parse) needs is always written.
     #[must_use]
     pub fn render(&self) -> String {
         let mut out = String::with_capacity(512);
@@ -337,6 +362,11 @@ impl BrokerHealth {
                 kv(k, &v.to_string());
             }
         }
+        if let Some(resident) = &self.resident {
+            for (k, v) in residency_counts(resident) {
+                kv(k, &v.to_string());
+            }
+        }
         match &self.poisoned {
             Some(why) => {
                 kv("poisoned", "yes");
@@ -350,9 +380,10 @@ impl BrokerHealth {
     /// The snapshot in `text`, or `None` for text that is not one this build reads:
     /// another first line (another format, or a file cut short), a key it needs
     /// missing, or a value that does not parse. Keys it does not know are skipped, so a
-    /// later build that adds one is still read. The process's flush tally is the one
-    /// fact an older build under this header did not write: its three keys are all
-    /// present (`process_flushes` is `Some`) or all absent (`None`), never some of them.
+    /// later build that adds one is still read. The process's flush tally and the log's
+    /// residency are the facts an older build under this header did not write: each
+    /// one's keys are all present (`process_flushes`, `resident` is `Some`) or all absent
+    /// (`None`), never some of them.
     #[must_use]
     pub fn parse(text: &str) -> Option<BrokerHealth> {
         let mut lines = text.lines();
@@ -360,10 +391,12 @@ impl BrokerHealth {
             return None;
         }
         let mut h = BrokerHealth::default();
-        // Every key `render` writes but `reason` (present exactly when poisoned) and the
-        // tally's (bits 26 to 28, all or none).
+        // Every key `render` writes but `reason` (present exactly when poisoned), the
+        // tally's (bits 26 to 28, all or none) and the residency's (bits 29 and 30, both
+        // or neither).
         let mut seen = 0u32;
         let mut tally = astream_sys::FlushTally::default();
+        let mut resident = Residency::default();
         let mut poisoned = None;
         let mut reason = None;
         let mut horizon = None;
@@ -501,6 +534,14 @@ impl BrokerHealth {
                     tally.plain = num()?;
                     28
                 }
+                "resident_records" => {
+                    resident.records = num()?;
+                    29
+                }
+                "resident_bytes" => {
+                    resident.bytes = num()?;
+                    30
+                }
                 "reason" => {
                     reason = Some(v.to_string());
                     continue;
@@ -511,11 +552,17 @@ impl BrokerHealth {
         }
         const NEEDED: u32 = (1u32 << 26) - 1;
         const TALLY: u32 = 0b111 << 26;
+        const RESIDENT: u32 = 0b11 << 29;
         if seen & NEEDED != NEEDED {
             return None;
         }
         h.process_flushes = match seen & TALLY {
             TALLY => Some(tally),
+            0 => None,
+            _ => return None,
+        };
+        h.resident = match seen & RESIDENT {
+            RESIDENT => Some(resident),
             0 => None,
             _ => return None,
         };
@@ -758,14 +805,20 @@ mod tests {
                 barrier: 13,
                 plain: 17,
             }),
+            resident: Some(Residency {
+                records: 5,
+                bytes: 619,
+            }),
             poisoned: Some("a flush failed (EIO)\nwith records".to_string()),
         }
     }
 
     /// The file round-trips every fact, the poison's reason on one line; a healthy log
-    /// writes `poisoned=no` and no reason. A later build's extra key is skipped. NEGATIVE
-    /// CONTROLS: another first line, a missing key, a value that does not parse, a
-    /// poison flag without its reason, and a reason without the flag are not snapshots.
+    /// writes `poisoned=no` and no reason. A later build's extra key is skipped, and an
+    /// older build's snapshot, without the tally or the residency, reads with that fact
+    /// unknown. NEGATIVE CONTROLS: another first line, a missing key, a tally or a
+    /// residency with one of its keys missing, a value that does not parse, a poison flag
+    /// without its reason, and a reason without the flag are not snapshots.
     #[test]
     fn the_snapshot_round_trips_and_refuses_what_it_is_not() {
         let h = sample();
@@ -826,6 +879,29 @@ mod tests {
                 "a tally without {key} is no writer's"
             );
         }
+        // Residency the same way: an older broker's snapshot carries none, and reads with
+        // it unknown, never a log that holds nothing resident.
+        assert!(
+            ht.contains("\nresident_records=5\nresident_bytes=619\n"),
+            "the log's residency, records then bytes: {ht}"
+        );
+        let older = without(&["resident_"]);
+        let mut unknown = healthy.clone();
+        unknown.resident = None;
+        assert_eq!(BrokerHealth::parse(&older), Some(unknown.clone()));
+        assert_eq!(unknown.render(), older, "no residency, no residency keys");
+        for key in ["resident_records=", "resident_bytes="] {
+            assert_eq!(
+                BrokerHealth::parse(&without(&[key])),
+                None,
+                "a residency without {key} is no writer's"
+            );
+        }
+        assert_eq!(
+            BrokerHealth::parse(&ht.replace("resident_bytes=619", "resident_bytes=-1")),
+            None,
+            "a residency count that does not parse"
+        );
         assert_eq!(
             BrokerHealth::parse(&ht.replace("records=8", "records=eight")),
             None

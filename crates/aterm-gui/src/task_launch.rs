@@ -788,23 +788,20 @@ fn run_worker_launch(work: &Launch) {
             return;
         }
     };
-    let _google_mark = native_google_agent(work.agent).then(|| InstallingMark::of(&work.ctx));
-    let (caller, google) = match NativeGoogleAdmission::prepare(work.agent, caller) {
-        Ok(prepared) => prepared,
-        Err(why) => {
-            stall(work, &why);
-            return;
-        }
-    };
-    let admitted = match admit_worker(
+    let (admitted, google) = match admit_prepared_worker(
         cli,
         caller,
         aterm_types::dirs::home_dir().as_deref(),
         &|note| note_launch(&work.ctx, note),
         &|| InstallingMark::of(&work.ctx),
         &AtpkgStore,
+        |starter| {
+            let _google_mark =
+                native_google_agent(work.agent).then(|| InstallingMark::of(&work.ctx));
+            NativeGoogleAdmission::prepare(work.agent, starter)
+        },
     ) {
-        Ok(admitted) => admitted,
+        Ok(prepared) => prepared,
         Err(refused) => {
             stall_why(work, refused_why(&refused), refused.why());
             return;
@@ -1093,9 +1090,25 @@ pub(crate) fn admit_worker<M>(
     Ok(admitted)
 }
 
+/// Install/admit the worker before invoking preparation that needs its native program.
+/// The returned authentication guard must survive until the final launch check.
+fn admit_prepared_worker<M, T>(
+    cli: &aterm_agent::harness::worker::WorkerCli,
+    starter: aterm_agent::harness::worker::Starter,
+    user: Option<&Path>,
+    note: &dyn Fn(String),
+    installing: &dyn Fn() -> M,
+    store: &dyn ProgramStore,
+    prepare: impl FnOnce(
+        aterm_agent::harness::worker::Starter,
+    ) -> Result<(aterm_agent::harness::worker::Starter, T), String>,
+) -> Result<(aterm_agent::harness::worker::Admitted, T), aterm_agent::harness::worker::Refused> {
+    admit_worker(cli, starter, user, note, installing, store)?.prepare(cli, user, prepare)
+}
+
 /// The task record's `why=` for a worker its launcher refused before its line
-/// ([`aterm_agent::harness::worker::Refused`]): `signin` for a signed-out CLI, which only a
-/// person can fix, and `install` for a program whose install failed.
+/// ([`aterm_agent::harness::worker::Refused`]): `signin` for a sign-in or authentication
+/// preparation failure, and `install` for a program whose install failed.
 pub(crate) const fn refused_why(refused: &aterm_agent::harness::worker::Refused) -> &'static str {
     match refused {
         aterm_agent::harness::worker::Refused::SignedOut(_) => crate::task_record::WHY_SIGNIN,

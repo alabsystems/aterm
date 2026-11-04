@@ -15,10 +15,10 @@ use crate::{
     ECHO_FADE, ECHO_FAULT_CROSS, ECHO_FAULT_FLASH, ECHO_SWEEP, ECHO_SWEEP_PERMILLE, GLINT_DELAY,
     GLINT_MIN_HALF_CELLS, GLINT_PEAK, GLINT_PERIOD, GLINT_RADIUS_PERMILLE, GLINT_TRAVEL, Instant,
 };
-// The easings and the glide live in the shared motion vocabulary (`aterm_scene::motion`); the
-// band draws with them as it always has, and keeps their old paths here.
-#[cfg(test)]
-pub(crate) use aterm_scene::motion::ease_out_cubic;
+// The easings and the glide live in the shared motion vocabulary (`aterm_scene::motion`);
+// `glide`, `ease_out_quad`, `glide_span`, `frac`, and `frac_fine` are re-exported or imported
+// below so the band draws with them at their module paths, while `ease_out_cubic` stays in
+// `aterm_scene::motion` alone.
 pub(crate) use aterm_scene::motion::glide;
 pub use aterm_scene::motion::{ease_out_quad, glide_span};
 use aterm_scene::motion::{frac, frac_fine};
@@ -515,9 +515,9 @@ pub fn comet(since: Duration, graded: bool) -> Surface {
             true,
         );
     }
-    let mut points = Vec::with_capacity(usize::try_from(TAIL_STOPS).unwrap_or(0) + 3);
+    let mut points = Vec::with_capacity(usize::from(TAIL_STOPS) + 3);
     for k in 0..=TAIL_STOPS {
-        let x = h - tail + tail * k / TAIL_STOPS;
+        let x = h - tail + tail * i64::from(k) / i64::from(TAIL_STOPS);
         points.push((x, tail_tone(k)));
     }
     points.push((h + lead, Tone::TRACK));
@@ -527,19 +527,28 @@ pub fn comet(since: Duration, graded: bool) -> Surface {
 /// The tail's segments: fine enough that a cell (a tail spans ~10 cells at
 /// 60 columns, ~34 at 200) sees the curve and not the chords; 8 showed faint
 /// vertical stripes along the tail.
-const TAIL_STOPS: i64 = 32;
+const TAIL_STOPS: u8 = 32;
 
-/// The tail's tone `k/TAIL_STOPS` of the way from its end to the head: the
+/// The tail's tone `stop/TAIL_STOPS` of the way from its end to the head: the
 /// fill `u²`, the lift rising as the square over the last half into
-/// [`Tone::HEAD`] at `k = TAIL_STOPS`.
-fn tail_tone(k: i64) -> Tone {
-    let (n, half) = (TAIL_STOPS, TAIL_STOPS / 2);
-    let u = k.clamp(0, n);
-    let fill = u8::try_from((u * u * 255 + n * n - 1) / (n * n)).unwrap_or(255);
-    let hot = (u - half).max(0);
-    let lift =
-        u8::try_from((i64::from(COMET_HEAD_LIFT) * hot * hot + half * half / 2) / (half * half))
-            .unwrap_or(0);
+/// [`Tone::HEAD`] at `stop = TAIL_STOPS`, and the head's tone past it.
+///
+/// The stop is a `u8` and the arithmetic `u32`, so each square is of a factor
+/// a `u8` bounds, and the prover decides each obligation in at most 5 s. The
+/// `i64` form with `clamp` it replaced sat at the prover's 120 s wall clock:
+/// what that proved moved with the machine's load, from none of its 42
+/// obligations to 28.
+fn tail_tone(stop: u8) -> Tone {
+    let (n, half) = (u32::from(TAIL_STOPS), u32::from(TAIL_STOPS / 2));
+    let u = u32::from(stop.min(TAIL_STOPS));
+    let fill = u8::try_from((u * u * 255).div_ceil(n * n)).unwrap_or(255);
+    let lift = if u > half {
+        let hot = u - half;
+        u8::try_from((u32::from(COMET_HEAD_LIFT) * hot * hot + half * half / 2) / (half * half))
+            .unwrap_or(0)
+    } else {
+        0
+    };
     Tone {
         fill,
         lift,
@@ -839,8 +848,6 @@ mod tests {
         assert_eq!(smooth(65_536), 65_536);
         assert_eq!(breath(0), 0);
         assert_eq!(breath(65_536), 65_536);
-        assert_eq!(ease_out_cubic(0), 0);
-        assert_eq!(ease_out_cubic(65_536), 65_536);
         assert_eq!(ease_out_quad(0), 0);
         assert_eq!(ease_out_quad(65_536), 65_536);
         assert_eq!(ease_out_quad(32_768), 49_152, "three quarters at half time");
@@ -970,6 +977,35 @@ mod tests {
         assert!(
             s.cells(80).iter().all(|t| *t == Tone::TRACK),
             "drained to the track, no warn anywhere"
+        );
+    }
+
+    /// The tail's tones are the `i64` clamp form's at every stop a `u8` holds: `ceil(255·u²/n²)`
+    /// fill and the lift `150·hot²/half²` rounded, the head's tone from `TAIL_STOPS` on.
+    #[test]
+    fn the_tail_tones_are_the_clamped_squares() {
+        let (n, half) = (i64::from(TAIL_STOPS), i64::from(TAIL_STOPS / 2));
+        for stop in 0..=u8::MAX {
+            let u = i64::from(stop).clamp(0, n);
+            let hot = (u - half).max(0);
+            let fill = u8::try_from((u * u * 255 + n * n - 1) / (n * n)).unwrap();
+            let lift = u8::try_from(
+                (i64::from(COMET_HEAD_LIFT) * hot * hot + half * half / 2) / (half * half),
+            )
+            .unwrap();
+            let want = Tone {
+                fill,
+                lift,
+                warn: 0,
+            };
+            assert_eq!(tail_tone(stop), want, "stop {stop}");
+        }
+        assert_eq!(tail_tone(0), Tone::TRACK, "the tail's end is the track");
+        assert_eq!(tail_tone(32), Tone::HEAD, "its last stop is the head");
+        assert_eq!(
+            tail_tone(u8::MAX),
+            Tone::HEAD,
+            "and so is every stop past it"
         );
     }
 }

@@ -18,7 +18,7 @@ use aterm_types::macos_setup::{
 mod typed_join_tests;
 
 /// Read `subjects` for `plan` without changing anything. `network` adds the
-/// GitHub repositories row (the network and the keychain); without it that row
+/// GitHub repositories row (the network and the token file); without it that row
 /// is left out. A row that cannot be read comes back Unknown with the reason in
 /// its detail; nothing is guessed.
 pub fn observe_initial_setup(plan: &Plan, subjects: &[Subject], network: bool) -> Vec<Observation> {

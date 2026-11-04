@@ -5,9 +5,8 @@
 //! Machines 5a and 5b (plan §17): the `[github] keys` row, and the key calls over agh's library
 //! against agh-fake on loopback. The default row keeps the REST path, scripted on the `Fake`.
 
-use super::github::{KeyCalls, Registered, TOKEN_HOST, register_via, revoke_via};
-use super::inventory::{Github, KeysVia};
-use crate::git_credential::script;
+use super::github::{KeyCalls, Registered, register_via, revoke_via};
+use super::inventory::{Github, KeysVia, Paths};
 use crate::port::{Fake, GithubResponse, RestMethod, Stat};
 use agh::config::Dirs;
 use agh::identity::ProcessEnv;
@@ -53,45 +52,58 @@ fn endpoints(fake: &FakeGithub) -> Endpoints {
     Endpoints::loopback(ports.api, ports.uploads, ports.web, ports.cdn)
 }
 
-/// A `Fake` whose agh client sends to `fake`, with CLT git for the keychain reads.
+/// The controller directory these tests name.
+fn paths() -> Paths {
+    Paths {
+        root: "/controller".into(),
+    }
+}
+
+/// `token` in `paths`'s GitHub token file, a private file of `sys`'s account, as `aterm machines
+/// github login` leaves it.
+pub(super) fn holds_token(sys: &Fake, paths: &Paths, token: &str) {
+    let file = paths.github_token();
+    let file = file.to_str().unwrap();
+    sys.file(file, format!("{token}\n").as_bytes()).stat_of(
+        file,
+        Stat {
+            uid: sys.euid,
+            gid: 0,
+            mode: 0o600,
+            dir: false,
+            symlink: false,
+            len: token.len() as u64 + 1,
+        },
+    );
+}
+
+/// A `Fake` whose agh client sends to `fake`.
 fn controller(fake: &FakeGithub) -> Fake {
     reaching(Fake::default(), fake)
 }
 
-/// `sys`, its agh client sending to `fake`, with CLT git for the keychain reads.
+/// `sys`, its agh client sending to `fake`.
 fn reaching(sys: Fake, fake: &FakeGithub) -> Fake {
-    let sys = sys.with_github(
+    sys.with_github(
         Arc::new(HttpTransport::direct(Arc::new(ProcessEnv))),
         endpoints(fake),
-    );
-    sys.stat_of(
-        crate::items::github::CLT_GIT,
-        Stat {
-            uid: 0,
-            gid: 0,
-            mode: 0o755,
-            dir: false,
-            symlink: false,
-            len: 1,
-        },
-    );
-    sys
+    )
 }
 
-/// A controller whose login keychain holds the fleet token for [`LOGIN`], which agh-fake
-/// knows; the token is returned for the scope test.
+/// A controller whose token file holds the fleet token for [`LOGIN`], which agh-fake knows; the
+/// token is returned for the scope test.
 fn inline(fake: &FakeGithub) -> (Fake, String) {
-    inline_on(Fake::default(), fake)
+    inline_on(Fake::default(), &paths(), fake)
 }
 
-/// `sys` reaching `fake`, its login keychain holding the fleet token for [`LOGIN`]: the
-/// controller on which the callers' tests (`commands.rs`, `enroll.rs`) run
+/// `sys` reaching `fake`, the token file of the controller at `paths` holding the fleet token
+/// for [`LOGIN`]: the controller on which the callers' tests (`commands.rs`, `enroll.rs`) run
 /// `keys = "agh-inline"`, their `machines.toml` naming [`LOGIN`].
-pub(super) fn inline_on(sys: Fake, fake: &FakeGithub) -> (Fake, String) {
+pub(super) fn inline_on(sys: Fake, paths: &Paths, fake: &FakeGithub) -> (Fake, String) {
     let token = agh_fake::token("fleet");
     fake.add_token(&token, LOGIN);
     let sys = reaching(sys, fake);
-    script::holds(&sys, None, TOKEN_HOST, LOGIN, &token);
+    holds_token(&sys, paths, &token);
     (sys, token)
 }
 
@@ -119,13 +131,10 @@ fn count(fake: &FakeGithub, request: &str) -> usize {
         .count()
 }
 
-/// The `Fake`'s calls are keychain reads alone: no REST call, and no call carries `token`.
-fn keychain_reads_only(sys: &Fake, token: &str) -> usize {
-    let calls = sys.calls();
-    let fill = script::credential(None, "fill");
-    assert!(calls.iter().all(|c| *c == fill), "{calls:?}");
-    assert!(calls.iter().all(|c| !c.contains(token)), "{calls:?}");
-    calls.len()
+/// The `Fake` saw no call: no REST call and no git run (the token file is read, never asked of
+/// git or the login keychain).
+fn no_calls(sys: &Fake) {
+    assert!(sys.calls().is_empty(), "{:?}", sys.calls());
 }
 
 /// Writes `bytes` to `path` (`0600`), its directory made `0700`.
@@ -203,7 +212,7 @@ fn the_default_is_gh() {
     let fake = FakeGithub::start();
     let sys = controller(&fake);
     let token = agh_fake::token("rest");
-    script::holds(&sys, None, TOKEN_HOST, "fleetbot", &token);
+    holds_token(&sys, &paths(), &token);
     let answer = |status: u16, body: &str| {
         Ok(GithubResponse {
             status,
@@ -236,6 +245,7 @@ fn the_default_is_gh() {
     };
     let done = register_via(
         &sys,
+        &paths(),
         &github,
         "lab-07",
         &[reported("alice", &alice), reported("bob", &bob)],
@@ -255,7 +265,7 @@ fn the_default_is_gh() {
         ]
     );
     let calls = sys.calls();
-    assert_eq!(calls[0], script::credential(None, "fill"));
+    assert_eq!(calls[0], "github GET /user");
     let posted = format!(
         r#"github POST /user/keys {{"title":"aterm-machines:lab-07:alice","key":"{alice}"}}"#
     );
@@ -281,6 +291,7 @@ fn inline_registers_and_revokes_over_agh() {
 
     let done = register_via(
         &sys,
+        &paths(),
         &github,
         "lab-07",
         &[reported("alice", &alice), reported("bob", &bob)],
@@ -315,7 +326,7 @@ fn inline_registers_and_revokes_over_agh() {
     );
 
     assert_eq!(
-        revoke_via(&sys, &github, &[alice_held.id]),
+        revoke_via(&sys, &paths(), &github, &[alice_held.id]),
         Ok(vec![alice.clone()])
     );
     assert_eq!(
@@ -331,8 +342,9 @@ fn inline_registers_and_revokes_over_agh() {
     );
     let left: Vec<String> = fake.keys(LOGIN).into_iter().map(|k| k.key).collect();
     assert_eq!(left, [bob]);
-    // One keychain read per command, and no REST call.
-    assert_eq!(keychain_reads_only(&sys, &token), 2);
+    // The token file read for each command, no git run, and no REST call.
+    no_calls(&sys);
+    assert!(!token.is_empty());
 }
 
 #[test]
@@ -341,6 +353,7 @@ fn key_writes_are_paced_one_second_apart() {
     let (sys, _token) = inline(&fake);
     let done = register_via(
         &sys,
+        &paths(),
         &row(KeysVia::AghInline),
         "lab-07",
         &[
@@ -368,6 +381,7 @@ fn fleet_reads_agh_toml() {
     let alice = key("alice");
     let done = register_via(
         &sys,
+        &paths(),
         &row(KeysVia::AghFleet),
         "lab-07",
         &[reported("alice", &alice)],
@@ -397,7 +411,7 @@ fn a_fleet_profile_that_cannot_be_used_sends_nothing() {
 
     let fake = FakeGithub::start();
     let sys = controller(&fake);
-    let err = register_via(&sys, &fleet, "lab-07", &alice).unwrap_err();
+    let err = register_via(&sys, &paths(), &fleet, "lab-07", &alice).unwrap_err();
     assert!(
         err.contains("agh-fleet") && err.ends_with("nothing was sent"),
         "{err}"
@@ -409,7 +423,7 @@ fn a_fleet_profile_that_cannot_be_used_sends_nothing() {
     let root = scratch();
     let dirs = Dirs::under(root.path());
     let sys = controller(&fake).with_agh_dirs(dirs.clone());
-    let err = register_via(&sys, &fleet, "lab-07", &alice).unwrap_err();
+    let err = register_via(&sys, &paths(), &fleet, "lab-07", &alice).unwrap_err();
     let path = dirs.config.join("agh.toml").display().to_string();
     assert!(
         err.contains(&path) && err.ends_with("nothing was sent"),
@@ -428,7 +442,7 @@ fn a_fleet_profile_that_cannot_be_used_sends_nothing() {
         let file = token_file(root.path(), profile, &fake, login);
         agh_toml(&dirs, profile, login, &file);
         let sys = controller(&fake).with_agh_dirs(dirs.clone());
-        let err = revoke_via(&sys, &fleet, &[20_000]).unwrap_err();
+        let err = revoke_via(&sys, &paths(), &fleet, &[20_000]).unwrap_err();
         assert!(
             err.contains(cause) && err.ends_with("nothing was sent"),
             "{err}"
@@ -461,14 +475,20 @@ fn a_fleet_token_of_another_login_sends_nothing() {
     agh_toml(&dirs, "fleet", LOGIN, &file);
     let sys = controller(&fake).with_agh_dirs(dirs);
     let fleet = row(KeysVia::AghFleet);
-    let err =
-        register_via(&sys, &fleet, "lab-07", &[reported("alice", &key("alice"))]).unwrap_err();
+    let err = register_via(
+        &sys,
+        &paths(),
+        &fleet,
+        "lab-07",
+        &[reported("alice", &key("alice"))],
+    )
+    .unwrap_err();
     assert!(
         err.contains("fixture-ext-bot") && err.ends_with("nothing was sent"),
         "{err}"
     );
     assert_eq!(requests(&fake.seen()), ["GET /user"]);
-    let err = revoke_via(&sys, &fleet, &[20_000]).unwrap_err();
+    let err = revoke_via(&sys, &paths(), &fleet, &[20_000]).unwrap_err();
     assert!(err.contains("fixture-ext-bot"), "{err}");
     assert_eq!(requests(&fake.seen()), ["GET /user", "GET /user"]);
     assert!(fake.keys("fixture-ext-bot").is_empty());
@@ -481,15 +501,16 @@ fn an_inline_token_of_another_login_sends_nothing() {
     let token = agh_fake::token("fleet");
     fake.add_token(&token, "fixture-ext-bot");
     let sys = controller(&fake);
-    script::holds(&sys, None, TOKEN_HOST, LOGIN, &token);
+    holds_token(&sys, &paths(), &token);
     let err = register_via(
         &sys,
+        &paths(),
         &row(KeysVia::AghInline),
         "lab-07",
         &[reported("alice", &key("alice"))],
     )
     .unwrap_err();
-    // The keychain's token is replaced with the keychain's verb; agh's own never sees it.
+    // The stored token is replaced with the controller's verb; agh's own never sees it.
     assert!(err.contains("fixture-ext-bot"), "{err}");
     assert!(err.contains("aterm machines github login"), "{err}");
     assert!(!err.contains("agh auth"), "{err}");
@@ -499,12 +520,12 @@ fn an_inline_token_of_another_login_sends_nothing() {
 }
 
 #[test]
-fn an_inline_token_github_refuses_names_the_keychain_verb() {
+fn an_inline_token_github_refuses_names_the_controllers_login_verb() {
     let fake = FakeGithub::start();
     let token = agh_fake::token("unknown");
     let sys = controller(&fake);
-    script::holds(&sys, None, TOKEN_HOST, LOGIN, &token);
-    let err = revoke_via(&sys, &row(KeysVia::AghInline), &[20_000]).unwrap_err();
+    holds_token(&sys, &paths(), &token);
+    let err = revoke_via(&sys, &paths(), &row(KeysVia::AghInline), &[20_000]).unwrap_err();
     assert!(err.contains("aterm machines github login"), "{err}");
     assert!(!err.contains("agh auth"), "{err}");
     assert!(!err.contains(&token), "{err}");
@@ -524,7 +545,7 @@ fn a_key_another_account_holds_leaves_the_others_registered() {
     let alice = key("alice");
     let bob = key("bob");
     fake.add_key("fixture-ext-bot", "elsewhere", &bob);
-    let registration = KeyCalls::new(&sys).register(
+    let registration = KeyCalls::new(&sys, &paths()).register(
         &row(KeysVia::AghInline),
         "lab-07",
         &[reported("alice", &alice), reported("bob", &bob)],
@@ -553,7 +574,7 @@ fn one_commands_key_calls_share_one_client_and_its_pacing() {
     let (sys, _token) = inline(&fake);
     let github = row(KeysVia::AghInline);
     let bob_id = fake.add_key(LOGIN, "aterm-machines:lab-07:bob", &key("bob"));
-    let calls = KeyCalls::new(&sys);
+    let calls = KeyCalls::new(&sys, &paths());
     let registration = calls.register(&github, "lab-07", &[reported("alice", &key("alice"))]);
     assert!(registration.failed.is_empty(), "{:?}", registration.failed);
     assert_eq!(calls.revoke(&github, &[bob_id]), Ok(vec![key("bob")]));
@@ -574,15 +595,21 @@ fn a_token_without_the_scope_names_it() {
     fake.set_scopes(&token, &["repo"]);
     let bob_id = fake.add_key(LOGIN, "aterm-machines:lab-07:bob", &key("bob"));
     let github = row(KeysVia::AghInline);
-    let err =
-        register_via(&sys, &github, "lab-07", &[reported("alice", &key("alice"))]).unwrap_err();
+    let err = register_via(
+        &sys,
+        &paths(),
+        &github,
+        "lab-07",
+        &[reported("alice", &key("alice"))],
+    )
+    .unwrap_err();
     assert!(err.starts_with("GET /user/keys"), "{err}");
     assert!(err.contains("admin:public_key"), "{err}");
-    // The inline token lives in the login keychain, so the line names the verb that stores
-    // the re-issued one, never agh's own.
+    // The inline token lives in the controller's token file, so the line names the verb that
+    // stores the re-issued one, never agh's own.
     assert!(err.contains("aterm machines github login"), "{err}");
     assert!(!err.contains("agh auth"), "{err}");
-    let err = revoke_via(&sys, &github, &[bob_id]).unwrap_err();
+    let err = revoke_via(&sys, &paths(), &github, &[bob_id]).unwrap_err();
     assert!(err.starts_with("GET /user/keys"), "{err}");
     assert!(err.contains("admin:public_key"), "{err}");
     assert!(err.contains("aterm machines github login"), "{err}");
@@ -610,7 +637,7 @@ fn revoke_reports_a_key_still_listed() {
             headers: Vec::new(),
         },
     );
-    let err = revoke_via(&sys, &row(KeysVia::AghInline), &[alice_id]).unwrap_err();
+    let err = revoke_via(&sys, &paths(), &row(KeysVia::AghInline), &[alice_id]).unwrap_err();
     assert!(
         err.starts_with(&format!("key {alice_id}: still registered (")),
         "{err}"
@@ -637,6 +664,7 @@ fn fleet_rejects_invalid_account_and_duplicate_keys_or_revoke_ids_send_once() {
     };
     let err = register_via(
         &controller(&fake),
+        &paths(),
         &bad_fleet,
         "lab-07",
         &[reported("alice", &key("alice"))],
@@ -653,6 +681,7 @@ fn fleet_rejects_invalid_account_and_duplicate_keys_or_revoke_ids_send_once() {
     let github = row(KeysVia::AghInline);
     let done = register_via(
         &sys,
+        &paths(),
         &github,
         "lab-07",
         &[reported("alice", &shared_key), reported("bob", &shared_key)],
@@ -663,7 +692,7 @@ fn fleet_rejects_invalid_account_and_duplicate_keys_or_revoke_ids_send_once() {
     assert_eq!(count(&fake, "POST /user/keys"), 1);
 
     let key_id = done[0].id;
-    let revoked = revoke_via(&sys, &github, &[key_id, key_id, key_id])
+    let revoked = revoke_via(&sys, &paths(), &github, &[key_id, key_id, key_id])
         .expect("duplicate revoke ids deduplicated");
     assert_eq!(revoked, vec![shared_key]);
     assert_eq!(count(&fake, &format!("DELETE /user/keys/{key_id}")), 1);

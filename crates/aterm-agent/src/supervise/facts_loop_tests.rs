@@ -247,8 +247,10 @@ impl<'a> Run<'a> {
                     Step::Break | Step::End | Step::Done | Step::Look => vec![rows],
                 };
                 s.ctl.m.served = 0;
+                // The caret sits after the line it left, on the composer's row, as a typed draft
+                // reads.
+                s.ctl.m.cursor_on_caret = stands;
                 if stands {
-                    // The caret sits after the line it left, as a typed draft reads.
                     s.ctl.m.screen_cols.insert(0, 12);
                     s.ctl.m.screen_cols.insert(1, 12);
                 }

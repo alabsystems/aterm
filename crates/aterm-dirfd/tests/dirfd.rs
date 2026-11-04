@@ -481,6 +481,15 @@ fn identity_fields_agree_bit_for_bit() {
     };
     assert_eq!(id("twolinks"), id("twolinks-b"));
     assert_ne!(id("twolinks"), id("file"));
+    for pair in [
+        id("file"),
+        id("twolinks"),
+        (0, 0),
+        (u64::MAX, 0x0123_4567_89ab_cdef),
+    ] {
+        let encoded = mine::encode_inode_identity_le(pair.0, pair.1);
+        assert_eq!(mine::decode_inode_identity_le(encoded), pair);
+    }
 }
 
 /// Creation and removal, including the errors: rmdir on a non-empty directory,
@@ -800,6 +809,7 @@ fn the_not_found_errno_is_the_same_constant() {
     let err = mine::unlinkat(&fa, "nothing-here", mine::AtFlags::empty()).unwrap_err();
     assert_eq!(err, mine::Errno::NOENT);
     assert!(err.is_noent());
+    assert!(!err.is_inval());
     assert_eq!(std::io::Error::from(err).raw_os_error(), Some(libc::ENOENT));
 }
 
@@ -814,6 +824,8 @@ fn an_interior_nul_is_refused_rather_than_truncated() {
     let evil = OsStr::from_bytes(b"real\0ignored");
     let err = mine::openat(&fd, evil, mine_flags_file(), mine::Mode::empty()).unwrap_err();
     assert_eq!(err, mine::Errno::INVAL);
+    assert!(err.is_inval());
+    assert!(!err.is_noent());
 }
 
 /// Long names: the wrapper keeps short names off the heap, and the boundary

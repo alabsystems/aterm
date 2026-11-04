@@ -205,11 +205,22 @@ fn pins_refuse_bad_rows_and_new_walls_release_the_override() {
             world.two(Cli::Codex);
             let store = world.seat().store(Cli::Codex);
             store
-                .transact_within(&accounts::LOCK_LADDER, NOW, &mut None, |s| {
+                .transact_logins(NOW, &mut None, |s, logins| {
+                    Ok(stage_current_auth(
+                        &world,
+                        Cli::Codex,
+                        s,
+                        logins,
+                        "main",
+                        accounts::Auth::SignedOut,
+                        NOW,
+                    ))
+                })
+                .unwrap();
+            store
+                .transact(NOW, &mut None, |s| {
                     s.active = Some(if missing { "missing" } else { "main" }.to_owned());
                     s.pinned = true;
-                    s.accounts.entry("main".to_owned()).or_default().auth =
-                        accounts::Auth::SignedOut;
                     Ok(Vec::new())
                 })
                 .unwrap();

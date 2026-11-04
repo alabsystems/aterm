@@ -617,6 +617,80 @@ pub const RECORDS_NEED_HEADER: &str = "X-Aterm-Records-Need";
 /// (`docs/DESIGN-fluid-swarm-2026-10-28.md` §4.1 F23, rule 8).
 pub const RECORDS_BOOT_HEADER: &str = "X-Aterm-Records-Boot";
 
+/// Header on every records GET and POST a build since the crossed fence sends, on each of a vault
+/// server's pulls of its peers, and on every records reply such a server sends: what the sender
+/// states of its records ([`crate::crossing::RecordsBound`]: its held bound, and whether its log
+/// has crossed). A crossed node answers a records request without it `409` with no record, and
+/// takes nothing from a reply without it. A value that is not exactly a bound's, or a header
+/// sent twice, is none.
+pub const RECORDS_BOUND_HEADER: &str = "X-Aterm-Records-Bound";
+
+/// The query a crossed node's records POST carries, beside a crossed
+/// [`RECORDS_BOUND_HEADER`]. Version 2 requires numeric capacity checks: older
+/// servers, including the header-only fence accepting `crossed=1`, reject this
+/// query before reading the body. No larger history is handed to those readers.
+pub const CROSSED_POST_QUERY: &str = "crossed=2";
+
+/// What a records reply said of its server's records ([`RECORDS_BOUND_HEADER`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReplyBound {
+    /// No reply came: a long poll the server held past its deadline.
+    Unheard,
+    /// A reply that stated no bound: a server before the fence (or none at all, `0.145`'s `404`).
+    Unstated,
+    /// A reply that stated this.
+    Stated(crate::crossing::RecordsBound),
+}
+
+impl ReplyBound {
+    /// What a reply whose [`RECORDS_BOUND_HEADER`] values are `values` states.
+    fn of<'a>(mut values: impl Iterator<Item = &'a str>) -> Self {
+        match (values.next(), values.next()) {
+            (Some(value), None) => {
+                crate::crossing::RecordsBound::parse(value).map_or(Self::Unstated, Self::Stated)
+            }
+            _ => Self::Unstated,
+        }
+    }
+
+    /// The bound the reply stated.
+    #[cfg(unix)]
+    pub(crate) const fn stated(self) -> Option<crate::crossing::RecordsBound> {
+        match self {
+            Self::Stated(bound) => Some(bound),
+            Self::Unheard | Self::Unstated => None,
+        }
+    }
+
+    /// Whether the reply stated that its server's log has crossed.
+    #[cfg(unix)]
+    pub(crate) const fn crossed(self) -> bool {
+        matches!(self, Self::Stated(bound) if bound.crossed)
+    }
+}
+
+fn check_records_reply(
+    local: crate::crossing::RecordsBound,
+    remote: ReplyBound,
+    url: &str,
+) -> crate::Result<()> {
+    let incompatible = match remote {
+        ReplyBound::Stated(peer) => !local.can_exchange(peer),
+        ReplyBound::Unstated => local.crossed,
+        ReplyBound::Unheard => false,
+    };
+    if incompatible {
+        return Err(Error::of_kind(
+            ErrorKind::Refused,
+            format!(
+                "{}: incompatible membership records capacity",
+                describe(url)
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Fetch bytes at `source` ([`FETCH_MARGIN`], [`Fetched::NoNewer`], [`Fetched::Missing`]).
 pub fn fetch(source: &Source, after: Option<u64>, wait: Duration) -> crate::Result<Fetched> {
     fetch_as(source, after, wait, None)
@@ -1266,14 +1340,17 @@ fn read_path(path: &std::path::Path) -> crate::Result<Option<Vec<u8>>> {
 }
 
 /// Fetch membership records missing past causal frontier `have` (`GET <url>/records?have=…`,
-/// `docs/DESIGN-fluid-swarm-2026-10-28.md` §4.1 F13).
+/// `docs/DESIGN-fluid-swarm-2026-10-28.md` §4.1 F13), as a caller that keeps no membership log
+/// of its own states its records ([`crate::crossing::RecordsBound::uncrossed`]): a test, or a
+/// lab reading what a server holds. A member's and a server's pulls state their own.
 ///
 /// With `wait = None`, sends [`NO_WAIT_HEADER`] so peers answer immediately; with `wait = Some(w)`,
 /// long-polls up to `w` (`total` bounds the HTTP exchange). Answers `204` and `404` (including
 /// `0.145` servers without `/records`) return an empty byte vector.
 ///
 /// # Errors
-/// Transport failure, oversized body, or a non-200/204/404 status from the server.
+/// Transport failure, oversized body, incompatible records capacity, or a
+/// non-200/204/404 status from the server.
 pub fn fetch_records(
     url: &str,
     have: &[crate::membership_log::RecordId],
@@ -1281,7 +1358,15 @@ pub fn fetch_records(
     total: Duration,
     subscriber: Option<&str>,
 ) -> crate::Result<Vec<u8>> {
-    fetch_records_sync(url, have, wait, total, subscriber).map(|answer| answer.bytes)
+    fetch_records_sync(
+        url,
+        have,
+        wait,
+        total,
+        subscriber,
+        crate::crossing::RecordsBound::uncrossed(),
+    )
+    .map(|answer| answer.bytes)
 }
 
 /// What a server answered a records GET ([`fetch_records_sync`]).
@@ -1300,14 +1385,23 @@ pub(crate) struct RecordsAnswer {
     /// The boot id it sent ([`RECORDS_BOOT_HEADER`]): `None` from a server before F23, or one
     /// that sent no 32 lowercase hex digits there.
     pub(crate) boot: Option<String>,
+    /// What it stated of its records ([`RECORDS_BOUND_HEADER`]).
+    pub(crate) bound: ReplyBound,
 }
 
 impl RecordsAnswer {
+    /// No answer: a long poll held past its deadline.
     const fn none() -> Self {
+        Self::stating(ReplyBound::Unheard)
+    }
+
+    /// An answer that brings nothing and states `bound`.
+    const fn stating(bound: ReplyBound) -> Self {
         Self {
             bytes: Vec::new(),
             needs: false,
             boot: None,
+            bound,
         }
     }
 }
@@ -1318,31 +1412,45 @@ pub(crate) struct ReceivedRecordsAnswer {
     pub(crate) received: crate::membership_log::untaken::ReceivedFrames,
     pub(crate) needs: bool,
     pub(crate) boot: Option<String>,
+    /// What the server stated of its records ([`RECORDS_BOUND_HEADER`]).
+    pub(crate) bound: ReplyBound,
 }
 
 #[cfg(unix)]
 impl ReceivedRecordsAnswer {
+    /// No answer: a long poll held past its deadline.
     fn none() -> Self {
         Self {
             received: crate::membership_log::untaken::ReceivedFrames::empty(),
             needs: false,
             boot: None,
+            bound: ReplyBound::Unheard,
         }
     }
 }
 
-fn records_exchange(
-    url: &str,
-    have: &[crate::membership_log::RecordId],
+/// One records GET ([`records_request`]): the ids it names, how long the server may hold it and
+/// the exchange may take, the subscriber it reads for, what it states of the puller's own
+/// records, and the most of the answer it reads.
+#[derive(Clone, Copy)]
+struct Pull<'a> {
+    have: &'a [crate::membership_log::RecordId],
     wait: Option<Duration>,
     total: Duration,
-    subscriber: Option<&str>,
+    subscriber: Option<&'a str>,
+    bound: crate::crossing::RecordsBound,
     limit: usize,
+}
+
+fn records_exchange(
+    url: &str,
+    pull: Pull<'_>,
 ) -> Result<aterm_http::Exchange, aterm_http::SendError> {
-    let deadline = wait.map_or(total, |wait| wait.saturating_add(FETCH_MARGIN).max(total));
+    let deadline = pull.wait.map_or(pull.total, |wait| {
+        wait.saturating_add(FETCH_MARGIN).max(pull.total)
+    });
     let http = client(deadline);
-    records_request(&http, url, have, wait, total, subscriber, limit)
-        .exchange(aterm_http::Body::Empty)
+    records_request(&http, url, pull).exchange(aterm_http::Body::Empty)
 }
 
 fn completed_records<T>(
@@ -1363,18 +1471,31 @@ fn completed_records<T>(
 enum RecordReception {
     Received(ReceivedRecordsAnswer),
     Other(aterm_http::Response),
+    Refused(Error),
 }
 
 #[cfg(unix)]
 impl RecordReception {
-    fn read(exchange: aterm_http::Exchange) -> Result<Self, aterm_http::SendError> {
-        Self::read_with_known(exchange, |_| None)
+    fn read(
+        exchange: aterm_http::Exchange,
+        local: crate::crossing::RecordsBound,
+        url: &str,
+    ) -> Result<Self, aterm_http::SendError> {
+        Self::read_with_known(exchange, local, url, |_| None)
     }
 
     fn read_with_known(
         exchange: aterm_http::Exchange,
+        local: crate::crossing::RecordsBound,
+        url: &str,
         known: impl FnMut(&crate::membership_log::RecordId) -> Option<crate::membership_log::Record>,
     ) -> Result<Self, aterm_http::SendError> {
+        let bound = ReplyBound::of(exchange.header_all(RECORDS_BOUND_HEADER));
+        if matches!(exchange.status(), 200 | 204 | 404)
+            && let Err(error) = check_records_reply(local, bound, url)
+        {
+            return Ok(Self::Refused(error));
+        }
         if exchange.status() != 200 {
             return exchange.collect().map(Self::Other);
         }
@@ -1389,48 +1510,58 @@ impl RecordReception {
             received,
             needs,
             boot,
+            bound,
         }))
     }
 
-    fn into_answer(self, url: &str) -> crate::Result<ReceivedRecordsAnswer> {
+    fn into_answer(
+        self,
+        url: &str,
+        local: crate::crossing::RecordsBound,
+    ) -> crate::Result<ReceivedRecordsAnswer> {
         match self {
             Self::Received(answer) => Ok(answer),
+            Self::Refused(error) => Err(error),
             Self::Other(response) => {
-                records_answer(response, url).map(|answer| ReceivedRecordsAnswer {
+                records_answer(response, url, local).map(|answer| ReceivedRecordsAnswer {
                     received: crate::membership_log::untaken::ReceivedFrames::empty(),
                     needs: answer.needs,
                     boot: answer.boot,
+                    bound: answer.bound,
                 })
             }
         }
     }
 }
 
-/// [`fetch_records`], also returning whether the server signaled [`RECORDS_NEED_HEADER`] (`"1"`)
-/// because it lacks at least one record named in `have`, and the boot id it sent.
+/// [`fetch_records`] stating `bound` of the puller's records, also returning whether the server
+/// signaled [`RECORDS_NEED_HEADER`] (`"1"`) because it lacks at least one record named in
+/// `have`, the boot id it sent, and what it stated of its own records.
 pub(crate) fn fetch_records_sync(
     url: &str,
     have: &[crate::membership_log::RecordId],
     wait: Option<Duration>,
     total: Duration,
     subscriber: Option<&str>,
+    bound: crate::crossing::RecordsBound,
 ) -> crate::Result<RecordsAnswer> {
-    let response = records_exchange(
-        url,
+    let pull = Pull {
         have,
         wait,
         total,
         subscriber,
-        crate::membership_log::MAX_RECORDS_STREAM,
-    )
-    .and_then(aterm_http::Exchange::collect);
+        bound,
+        limit: crate::membership_log::MAX_RECORDS_STREAM,
+    };
+    let response = records_exchange(url, pull).and_then(aterm_http::Exchange::collect);
     match completed_records(response, url, wait)? {
-        Some(response) => records_answer(response, url),
+        Some(response) => records_answer(response, url, bound),
         None => Ok(RecordsAnswer::none()),
     }
 }
 
-/// The ordinary client records pull, staging frames while the response is read.
+/// The ordinary client records pull, stating `bound` of the puller's records and staging frames
+/// while the response is read.
 #[cfg(unix)]
 pub(crate) fn fetch_record_frames_sync(
     url: &str,
@@ -1438,8 +1569,9 @@ pub(crate) fn fetch_record_frames_sync(
     wait: Option<Duration>,
     total: Duration,
     subscriber: Option<&str>,
+    bound: crate::crossing::RecordsBound,
 ) -> crate::Result<ReceivedRecordsAnswer> {
-    fetch_record_frames_with_known(url, have, wait, total, subscriber, |_| None)
+    fetch_record_frames_with_known(url, have, wait, total, subscriber, bound, |_| None)
 }
 
 /// A records pull that can reuse exact immutable owners already held in memory.
@@ -1450,19 +1582,21 @@ pub(crate) fn fetch_record_frames_with_known(
     wait: Option<Duration>,
     total: Duration,
     subscriber: Option<&str>,
+    bound: crate::crossing::RecordsBound,
     known: impl FnMut(&crate::membership_log::RecordId) -> Option<crate::membership_log::Record>,
 ) -> crate::Result<ReceivedRecordsAnswer> {
-    let response = records_exchange(
-        url,
+    let pull = Pull {
         have,
         wait,
         total,
         subscriber,
-        crate::membership_log::MAX_RECORDS_STREAM,
-    )
-    .and_then(|exchange| RecordReception::read_with_known(exchange, known));
+        bound,
+        limit: crate::membership_log::MAX_RECORDS_STREAM,
+    };
+    let response = records_exchange(url, pull)
+        .and_then(|exchange| RecordReception::read_with_known(exchange, bound, url, known));
     match completed_records(response, url, wait)? {
-        Some(response) => response.into_answer(url),
+        Some(response) => response.into_answer(url, bound),
         None => Ok(ReceivedRecordsAnswer::none()),
     }
 }
@@ -1478,12 +1612,21 @@ pub(crate) fn fetch_records_within(
     have: &[crate::membership_log::RecordId],
     total: Duration,
     subscriber: Option<&str>,
+    bound: crate::crossing::RecordsBound,
     limit: usize,
 ) -> crate::Result<Pulled<ReceivedRecordsAnswer>> {
-    match records_exchange(url, have, None, total, subscriber, limit)
-        .and_then(RecordReception::read)
+    let pull = Pull {
+        have,
+        wait: None,
+        total,
+        subscriber,
+        bound,
+        limit,
+    };
+    match records_exchange(url, pull)
+        .and_then(|exchange| RecordReception::read(exchange, bound, url))
     {
-        Ok(response) => response.into_answer(url).map(Pulled::Fetched),
+        Ok(response) => response.into_answer(url, bound).map(Pulled::Fetched),
         Err(aterm_http::SendError {
             error: aterm_http::Error::TooLarge { .. },
             ..
@@ -1508,53 +1651,61 @@ pub(crate) fn past_any_records_stream(url: &str) -> Error {
     )
 }
 
-/// A records GET of `url` naming `have` (`GET <url>/records?have=…`) on `http`, for `subscriber`
-/// where given, reading a body of at most `limit` bytes (never more than
-/// [`crate::membership_log::MAX_RECORDS_STREAM`]). With no `wait`, it asks the server not to
-/// ([`NO_WAIT_HEADER`]) and dials within [`PROBE_CONNECT`] (or `total`, where shorter).
+/// A records GET of `url` naming `pull.have` (`GET <url>/records?have=…`) on `http`, stating
+/// `pull.bound` ([`RECORDS_BOUND_HEADER`]), for `pull.subscriber` where given, reading a body of
+/// at most `pull.limit` bytes (never more than [`crate::membership_log::MAX_RECORDS_STREAM`]).
+/// With no `pull.wait`, it asks the server not to ([`NO_WAIT_HEADER`]) and dials within
+/// [`PROBE_CONNECT`] (or `pull.total`, where shorter).
 fn records_request<'a>(
     http: &'a Client,
     url: &str,
-    have: &[crate::membership_log::RecordId],
-    wait: Option<Duration>,
-    total: Duration,
-    subscriber: Option<&str>,
-    limit: usize,
+    pull: Pull<'_>,
 ) -> aterm_http::RequestBuilder<'a> {
     let request = http
-        .get(&records_have_url(url, have))
-        .limit(limit.min(crate::membership_log::MAX_RECORDS_STREAM));
-    let request = match subscriber {
+        .get(&records_have_url(url, pull.have))
+        .header(RECORDS_BOUND_HEADER, &pull.bound.value())
+        .limit(pull.limit.min(crate::membership_log::MAX_RECORDS_STREAM));
+    let request = match pull.subscriber {
         Some(sub) => request.header(SUBSCRIBER_HEADER, sub),
         None => request,
     };
-    if wait.is_none() {
+    if pull.wait.is_none() {
         request
             .header(NO_WAIT_HEADER, "1")
-            .connect_within(PROBE_CONNECT.min(total))
+            .connect_within(PROBE_CONNECT.min(pull.total))
     } else {
         request
     }
 }
 
 /// What `response`, `url`'s to a records GET ([`records_request`]), says.
-fn records_answer(response: aterm_http::Response, url: &str) -> crate::Result<RecordsAnswer> {
+fn records_answer(
+    response: aterm_http::Response,
+    url: &str,
+    local: crate::crossing::RecordsBound,
+) -> crate::Result<RecordsAnswer> {
     let (needs, boot) = records_headers(
         response.header(RECORDS_NEED_HEADER),
         response.header(RECORDS_BOOT_HEADER),
     );
+    let bound = ReplyBound::of(response.header_all(RECORDS_BOUND_HEADER));
+    if matches!(response.status(), 200 | 204 | 404) {
+        check_records_reply(local, bound, url)?;
+    }
     match response.status() {
         200 => Ok(RecordsAnswer {
             bytes: response.into_body(),
             needs,
             boot,
+            bound,
         }),
         204 => Ok(RecordsAnswer {
             bytes: Vec::new(),
             needs,
             boot,
+            bound,
         }),
-        404 => Ok(RecordsAnswer::none()),
+        404 => Ok(RecordsAnswer::stating(bound)),
         status => Err(refused(
             "fetching records from",
             url,
@@ -1694,7 +1845,10 @@ pub fn fetch_heard(url: &str) -> crate::Result<Option<Heard>> {
     }))
 }
 
-/// Post a self-delimiting stream of signed membership records (`POST <url>/records`).
+/// Post a self-delimiting stream of signed membership records (`POST <url>/records`), as a caller
+/// that keeps no membership log of its own states its records
+/// ([`crate::crossing::RecordsBound::uncrossed`]): a test, or a lab feeding a server. A member's
+/// posts state its own ([`post_records_answered_until`]).
 ///
 /// # Errors
 /// `records` exceeds [`crate::membership_log::MAX_RECORDS_STREAM`], transport fails, or the server
@@ -1714,29 +1868,39 @@ pub fn post_records(url: &str, records: &[u8]) -> crate::Result<()> {
 /// `records` exceeds [`crate::membership_log::MAX_RECORDS_STREAM`], transport fails, or the server
 /// answers `408`, `429` or a `5xx` other than `507`.
 pub(crate) fn post_records_answered(url: &str, records: &[u8]) -> crate::Result<crate::Result<()>> {
-    post_records_answered_until(url, records, None)
+    post_records_answered_until(
+        url,
+        records,
+        crate::crossing::RecordsBound::uncrossed(),
+        None,
+    )
 }
 
-/// [`post_records_answered`], the whole exchange ending by `deadline` where one is given (at most
-/// [`EXCHANGE`] from now): a post that starts once `deadline` has passed dials nothing and
-/// answers [`ErrorKind::TimedOut`], so the posts of one fan-out that share a deadline end by it
-/// however many servers take a post and never answer.
+/// [`post_records_answered`], stating `bound` of the poster's records ([`RECORDS_BOUND_HEADER`];
+/// a crossed one posts with [`CROSSED_POST_QUERY`], which a server before the fence refuses
+/// unread), the whole exchange ending by `deadline` where one is given (at most [`EXCHANGE`]
+/// from now): a post that starts once `deadline` has passed dials nothing and answers
+/// [`ErrorKind::TimedOut`], so the posts of one fan-out that share a deadline end by it however
+/// many servers take a post and never answer.
 ///
 /// # Errors
 /// As [`post_records_answered`], and [`ErrorKind::TimedOut`] once `deadline` has passed.
 pub(crate) fn post_records_answered_until(
     url: &str,
     records: &[u8],
+    bound: crate::crossing::RecordsBound,
     deadline: Option<std::time::Instant>,
 ) -> crate::Result<crate::Result<()>> {
-    post_records_body_answered_until(url, aterm_http::Body::Bytes(records), deadline)
+    post_records_body_answered_until(url, aterm_http::Body::Bytes(records), bound, deadline)
 }
 
-/// Post immutable selected records without collecting their wire stream.
+/// Post immutable selected records without collecting their wire stream, as
+/// [`post_records_answered_until`] posts a stream.
 #[cfg(unix)]
 pub(crate) fn post_record_selection_answered_until(
     url: &str,
     records: &[crate::membership_log::Record],
+    bound: crate::crossing::RecordsBound,
     deadline: Option<std::time::Instant>,
 ) -> crate::Result<crate::Result<()>> {
     let mut reader = records_body::RecordsReader::new(records)?;
@@ -1747,6 +1911,7 @@ pub(crate) fn post_record_selection_answered_until(
             len,
             reader: &mut reader,
         },
+        bound,
         deadline,
     )
 }
@@ -1754,6 +1919,7 @@ pub(crate) fn post_record_selection_answered_until(
 fn post_records_body_answered_until(
     url: &str,
     body: aterm_http::Body<'_>,
+    bound: crate::crossing::RecordsBound,
     deadline: Option<std::time::Instant>,
 ) -> crate::Result<crate::Result<()>> {
     let max = crate::membership_log::MAX_RECORDS_STREAM;
@@ -1783,14 +1949,24 @@ fn post_records_body_answered_until(
             .min(EXCHANGE),
         None => EXCHANGE,
     };
-    let target = records_url(url);
+    let target = if bound.crossed {
+        with_query(&records_url(url), CROSSED_POST_QUERY)
+    } else {
+        records_url(url)
+    };
     let response = client(within)
         .post(&target)
         .header("Content-Type", "application/octet-stream")
+        .header(RECORDS_BOUND_HEADER, &bound.value())
         .limit(REASON_BODY)
         .send_body(body)
         .map_err(|e| transport_error("posting records to", url, &e))?;
     if response.is_success() {
+        check_records_reply(
+            bound,
+            ReplyBound::of(response.header_all(RECORDS_BOUND_HEADER)),
+            url,
+        )?;
         return Ok(Ok(()));
     }
     let status = response.status();
@@ -2647,6 +2823,35 @@ mod tests {
 
     fn recipient() -> String {
         test_recipient(0)
+    }
+
+    /// A reply states a records bound only in one header that parses: one sent twice, even with
+    /// the same value, states none, as does a value that is not a bound's or no header at all.
+    ///
+    /// CONTROL (in the test): the same value sent once is the bound it states.
+    #[test]
+    fn a_reply_states_a_records_bound_only_in_one_header_that_parses() {
+        let bound = crate::crossing::RecordsBound::of(4_096, true);
+        let value = bound.value();
+        assert_eq!(
+            ReplyBound::of([value.as_str()].into_iter()),
+            ReplyBound::Stated(bound),
+            "control: one header"
+        );
+        assert_eq!(
+            ReplyBound::of([value.as_str(), value.as_str()].into_iter()),
+            ReplyBound::Unstated
+        );
+        let other = crate::crossing::RecordsBound::of(4_096, false).value();
+        assert_eq!(
+            ReplyBound::of([value.as_str(), other.as_str()].into_iter()),
+            ReplyBound::Unstated
+        );
+        assert_eq!(
+            ReplyBound::of(["1 4096 open"].into_iter()),
+            ReplyBound::Unstated
+        );
+        assert_eq!(ReplyBound::of(std::iter::empty()), ReplyBound::Unstated);
     }
 
     #[test]

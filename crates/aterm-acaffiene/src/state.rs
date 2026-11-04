@@ -1303,6 +1303,7 @@ mod tests {
             state_dir: dir.path().join("state"),
             home: dir.path().join("home"),
             logs_dir: dir.path().join("logs"),
+            local_volume: |_| true,
         };
         std::fs::create_dir_all(&paths.state_dir).expect("state dir");
         let ago = std::time::SystemTime::now() - Duration::from_secs(2 * 60 * 60);

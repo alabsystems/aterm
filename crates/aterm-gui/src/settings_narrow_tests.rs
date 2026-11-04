@@ -2447,6 +2447,8 @@ fn paged_screens_of(
 
 #[test]
 fn every_control_and_word_of_a_system_page_is_on_some_screen() {
+    /// The sizes, first in the sweep, that decide whether a page's toolless walks run between them.
+    const KEYED: usize = 3;
     let routes = [
         SettingsRoute::SoftwareUpdate,
         SettingsRoute::About,
@@ -2467,11 +2469,26 @@ fn every_control_and_word_of_a_system_page_is_on_some_screen() {
     };
     at_each_text_scale(&[1.0, 2.0], "every control and word", |scale| {
         for route in routes {
-            let sizes = NARROW_WIDTHS
+            let mut sizes: Vec<(f32, f32)> = NARROW_WIDTHS
                 .into_iter()
                 .flat_map(|width| NARROW_HEIGHTS.map(|height| (width, height)))
-                .chain(WIDE_SIZES[..2].iter().copied());
-            for (width, height) in sizes {
+                .chain(WIDE_SIZES[..2].iter().copied())
+                .collect();
+            // The narrowest column in the shortest window and the tallest (the only one of the
+            // three where 2x text keeps the compact heading row, and above the 420pt and 480pt
+            // inset brackets at 1x), then the widest column: they decide whether the toolless walk
+            // runs at the sizes between. That state reaches a compact page only as rows' words and
+            // presence (packages_page, Security's machine status, the packages.*, reroute.announce
+            // and machine.universal_control disclosures, Harness's landings), so a page it draws
+            // as the default does at all three walks alike at every size, and its walk adds
+            // nothing to the union below. Negative controls: a control only the toolless state
+            // draws, never whole, fails at any size on Packages and, on a page otherwise alike, at
+            // these three; one only at a size between them on such a page passes, which is what
+            // this gives up.
+            let widest = sizes.pop().expect("a size");
+            sizes.insert(KEYED - 1, widest);
+            let mut alike = true;
+            for (at, (width, height)) in sizes.into_iter().enumerate() {
                 {
                     let context = format!("{scale}\u{d7} {route:?} {width}\u{d7}{height}");
                     let mut controls = std::collections::BTreeMap::<String, bool>::new();
@@ -2480,8 +2497,8 @@ fn every_control_and_word_of_a_system_page_is_on_some_screen() {
                         String,
                         std::collections::BTreeMap<usize, String>,
                     >::new();
-                    for screen in
-                        [false, true].into_iter().flat_map(|toolless| {
+                    let walk =
+                        |toolless: bool| {
                             paged_screens_of(
                                 |runtime| {
                                     if toolless {
@@ -2501,8 +2518,19 @@ fn every_control_and_word_of_a_system_page_is_on_some_screen() {
                                 width,
                                 height,
                             )
-                        })
-                    {
+                        };
+                    let plain = walk(false);
+                    let toolless = (at < KEYED || !alike).then(|| walk(true));
+                    if at < KEYED {
+                        alike &= toolless.as_ref() == Some(&plain);
+                    }
+                    assert!(
+                        at + 1 != KEYED
+                            || !matches!(route, SettingsRoute::Packages | SettingsRoute::Harness)
+                            || !alike,
+                        "{context}: the toolless {route:?} page draws as the default"
+                    );
+                    for screen in plain.iter().chain(toolless.iter().flatten()) {
                         for node in &screen.paint {
                             let key = node.key.as_str().to_string();
                             let whole = node.fade.is_none()

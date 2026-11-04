@@ -741,6 +741,7 @@ fn publish_as_an_older_admin(admin: &Paths, urls: &[String], edit: impl FnOnce(&
         &opened.handoff,
         &admissions,
         None,
+        &[],
     )
     .unwrap();
     for url in urls {
@@ -1005,6 +1006,7 @@ fn a_merge_error_from_the_own_head_falls_back_to_the_served_merge() {
             &opened.handoff,
             &admissions,
             None,
+            &[],
         )
         .unwrap();
         fsx::write_atomic(&lab.st1.published_file(), &bytes, 0o600).unwrap();

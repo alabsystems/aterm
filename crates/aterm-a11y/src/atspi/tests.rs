@@ -1080,7 +1080,7 @@ impl TestBuses {
 impl Buses for TestBuses {
     fn session(&mut self) -> aterm_dbus::Result<Connection> {
         let stream = self.session.take().ok_or(aterm_dbus::Error::Closed)?;
-        Connection::handshake(stream, 1000, None)
+        Connection::handshake_within(stream, 1000, None, HANG)
     }
 
     fn write_timeout(&self) -> Option<Duration> {
@@ -1101,7 +1101,7 @@ impl Buses for TestBuses {
             .accessibility
             .pop_front()
             .ok_or(aterm_dbus::Error::Closed)?;
-        Connection::handshake(stream, 1000, None)
+        Connection::handshake_within(stream, 1000, None, HANG)
     }
 }
 

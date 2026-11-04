@@ -866,7 +866,11 @@ fn a_retired_judgment_keeps_independently_observed_work_visible() {
                 .value
                 .login_diagnostics
                 .push(LoginDiagnostic::from_exit_for_test(&row, 9, 1, None));
-            retire_judgment(&mut bound.value, AccountPoint::TurnEnd);
+            retire_judgment(
+                &mut bound.value,
+                AccountPoint::TurnEnd,
+                aterm_agent::harness::account_progress::BINDINGS_CHANGED_FINDING,
+            );
             let retired = bound.value.clone();
             match kind {
                 0 => {

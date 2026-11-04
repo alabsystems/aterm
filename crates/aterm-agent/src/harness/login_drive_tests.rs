@@ -325,6 +325,38 @@ fn stand_in_drive_in(root: &Path, script: &str, approver: &mut dyn Approver) -> 
     )
 }
 
+/// A PROGRAM THAT CANNOT START NAMES ITSELF, ONCE: `NotRun` is the program and the system's reason,
+/// and the words that say a sign-in did not run are its caller's.
+#[test]
+fn a_program_that_cannot_start_is_named_by_its_path() {
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let program = tmp.path().join("no-such-program");
+    let (grammar, completion, hosts) = lines_grammar(&KIMI_SIGNIN, Flow::Device);
+    let seen = Seen::default();
+    let drove = drive(
+        &Spec {
+            program: &program,
+            lead: &[],
+            args: &[],
+            env: &[],
+            cwd: tmp.path(),
+            grammar,
+            completion,
+            hosts: hosts.of(Some(Region::Global)).expect("global"),
+            email: None,
+            hang: Duration::from_secs(60),
+        },
+        &mut &seen,
+    );
+    let Outcome::NotRun(why) = drove.outcome else {
+        panic!("{:?}", drove.outcome);
+    };
+    assert!(
+        why.starts_with(&format!("{}: ", program.display())),
+        "{why}"
+    );
+}
+
 #[test]
 fn a_driven_sign_in_hands_the_printed_code_over_and_an_off_pin_page_is_never_opened() {
     let (drove, handed) = stand_in_drive("kimi 0");
@@ -582,7 +614,7 @@ fn unavailable_browser_stops_the_device_driver_without_requesting_a_person() {
     let drove = stand_in_drive_in(tmp.path(), "hold 0", &mut Unavailable);
     assert_eq!(
         drove.outcome,
-        Outcome::NotRun("pinned browser fetch is unavailable".into())
+        Outcome::Unverified("pinned browser fetch is unavailable".into())
     );
 }
 
@@ -725,6 +757,8 @@ impl GrokBed {
     fn sign_in(&self, no_desk: Option<&Path>) -> (Drove, Handed) {
         let route = GROK_SIGNIN.route(None).expect("grok's route");
         let req = Request {
+            recovery: None,
+            admission: None,
             cli: Cli::Grok,
             route,
             row: self.roster.row("grok-1").expect("the row"),
@@ -868,6 +902,8 @@ fn a_no_desk_cli_that_is_not_installed_is_named_so() {
     let bed = GrokBed::new();
     let route = GROK_SIGNIN.route(None).expect("grok's route");
     let req = Request {
+        recovery: None,
+        admission: None,
         cli: Cli::Grok,
         route,
         row: bed.roster.row("grok-1").expect("the row"),
@@ -910,6 +946,8 @@ fn over_ssh_a_persons_sign_in_opens_no_browser_on_this_machines_desk() {
     let sandbox = Some(Path::new(SANDBOX_EXEC));
     let route = GROK_SIGNIN.route(None).expect("grok's route");
     let grok = Request {
+        recovery: None,
+        admission: None,
         cli: Cli::Grok,
         route,
         row: bed.roster.row("grok-1").expect("the row"),
@@ -958,6 +996,8 @@ fn over_ssh_a_persons_sign_in_opens_no_browser_on_this_machines_desk() {
     );
     let route = KIMI_SIGNIN.route(None).expect("kimi's route");
     let kimi = Request {
+        recovery: None,
+        admission: None,
         cli: Cli::Kimi,
         route,
         row: roster.row("kimi-1").expect("the row"),
@@ -969,11 +1009,7 @@ fn over_ssh_a_persons_sign_in_opens_no_browser_on_this_machines_desk() {
     let held = held.expect("an opener-free PATH, held");
     assert_eq!(path_of(&cmd), Some(held.path().as_os_str().to_os_string()));
     assert!(!held.path().join("open").exists());
-    assert_ne!(
-        cmd.get_program(),
-        OsStr::new(SANDBOX_EXEC),
-        "kimi needs no sandbox"
-    );
+    assert_eq!(cmd.get_program(), OsStr::new(SANDBOX_EXEC));
     let (desk, held) = login_command(&kimi, &home, &parent, (false, sandbox)).expect("desk");
     assert!(held.is_none(), "CONTROL");
     assert_eq!(path_of(&desk), Some(OsString::from("/usr/bin:/bin")));
@@ -1007,6 +1043,8 @@ fn over_ssh_a_codex_browser_sign_in_runs_its_device_route_off_this_machines_desk
     let route = CODEX_SIGNIN.route(None).expect("codex's route");
     assert!(calls_back_here(route), "the default is the browser route");
     let codex = Request {
+        recovery: None,
+        admission: None,
         cli: Cli::Codex,
         route,
         row: roster.row("codex-1").expect("the row"),
@@ -1047,6 +1085,8 @@ fn over_ssh_a_codex_browser_sign_in_runs_its_device_route_off_this_machines_desk
         .route(Some(Flow::Browser))
         .expect("grok's browser route");
     let grok = Request {
+        recovery: None,
+        admission: None,
         cli: Cli::Grok,
         route: grok_browser,
         row: bed.roster.row("grok-1").expect("the row"),
@@ -1107,4 +1147,324 @@ fn slow_approver_past_output_grace_still_drains_buffered_signed_in_line() {
     assert_eq!(env_interpreter(&script).as_deref(), Some("python3"));
     std::fs::write(&script, b"#!/usr/bin/env ..\n").expect("write");
     assert_eq!(env_interpreter(&script), None);
+}
+
+#[test]
+fn native_completion_hooks_surround_the_real_driver_and_can_refuse_publication() {
+    struct Hooks {
+        seen: Vec<&'static str>,
+        reject_begin: bool,
+        reject_complete: bool,
+    }
+    impl Approver for Hooks {
+        fn begin(&mut self, _: &Request<'_>) -> Result<(), String> {
+            self.seen.push("begin");
+            if self.reject_begin {
+                Err("attempt refused".into())
+            } else {
+                Ok(())
+            }
+        }
+        fn approve(&mut self, _: &Handoff<'_>) -> Approval {
+            self.seen.push("approve");
+            Approval::Approved { page: false }
+        }
+        fn complete(
+            &mut self,
+            request: &Request<'_>,
+            outcome: &Outcome,
+            deadline: Instant,
+        ) -> Result<(), String> {
+            self.seen.push("complete");
+            assert!(deadline > Instant::now());
+            if matches!(outcome, Outcome::SignedIn { .. }) {
+                assert!(request.staging.join("credentials/kimi-code.json").is_file());
+            }
+            if self.reject_complete {
+                Err("provider identity was not verified".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+    for scenario in 0..4 {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let staging = root.path().join("staging");
+        std::fs::create_dir(&staging).unwrap();
+        std::fs::write(
+            staging.join(".stand-in"),
+            if scenario == 1 { "kimi 1" } else { "kimi 0" },
+        )
+        .unwrap();
+        let store = super::super::accounts::Store::at_for(root.path(), Cli::Kimi, root.path());
+        let row = super::super::accounts::Row {
+            label: "one".into(),
+            email: Some("kimi-one@example.com".into()),
+            vendor: super::super::accounts::Vendor {
+                region: Some(Region::Global),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let route = KIMI_SIGNIN.route(None).unwrap();
+        let request = Request {
+            recovery: None,
+            admission: None,
+            cli: Cli::Kimi,
+            row: &row,
+            staging: &staging,
+            store: &store,
+            route,
+            hosts: route.hosts.of(Some(Region::Global)).unwrap(),
+        };
+        let exe = std::env::current_exe().unwrap();
+        let lead = [
+            "harness::login_drive::tests::signin_stand_in",
+            "--exact",
+            "--nocapture",
+            "--",
+        ]
+        .map(OsString::from);
+        let mut hooks = Hooks {
+            seen: Vec::new(),
+            reject_begin: scenario == 3,
+            reject_complete: scenario == 2,
+        };
+        let result = sign_in_with(
+            &request,
+            (&exe, &lead),
+            None,
+            Some(Path::new(SANDBOX_EXEC)),
+            &vars(&[]),
+            &mut hooks,
+            Duration::from_secs(60),
+        );
+        if scenario == 0 {
+            assert!(matches!(result.outcome, Outcome::SignedIn { .. }));
+        } else if scenario == 1 {
+            assert!(matches!(result.outcome, Outcome::Exited(Some(1))));
+        } else if scenario == 2 {
+            assert!(matches!(result.outcome, Outcome::Unverified(_)));
+        } else {
+            assert!(matches!(result.outcome, Outcome::NotRun(_)));
+        }
+        assert_eq!(
+            hooks.seen,
+            if scenario == 3 {
+                vec!["begin"]
+            } else {
+                vec!["begin", "approve", "complete"]
+            }
+        );
+        if scenario == 3 {
+            assert!(!staging.join("credentials").exists());
+        }
+    }
+}
+
+#[test]
+fn retained_native_state_never_becomes_no_start_when_native_setup_fails() {
+    struct ResumeOnly(u8);
+    impl Approver for ResumeOnly {
+        fn resume(&mut self, _: &Request<'_>, _: Instant) -> Result<Resume, String> {
+            match self.0 {
+                0 => Ok(Resume::Fresh),
+                1 => Ok(Resume::NativeSeed),
+                _ => Err("retained credential could not be revalidated".into()),
+            }
+        }
+        fn approve(&mut self, _: &Handoff<'_>) -> Approval {
+            panic!("missing native program reached approval")
+        }
+    }
+    let root = aterm_tempfile::tempdir().unwrap();
+    let staging = root.path().join("staging");
+    #[cfg(unix)]
+    aterm_secrets::fsx::ensure_private_dir(&staging).unwrap();
+    #[cfg(not(unix))]
+    std::fs::create_dir(&staging).unwrap();
+    let store = super::super::accounts::Store::at_for(root.path(), Cli::Kimi, root.path());
+    let row = super::super::accounts::Row {
+        label: "one".into(),
+        email: Some("one@example.com".into()),
+        vendor: super::super::accounts::Vendor {
+            region: Some(Region::Global),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let route = KIMI_SIGNIN.route(None).unwrap();
+    let req = Request {
+        recovery: None,
+        admission: None,
+        cli: Cli::Kimi,
+        row: &row,
+        staging: &staging,
+        store: &store,
+        route,
+        hosts: route.hosts.of(Some(Region::Global)).unwrap(),
+    };
+    let missing = root.path().join("missing-native-kimi");
+    for phase in 0..3 {
+        let result = sign_in_with(
+            &req,
+            (&missing, &[]),
+            None,
+            None,
+            &vars(&[]),
+            &mut ResumeOnly(phase),
+            Duration::from_secs(60),
+        );
+        assert_eq!(matches!(result.outcome, Outcome::NotRun(_)), phase == 0);
+        assert_eq!(matches!(result.outcome, Outcome::Unverified(_)), phase != 0);
+    }
+    struct NoHooks;
+    impl Approver for NoHooks {
+        fn resume(&mut self, _: &Request<'_>, _: Instant) -> Result<Resume, String> {
+            panic!("revoked root admission reached a recovery hook")
+        }
+        fn approve(&mut self, _: &Handoff<'_>) -> Approval {
+            panic!("revoked root admission reached a browser")
+        }
+    }
+    let admission = RecoveryAdmission::new(RecoveryKey([4; 32]), true, |_| {
+        Err("root admission revoked".into())
+    });
+    let guarded = Request {
+        recovery: Some(admission.key()),
+        admission: Some(&admission),
+        ..req
+    };
+    let result = sign_in_with(
+        &guarded,
+        (&missing, &[]),
+        None,
+        None,
+        &vars(&[]),
+        &mut NoHooks,
+        Duration::from_secs(60),
+    );
+    assert!(matches!(result.outcome, Outcome::NotRun(_)));
+    let read_only = RecoveryAdmission::new(RecoveryKey([4; 32]), false, |_| Ok(()));
+    let guarded = Request {
+        recovery: Some(read_only.key()),
+        admission: Some(&read_only),
+        ..req
+    };
+    let result = sign_in_with(
+        &guarded,
+        (&missing, &[]),
+        None,
+        None,
+        &vars(&[]),
+        &mut NoHooks,
+        Duration::from_secs(60),
+    );
+    assert!(matches!(result.outcome, Outcome::Unverified(_)));
+    let one_entry = RecoveryAdmission::new(RecoveryKey([4; 32]), true, |_| Ok(()));
+    let guarded = Request {
+        recovery: Some(one_entry.key()),
+        admission: Some(&one_entry),
+        ..req
+    };
+    let result = sign_in_with(
+        &guarded,
+        (&missing, &[]),
+        None,
+        None,
+        &vars(&[]),
+        &mut ResumeOnly(0),
+        Duration::from_secs(60),
+    );
+    assert!(matches!(result.outcome, Outcome::NotRun(_)));
+    let result = sign_in_with(
+        &guarded,
+        (&missing, &[]),
+        None,
+        None,
+        &vars(&[]),
+        &mut NoHooks,
+        Duration::from_secs(60),
+    );
+    assert!(matches!(result.outcome, Outcome::Unverified(_)));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "contacts the installed native Kimi anonymously inside the existing no-window sandbox; ATERM_TEST_KIMI names its binary"]
+fn native_kimi_cancellation_runs_completion_without_opening_a_window() {
+    struct Observe(Vec<&'static str>);
+    impl Approver for Observe {
+        fn begin(&mut self, _: &Request<'_>) -> Result<(), String> {
+            self.0.push("begin");
+            Ok(())
+        }
+        fn approve(&mut self, handoff: &Handoff<'_>) -> Approval {
+            self.0.push("approve");
+            assert!(handoff.code.is_some());
+            assert!(pinned(handoff.url, handoff.hosts));
+            Approval::NotRun("anonymous probe stops before approval".into())
+        }
+        fn complete(
+            &mut self,
+            _: &Request<'_>,
+            outcome: &Outcome,
+            _: Instant,
+        ) -> Result<(), String> {
+            self.0.push("complete");
+            assert!(matches!(outcome, Outcome::Unverified(_)));
+            Ok(())
+        }
+    }
+    let program = std::env::var_os("ATERM_TEST_KIMI")
+        .map(std::path::PathBuf::from)
+        .expect("ATERM_TEST_KIMI is required");
+    let root = aterm_tempfile::tempdir().unwrap();
+    let staging = root.path().join("staging");
+    aterm_secrets::fsx::ensure_private_dir(&staging).unwrap();
+    let store = super::super::accounts::Store::at_for(root.path(), Cli::Kimi, root.path());
+    let row = super::super::accounts::Row {
+        label: "probe".into(),
+        email: Some("probe@example.invalid".into()),
+        vendor: super::super::accounts::Vendor {
+            region: Some(Region::Global),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let route = KIMI_SIGNIN.route(None).unwrap();
+    let checks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = checks.clone();
+    let admission = RecoveryAdmission::new(RecoveryKey([4; 32]), true, move |_| {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    });
+    let request = Request {
+        recovery: Some(admission.key()),
+        admission: Some(&admission),
+        cli: Cli::Kimi,
+        row: &row,
+        staging: &staging,
+        store: &store,
+        route,
+        hosts: route.hosts.of(Some(Region::Global)).unwrap(),
+    };
+    assert!(KIMI_SIGNIN.no_desk.contains(&"macos"));
+    let mut observer = Observe(Vec::new());
+    let result = sign_in_with(
+        &request,
+        (&program, &[]),
+        None,
+        Some(Path::new(SANDBOX_EXEC)),
+        &vars(&[]),
+        &mut observer,
+        Duration::from_secs(60),
+    );
+    assert!(matches!(result.outcome, Outcome::Unverified(_)));
+    assert_eq!(observer.0, ["begin", "approve", "complete"]);
+    assert!(checks.load(std::sync::atomic::Ordering::SeqCst) >= 3);
+    println!(
+        "native Kimi handoff and cancellation observed; config_present={}",
+        staging.join("config.toml").is_file()
+    );
 }

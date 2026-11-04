@@ -1272,7 +1272,7 @@ fn publish_before_notes(paths: &Paths, edit: impl FnOnce(&mut Document)) {
         bound,
         &doc,
         &admin.handoff,
-        &admin.opened_heads,
+        &[],
         &admissions,
     )
     .expect("sealed");

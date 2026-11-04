@@ -668,6 +668,8 @@ fn run_first(sc: &Scenario, dir: &Path) -> First {
     );
     let opts = opts_for(sc, host.as_ref());
     let mut m = Mock::new(vec![Vec::new()]);
+    // The only text a composer here holds is a line typed.
+    m.cell_attrs = "none";
     let mut l = Loop {
         s: session(&mut m, Some(SID.to_string())),
         opts,
@@ -1026,6 +1028,8 @@ fn run_follower_cut(
     let host = host_for(sc, &["relaunched"], tail);
     let opts = opts_for(sc, host.as_ref());
     let mut m = Mock::new(vec![Vec::new()]);
+    // The only text a composer here holds is a line typed.
+    m.cell_attrs = "none";
     let mut l = Loop {
         s: session(&mut m, Some(SID.to_string())),
         opts,

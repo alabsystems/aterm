@@ -2,7 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! `aterm secrets` ([`text`], [`age`], [`x25519`], [`envelope`], [`transport`], [`server`]), the
-//! join phrase and its CPace ([`phrase`], [`pake`]), and the membership log ([`membership_log`]).
+//! join phrase and its CPace ([`phrase`], [`pake`]), and the membership log ([`membership_log`])
+//! with the line old builds cannot follow it past ([`crossing`]).
 //! Client and service flows ([`materialize`], [`client`], [`service`], [`cli`]).
 
 #![forbid(unsafe_code)]
@@ -20,6 +21,7 @@ pub mod api_key;
 pub mod b64;
 pub mod bech32;
 pub mod commons;
+pub mod crossing;
 pub mod envelope;
 pub mod join;
 pub mod mailbox_component;
@@ -29,6 +31,7 @@ pub mod phrase;
 pub mod swarm;
 pub mod swarm_roster;
 pub mod text;
+pub mod token_line;
 pub mod transport;
 pub mod x25519;
 
@@ -80,6 +83,8 @@ pub mod network;
 pub mod operational;
 #[cfg(unix)]
 mod program_watch;
+#[cfg(unix)]
+mod records_storage;
 #[cfg(unix)]
 pub mod release_keychain;
 #[cfg(unix)]

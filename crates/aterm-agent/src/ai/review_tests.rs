@@ -1678,8 +1678,7 @@ fn a_pooled_codex_review_limit_marks_only_the_serving_account_so_the_next_accoun
         ("work-1", &work_1_base, &staging_1),
         ("work-2", &work_2_base, &staging_2),
     ] {
-        std::fs::create_dir_all(staging).expect("staging");
-        std::fs::write(staging.join("auth.json"), "\u{0}opaque").expect("auth");
+        codex_fixture_login(staging, &format!("{label}@example.test"), now_val);
         let mut note = None;
         acct_store
             .transact_logins(now_val, &mut note, |state, logins| {
@@ -1841,6 +1840,25 @@ fn a_pooled_codex_review_limit_marks_only_the_serving_account_so_the_next_accoun
 /// its own, both signed in here, beside its roster in `config`. For Codex, `reads` lays atpkg's
 /// launcher onto a codex-alab that keeps `CODEX_AUTH_PATH`'s login (`true`) or one from before
 /// it (`false`).
+fn codex_fixture_login(home: &Path, email: &str, now: i64) {
+    std::fs::create_dir_all(home).unwrap();
+    std::fs::write(
+        home.join("config.toml"),
+        "cli_auth_credentials_store='file'\n",
+    )
+    .unwrap();
+    let token =
+        crate::harness::codex_app_login::tests::make_chatgpt_jwt(Some(email), "plus", now + 3600);
+    std::fs::write(
+        home.join("auth.json"),
+        aterm_json::json!({
+            "auth_mode": "chatgpt", "tokens": {"id_token": token, "access_token": token}
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
 struct ReviewPool {
     b: crate::ai::testing::Box3,
     config: PathBuf,
@@ -1881,6 +1899,10 @@ impl ReviewPool {
         for login in [&default, &pool.work().join(store)] {
             std::fs::create_dir_all(login.parent().expect("parent")).expect("login home");
             std::fs::write(login, "{}").expect("stand-in login");
+        }
+        if cli == crate::harness::accounts::Cli::Codex {
+            codex_fixture_login(default.parent().unwrap(), "owner@example.com", Self::NOW);
+            codex_fixture_login(&pool.work(), "work@example.com", Self::NOW);
         }
         if listed {
             pool.roster(None);
@@ -1937,6 +1959,25 @@ impl ReviewPool {
                 Ok(Vec::new())
             })
             .expect("state");
+    }
+
+    fn auth(&self, label: &str, auth: crate::harness::accounts::Auth) {
+        use crate::harness::accounts::{self, Cli};
+        let store = self.store();
+        let path = self.config.join(self.cli.accounts().roster_file);
+        let records = store.read_account_records(Some(&path), Self::NOW).unwrap();
+        let raw = records.raw_roster.row(label).unwrap();
+        let context = store.capture_auth_context(records.roster.row(label).unwrap());
+        store
+            .transact_logins(Self::NOW, &mut None, |state, logins| {
+                if self.cli == Cli::Codex {
+                    accounts::stage_auth(state, raw, logins, context.unwrap(), auth, Self::NOW);
+                    Ok(Vec::new())
+                } else {
+                    Ok(accounts::note_auth(state, label, auth, Self::NOW))
+                }
+            })
+            .unwrap();
     }
 
     fn pin(&self, label: &str) {
@@ -2012,14 +2053,7 @@ impl ReviewPool {
 
     /// `main` signed out here.
     fn main_signed_out(&self) {
-        self.state(|state| {
-            let _ = crate::harness::accounts::note_auth(
-                state,
-                "main",
-                crate::harness::accounts::Auth::SignedOut,
-                Self::NOW,
-            );
-        });
+        self.auth("main", crate::harness::accounts::Auth::SignedOut);
     }
 
     /// `work` with no login here, as `accounts add` leaves it.
@@ -2161,8 +2195,25 @@ fn a_review_result_cannot_heal_or_limit_a_replacement_login() {
                 .unwrap();
             }
             let account_store = pool.store();
+            let raw = account_store
+                .read_account_records(
+                    Some(&pool.config.join(Cli::Codex.accounts().roster_file)),
+                    ReviewPool::NOW,
+                )
+                .unwrap()
+                .raw_roster
+                .row(label)
+                .unwrap()
+                .clone();
             let replacement = pool.b.home.join(".aterm/logins/codex/replacement");
             let runner = FakeRunner::with(move |call| {
+                if change == 1 {
+                    codex_fixture_login(
+                        &replacement,
+                        raw.expected_identity_email().unwrap(),
+                        ReviewPool::NOW,
+                    );
+                }
                 account_store
                     .transact_logins(ReviewPool::NOW, &mut None, |state, logins| {
                         let mut events = Vec::new();
@@ -2177,26 +2228,40 @@ fn a_review_result_cannot_heal_or_limit_a_replacement_login() {
                                 ReviewPool::NOW - 1,
                             ));
                         }
+                        let effective = accounts::bound(
+                            &accounts::Roster {
+                                rows: vec![raw.clone()],
+                            },
+                            logins,
+                        );
+                        let context = account_store
+                            .capture_auth_context(&effective.rows[0])
+                            .unwrap();
                         if change == 2 {
-                            events.extend(accounts::note_auth(
+                            accounts::stage_auth(
                                 state,
-                                label,
-                                Auth::SignedOut,
-                                ReviewPool::NOW - 1,
-                            ));
-                            events.extend(accounts::note_signed_back(
-                                state,
+                                &raw,
                                 logins,
-                                label,
-                                ReviewPool::NOW - 1,
-                            ));
-                        } else if outcome == 0 {
-                            events.extend(accounts::note_auth(
-                                state,
-                                label,
+                                context.clone(),
                                 Auth::SignedOut,
                                 ReviewPool::NOW - 1,
-                            ));
+                            );
+                            accounts::stage_signed_back(
+                                state,
+                                &raw,
+                                logins,
+                                context,
+                                ReviewPool::NOW - 1,
+                            );
+                        } else if outcome == 0 {
+                            accounts::stage_auth(
+                                state,
+                                &raw,
+                                logins,
+                                context,
+                                Auth::SignedOut,
+                                ReviewPool::NOW - 1,
+                            );
                         }
                         Ok(events)
                     })
@@ -2412,8 +2477,9 @@ fn unlisted_claude_uses_default_health_without_rebinding_retained_history() {
                     accounts::note_served_login(logins, "this-mac", ReviewPool::NOW - 20);
                     Vec::new()
                 };
-                events.extend(accounts::note_auth(
+                events.extend(accounts::note_auth_in_context(
                     state,
+                    logins,
                     "this-mac",
                     Auth::SignedOut,
                     ReviewPool::NOW - 10,
@@ -2557,8 +2623,9 @@ fn claude_review_results_follow_the_observed_account_and_receipt() {
                                 ));
                             }
                             if change == 2 {
-                                events.extend(accounts::note_auth(
+                                events.extend(accounts::note_auth_in_context(
                                     state,
+                                    logins,
                                     label,
                                     Auth::SignedOut,
                                     ReviewPool::NOW - 1,
@@ -2570,8 +2637,9 @@ fn claude_review_results_follow_the_observed_account_and_receipt() {
                                     ReviewPool::NOW - 1,
                                 ));
                             } else if outcome == 0 {
-                                events.extend(accounts::note_auth(
+                                events.extend(accounts::note_auth_in_context(
                                     state,
+                                    logins,
                                     label,
                                     Auth::SignedOut,
                                     ReviewPool::NOW - 1,
@@ -3758,7 +3826,7 @@ fn a_linked_roster_created_after_gather_selects_its_witnessed_login() {
 }
 
 fn preparation_case_for(cli: crate::harness::accounts::Cli, scope: i64, changed: i64) -> [bool; 4] {
-    use crate::harness::accounts::{self, Auth, Cli};
+    use crate::harness::accounts::{Auth, Cli};
     let pool = ReviewPool::with_scope(cli, (cli == Cli::Codex).then_some(true), scope != 0);
     if scope != 0 {
         pool.pin(if scope == 2 { "work" } else { "main" });
@@ -3768,10 +3836,8 @@ fn preparation_case_for(cli: crate::harness::accounts::Cli, scope: i64, changed:
         pool.roster(None);
         pool.pin("work");
         if changed == 2 {
-            pool.state(|state| {
-                accounts::note_auth(state, "main", Auth::SignedOut, ReviewPool::NOW);
-                accounts::note_auth(state, "work", Auth::SignedOut, ReviewPool::NOW);
-            });
+            pool.auth("main", Auth::SignedOut);
+            pool.auth("work", Auth::SignedOut);
         }
     }
     let account_store = pool.store();
@@ -4055,15 +4121,10 @@ fn a_prepared_fallback_does_not_hide_an_authorized_accounts_health() {
             let pool = ReviewPool::new(cli, reads);
             pool.state(|state| {
                 state.prepared_accounts.insert("work".into());
-                if expired {
-                    crate::harness::accounts::note_auth(
-                        state,
-                        "main",
-                        Auth::SignedOut,
-                        ReviewPool::NOW,
-                    );
-                }
             });
+            if expired {
+                pool.auth("main", Auth::SignedOut);
+            }
             if !expired {
                 pool.wall("main");
             }
@@ -4099,14 +4160,7 @@ fn prepared_and_shared_accounts_are_not_local_sign_in_alternatives() {
         for shared in [false, true] {
             let pool = ReviewPool::new(cli, reads);
             pool.wall("main");
-            pool.state(|state| {
-                crate::harness::accounts::note_auth(
-                    state,
-                    "work",
-                    Auth::SignedOut,
-                    ReviewPool::NOW,
-                );
-            });
+            pool.auth("work", Auth::SignedOut);
             let before = pool.facts();
             let next = before
                 .accounts
@@ -4156,8 +4210,8 @@ fn a_prepared_expired_pin_explains_its_hold_without_offering_sign_in() {
         let pool = ReviewPool::new(cli, reads);
         pool.state(|state| {
             state.prepared_accounts.insert("work".into());
-            crate::harness::accounts::note_auth(state, "work", Auth::SignedOut, ReviewPool::NOW);
         });
+        pool.auth("work", Auth::SignedOut);
         pool.pin("work");
         let facts = pool.facts();
         let row = crate::ai::state::assess(&facts, true, ReviewPool::NOW);
@@ -4184,8 +4238,8 @@ fn a_lone_default_keeps_its_existing_sign_out_and_lease_policy() {
     ] {
         let pool = ReviewPool::new(cli, reads);
         pool.main_alone();
+        pool.auth("main", Auth::SignedOut);
         pool.state(|state| {
-            crate::harness::accounts::note_auth(state, "main", Auth::SignedOut, ReviewPool::NOW);
             state.leases.insert(
                 "main".into(),
                 AccountLease {
@@ -4309,11 +4363,17 @@ type ReviewCase = (&'static str, fn(&ReviewPool));
 /// THE STATES OF A POOL A REVIEW IS JUDGED IN, UNDER ROTATION (`early`) AND WITH ROTATION OFF: no
 /// pin; `main` held for another Mac's warm set, which a launch passes over; the pin on either
 /// row; on `work` with no login of it here; on a label the roster does not list; `main` walled;
-/// both walled; `main` recorded signed out; and the pin on `work` while another Mac's claim
-/// holds it.
-fn review_cases() -> [ReviewCase; 10] {
+/// both walled; `main` recorded signed out; the pin on `work` while another Mac's claim holds it;
+/// and `work` active with no pin, which rotation takes and rotation off does not.
+fn review_cases() -> [ReviewCase; 11] {
     [
         ("no pin", |_| {}),
+        ("work active, no pin", |pool| {
+            pool.state(|state| {
+                state.active = Some("work".to_string());
+                state.proven = true;
+            });
+        }),
         ("main held for another Mac", |pool| {
             pool.roster(Some("other-mac"));
         }),
@@ -4341,7 +4401,8 @@ fn review_cases() -> [ReviewCase; 10] {
 /// `aterm ai review` OF A POOLED CLI RUNS UNDER THE ROW A LAUNCH TAKES, AND NOT AT ALL WHERE THE
 /// LAUNCH IS REFUSED: for Kimi Code, Grok Build and Codex (on a codex-alab that keeps
 /// `CODEX_AUTH_PATH`'s login and on one from before it), in each of [`review_cases`] under
-/// rotation and with it off, a launch that takes a row (`accounts_pool::launch_env_for`) has its
+/// rotation and with it off (by `[harness] accounts`, the harness's switch or the agent's, each as
+/// `accounts_for` reads it), a launch that takes a row (`accounts_pool::launch_env_for`) has its
 /// review run once under that row's login (the seam's variable naming it, or unset for this
 /// machine's own login); one that takes no row has it run on this machine's own login; and one
 /// that is refused runs no reviewer, whose answer gives the launch's reason (or, at a wall, the
@@ -4366,20 +4427,27 @@ fn a_pooled_review_takes_what_a_launch_takes() {
         if !atpkg::vendor_direct::served_here(cli.id()) {
             continue;
         }
-        for off in [false, true] {
+        let agent_off = format!("[harness.{}]\nenabled = false\n", cli.program().name());
+        for switch in [
+            "",
+            "[harness]\naccounts = \"off\"\n",
+            "[harness]\nenabled = false\n",
+            agent_off.as_str(),
+        ] {
             for (case, set) in review_cases() {
-                let at = format!("{} on {reads:?}, off={off}, {case}", cli.id());
+                let at = format!("{} on {reads:?}, {switch:?}, {case}", cli.id());
                 let ready = || {
                     let pool = ReviewPool::new(cli, reads);
-                    if off {
-                        std::fs::write(
-                            pool.config.join("aterm.toml"),
-                            "[harness]\naccounts = \"off\"\n",
-                        )
-                        .expect("aterm.toml");
-                    }
+                    std::fs::write(pool.config.join("aterm.toml"), switch).expect("aterm.toml");
                     set(&pool);
                     pool
+                };
+                let off = {
+                    let pool = ready();
+                    let (config, _) = crate::supervise::config::SupervisorConfig::from_path(Some(
+                        &pool.config.join("aterm.toml"),
+                    ));
+                    config.accounts_for(cli.program()) == crate::harness::accounts::Mode::Off
                 };
                 let reviewed = ready();
                 let (answer, envs) = reviewed.review();

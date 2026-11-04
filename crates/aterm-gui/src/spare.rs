@@ -2978,6 +2978,8 @@ impl Wake {
             #[cfg(target_os = "macos")]
             Wake::LocalNetworkProbeReady => None,
             #[cfg(target_os = "macos")]
+            Wake::LocalNetworkAlertWatch => None,
+            #[cfg(target_os = "macos")]
             Wake::UpdateLaunchUnregistered { .. } => None,
             #[cfg(target_os = "macos")]
             Wake::OwnLaunchRecord(..) => None,

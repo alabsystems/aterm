@@ -955,8 +955,27 @@ impl App {
     /// waiting for another package pass. A dismissed entry still needs that observation; one
     /// already resolved needs no more filesystem reads. Repository readiness is not compiler
     /// readiness: packaged git works without Apple's tools, and Linux packages them separately.
+    ///
+    /// A `missing` verdict held while an install was on its way
+    /// ([`crate::workstation_setup::Host::c_toolchain_missing_held`]) is dropped once the tools
+    /// are there, and filed once nothing installs them any more (the tab stopped, failed or
+    /// closed, an account that may not install them).
     pub(crate) fn settle_missing_tools_exception(&mut self) {
         use crate::toolchain_words::{CToolchain, c_toolchain_entry};
+        let installed = || {
+            self.workstation_setup
+                .developer_tools_installed
+                .is_some_and(|read| read() == Some(true))
+        };
+        if self.workstation_setup.c_toolchain_missing_held {
+            if installed() {
+                self.workstation_setup.c_toolchain_missing_held = false;
+            } else if !self.developer_tools_on_their_way() {
+                self.workstation_setup.c_toolchain_missing_held = false;
+                self.except(&c_toolchain_entry(CToolchain::Missing));
+            }
+            return;
+        }
         let missing = c_toolchain_entry(CToolchain::Missing).key();
         if !self.has_unresolved_exception(&missing) {
             return;
@@ -1369,6 +1388,7 @@ impl App {
         }
         if current {
             self.settle_developer_tools_shim();
+            self.settle_missing_tools_exception();
         }
         // Its work is done and nothing in it waits on anyone, so the current attempt's tab goes by
         // itself and no tab is left for a person to close (nux round 9, item 12); an older one's
@@ -1585,7 +1605,7 @@ impl App {
     /// installs nothing), or an install of them is under way on this Mac whoever started it, as the
     /// window knows it ([`Self::developer_tools_installing_known`]: the package follow-up's root
     /// half, Apple's installer window, another installer).
-    fn developer_tools_on_their_way(&self) -> bool {
+    pub(crate) fn developer_tools_on_their_way(&self) -> bool {
         let setup = &self.workstation_setup;
         !setup.developer_tools_not_admin
             && ((!setup.developer_tools_unfinished

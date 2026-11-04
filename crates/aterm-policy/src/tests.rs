@@ -5,12 +5,33 @@
 
 use super::{
     Defaults, OriginTag, Policy, Profile, Response, Rule, SCHEMA_VERSION, engine::PolicyEngine,
-    profiles, profiles::refinement::response_rank,
+    profiles,
 };
 
+/// NEGATIVE CONTROL: reversed strictness pairs (`Execute` vs `Ask`/`Rewrite`/`Warn`/`Drop`) must
+/// be rejected by [`Response::is_at_least_as_strict_as`], and every `(sequence, origin)` triple
+/// must preserve `Hardened >= Standard >= Permissive`.
 #[test]
 fn refinement_holds_over_all_sequences_and_origins() {
     use super::selector::DispatchedSequence;
+    let ordered = [
+        Response::Execute,
+        Response::Ask,
+        Response::Rewrite,
+        Response::Warn,
+        Response::Drop,
+    ];
+    for (idx, &lhs) in ordered.iter().enumerate() {
+        assert_eq!(u8::try_from(idx).unwrap(), lhs.strictness_rank());
+        for (jdx, &rhs) in ordered.iter().enumerate() {
+            assert_eq!(
+                lhs.is_at_least_as_strict_as(rhs),
+                idx >= jdx,
+                "{lhs:?} >= {rhs:?}"
+            );
+        }
+    }
+
     let s = |x: &str| x.to_owned();
     let seqs: Vec<DispatchedSequence> = vec![
         DispatchedSequence::osc(52, [s("c"), s("SGVsbG8=")]), // clipboard set
@@ -41,13 +62,17 @@ fn refinement_holds_over_all_sequences_and_origins() {
 
     for seq in &seqs {
         for &origin in &ALL_ORIGINS {
-            let rh = response_rank(hardened.evaluate(seq, origin).response);
-            let rs = response_rank(standard.evaluate(seq, origin).response);
-            let rp = response_rank(permissive.evaluate(seq, origin).response);
+            let rh = hardened.evaluate(seq, origin).response;
+            let rs = standard.evaluate(seq, origin).response;
+            let rp = permissive.evaluate(seq, origin).response;
             assert!(
-                rh >= rs && rs >= rp,
+                rh.is_at_least_as_strict_as(rs) && rs.is_at_least_as_strict_as(rp),
                 "refinement violated for {seq:?} / {origin:?}: \
-                 hardened={rh} standard={rs} permissive={rp} (need H>=S>=P strictness)"
+                 hardened={rh:?}({}) standard={rs:?}({}) permissive={rp:?}({}) \
+                 (need H>=S>=P strictness)",
+                rh.strictness_rank(),
+                rs.strictness_rank(),
+                rp.strictness_rank(),
             );
         }
     }
@@ -199,4 +224,59 @@ fn host_is_the_top_and_networkuntrusted_is_the_bottom() {
     assert!(!OriginTag::NetworkUntrusted.dominates(OriginTag::Host));
     assert!(OriginTag::Pty.dominates(OriginTag::NetworkUntrusted));
     assert!(!OriginTag::NetworkUntrusted.dominates(OriginTag::Pty));
+}
+
+/// NEGATIVE CONTROL: `Profile` strictness rejects reversed pairs (`Permissive` vs
+/// `Standard`/`Hardened`), `Response` execution/drop predicates partition `Ask` cleanly, and
+/// `RateLimit::{encode_params_le, decode_params_le}` round-trip all 4 `u32` fields in LE order.
+#[test]
+fn profile_response_and_rate_limit_scalar_helpers_match_contracts() {
+    use super::RateLimit;
+
+    let profiles = [
+        (Profile::Permissive, "Permissive", 0u8),
+        (Profile::Standard, "Standard", 1),
+        (Profile::Hardened, "Hardened", 2),
+    ];
+    for (idx, &(lhs, name, rank)) in profiles.iter().enumerate() {
+        assert_eq!(lhs.as_str(), name);
+        assert_eq!(lhs.strictness_rank(), rank);
+        for (jdx, &(rhs, _, _)) in profiles.iter().enumerate() {
+            assert_eq!(
+                lhs.is_at_least_as_strict_as(rhs),
+                idx >= jdx,
+                "{lhs:?} >= {rhs:?}"
+            );
+        }
+    }
+
+    for (resp, name, allows_exec, is_drop) in [
+        (Response::Drop, "drop", false, true),
+        (Response::Warn, "warn", false, true),
+        (Response::Execute, "execute", true, false),
+        (Response::Ask, "ask", false, false),
+        (Response::Rewrite, "rewrite", true, false),
+    ] {
+        assert_eq!(resp.as_str(), name);
+        assert_eq!(resp.allows_execution(), allows_exec, "{resp:?} allows_exec");
+        assert_eq!(resp.is_drop(), is_drop, "{resp:?} is_drop");
+    }
+
+    let encoded = RateLimit::encode_params_le(0x0102_0304, 0x0506_0708, 0x090A_0B0C, 0x0D0E_0F10);
+    assert_eq!(
+        encoded,
+        [
+            0x04, 0x03, 0x02, 0x01, 0x08, 0x07, 0x06, 0x05, 0x0C, 0x0B, 0x0A, 0x09, 0x10, 0x0F,
+            0x0E, 0x0D,
+        ]
+    );
+    for tuple in [
+        (0, 0, 0, 0),
+        (u32::MAX, u32::MAX, u32::MAX, u32::MAX),
+        (0x0102_0304, 0x0506_0708, 0x090A_0B0C, 0x0D0E_0F10),
+        (65_536, 102_400, 16, SCHEMA_VERSION),
+    ] {
+        let bytes = RateLimit::encode_params_le(tuple.0, tuple.1, tuple.2, tuple.3);
+        assert_eq!(RateLimit::decode_params_le(bytes), tuple);
+    }
 }

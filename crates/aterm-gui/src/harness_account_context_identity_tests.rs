@@ -288,7 +288,8 @@ fn a_different_auth_context_neither_falls_back_nor_claims_an_old_move() {
             usage_wall(),
         );
     assert_ne!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("adopted")
     );
     assert!(

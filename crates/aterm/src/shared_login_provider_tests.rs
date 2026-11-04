@@ -134,6 +134,7 @@ mod native_reader {
             "the default host must stay inert"
         );
         let context = Context {
+            admission: None,
             env: &env,
             store: &store,
             host: &host,
@@ -170,6 +171,7 @@ mod native_reader {
         let host = Native(Inert);
         assert!(host.native_credential_setup());
         let context = Context {
+            admission: None,
             env: &env,
             store: &store,
             host: &host,
@@ -178,8 +180,10 @@ mod native_reader {
         let observed = claude_observe_with_reader(&context, &row, stage.path(), reader);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(
-            observed.err().as_deref(),
-            Some("injected native reader denial")
+            observed.err(),
+            Some(ObservationError::Unavailable(
+                "injected native reader denial".into()
+            ))
         );
     }
 }

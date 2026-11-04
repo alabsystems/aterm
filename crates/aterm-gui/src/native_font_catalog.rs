@@ -1590,11 +1590,11 @@ mod tests {
             .sparkle_spec_consumers
             .as_deref()
             .expect("prepared catalogs always carry an authoritative projection");
-        assert!(consumers.sparkle_or_starburst_burst);
-        assert!(consumers.rainbow_ink);
-        assert!(consumers.twotone_ink);
-        assert!(!consumers.nova_burst);
-        assert!(!consumers.nova_twotone_ink);
+        assert_ne!(
+            consumers,
+            aterm_effects::spec::SpecConsumerCapabilities::default(),
+            "fixture exercises a non-empty admitted capability set"
+        );
         assert_eq!(
             consumers,
             completion.sparkle.consumer_capabilities(),
@@ -1604,10 +1604,12 @@ mod tests {
 
     #[test]
     fn prepared_path_feeds_are_not_reopened_by_font_preparation() {
-        let dir =
-            std::env::temp_dir().join(format!("aterm-font-prepared-feeds-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let dir = std::fs::canonicalize(&dir).unwrap();
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("aterm-font-prepared-feeds-")
+            .suffix(".noindex")
+            .tempdir()
+            .unwrap();
+        let dir = std::fs::canonicalize(scratch.path()).unwrap();
         let lexicon = dir.join("lexicon.toml");
         let v1 = "# font-worker-exact\n";
         let v2 = "# font-worker-replacement\n";
@@ -1648,7 +1650,6 @@ mod tests {
             2,
             "negative control: a genuine independent fingerprint reopen reaches the OS seam"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

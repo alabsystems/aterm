@@ -565,6 +565,7 @@ fn idle_host(sid: &str, agent: Program, switches: Arc<Switches>, hooks: Hooks) -
         settle_later: AtomicBool::default(),
         told: AtomicU8::new(0),
         repo_probe: Default::default(),
+        restart_left: Mutex::default(),
         group: Arc::default(),
     }
 }
@@ -7063,7 +7064,13 @@ impl Acting {
                     if let Some(host) = job.opts.idle_host.as_ref()
                         && w3.ask_restart.swap(false, Ordering::SeqCst)
                     {
-                        let said = host.restart(&Restart::Memory);
+                        let said = host.restart(
+                            &Restart::Memory,
+                            &aterm_agent::supervise::policy::turn_end::RestartAsk::of(
+                                &Restart::Memory,
+                                0,
+                            ),
+                        );
                         w3.restart_said.lock().unwrap().push(said);
                     }
                     if let Some(host) = job.opts.idle_host.as_ref().filter(|h| h.wants())
@@ -7482,7 +7489,7 @@ impl Acting {
                     a19.carries.lock().unwrap().push((codex, pid));
                     step.to_string()
                 }),
-                restart: Arc::new(move |sid, _, why, _| {
+                restart: restart_answering(move |sid, _, why, _| {
                     a10.restarts.lock().unwrap().push(why.word());
                     a10.set(&[]);
                     std::thread::sleep(Duration::from_millis(40));
@@ -7938,6 +7945,7 @@ fn a_point_resting_only_for_the_carry_on_steps_nothing_else() {
         activations: Arc::default(),
         told: AtomicU8::new(0),
         repo_probe: Default::default(),
+        restart_left: Mutex::default(),
         group: Arc::default(),
     };
     let question = IdlePoint {
@@ -8081,6 +8089,7 @@ fn a_task_done_under_land_is_carried_on_with_nothing_typed() {
         activations: Arc::default(),
         told: AtomicU8::new(0),
         repo_probe: Default::default(),
+        restart_left: Mutex::default(),
         group: Arc::default(),
     };
     let done = idle
@@ -8153,6 +8162,7 @@ fn a_relaunchs_owed_carry_on_is_settled_where_its_loop_takes_a_point() {
         settle_later: AtomicBool::default(),
         told: AtomicU8::new(0),
         repo_probe: Default::default(),
+        restart_left: Mutex::default(),
         group: Arc::default(),
         activations: Arc::default(),
     };
@@ -8536,6 +8546,7 @@ fn the_workers_own_readers_follow_the_agents_record_first() {
             lifted_off: false,
             told: AtomicU8::new(0),
             repo_probe: Default::default(),
+            restart_left: Mutex::default(),
             group: Arc::default(),
             beside: Arc::default(),
             sid: sid.to_string(),
@@ -9970,7 +9981,7 @@ impl Accts {
                 let to = a4.asked_to.lock().unwrap().clone();
                 to.filter(|_| a4.ended.load(Ordering::SeqCst))
             }),
-            restart: Arc::new(move |sid, _, why, selected| {
+            restart: restart_answering(move |sid, _, why, selected| {
                 let a = &a5;
                 let Restart::Account { to, .. } = why else {
                     return "refused:inert".to_string();
@@ -10222,7 +10233,8 @@ fn with_no_roster_nothing_is_advised_read_or_made() {
         }));
         idle.account_probed(Err(ProbeMiss::Lost));
         assert_eq!(
-            idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+            idle.restart_once(&move_to("work-2", AccountAt::Wall))
+                .as_deref(),
             Some("wait:account-changed"),
             "{why}"
         );
@@ -10675,8 +10687,8 @@ fn codex_pool_advice_records_thread_rollout_sample_and_plans_at_measured_wall() 
     .unwrap();
 
     let mut snap = a.spawn("s-codex-pool", THREAD, "work-2");
-    snap.program = "/opt/bin/codex".into();
-    snap.argv = vec!["/opt/bin/codex".into()];
+    snap.program = aterm_agent::harness::codex_alab::lay_package(&a.tmp.path().join("store"), true);
+    snap.argv = vec![snap.program.display().to_string()];
     snap.login = None;
     snap.stored_login = false;
     snap.run = relaunch::AgentRun::Codex(relaunch::CodexRun {
@@ -10768,14 +10780,16 @@ fn a_move_commits_under_the_lock_and_relaunches_outside_it() {
     a.wall(ACCT_TALK_A, ACCT_NOW - 10);
     assert_eq!(moves(&idle.account(usage_wall())), Some("work-2"));
     assert_eq!(
-        idle.restart(&move_to("pool-a", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("pool-a", AccountAt::Wall))
+            .as_deref(),
         Some("wait:account-changed")
     );
     assert_eq!(a.asked("restart:"), 0);
 
     assert_eq!(moves(&idle.account(usage_wall())), Some("work-2"));
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("adopted")
     );
     let said: Vec<String> = a
@@ -10888,7 +10902,8 @@ fn a_move_onto_an_unseen_login_runs_nothing_of_the_agents_program() {
     assert_eq!(a.state().account("work-2").auth, accounts::Auth::Unseen);
     assert_eq!(moves(&idle.account(usage_wall())), Some("work-2"));
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("adopted")
     );
     assert!(!ran.exists(), "nothing ran the agent's program");
@@ -10916,7 +10931,8 @@ fn an_account_whose_login_directory_is_empty_is_never_moved_to() {
     let idle = a.worker("s-acct-a", &on());
     assert_eq!(moves(&idle.account(usage_wall())), Some("pool-a"));
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("wait:account-changed")
     );
     assert_eq!(a.asked("restart:"), 0);
@@ -10948,19 +10964,22 @@ fn an_account_move_that_landed_tells_the_login_back() {
     };
     assert_eq!(moves(&idle.account(usage_wall())), Some("work-2"));
     assert_eq!(
-        idle.restart(&move_to("pool-a", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("pool-a", AccountAt::Wall))
+            .as_deref(),
         Some("wait:account-changed")
     );
     assert_eq!(moves(&idle.account(usage_wall())), Some("work-2"));
     a.answers.lock().unwrap().push_back("failed:no-agent");
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("failed:no-agent")
     );
     assert_eq!(backs(), 0, "no move landed");
     assert_eq!(moves(&idle.account(usage_wall())), Some("work-2"));
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("adopted")
     );
     assert_eq!(backs(), 1, "the tab's login is back");
@@ -10980,13 +10999,13 @@ fn two_sessions_at_one_wall_make_one_rotation_and_the_other_follows_once_proven(
 
     assert_eq!(
         first
-            .restart(&move_to("work-2", AccountAt::Wall))
+            .restart_once(&move_to("work-2", AccountAt::Wall))
             .as_deref(),
         Some("adopted")
     );
     assert_eq!(
         second
-            .restart(&move_to("work-2", AccountAt::Wall))
+            .restart_once(&move_to("work-2", AccountAt::Wall))
             .as_deref(),
         Some("wait:account-changed"),
         "advised before the rotation, asked after it"
@@ -11015,7 +11034,7 @@ fn two_sessions_at_one_wall_make_one_rotation_and_the_other_follows_once_proven(
     );
     assert_eq!(
         second
-            .restart(&move_to("work-2", AccountAt::Wall))
+            .restart_once(&move_to("work-2", AccountAt::Wall))
             .as_deref(),
         Some("wait:account-changed"),
         "no move was advised: none is made"
@@ -11033,7 +11052,7 @@ fn two_sessions_at_one_wall_make_one_rotation_and_the_other_follows_once_proven(
     assert_eq!(moves(&second.account(usage_wall())), Some("work-2"));
     assert_eq!(
         second
-            .restart(&move_to("work-2", AccountAt::Wall))
+            .restart_once(&move_to("work-2", AccountAt::Wall))
             .as_deref(),
         Some("adopted")
     );
@@ -11062,7 +11081,7 @@ fn a_follow_onto_an_account_struck_before_its_commit_is_refused() {
         assert_eq!(moves(&first.account(usage_wall())), Some("work-2"));
         assert_eq!(
             first
-                .restart(&move_to("work-2", AccountAt::Wall))
+                .restart_once(&move_to("work-2", AccountAt::Wall))
                 .as_deref(),
             Some("adopted")
         );
@@ -11077,7 +11096,7 @@ fn a_follow_onto_an_account_struck_before_its_commit_is_refused() {
             }
             after.store(a.ledger_len(), Ordering::SeqCst);
         });
-        let step = second.restart(&move_to("work-2", AccountAt::Wall));
+        let step = second.restart_once(&move_to("work-2", AccountAt::Wall));
         assert!(
             a.at_read.lock().unwrap().is_none(),
             "the window was reached"
@@ -11141,7 +11160,8 @@ fn a_relaunch_that_was_not_made_is_taken_back_exactly() {
     let before = a.state();
     let woke = a.wake();
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("wait:changed")
     );
     let after = a.state();
@@ -11161,7 +11181,8 @@ fn a_relaunch_that_was_not_made_is_taken_back_exactly() {
     a.answers.lock().unwrap().push_back("wait:changed");
     assert_eq!(moves(&idle.account(usage_wall())), Some("work-2"));
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("wait:changed")
     );
     assert_eq!(bare(a.state()), bare(before.clone()));
@@ -11184,7 +11205,8 @@ fn a_relaunch_that_was_not_made_is_taken_back_exactly() {
     a.answers.lock().unwrap().push_back("refused:line");
     assert_eq!(moves(&idle.account(usage_wall())), Some("work-2"));
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("refused:line")
     );
     let after = a.state();
@@ -11218,7 +11240,8 @@ fn an_adopted_relaunch_under_the_old_login_is_not_the_move() {
     a.same_login.store(true, Ordering::SeqCst);
     assert_eq!(moves(&idle.account(usage_wall())), Some("work-2"));
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("failed:account-not-applied")
     );
     assert_eq!(
@@ -11246,7 +11269,8 @@ fn an_adopted_relaunch_under_the_old_login_is_not_the_move() {
     assert_eq!(moves(&idle.account(usage_wall())), Some("work-2"));
     a.answers.lock().unwrap().push_back("relaunched");
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("failed:account-not-applied")
     );
     let state = a.state();
@@ -11266,7 +11290,8 @@ fn an_adopted_relaunch_under_the_old_login_is_not_the_move() {
     a.ended.store(true, Ordering::SeqCst);
     a.leaves_on_restart.store(true, Ordering::SeqCst);
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("failed:no-resume")
     );
     let state = a.state();
@@ -11293,7 +11318,8 @@ fn a_relaunch_in_flight_keeps_its_rotation() {
         a.ended.store(ended, Ordering::SeqCst);
         a.leaves_on_restart.store(ended, Ordering::SeqCst);
         assert_eq!(
-            idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+            idle.restart_once(&move_to("work-2", AccountAt::Wall))
+                .as_deref(),
             Some("wait:resume")
         );
         let state = a.state();
@@ -11318,7 +11344,8 @@ fn a_lost_login_or_its_own_wall_strikes_the_account_moved_to() {
     let login_wall = login_wall();
     assert_eq!(moves(&idle.account(login_wall)), Some("pool-a"));
     assert_eq!(
-        idle.restart(&move_to("pool-a", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("pool-a", AccountAt::Wall))
+            .as_deref(),
         Some("adopted")
     );
     assert_eq!(a.state().active.as_deref(), Some("pool-a"));
@@ -11354,7 +11381,8 @@ fn a_lost_login_signed_back_in_is_relaunched_under_it() {
     let idle = a.worker(sid, &on());
     assert_eq!(moves(&idle.account(usage_wall())), Some("work-2"));
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("adopted")
     );
     let lost = idle.kept.lock().unwrap().snapshot.clone().expect("moved");
@@ -11363,7 +11391,8 @@ fn a_lost_login_signed_back_in_is_relaunched_under_it() {
     a.now.store(t, Ordering::SeqCst);
     assert_eq!(moves(&idle.account(login_wall)), None);
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("wait:account-changed")
     );
     a.now.store(t + 30, Ordering::SeqCst);
@@ -11372,7 +11401,8 @@ fn a_lost_login_signed_back_in_is_relaunched_under_it() {
 
     assert_eq!(moves(&idle.account(login_wall)), None);
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("wait:account-changed")
     );
     assert_eq!(a.asked("restart:"), 1);
@@ -11382,7 +11412,8 @@ fn a_lost_login_signed_back_in_is_relaunched_under_it() {
     let rotations = a.state().rotations.len();
     assert_eq!(moves(&idle.account(login_wall)), Some("work-2"));
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("adopted")
     );
     assert_eq!(a.asked(&format!("restart:{sid}:work-2:")), 2);
@@ -11431,7 +11462,8 @@ fn a_sign_in_between_the_tell_and_the_first_ask_brings_the_session_back() {
         let idle = a.worker(sid, &on());
         assert_eq!(moves(&idle.account(usage_wall())), Some("work-2"));
         assert_eq!(
-            idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+            idle.restart_once(&move_to("work-2", AccountAt::Wall))
+                .as_deref(),
             Some("adopted")
         );
         let t = ACCT_NOW + accounts::CANARY_HOLD_S + 1;
@@ -11484,12 +11516,13 @@ fn the_owners_pin_is_followed_at_a_plain_turn_end() {
     );
     assert_eq!(moves(&idle.account(AccountPoint::TurnEnd)), Some("work-2"));
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("wait:account-changed")
     );
     assert_eq!(moves(&idle.account(AccountPoint::TurnEnd)), Some("work-2"));
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Ahead))
+        idle.restart_once(&move_to("work-2", AccountAt::Ahead))
             .as_deref(),
         Some("adopted")
     );
@@ -11547,7 +11580,8 @@ fn moved_at_wall(sid: &str) -> (Arc<Accts>, WorkerIdle) {
     let idle = a.worker(sid, &on());
     assert_eq!(moves(&idle.account(usage_wall())), Some("work-2"));
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("adopted")
     );
     (a, idle)
@@ -11635,13 +11669,14 @@ fn early_moves_a_session_off_a_low_account_ahead_of_its_limit() {
         "low, a fresh candidate, its sample thirty seconds old: the move, and no probe"
     );
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("wait:account-changed")
     );
     assert_eq!(moves(&idle.account(AccountPoint::TurnEnd)), Some("work-2"));
     let rows = a.ledger().len();
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Ahead))
+        idle.restart_once(&move_to("work-2", AccountAt::Ahead))
             .as_deref(),
         Some("adopted")
     );
@@ -11678,7 +11713,7 @@ fn early_moves_a_session_off_a_low_account_ahead_of_its_limit() {
     let (a, idle) = world(sid, 95, &at_wall_only());
     assert_eq!(idle.account(AccountPoint::TurnEnd), None);
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Ahead))
+        idle.restart_once(&move_to("work-2", AccountAt::Ahead))
             .as_deref(),
         Some("wait:account-changed")
     );
@@ -11718,7 +11753,7 @@ fn early_moves_a_session_off_a_low_account_ahead_of_its_limit() {
         })
     );
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Ahead))
+        idle.restart_once(&move_to("work-2", AccountAt::Ahead))
             .as_deref(),
         Some("adopted")
     );
@@ -11780,7 +11815,7 @@ fn a_due_probe_is_handed_on_with_the_move_behind_it_and_refuses_no_commit() {
         assert!(advice.request.matches_context(&k));
     }
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Ahead))
+        idle.restart_once(&move_to("work-2", AccountAt::Ahead))
             .as_deref(),
         Some("adopted"),
         "a probe that is due refuses no move"
@@ -11793,7 +11828,8 @@ fn a_due_probe_is_handed_on_with_the_move_behind_it_and_refuses_no_commit() {
     let (a, idle) = world(sid, &on());
     assert_eq!(idle.account(usage_wall()), Some(moved));
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("adopted")
     );
     assert!(
@@ -13248,7 +13284,7 @@ fn nobody_is_advised_off_an_account_whose_limit_reset_is_in_flight() {
     }
     assert_eq!(
         other
-            .restart(&move_to("work-2", AccountAt::Wall))
+            .restart_once(&move_to("work-2", AccountAt::Wall))
             .as_deref(),
         Some("wait:account-changed")
     );
@@ -13516,7 +13552,7 @@ fn a_move_advised_before_a_claim_is_not_committed_while_it_is_in_flight() {
                 ResetWord::Take(_)
             ));
         }
-        let answer = other.restart(&move_to("work-2", AccountAt::Wall));
+        let answer = other.restart_once(&move_to("work-2", AccountAt::Wall));
         if claims {
             assert_eq!(answer.as_deref(), Some("wait:account-changed"));
             assert_eq!(a.asked("restart:"), 0, "nothing relaunched");
@@ -13664,7 +13700,7 @@ fn a_followers_failed_relaunch_strikes_nothing_and_its_row_is_kept_fresh() {
     a.ended.store(true, Ordering::SeqCst);
     a.leaves_on_restart.store(true, Ordering::SeqCst);
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Ahead))
+        idle.restart_once(&move_to("work-2", AccountAt::Ahead))
             .as_deref(),
         Some("failed:no-resume")
     );
@@ -13737,7 +13773,8 @@ fn a_followers_exit_before_its_answer_strikes_nothing_of_a_proven_account() {
         let lead = a.worker("s-acct-lead", &on());
         assert_eq!(moves(&lead.account(usage_wall())), Some("work-2"));
         assert_eq!(
-            lead.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+            lead.restart_once(&move_to("work-2", AccountAt::Wall))
+                .as_deref(),
             Some("adopted")
         );
         (a, lead)
@@ -13758,7 +13795,8 @@ fn a_followers_exit_before_its_answer_strikes_nothing_of_a_proven_account() {
     let tail = a.worker("s-acct-tail", &on());
     assert_eq!(moves(&tail.account(usage_wall())), Some("work-2"));
     assert_eq!(
-        tail.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        tail.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("adopted")
     );
     assert!(tail.kept.lock().unwrap().account.moved.is_some());
@@ -13825,7 +13863,8 @@ fn a_move_from_an_unanswered_moves_process_goes_back_to_the_login_before_both() 
         let moved = |idle: &WorkerIdle| idle.kept.lock().unwrap().account.moved.clone();
         assert_eq!(moves(&idle.account(usage_wall())), Some("work-2"));
         assert_eq!(
-            idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+            idle.restart_once(&move_to("work-2", AccountAt::Wall))
+                .as_deref(),
             Some("adopted")
         );
         assert_eq!(
@@ -13841,7 +13880,8 @@ fn a_move_from_an_unanswered_moves_process_goes_back_to_the_login_before_both() 
         let login_wall = login_wall();
         assert_eq!(moves(&idle.account(login_wall)), Some("pool-a"));
         assert_eq!(
-            idle.restart(&move_to("pool-a", AccountAt::Wall)).as_deref(),
+            idle.restart_once(&move_to("pool-a", AccountAt::Wall))
+                .as_deref(),
             Some("adopted")
         );
         let second = moved(&idle).expect("the second move, unanswered");
@@ -13889,14 +13929,16 @@ fn a_move_whose_strike_the_lock_kept_out_is_not_answered() {
         let lead = a.worker("s-acct-lead", &on());
         assert_eq!(moves(&lead.account(usage_wall())), Some("work-2"));
         assert_eq!(
-            lead.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+            lead.restart_once(&move_to("work-2", AccountAt::Wall))
+                .as_deref(),
             Some("adopted")
         );
         lead.account_served();
         let idle = a.worker(sid, &on());
         assert_eq!(moves(&idle.account(usage_wall())), Some("work-2"));
         assert_eq!(
-            idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+            idle.restart_once(&move_to("work-2", AccountAt::Wall))
+                .as_deref(),
             Some("adopted")
         );
         let tab = idle.kept.lock().unwrap().snapshot.clone().expect("moved");
@@ -13916,7 +13958,8 @@ fn a_move_whose_strike_the_lock_kept_out_is_not_answered() {
         let login_wall = login_wall();
         assert_eq!(moves(&idle.account(login_wall)), Some("pool-a"));
         assert_eq!(
-            idle.restart(&move_to("pool-a", AccountAt::Wall)).as_deref(),
+            idle.restart_once(&move_to("pool-a", AccountAt::Wall))
+                .as_deref(),
             Some("adopted")
         );
         let moved = idle.kept.lock().unwrap().account.moved.clone();
@@ -13998,7 +14041,8 @@ fn an_exit_with_no_login_to_come_back_under_waits_under_its_own_for_the_sign_in(
         let idle = a.worker(sid, &on());
         assert_eq!(moves(&idle.account(usage_wall())), Some("work-2"));
         assert_eq!(
-            idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+            idle.restart_once(&move_to("work-2", AccountAt::Wall))
+                .as_deref(),
             Some("adopted")
         );
         for label in out {
@@ -14079,7 +14123,8 @@ fn an_exit_with_no_login_to_come_back_under_waits_under_its_own_for_the_sign_in(
     a.now.store(ACCT_NOW + 2 * 3600, Ordering::SeqCst);
     assert_eq!(moves(&idle.account(login_wall)), Some("work-2"));
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("adopted")
     );
     let back = idle
@@ -14109,7 +14154,8 @@ fn a_session_brought_back_under_a_login_nobody_saw_lost_is_moved_back_under_it()
         let idle = a.worker(sid, &on());
         assert_eq!(moves(&idle.account(usage_wall())), Some("work-2"));
         assert_eq!(
-            idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+            idle.restart_once(&move_to("work-2", AccountAt::Wall))
+                .as_deref(),
             Some("adopted")
         );
         idle.account_answered(AccountBad::SignedOut);
@@ -14139,7 +14185,8 @@ fn a_session_brought_back_under_a_login_nobody_saw_lost_is_moved_back_under_it()
     assert_eq!(advised.as_deref(), Some("main"), "its own login");
     assert!(next.kept.lock().unwrap().account.came_back.is_none());
     assert_eq!(
-        next.restart(&move_to("main", AccountAt::Wall)).as_deref(),
+        next.restart_once(&move_to("main", AccountAt::Wall))
+            .as_deref(),
         Some("adopted")
     );
     assert_eq!(a.asked("restart:s-acct-came-back:main:"), 1);
@@ -14178,7 +14225,8 @@ fn a_renewable_login_the_way_back_brought_up_is_moved_back_under_it() {
         let idle = a.worker(sid, &on());
         assert_eq!(moves(&idle.account(usage_wall())), Some("work-2"));
         assert_eq!(
-            idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+            idle.restart_once(&move_to("work-2", AccountAt::Wall))
+                .as_deref(),
             Some("adopted")
         );
         idle.account_answered(AccountBad::SignedOut);
@@ -14279,7 +14327,8 @@ fn a_limit_an_earlier_process_wrote_follows_and_rotates_nothing() {
     pinned(&a, "work-2");
     assert_eq!(moves(&idle.account(usage_wall())), Some("work-2"));
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("adopted")
     );
     let state = a.state();
@@ -14315,7 +14364,8 @@ fn what_can_pass_by_itself_is_a_wait_and_takes_back_only_what_was_not_tried() {
         .push_back(relaunch::IN_FLIGHT_OTHER);
     assert_eq!(moves(&idle.account(usage_wall())), Some("work-2"));
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("wait:restart-in-flight")
     );
     assert_eq!(
@@ -14342,7 +14392,8 @@ fn what_can_pass_by_itself_is_a_wait_and_takes_back_only_what_was_not_tried() {
     let relaunches = a.asked("restart:");
     let rows = a.ledger().len();
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("wait:account-state"),
         "a bounded wait, then asked again: never a refusal"
     );
@@ -14361,7 +14412,8 @@ fn what_can_pass_by_itself_is_a_wait_and_takes_back_only_what_was_not_tried() {
     assert_eq!(a.asked("wall:"), 2, "asked again, the lock free");
     assert_eq!(idle.kept.lock().unwrap().account.wall_again, 0);
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("adopted")
     );
     assert_eq!(a.state().active.as_deref(), Some("work-2"));
@@ -14520,7 +14572,8 @@ fn a_move_nobody_could_verify_stands_and_is_made_once_it_is_read() {
         a.same_login.store(same_login, Ordering::SeqCst);
         assert_eq!(moves(&idle.account(usage_wall())), Some("work-2"));
         assert_eq!(
-            idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+            idle.restart_once(&move_to("work-2", AccountAt::Wall))
+                .as_deref(),
             Some("wait:account-unverified")
         );
         let state = a.state();
@@ -14585,13 +14638,15 @@ fn a_move_nobody_could_verify_stands_and_is_made_once_it_is_read() {
     );
     let asked = a.asked("restart:");
     assert_eq!(
-        idle.restart(&move_to("pool-a", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("pool-a", AccountAt::Wall))
+            .as_deref(),
         Some("wait:account-changed")
     );
     assert_eq!(idle.kept.lock().unwrap().account.moved, landed(true));
     assert_eq!(moves(&idle.account(usage_wall())), Some("work-2"));
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("adopted")
     );
     assert_eq!(
@@ -14628,7 +14683,8 @@ fn a_move_nobody_could_verify_stands_and_is_made_once_it_is_read() {
     );
     assert_eq!(moves(&idle.account(usage_wall())), None);
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("wait:account-changed"),
         "control: a move nobody advised is not answered as made"
     );
@@ -14666,7 +14722,7 @@ fn a_move_ahead_nobody_could_verify_is_told_as_made_at_the_next_turn_end() {
         a.unread.store(true, Ordering::SeqCst);
         assert_eq!(moves(&idle.account(AccountPoint::TurnEnd)), Some("work-2"));
         assert_eq!(
-            idle.restart(&move_to("work-2", AccountAt::Ahead))
+            idle.restart_once(&move_to("work-2", AccountAt::Ahead))
                 .as_deref(),
             Some("wait:account-unverified")
         );
@@ -14692,7 +14748,7 @@ fn a_move_ahead_nobody_could_verify_is_told_as_made_at_the_next_turn_end() {
     );
     let asked = a.asked("restart:");
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Ahead))
+        idle.restart_once(&move_to("work-2", AccountAt::Ahead))
             .as_deref(),
         Some("adopted")
     );
@@ -14750,7 +14806,8 @@ fn a_service_told_while_a_moves_landing_is_unread_proves_nothing() {
     a.unread.store(true, Ordering::SeqCst);
     assert_eq!(moves(&idle.account(usage_wall())), Some("work-2"));
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("wait:account-unverified")
     );
     a.readable();
@@ -14796,7 +14853,8 @@ fn a_move_the_hosts_carry_lands_is_a_made_move() {
         a.answers.lock().unwrap().push_back("wait:exiting");
         a.ended.store(ended, Ordering::SeqCst);
         assert_eq!(
-            idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+            idle.restart_once(&move_to("work-2", AccountAt::Wall))
+                .as_deref(),
             Some("wait:exiting")
         );
         (a, idle)
@@ -15349,7 +15407,7 @@ fn accounts_off_stops_everything_of_the_feature_but_the_recorder() {
     }
     assert_eq!(
         quiet
-            .restart(&move_to("work-2", AccountAt::Wall))
+            .restart_once(&move_to("work-2", AccountAt::Wall))
             .as_deref(),
         Some("refused:accounts-off")
     );
@@ -15403,7 +15461,8 @@ fn the_owners_clearing_is_advised_as_a_resume_at_the_wall_it_lifted() {
         "continue here: the continuation is the probe"
     );
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("wait:account-changed"),
         "no move was advised: none is made"
     );
@@ -15415,7 +15474,8 @@ fn the_owners_clearing_is_advised_as_a_resume_at_the_wall_it_lifted() {
     a.wall(ACCT_TALK_A, ACCT_NOW + 50);
     assert_eq!(moves(&idle.account(usage_wall())), Some("work-2"));
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("adopted")
     );
     let state = a.state();
@@ -31460,7 +31520,7 @@ fn a_tabs_sign_in_ends_when_a_move_relaunches_it_onto_another_login() {
         assert_eq!(idle.login_latches.carried_rows(), main, "{answer}");
         struck_out(&a, "main", "s-other", ACCT_NOW - 5);
         let told = accounts_told(&notes).len();
-        let step = idle.restart(&move_to("work-2", AccountAt::Wall));
+        let step = idle.restart_once(&move_to("work-2", AccountAt::Wall));
         assert_eq!(
             step.as_deref().is_some_and(relaunch_took),
             took,
@@ -31623,7 +31683,7 @@ fn a_renewable_login_s_end_is_recorded_and_its_renewal_followed() {
         }),
         "the move onto the renewed login"
     );
-    let step = idle.restart(&move_to("main", AccountAt::Wall));
+    let step = idle.restart_once(&move_to("main", AccountAt::Wall));
     assert_eq!(step.as_deref(), Some("adopted"));
     let tab = a
         .tabs
@@ -31924,7 +31984,8 @@ fn logins_off_between_advice_and_commit_prevents_a_renewal_relaunch() {
         cfg.set("logins", "off").unwrap();
         idle.switches.set(&cfg, false);
         assert_eq!(
-            idle.restart(&move_to("main", AccountAt::Ahead)).as_deref(),
+            idle.restart_once(&move_to("main", AccountAt::Ahead))
+                .as_deref(),
             Some("wait:account-changed"),
             "{mode}: a renewal advised while on is not committed while off"
         );
@@ -31946,7 +32007,8 @@ fn logins_off_while_the_commit_is_opening_is_read_by_its_re_advice() {
     let switches = idle.switches.clone();
     a.at_seat_read(2, move |_| switches.set(&cfg, false));
     assert_eq!(
-        idle.restart(&move_to("main", AccountAt::Ahead)).as_deref(),
+        idle.restart_once(&move_to("main", AccountAt::Ahead))
+            .as_deref(),
         Some("wait:account-changed")
     );
     assert_eq!(
@@ -31989,7 +32051,8 @@ fn logins_off_keeps_a_superseded_process_attributed_for_account_rotation() {
         let idle = a.worker("s-renew-off", &cfg);
         assert_eq!(moves(&idle.account(usage_wall())), Some("work-2"));
         assert_eq!(
-            idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+            idle.restart_once(&move_to("work-2", AccountAt::Wall))
+                .as_deref(),
             Some("adopted")
         );
         assert_eq!(a.asked("restart:s-renew-off:work-2:"), 1);
@@ -32195,7 +32258,8 @@ fn a_superseded_session_at_a_usage_limit_follows_the_owners_account() {
         "not own"
     );
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("adopted")
     );
     assert_eq!(a.asked("restart:s-left:work-2:"), 1, "{:?}", a.said());
@@ -36067,6 +36131,7 @@ fn an_unnamed_conversation_is_read_again_at_a_look_not_at_once() {
             settle_later: AtomicBool::default(),
             told: AtomicU8::new(0),
             repo_probe: Default::default(),
+            restart_left: Mutex::default(),
             group: Arc::default(),
             activations: Arc::default(),
         };
@@ -36284,6 +36349,7 @@ fn idle_of(hooks: Hooks, agent: Program, session: Option<String>) -> WorkerIdle 
         settle_later: AtomicBool::default(),
         told: AtomicU8::new(0),
         repo_probe: Default::default(),
+        restart_left: Mutex::default(),
         group: Arc::default(),
         activations: Arc::default(),
     };
@@ -37986,6 +38052,7 @@ fn a_full_disk_withholds_continuations_and_space_back_types_the_resume_once() {
         settle_later: AtomicBool::default(),
         told: AtomicU8::new(0),
         repo_probe: Default::default(),
+        restart_left: Mutex::default(),
         group: Arc::default(),
         activations: Arc::default(),
     };
@@ -39757,7 +39824,7 @@ fn the_sweep_journals_a_finished_stage_and_counts_it() {
                 &root,
                 None,
                 std::time::SystemTime::now(),
-                atpkg::build_cache::RECLAIM_GONE_UNDER_PRESSURE,
+                atpkg::build_cache::ReclaimAfter::UNDER_PRESSURE,
                 None,
                 record,
                 &|_, _| Ok(aterm_uds::holders::PathScan::default()),
@@ -39857,7 +39924,7 @@ fn the_sweep_journals_an_intent_closed_with_nothing_gone_as_kept() {
                 &root,
                 None,
                 std::time::SystemTime::now(),
-                atpkg::build_cache::RECLAIM_GONE_UNDER_PRESSURE,
+                atpkg::build_cache::ReclaimAfter::UNDER_PRESSURE,
                 None,
                 record,
                 &processes,
@@ -40960,6 +41027,7 @@ fn a_codex_is_told_no_resume_line_and_claude_codes_is_unchanged() {
             settle_later: AtomicBool::new(false),
             told: AtomicU8::new(0),
             repo_probe: Default::default(),
+            restart_left: Mutex::default(),
             group: Arc::default(),
         };
         idle.kept.lock().unwrap().snapshot = kept;
@@ -41862,7 +41930,7 @@ fn account_move_claims_target_before_restarting_and_refuses_when_held_elsewhere(
     let idle = a.worker("s-claim-move", &on());
     assert_eq!(moves(&idle.account(usage_wall())), Some("work-2"));
     let step = claims::with_table(table.clone(), || {
-        idle.restart(&move_to("work-2", AccountAt::Wall))
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
     });
     if cfg!(not(unix)) {
         // Off Unix no owner-only claim activity can be kept (`claims_activity::Held::take`), so
@@ -41913,7 +41981,7 @@ fn account_move_claims_target_before_restarting_and_refuses_when_held_elsewhere(
     let idle = a.worker("s-claim-move", &on());
     assert_eq!(moves(&idle.account(usage_wall())), Some("work-2"));
     let step = claims::with_table(table.clone(), || {
-        idle.restart(&move_to("work-2", AccountAt::Wall))
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
     });
     assert_eq!(step.as_deref(), Some("wait:account-changed"));
     assert!(

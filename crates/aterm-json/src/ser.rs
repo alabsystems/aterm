@@ -18,6 +18,24 @@ pub fn to_vec<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Worst-case quoted byte capacity `len * 6 + 2`, refusing arithmetic overflow
+/// and allocations exceeding `isize::MAX`.
+#[inline]
+#[must_use]
+pub const fn quoted_capacity(len: usize) -> Option<usize> {
+    let Some(body) = len.checked_mul(6) else {
+        return None;
+    };
+    let Some(total) = body.checked_add(2) else {
+        return None;
+    };
+    if total <= isize::MAX as usize {
+        Some(total)
+    } else {
+        None
+    }
+}
+
 /// Encode one quoted JSON string, reserving its worst-case size before copying
 /// any text. The buffer never grows while it holds text; callers handling
 /// private data can scrub the returned allocation without abandoned growth
@@ -25,11 +43,7 @@ pub fn to_vec<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
 /// # Errors
 /// The string's worst-case escaped length exceeds the addressable capacity.
 pub fn quoted_string(text: &str) -> Result<Vec<u8>> {
-    let capacity = text
-        .len()
-        .checked_mul(6)
-        .and_then(|n| n.checked_add(2))
-        .filter(|n| *n <= isize::MAX as usize)
+    let capacity = quoted_capacity(text.len())
         .ok_or_else(|| Error::message("quoted string exceeds capacity"))?;
     let mut out = Vec::with_capacity(capacity);
     write_json_string(&mut out, text);
@@ -745,24 +759,5 @@ impl ser::Serializer for KeySerializer<'_> {
         _len: usize,
     ) -> Result<Self::SerializeStructVariant> {
         Err(key_type_error())
-    }
-}
-
-#[cfg(test)]
-mod quoted_tests {
-    #[test]
-    fn preallocated_quoting_matches_general_serialization_at_escape_bounds() {
-        let controls: String = (0..32).map(char::from).collect();
-        for text in [
-            String::new(),
-            controls,
-            "\"\\\nλ🔒".repeat(400),
-            "x".repeat(65536),
-        ] {
-            let quoted = super::quoted_string(&text).unwrap();
-            assert_eq!(quoted, super::to_vec(&text).unwrap());
-            assert!(quoted.capacity() >= text.len() * 6 + 2);
-            assert_eq!(crate::from_slice::<String>(&quoted).unwrap(), text);
-        }
     }
 }

@@ -161,26 +161,47 @@ impl TextSelection {
     #[must_use]
     #[inline]
     pub fn intersects_absolute_band(&self, live_top_abs: u64, lo_abs: u64, hi_abs: u64) -> bool {
-        if self.state == SelectionState::None {
+        if self.state == SelectionState::None || lo_abs > hi_abs {
             return false;
         }
-        let base = i64::try_from(live_top_abs).unwrap_or(i64::MAX);
-        let to_abs = |row: i32| base.saturating_add(i64::from(row));
-        let (a, b) = (to_abs(self.start.row), to_abs(self.end.row));
-        let (sel_lo, sel_hi) = if a <= b { (a, b) } else { (b, a) };
-        let lo = i64::try_from(lo_abs).unwrap_or(i64::MAX);
-        let hi = i64::try_from(hi_abs).unwrap_or(i64::MAX);
-        sel_lo <= hi && lo <= sel_hi
+        let min_r = self.start.row.min(self.end.row);
+        let max_r = self.start.row.max(self.end.row);
+        let upper_ok = if max_r < 0 {
+            match live_top_abs.checked_sub(u64::from(max_r.unsigned_abs())) {
+                Some(sel_hi) => lo_abs <= sel_hi,
+                None => false,
+            }
+        } else {
+            match live_top_abs.checked_add(u64::from(max_r.unsigned_abs())) {
+                Some(sel_hi) => lo_abs <= sel_hi,
+                None => true,
+            }
+        };
+        if !upper_ok {
+            return false;
+        }
+        if min_r < 0 {
+            live_top_abs.saturating_sub(u64::from(min_r.unsigned_abs())) <= hi_abs
+        } else {
+            match live_top_abs.checked_add(u64::from(min_r.unsigned_abs())) {
+                Some(sel_lo) => sel_lo <= hi_abs,
+                None => false,
+            }
+        }
     }
 
     /// Re-floor the selection after scrollback eviction without a scroll delta (e.g. a retention-limit shrink or memory-budget trim).
     ///
     /// When `oldest_abs >= live_top_abs` (no scrollback rows remain above the live grid), the floor clamps to row `0`.
     pub fn truncate_to_floor(&mut self, oldest_abs: u64, live_top_abs: u64) -> bool {
-        let oldest = i64::try_from(oldest_abs).unwrap_or(i64::MAX);
-        let live_top = i64::try_from(live_top_abs).unwrap_or(i64::MAX);
-        let min_row = i32::try_from(oldest.saturating_sub(live_top)).unwrap_or(i32::MIN);
-        self.clamp_head_to_min_row(min_row.min(0))
+        let min_row = match live_top_abs.checked_sub(oldest_abs) {
+            None | Some(0) => 0,
+            Some(depth) => match i32::try_from(depth) {
+                Ok(d) => d.saturating_neg(),
+                Err(_) => i32::MIN,
+            },
+        };
+        self.clamp_head_to_min_row(min_row)
     }
 
     /// Clamp an endpoint evicted below `min_row` (the deepest retained row,

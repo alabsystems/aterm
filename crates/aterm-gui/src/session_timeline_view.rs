@@ -340,6 +340,15 @@ fn project_mark(r: &Rec) -> Option<(&'static str, String)> {
                     .map_or_else(|| "-".to_string(), crate::control::pct_encode)
             ),
         ),
+        // Vendor observations remain in the raw log. They are not session metadata
+        // changes, and the generic projection would discard their identity and metrics.
+        Kind::Meta
+            if r.src == aterm_slog::Src::Transcript
+                && r.by == aterm_slog::Actor::Vendor
+                && f.get_str(Key::Field) == Some("vendor-turn") =>
+        {
+            return None;
+        }
         Kind::Meta => (
             crate::session_timeline::META_CHANGE,
             format!(

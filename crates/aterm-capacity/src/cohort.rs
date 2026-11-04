@@ -13,6 +13,68 @@
 use aterm_uds::process;
 use aterm_uds::spawnfd::Child;
 use std::io;
+use std::time::{Duration, Instant};
+
+/// How long a spawned child that has exited has to become reapable. A live read refuses a process
+/// before `wait` can reap it, for about 300 µs when it is a few milliseconds old, as a launch's
+/// capture finds it; a retried bind can find an older child, for which this was not measured
+/// (`docs/measured/cohort-capture-at-exit-2026-11-04.md`). A test's wait for what must happen is
+/// a hang detector, so there it is a minute.
+const LEAVES_WITHIN: Duration = if cfg!(test) {
+    Duration::from_secs(60)
+} else {
+    Duration::from_secs(1)
+};
+
+/// The pause between looks at a child on its way out.
+const LEAVING_LOOK: Duration = Duration::from_micros(100);
+
+/// What one look at a just-spawned child found.
+enum Look {
+    Live(Cohort),
+    Ended,
+    /// Exited, and not yet reapable: another look can say more.
+    Leaving,
+    Refused,
+}
+
+fn look(child: &mut Child, scope: &Scope) -> io::Result<Look> {
+    Ok(match Cohort::of_child(child) {
+        Ok(cohort) if cohort.scope == *scope => Look::Live(cohort),
+        _ if child.try_wait()?.is_some() => Look::Ended,
+        _ if exited(child) => Look::Leaving,
+        _ => Look::Refused,
+    })
+}
+
+fn exited(child: &Child) -> bool {
+    i32::try_from(child.id()).is_ok_and(|pid| {
+        matches!(
+            process::process_presence(pid),
+            process::ProcessPresence::Exited
+        )
+    })
+}
+
+/// Looks until a child on its way out has gone, or `deadline` passes with it still leaving.
+fn settled(deadline: Instant, mut look: impl FnMut() -> io::Result<Look>) -> io::Result<Look> {
+    loop {
+        match look()? {
+            Look::Leaving if Instant::now() < deadline => std::thread::sleep(LEAVING_LOOK),
+            found => return Ok(found),
+        }
+    }
+}
+
+/// Two reads of one self-led child of this process. `uniqueid` names it through an `exec`, which
+/// moves `identity`'s pid version, and the child is unreaped, so its pid is not another's.
+fn same_leader(first: &process::Lineage, second: &process::Lineage, child: u32) -> bool {
+    first.parent == std::process::id()
+        && first.pgid == child
+        && first.uniqueid == second.uniqueid
+        && first.parent == second.parent
+        && first.pgid == second.pgid
+}
 
 #[path = "cohort_launch.rs"]
 pub mod launch;
@@ -194,22 +256,25 @@ impl RecordedCohort {
 impl Cohort {
     /// Capture the dedicated group of a controlled actual spawn, including a child that
     /// exited before the parent could read its live identity. The sealed spawn outcome proves
-    /// the initial group birth; a decoded record or an arbitrary numeric pid cannot do so.
+    /// the initial group birth; a decoded record or an arbitrary numeric pid cannot do so. A child
+    /// that has exited and is not yet reapable is waited for.
     ///
     /// # Errors
-    /// The attempt's actual owner/scope is stale, or a still-live child cannot be captured as
-    /// this parent's self-led group. Members leaving the group still require separate custody.
+    /// The attempt's actual owner/scope is stale or its original child was replaced, a still-live
+    /// child cannot be captured as this parent's self-led group, an exited child did not become
+    /// reapable within a second or its pid is not a group, or `Child::try_wait` fails. Members
+    /// leaving the group still require separate custody.
     pub fn of_spawned(spawned: &mut aterm_uds::spawnfd::Spawned) -> io::Result<Self> {
-        if !spawned.key().is_current() {
+        if !spawned.key().is_current() || !spawned.is_original_child() {
             return Err(io::Error::other(
-                "spawn owner or scope changed before cohort capture",
+                "spawn owner, scope or original child changed before cohort capture",
             ));
         }
         let scope = Scope::of_key(spawned.key());
         let child = spawned.child_mut();
-        match Self::of_child(child) {
-            Ok(cohort) if cohort.scope == scope => Ok(cohort),
-            _ if child.try_wait()?.is_some() && scope.ended_or_unknown().is_none() => {
+        match settled(Instant::now() + LEAVES_WITHIN, || look(child, &scope))? {
+            Look::Live(cohort) => Ok(cohort),
+            Look::Ended if scope.ended_or_unknown().is_none() => {
                 let group = i32::try_from(child.id())
                     .ok()
                     .filter(|p| *p > 1)
@@ -220,7 +285,7 @@ impl Cohort {
                     leader_serial: 0,
                 })
             }
-            _ => Err(io::Error::other(
+            Look::Ended | Look::Leaving | Look::Refused => Err(io::Error::other(
                 "live actual child cohort is unknown or changed",
             )),
         }
@@ -275,12 +340,7 @@ impl Cohort {
         let scope = Scope::read().ok_or_else(refused)?;
         let first = process::read_lineage(group).ok_or_else(refused)?;
         let second = process::read_lineage(group).ok_or_else(refused)?;
-        if first.parent != std::process::id()
-            || first.pgid != child.id()
-            || first.uniqueid != second.uniqueid
-            || first.identity != second.identity
-            || first.parent != second.parent
-            || first.pgid != second.pgid
+        if !same_leader(&first, &second, child.id())
             || Scope::read().as_ref() != Some(&scope)
             || child.try_wait()?.is_some()
         {
@@ -348,8 +408,9 @@ fn kernel_group(group: i32) -> Lifetime {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cohort, Lifetime, RecordedCohort, Scope};
+    use super::{Cohort, Lifetime, Look, RecordedCohort, Scope, look, same_leader, settled};
     use aterm_uds::spawnfd;
+    use std::time::{Duration, Instant};
 
     struct Running(spawnfd::Child);
 
@@ -510,5 +571,101 @@ mod tests {
         );
         drop(input);
         inherited.0.wait().expect("inherited cat ended");
+    }
+
+    /// A child that can no longer be read is looked at again until it can be reaped.
+    #[test]
+    fn a_child_on_its_way_out_is_looked_at_until_it_ends() {
+        let mut looks = vec![Look::Ended, Look::Leaving, Look::Leaving];
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let found = settled(deadline, || Ok(looks.pop().expect("a look too many"))).unwrap();
+        assert!(matches!(found, Look::Ended));
+        assert!(looks.is_empty());
+    }
+
+    /// A refused child has settled: its refusal does not wait on the kernel.
+    #[test]
+    fn a_refused_child_is_looked_at_once() {
+        let mut looks = 0;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let found = settled(deadline, || {
+            looks += 1;
+            Ok(Look::Refused)
+        });
+        assert!(matches!(found.unwrap(), Look::Refused));
+        assert_eq!(looks, 1);
+    }
+
+    /// A live child refused is `Refused`, not one to wait for: it is captured in another scope.
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    #[test]
+    fn a_live_child_that_will_not_do_is_refused_not_waited_for() {
+        let mut child = Running(
+            spawnfd::command("/bin/cat")
+                .stdin(spawnfd::Stdio::piped())
+                .stdout(spawnfd::Stdio::piped())
+                .process_group(0)
+                .spawn()
+                .expect("self-led cat"),
+        );
+        let input = aterm_uds::deadline::cat_echoes(&mut child.0);
+        let found = look(&mut child.0, &token().scope).unwrap();
+        assert!(matches!(found, Look::Refused));
+        drop(input);
+        child.0.wait().expect("cat ended");
+    }
+
+    /// The wait has a bound: past it, a child still leaving is the answer.
+    #[test]
+    fn a_child_still_leaving_at_the_deadline_ends_the_wait() {
+        let (done, ended) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut looks = 0;
+            let found = settled(Instant::now(), || {
+                looks += 1;
+                Ok(Look::Leaving)
+            });
+            let _ = done.send((found.map(|look| matches!(look, Look::Leaving)), looks));
+        });
+        let (leaving, looks) = ended
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the deadline ends the wait");
+        assert!(leaving.unwrap());
+        assert_eq!(looks, 1);
+    }
+
+    /// A child that `exec`s between two reads is still the leader they read, though the kernel
+    /// moved its pid version: `cat` echoing proves the `exec` came between them.
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    #[test]
+    fn two_reads_either_side_of_an_exec_are_the_same_leader() {
+        use std::io::Write as _;
+        let mut child = Running(
+            spawnfd::command("/bin/sh")
+                .args(["-c", "read go; exec /bin/cat"])
+                .stdin(spawnfd::Stdio::piped())
+                .stdout(spawnfd::Stdio::piped())
+                .process_group(0)
+                .spawn()
+                .expect("self-led sh"),
+        );
+        let pid = i32::try_from(child.0.id()).unwrap();
+        let before = aterm_uds::process::read_lineage(pid).expect("sh reads");
+        let mut input = child.0.stdin.take().expect("sh's input");
+        input.write_all(b"go\nran\n").unwrap();
+        aterm_uds::deadline::prints(&mut child.0, "ran", aterm_uds::deadline::ECHO_HANG);
+        let after = aterm_uds::process::read_lineage(pid).expect("cat reads");
+        if aterm_uds::process::KEEPS_PID_VERSIONS {
+            assert_ne!(
+                before.identity, after.identity,
+                "the exec moved its version"
+            );
+        }
+        assert!(same_leader(&before, &after, child.0.id()));
+        let mut stranger = after;
+        stranger.uniqueid += 1;
+        assert!(!same_leader(&before, &stranger, child.0.id()));
+        drop(input);
+        child.0.wait().expect("cat ended");
     }
 }

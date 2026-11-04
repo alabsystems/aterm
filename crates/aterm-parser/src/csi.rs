@@ -9,14 +9,15 @@ use crate::action::ActionSink;
 use crate::state::State;
 use crate::{MAX_INTERMEDIATES, MAX_PARAMS, Parser};
 
-/// Whether `mask` is a live `subparam_mask` for `len` parameters: bit `i` for `params[i]`, and
-/// nothing past them but bit `MAX_PARAMS`, which a full list carries once the cap has dropped a
-/// sub-parameter. A handler reads that bit to tell a colon group the cap cut from one that ended
-/// at the cap: the bit does not say which later element fell, only that a colon came after the cap.
+/// Whether `mask` is a live `subparam_mask` for `len` parameters: bit `i` (`i >= 1`) for
+/// `params[i]`, bit `0` clear (`params[0]` cannot follow a colon), and nothing past `len` except
+/// bit `MAX_PARAMS`, which a full list carries once the cap has dropped a sub-parameter. A handler
+/// reads that bit to tell a colon group the cap cut from one that ended at the cap: the bit does
+/// not say which later element fell, only that a colon came after the cap.
 #[inline]
 pub(crate) const fn subparam_mask_fits(mask: u32, len: usize) -> bool {
     let past = mask >> len;
-    past == 0 || (len == MAX_PARAMS && past == 1)
+    (mask & 1) == 0 && (past == 0 || (len == MAX_PARAMS && past == 1))
 }
 
 impl Parser {

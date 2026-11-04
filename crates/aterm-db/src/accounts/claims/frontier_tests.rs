@@ -84,10 +84,8 @@ fn claim_frontier_admission_preserves_rows_and_both_capacity_limits() {
     let peer = read_at(&lab.paths[1], NOW, Caps::default()).unwrap();
     assert_eq!(first.rows.len(), writers);
     assert_eq!(first.rows, peer.rows);
-    for writer in 0..3 {
-        let me = read_at(&lab.paths[writer], NOW, Caps::default())
-            .unwrap()
-            .me;
+    for paths in &lab.paths[..3] {
+        let me = read_at(paths, NOW, Caps::default()).unwrap().me;
         assert_eq!(
             first
                 .rows

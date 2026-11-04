@@ -38,7 +38,7 @@ use crate::supervise::policy::reset::{
     ResetAsk, ResetEnd, ResetGo, ResetNo, ResetOutcome, ResetWord,
 };
 use crate::supervise::policy::turn_end::{
-    AccountAdvice, AccountBad, AccountPoint, AgentResumed, HostTurn, Reach, Restart,
+    AccountAdvice, AccountBad, AccountPoint, AgentResumed, HostTurn, Reach, Restart, RestartAsk,
 };
 use crate::supervise::policy::turn_end::{HeldBy, Ready, RosterWord, SignInNext};
 use crate::supervise::run::{
@@ -235,6 +235,7 @@ tape_arg_debug!(
     IdlePoint,
     Lasting,
     Restart,
+    RestartAsk,
     WaitPlan,
     Act,
     TaskFace,
@@ -925,6 +926,33 @@ impl TapeValue for Option<AgentResumed> {
                 resumed: w.resumed,
             }),
         )
+    }
+
+    fn absent() -> Option<Self> {
+        Some(None)
+    }
+}
+
+/// `restart_left`'s answer as a tape holds it ([`crate::supervise::custody::Process`]): the pid
+/// and the start the restart's report names, either left out where it names none.
+#[derive(Serialize, Deserialize)]
+struct LeftWire {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    started: Option<i64>,
+}
+
+/// A DOOR NEWER THAN THE TAPE: a recording build with no `host.restart_left` asked nothing there,
+/// and its loop went by the process the host named ([`TapeValue::absent`]: `None`), where the
+/// tape's header says that build lacked the door, and only there.
+impl TapeValue for Option<crate::supervise::custody::Process> {
+    fn to_tape(&self) -> Vec<u8> {
+        json(&self.map(|(pid, started)| LeftWire { pid, started }))
+    }
+
+    fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
+        Ok(of_json::<Option<LeftWire>>(bytes)?.map(|w| (w.pid, w.started)))
     }
 
     fn absent() -> Option<Self> {

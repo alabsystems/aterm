@@ -1267,3 +1267,36 @@ fn max_encoded_len_bounds_every_encode() {
         out.len()
     );
 }
+
+/// `OutputInfo::buffer_size` saturates at `usize::MAX` for caller-constructed oversized dimensions.
+/// NEGATIVE CONTROL: unchecked `self.line_size * self.height as usize` panics in debug builds (or
+/// wraps in release) when `line_size == usize::MAX` and `height == 2`.
+#[test]
+fn output_info_buffer_size_saturates_on_overflow() {
+    let normal = aterm_png::OutputInfo {
+        width: 16,
+        height: 8,
+        color_type: aterm_png::ColorType::Rgba,
+        bit_depth: aterm_png::BitDepth::Eight,
+        line_size: 64,
+    };
+    assert_eq!(normal.buffer_size(), 512);
+
+    let overflow = aterm_png::OutputInfo {
+        width: u32::MAX,
+        height: 2,
+        color_type: aterm_png::ColorType::Rgba,
+        bit_depth: aterm_png::BitDepth::Eight,
+        line_size: usize::MAX,
+    };
+    assert_eq!(overflow.buffer_size(), usize::MAX);
+
+    let empty = aterm_png::OutputInfo {
+        width: 0,
+        height: u32::MAX,
+        color_type: aterm_png::ColorType::Grayscale,
+        bit_depth: aterm_png::BitDepth::Eight,
+        line_size: 0,
+    };
+    assert_eq!(empty.buffer_size(), 0);
+}

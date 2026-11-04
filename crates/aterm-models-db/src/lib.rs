@@ -34,6 +34,8 @@ mod broker_selection;
 pub use broker_selection::broker_selection_model;
 mod broker_refresh;
 pub use broker_refresh::broker_refresh_model;
+mod broker_publication;
+pub use broker_publication::broker_publication_model;
 mod entry_version;
 pub use entry_version::entry_version_model;
 mod resource_retirement;

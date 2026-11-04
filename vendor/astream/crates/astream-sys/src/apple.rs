@@ -85,7 +85,7 @@ pub(crate) fn sighup_generation() -> u64 {
 /// [`crate::retried_on_eintr`]); any other failure is the call's own errno.
 pub(crate) fn barrier_fsync(file: &File) -> io::Result<()> {
     let fd = file.as_raw_fd();
-    crate::retried_on_eintr(|| {
+    crate::retried_on_eintr!({
         if apple_ffi!(barrier_fsync(fd, F_BARRIERFSYNC)) == -1 {
             Err(io::Error::last_os_error())
         } else {
@@ -100,7 +100,7 @@ pub(crate) fn barrier_fsync(file: &File) -> io::Result<()> {
 /// process in a debug build ([`crate::TEST_PLAIN_FSYNC_ENV`]).
 pub(crate) fn plain_fsync(file: &File) -> io::Result<()> {
     let fd = file.as_raw_fd();
-    crate::retried_on_eintr(|| {
+    crate::retried_on_eintr!({
         if apple_ffi!(fsync(fd)) == -1 {
             Err(io::Error::last_os_error())
         } else {

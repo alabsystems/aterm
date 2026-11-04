@@ -61,6 +61,9 @@ pub struct CommonsEpochView {
     pub generation: u64,
     /// Unwrapped 32-byte Commons symmetric network key for `basis`.
     pub key: Zeroizing<[u8; 32]>,
+    /// `basis` is still wrapped to a recipient the log removed: a row sealed under it now would
+    /// reach that Mac, so no writer seals under it until the removal's rotation lands.
+    pub wraps_removed: bool,
 }
 
 /// One keyed epoch (F21 rule 4), as [`Log::keyed_epochs`] reads it from the records alone: an
@@ -1663,6 +1666,11 @@ impl Log {
             return Ok(None);
         };
         let mut unwrapped_basis: Option<Zeroizing<[u8; 32]>> = None;
+        let wraps_removed = self.order.iter().enumerate().skip(1).any(|(i, record)| {
+            effective.counts(i)
+                && matches!(record.body(), Body::Wrap { epoch, recipient, .. }
+                    if *epoch == basis && self.recipient_is_removed(recipient))
+        });
         for (i, record) in self.order.iter().enumerate().skip(1) {
             if !effective.counts(i) {
                 continue;
@@ -1695,6 +1703,7 @@ impl Log {
             basis,
             generation,
             key,
+            wraps_removed,
         }))
     }
 
@@ -3154,7 +3163,6 @@ mod tests {
         assert!(!opened.by_audience[&Audience::Everyone].contains_key("new"));
     }
 
-    /// Sign `draft` with (`seed`, `incarnation`), hold it in `log`, and hand back its id.
     /// The audiences `member` reseals under F21 rule 5 ([`Log::rekey_dues`]).
     fn reseal_due_on(log: &Log, member: &MemberId) -> BTreeSet<EpochAudience> {
         log.rekey_dues()
@@ -3164,6 +3172,7 @@ mod tests {
             .collect()
     }
 
+    /// Sign `draft` with (`seed`, `incarnation`), hold it in `log`, and hand back its id.
     fn hold(log: &mut Log, draft: Draft, seed: &[u8; 32], incarnation: [u8; 16]) -> RecordId {
         let record = draft.sign(seed, incarnation).unwrap();
         let id = *record.id();

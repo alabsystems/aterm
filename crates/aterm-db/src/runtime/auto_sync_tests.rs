@@ -1170,7 +1170,7 @@ fn two_loopback_islands_write_admit_and_remove_then_join_and_match_inventories()
     let mut closed = Vec::new();
     for at in [at, at + 100 * 60_000] {
         for paths in holders {
-            closed.extend(aterm_secrets::client::test_tend_at(paths, at).unwrap());
+            closed.extend(aterm_secrets::client::vault_pass_at(paths, at).unwrap());
         }
         for from in holders {
             let records = load_records(from).unwrap().encode();

@@ -15,7 +15,23 @@
 //! ran in that a read saw inside it, each the same process (a pid and its start), and those
 //! members' children since: a compiler or build script a killed `cargo` left running, reparented
 //! away so its parents no longer lead to the root. One that left the group (`setsid`,
-//! `setpgid`) is not read. Off macOS none is read.
+//! `setpgid`) is absent from the accounting snapshot. Custody reads reconcile previously
+//! observed identities against the kernel until positive exit, absence or birth replacement;
+//! missing accounting or identity data cannot establish their end. Those conclusive facts
+//! are reused for this meter's lifetime. A member first read once the root is gone is the
+//! tree's where its parents still lead to a member an earlier read booked inside it; where
+//! they lead nowhere known its ancestry is undecided that read, never booked outside for
+//! good, so [`Tally::left`]'s children-since can still find it under a known parent.
+//! Ancestry through the root itself is fenced to the original root (its pid and its
+//! start): a later process given the root's pid authorizes no member, and no read made
+//! under it replaces the last one the original root lived for. Cleanup queries retain each
+//! newly discovered child's identity, so its parent's end cannot erase the observation.
+//! These are sampled ancestry checks, not atomic containment. Never-observed descendants
+//! remain outside this observation contract. Off macOS none is read. A caller deciding a tree is drained reads
+//! [`TreeWatch::left_observed`] instead: only its [`Left::Read`] with nothing in it says a read
+//! of the group found none left, where a group no read ever found ([`Left::Unobserved`]) and a
+//! read of a known group that failed ([`Left::Unread`]) say nothing is known, and never that
+//! none is left.
 //!
 //! ITS SURVIVORS ([`TreeMeter::survivors`]), narrower: the live members of that group that
 //! descended from the root at the last read made while the root lived, each the same process. A
@@ -23,7 +39,7 @@
 //! parent ended) is none, though an earlier read saw it inside. The group is the one the first
 //! read found the root in, kept, so the reads go on once the root is gone.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
@@ -83,6 +99,13 @@ pub struct Tally {
     together: u64,
     one: u64,
     seen: HashMap<(u32, u64), bool>,
+    /// The original root (its pid and its start), from the first read that found it: the
+    /// only root process whose ancestry authorizes a member.
+    root: Option<(u32, u64)>,
+    /// The original root positively ended or its pid was taken anew: conclusive, kept.
+    root_ended: bool,
+    /// Conclusive kernel termination or replacement facts, reused for this meter's lifetime.
+    ended: HashSet<(u32, u64)>,
     /// The process group the tree ran in, from the first read that found its root.
     group: Option<u32>,
     /// The members that descended from the root at the last read made while it lived.
@@ -121,14 +144,25 @@ impl Tally {
     }
 
     /// Book one read of `members`: those `in_tree` takes, asked once per member (a pid and its
-    /// start), summed by footprint; their lifetime peaks floor the result.
-    pub fn book(&mut self, members: &[Member], in_tree: &mut dyn FnMut(u32) -> bool) {
+    /// start) until it decides, summed by footprint; their lifetime peaks floor the result.
+    /// `in_tree` answers `None` where a member's ancestry cannot be decided this read (its
+    /// parents lead neither to the original root while it lives nor to a member already
+    /// booked inside): that member is summed nowhere and, above all, not booked outside, so
+    /// a later read — or [`Self::left`]'s children-since under a known parent — can still
+    /// find it the tree's. Only a decided answer is kept for the member's life.
+    pub fn book(&mut self, members: &[Member], in_tree: &mut dyn FnMut(u32) -> Option<bool>) {
         let mut sum = 0u64;
         for m in members {
-            let inside = *self
-                .seen
-                .entry((m.pid, m.start))
-                .or_insert_with(|| in_tree(m.pid));
+            let inside = match self.seen.get(&(m.pid, m.start)) {
+                Some(&inside) => inside,
+                None => match in_tree(m.pid) {
+                    Some(inside) => {
+                        self.seen.insert((m.pid, m.start), inside);
+                        inside
+                    }
+                    None => continue,
+                },
+            };
             if inside {
                 sum = sum.saturating_add(m.footprint);
                 self.one = self.one.max(m.peak);
@@ -170,7 +204,9 @@ impl Tally {
     #[must_use]
     pub fn survivors(&self, now: &[Alive]) -> Vec<u32> {
         now.iter()
-            .filter(|a| self.within.contains(&(a.pid, a.start)))
+            .filter(|a| {
+                self.within.contains(&(a.pid, a.start)) && !self.ended.contains(&(a.pid, a.start))
+            })
             .map(|a| a.pid)
             .collect()
     }
@@ -180,7 +216,9 @@ impl Tally {
     #[must_use]
     pub fn survivors_using(&self, now: &[(Alive, u64)]) -> (Vec<u32>, u64) {
         now.iter()
-            .filter(|(a, _)| self.within.contains(&(a.pid, a.start)))
+            .filter(|(a, _)| {
+                self.within.contains(&(a.pid, a.start)) && !self.ended.contains(&(a.pid, a.start))
+            })
             .fold((Vec::new(), 0), |(mut pids, sum), (a, footprint)| {
                 pids.push(a.pid);
                 (pids, sum.saturating_add(*footprint))
@@ -191,28 +229,106 @@ impl Tally {
     /// booked inside it, the same process by its start, and each child since of one left (a
     /// member no read saw). A member a read booked outside it is never left, nor a child of one.
     #[must_use]
-    pub fn left(&self, now: &[Alive]) -> Vec<u32> {
-        let mut left: Vec<u32> = now
+    pub fn left(&mut self, now: &[Alive]) -> Vec<u32> {
+        self.left_identities(now)
             .iter()
-            .filter(|a| self.seen.get(&(a.pid, a.start)) == Some(&true))
-            .map(|a| a.pid)
+            .map(|&(pid, _)| pid)
+            .collect()
+    }
+
+    /// [`Self::left`] with each left process's identity kept (its pid and its start, so a pid
+    /// taken anew by another process is another identity): what a caller signs its work on
+    /// one left process with, and tells it from a later process given its pid.
+    #[must_use]
+    pub fn left_identities(&mut self, now: &[Alive]) -> Vec<(u32, u64)> {
+        let mut left: Vec<(u32, u64)> = now
+            .iter()
+            .filter(|a| {
+                self.seen.get(&(a.pid, a.start)) == Some(&true)
+                    && !self.ended.contains(&(a.pid, a.start))
+            })
+            .map(|a| (a.pid, a.start))
             .collect();
         loop {
-            let more: Vec<u32> = now
+            let more: Vec<(u32, u64)> = now
                 .iter()
                 .filter(|a| {
                     !self.seen.contains_key(&(a.pid, a.start))
-                        && left.contains(&a.ppid)
-                        && !left.contains(&a.pid)
+                        && left.iter().any(|&(pid, _)| pid == a.ppid)
+                        && !left.contains(&(a.pid, a.start))
                 })
-                .map(|a| a.pid)
+                .map(|a| (a.pid, a.start))
                 .collect();
             if more.is_empty() {
                 return left;
             }
+            for &identity in &more {
+                self.seen.insert(identity, true);
+            }
             left.extend(more);
         }
     }
+
+    /// What one attempted read of the tree's group (`now`, `None` where the read failed) says
+    /// of what the tree leaves ([`Left`]): no group ever found is [`Left::Unobserved`] and a
+    /// failed read of the known group is [`Left::Unread`], neither of them a reading of none.
+    #[must_use]
+    pub fn left_observed(&mut self, now: Option<&[Alive]>) -> Left {
+        match (self.group, now) {
+            (None, _) => Left::Unobserved,
+            (Some(_), None) => Left::Unread,
+            (Some(_), Some(now)) => Left::Read(self.left_identities(now)),
+        }
+    }
+
+    fn reconcile_known(
+        &mut self,
+        now: &mut Vec<Alive>,
+        mut probe: impl FnMut((u32, u64)) -> Result<Option<Alive>, ()>,
+    ) -> bool {
+        for (&identity, &inside) in &self.seen {
+            if !inside
+                || self.ended.contains(&identity)
+                || now.iter().any(|a| (a.pid, a.start) == identity)
+            {
+                continue;
+            }
+            match probe(identity) {
+                Ok(Some(alive)) => now.push(alive),
+                Ok(None) => {
+                    self.ended.insert(identity);
+                }
+                Err(()) => return false,
+            }
+        }
+        true
+    }
+}
+
+/// What one read can say of a tree's survivors ([`TreeMeter::survivors_using_observed`]),
+/// as [`Left`] says it of what a tree leaves.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Survivors {
+    /// A read of the tree's group succeeded: its survivors' pids and the footprint they
+    /// hold together, bytes. No pid is a read that found none.
+    Read(Vec<u32>, u64),
+    /// The tree's group is known, and this read of it failed: nothing is known.
+    Unread,
+    /// No read ever found the tree's group, off macOS included: nothing was ever observed.
+    Unobserved,
+}
+
+/// What one read can say of what a tree leaves ([`TreeMeter::left_observed`]): unavailable
+/// telemetry is its own answer, never a reading of none left.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Left {
+    /// A read of the tree's group succeeded: the identities (a pid and its start) it leaves.
+    /// Empty is a read that found none left.
+    Read(Vec<(u32, u64)>),
+    /// The tree's group is known, and this read of it failed: nothing is known.
+    Unread,
+    /// No read ever found the tree's group, off macOS included: nothing was ever observed.
+    Unobserved,
 }
 
 /// A running read of one tree's memory ([`TreeMeter::start`]).
@@ -268,6 +384,12 @@ impl TreeMeter {
         self.watch().left()
     }
 
+    /// What a read now can say of what its tree leaves ([`TreeWatch::left_observed`]).
+    #[must_use]
+    pub fn left_observed(&self) -> Left {
+        self.watch().left_observed()
+    }
+
     /// The pids that SURVIVE ITS ROOT now ([`Tally::survivors`]): the live members of the group
     /// it ran in that descended from it at the last read made while it lived. Empty where no read
     /// found the group, and off macOS.
@@ -290,6 +412,44 @@ impl TreeMeter {
             .group
             .map(|group| tally.survivors_using(&alive_using(group)))
             .unwrap_or_default()
+    }
+
+    /// What a read now can say of its survivors and their footprint ([`Survivors`]): a caller
+    /// deciding whether any survivor keeps a claim held takes a failed read of the known
+    /// group ([`Survivors::Unread`]) for no answer, never for none left, and a group no read
+    /// ever found ([`Survivors::Unobserved`]) for no observed survivor at all.
+    #[must_use]
+    pub fn survivors_using_observed(&self) -> Survivors {
+        self.survivors_using_read(alive_using_observed)
+    }
+
+    fn survivors_using_read(
+        &self,
+        read: impl FnOnce(u32) -> Option<Vec<(Alive, u64)>>,
+    ) -> Survivors {
+        let mut tally = self.tally.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(group) = tally.group else {
+            return Survivors::Unobserved;
+        };
+        match read(group) {
+            Some(now) => {
+                let mut alive: Vec<_> = now.iter().map(|&(a, _)| a).collect();
+                if !tally.reconcile_known(&mut alive, known_alive)
+                    || alive.iter().any(|a| {
+                        tally.within.contains(&(a.pid, a.start))
+                            && !tally.ended.contains(&(a.pid, a.start))
+                            && !now.iter().any(|(measured, _)| {
+                                (measured.pid, measured.start) == (a.pid, a.start)
+                            })
+                    })
+                {
+                    return Survivors::Unread;
+                }
+                let (pids, footprint) = tally.survivors_using(&now);
+                Survivors::Read(pids, footprint)
+            }
+            None => Survivors::Unread,
+        }
     }
 
     /// TEST SEAM: the latest attempted meter read, including an unavailable attempt rather
@@ -371,17 +531,185 @@ impl TreeWatch {
     /// read found the group, and off macOS.
     #[must_use]
     pub fn left(&self) -> Vec<u32> {
-        let tally = self.tally.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut tally = self.tally.lock().unwrap_or_else(PoisonError::into_inner);
         tally
             .group
             .map(|group| tally.left(&alive_in(group)))
             .unwrap_or_default()
     }
+
+    /// What a read now can say of what the tree leaves ([`Left`], [`Tally::left_observed`]):
+    /// the read a caller ends a tree's custody on, since only a [`Left::Read`] that is empty
+    /// is a read of none left.
+    #[must_use]
+    pub fn left_observed(&self) -> Left {
+        self.left_using(alive_in_observed, known_alive)
+    }
+
+    fn left_using(
+        &self,
+        read: impl FnOnce(u32) -> Option<Vec<Alive>>,
+        probe: impl FnMut((u32, u64)) -> Result<Option<Alive>, ()>,
+    ) -> Left {
+        let mut tally = self.tally.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(group) = tally.group else {
+            return Left::Unobserved;
+        };
+        let Some(mut now) = read(group) else {
+            return Left::Unread;
+        };
+        if !tally.reconcile_known(&mut now, probe) {
+            return Left::Unread;
+        }
+        tally.left_observed(Some(&now))
+    }
+}
+
+// Accounting can omit a live identity. Only positive kernel absence/exit or a changed birth
+// closes a previously observed identity; unavailable metadata must retain uncertainty.
+#[cfg(target_os = "macos")]
+fn known_alive((pid, start): (u32, u64)) -> Result<Option<Alive>, ()> {
+    use aterm_uds::process::{self, ProcessPresence};
+    let raw = i32::try_from(pid).map_err(|_| ())?;
+    match process::process_presence(raw) {
+        ProcessPresence::Absent | ProcessPresence::Exited => return Ok(None),
+        ProcessPresence::Unknown => return Err(()),
+        ProcessPresence::Present => {}
+    }
+    let before = process::read_process_start(raw).ok_or(())?;
+    if before.boot.0 != start {
+        return Ok(None);
+    }
+    let Some(record) = aterm_sysprobe::kproc::record_read(pid).map_err(|_| ())? else {
+        return Ok(None);
+    };
+    if record.zombie {
+        return Ok(None);
+    }
+    let after = process::read_process_start(raw).ok_or(())?;
+    if before != after {
+        return Ok(None);
+    }
+    Ok(Some(Alive {
+        pid,
+        start,
+        ppid: record.ppid,
+    }))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn known_alive(_identity: (u32, u64)) -> Result<Option<Alive>, ()> {
+    Err(())
+}
+
+/// Whether the original root still lives, as one read can tell: only positive kernel
+/// absence, exit or birth replacement ends it; unavailable metadata decides nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RootState {
+    /// The process the meter was started on, by its start, still lives.
+    Live,
+    /// That process positively ended, or its pid is another process's now.
+    Ended,
+    /// Its identity could not be read this time.
+    Unknown,
+}
+
+/// The most parents one ancestry walk follows: deeper than any build nests.
+const DEPTH_MAX: usize = 64;
+
+/// Whether `pid` is the tree's, by walking its parents: inside where they reach the
+/// original root while it lives or an `anchors` member (one this read lists and an
+/// earlier read booked inside, the same process by its start). Reaching the system
+/// parent decides outside only while the original root lives. Missing metadata,
+/// an ended root, cycles and the depth bound decide nothing (`None`), so they cannot
+/// permanently book a leftover's child outside. A reused root pid grants no ancestry.
+fn ancestry_verdict(
+    pid: u32,
+    root: u32,
+    root_state: RootState,
+    anchors: &HashSet<u32>,
+    parent: &mut dyn FnMut(u32) -> Option<u32>,
+) -> Option<bool> {
+    let mut at = pid;
+    for _ in 0..DEPTH_MAX {
+        if at == root {
+            return match root_state {
+                RootState::Live => Some(true),
+                RootState::Ended | RootState::Unknown => None,
+            };
+        }
+        if at <= 1 {
+            return (root_state == RootState::Live).then_some(false);
+        }
+        if at != pid && anchors.contains(&at) {
+            return Some(true);
+        }
+        at = parent(at)?;
+    }
+    None
+}
+
+/// `pid`'s parent, including the system parent; `None` where metadata is unavailable
+/// or invalid, which is distinct from a positively completed ancestry walk.
+#[cfg(target_os = "macos")]
+fn parent_of(pid: u32) -> Option<u32> {
+    match aterm_sysprobe::kproc::record(pid) {
+        Some(r) if r.ppid != pid => Some(r.ppid),
+        _ => None,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn parent_of(pid: u32) -> Option<u32> {
+    let _ = pid;
+    None
+}
+
+/// The original root's state now and its start where first read here: with its start
+/// known, the same kernel presence and birth reconciliation custody reads use
+/// ([`known_alive`]); without it, presence and a first start read. An ended answer is
+/// the caller's to keep — a pid taken anew never revives the original root.
+#[cfg(target_os = "macos")]
+fn probe_root(root: u32, birth: Option<u64>) -> (RootState, Option<u64>) {
+    use aterm_uds::process::{self, ProcessPresence};
+    if let Some(birth) = birth {
+        return (
+            match known_alive((root, birth)) {
+                Ok(Some(_)) => RootState::Live,
+                Ok(None) => RootState::Ended,
+                Err(()) => RootState::Unknown,
+            },
+            Some(birth),
+        );
+    }
+    let Ok(raw) = i32::try_from(root) else {
+        return (RootState::Unknown, None);
+    };
+    match process::process_presence(raw) {
+        ProcessPresence::Absent | ProcessPresence::Exited => (RootState::Ended, None),
+        ProcessPresence::Unknown => (RootState::Unknown, None),
+        ProcessPresence::Present => match process::read_process_start(raw) {
+            Some(start) => match aterm_sysprobe::kproc::record_read(root) {
+                Ok(Some(record)) if !record.zombie => (RootState::Live, Some(start.boot.0)),
+                Ok(_) => (RootState::Ended, Some(start.boot.0)),
+                Err(_) => (RootState::Unknown, Some(start.boot.0)),
+            },
+            None => (RootState::Unknown, None),
+        },
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn probe_root(root: u32, birth: Option<u64>) -> (RootState, Option<u64>) {
+    let _ = root;
+    (RootState::Unknown, birth)
 }
 
 /// One read of `root`'s tree booked into `tally`: the members of the group the first read found
-/// it in (kept, so a read once the root is gone still finds them), and which of those descend from
-/// it while it lives ([`Tally::mark_within`]).
+/// it in (kept, so a read once the root is gone still finds them), each new one decided by
+/// its ancestry to the original root or to a member already booked inside
+/// ([`ancestry_verdict`]), and which of those descend from it while it lives
+/// ([`Tally::mark_within`]).
 fn read_into(root: u32, tally: &Mutex<Tally>) {
     let known = tally.lock().unwrap_or_else(PoisonError::into_inner).group;
     let Some((group, members)) = members_of(root, known) else {
@@ -394,17 +722,83 @@ fn read_into(root: u32, tally: &Mutex<Tally>) {
     };
     let mut tally = tally.lock().unwrap_or_else(PoisonError::into_inner);
     tally.group.get_or_insert(group);
-    tally.book(&members, &mut |pid| descends(pid, root));
-    #[cfg(any(test, debug_assertions))]
-    let mut root_lived = false;
-    tally.mark_within(&members, &mut |pid| descends(pid, root), &mut || {
-        let lived = lives(root);
-        #[cfg(any(test, debug_assertions))]
-        {
-            root_lived = lived;
+    if tally.root.is_none()
+        && let Some(member) = members.iter().find(|m| m.pid == root)
+    {
+        tally.root = Some((root, member.start));
+    }
+    // A listed root pid with another start is positive replacement: the original root
+    // ended before its pid could be taken anew, accounting complete or not.
+    if let Some((_, birth)) = tally.root
+        && members.iter().any(|m| m.pid == root && m.start != birth)
+    {
+        tally.root_ended = true;
+    }
+    let (root_state, adopted) = if tally.root_ended {
+        (RootState::Ended, tally.root.map(|(_, birth)| birth))
+    } else {
+        probe_root(root, tally.root.map(|(_, birth)| birth))
+    };
+    if tally.root.is_none() {
+        tally.root = adopted.map(|birth| (root, birth));
+    }
+    if root_state == RootState::Ended {
+        tally.root_ended = true;
+    }
+    let birth = tally.root.map(|(_, birth)| birth);
+    let anchors: HashSet<u32> = members
+        .iter()
+        .filter(|m| {
+            tally.seen.get(&(m.pid, m.start)) == Some(&true)
+                && !tally.ended.contains(&(m.pid, m.start))
+        })
+        .map(|m| m.pid)
+        .collect();
+    // Stage new decisions until the original root's identity has been checked again.
+    // A root that ended during the walk cannot authorize a new permanent booking.
+    let mut verdicts: HashMap<u32, Option<bool>> = members
+        .iter()
+        .filter(|m| !tally.seen.contains_key(&(m.pid, m.start)))
+        .map(|m| {
+            (
+                m.pid,
+                ancestry_verdict(m.pid, root, root_state, &anchors, &mut parent_of),
+            )
+        })
+        .collect();
+    // Survivors are narrower than leftovers: an old anchor that was reparented
+    // while the root lived must not replace a current chain to the original root.
+    let no_anchors = HashSet::new();
+    let within: HashSet<u32> = members
+        .iter()
+        .filter(|m| {
+            root_state == RootState::Live
+                && (tally.seen.get(&(m.pid, m.start)) == Some(&true)
+                    || verdicts.get(&m.pid) == Some(&Some(true)))
+        })
+        .filter(|m| {
+            ancestry_verdict(m.pid, root, root_state, &no_anchors, &mut parent_of) == Some(true)
+        })
+        .map(|m| m.pid)
+        .collect();
+    let (after, _) = if root_state == RootState::Ended {
+        (RootState::Ended, birth)
+    } else {
+        probe_root(root, birth)
+    };
+    if root_state == RootState::Live && after != RootState::Live {
+        for (&pid, verdict) in &mut verdicts {
+            *verdict = ancestry_verdict(pid, root, after, &anchors, &mut parent_of);
         }
-        lived
+    }
+    tally.book(&members, &mut |pid| verdicts.get(&pid).copied().flatten());
+    let root_lived = root_state == RootState::Live && after == RootState::Live;
+    tally.mark_within(&members, &mut |pid| within.contains(&pid), &mut || {
+        root_lived
     });
+    if after == RootState::Ended {
+        tally.root_ended = true;
+    }
     #[cfg(any(test, debug_assertions))]
     tally.observe(Some(&members), root_lived);
 }
@@ -438,60 +832,70 @@ fn members_of(root: u32, known: Option<u32>) -> Option<(u32, Vec<Member>)> {
     None
 }
 
-/// Whether `pid` lives: a process the kernel records that has not exited.
-#[cfg(target_os = "macos")]
-fn lives(pid: u32) -> bool {
-    aterm_sysprobe::kproc::record(pid).is_some_and(|r| !r.zombie)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn lives(pid: u32) -> bool {
-    let _ = pid;
-    false
-}
-
 /// The live members of process group `group` now, each with its parent: none that has exited
 /// unreaped.
 #[cfg(target_os = "macos")]
 fn alive_in(group: u32) -> Vec<Alive> {
-    aterm_sysprobe::group_usage(group)
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|m| {
-            let record = aterm_sysprobe::kproc::record(m.pid)?;
-            (!record.zombie).then_some(Alive {
-                pid: m.pid,
-                start: m.start,
-                ppid: record.ppid,
-            })
-        })
-        .collect()
+    alive_in_observed(group).unwrap_or_default()
 }
 
 #[cfg(not(target_os = "macos"))]
 fn alive_in(group: u32) -> Vec<Alive> {
     let _ = group;
     Vec::new()
+}
+
+/// One listed accounting member's live ancestry, checked against its captured birth.
+/// An unavailable record is uncertainty; positive absence/exit/replacement is completion.
+#[cfg(target_os = "macos")]
+fn member_alive(member: &aterm_sysprobe::MemberUsage) -> Result<Option<Alive>, ()> {
+    use aterm_uds::process::{self, ProcessPresence};
+    let Some(record) = aterm_sysprobe::kproc::record_read(member.pid).map_err(|_| ())? else {
+        return Ok(None);
+    };
+    if record.zombie {
+        return Ok(None);
+    }
+    let raw = i32::try_from(member.pid).map_err(|_| ())?;
+    let Some(start) = process::read_process_start(raw) else {
+        return match process::process_presence(raw) {
+            ProcessPresence::Absent | ProcessPresence::Exited => Ok(None),
+            ProcessPresence::Unknown | ProcessPresence::Present => Err(()),
+        };
+    };
+    if start.boot.0 != member.start {
+        return Ok(None);
+    }
+    Ok(Some(Alive {
+        pid: member.pid,
+        start: member.start,
+        ppid: record.ppid,
+    }))
+}
+
+/// [`alive_in`] with unavailable metadata kept distinct from an empty reading. Accounting
+/// can omit members entirely; custody readers must also reconcile their known identities.
+#[cfg(target_os = "macos")]
+fn alive_in_observed(group: u32) -> Option<Vec<Alive>> {
+    let mut alive = Vec::new();
+    for member in aterm_sysprobe::group_usage(group)? {
+        if let Some(member) = member_alive(&member).ok()? {
+            alive.push(member);
+        }
+    }
+    Some(alive)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn alive_in_observed(group: u32) -> Option<Vec<Alive>> {
+    let _ = group;
+    None
 }
 
 /// [`alive_in`], each member with its footprint now, bytes.
 #[cfg(target_os = "macos")]
 fn alive_using(group: u32) -> Vec<(Alive, u64)> {
-    aterm_sysprobe::group_usage(group)
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|m| {
-            let record = aterm_sysprobe::kproc::record(m.pid)?;
-            (!record.zombie).then_some((
-                Alive {
-                    pid: m.pid,
-                    start: m.start,
-                    ppid: record.ppid,
-                },
-                m.footprint,
-            ))
-        })
-        .collect()
+    alive_using_observed(group).unwrap_or_default()
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -500,29 +904,23 @@ fn alive_using(group: u32) -> Vec<(Alive, u64)> {
     Vec::new()
 }
 
-/// The most parents [`descends`] walks: deeper than any build nests.
+/// [`alive_using`] where the group's own read succeeded, and `None` where it failed or (off
+/// macOS) no reader reads one, as [`alive_in_observed`] distinguishes them.
 #[cfg(target_os = "macos")]
-const DEPTH_MAX: usize = 64;
-
-/// Whether `pid` is `root` or descends from it, by the parents the kernel records now.
-#[cfg(target_os = "macos")]
-fn descends(pid: u32, root: u32) -> bool {
-    let mut at = pid;
-    for _ in 0..DEPTH_MAX {
-        if at == root {
-            return true;
-        }
-        match aterm_sysprobe::kproc::record(at) {
-            Some(r) if r.ppid > 1 && r.ppid != at => at = r.ppid,
-            _ => return false,
+fn alive_using_observed(group: u32) -> Option<Vec<(Alive, u64)>> {
+    let mut alive = Vec::new();
+    for member in aterm_sysprobe::group_usage(group)? {
+        if let Some(identity) = member_alive(&member).ok()? {
+            alive.push((identity, member.footprint));
         }
     }
-    false
+    Some(alive)
 }
 
 #[cfg(not(target_os = "macos"))]
-fn descends(pid: u32, root: u32) -> bool {
-    pid == root
+fn alive_using_observed(group: u32) -> Option<Vec<(Alive, u64)>> {
+    let _ = group;
+    None
 }
 
 #[cfg(test)]

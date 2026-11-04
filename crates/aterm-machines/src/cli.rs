@@ -98,9 +98,10 @@ CHANGE
     run <host>…|--all [--user <u>] [--parallel N] -- <argv>
                               run one program by its absolute path (no shell, no PATH
                               lookup) as root, or as the account <u>
-    github login              store the [github] machine user's token in the login
-                              keychain (typed, not echoed) once GitHub signs it in as
-                              that account with the admin:public_key scope
+    github login              store the [github] machine user's token in the
+                              controller's keys/github_token (0600; typed, not echoed)
+                              once GitHub signs it in as that account with the
+                              admin:public_key scope
     github revoke <host>      delete the host's GitHub keys from the machine user; those
                               keys are never registered again (a key it makes anew is)
     rekey <host>…|--all --signers <file> [--key <private key>] [--parallel N]

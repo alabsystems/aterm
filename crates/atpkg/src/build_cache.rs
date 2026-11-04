@@ -73,7 +73,7 @@ mod seams {
     pub(super) const fn staging(_: &std::path::Path) {}
 }
 
-pub use stale::RECLAIM_STALE;
+pub use stale::{RECLAIM_STALE, RECLAIM_STALE_UNDER_PRESSURE};
 
 /// When a workspace is gone: the rule the window's disk watch uses too.
 pub use aterm_toolchain::checkout;
@@ -294,7 +294,7 @@ const CARGO_LOCKS: &[&str] = &[".cargo-build-lock", ".cargo-lock", ".cargo-artif
 /// A build directory whose workspace is seen gone goes once unwritten this long.
 pub const RECLAIM_GONE: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Below the disk watch's floor, a build directory whose workspace is seen gone goes once unwritten this long ([`reclaim_watched`]'s `gone_after` there) instead of [`RECLAIM_GONE`]: nobody builds into a removed workspace again, and a day of waiting is a day of a full disk.
+/// Below the disk watch's floor, a build directory whose workspace is seen gone goes once unwritten this long ([`ReclaimAfter::UNDER_PRESSURE`]) instead of [`RECLAIM_GONE`]: nobody builds into a removed workspace again, and a day of waiting is a day of a full disk.
 pub const RECLAIM_GONE_UNDER_PRESSURE: Duration = Duration::from_secs(10 * 60);
 
 /// Any build directory goes once unwritten this long, whatever its workspace's state: it is a cache, and a month on the compiler has usually moved and cargo would rebuild anyway.
@@ -302,6 +302,58 @@ pub const RECLAIM_IDLE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// A build directory under the root the cache moved from ([`moved_from`]) goes whole once unwritten this long with no build holding its locks ([`reclaim_moved`]), and the root once empty. No build of this version writes there, so nothing is moved into the new root: cargo keeps absolute paths in a build directory (build scripts' output, dep-info), so a moved one would rebuild anyway, and new builds make the new root before a pass runs. Only a shim laid before the move, or a checkout's verify built from older code, still builds there; it holds cargo's locks while it does, and an hour quiet means it has stopped, at worst costing that checkout one fresh build in whichever root its code names.
 pub const MOVED_AFTER: Duration = Duration::from_secs(60 * 60);
+
+/// How long a pass waits on what no build reads again, each kind unwritten that long. Whether the
+/// volume is below its floor chooses both ([`Self::by_floor`], [`Self::for_claim`]), so neither
+/// can be passed for the other. The locks and process checks around a removal never depend on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReclaimAfter {
+    /// A build directory whose workspace is seen gone, whole.
+    pub gone: Duration,
+    /// A stale part of a build directory that stays ([`stale::decide`]).
+    pub stale: Duration,
+}
+
+impl ReclaimAfter {
+    /// The volume has room.
+    pub const CALM: Self = Self {
+        gone: RECLAIM_GONE,
+        stale: RECLAIM_STALE,
+    };
+    /// The volume is below the disk watch's floor.
+    pub const UNDER_PRESSURE: Self = Self {
+        gone: RECLAIM_GONE_UNDER_PRESSURE,
+        stale: RECLAIM_STALE_UNDER_PRESSURE,
+    };
+    /// By whether the volume is below the disk watch's floor.
+    #[must_use]
+    pub const fn by_floor(below: bool) -> Self {
+        if below {
+            Self::UNDER_PRESSURE
+        } else {
+            Self::CALM
+        }
+    }
+    /// A run's claim that does not fit: a gone workspace's build directory goes as it does below
+    /// the floor, since nobody builds there again; a live workspace's stale parts wait unless the
+    /// volume is below its floor too, since a claim can fall short well above it.
+    #[must_use]
+    pub const fn for_claim(below_floor: bool) -> Self {
+        Self {
+            gone: RECLAIM_GONE_UNDER_PRESSURE,
+            stale: if below_floor {
+                RECLAIM_STALE_UNDER_PRESSURE
+            } else {
+                RECLAIM_STALE
+            },
+        }
+    }
+    /// The root the cache moved from ([`reclaim_moved`]), where nothing is pruned in part.
+    const MOVED: Self = Self {
+        gone: MOVED_AFTER,
+        stale: RECLAIM_STALE,
+    };
+}
 
 /// The shim's half, rendered ahead of a `targo`/`targo-tippy` shim's `exec` on macOS:
 /// shell builtins only.
@@ -637,7 +689,7 @@ pub enum Unused {
     Tooling { idle: Duration, after: Duration },
     /// A tooling scratch carrying both its give-up exec stamp and a regular run-proof file ([`aterm_uds::deadline::RAN`]); elapsed time and a reboot never replace that proof.
     GivenUp,
-    /// PART of a build directory that stays ([`stale`]): `incremental` crate folders and `units` an old compiler built, each unwritten for `after` ([`RECLAIM_STALE`]) or more.
+    /// PART of a build directory that stays ([`stale`]): `incremental` crate folders and `units` an old compiler built, each unwritten for `after` ([`ReclaimAfter::stale`]) or more.
     Stale {
         incremental: usize,
         units: usize,
@@ -807,7 +859,7 @@ impl<'r> Intents<'r> {
 /// seen gone ([`checkout::gone`], `home` naming the folders it never looks into), and any
 /// unwritten for [`RECLAIM_IDLE`]. A live process or unreadable ownership keeps its cache.
 pub fn reclaim(root: &Path, home: Option<&Path>, now: SystemTime) -> Vec<PathBuf> {
-    reclaim_watched(root, home, now, RECLAIM_GONE, None, &mut |_, _| true)
+    reclaim_watched(root, home, now, ReclaimAfter::CALM, None, &mut |_, _| true)
         .into_iter()
         .filter(|(_, why)| {
             !why.nothing_went() && !matches!(why, Unused::Stayed { .. } | Unused::Revoked { .. })
@@ -816,12 +868,12 @@ pub fn reclaim(root: &Path, home: Option<&Path>, now: SystemTime) -> Vec<PathBuf
         .collect()
 }
 
-/// [`reclaim`] as the window's disk watch runs it, `record` asked before each removal (`false` keeps it), each directory returned with why it went ([`Unused`]), each stage a removal could not finish with what stayed of it ([`Unused::Stayed`]), and each entry whose intent `record` put on record and nothing of which went (its rename aside refused after the check, or the pass stopped before its move, or, moved aside, before its removal, returned as its stage: [`Refusal`]) with [`Unused::Refused`], so every intent on record closes with an outcome ([`Intents`]): a gone workspace's build directory goes once unwritten for `gone_after` ([`RECLAIM_GONE`] while the volume is only low, [`RECLAIM_GONE_UNDER_PRESSURE`] below the floor); and with `placing` (the home volume's device and a complete mount table), a workspace nested in a removed checkout is gone too ([`checkout::gone_placed`]).
+/// [`reclaim`] as the window's disk watch runs it, `record` asked before each removal (`false` keeps it), each directory returned with why it went ([`Unused`]), each stage a removal could not finish with what stayed of it ([`Unused::Stayed`]), and each entry whose intent `record` put on record and nothing of which went (its rename aside refused after the check, or the pass stopped before its move, or, moved aside, before its removal, returned as its stage: [`Refusal`]) with [`Unused::Refused`], so every intent on record closes with an outcome ([`Intents`]): a gone workspace's build directory goes once unwritten for `after.gone`, and a stale part of one that stays for `after.stale` ([`ReclaimAfter::CALM`] while the volume is only low, [`ReclaimAfter::UNDER_PRESSURE`] below the floor); and with `placing` (the home volume's device and a complete mount table), a workspace nested in a removed checkout is gone too ([`checkout::gone_placed`]).
 pub fn reclaim_watched(
     root: &Path,
     home: Option<&Path>,
     now: SystemTime,
-    gone_after: Duration,
+    after: ReclaimAfter,
     placing: Option<&checkout::Placing>,
     record: &mut dyn FnMut(&Path, Unused) -> bool,
 ) -> Vec<(PathBuf, Unused)> {
@@ -829,7 +881,7 @@ pub fn reclaim_watched(
         root,
         home,
         now,
-        gone_after,
+        after,
         placing,
         record,
         &fence::Fence::default(),
@@ -842,7 +894,7 @@ pub fn reclaim_watched_with_processes(
     root: &Path,
     home: Option<&Path>,
     now: SystemTime,
-    gone_after: Duration,
+    after: ReclaimAfter,
     placing: Option<&checkout::Placing>,
     record: &mut dyn FnMut(&Path, Unused) -> bool,
     processes: fence::Processes<'_>,
@@ -851,7 +903,7 @@ pub fn reclaim_watched_with_processes(
         root,
         home,
         now,
-        gone_after,
+        after,
         placing,
         record,
         &fence::Fence::new(processes),
@@ -862,28 +914,47 @@ fn reclaim_watched_on(
     root: &Path,
     home: Option<&Path>,
     now: SystemTime,
-    gone_after: Duration,
+    after: ReclaimAfter,
     placing: Option<&checkout::Placing>,
     record: &mut dyn FnMut(&Path, Unused) -> bool,
     fence: &fence::Fence<'_>,
 ) -> Vec<(PathBuf, Unused)> {
+    reclaim_root_on(root, home, now, after, placing, record, fence).0
+}
+
+/// [`reclaim_watched_on`], and whether the record declined a prune, which speaks for what a pass
+/// would prune next too.
+fn reclaim_root_on(
+    root: &Path,
+    home: Option<&Path>,
+    now: SystemTime,
+    after: ReclaimAfter,
+    placing: Option<&checkout::Placing>,
+    record: &mut dyn FnMut(&Path, Unused) -> bool,
+    fence: &fence::Fence<'_>,
+) -> (Vec<(PathBuf, Unused)>, bool) {
+    let mut declined = false;
     let mut intents = Intents::new(record);
     if std::fs::symlink_metadata(root).is_ok_and(|m| m.is_dir()) {
         let mut sweep = Sweep {
             root,
             home,
             now,
-            gone_after,
+            after,
             placing,
             moved: false,
             compiler_store: compiler_store(home),
             intents: &mut intents,
             fence,
             permitted: &|| true,
+            pruning: Vec::new(),
+            declined: false,
         };
         sweep.walk(root, 0);
+        sweep.finish_prunes();
+        declined = sweep.declined;
     }
-    intents.finish()
+    (intents.finish(), declined)
 }
 
 /// THE ROOT THE CACHE MOVED FROM, emptied ([`MOVED_AFTER`]): each build directory under `root` that nothing wrote for [`MOVED_AFTER`] goes whole, its locks held as [`reclaim_watched`] holds them ([`Unused::Moved`]), whatever its workspace's state; nothing is pruned in part, and a build directory a build holds or wrote within the hour stays for a later pass. The root itself goes once nothing is left in it and it is as quiet, or this pass emptied it. `record` is asked before each removal, a stage a removal could not finish is returned with what stayed of it ([`Unused::Stayed`]), and an entry whose intent is on record and nothing of which went with [`Unused::Refused`].
@@ -892,7 +963,15 @@ pub fn reclaim_moved(
     now: SystemTime,
     record: &mut dyn FnMut(&Path, Unused) -> bool,
 ) -> Vec<(PathBuf, Unused)> {
-    let fence = fence::Fence::default();
+    reclaim_moved_on(root, now, record, &fence::Fence::default())
+}
+
+fn reclaim_moved_on(
+    root: &Path,
+    now: SystemTime,
+    record: &mut dyn FnMut(&Path, Unused) -> bool,
+    fence: &fence::Fence<'_>,
+) -> Vec<(PathBuf, Unused)> {
     let mut intents = Intents::new(record);
     if std::fs::symlink_metadata(root).is_ok_and(|m| m.is_dir()) {
         let quiet = last_written(root).is_some_and(|t| age(now, t) >= MOVED_AFTER);
@@ -900,13 +979,15 @@ pub fn reclaim_moved(
             root,
             home: None,
             now,
-            gone_after: MOVED_AFTER,
+            after: ReclaimAfter::MOVED,
             placing: None,
             moved: true,
             compiler_store: None,
             intents: &mut intents,
-            fence: &fence,
+            fence,
             permitted: &|| true,
+            pruning: Vec::new(),
+            declined: false,
         };
         let any = sweep.walk(root, 0);
         if quiet || any {
@@ -921,8 +1002,8 @@ struct Sweep<'a, 'r> {
     root: &'a Path,
     home: Option<&'a Path>,
     now: SystemTime,
-    /// How long a gone workspace's build directory must be unwritten.
-    gone_after: Duration,
+    /// How long a gone workspace's build directory and a stale part must be unwritten.
+    after: ReclaimAfter,
     /// What places a workspace nested in a removed checkout ([`checkout::gone_placed`]).
     placing: Option<&'a checkout::Placing>,
     /// `root` is the one the cache moved from ([`reclaim_moved`]): each build directory goes whole once [`MOVED_AFTER`] quiet, or stays whole.
@@ -935,6 +1016,12 @@ struct Sweep<'a, 'r> {
     fence: &'a fence::Fence<'a>,
     /// Additional authority checked at every deletion boundary for registered roots.
     permitted: &'a dyn Fn() -> bool,
+    /// The live build directories a walk found, each (its mirror folder, its leaf), pruned once
+    /// the walk took what costs nothing ([`Self::finish_prunes`]).
+    pruning: Vec<(PathBuf, PathBuf)>,
+    /// The record declined a prune. A goal met or a ledger refusing says the same of the next in
+    /// this walk, which would only move its parts aside and back and date its clocks now.
+    declined: bool,
 }
 
 /// How deep [`reclaim`] walks the mirror of the filesystem.
@@ -963,6 +1050,14 @@ impl Sweep<'_, '_> {
         self.take(stage, stage.to_path_buf(), Unused::Unfinished, original)
     }
 
+    /// Each live build directory's stale parts, after the walk: a pass that stops at a goal must
+    /// not cost a live worktree a cold compile while a dead directory would have covered it.
+    fn finish_prunes(&mut self) {
+        for (dir, leaf) in std::mem::take(&mut self.pruning) {
+            let _ = self.prune(&dir, &leaf);
+        }
+    }
+
     /// REMOVE THE STAGE `stage` ([`remove::tree`], every removal a pass makes), its intent on
     /// record: removed whole, `went` is returned as gone for `why`, and `true`; one some entry
     /// of which stayed is returned as [`Unused::Stayed`] (what stayed, and the bytes that went)
@@ -988,6 +1083,7 @@ impl Sweep<'_, '_> {
             return false;
         }
         let permitted = || {
+            self.fence.working();
             (self.permitted)()
                 && registered::retention::allows_tree(original)
                 && registered::retention::allows_walk(stage)
@@ -1029,7 +1125,8 @@ impl Sweep<'_, '_> {
     /// stays staged for a later pass, which finishes it only while custody at `leaf` allows),
     /// and removed with the locks let go.
     fn prune(&mut self, dir: &Path, leaf: &Path) -> bool {
-        if !(self.permitted)() || !registered::retention::allows_tree(leaf) {
+        self.fence.working();
+        if self.declined || !(self.permitted)() || !registered::retention::allows_tree(leaf) {
             return false;
         }
         let Some(seen) = look(leaf) else {
@@ -1044,6 +1141,7 @@ impl Sweep<'_, '_> {
                 self.compiler_store.as_deref(),
             ),
             self.now,
+            self.after.stale,
         );
         if doomed.is_empty() {
             return false;
@@ -1065,6 +1163,7 @@ impl Sweep<'_, '_> {
                 self.compiler_store.as_deref(),
             ),
             self.now,
+            self.after.stale,
         );
         if doomed.is_empty() {
             return false;
@@ -1098,15 +1197,14 @@ impl Sweep<'_, '_> {
         let why = Unused::Stale {
             incremental,
             units,
-            after: RECLAIM_STALE,
+            after: self.after.stale,
         };
         // A rename acts by name: a keep published at the leaf as its parts moved would lose
         // them, so custody is read there again once they moved, and one it keeps moves back.
         staged::at(&stage);
-        if moved.is_empty()
-            || !registered::retention::allows_tree(leaf)
-            || !self.intents.ask_staged(&stage, why)
-        {
+        let asks = !moved.is_empty() && registered::retention::allows_tree(leaf);
+        if !asks || !self.intents.ask_staged(&stage, why) {
+            self.declined |= asks;
             // A new process may have started from a staged image while the intent was
             // refused. Keep that stage for a later recorded pass rather than move its image.
             if !self.fence.clear(leaf, &stage) {
@@ -1151,18 +1249,19 @@ impl Sweep<'_, '_> {
         for child in children {
             let name = child.file_name().unwrap_or_default();
             if name == LEAF {
+                self.fence.working();
                 let judged = if self.moved {
                     unused(&child, &|seen| moved(seen, now))
                 } else {
                     workspace_of(root, dir).and_then(|ws| {
                         unused(&child, &|seen| {
-                            whole(&ws, seen, home, now, self.gone_after, self.placing)
+                            whole(&ws, seen, home, now, self.after, self.placing)
                         })
                     })
                 };
                 let Some((held, why)) = judged else {
                     if !self.moved {
-                        any |= self.prune(dir, &child);
+                        self.pruning.push((dir.to_path_buf(), child));
                     }
                     continue;
                 };
@@ -1246,24 +1345,24 @@ fn moved(seen: &Seen, now: SystemTime) -> Option<Unused> {
 }
 
 /// Why the build directory of `workspace`, as [`look`] `seen` it, goes whole: idle at least
-/// `gone_after` with its workspace seen gone, or [`RECLAIM_IDLE`] whatever its state.
+/// `after.gone` with its workspace seen gone, or [`RECLAIM_IDLE`] whatever its state.
 fn whole(
     workspace: &Path,
     seen: &Seen,
     home: Option<&Path>,
     now: SystemTime,
-    gone_after: Duration,
+    after: ReclaimAfter,
     placing: Option<&checkout::Placing>,
 ) -> Option<Unused> {
     let idle = age(now, seen.newest);
-    if idle < gone_after {
+    if idle < after.gone {
         None
     } else if idle >= RECLAIM_IDLE {
         Some(Unused::Idle { idle })
     } else if checkout::gone_placed(workspace, home, placing).is_ok() {
         Some(Unused::Gone {
             idle,
-            after: gone_after,
+            after: after.gone,
         })
     } else {
         None
@@ -1511,36 +1610,125 @@ fn compiler_store(_: Option<&Path>) -> Option<PathBuf> {
     None
 }
 
-/// [`reclaim_watched`] over this user's cache, now, then [`reclaim_moved`] over the root it moved from and [`tooling::reclaim`] over its tooling cache, `record` asked before each removal; nothing off macOS or without a home.
+/// One pass over this user's roots, now: the dead entries of the root the cache moved from
+/// ([`reclaim_moved`]), its tooling cache ([`tooling::reclaim`]) and each registered cache, then
+/// the shared cache ([`reclaim_watched`]), then each live registered cache's stale parts and each
+/// package target, unless the shared cache's record declined a prune; `record` is asked before
+/// each removal, and every path is returned with why it went. Nothing off macOS or without a home.
 pub fn reclaim_home_watched(
-    gone_after: Duration,
+    after: ReclaimAfter,
     placing: Option<&checkout::Placing>,
+    record: &mut dyn FnMut(&Path, Unused) -> bool,
+) -> Vec<(PathBuf, Unused)> {
+    reclaim_home_told(after, placing, &|| {}, record)
+}
+
+/// [`reclaim_home_watched`] for a pass something waits on: `working` hears its progress, so a long
+/// removal reads as work and a hung one still goes quiet.
+pub fn reclaim_home_told(
+    after: ReclaimAfter,
+    placing: Option<&checkout::Placing>,
+    working: &dyn Fn(),
     record: &mut dyn FnMut(&Path, Unused) -> bool,
 ) -> Vec<(PathBuf, Unused)> {
     if !cfg!(target_os = "macos") {
         return Vec::new();
     }
     aterm_types::dirs::home_dir().map_or_else(Vec::new, |home| {
-        let now = SystemTime::now();
-        let mut removed = reclaim_watched(
-            &cache_root(&home),
-            Some(&home),
+        let fence = fence::Fence::default().telling(working);
+        reclaim_roots(
+            &home,
+            SystemTime::now(),
+            after,
+            placing,
+            true,
+            &fence,
+            record,
+        )
+    })
+}
+
+/// WHAT COSTS NOTHING GOES FIRST, ACROSS EVERY ROOT, because a pass may stop at a goal: the root
+/// the cache moved from, the tooling and each registered cache's dead entries, then the shared
+/// cache's dead entries and its live worktrees' stale parts, then each live registered cache's
+/// and each package target, whose retirement costs a cold build.
+/// `shared` adds the shared cache, the moved root and the tooling to the registered caches. Once
+/// the shared cache's record declines a prune no registered cache is pruned, since that would only
+/// move its parts aside and back. Each registered cache decides for itself below that: a run's
+/// relief keeps by path, so one cache's decline says nothing of the next.
+fn reclaim_roots(
+    home: &Path,
+    now: SystemTime,
+    after: ReclaimAfter,
+    placing: Option<&checkout::Placing>,
+    shared: bool,
+    fence: &fence::Fence<'_>,
+    record: &mut dyn FnMut(&Path, Unused) -> bool,
+) -> Vec<(PathBuf, Unused)> {
+    let mut removed = Vec::new();
+    if shared {
+        removed.extend(reclaim_moved_on(&moved_from(home), now, record, fence));
+        removed.extend(tooling::reclaim_on(
+            &tooling::root(home),
             now,
-            gone_after,
+            record,
+            fence,
+        ));
+    }
+    removed.extend(registered::reclaim_dead_on(
+        home, now, after, placing, record, fence,
+    ));
+    let mut declined = false;
+    if shared {
+        let (went, said_no) = reclaim_root_on(
+            &cache_root(home),
+            Some(home),
+            now,
+            after,
             placing,
             record,
+            fence,
         );
-        removed.extend(reclaim_moved(&moved_from(&home), now, record));
-        removed.extend(tooling::reclaim(&tooling::root(&home), now, record));
-        removed.extend(registered::reclaim(&home, now, gone_after, placing, record));
-        removed
-    })
+        removed.extend(went);
+        declined = said_no;
+    }
+    if !declined {
+        removed.extend(registered::reclaim_live_on(
+            home, now, after, placing, record, fence,
+        ));
+    }
+    removed
+}
+
+/// What the window's disk look sweeps beside a supervised session, a demand or a projection: the
+/// registered caches, and below the floor all of `home`'s cache too, as [`reclaim_home_watched`]
+/// does with no session. At this look nothing else reaches a stale part of a profile in use: its
+/// disk pass takes a profile's whole `incremental/`, and only once it stands idle. Off macOS there
+/// is no such cache, so only the registered caches are swept. A waiter's wait reads the look's
+/// beat, so `working` hears each root's progress.
+pub fn reclaim_beside_sessions(
+    home: &Path,
+    now: SystemTime,
+    below_floor: bool,
+    placing: Option<&checkout::Placing>,
+    working: &dyn Fn(),
+    record: &mut dyn FnMut(&Path, Unused) -> bool,
+) -> Vec<(PathBuf, Unused)> {
+    reclaim_roots(
+        home,
+        now,
+        ReclaimAfter::by_floor(below_floor),
+        placing,
+        below_floor && cfg!(target_os = "macos"),
+        &fence::Fence::default().telling(working),
+        record,
+    )
 }
 
 /// [`reclaim`] over this user's cache, now, each path returned with why it went; nothing off macOS or without a home.
 #[must_use]
 pub fn reclaim_home() -> Vec<(PathBuf, Unused)> {
-    reclaim_home_watched(RECLAIM_GONE, None, &mut |_, _| true)
+    reclaim_home_watched(ReclaimAfter::CALM, None, &mut |_, _| true)
 }
 
 /// An advisory cleanup candidate from [`plan`]: a whole build directory, its stale parts,
@@ -1596,21 +1784,13 @@ pub fn plan(
     root: &Path,
     home: Option<&Path>,
     now: SystemTime,
-    gone_after: Duration,
+    after: ReclaimAfter,
     placing: Option<&checkout::Placing>,
 ) -> Vec<Planned> {
     let mut planned = Vec::new();
     if std::fs::symlink_metadata(root).is_ok_and(|m| m.is_dir()) {
         let store = compiler_store(home);
-        let pass = (
-            root,
-            home,
-            now,
-            gone_after,
-            placing,
-            store.as_deref(),
-            false,
-        );
+        let pass = (root, home, now, after, placing, store.as_deref(), false);
         plan_walk(pass, root, 0, &mut planned);
     }
     planned
@@ -1622,7 +1802,7 @@ pub fn plan(
 pub fn plan_moved(root: &Path, now: SystemTime) -> Vec<Planned> {
     let mut planned = Vec::new();
     if std::fs::symlink_metadata(root).is_ok_and(|m| m.is_dir()) {
-        let pass = (root, None, now, MOVED_AFTER, None, None, true);
+        let pass = (root, None, now, ReclaimAfter::MOVED, None, None, true);
         plan_walk(pass, root, 0, &mut planned);
     }
     planned
@@ -1638,7 +1818,13 @@ pub fn plan_home() -> Vec<Planned> {
     }
     aterm_types::dirs::home_dir().map_or_else(Vec::new, |home| {
         let now = SystemTime::now();
-        let mut planned = plan(&cache_root(&home), Some(&home), now, RECLAIM_GONE, None);
+        let mut planned = plan(
+            &cache_root(&home),
+            Some(&home),
+            now,
+            ReclaimAfter::CALM,
+            None,
+        );
         planned.extend(plan_moved(&moved_from(&home), now));
         planned.extend(tooling::plan(&tooling::root(&home), now));
         planned.extend(registered::plan(&home, now));
@@ -1646,13 +1832,13 @@ pub fn plan_home() -> Vec<Planned> {
     })
 }
 
-/// What one [`plan`] judges by: its `root`, `home`, `now`, `gone_after`, `placing`, the
+/// What one [`plan`] judges by: its `root`, `home`, `now`, `after`, `placing`, the
 /// compiler store, and whether `root` is the one the cache moved from ([`plan_moved`]).
 type PlanPass<'a> = (
     &'a Path,
     Option<&'a Path>,
     SystemTime,
-    Duration,
+    ReclaimAfter,
     Option<&'a checkout::Placing>,
     Option<&'a Path>,
     bool,
@@ -1663,7 +1849,7 @@ type PlanPass<'a> = (
 /// its leaf nominated whole only while it can be staged ([`stage_for`]), and its stale parts only
 /// while a stage can be made beside it ([`free_stage`]).
 fn plan_walk(pass: PlanPass<'_>, dir: &Path, depth: usize, planned: &mut Vec<Planned>) {
-    let (root, home, now, gone_after, placing, store, was_moved) = pass;
+    let (root, home, now, after, placing, store, was_moved) = pass;
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -1686,8 +1872,7 @@ fn plan_walk(pass: PlanPass<'_>, dir: &Path, depth: usize, planned: &mut Vec<Pla
             let goes = if was_moved {
                 moved(&seen, now)
             } else {
-                workspace_of(root, dir)
-                    .and_then(|ws| whole(&ws, &seen, home, now, gone_after, placing))
+                workspace_of(root, dir).and_then(|ws| whole(&ws, &seen, home, now, after, placing))
             };
             if let Some(why) = goes {
                 if stage_for(&child, dir, OsStr::new(DOOMED)).is_some() {
@@ -1705,7 +1890,7 @@ fn plan_walk(pass: PlanPass<'_>, dir: &Path, depth: usize, planned: &mut Vec<Pla
                 continue;
             }
             let survey = stale::survey(&stale::Disk, &child, &profiles_of(&seen.locks), store);
-            let doomed = stale::decide(&survey, now);
+            let doomed = stale::decide(&survey, now, after.stale);
             if doomed.is_empty() {
                 continue;
             }
@@ -1715,7 +1900,7 @@ fn plan_walk(pass: PlanPass<'_>, dir: &Path, depth: usize, planned: &mut Vec<Pla
                 why: Unused::Stale {
                     incremental: count(stale::Part::Incremental),
                     units: count(stale::Part::Unit),
-                    after: RECLAIM_STALE,
+                    after: after.stale,
                 },
                 paths: doomed.into_iter().flat_map(|d| d.paths).collect(),
                 held,

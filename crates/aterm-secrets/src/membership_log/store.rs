@@ -46,13 +46,17 @@ pub fn encode_records<'a>(records: impl IntoIterator<Item = &'a Record>) -> Vec<
 /// `bytes` exceeds [`MAX_RECORDS_STREAM`], holds more than [`MAX_HELD_RECORDS`] records, or
 /// contains a malformed or invalidly signed record.
 pub fn decode_records(bytes: &[u8]) -> Result<Vec<Record>> {
+    decode_records_bounded(bytes, MAX_HELD_RECORDS)
+}
+
+pub(crate) fn decode_records_bounded(bytes: &[u8], record_limit: usize) -> Result<Vec<Record>> {
     if bytes.len() > MAX_RECORDS_STREAM {
         return Err(Error::new("membership record stream is too large"));
     }
     let mut out = Vec::new();
     let mut at = 0usize;
     while at < bytes.len() {
-        if out.len() >= MAX_HELD_RECORDS {
+        if out.len() >= record_limit {
             return Err(Error::new("membership record stream exceeds record bound"));
         }
         let len = Record::wire_len_prefix(&bytes[at..])?;
@@ -501,15 +505,17 @@ impl Store {
     }
 
     /// [`Store::recover`] into this empty store, as [`Store::for_vault`] and
-    /// [`Store::also_under`] made it.
+    /// [`Store::also_under`] made it, acquiring at most this store's held budget of verified
+    /// frames from the first [`MAX_RECORDS_STREAM`] bytes. Duplicate frames count too.
     #[must_use]
     pub fn recovering(self, bytes: &[u8]) -> Self {
-        if let Ok(records) = decode_records(bytes) {
+        let bytes = &bytes[..bytes.len().min(MAX_RECORDS_STREAM)];
+        if let Ok(records) = decode_records_bounded(bytes, self.budgets.held) {
             return self.recover_decoded(records, true);
         }
         let mut records = Vec::new();
         let mut at = 0usize;
-        while at < bytes.len() && records.len() < MAX_HELD_RECORDS {
+        while at < bytes.len() && records.len() < self.budgets.held {
             let Ok(len) = Record::wire_len_prefix(&bytes[at..]) else {
                 break;
             };
@@ -713,11 +719,11 @@ impl Store {
     /// What this store keeps in memory, as the records cache counts it: the wire bytes of every
     /// record it holds, keeps waiting or keeps before a genesis, and its reachability index's
     /// bytes.
-    #[cfg(unix)]
+    #[cfg(any(unix, test))]
     pub(crate) fn footprint(&self) -> usize {
         self.log.as_ref().map_or_else(
             || self.unrooted.values().map(|r| r.bytes().len()).sum(),
-            |log| log.total_bytes() + log.reach.bytes(),
+            Log::footprint,
         )
     }
 

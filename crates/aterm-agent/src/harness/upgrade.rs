@@ -4588,17 +4588,34 @@ pub const RELEASE_HEAD: &str = "[aterm harness] Upgrade off: ";
 
 pub const TELL_HEAD: &str = "[aterm harness] Upgrade waiting: ";
 
+/// `text` with no whitespace and no leading caret, as [`own_draft`] and [`own_words`] compare it.
+fn upgrade_compact(text: &str) -> String {
+    let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    compact
+        .trim_start_matches(['\u{276F}', '\u{203A}', '\u{00BB}'])
+        .to_string()
+}
+
 /// Returns whether `draft` is a prefix of aterm's own upgrade notice or release line.
 #[must_use]
 pub fn own_draft(draft: &str) -> bool {
-    let compact = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
-    let draft = compact(draft);
-    let draft = draft.trim_start_matches(['\u{276F}', '\u{203A}', '\u{00BB}']);
+    let draft = upgrade_compact(draft);
     draft.chars().nth(1).is_some()
         && [ANNOUNCE_HEAD, RELEASE_HEAD, TELL_HEAD]
             .iter()
-            .map(|head| compact(head))
-            .any(|head| draft.starts_with(&head) || head.starts_with(draft))
+            .map(|head| upgrade_compact(head))
+            .any(|head| draft.starts_with(&head) || head.starts_with(&draft))
+}
+
+/// Returns whether `draft` opens with the whole head of aterm's own upgrade notice or release line:
+/// aterm's words, as no part of a head can say of a person's few glyphs, which [`own_draft`] takes in
+/// too.
+#[must_use]
+pub fn own_words(draft: &str) -> bool {
+    let draft = upgrade_compact(draft);
+    [ANNOUNCE_HEAD, RELEASE_HEAD, TELL_HEAD]
+        .iter()
+        .any(|head| draft.starts_with(&upgrade_compact(head)))
 }
 
 /// The quiet upgrade's line to an agent whose own work has held its move `held_s` ([`Step::Tell`]):

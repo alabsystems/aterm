@@ -694,8 +694,7 @@ mod tests {
         }
     }
 
-    /// `ENOTSUP` as this platform numbers it ([`seam::ENOTSUP`]): Darwin's 45, which std leaves
-    /// uncategorized, and Linux's 95, which std reads as `Unsupported`.
+    /// `ENOTSUP` as this platform numbers it ([`seam::ENOTSUP`]): Darwin's 45, Linux's 95.
     #[cfg(unix)]
     fn enotsup() -> std::io::Error {
         std::io::Error::from_raw_os_error(seam::ENOTSUP)
@@ -761,22 +760,23 @@ mod tests {
         assert!(DirFlushed::classify(Ok(())).unwrap().is_flushed());
     }
 
-    /// The kernel's own refusal is accepted: `F_FULLFSYNC` on `/dev/null`. std gives Darwin's
-    /// `ENOTSUP` (45) neither kind a check of the kind alone accepted, so it is the errno half
-    /// of the classification that accepts it.
+    /// The kernel's own refusal is accepted: `F_FULLFSYNC` on `/dev/null`, which devfs refuses
+    /// with an errno (`ENODEV`) std names by neither kind a check of the kind alone accepts, so
+    /// it is the errno half of the classification that accepts it.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn accepting_a_file_refusal_accepts_the_kernels_own() {
+        let null = std::fs::File::open("/dev/null").unwrap();
+        let refused = primitive::full(&null).expect_err("/dev/null takes no F_FULLFSYNC");
         assert!(
             !matches!(
-                enotsup().kind(),
+                refused.kind(),
                 io::ErrorKind::Unsupported | io::ErrorKind::InvalidInput
             ),
-            "CONTROL: std now names Darwin's ENOTSUP by kind; the errno half is untested"
+            "CONTROL: the kind alone names this refusal ({refused:?}); the errno half is untested"
         );
-        let null = std::fs::File::open("/dev/null").unwrap();
         assert!(
-            refusal_accepted(primitive::full(&null)).is_ok(),
+            refusal_accepted(Err(refused)).is_ok(),
             "the real refusal of F_FULLFSYNC on /dev/null"
         );
     }

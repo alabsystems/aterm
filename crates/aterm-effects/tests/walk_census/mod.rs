@@ -981,7 +981,7 @@ pub fn recording(src: &str) -> Vec<(u64, Rec)> {
 }
 
 pub fn is_arrow(b: &[u8]) -> bool {
-    b.starts_with(b"\x1b[") && matches!(b.last(), Some(b'A' | b'B' | b'C' | b'D'))
+    b.starts_with(b"\x1b[") && matches!(b.last(), Some(b'A'..=b'D'))
 }
 
 /// One captured take and the composer it types into: the rows its text

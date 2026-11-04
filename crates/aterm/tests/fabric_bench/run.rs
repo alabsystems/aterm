@@ -454,12 +454,15 @@ struct Reopen {
     /// [`REOPENS`] opens, each what `aterm link broker` does before it binds: the open (every
     /// retained record scanned, under a key authenticated) and its retention rules.
     ms: Vec<f64>,
+    /// What the last open held in memory, read before it was dropped (D10).
+    held: Option<backlog::Held>,
 }
 
 /// Time [`REOPENS`] opens of `w`'s stopped log, under the options it served with.
 fn reopen(w: &World) -> Reopen {
+    let mut held = None;
     let ms = (0..REOPENS)
-        .map(|_| {
+        .map(|i| {
             let start = Instant::now();
             let broker = if w.retained {
                 harness::open_broker(&w.broker_log, &w.opts)
@@ -467,6 +470,15 @@ fn reopen(w: &World) -> Reopen {
                 harness::open_broker_unretained(&w.broker_log, &w.opts)
             };
             let took = start.elapsed().as_secs_f64() * 1e3;
+            if i + 1 == REOPENS {
+                // Its residency alone: by now this process also holds the census's copy of
+                // the whole log ([`stop_read_then`]), so its footprint is not the broker's.
+                held = Some(backlog::Held {
+                    footprint: None,
+                    peak_footprint: None,
+                    ..backlog::held(&broker)
+                });
+            }
             drop(broker);
             took
         })
@@ -474,6 +486,7 @@ fn reopen(w: &World) -> Reopen {
     Reopen {
         bytes: std::fs::metadata(&w.broker_log).map_or(0, |m| m.len()),
         ms,
+        held,
     }
 }
 
@@ -1966,6 +1979,8 @@ struct Backlog {
     /// `(inside, outside)` ([`backlog::split`]): inside is a beat that meets
     /// a round's kill -> every session's live mail visible.
     steady: (Vec<f64>, Vec<f64>),
+    /// What the broker held in memory once this population's restarts were done (D10).
+    held: backlog::Held,
 }
 
 /// One `| … | n | mean | p50 | p95 | p99 | max |` cell run of `values`.
@@ -1985,6 +2000,7 @@ fn backlog_report(
     node: &str,
     backlogs: &[Backlog],
     reopened: &Reopen,
+    budget: Option<usize>,
     md: &mut Vec<String>,
 ) -> Value {
     if spec.backlog == 0 {
@@ -2038,6 +2054,7 @@ fn backlog_report(
             "fill_ms": stats::round3(b.fill_ms),
             "steady_inside_ms": stats::to_json(inside),
             "steady_outside_ms": stats::to_json(outside),
+            "held": held_json(&b.held),
         }));
     }
     md.push(String::new());
@@ -2052,17 +2069,80 @@ fn backlog_report(
     md.push("|---|---:|---:|---:|---:|---:|".to_string());
     md.push(stats::row("open the stopped log", &reopened.ms));
     md.push(String::new());
+    let budget_words = budget.map_or_else(
+        || "none: every retained record resident".to_string(),
+        |b| format!("{:.1} MiB", b as f64 / (1024.0 * 1024.0)),
+    );
+    md.push(format!(
+        "**What the broker holds in memory** (D10), its residency budget {budget_words} \
+         (astream's `OpenOptions::resident_budget`, as the world's options set it): the retained \
+         records it keeps decoded (`Broker::residency`: the records, and the bytes the budget \
+         charges them), and this process's physical footprint (`ri_phys_footprint`, with its \
+         peak over this process's lifetime), read once a population's restarts are done. The broker \
+         runs in this process, so the footprint is the broker's and the bench's own clients' and \
+         tables beside it. The last open of the stopped log reads its residency alone: by then \
+         this process also holds the census's copy of the whole log.\n"
+    ));
+    md.push(
+        "| read | resident records | resident (MiB) | retained records | footprint (MiB) | peak \
+         (MiB) |"
+            .to_string(),
+    );
+    md.push("|---|---:|---:|---:|---:|---:|".to_string());
+    for b in backlogs {
+        md.push(held_row(
+            &format!("after {} session(s)' restarts", b.sessions),
+            &b.held,
+        ));
+    }
+    if let Some(held) = &reopened.held {
+        md.push(held_row("the last open of the stopped log", held));
+    }
+    md.push(String::new());
     json!({
         "records": spec.backlog,
         "body_bytes": backlog::FILL_BODY_LEN,
         "subject": backlog::fill_subject(node),
         "steady_every_ms": u64::try_from(backlog::STEADY_EVERY.as_millis()).unwrap_or(u64::MAX),
         "fetch_scan_max": astream_broker::broker::FETCH_SCAN_MAX,
+        "resident_budget": budget,
         "sizes": Value::Array(sizes),
         "reopen": {
             "log_bytes": reopened.bytes,
             "ms": stats::to_json(&reopened.ms),
+            "held": reopened.held.as_ref().map_or(Value::Null, held_json),
         },
+    })
+}
+
+/// `bytes` in MiB to a tenth, `–` for none.
+fn mib(bytes: Option<u64>) -> String {
+    bytes.map_or_else(
+        || "–".to_string(),
+        |b| format!("{:.1}", b as f64 / (1024.0 * 1024.0)),
+    )
+}
+
+/// One `| read | resident records | resident | retained | footprint | peak |` row of `held`.
+fn held_row(read: &str, held: &backlog::Held) -> String {
+    format!(
+        "| {read} | {} | {} | {} | {} | {} |",
+        held.resident_records,
+        mib(u64::try_from(held.resident_bytes).ok()),
+        held.retained,
+        mib(held.footprint),
+        mib(held.peak_footprint)
+    )
+}
+
+/// `held` as the report's JSON carries it.
+fn held_json(held: &backlog::Held) -> Value {
+    json!({
+        "resident_records": held.resident_records,
+        "resident_bytes": held.resident_bytes,
+        "retained_records": held.retained,
+        "footprint_bytes": held.footprint,
+        "peak_footprint_bytes": held.peak_footprint,
     })
 }
 
@@ -2283,6 +2363,7 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
                     sessions: size,
                     fill_ms,
                     steady: backlog::split(&beats, &windows),
+                    held: backlog::held(broker),
                 });
             }
             rounds.extend(size_rounds);
@@ -2300,6 +2381,7 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             Reopen {
                 bytes: 0,
                 ms: Vec::new(),
+                held: None,
             }
         }
     });
@@ -2502,7 +2584,14 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         ));
     }
     md.push(String::new());
-    let backlog_json = backlog_report(spec, &w.node, &backlogs, &reopened, &mut md);
+    let backlog_json = backlog_report(
+        spec,
+        &w.node,
+        &backlogs,
+        &reopened,
+        w.opts.resident_budget,
+        &mut md,
+    );
     md.extend(yardstick_rows(&ruler, &cal_before, &cal_after));
     md.extend(normalized);
     md.push(String::new());

@@ -1292,6 +1292,88 @@ fn index_sugar_is_total() {
     assert!(value["rows"]["nope"].is_null());
 }
 
+/// NEGATIVE CONTROL: out-of-range recursion depths (`>= 128`), non-RFC-8259 whitespace (`0x0c`),
+/// non-control printable bytes (`>= 0x20`), and unpaired/reversed UTF-16 surrogates are rejected
+/// by `aterm_json`'s const boundary helpers while valid boundary values round-trip.
+#[test]
+fn json_const_helpers_round_trip() {
+    assert_eq!(aterm_json::recursion_limit(), 127);
+    assert!(aterm_json::within_recursion_limit(0));
+    assert!(aterm_json::within_recursion_limit(127));
+    assert!(!aterm_json::within_recursion_limit(128));
+    for ws in *b" \t\n\r" {
+        assert!(aterm_json::is_json_whitespace_byte(ws));
+    }
+    for non_ws in [0x0b, 0x0c, b'a', 0xfe] {
+        assert!(!aterm_json::is_json_whitespace_byte(non_ws));
+    }
+    assert!(aterm_json::is_json_control_byte(0x00));
+    assert!(aterm_json::is_json_control_byte(0x1f));
+    assert!(!aterm_json::is_json_control_byte(0x20));
+    assert!(!aterm_json::is_utf16_high_surrogate(0xd7ff));
+    assert!(aterm_json::is_utf16_high_surrogate(0xd800));
+    assert!(aterm_json::is_utf16_high_surrogate(0xdbff));
+    assert!(!aterm_json::is_utf16_high_surrogate(0xdc00));
+    assert!(!aterm_json::is_utf16_low_surrogate(0xdbff));
+    assert!(aterm_json::is_utf16_low_surrogate(0xdc00));
+    assert!(aterm_json::is_utf16_low_surrogate(0xdfff));
+    assert!(!aterm_json::is_utf16_low_surrogate(0xe000));
+    assert_eq!(
+        aterm_json::decode_surrogate_pair(0xd800, 0xdc00),
+        Some(0x10000)
+    );
+    assert_eq!(
+        aterm_json::decode_surrogate_pair(0xd83d, 0xde00),
+        Some(0x1f600)
+    );
+    assert_eq!(
+        aterm_json::decode_surrogate_pair(0xdbff, 0xdfff),
+        Some(0x10ffff)
+    );
+    assert_eq!(aterm_json::decode_surrogate_pair(0xd800, 0x0041), None);
+    assert_eq!(aterm_json::decode_surrogate_pair(0xdc00, 0xd800), None);
+    let enc = aterm_json::encode_json_span_le(12, 34, 5, u32::MAX);
+    assert_eq!(aterm_json::decode_json_span_le(enc), (12, 34, 5, u32::MAX));
+}
+
+/// NEGATIVE CONTROL: exercises worst-case 6-byte `\u00XX` expansion on every
+/// input byte so an off-by-one capacity reservation would reallocate.
+#[test]
+fn preallocated_quoting_matches_general_serialization_at_escape_bounds() {
+    let controls: String = (0..32).map(char::from).collect();
+    let all_six_byte = "\x00\x1f".repeat(128);
+    for text in [
+        String::new(),
+        controls,
+        all_six_byte.clone(),
+        "\"\\\nλ🔒".repeat(400),
+        "x".repeat(65536),
+    ] {
+        let expected_cap = text.len() * 6 + 2;
+        let quoted = aterm_json::quoted_string(&text).unwrap();
+        assert_eq!(quoted, aterm_json::to_vec(&text).unwrap());
+        assert_eq!(quoted.capacity(), expected_cap);
+        assert!(quoted.len() <= expected_cap);
+        if text == all_six_byte {
+            assert_eq!(quoted.len(), expected_cap);
+        }
+        assert_eq!(aterm_json::from_slice::<String>(&quoted).unwrap(), text);
+    }
+}
+
+/// NEGATIVE CONTROL: refuses byte lengths whose `len * 6 + 2` worst-case
+/// reservation overflows `usize` or exceeds `isize::MAX`.
+#[test]
+fn quoted_capacity_refuses_overflow_and_exceeding_isize_max() {
+    let max_len = (isize::MAX as usize - 2) / 6;
+    assert_eq!(aterm_json::quoted_capacity(0), Some(2));
+    assert_eq!(aterm_json::quoted_capacity(max_len), Some(max_len * 6 + 2));
+    assert!(aterm_json::quoted_capacity(max_len).unwrap() <= isize::MAX as usize);
+    assert_eq!(aterm_json::quoted_capacity(max_len + 1), None);
+    assert_eq!(aterm_json::quoted_capacity(usize::MAX / 6 + 1), None);
+    assert_eq!(aterm_json::quoted_capacity(usize::MAX), None);
+}
+
 const GENERATED: &str = "74f9f81f8a37dea6";
 const MUTATED: &str = "4daea7102798962d";
 const ARBITRARY: &str = "090c30db3386449b";

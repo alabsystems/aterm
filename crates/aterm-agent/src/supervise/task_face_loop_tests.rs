@@ -2760,7 +2760,11 @@ impl IdleHost for Restarter {
     fn can_restart(&self) -> bool {
         true
     }
-    fn restart(&self, why: &crate::supervise::policy::turn_end::Restart) -> Option<String> {
+    fn restart(
+        &self,
+        why: &crate::supervise::policy::turn_end::Restart,
+        _: &crate::supervise::policy::turn_end::RestartAsk,
+    ) -> Option<String> {
         self.restarts
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

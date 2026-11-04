@@ -1237,7 +1237,13 @@ impl<S: Read + Write> Client<S> {
     /// All or nothing on THIS side: every frame is built before a byte is written, so a
     /// burst with an op over the frame cap is refused whole, owes nothing and leaves
     /// the client in step; a write that failed latches the client out of step, owing
-    /// nothing. An empty burst writes nothing. While the burst's acks are owed every
+    /// nothing. Owing nothing is not landing nothing: a write cut short (a peer that
+    /// closed, a timeout part way) may have delivered every frame ahead of the cut that the
+    /// broker received whole, and the broker may have published or committed each of them,
+    /// though no ack of theirs is read here. Only the frame the cut fell in, and those after
+    /// it, are sure not to have landed, so a caller that sends the burst's publishes again
+    /// sends them under the same producer ids, and the ones that landed dedup (each answered
+    /// `deduped`). An empty burst writes nothing. While the burst's acks are owed every
     /// request that reads its own reply is refused with [`AcksOwed`], as after any
     /// pipelined send; keep [`owed_acks`](Self::owed_acks) under
     /// [`MAX_PIPELINE_WINDOW`](Self::MAX_PIPELINE_WINDOW).

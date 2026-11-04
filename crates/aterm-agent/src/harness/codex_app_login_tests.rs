@@ -45,6 +45,53 @@ pub(crate) fn make_chatgpt_jwt(email: Option<&str>, plan: &str, exp: i64) -> Str
     make_jwt(&claims)
 }
 
+#[test]
+fn the_native_account_reader_requires_consistent_email_claims_in_one_snapshot() {
+    for user in [Some("same-user"), None] {
+        for (id_email, access_email, expected) in [
+            (Some("b@example.test"), Some("a@example.test"), None),
+            (
+                Some("b@example.test"),
+                Some("b@example.test"),
+                Some("b@example.test"),
+            ),
+            (Some("b@example.test"), None, Some("b@example.test")),
+            (None, Some("b@example.test"), Some("b@example.test")),
+        ] {
+            let home = aterm_tempfile::TempDir::new().unwrap();
+            let token = |email: Option<&str>| {
+                let mut auth = json!({"chatgpt_account_id": "same-account"});
+                if let Some(user) = user {
+                    auth.as_object_mut()
+                        .unwrap()
+                        .insert("chatgpt_user_id".into(), Value::String(user.into()));
+                }
+                let mut claims = json!({"exp": 1_900_000_000, "https://api.openai.com/auth": auth});
+                if let Some(email) = email {
+                    claims
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("email".into(), Value::String(email.into()));
+                }
+                make_jwt(&claims)
+            };
+            let auth = json!({"tokens": {"id_token": token(id_email), "access_token": token(access_email)}}).to_string();
+            std::fs::write(home.path().join("auth.json"), &auth).unwrap();
+            assert_eq!(read_account_email(home.path()).as_deref(), expected);
+            let account = read_account_in_home(home.path());
+            assert_eq!(account.is_some(), expected.is_some());
+            assert_eq!(
+                account.and_then(|account| account.email).as_deref(),
+                expected
+            );
+            assert_eq!(
+                std::fs::read_to_string(home.path().join("auth.json")).unwrap(),
+                auth
+            );
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct RecordedHttp {
     method: String,
@@ -54,6 +101,9 @@ struct RecordedHttp {
 }
 
 fn read_http_request(stream: &mut TcpStream) -> Option<RecordedHttp> {
+    // A socket accepted from a non-blocking listener is non-blocking on macOS, where a read before
+    // the request arrives would end the read here rather than wait out this timeout.
+    stream.set_nonblocking(false).ok()?;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
@@ -449,7 +499,7 @@ fn unavailable_browser_stops_native_pkce_without_requesting_a_person() {
     );
     assert_eq!(
         drove.outcome,
-        Outcome::NotRun("pinned browser fetch is unavailable".into())
+        Outcome::Unverified("pinned browser fetch is unavailable".into())
     );
     assert!(!home.join("auth.json").exists());
 }
@@ -1369,14 +1419,32 @@ fn native_wham_usage_reads_windows_walls_and_refreshes_expired_or_unauthorized_t
         .expect("json"),
     )
     .expect("write");
-    let usage_exp = read_usage_with(
+    let before_exp = CredentialContext::for_login(
+        &load_stored_auth(&home_expiring).unwrap(),
+        &usage_url,
+        &token_url,
+    );
+    let snapshot_exp = read_login_snapshot(
         &home_expiring,
         &usage_url,
         &token_url,
         Duration::from_secs(10),
         now,
-    )
-    .expect("proactively refreshed usage");
+        None,
+    );
+    assert_ne!(snapshot_exp.context, Some(before_exp));
+    assert_eq!(
+        snapshot_exp.context,
+        Some(CredentialContext::for_login(
+            &load_stored_auth(&home_expiring).unwrap(),
+            &usage_url,
+            &token_url,
+        ))
+    );
+    let usage_exp = snapshot_exp
+        .reading
+        .usage()
+        .expect("proactively refreshed usage");
     assert_eq!(usage_exp.sample.session_pct, Some(95));
     let persisted_exp =
         std::fs::read_to_string(home_expiring.join("auth.json")).expect("persisted");
@@ -2760,6 +2828,36 @@ fn codex_refresh_uses_the_recorded_oauth_authority() {
     assert!(!is_loopback_endpoint("http://localhost.evil.test:1234"));
 }
 
+#[cfg(any(unix, windows))]
+#[test]
+fn auth_reads_keep_the_opened_file_and_bound_growth_after_opening() {
+    use std::io::Write as _;
+
+    for grows in [false, true] {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let path = root.path().join(AUTH_FILE);
+        let retained = root.path().join("opened.json");
+        std::fs::write(&path, "opened contents").unwrap();
+        let read = read_auth_file_bounded_with(root.path(), |path| {
+            let opened = aterm_uds::regular_file::open(path)?;
+            std::fs::rename(path, &retained)?;
+            std::fs::write(path, "replacement contents")?;
+            if grows {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&retained)?
+                    .write_all(&vec![b'x'; AUTH_FILE_MAX + 1])?;
+            }
+            Ok(opened)
+        });
+        assert_eq!(read.as_deref(), (!grows).then_some("opened contents"));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "replacement contents"
+        );
+    }
+}
+
 #[test]
 fn auth_reads_are_bounded_regular_non_symlink_files_and_expired_or_portless_login_exits_early() {
     let tmp = aterm_tempfile::tempdir().expect("tempdir");
@@ -3133,6 +3231,148 @@ fn hour_login(home: &Path, now: i64, refresh: Option<&str>) -> StoredAuth {
 }
 
 #[test]
+fn current_login_context_binds_identity_to_the_captured_material() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let home = root.path().join("login");
+    hour_login(&home, 1_790_000_000, None);
+    let old = current_login_context(&home, root.path(), Some("owner@example.test")).unwrap();
+    assert!(old.identity_matches);
+    let changed = make_chatgpt_jwt(Some("replacement@example.test"), "pro", 1_790_007_200);
+    write_auth_doc(
+        &home,
+        &json!({"tokens": {"id_token": changed, "access_token": changed}}),
+    )
+    .unwrap();
+    let for_old = current_login_context(&home, root.path(), Some("owner@example.test")).unwrap();
+    let for_new =
+        current_login_context(&home, root.path(), Some("replacement@example.test")).unwrap();
+    assert!(!for_old.identity_matches);
+    assert!(for_new.identity_matches);
+    assert_ne!(for_old.context, old.context);
+    assert_eq!(for_old.context, for_new.context);
+    assert_eq!(current_context(&home, root.path()), Some(for_new.context));
+    let conflict = |email| {
+        make_jwt(&json!({"email": email,
+        "https://api.openai.com/auth": {"chatgpt_user_id": "same-user"}}))
+    };
+    write_auth_doc(
+        &home,
+        &json!({"tokens": {
+            "id_token": conflict("owner@example.test"),
+            "access_token": conflict("replacement@example.test")
+        }}),
+    )
+    .unwrap();
+    let captured = current_login_context(&home, root.path(), None).unwrap();
+    assert!(!captured.identity_matches);
+    assert_eq!(current_context(&home, root.path()), Some(captured.context));
+    assert!(read_account_email(&home).is_none());
+}
+
+#[test]
+fn credential_context_tracks_semantic_material_and_route_without_read_side_effects() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let home = root.path().join("login");
+    let stored = hour_login(&home, 1_790_000_000, Some("context-refresh"));
+    let path = home.join(AUTH_FILE);
+    let original = std::fs::read(&path).unwrap();
+    let context = current_context(&home, root.path()).unwrap();
+    assert_eq!(current_context(&path, root.path()), Some(context.clone()));
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    let wire = context.to_private_wire();
+    assert_eq!(
+        CredentialContext::from_private_wire(&wire),
+        Some(context.clone())
+    );
+    let debug = format!("{context:?}");
+    assert!(!debug.contains(&wire));
+    assert!(!debug.contains(&stored.access_token));
+    for invalid in [
+        String::new(),
+        wire.to_uppercase(),
+        wire.replace("v1:", "v2:"),
+        format!("{wire}0"),
+        format!("v1:{}g", "0".repeat(63)),
+    ] {
+        assert!(CredentialContext::from_private_wire(&invalid).is_none());
+    }
+    let mut metadata = stored.doc.clone();
+    let object = metadata.as_object_mut().unwrap();
+    object.insert("owner_note".into(), json!("changed independently"));
+    object.insert("last_refresh".into(), json!("2026-01-01T00:00:00Z"));
+    object.insert("auth_mode".into(), json!("chatgptAuthTokens"));
+    object
+        .get_mut("tokens")
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .insert("unrelated_metadata".into(), json!({"order": 2}));
+    std::fs::write(
+        &path,
+        format!("\n\t{}\r\n", aterm_json::to_string(&metadata).unwrap()),
+    )
+    .unwrap();
+    assert_eq!(current_context(&home, root.path()), Some(context.clone()));
+    for field in [
+        "id_token",
+        "access_token",
+        "refresh_token",
+        "account_id",
+        "oauth_provenance",
+    ] {
+        let mut changed = stored.doc.clone();
+        let replacement = if field == "oauth_provenance" {
+            json!({"issuer":"https://other.example.test", "client_id":CLIENT_ID})
+        } else if field.ends_with("token") && field != "refresh_token" {
+            json!(make_chatgpt_jwt(
+                Some("owner@example.test"),
+                "pro",
+                1_790_007_200
+            ))
+        } else {
+            json!("different-context")
+        };
+        changed
+            .as_object_mut()
+            .unwrap()
+            .get_mut("tokens")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert(field.into(), replacement);
+        std::fs::write(&path, changed.to_string()).unwrap();
+        assert_ne!(
+            current_context(&home, root.path()),
+            Some(context.clone()),
+            "{field}"
+        );
+    }
+    std::fs::write(&path, &original).unwrap();
+    std::fs::write(
+        home.join("config.toml"),
+        "chatgpt_base_url='https://other.example.test'\n",
+    )
+    .unwrap();
+    assert_ne!(current_context(&home, root.path()), Some(context));
+    for backend in ["keyring", "auto", "ephemeral"] {
+        std::fs::write(
+            home.join("config.toml"),
+            format!("cli_auth_credentials_store='{backend}'\n"),
+        )
+        .unwrap();
+        assert!(current_context(&home, root.path()).is_none());
+        let observed = observed_in_home(&home, root.path(), Duration::ZERO, 1_790_000_000, None);
+        assert_eq!(observed.reading, Reading::Unread);
+        assert!(observed.context.is_none());
+    }
+    std::fs::remove_file(home.join("config.toml")).unwrap();
+    std::fs::write(&path, "{").unwrap();
+    assert!(current_context(&home, root.path()).is_none());
+    std::fs::remove_file(&path).unwrap();
+    assert!(current_context(&home, root.path()).is_none());
+}
+
+#[test]
 fn a_login_the_provider_refused_reads_signed_out_and_a_failed_refresh_reads_nothing() {
     let now = 1_790_000_000;
     for (token_status, token_body, refresh, want) in [
@@ -3182,7 +3422,7 @@ fn a_login_the_provider_refused_reads_signed_out_and_a_failed_refresh_reads_noth
             "/oauth/token" => (token_status, token_body.clone()),
             _ => ("401 Unauthorized", json!({"error":"unauthorized"})),
         });
-        let got = read_login_with(
+        let snapshot = read_login_snapshot(
             &home,
             &format!("http://127.0.0.1:{port}/backend-api/wham/usage"),
             &format!("http://127.0.0.1:{port}/oauth/token"),
@@ -3190,6 +3430,15 @@ fn a_login_the_provider_refused_reads_signed_out_and_a_failed_refresh_reads_noth
             now,
             None,
         );
+        let expected = (want == Reading::SignedOut).then(|| {
+            CredentialContext::for_login(
+                &load_stored_auth(&home).unwrap(),
+                &format!("http://127.0.0.1:{port}/backend-api/wham/usage"),
+                &format!("http://127.0.0.1:{port}/oauth/token"),
+            )
+        });
+        assert_eq!(snapshot.context, expected);
+        let got = snapshot.reading;
         let seen = provider_seen(port, server);
         assert_eq!(got, want, "{token_status} {refresh:?}: {seen:?}");
         assert_eq!(
@@ -3265,7 +3514,12 @@ fn a_refresh_refused_as_reused_reads_the_rotation_another_program_wrote() {
             _ => ("401 Unauthorized", json!({"error":"unauthorized"})),
         }
     });
-    let got = read_login_with(
+    let old_context = CredentialContext::for_login(
+        &load_stored_auth(&home).unwrap(),
+        &format!("http://127.0.0.1:{port}/backend-api/wham/usage"),
+        &format!("http://127.0.0.1:{port}/oauth/token"),
+    );
+    let snapshot = read_login_snapshot(
         &home,
         &format!("http://127.0.0.1:{port}/backend-api/wham/usage"),
         &format!("http://127.0.0.1:{port}/oauth/token"),
@@ -3275,6 +3529,16 @@ fn a_refresh_refused_as_reused_reads_the_rotation_another_program_wrote() {
     );
     let seen = provider_seen(port, server);
     writer.join().expect("codex-alab's write");
+    assert_ne!(snapshot.context, Some(old_context));
+    assert_eq!(
+        snapshot.context,
+        Some(CredentialContext::for_login(
+            &load_stored_auth(&home).unwrap(),
+            &format!("http://127.0.0.1:{port}/backend-api/wham/usage"),
+            &format!("http://127.0.0.1:{port}/oauth/token"),
+        ))
+    );
+    let got = snapshot.reading;
     let Reading::Usage(usage) = got else {
         panic!("the rotated login is read, not signed out: {got:?} {seen:?}");
     };

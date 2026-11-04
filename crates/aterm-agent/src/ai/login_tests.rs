@@ -991,16 +991,13 @@ fn a_codex_default_row_on_a_build_that_ignores_codex_auth_path_signs_in_by_codex
     let roster = config.join("accounts-codex.toml");
     std::fs::write(&roster, &both).expect("codex roster");
     let pool_store = accounts::Store::at_for(&b.state, Cli::Codex, &b.home);
-    pool_store
-        .transact_logins(now, &mut None, |state, _| {
-            Ok(accounts::note_auth(
-                state,
-                "main",
-                accounts::Auth::SignedOut,
-                now,
-            ))
-        })
-        .expect("sign `main` out");
+    crate::ai::testing::current_codex_auth(
+        &pool_store,
+        &roster,
+        "main",
+        accounts::Auth::SignedOut,
+        now,
+    );
     let home = b.home.display().to_string();
     let var = |k: &str| (k == "HOME").then(|| home.clone());
     let at = |now: i64| Machine {
@@ -1198,18 +1195,44 @@ fn a_managed_default_login_records_failure_without_overwriting_a_newer_sign_in()
             serving_login: Some(("CODEX_HOME", None)),
             ..CliAccounts::default()
         });
+        account_store
+            .transact_logins(now, &mut None, |_, logins| {
+                accounts::note_served_login(logins, "main", now);
+                Ok(Vec::new())
+            })
+            .unwrap();
         let current_store = account_store.clone();
+        let current_roster = f.pool.as_ref().unwrap().roster.clone();
+        let login_home = b.home.join(".codex");
         let runner = FakeRunner::with(move |_| {
             if superseded {
                 current_store
                     .transact_logins(now, &mut None, |state, logins| {
-                        let mut events = accounts::note_auth(state, "main", Auth::SignedOut, now);
-                        events.extend(accounts::note_signed_back(state, logins, "main", now));
-                        Ok(events)
+                        let raw = accounts::Roster::load_for(Cli::Codex, &current_roster).unwrap();
+                        let row = raw.row("main").unwrap();
+                        let context = current_store.capture_auth_context(row).unwrap();
+                        accounts::stage_checked_sign_in(state, row, logins, context, now);
+                        Ok(Vec::new())
                     })
                     .unwrap();
             }
             Ok(ran(1, "", "Not logged in\n"))
+        })
+        .exiting(move |_| {
+            std::fs::create_dir_all(&login_home).unwrap();
+            let token = crate::harness::codex_app_login::tests::make_jwt(&aterm_json::json!({
+                "email": "fixture@example.test",
+                "https://api.openai.com/auth": {"chatgpt_user_id": "fixture-user"}
+            }));
+            std::fs::write(
+                login_home.join("auth.json"),
+                aterm_json::to_vec(&aterm_json::json!({
+                    "tokens": {"id_token": token, "access_token": token}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            0
         });
         assert_eq!(
             Rig::new(&[]).sign_in(&runner, &store, &f, &row(&CODEX, State::SignedOut), &[]),
@@ -1302,25 +1325,27 @@ fn a_first_default_sign_in_checks_identity_and_supersedes_older_reviews() {
             .witness;
             let home = b.home.join(".codex");
             let login_home = home.clone();
-            let runner = FakeRunner::with(move |_| {
-                std::fs::create_dir_all(&login_home).unwrap();
-                let email = if matching {
-                    "owner@example.com"
-                } else {
-                    "other@example.com"
-                };
-                let token = crate::harness::codex_app_login::tests::make_chatgpt_jwt(
-                    Some(email),
-                    "plus",
-                    now + 3600,
-                );
-                std::fs::write(
-                    login_home.join("auth.json"),
-                    aterm_json::json!({"tokens":{"access_token":token}}).to_string(),
-                )
-                .unwrap();
-                Ok(ran(0, "", "Logged in using ChatGPT\n"))
-            });
+            let runner = FakeRunner::with(|_| Ok(ran(0, "", "Logged in using ChatGPT\n"))).exiting(
+                move |_| {
+                    std::fs::create_dir_all(&login_home).unwrap();
+                    let email = if matching {
+                        "owner@example.com"
+                    } else {
+                        "other@example.com"
+                    };
+                    let token = crate::harness::codex_app_login::tests::make_chatgpt_jwt(
+                        Some(email),
+                        "plus",
+                        now + 3600,
+                    );
+                    std::fs::write(
+                        login_home.join("auth.json"),
+                        aterm_json::json!({"tokens":{"access_token":token}}).to_string(),
+                    )
+                    .unwrap();
+                    0
+                },
+            );
             let done =
                 Rig::new(&[]).sign_in(&runner, &store, &f, &row(&CODEX, State::SignedOut), &[]);
             if matching {
@@ -1451,16 +1476,13 @@ fn a_held_signed_out_default_row_on_a_build_that_ignores_codex_auth_path_signs_i
     std::fs::write(&roster_file, roster("held_by = \"m2\"\n")).expect("codex roster");
     let now = 1_800_000_000_i64;
     let pool_store = accounts::Store::at_for(&b.state, Cli::Codex, &b.home);
-    pool_store
-        .transact_logins(now, &mut None, |state, _| {
-            Ok(accounts::note_auth(
-                state,
-                "main",
-                accounts::Auth::SignedOut,
-                now,
-            ))
-        })
-        .expect("sign `main` out");
+    crate::ai::testing::current_codex_auth(
+        &pool_store,
+        &roster_file,
+        "main",
+        accounts::Auth::SignedOut,
+        now,
+    );
     let home = b.home.display().to_string();
     let var = |k: &str| (k == "HOME").then(|| home.clone());
     let m = Machine {
@@ -1653,11 +1675,7 @@ fn grok_signs_in_on_this_terminal_or_through_its_pool_and_never_for_an_agent() {
     }
 }
 
-/// KIMI CODE IS A CONNECTION WHOSE OWN SIGN-IN OVER SSH IS PLAIN `kimi login` WITH THE
-/// OPENER-FREE `PATH`: its device login prints the URL and code for the person to open where
-/// they are (2.3.3's lines, `docs/measured/kimi-review-2026-10-27.md` §6) and opens a browser
-/// only through an opener on `PATH`, so no sandbox holds it (its sign-in's `no_desk` is empty)
-/// and only `PATH` changes. CONTROL: at the desk it runs with this process's `PATH`.
+/// Kimi's SSH sign-in keeps an opener-free PATH and enforces the macOS no-window sandbox.
 #[test]
 fn kimi_signs_in_over_ssh_with_its_own_login_and_no_opener_on_its_path() {
     let kimi = crate::ai::connector::connector("kimi").expect("Kimi Code is a connection");
@@ -1677,11 +1695,22 @@ fn kimi_signs_in_over_ssh_with_its_own_login_and_no_opener_on_its_path() {
         assert_eq!(done, Done::NotChecked, "kimi has no status read");
         let calls = runner.calls();
         assert_eq!(calls.len(), 1, "{calls:?}");
-        assert!(
-            calls[0].terminal && calls[0].program == "kimi" && calls[0].args == ["login"],
-            "over SSH {over_ssh}: {:?}",
-            calls[0]
-        );
+        assert!(calls[0].terminal);
+        if cfg!(target_os = "macos") && over_ssh {
+            assert_eq!(calls[0].program, "sandbox-exec");
+            assert_eq!(
+                calls[0].args,
+                vec![
+                    "-p".to_string(),
+                    crate::harness::login_drive::NO_DESK.to_string(),
+                    shim.display().to_string(),
+                    "login".to_string(),
+                ]
+            );
+        } else {
+            assert_eq!(calls[0].program, "kimi");
+            assert_eq!(calls[0].args, ["login"]);
+        }
         let path = calls[0]
             .env
             .iter()
@@ -1738,6 +1767,10 @@ fn sign_in_over_ssh_opens_no_browser_on_this_machines_desk() {
     let grok = crate::ai::connector::connector("grok").expect("a connection");
     for (c, words) in [
         (grok, &["login", "--device-auth"][..]),
+        (
+            crate::ai::connector::connector("kimi").unwrap(),
+            &["login"][..],
+        ),
         (&CODEX, &["login"][..]),
     ] {
         let b = machine(&[c.id]);
@@ -1944,4 +1977,76 @@ fn with_nobody_here_a_pools_renewal_waits_on_a_bot_check_or_a_persons_step() {
     let done = agent.sign_in(&runner, &store, &pooled, &row(&KIMI, State::SignedOut), &[]);
     assert_eq!(done, Done::SignedIn(None), "CONTROL");
     assert!(!runner.calls()[0].terminal, "CONTROL");
+}
+
+/// A SIGN-IN THAT EXITS NONZERO SIGNED NOTHING IN, WHATEVER A STATUS READ AFTER IT FINDS: Codex's
+/// login that fails and leaves an older login says that exit, and records no sign-in; one the status
+/// shows gone says the exit too. CONTROL: exit 0 with the status signed in is a sign-in.
+#[test]
+fn a_sign_in_that_exits_nonzero_signs_nothing_in() {
+    for status in ["Logged in using ChatGPT\n", "Not logged in\n"] {
+        let b = machine(&["codex"]);
+        let store = Store::at(&b.state);
+        let shim = b.pkg.agents_dir().join("codex");
+        let rig = Rig::new(&[]);
+        let answer = status.to_string();
+        let runner = FakeRunner::with(move |_| {
+            Ok(ran(i32::from(!answer.starts_with("Logged")), "", &answer))
+        })
+        .exiting(|_| 3);
+        let done = rig.sign_in(
+            &runner,
+            &store,
+            &facts(&CODEX, shim),
+            &row(&CODEX, State::SignedOut),
+            &[],
+        );
+        assert_eq!(done, Done::Failed("codex exited 3".to_string()), "{status}");
+        assert_eq!(
+            store
+                .load()
+                .expect("load")
+                .of_scope("codex", Some("file"))
+                .used_how,
+            None,
+            "{status}: no sign-in is on record"
+        );
+    }
+    let b = machine(&["codex"]);
+    let store = Store::at(&b.state);
+    let runner = FakeRunner::with(|_| Ok(ran(0, "", "Logged in using ChatGPT\n")));
+    let done = Rig::new(&[]).sign_in(
+        &runner,
+        &store,
+        &facts(&CODEX, b.pkg.agents_dir().join("codex")),
+        &row(&CODEX, State::SignedOut),
+        &[],
+    );
+    assert_eq!(done, Done::SignedIn(Some("chatgpt")), "CONTROL");
+}
+
+/// A SIGN-IN THAT IS THE CLI ITSELF ENDS WHEN THE PERSON QUITS IT, AND A QUIT'S EXIT SAYS NOTHING OF
+/// THE SIGN-IN: `agy` is opened, signed in and quit, which can exit nonzero, and with no status to
+/// read the result is that nothing reads whether it worked. CONTROL: a `login` subcommand with no
+/// status to read (Muse's) that exits nonzero did not sign in.
+#[test]
+fn a_sign_in_that_is_the_cli_itself_says_nothing_by_its_exit() {
+    use crate::ai::connector::{AGY, MUSE};
+    for (c, want) in [
+        (&AGY, Done::NotChecked),
+        (&MUSE, Done::Failed("muse exited 130".to_string())),
+    ] {
+        let b = machine(&[c.id]);
+        let store = Store::at(&b.state);
+        let shim = b.pkg.agents_dir().join(c.id);
+        let runner = FakeRunner::with(|_| Ok(ran(0, "", ""))).exiting(|_| 130);
+        let done = Rig::new(&[]).sign_in(
+            &runner,
+            &store,
+            &facts(c, shim),
+            &row(c, State::SignedOut),
+            &[],
+        );
+        assert_eq!(done, want, "{}", c.id);
+    }
 }

@@ -382,6 +382,10 @@ impl alab_roster::Source for &'static Cache {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .failed
     }
+
+    fn turned_off(&self) -> bool {
+        turned_off(&self.config)
+    }
 }
 
 static CACHE: OnceLock<Cache> = OnceLock::new();

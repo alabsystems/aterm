@@ -315,7 +315,7 @@ fn socket_leg(sock: &str, request: &str, wait: Duration) -> Leg {
         Err(e) if redial::is_hangup(&e) => return Leg::HungUp { server, listener },
         Err(e) => return Leg::Failed(e),
     }
-    read_leg(&mut BufReader::new(&stream), super::MAX_BODY_BYTES, || {
+    read_leg(&mut super::reply_on(&stream), super::MAX_BODY_BYTES, || {
         Leg::HungUp { server, listener }
     })
 }

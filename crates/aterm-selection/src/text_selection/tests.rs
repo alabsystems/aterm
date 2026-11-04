@@ -1050,3 +1050,145 @@ fn is_empty_iff_none_or_the_anchors_coincide() {
         }
     }
 }
+
+/// NEGATIVE CONTROL: `intersects_absolute_band` rejects `SelectionState::None`, inverted
+/// `lo_abs > hi_abs` ranges, and negative out-of-history hulls, while matching exact integer
+/// interval overlap above `i64::MAX as u64` and near `u64::MAX`.
+#[test]
+fn intersects_absolute_band_matches_exact_integer_hull_across_u64_domain() {
+    let empty = TextSelection::new();
+    assert!(!empty.intersects_absolute_band(0, 0, 0));
+    assert!(!empty.intersects_absolute_band(u64::MAX, 0, u64::MAX));
+
+    let above_i64 = (i64::MAX as u64) + 20;
+    let bases = [
+        0u64,
+        2,
+        10,
+        (i64::MAX as u64) - 5,
+        i64::MAX as u64,
+        above_i64,
+        u64::MAX - 5,
+        u64::MAX,
+    ];
+    let rows = [i32::MIN, -15, -5, -1, 0, 1, 5, i32::MAX];
+    for &base in &bases {
+        let bands = [
+            (0u64, 0u64),
+            (0, 5),
+            (5, 4),
+            (base.saturating_sub(10), base.saturating_sub(6)),
+            (base.saturating_sub(5), base),
+            (base, base.saturating_add(5)),
+            (u64::MAX, 0),
+            (u64::MAX - 2, u64::MAX),
+        ];
+        for &r1 in &rows {
+            for &r2 in &rows {
+                let mut sel = TextSelection::new();
+                sel.start_selection(r1, 1, SelectionSide::Left, SelectionType::Simple);
+                sel.update_selection(r2, 3, SelectionSide::Right);
+                let min_r = i128::from(r1.min(r2));
+                let max_r = i128::from(r1.max(r2));
+                let hull_lo = i128::from(base) + min_r;
+                let hull_hi = i128::from(base) + max_r;
+                for &(lo, hi) in &bands {
+                    let expected =
+                        lo <= hi && i128::from(lo) <= hull_hi && hull_lo <= i128::from(hi);
+                    assert_eq!(
+                        sel.intersects_absolute_band(base, lo, hi),
+                        expected,
+                        "in-progress base={base} r=({r1},{r2}) band={lo}..={hi}"
+                    );
+                }
+                sel.complete_selection();
+                for &(lo, hi) in &bands {
+                    let expected =
+                        lo <= hi && i128::from(lo) <= hull_hi && hull_lo <= i128::from(hi);
+                    assert_eq!(
+                        sel.intersects_absolute_band(base, lo, hi),
+                        expected,
+                        "complete base={base} r=({r1},{r2}) band={lo}..={hi}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// NEGATIVE CONTROL: `truncate_to_floor` computes exact `u64` scrollback depth above
+/// `i64::MAX as u64` rather than collapsing `oldest_abs - live_top_abs` to `0` and wiping
+/// surviving scrollback selections.
+#[test]
+fn truncate_to_floor_preserves_scrollback_depth_above_i64_max() {
+    let oldest = (i64::MAX as u64) + 10;
+    let live_top = oldest + 10;
+
+    let mut intact = TextSelection::new();
+    intact.start_selection(-8, 2, SelectionSide::Left, SelectionType::Simple);
+    intact.update_selection(-2, 5, SelectionSide::Right);
+    intact.complete_selection();
+    assert!(intact.truncate_to_floor(oldest, live_top));
+    assert!(!intact.truncated());
+    assert_eq!((intact.start().row, intact.end().row), (-8, -2));
+
+    let mut clamped = TextSelection::new();
+    clamped.start_selection(-14, 4, SelectionSide::Right, SelectionType::Simple);
+    clamped.update_selection(-3, 6, SelectionSide::Right);
+    clamped.complete_selection();
+    assert!(clamped.truncate_to_floor(oldest, live_top));
+    assert!(clamped.truncated());
+    assert_eq!(
+        clamped.start(),
+        SelectionAnchor::new(-10, 0, SelectionSide::Left)
+    );
+    assert_eq!(
+        clamped.end(),
+        SelectionAnchor::new(-3, 6, SelectionSide::Right)
+    );
+
+    let mut evicted = TextSelection::new();
+    evicted.start_selection(-20, 0, SelectionSide::Left, SelectionType::Simple);
+    evicted.update_selection(-11, 3, SelectionSide::Right);
+    evicted.complete_selection();
+    assert!(!evicted.truncate_to_floor(oldest, live_top));
+    assert_eq!(evicted.state(), SelectionState::None);
+    assert!(!evicted.truncated());
+
+    let mut deep = TextSelection::new();
+    deep.start_selection(i32::MIN, 1, SelectionSide::Left, SelectionType::Block);
+    deep.update_selection(-1, 4, SelectionSide::Right);
+    deep.complete_selection();
+    assert!(deep.truncate_to_floor(0, u64::MAX));
+    assert!(!deep.truncated());
+    assert_eq!((deep.start().row, deep.end().row), (i32::MIN, -1));
+}
+
+/// NEGATIVE CONTROL: `relocate` rewrites raw anchor `(row, col)` coordinates while framing
+/// anchor sides, `selection_type`, `state`, and `truncated`.
+#[test]
+fn relocate_updates_anchor_coordinates_preserving_sides_type_state_and_truncated() {
+    let mut none = TextSelection::new();
+    none.relocate(-4, 7, 9, 12);
+    assert_eq!(none.state(), SelectionState::None);
+    assert!(!none.truncated());
+    assert_eq!((none.start().row, none.start().col), (-4, 7));
+    assert_eq!((none.end().row, none.end().col), (9, 12));
+
+    let mut sel = TextSelection::new();
+    sel.start_selection(-12, 5, SelectionSide::Right, SelectionType::Block);
+    sel.update_selection(-2, 9, SelectionSide::Left);
+    sel.complete_selection();
+    assert!(sel.truncate_to_floor(100, 108));
+    assert!(sel.truncated());
+
+    sel.relocate(-6, 11, 4, 2);
+    assert_eq!(sel.state(), SelectionState::Complete);
+    assert_eq!(sel.selection_type(), SelectionType::Block);
+    assert!(sel.truncated());
+    assert_eq!(
+        sel.start(),
+        SelectionAnchor::new(-6, 11, SelectionSide::Right)
+    );
+    assert_eq!(sel.end(), SelectionAnchor::new(4, 2, SelectionSide::Left));
+}

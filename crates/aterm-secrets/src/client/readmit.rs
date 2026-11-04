@@ -65,6 +65,7 @@ use super::admit::{
 use super::*;
 use crate::commons::binding::Request;
 use crate::members::Allowed;
+use crate::members::bundle::Reader;
 use crate::membership_log::{
     Body, Budget, Entrant, EpochAudience, Evidence, Kind, Log, MemberId, NodeStanding, Record,
     RecordCounts, RecordId, Signer, encode_records,
@@ -176,6 +177,8 @@ pub struct Proven<'a> {
     pub node: [u8; 32],
     /// The machine name it asks under, for display.
     pub name: &'a str,
+    /// Payload and capacity capability stated on this same proof exchange.
+    pub reader: Reader,
     /// The fleet handshake also proved the fleet's current key, and this member's own drive
     /// admission takes the node.
     pub fleet: bool,
@@ -621,11 +624,14 @@ const NOT_HERE: &str = "this member admits nobody through the membership log";
 
 /// Why a member that may not know of a removal lets no new key in.
 const NOT_FRESH: &str = "this member did not read all of the vault's newest records just now (no \
-                         server or peer answered, or one holds records this build cannot take), \
-                         so it may not know of a removal: another member may let the Mac in";
+                         server or peer answered, one holds records this build cannot take, or \
+                         only servers of a build before the crossed fence, which state no \
+                         records bound, answered), so it may not know of a removal: another \
+                         member may let the Mac in";
 
 /// Whether this member read all of the vault's newest records from its servers and peers just now
-/// (within [`FRESH_WITHIN`]).
+/// (within [`FRESH_WITHIN`]), a server that states its records bound among those that answered
+/// ([`crate::crossing`], [`super::RecordsPass::fresh`]).
 fn read_newest(paths: &Paths) -> bool {
     super::sync_records_until(
         paths,
@@ -635,7 +641,7 @@ fn read_newest(paths: &Paths) -> bool {
         Some(Instant::now() + FRESH_WITHIN),
         None,
     )
-    .is_ok_and(|pass| !pass.untaken)
+    .is_ok_and(|pass| pass.fresh())
 }
 
 /// Whether a Mac under `node` has nothing in `log` that gives it a claim: no seat, no `Admit` and no
@@ -667,11 +673,17 @@ fn pre_possession_pass(
     now_ms: u64,
     synced: bool,
 ) -> Result<Decision, Option<String>> {
-    let Some((_, log, _, opened)) = held_log(paths).map_err(|_| None)? else {
+    let Some((store, log, _, opened)) = held_log(paths).map_err(|_| None)? else {
         return Err(Some(NOT_HERE.to_owned()));
     };
     if !synced && !proving.fleet && !proving.lan && unclaimed(&log, &proving.node) {
         return Err(Some(NO_SEAT.to_owned()));
+    }
+    let source = records_bound(paths, &store).map_err(|_| None)?;
+    if !proven.reader.can_take(source) {
+        return Err(Some(
+            "the joining device cannot receive this membership history".to_owned(),
+        ));
     }
     let binding = proving.request.binding();
     if let Some(why) =
@@ -725,6 +737,7 @@ pub fn refuses_before_possession_at_ms(
         request: proving.request,
         node: proving.node,
         name: proving.name,
+        reader: proving.reader,
         fleet: proving.fleet,
         lan: proving.lan,
         fresh: false,
@@ -793,6 +806,11 @@ pub fn admit_by_proof(paths: &Paths, proven: &Proven<'_>, now_ms: u64) -> crate:
     let Some((mut store, mut log, _, opened)) = held_log(paths)? else {
         return Ok(Readmit::NotHere);
     };
+    if !proven.reader.can_take(records_bound(paths, &store)?) {
+        return Ok(Readmit::Refused(
+            "the joining device cannot receive this membership history".to_owned(),
+        ));
+    }
     let binding = proven.request.binding();
     if let Some(why) = roster_keeps_out(paths, Some(&opened), binding, proven.node, Some(&lock))? {
         return Ok(Readmit::Refused(why));
@@ -923,14 +941,29 @@ pub fn admit_by_proof(paths: &Paths, proven: &Proven<'_>, now_ms: u64) -> crate:
             seated.label
         )));
     }
+    if !signed.is_empty() {
+        store.ingest(&encode_records(&signed))?;
+        if signed
+            .iter()
+            .any(|record| store.get_bytes(record.id()).is_none())
+        {
+            return Err(Error::new("the proof admission cannot be retained in full"));
+        }
+    }
+    let source = records_bound(paths, &store)?;
+    if !proven.reader.can_take(source) {
+        return Ok(Readmit::Refused(
+            "the proof admission exceeds the joining device's record capacity".to_owned(),
+        ));
+    }
     let admission = LogAdmission {
+        source,
         admit: seated.entry,
         label: seated.label.clone(),
         signed: signed.clone(),
         records: Vec::new(),
     };
     if !signed.is_empty() {
-        store.ingest(&encode_records(&signed))?;
         super::write_records(paths, &store)?;
     }
     let allowed = device.with_seed(|seed| Allowed::sign(binding, &name, seed))?;
@@ -938,10 +971,11 @@ pub fn admit_by_proof(paths: &Paths, proven: &Proven<'_>, now_ms: u64) -> crate:
         paths,
         &allowed,
         LogAdmission {
-            records: store.encode(),
+            records: store.encode_held(),
             ..admission
         },
         policy,
+        proven.reader,
     )?;
     drop(lock);
     if !signed.is_empty() {
@@ -983,6 +1017,7 @@ pub fn prove_at_ms(
         request: proving.request,
         node: proving.node,
         name: proving.name,
+        reader: proving.reader,
         fleet: proving.fleet,
         lan: proving.lan,
         fresh: proving.fresh.get(),

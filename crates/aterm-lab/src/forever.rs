@@ -163,6 +163,10 @@ const CRUISE_N_LIMIT_MS: i64 = 20 * 60 * 1000;
 /// the short streak's fourth back-off (16 min, a defense being a done claim that lengthens the
 /// streak) after the 8 min one before the nudge quoting its list, about 28 min on every harness.
 const LIST_CONTRADICTED_LIMIT_MS: i64 = 35 * 60 * 1000;
+/// How long land-reworded may take to watch past its hold: the nudge quoting its new words waits
+/// out a second back-off after the second check (4 min, its hold at +875.1 s under Claude Code
+/// 2.1.318, 8 min on a longer short streak) after the 8 min one before the nudge quoting its list.
+const LIST_REWORDED_LIMIT_MS: i64 = 24 * 60 * 1000;
 const WALL_REDRAW_LIMIT_MS: i64 = 30 * 60 * 1000;
 const WALL_SWITCH_LIMIT_MS: i64 = 30 * 60 * 1000;
 const WALL_UNREAD_LIMIT_MS: i64 = 100 * 60 * 1000;
@@ -1632,6 +1636,7 @@ impl Chain {
             Chain::Cap => CAP_LIMIT_MS,
             Chain::CruiseN => CRUISE_N_LIMIT_MS,
             Chain::LandContradictedList => LIST_CONTRADICTED_LIMIT_MS,
+            Chain::LandReworded => LIST_REWORDED_LIMIT_MS,
             Chain::Ladder => LADDER_LIMIT_MS,
             Chain::CruiseWall => WALL_CRUISE_LIMIT_MS,
             Chain::RelaunchWall => WALL_RELAUNCH_LIMIT_MS,
@@ -8232,8 +8237,7 @@ fn finished(tab: &Tab, now: i64) -> bool {
         | Chain::LandG
         | Chain::LandH
         | Chain::LandI
-        | Chain::LandSameList
-        | Chain::LandReworded => {
+        | Chain::LandSameList => {
             (nudge.is_some() && surfaces::held::watched_past(s, now)) || done_since(20_000)
         }
         // land-contradicted-list's hold comes after its second nudge, the contradiction: the
@@ -8241,6 +8245,17 @@ fn finished(tab: &Tab, now: i64) -> bool {
         Chain::LandContradictedList => {
             (s.acts(turn_end::RULE_LAND_NUDGE).len() >= 2 && surfaces::held::watched_past(s, now))
                 || done_since(20_000)
+        }
+        // land-reworded's hold comes after the nudge quoting its new words, the first past its
+        // second check: the back-off before that nudge is no end of its watch.
+        Chain::LandReworded => {
+            let second_check = s.acts(turn_end::RULE_LAND_CHECK).get(1).map(|(t, _)| *t);
+            let quoted = second_check.is_some_and(|c| {
+                s.acts(turn_end::RULE_LAND_NUDGE)
+                    .iter()
+                    .any(|(t, _)| *t > c)
+            });
+            (quoted && surfaces::held::watched_past(s, now)) || done_since(20_000)
         }
         // L6 rests on its check's need: watched past the ladder's next step after the rest, as a
         // landing is.

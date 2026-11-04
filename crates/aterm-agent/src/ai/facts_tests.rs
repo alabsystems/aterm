@@ -5,6 +5,9 @@ use super::*;
 use crate::ai::connector::{CLAUDE, CODEX, GROK};
 use crate::ai::testing::machine;
 
+#[path = "facts_default_identity_tests.rs"]
+mod default_identity;
+
 fn gather_with(
     b: &crate::ai::testing::Box3,
     vars: &[(&str, &str)],
@@ -1215,16 +1218,13 @@ fn a_codex_review_on_a_build_that_ignores_codex_auth_path_signs_in_only_the_defa
     )
     .expect("codex roster");
     let store = Store::at_for(&b.state, Cli::Codex, &b.home);
-    store
-        .transact_logins(now, &mut None, |state, _| {
-            Ok(accounts::note_auth(
-                state,
-                "main",
-                accounts::Auth::SignedOut,
-                now,
-            ))
-        })
-        .expect("sign `main` out");
+    crate::ai::testing::current_codex_auth(
+        &store,
+        &roster_path,
+        "main",
+        accounts::Auth::SignedOut,
+        now,
+    );
     let home = b.home.display().to_string();
     let var = |k: &str| (k == "HOME").then(|| home.clone());
     let m = Machine {
@@ -1389,16 +1389,13 @@ fn a_codex_pool_judges_the_program_a_launch_runs_not_the_managed_copy() {
 
     // Past its wall, `main` signs out.
     let later = now + 7200;
-    store
-        .transact_logins(later, &mut None, |state, _| {
-            Ok(accounts::note_auth(
-                state,
-                "main",
-                accounts::Auth::SignedOut,
-                later,
-            ))
-        })
-        .expect("sign `main` out");
+    crate::ai::testing::current_codex_auth(
+        &store,
+        &config.join("accounts-codex.toml"),
+        "main",
+        accounts::Auth::SignedOut,
+        later,
+    );
     let f = gather(&at(later), &CODEX);
     let pool = f.pool.as_ref().expect("codex pool");
     assert_eq!(
@@ -1478,26 +1475,18 @@ impl DoctorPool {
 
     /// `main` recorded signed out a minute ago, its login file left in place.
     fn sign_out_main(&self) {
-        self.state(|state| {
-            crate::harness::accounts::note_auth(
-                state,
-                "main",
-                crate::harness::accounts::Auth::SignedOut,
-                Self::NOW - 60,
-            );
-        });
+        self.sign_out("main");
     }
 
     /// `label` recorded signed out a minute ago, its login file left in place.
     fn sign_out(&self, label: &str) {
-        self.state(|state| {
-            crate::harness::accounts::note_auth(
-                state,
-                label,
-                crate::harness::accounts::Auth::SignedOut,
-                Self::NOW - 60,
-            );
-        });
+        crate::ai::testing::current_codex_auth(
+            &self.store,
+            &self.roster,
+            label,
+            crate::harness::accounts::Auth::SignedOut,
+            Self::NOW - 60,
+        );
     }
 
     /// The roster of `main` alone, with `email` where one is given.
@@ -1869,6 +1858,41 @@ fn a_launch_another_mac_holds_back_is_a_note_that_asks_nobody() {
     }
 }
 
+/// `aterm ai login codex` SIGNS IN NO HEALTHY ROW: with `main`, which has no email, signed out
+/// beside a healthy `work`, the login runs nothing and names what `main` needs, its `accounts login`
+/// at a terminal, never `work`. CONTROL: with every row healthy, the pool needs no sign-in, and the
+/// refusal says so.
+#[test]
+fn a_login_signs_in_no_healthy_row_beside_a_signed_out_row_with_no_email() {
+    use crate::harness::accounts::Cli;
+    let pool = DoctorPool::new(true, None);
+    let work = pool.b.home.join(".aterm/logins/codex/work");
+    std::fs::write(
+        &pool.roster,
+        format!(
+            "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n\n\
+             [[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = {:?}\n\
+             email = \"work@example.com\"\n",
+            work.display().to_string()
+        ),
+    )
+    .expect("codex roster");
+    let f = pool.facts();
+    let p = f.pool.as_ref().expect("codex pool");
+    assert_eq!(p.next, None, "CONTROL");
+    let why = crate::ai::login::pool_target(Cli::Codex, p).expect_err("nothing to sign in");
+    assert!(why.contains("needs no sign-in"), "CONTROL: {why}");
+
+    pool.sign_out_main();
+    let f = pool.facts();
+    let p = f.pool.as_ref().expect("codex pool");
+    assert_eq!(p.next, None, "the healthy row is not next");
+    assert_eq!(p.unaddressed.as_deref(), Some("main"));
+    let why = crate::ai::login::pool_target(Cli::Codex, p).expect_err("nothing to sign in");
+    assert!(why.contains("accounts login main --cli codex"), "{why}");
+    assert!(!why.contains("`work`"), "{why}");
+}
+
 /// WHERE A CODEX ROSTER CARRIES AN EMAIL AND NO ROW HAS A SIGN-IN TO RUN, `aterm ai login codex`
 /// SAYS SO, NEVER THAT THE ROSTER LISTS NO EMAIL: on a build that keeps no row's login its own,
 /// with `main` alone listed, with an email, and its login working, the refusal points at the
@@ -1886,8 +1910,7 @@ fn a_login_with_an_email_and_nothing_to_sign_in_says_so() {
     );
     let why = crate::ai::login::pool_target(Cli::Codex, p).expect_err("nothing to sign in");
     assert!(
-        why.contains("names no row `aterm ai login codex` signs in now")
-            && why.contains("says each row's state"),
+        why.contains("needs no sign-in") && why.contains("says each row's state"),
         "{why}"
     );
     assert!(!why.contains("lists no email"), "{why}");
@@ -2076,7 +2099,7 @@ fn held_by_rows_are_excluded_from_due_next_and_next_sign_in() {
     let f = pool.facts();
     let p = f.pool.as_ref().expect("codex pool");
     assert_eq!(p.serving_label.as_deref(), Some("warm"));
-    assert_eq!(p.next.as_deref(), Some("warm"));
+    assert_eq!(p.next, None, "nothing here needs a sign-in");
     assert!(p.due.is_empty());
 
     pool.state(|state| {
@@ -2093,4 +2116,13 @@ fn held_by_rows_are_excluded_from_due_next_and_next_sign_in() {
     let p = f.pool.as_ref().expect("codex pool with warm walled");
     assert_eq!(p.serving_label.as_deref(), Some("warm"));
     assert_eq!(p.next_sign_in, None, "held row is never next_sign_in");
+
+    std::fs::remove_file(warm_dir.join("auth.json")).expect("warm's login");
+    let f = pool.facts();
+    let p = f.pool.as_ref().expect("codex pool with warm's login gone");
+    assert_eq!(
+        p.next.as_deref(),
+        Some("warm"),
+        "held comes first, and is not next"
+    );
 }

@@ -1023,6 +1023,16 @@ fn pair(r: &Rec) -> (Op, Lvl) {
     (r.op, r.node.lvl)
 }
 
+// Corpus structural expectations do not consume the independent raw vendor
+// observations. The complete records still participate in replay and twins.
+fn structural(r: &Rec) -> bool {
+    !(r.op == Op::Mark
+        && r.k == Kind::Meta
+        && r.src == Src::Transcript
+        && r.by == Actor::Vendor
+        && r.f.get_str(Key::Field) == Some("vendor-turn"))
+}
+
 fn check(
     live: &Live,
     all: &[Rec],
@@ -1047,7 +1057,10 @@ fn check(
             toks,
         } => {
             let i = next.entry((op.word(), *lvl)).or_insert(0);
-            let of_pair: Vec<&Rec> = all.iter().filter(|r| pair(r) == (*op, *lvl)).collect();
+            let of_pair: Vec<&Rec> = all
+                .iter()
+                .filter(|r| structural(r) && pair(r) == (*op, *lvl))
+                .collect();
             let Some(r) = of_pair.get(*i) else {
                 return Err(format!(
                     "no {} record of a {lvl:?} is appended yet (entry {} of the pair)",
@@ -1394,7 +1407,7 @@ pub fn replay(seq: &Seq, broken: Broken) -> Result<Replay, String> {
     }
     let name = &seq.name;
     for (p, n) in &named {
-        let of = |r: &&Rec| (r.op.word(), r.node.lvl) == *p;
+        let of = |r: &&Rec| structural(r) && (r.op.word(), r.node.lvl) == *p;
         let got = all.iter().filter(of).count();
         if got != *n {
             let lines: Vec<String> = all.iter().filter(of).map(enc).collect();

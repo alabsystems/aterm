@@ -100,7 +100,7 @@ value-encoding	contract	ser::{to_vec,to_string,write_json_string,write_u128,writ
 number-normal-form	invariant	value::Number::{from(u64),from(i64),from(f64),as_u64,as_i64,as_f64}, value::ValueVisitor::{visit_i64,visit_u64,visit_f64}	Type invariant on Number: Signed(v) ⇒ v < 0. Every constructor keeps it: the field is private and From<i64> maps v ≥ 0 to Unsigned. So a non-negative integer has exactly one representation. as_u64 = Some(v) ⇔ Unsigned(v); as_i64 is Some for Signed and for Unsigned ≤ i64::MAX; as_f64 is always Some (an `as` cast). A lemma of value-roundtrip: without it, Signed(5) would read back as Unsigned(5).	(none directly; lemma)	EASY: private-field enum invariant; i64::unsigned_abs; i64::try_from(u64); `as` cast to f64	0,1,3
 value-roundtrip	round-trip	ser::to_string, de::from_str, <Value as Serialize>::serialize, value::ValueVisitor, de::Deserializer::parse_number	∀ v: Value with every float finite and depth(v) ≤ 127: from_str::<Value>(&to_string(&v)?) = Ok(v′) with v′ structurally identical to v, floats compared by to_bits (so -0.0 keeps its sign). Uses number-normal-form, string-escape-roundtrip and float-f64-shortest-roundtrip. Corollary: ∀ b ∈ JSONa, from_str(to_string(Den(b))) = Den(b) bitwise, the lossless check the test helper `parse` makes on every accepted document.	generated_documents_parse_and_reserialize, mutated_documents_get_their_pinned_verdicts, named_edge_cases_get_their_pinned_verdicts	FREE given value-encoding, json-accepts-exactly-grammar and the three lemmas: composition over a recursive enum with Vec and BTreeMap; float bit equality	0,1,2,3,4,5,7,11
 integer-format	contract	ser::{write_u128,write_i128}, ser::Serializer::serialize_{u8,u16,u32,u64,u128,i8,i16,i32,i64,i128}, ser::KeySerializer::{quoted_number,serialize_<int>}	∀ integer n of every width (u8..u128, i8..i128): to_string(&n) = Ok(n.to_string()): `-` iff n < 0, no leading zeros, `0` for zero, i128::MIN exact through unsigned_abs. write_u128(out, x) appends exactly the decimal digits of x (1 to 39 of them) and nothing else. As a map key, an integer is that decimal in quotes.	json::integer_formatting, wide_integers_round_trip_or_fail	EASY-MEDIUM: a while loop over a [u8;39] buffer with % and / by 10 on u128; slice get_mut/get; &mut Vec<u8>; loop invariant: buf[i..] encodes value / 10^k	0,1,2,3,5,7
-string-escape-roundtrip	round-trip	ser::{write_json_string,hex_nibble}, ser::Serializer::{serialize_str,serialize_char}, de::Deserializer::{parse_string_body,parse_escape,parse_hex4}	∀ s: &str: to_string(&s) = Ok(Q(s)): only C0 controls, `"` and `\` are escaped, in Q's forms; every other byte (DEL, non-ASCII, `/`, U+2028/2029) is copied verbatim. from_str::<String>(&Q(s)) = Ok(s.to_owned()). ∀ c: char: to_string(&c) = Ok(Q(c.to_string())).	json::string_escaping_is_pinned_and_round_trips	MEDIUM: for loop with enumerate over bytes plus a chunk index; slice get(chunk..i); extend_from_slice; hex_nibble lookup via get().unwrap_or; char::encode_utf8. The writer half is EASY alone; the inverse needs the parse_string_body model.	0,1,2,3,4,5,7
+string-escape-roundtrip	round-trip	ser::{quoted_string,quoted_capacity,write_json_string,hex_nibble}, ser::Serializer::{serialize_str,serialize_char}, de::Deserializer::{parse_string_body,parse_escape,parse_hex4}	∀ s: &str: to_string(&s) = Ok(Q(s)): only C0 controls, `"` and `\` are escaped, in Q's forms; every other byte (DEL, non-ASCII, `/`, U+2028/2029) is copied verbatim. quoted_capacity(n) = Some(6n + 2) iff 6n + 2 ≤ isize::MAX (without overflow), else None; quoted_string(s) reserves that exact capacity up front (no growth reallocation while holding text) and writes Q(s), or returns Err("quoted string exceeds capacity"). from_str::<String>(&Q(s)) = Ok(s.to_owned()). ∀ c: char: to_string(&c) = Ok(Q(c.to_string())).	json::{string_escaping_is_pinned_and_round_trips, preallocated_quoting_matches_general_serialization_at_escape_bounds, quoted_capacity_refuses_overflow_and_exceeding_isize_max}	MEDIUM: const fn checked_mul/checked_add capacity bound; for loop with enumerate over bytes plus a chunk index; slice get(chunk..i); extend_from_slice; hex_nibble lookup via get().unwrap_or; char::encode_utf8. The writer half is EASY alone; the inverse needs the parse_string_body model.	0,1,2,3,4,5,7
 float-f64-shortest-roundtrip	contract	ser::{write_f64,write_special,shortest_f64,split_exp,write_layout}, ser::Serializer::serialize_f64, de::from_str::<f64>	∀ x: f64: to_string(&x) = Ok(F64(x)). Not finite → `null`; ±0 → `0.0`/`-0.0`. For finite x ≠ 0 the text t is in the JSON number grammar and contains `.` or `e` (it never reads back as an integer); t.parse::<f64>() and from_str::<f64>(t) both have the bits of x; t's significant-digit count is the minimum over all decimals that round to x, and among those the digits are the closest to x; kk = e+1 ∈ -4..=16 gives fixed notation, anything else d.ddde±X.	json::float_formatting_is_pinned_and_round_trips, a_power_of_two_gets_the_shortest_digits	VERY HARD: format!("{:e}") and format!("{:.p$e}") (std float formatting; format_args uses an unsafe constructor the Trust model refuses); str::parse::<f64>; String filtering by chars; i32 arithmetic; loops pushing zeros; split_at. Needs a Clean model of binary64 rounding intervals and the shortest-digits theorem (Ryu/Grisu). See §5.5 for an unproved step.	0,1,3,5,7,8,14
 float-f32-shortest	contract	ser::{write_f32,shortest_f32,write_layout,write_special}, ser::Serializer::serialize_f32	∀ y: f32: to_string(&y) = Ok(F32(y)). The f64 statement at binary32: the digits are the shortest that round to y as an f32 (not to the f64 it widens to), closest among them; t.parse::<f32>() has the bits of y; fixed notation iff kk ∈ -5..=13.	json::f32_formatting_is_pinned, a_power_of_two_gets_the_shortest_digits	VERY HARD: as float-f64-shortest-roundtrip, at binary32	0,1,3,5,7,8,14
 float-parse-correctly-rounded	contract	de::Deserializer::{parse_number,visit_number,dispatch}, <&mut de::Deserializer as serde::Deserializer>::deserialize_f64 (forwarded to deserialize_any), serde f64 primitive visitor	∀ t in the JSON number grammar (after ws): from_str::<f64>(t) = Ok(nearest(t)) bitwise when nearest(t) is finite, Err otherwise. Integer tokens included: a token classified Unsigned/Signed goes through visit_u64/visit_i64 and `as f64`, which equals nearest(t); a token wider than 64 bits goes straight to nearest. `-0` gives -0.0; underflow gives ±0.	json::our_float_parsing_is_correctly_rounded	HARD: str::parse::<f64> (dec2flt model); the u64/i64 `as f64` rounding lemma; serde's primitive visitor (cross-crate)	0,1,3,5,11,12
@@ -117,16 +117,18 @@ index-total	no-panic	<Value as Index<&str>>::index, <Value as Index<usize>>::ind
 ## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
-Every file is `crates/aterm-json/tests/json.rs`.
+Files are relative to the workspace root.
 
 ```tsv
 file	test	primary	also
+crates/aterm-json/tests/json.rs	preallocated_quoting_matches_general_serialization_at_escape_bounds	string-escape-roundtrip	
+crates/aterm-json/tests/json.rs	quoted_capacity_refuses_overflow_and_exceeding_isize_max	string-escape-roundtrip	
 crates/aterm-json/tests/json.rs	ignored_strings_validate_the_same_bytes_as_materialized_values	skip-equals-materialize	
 crates/aterm-json/tests/json.rs	generated_documents_parse_and_reserialize	json-accepts-exactly-grammar	value-roundtrip
 crates/aterm-json/tests/json.rs	mutated_documents_get_their_pinned_verdicts	json-accepts-exactly-grammar	value-roundtrip
 crates/aterm-json/tests/json.rs	arbitrary_bytes_get_their_pinned_verdicts	json-accepts-exactly-grammar	
 crates/aterm-json/tests/json.rs	named_edge_cases_get_their_pinned_verdicts	json-accepts-exactly-grammar	value-roundtrip
-crates/aterm-json/tests/json.rs	the_recursion_limit	recursion-limit	(bound in the doc is off by one, §5.2)
+crates/aterm-json/tests/json.rs	the_recursion_limit	recursion-limit	
 crates/aterm-json/tests/json.rs	float_formatting_is_pinned_and_round_trips	float-f64-shortest-roundtrip	
 crates/aterm-json/tests/json.rs	f32_formatting_is_pinned	float-f32-shortest	
 crates/aterm-json/tests/json.rs	a_power_of_two_gets_the_shortest_digits	float-f64-shortest-roundtrip	float-f32-shortest
@@ -139,23 +141,23 @@ crates/aterm-json/tests/json.rs	wide_integers_round_trip_or_fail	typed-integer-t
 crates/aterm-json/tests/json.rs	a_value_that_cannot_serialize_is_refused	key-serializer-refuses	
 crates/aterm-json/tests/json.rs	every_map_the_writer_accepts_reads_back	deserializer-faithful	key-serializer-refuses, integer-format
 crates/aterm-json/tests/json.rs	a_key_reads_back_only_in_the_spelling_the_writer_uses	deserializer-faithful	key-serializer-refuses
-crates/aterm-json/tests/json.rs	deny_unknown_fields_denies	deserializer-faithful	(one row is mislabelled, §5.1)
+crates/aterm-json/tests/json.rs	deny_unknown_fields_denies	deserializer-faithful	
 crates/aterm-json/tests/json.rs	the_json_macro	json-macro-denotation	value-encoding
 crates/aterm-json/tests/json.rs	to_value_and_from_value_round_trip	to-value-exact	serializer-data-model, deserializer-faithful
 crates/aterm-json/tests/json.rs	value_display_is_compact	value-encoding	
 crates/aterm-json/tests/json.rs	our_float_parsing_is_correctly_rounded	float-parse-correctly-rounded	
 crates/aterm-json/tests/json.rs	json_pointer	json-pointer-rfc6901	
 crates/aterm-json/tests/json.rs	index_sugar_is_total	index-total	
-crates/aterm-json/src/lib.rs	json_const_helpers_round_trip	recursion-limit	json-accepts-exactly-grammar
+crates/aterm-json/tests/json.rs	json_const_helpers_round_trip	recursion-limit	json-accepts-exactly-grammar
 ```
 
 ## 3. Coverage
 
+- All 28 live `#[test]` functions in `crates/aterm-json/tests/json.rs` map to one of the 19 specs
+  in §1 (`[lib] test = false` in `Cargo.toml`, so tests live in `tests/json.rs` and doctests).
 - `number-normal-form` retires no test as primary; it is a lemma of `value-roundtrip`.
 - A test goes only when every spec it samples (`primary` and `also`) is Certified. For example,
   `wide_integers_round_trip_or_fail` needs `typed-integer-targets`, `integer-format` and `to-value-exact`.
-- `src/lib.rs`'s `const_tests::json_const_helpers_round_trip` has no row, and `[lib] test = false`
-  keeps it from running.
 
 ## 4. Tests that are not spec samples
 

@@ -2904,9 +2904,8 @@ fn asks_a_sign_in(msg: &aterm_messages::Message) -> bool {
 /// the signed-out, due, none-soon, wrong-account and no-sign-in entries each say what aterm did
 /// and why it is not enough, their step the read of each route tried, their rows in Details;
 /// another CLI's due and wrong-account entries, whose rows the upkeep signs in again in the
-/// background too, are such facts, their step the read of its pool. CONTROL: a background
-/// sign-in stopped for a person, which still names a sign-in by hand, is caught by the same
-/// reading.
+/// background too, are such facts, their step the read of its pool. CONTROL: an entry that asks
+/// only a person and names a sign-in by hand is caught by the same reading.
 #[test]
 fn no_claude_accounts_fact_asks_a_person_to_sign_in() {
     use aterm_agent::harness::accounts::Cli;
@@ -2983,70 +2982,72 @@ fn no_claude_accounts_fact_asks_a_person_to_sign_in() {
             msg.detail
         );
     }
-    let stopped = super::accounts_sign_in_entry_for(
-        Cli::Kimi,
-        &[(
-            "kimi-1".to_string(),
-            aterm_agent::harness::accounts::SignInAction::Login,
-        )],
+    let asks = Entry::new(
+        Family::Accounts,
+        "kimi",
+        "sign-in",
+        "A sign-in",
+        aterm_messages::need::Why::OnlyYou(aterm_messages::need::Reason::new("only a person")),
+        Then::step("Run aterm harness accounts login kimi-1 --cli kimi"),
     );
     assert!(
-        asks_a_sign_in(&shown(stopped)),
-        "the control: a sign-in stopped for a person"
+        asks_a_sign_in(&shown(Some(asks))),
+        "CONTROL: an entry that asks a person"
     );
 }
 
-/// A GROK LOGIN DUE FOR RENEWAL ASKS FOR ITS SIGN-IN: Grok Build's renewals stop at
-/// accounts.x.ai's block page (`Cli::renews_headlessly`), so its due entry names each row's
-/// `accounts login` on a terminal, the first as its step, under the key its pool clears, and
-/// never a renewal; a Grok row that signed in another account names that sign-in too, never a
-/// promise that aterm signs it in by itself. CONTROL: Kimi's due and wrong-account entries,
-/// whose rows the upkeep renews, ask no one.
+/// EVERY AUTOMATIC POOL ENTRY IS A FACT FOR LATER, AND NONE ASKS A PERSON: a Grok Build login due
+/// for renewal (its renewals stop at accounts.x.ai's block page, `Cli::renews_headlessly`, so aterm
+/// starts none and it stays due), a Grok row that signed in another account, and a sign-in of any
+/// CLI that stopped each step to the read of the pool, name the row in Details and name no sign-in
+/// verb. CONTROL: the wrong-account words keep each CLI's truth: aterm signs a Kimi row in again
+/// by itself and no Grok row.
 #[test]
-fn a_grok_login_due_for_renewal_asks_for_its_sign_in() {
-    use aterm_agent::harness::accounts::Cli;
+fn every_automatic_pool_entry_is_a_fact_for_later() {
+    use aterm_agent::harness::accounts::{Cli, SignInAction};
     let labels = vec!["grok-1".to_string(), "grok-2".to_string()];
-    let entry = super::accounts_due_entry_for(Cli::Grok, &labels).expect("an entry");
-    assert_eq!(entry.key(), super::pool_notice_key(Cli::Grok, "due"));
-    let msg = entry.message().expect("a valid entry");
-    assert!(asks_a_sign_in(&msg), "{msg:?}");
-    assert_eq!(
-        msg.detail[1], "Run aterm harness accounts login grok-1 --cli grok",
-        "{:?}",
-        msg.detail
-    );
-    assert!(
-        msg.detail
-            .iter()
-            .any(|l| l == "grok-2: Run aterm harness accounts login grok-2 --cli grok")
-            && !format!("{msg:?}").contains("accounts renew"),
-        "{:?}",
-        msg.detail
-    );
-    let kimi = super::accounts_due_entry_for(Cli::Kimi, &labels)
-        .expect("an entry")
-        .message()
-        .expect("a valid entry");
-    assert!(!asks_a_sign_in(&kimi), "CONTROL: {kimi:?}");
-
-    let wrong = |cli| {
-        super::accounts_wrong_entry_for(cli, &labels[..1])
+    let due = super::accounts_due_entry_for(Cli::Grok, &labels).expect("an entry");
+    assert_eq!(due.key(), super::pool_notice_key(Cli::Grok, "due"));
+    let wrong = |cli| super::accounts_wrong_entry_for(cli, &labels[..1]).expect("an entry");
+    let stopped = |cli| {
+        super::accounts_sign_in_entry_for(cli, &[("grok-1".to_string(), SignInAction::Login)])
             .expect("an entry")
-            .message()
-            .expect("a valid entry")
     };
-    let grok = wrong(Cli::Grok);
-    assert!(asks_a_sign_in(&grok), "{grok:?}");
+    for (what, cli, entry) in [
+        ("grok due", Cli::Grok, due),
+        ("grok wrong", Cli::Grok, wrong(Cli::Grok)),
+        ("grok stopped", Cli::Grok, stopped(Cli::Grok)),
+        ("kimi stopped", Cli::Kimi, stopped(Cli::Kimi)),
+    ] {
+        let msg = entry.message().expect("a valid entry");
+        assert!(!asks_a_sign_in(&msg), "{what}: {msg:?}");
+        let words = format!("{msg:?}");
+        assert!(
+            !words.contains("accounts login") && !words.contains("accounts renew"),
+            "{what}: {words}"
+        );
+        let aterm_messages::need::Need::Later(ask) = msg.need() else {
+            panic!("{what}: {words}");
+        };
+        assert!(
+            ask.then().words().contains(&format!("--cli {}", cli.id())),
+            "{what}: {words}"
+        );
+        assert!(
+            msg.detail.iter().any(|line| line.contains("grok-1")),
+            "{what}: {words}"
+        );
+    }
+    let says = |cli| format!("{:?}", wrong(cli).message().expect("a valid entry"));
     assert!(
-        format!("{grok:?}").contains("accounts login grok-1 --cli grok")
-            && !format!("{grok:?}").contains("signs the row in again by itself"),
-        "{grok:?}"
+        !says(Cli::Grok).contains("signs the row in again by itself"),
+        "{}",
+        says(Cli::Grok)
     );
-    let kimi = wrong(Cli::Kimi);
-    assert!(!asks_a_sign_in(&kimi), "CONTROL: {kimi:?}");
     assert!(
-        format!("{kimi:?}").contains("signs the row in again by itself"),
-        "CONTROL: {kimi:?}"
+        says(Cli::Kimi).contains("signs the row in again by itself"),
+        "CONTROL: {}",
+        says(Cli::Kimi)
     );
 }
 

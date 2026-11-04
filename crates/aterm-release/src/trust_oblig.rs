@@ -618,12 +618,15 @@ impl<'a> Sources<'a> {
                 return Ok((rel, true));
             }
         }
-        if raw
+        // A toolchain library's file, as one prover names it (`core/src/…`) or another, from its
+        // source tree's root (`library/core/src/…`): one name, so records compare across provers.
+        let lib = raw.strip_prefix("library/").unwrap_or(raw);
+        if lib
             .split('/')
             .next()
             .is_some_and(|first| SYSROOT.contains(&first))
         {
-            return Ok((format!("@sysroot/{raw}"), false));
+            return Ok((format!("@sysroot/{lib}"), false));
         }
         Err(format!(
             "{raw} names no file in the checkout (looked under {})",
@@ -1118,6 +1121,15 @@ mod tests {
         assert_eq!(
             s.resolve("alloc/src/macros.rs").unwrap(),
             ("@sysroot/alloc/src/macros.rs".into(), false)
+        );
+        // Trust 0.12 (29ebb403d) names them from its source tree's root.
+        assert_eq!(
+            s.resolve("library/core/src/macros/mod.rs").unwrap(),
+            ("@sysroot/core/src/macros/mod.rs".into(), false)
+        );
+        assert!(
+            s.resolve("library/serde/src/lib.rs").is_err(),
+            "a library/ that is no toolchain crate's names no file"
         );
         assert_eq!(
             s.resolve("/Users//user000/trust/library/alloc/src/macros.rs")

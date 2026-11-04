@@ -1587,17 +1587,6 @@ impl Grid {
                 .push(HyperlinkSpan::with_id(start, end_col, url, id));
         }
     }
-
-    /// Extract a row's extras and convert it to a [`Line`] in one step.
-    #[cfg(test)]
-    pub(crate) fn row_to_line_with_hyperlinks(
-        row: &Row,
-        extras: &CellExtras,
-        row_idx: u16,
-    ) -> Line {
-        let extracted = Self::extract_row_extras(row, extras, row_idx);
-        Self::row_to_line_with_stored_extras(row, &extracted)
-    }
 }
 
 fn push_cell_text(

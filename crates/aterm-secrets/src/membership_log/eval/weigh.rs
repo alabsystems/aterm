@@ -46,7 +46,7 @@
 //! hold the same records walk the same steps: every order and pin is read off record content, and
 //! nothing breaks a tie by where a record sits in the order.
 
-use super::{AuthScratch, Authorization, Bits, Candidate, Graph, Memo, Weighed};
+use super::{AuthScratch, Authorization, Bits, Candidate, Graph, Memo, Weighed, membership_void};
 use crate::membership_log::{Kind, MemberId};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -55,9 +55,11 @@ pub(super) use relations::Relations;
 #[cfg(test)]
 mod relations_oracle_tests;
 
-/// The candidates that hold with nothing void, weighed so, and what weighing them read.
+/// The candidates that hold with nothing void, weighed so, and what weighing them read; a
+/// carried weighing keeps only what is read after it ([`Apart::kept_for`]).
+#[derive(Debug, PartialEq, Eq)]
 pub(super) struct Apart {
-    /// Authorization with nothing void.
+    /// Authorization at the weighed records with nothing void, by slot.
     pub(super) plain: Authorization,
     /// The members at each cutoff a candidate names, with nothing void.
     pub(super) at_cutoff: BTreeMap<usize, Option<BTreeSet<MemberId>>>,
@@ -65,9 +67,39 @@ pub(super) struct Apart {
     pub(super) weighed: BTreeMap<usize, Weighed>,
 }
 
+impl Apart {
+    /// What a carried weighing keeps: `plain`, and of the candidates that take effect
+    /// (`accepted`) how each was weighed and the members at its cutoff, all that is read once the
+    /// weighing is done. The members at every other cutoff are let go: one set per cutoff, they
+    /// hold about the square of the members where `Remove`s name many cutoffs. What is kept is
+    /// at most five ids for each share of a kept candidate (one that holds counts more than half
+    /// its voters, and the members at its cutoff are its voters and its member), so it grows with
+    /// the `Remove`s alone.
+    pub(super) fn kept_for(mut self, candidates: &[Candidate], accepted: &[usize]) -> Self {
+        let accepted: BTreeSet<usize> = accepted.iter().copied().collect();
+        let cutoffs: BTreeSet<usize> = accepted.iter().map(|&q| candidates[q].cutoff).collect();
+        self.weighed.retain(|q, _| accepted.contains(q));
+        self.at_cutoff.retain(|cutoff, _| cutoffs.contains(cutoff));
+        self
+    }
+
+    /// The member ids it holds: the members at each cutoff, and each candidate's voters and the
+    /// signers that counted.
+    #[cfg(test)]
+    pub(super) fn ids(&self) -> usize {
+        let at_cutoff: usize = self.at_cutoff.values().flatten().map(BTreeSet::len).sum();
+        let weighed: usize = self
+            .weighed
+            .values()
+            .map(|alone| alone.voters.len() + alone.counted.len())
+            .sum();
+        at_cutoff + weighed
+    }
+}
+
 impl Graph<'_> {
-    /// [`Graph::accepted`], with each candidate that holds apart and how it was weighed with
-    /// nothing void, and the relations among them.
+    /// The candidates that take effect ([`Weighing`]'s `accepted`), with each candidate that
+    /// holds apart and how it was weighed with nothing void, and the relations among them.
     pub(super) fn weigh_all(
         &self,
         candidates: &[Candidate],
@@ -88,8 +120,8 @@ impl Graph<'_> {
         memo: &mut Memo,
         scratch: &mut AuthScratch,
     ) -> Apart {
-        let no_void = vec![false; self.records.len()];
-        let plain = self.authorized(&no_void, memo, scratch);
+        let no_void = self.no_void();
+        let plain = self.authorize(&no_void, memo, scratch);
         let mut at_cutoff: BTreeMap<usize, Option<BTreeSet<MemberId>>> = BTreeMap::new();
         let mut weighed = BTreeMap::new();
         for (q, cand) in candidates.iter().enumerate() {
@@ -118,6 +150,9 @@ impl Graph<'_> {
     ) -> Relations {
         let mut relations = {
             let keys: Vec<usize> = apart.weighed.keys().copied().collect();
+            // Every candidate holds two `Remove`s of its own, so a log within the record bound
+            // has at most `relations::MAX_CANDIDATES`, whose relations fit their budget (the
+            // bound's compile-time assertion).
             Relations::new(&keys).expect("held quorum candidates fit their relation budget")
         };
         if apart.weighed.len() < 2 {
@@ -250,12 +285,13 @@ pub(super) fn allocation_probe(dense: bool) -> usize {
 
 /// What the walk reads of the log once, whatever the candidates. The reader records are the
 /// `Remove`s ([`Graph::removes_of`]) and the `Admit`s another Mac signed ([`Graph::admits_of`]):
-/// every record `is_member_upto` and `admit_effective_upto` read the liveness of.
+/// every record `is_member_upto` and `admit_effective_upto` read the liveness of. Each is a
+/// weighed record, and every per-record list here is by slot.
 struct Readers {
     /// The actor a reader record is about (a `Remove`'s target, an `Admit`'s entrant);
-    /// `usize::MAX` for any other record.
+    /// `usize::MAX` for any other weighed record.
     about: Vec<usize>,
-    /// A `Remove`'s cutoff; `usize::MAX` for any other record.
+    /// A `Remove`'s cutoff, by record index; `usize::MAX` for any other weighed record.
     cut: Vec<usize>,
     /// Per actor: the reader `Admit`s it signed, ascending.
     signed: Vec<Vec<usize>>,
@@ -276,31 +312,31 @@ struct Readers {
 
 impl Readers {
     fn new(graph: &Graph<'_>) -> Self {
-        let n = graph.records.len();
+        let n = graph.weighed.len();
         let mut about = vec![usize::MAX; n];
         let mut cut = vec![usize::MAX; n];
         let mut signed = vec![Vec::new(); graph.actors.len()];
         for (actor, removes) in graph.removes_of.iter().enumerate() {
             for &(r, cutoff) in removes {
-                about[r] = actor;
-                cut[r] = cutoff;
+                about[graph.slot[r]] = actor;
+                cut[graph.slot[r]] = cutoff;
             }
         }
         for (actor, admits) in graph.admits_of.iter().enumerate() {
             for &e in admits {
-                about[e] = actor;
+                about[graph.slot[e]] = actor;
             }
         }
         let mut list = Vec::new();
         let mut bits = Bits::new(n);
-        for (i, &actor) in about.iter().enumerate() {
+        for (s, &actor) in about.iter().enumerate() {
             if actor == usize::MAX {
                 continue;
             }
-            list.push(i);
-            bits.set(i);
-            if cut[i] == usize::MAX {
-                signed[graph.signer_actor[i]].push(i);
+            list.push(s);
+            bits.set(s);
+            if cut[s] == usize::MAX {
+                signed[graph.signer_actor[graph.weighed[s]]].push(s);
             }
         }
         let mut pins_out = vec![false; n];
@@ -311,30 +347,18 @@ impl Readers {
             if removes.is_empty() {
                 continue;
             }
-            // Every record some `Admit` of the actor follows; every record some `Admit` it signed
-            // follows; every record an `Admit` of it that precedes one it signed follows.
-            let mut admitted_after = Bits::new(n);
-            for &e in admits {
-                graph.union_past_into(e, &mut admitted_after);
-            }
-            let mut signs_after = Bits::new(n);
-            for &x in signed_by {
-                graph.union_past_into(x, &mut signs_after);
-            }
-            let mut restored_after = Bits::new(n);
-            let mut removed = Bits::new(n);
-            for &(r, _) in removes {
-                removed.set(r);
-            }
-            for &e in admits {
-                if signs_after.get(e) {
-                    graph.union_past_into(e, &mut restored_after);
-                    restores[e] = graph.past_intersects(e, &removed);
-                }
+            // The actor's `Admit`s that some `Admit` it signed follows: each can restore one.
+            let restoring: Vec<usize> = admits
+                .iter()
+                .copied()
+                .filter(|&e| signed_by.iter().any(|&x| graph.before(e, graph.weighed[x])))
+                .collect();
+            for &e in &restoring {
+                restores[graph.slot[e]] = removes.iter().any(|&(r, _)| graph.before(r, e));
             }
             for &(r, _) in removes {
-                pins_out[r] = !admitted_after.get(r);
-                cuts_for_good[r] = !restored_after.get(r);
+                pins_out[graph.slot[r]] = !admits.iter().any(|&e| graph.before(r, e));
+                cuts_for_good[graph.slot[r]] = !restoring.iter().any(|&e| graph.before(r, e));
             }
         }
         Self {
@@ -354,8 +378,9 @@ impl Readers {
     }
 }
 
-/// The state one candidate's effects leave: what is void, what is authorized, and the reader
-/// records whose liveness differs from plain's (ascending).
+/// The state one candidate's effects leave: which weighed records are void, which are
+/// authorized, and the reader records whose liveness differs from plain's (ascending), all by
+/// slot.
 struct Class {
     void: Vec<bool>,
     auth: Authorization,
@@ -383,14 +408,14 @@ struct Steady {
     epoch: u32,
     /// A live-everywhere `Remove` up to the cutoff keeps the actor out.
     out: Vec<bool>,
-    /// The cutoffs of its live-everywhere final `Remove`s up to the cutoff.
+    /// The cutoffs of its live-everywhere final `Remove`s up to the cutoff, by record index.
     cuts: Vec<Vec<usize>>,
     /// Its `Remove`s up to the cutoff that keep it out, or are final, live in some state and not
-    /// in every one: whether one is live in both states is the step's to read.
+    /// in every one, by slot: whether one is live in both states is the step's to read.
     some_out: Vec<Vec<usize>>,
     some_good: Vec<Vec<usize>>,
     /// The `Admit`s it signed up to the cutoff that reaching can change anything for
-    /// ([`Step::victims`]), filled once per cutoff.
+    /// ([`Step::victims`]), by slot, filled once per cutoff.
     victims: Vec<Vec<usize>>,
     victims_stamp: Vec<u32>,
     /// The records read filling these, for the bookkeeping count.
@@ -398,8 +423,8 @@ struct Steady {
 }
 
 /// A step's reach: from a toggled `Remove` of `g`, the `Admit`s `g` signed outside the cutoff
-/// `Cut(g, κ)` names; from a toggled or changed `Admit` `a` of `g`, the `Admit`s `g` signed after
-/// it (`After(g, a)`).
+/// `Cut(g, κ)` names (a record index); from a toggled or changed `Admit` `a` of `g` (a slot), the
+/// `Admit`s `g` signed after it (`After(g, a)`).
 #[derive(Clone, Copy)]
 enum Reach {
     Cut(usize, usize),
@@ -418,19 +443,18 @@ struct Walk<'w, 'a> {
     order: Vec<usize>,
     /// `diffs[t]`: what step `t` toggles against step `t - 1` (against plain for the first).
     diffs: Vec<Diff>,
-    /// Reader records live with nothing void and in every class.
+    /// Reader records live with nothing void and in every class, by slot.
     always: Vec<bool>,
     /// Per actor: its `Remove`s that keep it out (`out`) or are final (`good`), live in some state
-    /// and not in every one.
+    /// and not in every one, by slot.
     sometimes_out: Vec<Vec<usize>>,
     sometimes_good: Vec<Vec<usize>>,
-    /// Each actor's index, by member.
-    actor_at: BTreeMap<MemberId, usize>,
     /// Per candidate holding apart: the actors whose shares counted for it alone.
     counted_alone: BTreeMap<usize, Vec<usize>>,
     steady: Steady,
     step: u32,
     dirty_mark: Vec<u32>,
+    /// Per weighed record, by slot: the step that last reached it, or reached on after it.
     reached_mark: Vec<u32>,
     after_mark: Vec<u32>,
 }
@@ -443,24 +467,31 @@ impl<'w, 'a> Walk<'w, 'a> {
         memo: &mut Memo,
         scratch: &mut AuthScratch,
     ) -> Self {
-        let n = graph.records.len();
+        let n = graph.weighed.len();
         let readers = Readers::new(graph);
         let mut keys: BTreeMap<Bits, usize> = BTreeMap::new();
         let mut classes: Vec<Class> = Vec::new();
         let mut class_of = BTreeMap::new();
         for &q in apart.weighed.keys() {
-            let void = graph.effects(candidates, &[q]).void;
-            let key = graph.membership_void(&void);
+            let void = graph.weighed_void(candidates, &[q]);
+            let key = membership_void(&void);
             let class = if let Some(&class) = keys.get(&key) {
                 class
             } else {
-                let auth = graph.authorized(&void, memo, scratch);
-                let delta = readers
+                let auth = graph.authorize(&void, memo, scratch);
+                let delta: Vec<usize> = readers
                     .list
                     .iter()
                     .copied()
                     .filter(|&r| (!void[r] && auth[r]) != apart.plain[r])
                     .collect();
+                #[cfg(test)]
+                {
+                    scratch.class_bytes += void.len() * size_of::<bool>()
+                        + auth.len() * size_of::<bool>()
+                        + delta.len() * size_of::<usize>()
+                        + key.0.len() * size_of::<u64>();
+                }
                 classes.push(Class { void, auth, delta });
                 keys.insert(key, classes.len() - 1);
                 classes.len() - 1
@@ -512,8 +543,9 @@ impl<'w, 'a> Walk<'w, 'a> {
             .collect();
         let mut sometimes_out = vec![Vec::new(); graph.actors.len()];
         let mut sometimes_good = vec![Vec::new(); graph.actors.len()];
-        for (actor, removes) in graph.removes_of.iter().enumerate() {
+        for (actor, removes) in graph.removes_of.iter().enumerate().take(graph.actors.len()) {
             for &(r, _) in removes {
+                let r = graph.slot[r];
                 if in_some.get(r) && readers.pins_out[r] {
                     sometimes_out[actor].push(r);
                 }
@@ -522,16 +554,10 @@ impl<'w, 'a> Walk<'w, 'a> {
                 }
             }
         }
-        let actor_at: BTreeMap<MemberId, usize> = graph
-            .actors
-            .iter()
-            .enumerate()
-            .map(|(i, m)| (*m, i))
-            .collect();
         let counted_alone = apart
             .weighed
             .iter()
-            .map(|(&q, alone)| (q, alone.counted.iter().map(|m| actor_at[m]).collect()))
+            .map(|(&q, alone)| (q, alone.counted.iter().map(|m| graph.actor_at[m]).collect()))
             .collect();
         let actors = graph.actors.len();
         Self {
@@ -546,7 +572,6 @@ impl<'w, 'a> Walk<'w, 'a> {
             always,
             sometimes_out,
             sometimes_good,
-            actor_at,
             counted_alone,
             steady: Steady {
                 stamp: vec![0; actors],
@@ -578,21 +603,27 @@ impl<'w, 'a> Walk<'w, 'a> {
         scratch: &mut AuthScratch,
     ) {
         let graph = self.graph;
-        let n = graph.records.len();
         let mut member = vec![false; graph.actors.len()];
         for m in members {
-            member[self.actor_at[m]] = true;
+            member[graph.actor_at[m]] = true;
         }
         let mut count = members.len();
-        let mut upto = Bits::new(n);
-        graph.copy_past_into(cutoff, &mut upto);
-        upto.set(cutoff);
+        // The reader records up to the cutoff (a record's past comes before it in the order).
+        let mut upto = Bits::new(graph.weighed.len());
+        for &r in &self.readers.list {
+            if graph.weighed[r] > cutoff {
+                break;
+            }
+            if graph.upto(graph.weighed[r], cutoff) {
+                upto.set(r);
+            }
+        }
         let budget = graph.actors.len() + upto.count_and(&self.readers.bits);
         self.steady.epoch += 1;
         // `pending`: the reader records up to the cutoff whose liveness differs between the state
         // `member` holds and the step's; `touched`, every record toggled since the last re-check;
         // `differ`, how many reader records up to the cutoff the step's state toggles against plain.
-        let mut pending = Bits::new(n);
+        let mut pending = Bits::new(graph.weighed.len());
         let mut touched: Vec<usize> = Vec::new();
         let mut differ = 0usize;
         for t in 0..self.order.len() {
@@ -629,7 +660,7 @@ impl<'w, 'a> Walk<'w, 'a> {
                     let counted: BTreeSet<MemberId> = self.candidates[j]
                         .shares
                         .iter()
-                        .filter(|&&s| !class.void[s])
+                        .filter(|&&s| !class.void[graph.slot[s]])
                         .map(|&s| *graph.signer(s))
                         .filter(|signer| alone.voters.contains(signer))
                         .collect();
@@ -641,7 +672,7 @@ impl<'w, 'a> Walk<'w, 'a> {
                 }
                 continue;
             }
-            if graph.records[cutoff].kind() == Kind::Admit && !class.auth[cutoff] {
+            if graph.records[cutoff].kind() == Kind::Admit && !class.auth[graph.slot[cutoff]] {
                 // No cutoff: nobody votes there.
                 for &j in here.iter().filter(|&&j| j != one) {
                     relations.set_undoes(one, j);
@@ -680,11 +711,11 @@ impl<'w, 'a> Walk<'w, 'a> {
             self.check_members(cutoff, class_index, &member);
             for &j in here.iter().filter(|&&j| j != one) {
                 let cand = &self.candidates[j];
-                let voters = count - usize::from(member[self.actor_at[&cand.member]]);
+                let voters = count - usize::from(member[graph.actor_at[&cand.member]]);
                 let mut counted: Vec<usize> = cand
                     .shares
                     .iter()
-                    .filter(|&&s| !class.void[s] && member[graph.signer_actor[s]])
+                    .filter(|&&s| !class.void[graph.slot[s]] && member[graph.signer_actor[s]])
                     .map(|&s| graph.signer_actor[s])
                     .collect();
                 counted.sort_unstable();
@@ -789,7 +820,7 @@ impl<'w, 'a> Walk<'w, 'a> {
         while let Some(next) = reach.pop() {
             let (g, from) = match next {
                 Reach::Cut(g, cut) => (g, cut),
-                Reach::After(g, a) => (g, a),
+                Reach::After(g, a) => (g, self.graph.weighed[a]),
             };
             if step.pinned_cut(&mut self.steady, g, from, &mut work) {
                 continue;
@@ -798,9 +829,10 @@ impl<'w, 'a> Walk<'w, 'a> {
             work += self.steady.victims[g].len();
             for i in 0..self.steady.victims[g].len() {
                 let e = self.steady.victims[g][i];
+                let at = self.graph.weighed[e];
                 let reaches = match next {
-                    Reach::Cut(_, cut) => !self.graph.upto(e, cut),
-                    Reach::After(_, a) => self.graph.before(a, e),
+                    Reach::Cut(_, cut) => !self.graph.upto(at, cut),
+                    Reach::After(_, a) => self.graph.before(self.graph.weighed[a], at),
                 };
                 if !reaches || self.reached_mark[e] == mark {
                     continue;
@@ -862,11 +894,12 @@ impl Step<'_, '_> {
                 break;
             }
             steady.read += 1;
-            if !self.always[r] || !self.graph.upto(r, self.cutoff) {
+            let at = self.graph.slot[r];
+            if !self.always[at] || !self.graph.upto(r, self.cutoff) {
                 continue;
             }
-            out |= self.readers.pins_out[r];
-            if self.readers.cuts_for_good[r] {
+            out |= self.readers.pins_out[at];
+            if self.readers.cuts_for_good[at] {
                 cuts.push(cut);
             }
         }
@@ -875,11 +908,12 @@ impl Step<'_, '_> {
         let upto = |some: &[usize], read: &mut usize, into: &mut Vec<usize>| {
             into.clear();
             for &r in some {
-                if r > self.cutoff {
+                let at = self.graph.weighed[r];
+                if at > self.cutoff {
                     break;
                 }
                 *read += 1;
-                if self.graph.upto(r, self.cutoff) {
+                if self.graph.upto(at, self.cutoff) {
                     into.push(r);
                 }
             }
@@ -935,18 +969,19 @@ impl Step<'_, '_> {
     /// signer live in both cuts it (its cutoff does not reach `e`), so whether `e` is live reads
     /// the same either way.
     fn dead(&self, steady: &mut Steady, e: usize, work: &mut usize) -> bool {
-        let g = self.graph.signer_actor[e];
+        let at = self.graph.weighed[e];
+        let g = self.graph.signer_actor[at];
         self.settle(steady, g);
         if steady.cuts[g].iter().any(|&cut| {
             *work += 1;
-            !self.graph.upto(e, cut)
+            !self.graph.upto(at, cut)
         }) {
             return true;
         }
         let some = &steady.some_good[g];
         some.iter().any(|&r| {
             *work += 1;
-            self.steady(r) && !self.graph.upto(e, self.readers.cut[r])
+            self.steady(r) && !self.graph.upto(at, self.readers.cut[r])
         })
     }
 
@@ -961,11 +996,12 @@ impl Step<'_, '_> {
         let mut victims = std::mem::take(&mut steady.victims[g]);
         victims.clear();
         for &e in &self.readers.signed[g] {
-            if e > self.cutoff {
+            let at = self.graph.weighed[e];
+            if at > self.cutoff {
                 break;
             }
             steady.read += 1;
-            if !self.graph.upto(e, self.cutoff) {
+            if !self.graph.upto(at, self.cutoff) {
                 continue;
             }
             let entrant = self.readers.about[e];
@@ -1063,7 +1099,7 @@ impl Walk<'_, '_> {
             return;
         }
         let class = &self.classes[class];
-        let mut fresh = AuthScratch::new(self.graph.records.len());
+        let mut fresh = self.graph.scratch();
         let want = self
             .graph
             .members_at_cutoff(cutoff, &class.void, &class.auth, &mut fresh)
@@ -1088,7 +1124,7 @@ impl Walk<'_, '_> {
         if !CHECKED.with(std::cell::Cell::get) {
             return;
         }
-        let mut fresh = AuthScratch::new(self.graph.records.len());
+        let mut fresh = self.graph.scratch();
         let want = self
             .graph
             .weigh(self.candidates, j, Some(one), memo, &mut fresh);
@@ -1115,8 +1151,8 @@ impl Graph<'_> {
         memo: &mut Memo,
         scratch: &mut AuthScratch,
     ) -> (Vec<usize>, Relations) {
-        let no_void = vec![false; self.records.len()];
-        let plain_auth = self.authorized(&no_void, memo, scratch);
+        let no_void = self.no_void();
+        let plain_auth = self.authorize(&no_void, memo, scratch);
         let mut plain_cutoffs: BTreeMap<usize, Option<BTreeSet<MemberId>>> = BTreeMap::new();
         let mut apart: BTreeMap<usize, Weighed> = BTreeMap::new();
         for (q, cand) in candidates.iter().enumerate() {
@@ -1133,20 +1169,24 @@ impl Graph<'_> {
         let mut undoes = BTreeSet::new();
         let mut strips = BTreeSet::new();
         for &one in apart.keys() {
-            let one_void = self.effects(candidates, &[one]).void;
-            let one_mvoid = self.membership_void(&one_void);
-            let one_auth = self.authorized(&one_void, memo, scratch);
+            let one_void = self.weighed_void(candidates, &[one]);
+            let one_mvoid = membership_void(&one_void);
+            let one_auth = self.authorize(&one_void, memo, scratch);
             let mut one_cutoffs: BTreeMap<usize, Option<BTreeSet<MemberId>>> = BTreeMap::new();
             for (&other, alone) in &apart {
                 if one == other {
                     continue;
                 }
                 let cand = &candidates[other];
-                if !one_mvoid.get(cand.cutoff) && !self.past_intersects(cand.cutoff, &one_mvoid) {
+                // No record one voids lies up to the other's cutoff.
+                if !one_mvoid
+                    .ones()
+                    .any(|s| self.upto(self.weighed[s], cand.cutoff))
+                {
                     let counted: BTreeSet<MemberId> = cand
                         .shares
                         .iter()
-                        .filter(|&&s| !one_void[s])
+                        .filter(|&&s| !one_void[self.slot[s]])
                         .map(|&s| *self.signer(s))
                         .filter(|signer| alone.voters.contains(signer))
                         .collect();

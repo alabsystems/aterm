@@ -2788,12 +2788,29 @@ impl Jobs {
 
         let rows: Vec<JobRow> = {
             let mut r: Vec<JobRow> = self.jobs.iter().filter_map(|j| j.row.clone()).collect();
+            let shell_members: ShellMembers<'_> = self
+                .jobs
+                .iter()
+                .filter(|j| {
+                    matches!(j.kind, JobKind::Shell | JobKind::ShellBg) && j.exited_ms.is_none()
+                })
+                .map(|j| {
+                    (
+                        (j.key.tab, j.id.as_str()),
+                        j.members
+                            .iter()
+                            .filter_map(|(&pid, member)| member.start.map(|start| (pid, start)))
+                            .collect(),
+                    )
+                })
+                .collect();
             r.sort_by(|a, b| a.tab.cmp(&b.tab).then_with(|| a.id.cmp(&b.id)));
             note_working_descendants(
                 &mut r,
                 &sweep,
                 &facts,
                 &tick.tabs,
+                &shell_members,
                 tick.machine.stretch_milli,
             );
             r
@@ -3405,6 +3422,8 @@ fn in_tree(pid: u32, root: u32, sweep: &HashMap<u32, &SweepProc>) -> Option<bool
 /// A detached call's current ancestry inside one known user/terminal/joined context.
 /// Ages share the probe batch's clock. Unknown or inconsistent generations, including a
 /// clock-clamped zero age, are no evidence; process start tokens are compared only for identity.
+/// A consistently observed terminal process can be the final ownership anchor, never a bridge
+/// through its terminal to another context.
 fn call_ancestry(
     tab: u64,
     child: (u32, u64),
@@ -3429,6 +3448,17 @@ fn call_ancestry(
             return None;
         }
         if s.has_tty? || p.uid? != uid {
+            if p.uid == Some(uid)
+                && p.pgid != 0
+                && p.pgid == s.pgid
+                && let Some(start) = p.start
+                && let Some(age) = p.age_ms.filter(|age| *age > 0)
+                && age >= younger_age
+                && !seen.contains(&cur)
+                && !seen.contains(&p.ppid)
+            {
+                path.push((cur, start));
+            }
             return Some(path);
         }
         let start = p.start?;
@@ -3446,6 +3476,9 @@ fn call_ancestry(
     None
 }
 
+/// Current accepted member identities for live shell rows, keyed by tab and job id.
+type ShellMembers<'a> = HashMap<(u64, &'a str), Vec<(u32, u64)>>;
+
 /// Keep local verdicts and accounting, but expose observed work in a detached descendant.
 /// A Running row carries bounded recent progress (at most [`super::RUNNING_WINDOW_MS`]),
 /// while a busy row needs current CPU. Neither is a claim of semantic compiler progress.
@@ -3454,18 +3487,73 @@ fn note_working_descendants(
     sweep: &HashMap<u32, &SweepProc>,
     facts: &HashMap<u32, &JobProc>,
     tabs: &[JobTab],
+    shell_members: &ShellMembers<'_>,
     stretch_milli: u32,
 ) {
     let joined: BTreeSet<_> = tabs
         .iter()
         .flat_map(|t| t.calls.iter().map(move |c| (t.key, c.leader)))
         .collect();
-    let ancestors: HashMap<_, _> = rows
+    let mut ancestors: HashMap<_, _> = rows
         .iter()
         .enumerate()
         .filter(|(_, r)| r.kind == JobKind::AgentCall && r.verdict != Verdict::Exited)
-        .filter_map(|(i, r)| r.leader.1.map(|start| ((r.tab, r.leader.0), (i, start))))
+        .filter_map(|(i, r)| {
+            r.leader
+                .1
+                .map(|start| ((r.tab, r.leader.0), vec![(i, start)]))
+        })
         .collect();
+    for (i, row) in rows.iter().enumerate().filter(|(_, r)| {
+        matches!(r.kind, JobKind::Shell | JobKind::ShellBg)
+            && r.verdict != Verdict::Exited
+            && r.pgid != 0
+    }) {
+        let Some(owner) = facts.get(&row.leader.0).filter(|p| {
+            row.leader.1.is_some()
+                && p.start == row.leader.1
+                && p.pgid != 0
+                && !matches!(p.state, ProcState::Unknown | ProcState::Zombie)
+        }) else {
+            continue;
+        };
+        let Some((uid, owner_age)) = owner.uid.zip(owner.age_ms.filter(|age| *age > 0)) else {
+            continue;
+        };
+        if !sweep.get(&row.leader.0).is_some_and(|s| {
+            s.ppid == owner.ppid
+                && s.uid == Some(uid)
+                && s.pgid == owner.pgid
+                && !matches!(s.state, ProcState::Unknown | ProcState::Zombie)
+        }) {
+            continue;
+        }
+        let Some(members) = shell_members.get(&(row.tab, row.id.as_str())) else {
+            continue;
+        };
+        let Some(tab) = tabs.iter().find(|tab| tab.key == row.tab) else {
+            continue;
+        };
+        for &(pid, start) in members {
+            // The persistent shell also parents work from earlier blocks. Only this command's
+            // terminal endpoint can connect the activity, without crossing a joined context.
+            if pid != tab.shell_pid
+                && !joined.contains(&(row.tab, pid))
+                && sweep.get(&pid).is_some_and(|s| s.has_tty == Some(true))
+                && facts.get(&pid).is_some_and(|p| {
+                    p.start == Some(start)
+                        && p.uid == Some(uid)
+                        && p.pgid == row.pgid
+                        && p.age_ms.is_some_and(|age| age > 0 && age <= owner_age)
+                })
+            {
+                ancestors
+                    .entry((row.tab, pid))
+                    .or_default()
+                    .push((i, start));
+            }
+        }
+    }
     let working: Vec<_> = rows
         .iter()
         .filter(|r| r.kind == JobKind::AgentCall && !r.tick.refused)
@@ -3488,12 +3576,17 @@ fn note_working_descendants(
         let mut targets = Vec::new();
         let mut consistent = true;
         for &(pid, start) in path.iter().skip(1) {
-            if let Some(&(i, expected)) = ancestors.get(&(tab, pid)) {
-                if start != expected {
-                    consistent = false;
+            if let Some(owners) = ancestors.get(&(tab, pid)) {
+                for &(i, expected) in owners {
+                    if start != expected {
+                        consistent = false;
+                        break;
+                    }
+                    targets.push(i);
+                }
+                if !consistent {
                     break;
                 }
-                targets.push(i);
             }
         }
         if consistent {

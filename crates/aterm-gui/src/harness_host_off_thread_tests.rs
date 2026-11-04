@@ -265,11 +265,11 @@ fn a_slow_relaunch_read_never_holds_the_step_after_an_act() {
 
     // The restart in place, its act the agent's restart.
     let restarting = |h: &mut Hooks, _: &Arc<GatedRead>| {
-        h.acts.restart = Arc::new(|_, _, _, _| "restarted".to_string());
+        h.acts.restart = Arc::new(|_, _, _, _, _| RestartSaid::step("restarted"));
     };
     let (idle, held) = gated_idle(Program::Claude, Duration::ZERO, restarting);
     let at = Arc::clone(&idle);
-    let restart = std::thread::spawn(move || at.restart(&Restart::Memory));
+    let restart = std::thread::spawn(move || at.restart_once(&Restart::Memory));
     until("the restart returns while its read is held", || {
         restart.is_finished()
     });
@@ -283,12 +283,59 @@ fn a_slow_relaunch_read_never_holds_the_step_after_an_act() {
     // CONTROL: back within the bound, the restart returns with its read landed.
     let (idle, held) = gated_idle(Program::Claude, aterm_spec::wait::MUST_HAPPEN, restarting);
     let at = Arc::clone(&idle);
-    let restart = std::thread::spawn(move || at.restart(&Restart::Memory));
+    let restart = std::thread::spawn(move || at.restart_once(&Restart::Memory));
     until("its read began", || held.began.load(Ordering::SeqCst) == 1);
     assert!(!restart.is_finished(), "the control waits its read");
     held.let_go();
     assert_eq!(restart.join().unwrap().as_deref(), Some("restarted"));
     assert_eq!(kept_session(&idle).as_deref(), Some(NAMED));
+}
+
+/// THE RESTART'S OWN REPORT IS ITS EVIDENCE WHILE THE KEPT SNAPSHOT LAGS IT
+/// ([`IdleHost::restart_left`], ATERM-KI-1101-3): a restart in place whose report names the
+/// process it started returns while the snapshot read after its act is still held, so the kept
+/// snapshot still names the process before; the worker names the report's process as the one the
+/// restart left. The next restart, answered with no process named, keeps none: never the process
+/// an earlier restart named. Negative control by mutation: the report's pid dropped in
+/// `WorkerIdle::said`: no process left is named, and the loop could go by the lagging snapshot
+/// alone.
+#[test]
+fn a_restart_left_names_its_reports_process_while_the_snapshot_lags() {
+    let (idle, held) = gated_idle(Program::Claude, Duration::ZERO, |h, _| {
+        let asks = Arc::new(AtomicUsize::new(0));
+        h.acts.restart = Arc::new(move |_, _, _, _, _| {
+            if asks.fetch_add(1, Ordering::SeqCst) == 0 {
+                RestartSaid {
+                    step: "adopted".to_string(),
+                    pid: Some(5151),
+                }
+            } else {
+                RestartSaid::step("wait:resume")
+            }
+        });
+    });
+    let before = idle.agent_pid();
+    assert!(before.is_some() && before != Some(5151), "{before:?}");
+    assert_eq!(
+        idle.restart_once(&Restart::Memory).as_deref(),
+        Some("adopted")
+    );
+    assert_eq!(
+        idle.restart_left(),
+        Some((Some(5151), None)),
+        "the report's process"
+    );
+    assert_eq!(idle.agent_pid(), before, "the kept snapshot lags it");
+    assert_eq!(
+        idle.restart_once(&Restart::Memory).as_deref(),
+        Some("wait:resume")
+    );
+    assert_eq!(
+        idle.restart_left(),
+        None,
+        "a report that names none keeps none"
+    );
+    held.let_go();
 }
 
 #[test]
@@ -495,8 +542,9 @@ fn a_slow_read_after_an_account_move_never_holds_its_outcome() {
             move |sid: &str,
                   grace: u32,
                   why: &Restart,
+                  ask: &aterm_agent::supervise::policy::turn_end::RestartAsk,
                   selected: Option<&relaunch::AccountRestart>| {
-                let step = restart(sid, grace, why, selected);
+                let step = restart(sid, grace, why, ask, selected);
                 arm.store(true, Ordering::SeqCst);
                 step
             },
@@ -505,7 +553,7 @@ fn a_slow_read_after_an_account_move_never_holds_its_outcome() {
         assert_eq!(moves(&idle.account(usage_wall())), Some("work-2"));
         let idle = Arc::new(idle);
         let at = Arc::clone(&idle);
-        let step = std::thread::spawn(move || at.restart(&move_to("work-2", AccountAt::Wall)));
+        let step = std::thread::spawn(move || at.restart_once(&move_to("work-2", AccountAt::Wall)));
         (a, idle, held, step)
     };
 

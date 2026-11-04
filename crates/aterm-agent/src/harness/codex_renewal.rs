@@ -221,11 +221,7 @@ pub fn with_successor_writer<T>(
         .ok_or("auth-path")?;
     let default = home.join(".codex");
     let old_dir = (old_home != default).then(|| old_home.to_string_lossy().into_owned());
-    let candidates: Vec<_> = roster
-        .rows
-        .iter()
-        .filter(|row| row.dir == old_dir || row.was.contains(&old_dir))
-        .collect();
+    let candidates = roster.rows_of_login(old_dir.as_deref());
     let [row] = candidates.as_slice() else {
         return Err("account-lineage");
     };
@@ -240,7 +236,8 @@ pub fn with_successor_writer<T>(
     {
         return Err("account-held");
     }
-    let state = store.load(env.now).map_err(|_| "state-unreadable")?.0;
+    let mut state = store.load(env.now).map_err(|_| "state-unreadable")?.0;
+    store.hydrate_auth_contexts(&mut state, &roster);
     if accounts::condition(row, &state, true, env.now) == accounts::Condition::SignedOut {
         return Err("account-signed-out");
     }
@@ -330,6 +327,42 @@ pub fn with_selected<T>(
 /// consumption has already closed native execution authority.
 pub fn retire_pool_record(env: &Env, receipt: &Receipt) -> Result<Option<bool>, &'static str> {
     with_receipt_writer(env, |writer| writer.retire_pool_record(receipt))
+}
+
+/// Retire a native reservation that never issued Go. The caller must prove
+/// that the source image still owns the operation and no successor ran.
+pub fn cancel_unexecuted_rotation(
+    env: &Env,
+    receipt: &Receipt,
+    target: &str,
+) -> Result<Option<Receipt>, &'static str> {
+    if receipt.launch_attempted
+        || receipt.accepted_turn.is_some()
+        || !matches!(receipt.phase, Phase::Ready | Phase::Retired)
+    {
+        return Err("rotation-already-executed");
+    }
+    let mut retired = receipt.clone();
+    retired.phase = Phase::Retired;
+    retired.revoked = true;
+    with_receipt_writer(env, |writer| {
+        let stored = read_receipt(env, &receipt.id);
+        if stored.as_ref() != Some(receipt) && stored.as_ref() != Some(&retired) {
+            return Err("rotation-receipt-changed");
+        }
+        write_receipt(env, &retired)?;
+        writer.release_unexecuted_rotation(&retired, target)?;
+        Ok(retired)
+    })
+}
+
+/// Record native evidence that the consumed original turn served a successful
+/// response. Only the native host may supply that evidence; a receipt alone
+/// never proves process execution or completion.
+pub fn record_completed_rotation(env: &Env, receipt: &Receipt) -> Result<Option<()>, &'static str> {
+    super::codex_rotation::with_completed_writer(env, receipt, |next, writer| {
+        writer.prove_completed_rotation(receipt, &next.row.label)
+    })
 }
 
 pub fn with_selected_writer<T>(

@@ -16,10 +16,12 @@
 //! - `DEVELOPER_DIR` ([`developer_dir`], set by [`developer_dir_move`] in every aterm process):
 //!   on macOS 26.6 with the tools installed, Apple's stubs hand a call to
 //!   `$DEVELOPER_DIR/usr/bin/xcrun <tool> <args>` when the variable names a directory holding
-//!   one, and fail plainly (`missing DEVELOPER_DIR path`, exit 1) when it names none. That the
-//!   stubs do the same on a Mac whose tools are missing, rather than raise their dialog first, is
-//!   not measured here: only a guest without them (`lab mac --no-clt`) can show it. Where it holds,
-//!   a process that inherits the variable is covered whatever its PATH says: a login shell's
+//!   one, and fail plainly (`missing DEVELOPER_DIR path`, exit 1) when it names none. On a
+//!   macOS 27 guest without the tools (`lab mac --no-clt`, rounds 4 and 6 of
+//!   `docs/measured/nux-round9-2026-11-02.md`) the stubs did the same rather than raise their
+//!   dialog: `/usr/bin/git` by its full path in an aterm tab printed this module's line (exit 69)
+//!   while the no-aterm control raised Apple's dialog. So a process that inherits the variable is
+//!   covered whatever its PATH says: a login shell's
 //!   `path_helper`, an agent's tool shell whose PATH was frozen by a snapshot, and a program that
 //!   runs `/usr/bin/git` by its absolute path.
 //!

@@ -59,10 +59,43 @@ pub fn foreign_cells(host: &str) -> Vec<Cell> {
 /// The cells a pulled run checks ([`crate::checks::pulls_cells`]): of [`foreign_cells`], those
 /// of the OSes other than `host`'s, one per OS and root package, the cell of `host`'s
 /// architecture where the OS has one. An OS's code differs from this machine's in its `cfg`s,
-/// which one cell of it judges; an architecture's (the Intel Mac slice, x86_64 Linux and
-/// Windows on an Apple-silicon Mac) is left to `verify cells`, which checks every cell.
+/// which one cell of it judges; an architecture's (x86_64 Linux and Windows on an Apple-silicon
+/// Mac) is left to `verify cells`, which checks every cell. Then one cell of `host`'s own OS
+/// ([`lint_only_when_pulled`]): the host's code is compiled with debug assertions off by no other
+/// dev check, and a cell's lint pass does ([`CellCargo::lint`]).
 #[must_use]
 pub fn pulled_cells(host: &str) -> Vec<Cell> {
+    let mut kept: Vec<Cell> = other_os_cells(host);
+    kept.extend(
+        foreign_cells(host)
+            .into_iter()
+            .find(|cell| lint_only_when_pulled(&cell.triple, host)),
+    );
+    kept
+}
+
+/// Whether a pulled run checks `triple` only for its lint pass: a cell of `host`'s own OS, whose
+/// test targets differ from what `host`'s own `test` and `lint` compile only by architecture. It is
+/// there for shipped code that calls a seam only debug assertions compile, a compile error no dev
+/// check of `host` can see, at a lint pass's cost (docs/measured/release-lint-in-dev-2026-11-03.md).
+#[must_use]
+pub fn lint_only_when_pulled(triple: &str, host: &str) -> bool {
+    triple != host && os_of(triple) == os_of(host)
+}
+
+/// Whether this run checks `triple` for its lint pass alone: a pulled run's
+/// ([`lint_only_when_pulled`]), on a host it can name. A run naming `cells` checks every target of
+/// every cell.
+fn lint_only_in_run(
+    pulled: bool,
+    triple: &str,
+    host: impl FnOnce() -> Result<String, String>,
+) -> bool {
+    pulled && host().is_ok_and(|host| lint_only_when_pulled(triple, &host))
+}
+
+/// [`pulled_cells`]' cells of the OSes other than `host`'s.
+fn other_os_cells(host: &str) -> Vec<Cell> {
     let mut kept: Vec<Cell> = Vec::new();
     for cell in foreign_cells(host)
         .into_iter()
@@ -374,8 +407,9 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
     };
     if ctx.cells_pulled {
         r.raw(format!(
-            "cells: pulled by the selection, so one cell per other OS ({}), each where its graph \
-             holds a selected crate; `targo --unverified verify cells` checks every cell",
+            "cells: pulled by the selection, so one cell per other OS and one of this OS for its \
+             debug-off lint ({}), each where its graph holds a selected crate; `targo --unverified \
+             verify cells` checks every cell",
             cells
                 .iter()
                 .map(|c| c.name.as_str())
@@ -1114,7 +1148,8 @@ fn check_cell(
         ));
     }
 
-    if let (None, Some(tests)) = (&red.status, &tests) {
+    let lint_only = lint_only_in_run(ctx.cells_pulled, &cell.triple, || host_triple(ctx));
+    if let (None, Some(tests), false) = (&red.status, &tests, lint_only) {
         let test_cargo = CellCargo {
             shim_args: &test_shim_args,
             ..cargo
@@ -1460,9 +1495,17 @@ impl CellCargo<'_> {
 
     /// The lint of `packages` (`-p` arguments): of clippy, only the `clippy.toml` bans (every other
     /// clippy lint is the host's), the browser cells with their own clock-only config; rustc's own
-    /// warnings are read from the stream ([`is_cell_warning`]).
+    /// warnings are read from the stream ([`is_cell_warning`]). Under `--release`, so debug
+    /// assertions are off as a shipped build has them: a seam gated on them that shipped code calls
+    /// is a compile error here, and code only they keep alive a dead-code warning. No dev check
+    /// compiles aterm's library that way otherwise; the all-targets pass stays debug-on, because
+    /// test targets call those seams. `tippy -p aterm --release` stays in the release set for what
+    /// only Trust compiles (`cfg(trust_verify)`, `cfg(clean_islands)`).
     fn lint(&self, packages: &[String]) -> Cmd {
-        let mut cmd = self.base("clippy").args(packages.iter().cloned());
+        let mut cmd = self
+            .base("clippy")
+            .arg("--release")
+            .args(packages.iter().cloned());
         cmd = cmd.arg("--").args(lint_flags(self.triple));
         if self.triple.starts_with("wasm32") {
             cmd = cmd.env("CLIPPY_CONF_DIR", self.ctx.root.join(WASM_CLIPPY_CONF));
@@ -2033,21 +2076,44 @@ mod tests {
         };
         assert_eq!(
             names("aarch64-apple-darwin"),
-            ["linux-arm", "win-arm", "wasm-cpu", "wasm-gpu"]
+            ["linux-arm", "win-arm", "wasm-cpu", "wasm-gpu", "mac-x64"]
         );
         assert_eq!(
             names("x86_64-unknown-linux-gnu"),
-            ["mac-x64", "win", "wasm-cpu", "wasm-gpu"]
+            ["mac-x64", "win", "wasm-cpu", "wasm-gpu", "linux-arm"]
         );
         assert_eq!(
             names("x86_64-apple-darwin"),
-            ["linux", "win", "wasm-cpu", "wasm-gpu"]
+            ["linux", "win", "wasm-cpu", "wasm-gpu", "mac-arm"]
         );
         assert_eq!(
             names("riscv64gc-unknown-linux-gnu"),
-            ["mac-arm", "win", "wasm-cpu", "wasm-gpu"],
+            ["mac-arm", "win", "wasm-cpu", "wasm-gpu", "linux"],
             "no cell of its architecture: each OS's first"
         );
+        assert!(lint_only_when_pulled(
+            "x86_64-apple-darwin",
+            "aarch64-apple-darwin"
+        ));
+        assert!(
+            !lint_only_when_pulled("aarch64-unknown-linux-gnu", "aarch64-apple-darwin"),
+            "CONTROL: another OS's test targets differ in their cfgs"
+        );
+    }
+
+    /// A pulled run's cell of the host's own OS checks no test target, and a run naming `cells`
+    /// checks them all. CONTROL: another OS's cell keeps its test pass in a pulled run, and a host
+    /// nothing can name takes nothing away.
+    #[test]
+    fn only_a_pulled_run_skips_the_test_targets_of_a_cell_of_the_hosts_os() {
+        let mac = "aarch64-apple-darwin";
+        let host = || Ok(mac.to_owned());
+        assert!(lint_only_in_run(true, "x86_64-apple-darwin", host));
+        assert!(!lint_only_in_run(false, "x86_64-apple-darwin", host));
+        assert!(!lint_only_in_run(true, "aarch64-unknown-linux-gnu", host));
+        assert!(!lint_only_in_run(true, "x86_64-apple-darwin", || Err(
+            "no host".to_owned()
+        )));
     }
 
     /// `-p` and a pulled run narrow a cell, never the browser's; a run naming `cells` with no `-p`
@@ -3093,6 +3159,11 @@ mod tests {
                 "{:?}",
                 narrowed.args
             );
+            // The lint compiles what ships, with debug assertions off, and the pass over test
+            // targets, which call the seams they gate, keeps them on.
+            let release = |cmd: &Cmd| cmd.args.iter().any(|a| a == "--release");
+            assert!(release(&cargo.lint(&packages)), "the lint is debug-off");
+            assert!(!release(&narrowed), "CONTROL: test targets are debug-on");
             let cmd = cargo.all_targets(&[]);
             let get = |k: &str| {
                 cmd.envs

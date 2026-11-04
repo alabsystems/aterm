@@ -519,8 +519,8 @@ fn every_capture_cut_at_any_row_reads_cut() {
 
 /// NEGATIVE CONTROLS for the cut read: a cut in other words, further in, with a first row that
 /// starts inside a word that fits (no wrap Ink draws), its blocks apart, a ruleless title under a blank first row
-/// (no cut: the rule stands right over the title), a rule above it, or its footer's rows in other
-/// words, is no intro.
+/// (no cut: the rule stands right over the title), a title or paragraph under two blank rows (Ink
+/// draws one between blocks), a rule above it, or its footer's rows in other words, is no intro.
 #[test]
 fn a_cut_look_alike_is_not_the_intro() {
     let rows = inline(40);
@@ -556,6 +556,27 @@ fn a_cut_look_alike_is_not_the_intro() {
     let mut untitled = vec![String::new()];
     untitled.extend(rows[title_at(&rows)..].iter().cloned());
     cases.push(("a ruleless title under a blank row", untitled));
+    // Ink draws one blank row between blocks, never two, so a cut opens on row 0 or row 1.
+    let paragraph = title_at(&rows) + 2;
+    assert!(
+        rows[paragraph - 1].trim().is_empty() && !rows[paragraph].trim().is_empty(),
+        "PRECONDITION: a paragraph opens under the blank row after the title"
+    );
+    let mut gap = vec![String::new()];
+    gap.extend(rows[paragraph..].iter().cloned());
+    assert!(
+        parse_prompt_v2(&gap)
+            .is_some_and(|p| p.kind == PromptKind::ChromeIntro && p.head_off_screen),
+        "CONTROL: a cut on the blank row between blocks reads"
+    );
+    for (what, from) in [
+        ("a ruleless title under two blank rows", title_at(&rows)),
+        ("a paragraph under two blank rows", paragraph),
+    ] {
+        let mut gapped = vec![String::new(), String::new()];
+        gapped.extend(rows[from..].iter().cloned());
+        cases.push((what, gapped));
+    }
     let mut transcript = vec!["⏺ Here is the intro:".to_string()];
     transcript.extend(cut.iter().cloned());
     cases.push(("a transcript row over it", transcript));

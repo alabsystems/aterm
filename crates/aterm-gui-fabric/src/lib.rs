@@ -345,6 +345,21 @@ fn expiry_grace_ms() -> u64 {
     EXPIRY_GRACE_MS
 }
 
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// A test thread's own fetch bound in place of [`FETCH_WAIT_MS`] (None: the product's).
+    static TEST_FETCH_WAIT: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn fetch_wait() -> std::time::Duration {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(wait) = TEST_FETCH_WAIT.with(std::cell::Cell::get) {
+        return wait;
+    }
+    std::time::Duration::from_millis(FETCH_WAIT_MS)
+}
+
 /// One delivered message.
 #[derive(Clone, Debug)]
 pub struct InboxRow {
@@ -5822,7 +5837,7 @@ pub fn cmd_inbox_get(ctx: &dyn FabricSession, rest: &str) -> String {
 }
 
 fn inbox_get_at(ctx: &dyn FabricSession, off: u64) -> String {
-    inbox_get_at_within(ctx, off, std::time::Duration::from_millis(FETCH_WAIT_MS))
+    inbox_get_at_within(ctx, off, fetch_wait())
 }
 
 fn inbox_get_at_within(ctx: &dyn FabricSession, off: u64, wait: std::time::Duration) -> String {
@@ -6979,6 +6994,23 @@ mod inbox_hold {
     fn attach_up(store: &Store, generation: BridgeGeneration) {
         bridge_attached(generation);
         assert!(link_report(store, Some(generation), true, "", Some(1)));
+    }
+
+    /// A minute in ms, the `--wait=` of a post whose landing the test delivers itself.
+    fn hang_ms() -> u64 {
+        u64::try_from(aterm_spec::wait::MUST_HAPPEN.as_millis()).expect("a minute in milliseconds")
+    }
+
+    /// For a section that settles every debt it arms: a debt goes stale at twice a hang
+    /// detector, not the instance's 6 s, so half the horizon is still one.
+    fn stale_after_a_hang() {
+        STALE_AFTER_IN_TEST.store(2 * hang_ms(), Ordering::Relaxed);
+    }
+
+    /// On a reader thread whose fetch the test answers itself: the read waits a hang detector,
+    /// not the product's 10 s.
+    fn fetch_waits_a_hang() {
+        TEST_FETCH_WAIT.with(|wait| wait.set(Some(aterm_spec::wait::MUST_HAPPEN)));
     }
 
     fn on_lane<T>(generation: BridgeGeneration, f: impl FnOnce() -> T) -> T {
@@ -9569,6 +9601,7 @@ mod inbox_hold {
     fn a_parked_waiter_is_woken_by_a_down_report_from_starting_or_up() {
         for was_up in [false, true] {
             with_link(|| {
+                stale_after_a_hang();
                 let store = new_store();
                 let (_sid, ctx) = registered(&store);
                 let generation = next_bridge_generation();
@@ -10015,6 +10048,7 @@ mod inbox_hold {
     fn an_accepted_post_wakes_before_its_wait_parks_and_a_refused_one_never() {
         use std::time::Duration;
         with_link(|| {
+            stale_after_a_hang();
             let store = new_store();
             let (sid, ctx) = registered(&store);
             attach_up(&store, next_bridge_generation());
@@ -10027,7 +10061,11 @@ mod inbox_hold {
             let poster = {
                 let ctx = ctx.clone();
                 std::thread::spawn(move || {
-                    cmd_post(&ctx, "to=h-andrew kind=task --wait=30000 ship it", None)
+                    cmd_post(
+                        &ctx,
+                        &format!("to=h-andrew kind=task --wait={} ship it", hang_ms()),
+                        None,
+                    )
                 })
             };
             assert!(
@@ -10174,7 +10212,10 @@ mod inbox_hold {
 
             let reader = {
                 let ctx = ctx.clone();
-                std::thread::spawn(move || cmd_inbox_verb(&ctx, "get @7"))
+                std::thread::spawn(move || {
+                    fetch_waits_a_hang();
+                    cmd_inbox_verb(&ctx, "get @7")
+                })
             };
             assert!(
                 watcher.wait(aterm_spec::wait::MUST_HAPPEN),
@@ -10199,6 +10240,7 @@ mod inbox_hold {
     #[test]
     fn post_key_is_bounded_rides_the_outbox_and_a_dup_retirement_reaches_the_wait() {
         with_link(|| {
+            stale_after_a_hang();
             let store = new_store();
             let (sid, ctx) = registered(&store);
             assert!(valid_key("k-1") && valid_key("0123:abcd:99") && valid_key("a.b_c"));
@@ -10271,7 +10313,7 @@ mod inbox_hold {
                 std::thread::spawn(move || {
                     cmd_post(
                         &ctx,
-                        "to=h-andrew kind=task key=k-2 --wait=30000 ship it",
+                        &format!("to=h-andrew kind=task key=k-2 --wait={} ship it", hang_ms()),
                         None,
                     )
                 })
@@ -10495,6 +10537,7 @@ mod inbox_hold {
     #[test]
     fn post_wait_ack_returns_the_verdict_or_the_expiry_and_is_bounded_by_dl() {
         with_link(|| {
+            stale_after_a_hang();
             let store = new_store();
             let (sid, ctx) = registered(&store);
             attach_up(&store, next_bridge_generation());
@@ -10505,7 +10548,11 @@ mod inbox_hold {
             let poster = {
                 let ctx = ctx.clone();
                 std::thread::spawn(move || {
-                    cmd_post(&ctx, "to=@s-peer kind=task --wait-ack=30000 ship it", None)
+                    cmd_post(
+                        &ctx,
+                        &format!("to=@s-peer kind=task --wait-ack={} ship it", hang_ms()),
+                        None,
+                    )
                 })
             };
             loop {
@@ -10530,6 +10577,7 @@ mod inbox_hold {
             let poster = {
                 let ctx = ctx.clone();
                 std::thread::spawn(move || {
+                    TEST_EXPIRY_GRACE_MS.with(|grace| grace.set(Some(hang_ms())));
                     cmd_post(&ctx, "to=@s-peer kind=ask dl=30000 --wait-ack why?", None)
                 })
             };
@@ -10571,6 +10619,7 @@ mod inbox_hold {
             let poster = {
                 let ctx = ctx.clone();
                 std::thread::spawn(move || {
+                    TEST_EXPIRY_GRACE_MS.with(|grace| grace.set(Some(hang_ms())));
                     cmd_post(&ctx, "to=@s-peer kind=ask dl=100 --wait-ack late?", None)
                 })
             };
@@ -10778,7 +10827,10 @@ mod inbox_hold {
             );
             let reader = {
                 let ctx = ctx.clone();
-                std::thread::spawn(move || cmd_inbox_get(&ctx, "@1000"))
+                std::thread::spawn(move || {
+                    fetch_waits_a_hang();
+                    cmd_inbox_get(&ctx, "@1000")
+                })
             };
             await_fetch(1000);
             assert_eq!(
@@ -10803,7 +10855,10 @@ mod inbox_hold {
             assert_eq!(cmd_inbox_get(&ctx, "1"), "ERR no such message\n");
             let reader = {
                 let ctx = ctx.clone();
-                std::thread::spawn(move || cmd_inbox_get(&ctx, "@7"))
+                std::thread::spawn(move || {
+                    fetch_waits_a_hang();
+                    cmd_inbox_get(&ctx, "@7")
+                })
             };
             await_fetch(7);
             assert_eq!(
@@ -10816,7 +10871,10 @@ mod inbox_hold {
             );
             let reader = {
                 let ctx = ctx.clone();
-                std::thread::spawn(move || cmd_inbox_get(&ctx, "@8"))
+                std::thread::spawn(move || {
+                    fetch_waits_a_hang();
+                    cmd_inbox_get(&ctx, "@8")
+                })
             };
             await_fetch(8);
             assert_eq!(
@@ -10835,7 +10893,10 @@ mod inbox_hold {
 
             let reader = {
                 let ctx = ctx.clone();
-                std::thread::spawn(move || cmd_inbox_get(&ctx, "@1002"))
+                std::thread::spawn(move || {
+                    fetch_waits_a_hang();
+                    cmd_inbox_get(&ctx, "@1002")
+                })
             };
             await_fetch(1002);
             let line = |tail: &str| {
@@ -10857,7 +10918,10 @@ mod inbox_hold {
             );
             let reader = {
                 let ctx = ctx.clone();
-                std::thread::spawn(move || cmd_inbox_get(&ctx, "@1003"))
+                std::thread::spawn(move || {
+                    fetch_waits_a_hang();
+                    cmd_inbox_get(&ctx, "@1003")
+                })
             };
             await_fetch(1003);
             let line = |tail: &str| {
@@ -10875,7 +10939,10 @@ mod inbox_hold {
             );
             let reader = {
                 let ctx = ctx.clone();
-                std::thread::spawn(move || cmd_inbox_get(&ctx, "@1004"))
+                std::thread::spawn(move || {
+                    fetch_waits_a_hang();
+                    cmd_inbox_get(&ctx, "@1004")
+                })
             };
             await_fetch(1004);
             let big = BODY_MAX + 44_000;
@@ -10908,7 +10975,10 @@ mod inbox_hold {
             );
             let reader = {
                 let ctx = ctx.clone();
-                std::thread::spawn(move || cmd_inbox_get(&ctx, "@5000"))
+                std::thread::spawn(move || {
+                    fetch_waits_a_hang();
+                    cmd_inbox_get(&ctx, "@5000")
+                })
             };
             await_fetch(5000);
             assert_eq!(
@@ -10936,7 +11006,10 @@ mod inbox_hold {
             );
             let reader = {
                 let ctx = ctx.clone();
-                std::thread::spawn(move || cmd_inbox_get(&ctx, "@5001"))
+                std::thread::spawn(move || {
+                    fetch_waits_a_hang();
+                    cmd_inbox_get(&ctx, "@5001")
+                })
             };
             await_fetch(5001);
             assert_eq!(
@@ -11008,7 +11081,10 @@ mod inbox_hold {
             assert_eq!(tell(&a), "OK\n", "the same log again forgets nothing");
             let parked = {
                 let ctx = ctx.clone();
-                std::thread::spawn(move || cmd_inbox_get(&ctx, "@1000"))
+                std::thread::spawn(move || {
+                    fetch_waits_a_hang();
+                    cmd_inbox_get(&ctx, "@1000")
+                })
             };
             let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
             while !cmd_outbox(&store, "").contains(&format!("fetch sid={sid} off=1000\n")) {
@@ -11599,6 +11675,7 @@ mod inbox_hold {
         let a1 = format!("{}.1", "aa".repeat(16));
         for lineage in [true, false] {
             with_link(|| {
+                stale_after_a_hang();
                 let store = new_store();
                 let (sid, ctx) = registered(&store);
                 let generation = next_bridge_generation();
@@ -11607,7 +11684,10 @@ mod inbox_hold {
                 let tell = |line: &str| cmd_link(&store, &format!("log {line}"), Some(generation));
                 let read = |off: u64| {
                     let ctx = ctx.clone();
-                    std::thread::spawn(move || cmd_inbox_get(&ctx, &format!("@{off}")))
+                    std::thread::spawn(move || {
+                        fetch_waits_a_hang();
+                        cmd_inbox_get(&ctx, &format!("@{off}"))
+                    })
                 };
                 let fetched = |off: u64, text: &str| {
                     cmd_deliver(
@@ -12822,6 +12902,7 @@ mod inbox_hold {
     #[test]
     fn a_parked_post_wakes_on_an_undeliverable_verdict() {
         with_link(|| {
+            stale_after_a_hang();
             let store = new_store();
             let (sid, ctx) = registered(&store);
             attach_up(&store, next_bridge_generation());
@@ -12880,6 +12961,7 @@ mod inbox_hold {
     #[test]
     fn a_parked_post_learns_the_bridge_died_rather_than_timing_out() {
         with_link(|| {
+            stale_after_a_hang();
             let store = new_store();
             let (_sid, ctx) = registered(&store);
             let generation = next_bridge_generation();

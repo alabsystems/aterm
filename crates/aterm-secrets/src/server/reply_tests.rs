@@ -283,7 +283,18 @@ fn a_selected_reply_survives_concurrent_store_replacement_without_holding_state(
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
     let (server, _) = listener.accept().unwrap();
-    let reply = get_records(&running.shared, &server, "team", None, None, true, true);
+    let reply = get_records(
+        &running.shared,
+        &server,
+        "team",
+        &RecordsGet {
+            query: None,
+            subscriber: None,
+            no_wait: true,
+            local: true,
+            stated: Some(crate::crossing::RecordsBound::uncrossed()),
+        },
+    );
     let (change, requested) = std::sync::mpsc::channel();
     let (finished, done) = std::sync::mpsc::channel();
     let shared = Arc::clone(&running.shared);
@@ -308,7 +319,18 @@ fn a_selected_reply_survives_concurrent_store_replacement_without_holding_state(
     write_reply_to(&mut sink, &reply, None, HANG, HANG).unwrap();
     drop(reply);
     worker.join().unwrap();
-    let current = get_records(&running.shared, &server, "team", None, None, true, true);
+    let current = get_records(
+        &running.shared,
+        &server,
+        "team",
+        &RecordsGet {
+            query: None,
+            subscriber: None,
+            no_wait: true,
+            local: true,
+            stated: Some(crate::crossing::RecordsBound::uncrossed()),
+        },
+    );
     drop(running);
     drop(client);
     assert!(

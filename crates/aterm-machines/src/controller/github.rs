@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Host GitHub key registration and revocation ([`login`], [`crate::git_credential`],
-//! [`TOKEN_HOST`], [`System::github_rest`], [`KEY_SCOPE`]), or, by `[github] keys`, over agh's
-//! library ([`register_via`], [`revoke_via`]: machines 5a and 5b).
+//! Host GitHub key registration and revocation ([`login`], the token file
+//! [`Paths::github_token`] names, [`System::github_rest`], [`KEY_SCOPE`]), or, by `[github] keys`,
+//! over agh's library ([`register_via`], [`revoke_via`]: machines 5a and 5b). The machine user's
+//! token is never kept in the login keychain (owner ruling 2026-11-03).
 
-use super::inventory::{Github, KeysVia};
-use crate::git_credential::Git;
+use super::inventory::{Github, KeysVia, Paths};
 use crate::github_pages;
 use crate::port::{GithubResponse, RestMethod, Secret, System};
 use agh::GithubBuilder;
@@ -16,11 +16,10 @@ use agh::redact::Redactor;
 use agh::retry::RetryPolicy;
 use serde::Serialize;
 use std::cell::RefCell;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-
-/// The host the machine user's token is filed under in the login keychain.
-pub const TOKEN_HOST: &str = "api.github.com";
 
 /// OAuth scope required to list, add, and delete the account's SSH keys.
 pub const KEY_SCOPE: &str = "admin:public_key";
@@ -28,6 +27,9 @@ pub const KEY_SCOPE: &str = "admin:public_key";
 /// The key listing, at GitHub's largest page.
 const KEYS: &str = "/user/keys?per_page=100";
 const KEYS_PER_PAGE: usize = 100;
+
+/// The largest token file read.
+const TOKEN_FILE_MAX: usize = 64 * 1024;
 
 /// One key `POST /user/keys` registered.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,50 +50,61 @@ fn valid_login(account: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
-/// Why the machine user's token cannot be kept on a Mac without git.
-pub(crate) const NO_GIT: &str = "the machine user's GitHub token is kept through git, from \
-                                 Apple's Command Line Tools or Xcode, and neither is installed \
-                                 (aterm init --only base.clt installs the tools)";
-
-/// Resolve the git binary used to store and read `account`'s token.
-fn keychain(sys: &dyn System, account: &str) -> Result<Git, String> {
-    if !valid_login(account) {
-        return Err(format!("{account:?} is not a GitHub login"));
-    }
-    let git = Git::keychain(sys);
-    if !git.installed(sys) {
-        return Err(NO_GIT.into());
-    }
-    Ok(git)
-}
-
 /// An authenticated session as the machine user.
 struct Session {
     token: Secret,
 }
 
-/// `account`'s token, read from the login keychain with `git credential fill` under
-/// [`TOKEN_HOST`]: what `aterm machines github login` stored.
-fn stored_token(sys: &dyn System, account: &str) -> Result<Secret, String> {
-    let git = keychain(sys, account)?;
-    git.fill(sys, None, TOKEN_HOST, account)?.ok_or_else(|| {
-        format!(
-            "the login keychain holds no GitHub token for {account} (aterm machines github \
-             login stores one: a token of {account}'s with the {KEY_SCOPE} scope)"
-        )
-    })
+/// `account`'s token, read from `token_file` ([`Paths::github_token`]): what `aterm machines
+/// github login` stored, one token, in a private regular file of this account's (0600) that is
+/// itself no link.
+fn stored_token(sys: &dyn System, token_file: &Path, account: &str) -> Result<Secret, String> {
+    if !valid_login(account) {
+        return Err(format!("{account:?} is not a GitHub login"));
+    }
+    crate::port::no_core_dumps();
+    let mut bytes = sys
+        .read_owned_file(token_file, sys.euid(), TOKEN_FILE_MAX, true)
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                format!(
+                    "no GitHub token for {account} is stored in {} (aterm machines github login \
+                     stores one: a token of {account}'s with the {KEY_SCOPE} scope)",
+                    token_file.display()
+                )
+            } else {
+                format!(
+                    "{} must be a private regular file of this account's (0600), not a link, at \
+                     most 64 KiB (aterm machines github login replaces it)",
+                    token_file.display()
+                )
+            }
+        })?;
+    let token = std::str::from_utf8(&bytes)
+        .ok()
+        .map(str::trim)
+        .filter(|token| !token.is_empty() && !token.contains(char::is_whitespace))
+        .map(|token| Secret::new(token.as_bytes()));
+    aterm_uds::secret::scrub(&mut bytes);
+    match token {
+        Some(Ok(token)) => Ok(token),
+        _ => Err(format!(
+            "{} holds no single GitHub token (aterm machines github login replaces it)",
+            token_file.display()
+        )),
+    }
 }
 
 impl Session {
-    /// Read `account`'s token from the login keychain and check that it signs in as `account`.
-    fn open(sys: &dyn System, account: &str) -> Result<Self, String> {
-        let token = stored_token(sys, account)?;
+    /// Read `account`'s token from `token_file` and check that it signs in as `account`.
+    fn open(sys: &dyn System, token_file: &Path, account: &str) -> Result<Self, String> {
+        let token = stored_token(sys, token_file, account)?;
         let session = Self { token };
         let (login, _) = session.login(sys)?;
         if !login.eq_ignore_ascii_case(account) {
             return Err(format!(
-                "the login keychain's GitHub token for {account} signs in as {login:?}; nothing \
-                 was sent (aterm machines github login replaces it)"
+                "the stored GitHub token for {account} signs in as {login:?}; nothing was sent \
+                 (aterm machines github login replaces it)"
             ));
         }
         Ok(session)
@@ -238,22 +251,25 @@ impl Registration {
     }
 }
 
-/// Register each `github.key@<user>` public key in `report` not yet held by `account`.
+/// Register each `github.key@<user>` public key in `report` not yet held by `account`, with
+/// the token `token_file` holds.
 ///
 /// # Errors
 /// One line (no token for `account`, the token is for another login, the API refused).
 pub fn register(
     sys: &dyn System,
+    token_file: &Path,
     account: &str,
     host_name: &str,
     keys: &[(String, String)],
 ) -> Result<Vec<Registered>, String> {
-    register_each(sys, account, host_name, keys).into_result()
+    register_each(sys, token_file, account, host_name, keys).into_result()
 }
 
 /// [`register`], each key's outcome kept.
 fn register_each(
     sys: &dyn System,
+    token_file: &Path,
     account: &str,
     host_name: &str,
     keys: &[(String, String)],
@@ -265,7 +281,7 @@ fn register_each(
         Ok(wanted) => wanted,
         Err(why) => return Registration::stopped(why),
     };
-    let opened = Session::open(sys, account)
+    let opened = Session::open(sys, token_file, account)
         .and_then(|session| listed(sys, &session).map(|held| (session, held)));
     let (session, mut held) = match opened {
         Ok(opened) => opened,
@@ -331,16 +347,22 @@ fn dedup_ids(ids: &[u64]) -> Vec<u64> {
     unique
 }
 
-/// Delete each key id from the machine user `account`, and read the account's keys back.
+/// Delete each key id from the machine user `account`, with the token `token_file` holds, and
+/// read the account's keys back.
 ///
 /// # Errors
 /// One line per key the account still holds, or why the keys could not be listed.
-pub fn revoke(sys: &dyn System, account: &str, ids: &[u64]) -> Result<Vec<String>, String> {
+pub fn revoke(
+    sys: &dyn System,
+    token_file: &Path,
+    account: &str,
+    ids: &[u64],
+) -> Result<Vec<String>, String> {
     let ids = dedup_ids(ids);
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let session = Session::open(sys, account)?;
+    let session = Session::open(sys, token_file, account)?;
     let listing = listed(sys, &session)?;
     let before: Vec<u64> = listing.iter().map(|(id, ..)| *id).collect();
     let deleted: Vec<String> = listing
@@ -398,14 +420,27 @@ fn judged(ids: &[u64], after: &[u64], answers: &[(u64, String)]) -> Result<(), S
     }
 }
 
-/// Validate `token` against `account` and [`KEY_SCOPE`], then store it in the login keychain.
+/// Validate `token` against `account` and [`KEY_SCOPE`], then store it in `token_file`
+/// ([`Paths::github_token`], 0600), never the login keychain.
 ///
 /// # Errors
-/// One line (not a login, no CLT git, GitHub refused the token, it is another account's or
-/// lacks the scope, or the keychain did not hand it back). Nothing is stored on an error
-/// before the store, and no error carries the token.
-pub fn login(sys: &dyn System, account: &str, token: Secret) -> Result<(), String> {
-    let git = keychain(sys, account)?;
+/// One line (not a login, the token is empty or holds whitespace, GitHub refused it, it is
+/// another account's or lacks the scope, the file could not be written, or it did not hand the
+/// token back). Nothing is stored on an error before the write, and no error carries the token.
+pub fn login(
+    sys: &dyn System,
+    token_file: &Path,
+    account: &str,
+    token: Secret,
+) -> Result<(), String> {
+    if !valid_login(account) {
+        return Err(format!(
+            "{account:?} is not a GitHub login; nothing was stored"
+        ));
+    }
+    if token.bytes().is_empty() || token.bytes().iter().any(u8::is_ascii_whitespace) {
+        return Err("the token is not one word; nothing was stored".into());
+    }
     let session = Session { token };
     let (login, headers) = session
         .login(sys)
@@ -423,17 +458,30 @@ pub fn login(sys: &dyn System, account: &str, token: Secret) -> Result<(), Strin
              keys needs; nothing was stored"
         ));
     }
-    git.store(sys, None, TOKEN_HOST, account, &session.token)
+    if let Some(keys) = token_file.parent() {
+        sys.create_dir_all(keys, 0o700)
+            .map_err(|e| format!("{}: {e}; nothing was stored", keys.display()))?;
+    }
+    sys.write_file(token_file, session.token.bytes(), 0o600)
+        .map_err(|e| format!("{}: {e}", token_file.display()))?;
+    let stored = stored_token(sys, token_file, account)?;
+    if stored.bytes() != session.token.bytes() {
+        return Err(format!(
+            "{} did not hand the token back as it was written",
+            token_file.display()
+        ));
+    }
+    Ok(())
 }
 
 /// The name of the profile the agh key path speaks as, inline (5a) or from agh.toml (5b).
 const FLEET: &str = "fleet";
 
 /// The single-identity router of the agh key path `github.keys_via()` names (plan §17): the
-/// keychain's token inline (`AghInline`), or agh.toml's `fleet` profile (`AghFleet`). Each
-/// refusal of its own ends `nothing was sent`; the keychain read refuses with
+/// token file's token inline (`AghInline`), or agh.toml's `fleet` profile (`AghFleet`). Each
+/// refusal of its own ends `nothing was sent`; the token file's read refuses with
 /// `stored_token`'s texts, unchanged (body 3).
-fn agh_router(sys: &dyn System, github: &Github) -> Result<Router, String> {
+fn agh_router(sys: &dyn System, token_file: &Path, github: &Github) -> Result<Router, String> {
     let account = &github.account;
     match github.keys_via() {
         KeysVia::Gh => Err(format!(
@@ -441,7 +489,7 @@ fn agh_router(sys: &dyn System, github: &Github) -> Result<Router, String> {
              sent"
         )),
         KeysVia::AghInline => {
-            let token = stored_token(sys, account)?;
+            let token = stored_token(sys, token_file, account)?;
             let token =
                 InlineToken::new(aterm_uds::secret::Secret::new(token.bytes())).map_err(|e| {
                     format!(
@@ -506,7 +554,7 @@ fn agh_router(sys: &dyn System, github: &Github) -> Result<Router, String> {
 struct AghKeys {
     gh: agh::Github,
     permit: agh::Permit,
-    /// The account, on the inline path (5a), whose token is the login keychain's.
+    /// The account, on the inline path (5a), whose token is the token file's.
     inline: Option<String>,
 }
 
@@ -515,8 +563,8 @@ impl AghKeys {
     /// reads signs in as `github.account` before any key call, as the REST path's session and
     /// the inline path's login binding check theirs: agh binds only an inline profile's login
     /// (plan §17, As built).
-    fn open(sys: &dyn System, github: &Github) -> Result<Self, String> {
-        let router = agh_router(sys, github)?;
+    fn open(sys: &dyn System, token_file: &Path, github: &Github) -> Result<Self, String> {
+        let router = agh_router(sys, token_file, github)?;
         let (transport, endpoints) = sys.github_transport();
         let gh = GithubBuilder::new(router)
             .transport(transport)
@@ -549,7 +597,7 @@ impl AghKeys {
 
     /// One line for a key call's failure, as `agh_line`. On the inline path a token agh
     /// refuses as unauthenticated (another login's, or one GitHub answers 401) names the verb
-    /// that replaces the login keychain's token, never agh's own, which cannot see it: another
+    /// that replaces the token file's token, never agh's own, which cannot see it: another
     /// login's token gets the REST path's text. A token GitHub says lacks `admin:public_key`
     /// keeps agh's scope hint and also names that verb, which stores the re-issued token.
     fn line(&self, what: &str, e: &agh::Error) -> String {
@@ -559,12 +607,12 @@ impl AghKeys {
         let line = if e.kind == agh::Kind::Unauthenticated {
             match &e.sub {
                 agh::Sub::LoginMismatch { got, .. } => format!(
-                    "the login keychain's GitHub token for {account} signs in as {got:?}; \
-                     nothing was sent (aterm machines github login replaces it)"
+                    "the stored GitHub token for {account} signs in as {got:?}; nothing was \
+                     sent (aterm machines github login replaces it)"
                 ),
                 _ => format!(
-                    "{what}: {}; aterm machines github login replaces the login keychain's \
-                     token for {account} (a token of {account}'s with the {KEY_SCOPE} scope)",
+                    "{what}: {}; aterm machines github login replaces the stored token for \
+                     {account} (a token of {account}'s with the {KEY_SCOPE} scope)",
                     e.why
                 ),
             }
@@ -626,15 +674,18 @@ fn agh_line(gh: &agh::Github, what: &str, e: &agh::Error) -> String {
 /// session per call, unchanged.
 pub(crate) struct KeyCalls<'s> {
     sys: &'s dyn System,
+    /// The machine user's token file ([`Paths::github_token`]).
+    token_file: PathBuf,
     /// The client opened for an account and a key path, and its permit.
     agh: RefCell<Option<(String, KeysVia, Rc<AghKeys>)>>,
 }
 
 impl<'s> KeyCalls<'s> {
-    /// No client opened yet.
-    pub(crate) fn new(sys: &'s dyn System) -> Self {
+    /// No client opened yet; the token from the controller's token file.
+    pub(crate) fn new(sys: &'s dyn System, paths: &Paths) -> Self {
         Self {
             sys,
+            token_file: paths.github_token(),
             agh: RefCell::new(None),
         }
     }
@@ -648,7 +699,7 @@ impl<'s> KeyCalls<'s> {
         {
             return Ok(Rc::clone(keys));
         }
-        let keys = Rc::new(AghKeys::open(self.sys, github)?);
+        let keys = Rc::new(AghKeys::open(self.sys, &self.token_file, github)?);
         *self.agh.borrow_mut() = Some((github.account.clone(), via, Rc::clone(&keys)));
         Ok(keys)
     }
@@ -662,7 +713,9 @@ impl<'s> KeyCalls<'s> {
         keys: &[(String, String)],
     ) -> Registration {
         match github.keys_via() {
-            KeysVia::Gh => register_each(self.sys, &github.account, host_name, keys),
+            KeysVia::Gh => {
+                register_each(self.sys, &self.token_file, &github.account, host_name, keys)
+            }
             KeysVia::AghInline | KeysVia::AghFleet => self.register_agh(github, host_name, keys),
         }
     }
@@ -674,7 +727,7 @@ impl<'s> KeyCalls<'s> {
     /// As `revoke`, or the agh path's refusal.
     pub(crate) fn revoke(&self, github: &Github, ids: &[u64]) -> Result<Vec<String>, String> {
         match github.keys_via() {
-            KeysVia::Gh => revoke(self.sys, &github.account, ids),
+            KeysVia::Gh => revoke(self.sys, &self.token_file, &github.account, ids),
             KeysVia::AghInline | KeysVia::AghFleet => self.revoke_agh(github, ids),
         }
     }
@@ -757,20 +810,21 @@ impl<'s> KeyCalls<'s> {
     }
 }
 
-/// [`register`] by the path `github.keys_via()` names: `Gh` is
-/// `register(sys, &github.account, host_name, keys)`, unchanged; `AghInline` and `AghFleet`
-/// are the agh path (§17).
+/// [`register`] by the path `github.keys_via()` names, with the token file `paths` names:
+/// `Gh` is `register(sys, &paths.github_token(), &github.account, host_name, keys)`;
+/// `AghInline` and `AghFleet` are the agh path (§17).
 ///
 /// # Errors
 ///
 /// As `register`, or the agh path's refusal, one line naming the key call.
 pub fn register_via(
     sys: &dyn System,
+    paths: &Paths,
     github: &Github,
     host_name: &str,
     keys: &[(String, String)],
 ) -> Result<Vec<Registered>, String> {
-    KeyCalls::new(sys)
+    KeyCalls::new(sys, paths)
         .register(github, host_name, keys)
         .into_result()
 }
@@ -780,18 +834,25 @@ pub fn register_via(
 /// # Errors
 ///
 /// As `revoke`, or the agh path's refusal.
-pub fn revoke_via(sys: &dyn System, github: &Github, ids: &[u64]) -> Result<Vec<String>, String> {
-    KeyCalls::new(sys).revoke(github, ids)
+pub fn revoke_via(
+    sys: &dyn System,
+    paths: &Paths,
+    github: &Github,
+    ids: &[u64],
+) -> Result<Vec<String>, String> {
+    KeyCalls::new(sys, paths).revoke(github, ids)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::git_credential::script;
     use crate::port::{Fake, Stat};
 
     /// Made up; never a real token.
     const TOKEN: &str = "fixture_machine_user_token_only";
+
+    /// The controller's token file in these tests.
+    const TOKEN_FILE: &str = "/controller/keys/github_token";
 
     /// The key the VM's admin made (see items::github's fixtures).
     const ALICE_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJpFPtSPTOuLIj6oqQTj8ndNDVNHFp4renP47+wxFYao aterm-machines:lab-07:alice";
@@ -843,26 +904,29 @@ mod tests {
         sys.on_github_rest(RestMethod::Get, FIRST_PAGE, answer(200, &[], &keys(held)));
     }
 
-    /// CLT git, for the keychain reads.
-    fn git(sys: &Fake) {
-        sys.stat_of(
-            crate::items::github::CLT_GIT,
+    fn token_file() -> &'static Path {
+        Path::new(TOKEN_FILE)
+    }
+
+    /// `bytes` in the controller's token file, with `mode`, owned by this account.
+    fn stored(sys: &Fake, bytes: &str, mode: u32) {
+        sys.file(TOKEN_FILE, bytes.as_bytes()).stat_of(
+            TOKEN_FILE,
             Stat {
-                uid: 0,
+                uid: sys.euid,
                 gid: 0,
-                mode: 0o755,
+                mode,
                 dir: false,
                 symlink: false,
-                len: 1,
+                len: bytes.len() as u64,
             },
         );
     }
 
-    /// A controller whose login keychain holds a token for `fleetbot` that signs in as `login`.
+    /// A controller whose token file holds a token for `fleetbot` that signs in as `login`.
     fn controller(login: &str) -> Fake {
         let sys = Fake::default();
-        git(&sys);
-        script::holds(&sys, None, TOKEN_HOST, "fleetbot", TOKEN);
+        stored(&sys, &format!("{TOKEN}\n"), 0o600);
         sys.on_github_rest(
             RestMethod::Get,
             "/user",
@@ -877,13 +941,17 @@ mod tests {
         )
     }
 
-    /// No call carries the token, and none is gh.
+    /// No call carries the token, none is gh, and none runs git: the login keychain is never
+    /// asked.
     fn clean(sys: &Fake) {
         let calls = sys.calls();
         assert!(
-            calls
-                .iter()
-                .all(|c| !c.contains(TOKEN) && !c.contains("/gh ") && !c.contains("GH_TOKEN")),
+            calls.iter().all(|c| !c.contains(TOKEN)
+                && !c.contains("/gh ")
+                && !c.contains("GH_TOKEN")
+                && !c.contains("/git ")
+                && !c.contains("credential")
+                && !c.contains("osxkeychain")),
             "{calls:?}"
         );
     }
@@ -911,7 +979,7 @@ mod tests {
                 format!("ssh-ed25519 {BOB_BODY} aterm-machines:lab-07:bob"),
             ),
         ];
-        let done = register(&sys, "fleetbot", "lab-07", &keys).unwrap();
+        let done = register(&sys, token_file(), "fleetbot", "lab-07", &keys).unwrap();
         assert_eq!(
             done,
             [
@@ -935,7 +1003,7 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(calls[0], script::credential(None, "fill"));
+        assert_eq!(calls[0], "github GET /user");
         clean(&sys);
     }
 
@@ -963,7 +1031,7 @@ mod tests {
                 "bob".to_owned(),
                 format!("ssh-ed25519 {BOB_BODY} aterm-machines:lab-07:bob"),
             )];
-            let done = register(&sys, "fleetbot", "lab-07", &bob);
+            let done = register(&sys, token_file(), "fleetbot", "lab-07", &bob);
             if cut {
                 assert!(done.unwrap_err().contains("cut short"));
             } else {
@@ -984,6 +1052,7 @@ mod tests {
         let sys = controller("someone-else");
         let err = register(
             &sys,
+            token_file(),
             "fleetbot",
             "lab-07",
             &[("alice".into(), ALICE_KEY.into())],
@@ -994,26 +1063,41 @@ mod tests {
         clean(&sys);
     }
 
+    /// No token file names the verb that stores one; a token file others can read, or one that
+    /// holds no single token, is refused and names the verb that replaces it. None of them
+    /// sends anything, and none runs git.
     #[test]
-    fn no_token_in_the_keychain_names_the_verb_that_stores_one_and_sends_nothing() {
+    fn no_usable_token_file_names_the_verb_that_stores_one_and_sends_nothing() {
         let sys = Fake::default();
-        git(&sys);
-        script::holds_nothing(&sys, None);
-        let err = revoke(&sys, "fleetbot", &[1]).unwrap_err();
-        assert!(err.contains("holds no GitHub token for fleetbot"), "{err}");
+        let err = revoke(&sys, token_file(), "fleetbot", &[1]).unwrap_err();
+        assert!(
+            err.contains("no GitHub token for fleetbot is stored"),
+            "{err}"
+        );
         assert!(err.contains("aterm machines github login"), "{err}");
-        assert_eq!(sys.calls(), [script::credential(None, "fill")]);
-        let sys = Fake::default();
-        let err = revoke(&sys, "fleetbot", &[1]).unwrap_err();
-        assert!(err.contains("aterm init --only base.clt"), "{err}");
-        assert!(sys.calls().is_empty());
+        assert!(sys.calls().is_empty(), "{:?}", sys.calls());
+        for (bytes, mode, why) in [
+            (TOKEN, 0o644, "private regular file"),
+            ("", 0o600, "no single GitHub token"),
+            ("first second", 0o600, "no single GitHub token"),
+        ] {
+            let sys = Fake::default();
+            stored(&sys, bytes, mode);
+            let err = revoke(&sys, token_file(), "fleetbot", &[1]).unwrap_err();
+            assert!(err.contains(why), "{err}");
+            assert!(
+                err.contains("aterm machines github login replaces it"),
+                "{err}"
+            );
+            assert!(!err.contains(TOKEN), "{err}");
+            assert!(sys.calls().is_empty(), "{:?}", sys.calls());
+        }
     }
 
     #[test]
     fn a_token_github_no_longer_accepts_stops_at_the_login_check() {
         let sys = Fake::default();
-        git(&sys);
-        script::holds(&sys, None, TOKEN_HOST, "fleetbot", TOKEN);
+        stored(&sys, TOKEN, 0o600);
         sys.on_github_rest(
             RestMethod::Get,
             "/user",
@@ -1021,6 +1105,7 @@ mod tests {
         );
         let err = register(
             &sys,
+            token_file(),
             "fleetbot",
             "lab-07",
             &[("alice".into(), ALICE_KEY.into())],
@@ -1046,6 +1131,7 @@ mod tests {
         );
         let err = register(
             &sys,
+            token_file(),
             "fleetbot",
             "lab-07",
             &[("alice".into(), ALICE_KEY.into())],
@@ -1071,7 +1157,7 @@ mod tests {
             answer(204, &[], ""),
         );
         assert_eq!(
-            revoke(&sys, "fleetbot", &[100_000_105, 100_000_106]),
+            revoke(&sys, token_file(), "fleetbot", &[100_000_105, 100_000_106]),
             Ok(vec![format!("ssh-ed25519 {BOB_BODY}")])
         );
         let calls = sys.calls();
@@ -1093,7 +1179,7 @@ mod tests {
                 "/user/keys/100000107",
                 answer(404, &[ACCEPTED, ("X-OAuth-Scopes", held)], NOT_FOUND_BODY),
             );
-            let err = revoke(&sys, "fleetbot", &[100_000_107]).unwrap_err();
+            let err = revoke(&sys, token_file(), "fleetbot", &[100_000_107]).unwrap_err();
             assert!(
                 err.starts_with(
                     "key 100000107: still registered (GitHub DELETE /user/keys/100000107: HTTP \
@@ -1117,7 +1203,7 @@ mod tests {
             FIRST_PAGE,
             answer(404, &[ACCEPTED, ("X-OAuth-Scopes", "repo")], NOT_FOUND_BODY),
         );
-        let err = revoke(&sys, "fleetbot", &[7]).unwrap_err();
+        let err = revoke(&sys, token_file(), "fleetbot", &[7]).unwrap_err();
         assert!(
             err.starts_with("GitHub GET /user/keys: HTTP 404 (Not Found); the token lacks the admin:public_key scope"),
             "{err}"
@@ -1140,7 +1226,7 @@ mod tests {
                 ),
             ),
         );
-        let err = revoke(&sys, "fleetbot", &[100_000_107]).unwrap_err();
+        let err = revoke(&sys, token_file(), "fleetbot", &[100_000_107]).unwrap_err();
         assert!(err.contains("not an id and an SSH key"), "{err}");
         assert!(sys.calls().iter().all(|c| !c.contains("DELETE")));
     }
@@ -1148,25 +1234,48 @@ mod tests {
     #[test]
     fn nothing_to_do_reads_no_token() {
         let sys = Fake::default();
-        assert_eq!(register(&sys, "fleetbot", "lab-07", &[]), Ok(Vec::new()));
-        assert_eq!(revoke(&sys, "fleetbot", &[]), Ok(Vec::new()));
+        assert_eq!(
+            register(&sys, token_file(), "fleetbot", "lab-07", &[]),
+            Ok(Vec::new())
+        );
+        assert_eq!(revoke(&sys, token_file(), "fleetbot", &[]), Ok(Vec::new()));
         assert!(sys.calls().is_empty());
     }
 
     #[test]
-    fn an_account_that_is_not_a_login_is_refused_before_git_runs() {
+    fn an_account_that_is_not_a_login_is_refused_before_anything_is_read() {
         let sys = Fake::default();
-        git(&sys);
-        let err = revoke(&sys, "--user=x", &[1]).unwrap_err();
+        stored(&sys, TOKEN, 0o600);
+        let err = revoke(&sys, token_file(), "--user=x", &[1]).unwrap_err();
         assert!(err.contains("not a GitHub login"), "{err}");
-        let err = login(&sys, "a\nb", Secret::new(TOKEN.as_bytes()).unwrap()).unwrap_err();
+        let err = login(
+            &sys,
+            token_file(),
+            "a\nb",
+            Secret::new(TOKEN.as_bytes()).unwrap(),
+        )
+        .unwrap_err();
         assert!(err.contains("not a GitHub login"), "{err}");
         assert!(sys.calls().is_empty());
     }
 
-    /// `aterm machines github login` stores the token only once GitHub signs it in as the
-    /// account with the key scope, and reads it back. Negative controls: another account's
-    /// token, a classic token without the scope, and one GitHub refuses each store nothing.
+    /// A token that is empty or holds whitespace is no token: nothing is stored or asked.
+    #[test]
+    fn a_token_that_is_not_one_word_stores_nothing_and_asks_nothing() {
+        for token in [&b"a b"[..], b"", b"a\nb"] {
+            let sys = Fake::default();
+            let err =
+                login(&sys, token_file(), "fleetbot", Secret::new(token).unwrap()).unwrap_err();
+            assert!(err.contains("not one word"), "{err}");
+            assert!(sys.calls().is_empty(), "{:?}", sys.calls());
+            assert_eq!(sys.written(&token_file().to_string_lossy()), None);
+        }
+    }
+
+    /// `aterm machines github login` stores the token in the controller's token file (0600) only
+    /// once GitHub signs it in as the account with the key scope, and reads it back; git and the
+    /// login keychain are never asked. Negative controls: another account's token, a classic
+    /// token without the scope, and one GitHub refuses each store nothing.
     #[test]
     fn login_stores_a_token_only_after_github_vouches_for_it() {
         let user = |login: &str| format!(r#"{{"login":"{login}"}}"#);
@@ -1203,56 +1312,74 @@ mod tests {
         ];
         for (reply, refused) in cases {
             let sys = Fake::default();
-            git(&sys);
             sys.on_github_rest(RestMethod::Get, "/user", reply);
-            let approve = script::approves(&sys, None);
-            script::holds(&sys, None, TOKEN_HOST, "fleetbot", TOKEN);
-            let stored = login(&sys, "fleetbot", Secret::new(TOKEN.as_bytes()).unwrap());
+            let result = login(
+                &sys,
+                token_file(),
+                "fleetbot",
+                Secret::new(TOKEN.as_bytes()).unwrap(),
+            );
             let calls = sys.calls();
             match refused {
                 None => {
-                    stored.unwrap();
+                    result.unwrap();
                     assert_eq!(
                         calls,
                         [
                             "github GET /user".to_owned(),
-                            approve,
-                            script::credential(None, "fill")
+                            "mkdir /controller/keys 700".to_owned(),
+                            format!("write {TOKEN_FILE} 600"),
                         ]
+                    );
+                    assert_eq!(sys.mode_of(TOKEN_FILE), Some(0o600));
+                    assert_eq!(
+                        stored_token(&sys, token_file(), "fleetbot")
+                            .unwrap()
+                            .bytes(),
+                        TOKEN.as_bytes()
                     );
                 }
                 Some(why) => {
-                    let err = stored.unwrap_err();
+                    let err = result.unwrap_err();
                     assert!(err.contains(why), "{err}");
                     assert_eq!(calls, ["github GET /user"], "nothing was stored");
+                    assert!(sys.written(TOKEN_FILE).is_none());
                 }
             }
             clean(&sys);
         }
     }
 
+    /// A token file the read-back cannot read as a private file of this account's fails the
+    /// login, and the error carries no token.
     #[test]
-    fn a_store_the_keychain_does_not_hand_back_fails() {
+    fn a_token_file_that_does_not_read_back_fails() {
         let sys = Fake::default();
-        git(&sys);
         sys.on_github_rest(
             RestMethod::Get,
             "/user",
             answer(200, &[], r#"{"login":"fleetbot"}"#),
         );
-        script::approves(&sys, None);
-        script::holds(
+        sys.stat_of(
+            TOKEN_FILE,
+            Stat {
+                uid: 0,
+                gid: 0,
+                mode: 0o644,
+                dir: false,
+                symlink: false,
+                len: TOKEN.len() as u64,
+            },
+        );
+        let err = login(
             &sys,
-            None,
-            TOKEN_HOST,
+            token_file(),
             "fleetbot",
-            "fixture_some_other_value",
-        );
-        let err = login(&sys, "fleetbot", Secret::new(TOKEN.as_bytes()).unwrap()).unwrap_err();
-        assert!(err.contains("did not hand back"), "{err}");
-        assert!(
-            !err.contains(TOKEN) && !err.contains("fixture_some_other_value"),
-            "{err}"
-        );
+            Secret::new(TOKEN.as_bytes()).unwrap(),
+        )
+        .unwrap_err();
+        assert!(err.contains("private regular file"), "{err}");
+        assert!(!err.contains(TOKEN), "{err}");
+        clean(&sys);
     }
 }

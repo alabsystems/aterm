@@ -1875,6 +1875,16 @@ fn two_islands_admit_and_remove_then_tables_continue_after_the_heal() {
                     .expect("initiator exchange");
                     server.join().unwrap();
                 });
+                assert!(
+                    ra.membership_error().is_none(),
+                    "initiator membership error: {:?}",
+                    ra.membership_error()
+                );
+                assert!(
+                    rb.membership_error().is_none(),
+                    "responder membership error: {:?}",
+                    rb.membership_error()
+                );
                 if !checked {
                     continue;
                 }
@@ -2269,7 +2279,7 @@ fn two_islands_admit_and_remove_then_tables_continue_after_the_heal() {
     for at in [healed_at, healed_at + 100 * 60_000] {
         for p in [&m1, &m2, &m4, &m5] {
             closed.extend(
-                aterm_secrets::client::test_tend_at(p, at).expect("the vault pass's closer looks"),
+                aterm_secrets::client::vault_pass_at(p, at).expect("the vault pass's closer looks"),
             );
         }
         heal_pairs();
@@ -2925,6 +2935,16 @@ fn a_refusal_hold_ends_when_either_inventory_changes_and_a_refused_retry_renews_
                 (report.sent, answer.received, answer.deferred),
                 (0, 0, report.deferred)
             );
+            if hint_a
+                .refused
+                .as_ref()
+                .is_some_and(|run| run.held.is_some())
+            {
+                assert!(
+                    hint_a.cursor.is_none(),
+                    "a held retry must restart at missing parents"
+                );
+            }
             report.deferred
         })
     };
@@ -3203,8 +3223,12 @@ fn log_witness_and_acx2_handle_restored_seats_rotated_node_keys_and_denied_write
         .log_witness()
         .expect("log_witness succeeds")
         .expect("witness present");
-    let peer_log = check_log_witness(trust, &req2, &witness2)
-        .expect("restored + node-rotated member witness must pass check_log_witness");
+    let peer_log = check_log_witness(
+        trust,
+        &req2,
+        &aterm_secrets::membership_log::encode_records(witness2.records()),
+    )
+    .expect("restored + node-rotated member witness must pass check_log_witness");
     let ep2 = Endpoint::from_bootstrap(&b2)
         .expect("Endpoint::from_bootstrap succeeds for restored + node-rotated member")
         .expect("endpoint present");
@@ -3529,3 +3553,8 @@ fn a_peer_is_checked_against_the_deny_list_while_no_roster_is_read() {
         "and so does a sync applying"
     );
 }
+#[path = "crossing_tests.rs"]
+mod crossing_tests;
+
+#[path = "frontier_tests.rs"]
+mod frontier_tests;

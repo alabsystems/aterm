@@ -88,24 +88,10 @@ pub(super) fn byte_of_line(text: &str, line: usize) -> usize {
         .unwrap_or(text.len())
 }
 
-/// Byte offset at which every line of `text` begins.
-#[cfg(any(test, debug_assertions))]
-pub fn line_starts(text: &str) -> Vec<usize> {
-    let mut starts = Vec::with_capacity(1 + text.len() / 40);
-    starts.push(0);
-    starts.extend(
-        text.as_bytes()
-            .iter()
-            .enumerate()
-            .filter_map(|(index, byte)| (*byte == b'\n').then_some(index.saturating_add(1))),
-    );
-    starts
-}
-
 /// Ceiling on resident line-index entries: 2 Mi × 8 B = **16 MiB**.
 pub const MAX_LINE_INDEX_ENTRIES: usize = 2 << 20;
 
-/// [`line_starts`], but declines rather than exceed [`MAX_LINE_INDEX_ENTRIES`].
+/// Byte offsets at which every line of `text` begins, or `None` past [`MAX_LINE_INDEX_ENTRIES`].
 pub fn line_starts_capped(text: &str) -> Option<Vec<usize>> {
     let mut starts = Vec::with_capacity((1 + text.len() / 40).min(MAX_LINE_INDEX_ENTRIES));
     starts.push(0);
@@ -132,7 +118,7 @@ impl<'a> EditorLines<'a> {
         Self { text, starts: None }
     }
 
-    /// Answer from a [`line_starts`] index built for exactly this `text`.
+    /// Answer from a [`line_starts_capped`] index built for exactly this `text`.
     pub const fn indexed(text: &'a str, starts: &'a [usize]) -> Self {
         Self {
             text,
@@ -599,6 +585,17 @@ mod tests {
     use super::*;
     use crate::editor::{EditorSelectionSpan, Selection, editor};
 
+    fn uncapped_line_starts(text: &str) -> Vec<usize> {
+        std::iter::once(0)
+            .chain(
+                text.as_bytes()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, byte)| (*byte == b'\n').then_some(index + 1)),
+            )
+            .collect()
+    }
+
     #[test]
     fn projected_column_limit_is_the_clamp_it_replaced() {
         for columns in [0, 3, 4, 5, 80, 4_095, 4_096, 4_097, usize::MAX] {
@@ -618,7 +615,7 @@ mod tests {
             "\n\n\n",
             "α\nβγ\n\nδ",
         ] {
-            let starts = line_starts(text);
+            let starts = line_starts_capped(text).expect("short fixture fits under cap");
             let scanning = EditorLines::scanning(text);
             let indexed = EditorLines::indexed(text, &starts);
             assert_eq!(scanning.total(), indexed.total(), "total for {text:?}");
@@ -663,7 +660,7 @@ mod tests {
         ];
         view.primary = 0;
 
-        let projection = project_viewport(text, &view, 2, usize::MAX);
+        let projection = project_viewport_with(&EditorLines::scanning(text), &view, 2, usize::MAX);
         assert_eq!(projection.first_line, 1);
         assert_eq!(projection.total_lines, 4);
         assert_eq!(projection.lines.len(), 2, "projection stays visible-only");
@@ -691,7 +688,8 @@ mod tests {
         let (_, _, mut view, _) = editor(text);
         view.selections = vec![Selection { anchor: 0, head: 2 }];
 
-        let projection = project_viewport(text, &view, usize::MAX, usize::MAX);
+        let projection =
+            project_viewport_with(&EditorLines::scanning(text), &view, usize::MAX, usize::MAX);
         assert_eq!(projection.total_lines, 2);
         assert_eq!(projection.lines.len(), 2);
         assert_eq!(projection.lines[0].text, "a");
@@ -710,7 +708,7 @@ mod tests {
         let caret = 173;
         view.selections = vec![Selection::caret(caret)];
 
-        let projection = project_viewport(&text, &view, 3, 40);
+        let projection = project_viewport_with(&EditorLines::scanning(&text), &view, 3, 40);
         assert_eq!(projection.lines.len(), 3);
         let expected_start = caret - 30;
         for (row, projected) in projection.lines.iter().enumerate() {
@@ -739,7 +737,7 @@ mod tests {
         let text = "agents_auto_prime = false\n[update]\nenabled = false\n";
         let (_, _, mut view, _) = editor(text);
         view.selections = vec![Selection::caret(25)];
-        let projection = project_viewport(text, &view, 3, 29);
+        let projection = project_viewport_with(&EditorLines::scanning(text), &view, 3, 29);
         let texts: Vec<&str> = projection
             .lines
             .iter()
@@ -758,7 +756,7 @@ mod tests {
             view.selections = vec![Selection::caret(caret)];
             view
         };
-        let projection = project_viewport(text, &view_at(25), 3, 25);
+        let projection = project_viewport_with(&EditorLines::scanning(text), &view_at(25), 3, 25);
         assert_eq!(projection.lines[0].column_start, 1);
         assert_eq!(projection.lines[0].text, "gents_auto_prime = false");
 
@@ -768,7 +766,7 @@ mod tests {
         let (_, _, mut view, _) = editor(&long);
         for (caret, start) in [(50, 20), (80, 50), (85, 55), (91, 61), (100, 61)] {
             view.selections = vec![Selection::caret(caret)];
-            let projection = project_viewport(&long, &view, 1, 40);
+            let projection = project_viewport_with(&EditorLines::scanning(&long), &view, 1, 40);
             assert_eq!(
                 projection.lines[0].column_start, start,
                 "caret at column {caret}"
@@ -790,7 +788,7 @@ mod tests {
         let caret = "α".len() * 70;
         view.selections = vec![Selection::caret(caret)];
 
-        let projection = project_viewport(&text, &view, 2, 32);
+        let projection = project_viewport_with(&EditorLines::scanning(&text), &view, 2, 32);
         assert_eq!(projection.lines.len(), 2);
         assert!(projection.lines[0].source.start > 0);
         assert_eq!(projection.lines[0].column_start, 46);
@@ -813,7 +811,7 @@ mod tests {
         let (_, _, mut view, _) = editor(&text);
         view.selections = vec![Selection::caret(text.len())];
 
-        let projection = project_viewport(&text, &view, 1, 4);
+        let projection = project_viewport_with(&EditorLines::scanning(&text), &view, 1, 4);
         let line = &projection.lines[0];
         assert_eq!(line.text, "👩‍💻x");
         assert_eq!(line.source.start, 31);
@@ -832,7 +830,7 @@ mod tests {
 
         let text = "abce\u{301}z";
         let (_, _, view, _) = editor(text);
-        let projection = project_viewport(text, &view, 1, 4);
+        let projection = project_viewport_with(&EditorLines::scanning(text), &view, 1, 4);
         let line = &projection.lines[0];
         assert_eq!(line.text, "abce\u{301}");
         assert_eq!(line.source, 0.."abce\u{301}".len());
@@ -849,7 +847,8 @@ mod tests {
         let caret = text.len() - "α".len() * 9;
         view.selections = vec![Selection::caret(caret)];
 
-        let projection = project_viewport(&text, &view, usize::MAX, usize::MAX);
+        let projection =
+            project_viewport_with(&EditorLines::scanning(&text), &view, usize::MAX, usize::MAX);
         assert_eq!(projection.lines.len(), 1);
         let line = &projection.lines[0];
         assert!(line.text.len() <= 32 * 1024);
@@ -866,7 +865,7 @@ mod tests {
         assert_eq!(text.graphemes().count(), 1);
         let (_, _, view, _) = editor(&text);
 
-        let projection = project_viewport(&text, &view, 1, usize::MAX);
+        let projection = project_viewport_with(&EditorLines::scanning(&text), &view, 1, usize::MAX);
         let line = &projection.lines[0];
         assert_eq!(line.text, "");
         assert_eq!(line.source, 0..0);
@@ -878,7 +877,8 @@ mod tests {
         let line = format!("{}\n", "\u{0001}".repeat(40 * 1024));
         let text = line.repeat(40);
         let (_, _, view, _) = editor(&text);
-        let projection = project_viewport(&text, &view, usize::MAX, usize::MAX);
+        let projection =
+            project_viewport_with(&EditorLines::scanning(&text), &view, usize::MAX, usize::MAX);
         let total = projection
             .lines
             .iter()
@@ -903,12 +903,12 @@ mod tests {
         let starts = line_starts_capped(&ok).expect("under the cap must index");
         assert_eq!(
             starts,
-            line_starts(&ok),
+            uncapped_line_starts(&ok),
             "capped index must equal the plain one"
         );
 
         let scanning = EditorLines::scanning(&dense);
-        let reference = line_starts(&dense);
+        let reference = uncapped_line_starts(&dense);
         let indexed = EditorLines::indexed(&dense, &reference);
         assert_eq!(scanning.total(), indexed.total());
         for position in [0, 1, 7, dense.len() / 2, dense.len(), dense.len() + 3] {

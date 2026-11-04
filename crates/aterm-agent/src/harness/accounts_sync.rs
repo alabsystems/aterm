@@ -143,6 +143,14 @@ pub struct FleetRoster {
     /// under its lab label ([`super::alab_roster::fleet_for`]): never added unasked, only the name the
     /// default login's account takes ([`build_machine_roster`]). Never written or said.
     pub(crate) known: Vec<FleetAccount>,
+    /// Whether discovery made this fleet ([`OptIn::Discovered`]): over a roster that lists rows, a
+    /// sync then keeps every row as a person listed it and only adds an account no row holds
+    /// ([`keep_discovered_rows`]). Set from the file's `opt_in` as a sync reads it, never written.
+    pub(crate) keeps_rows: bool,
+    /// Each account the lab prefers here that was left out because an existing row of another
+    /// account holds its label: `(label, address)` ([`super::alab_roster::fleet_for`]). A sync's
+    /// receipt names them ([`CliSynced::clashes`]); never written.
+    pub(crate) clashes: Vec<(String, String)>,
 }
 
 impl FleetRoster {
@@ -1312,6 +1320,8 @@ fn parse_sheet(csv_text: &str, source: &str, cli: Cli) -> Result<Sheet, String> 
             conflicting,
             alab: None,
             known: Vec::new(),
+            keeps_rows: false,
+            clashes: Vec::new(),
         },
         held,
     })
@@ -1430,6 +1440,8 @@ pub(crate) struct LoginWitness {
     parent: accounts::RenewalParent,
     observed_at: i64,
     sign_in_receipt: Option<u64>,
+    /// Local file routing before the run; this does not prove what an external CLI cached.
+    auth_context: Option<accounts::AuthContext>,
 }
 
 /// A review's account, or the unassigned default login whose scope was observed.
@@ -1496,6 +1508,10 @@ pub(crate) fn capture_current_review(
         let selected = if cli == Cli::Claude {
             if records.raw_roster.rows.is_empty() {
                 None
+            } else if mode == accounts::Mode::Off {
+                // Rotation off picks no row of the pool: a review starts on the login it is
+                // started with, this machine's own, as a new session does.
+                records.roster.row_for_login(None)
             } else {
                 let (row, ready) = crate::ai::facts::select_claude_serving_row(
                     &records.roster,
@@ -1509,6 +1525,20 @@ pub(crate) fn capture_current_review(
                 }
                 Some(row)
             }
+        } else if cli == Cli::Codex {
+            let home = store
+                .user_home()
+                .ok_or("the Codex review home is unavailable")?;
+            super::accounts_pool::launch_observed(
+                (cli, false, mode),
+                &records.roster,
+                &records.state,
+                &enrolled,
+                program.or(Some(Path::new("codex"))),
+                now,
+                home,
+            )?
+            .or_else(|| records.roster.row_for_login(None))
         } else {
             super::accounts_pool::launch_now(
                 (cli, false, mode),
@@ -1671,9 +1701,21 @@ fn witness_from_row(
         roster: roster_path.to_path_buf(),
         parent: accounts::RenewalParent::capture(logins, &row.label),
         sign_in_receipt: logins.sign_in_receipts.get(&row.label).copied(),
+        auth_context: store.capture_auth_context(&row),
         row,
         observed_at: now,
     }
+}
+
+/// Captures the credentials before a fresh status process, retaining the original
+/// sign-in operation's policy and receipt fences across its intentional replacement.
+pub(crate) fn capture_status_context(
+    store: &accounts::Store,
+    witness: &LoginWitness,
+) -> LoginWitness {
+    let mut status = witness.clone();
+    status.auth_context = store.capture_auth_context(&witness.row);
+    status
 }
 
 /// Record a checked default login against its pre-run witness. Only a turn
@@ -1689,7 +1731,7 @@ pub(crate) fn record_default_sign_back(
     served: bool,
     now: i64,
 ) -> Result<Vec<accounts::Event>, String> {
-    transact_login_observation(store, roster_path, witness, now, |row, state, logins| {
+    transact_login_observation(store, roster_path, witness, now, |row, _, state, logins| {
         if row.dir.is_some() {
             return Err("default login observation names an isolated login".into());
         }
@@ -1707,6 +1749,28 @@ pub(crate) enum DefaultSignIn {
     Accepted,
     /// The identity was unverified; the current account was recorded signed out.
     WrongIdentity,
+}
+
+fn checked_codex_auth_context(
+    store: &accounts::Store,
+    row: &Row,
+) -> Option<(accounts::AuthContext, bool)> {
+    let user_home = store.user_home()?;
+    let default = store.default_home()?;
+    let home = row
+        .dir
+        .as_deref()
+        .filter(|dir| !dir.is_empty())
+        .map_or(default.as_path(), Path::new);
+    let observed = super::codex_app_login::current_login_context(
+        home,
+        user_home,
+        row.expected_identity_email(),
+    )?;
+    Some((
+        accounts::AuthContext::new(row, observed.context),
+        observed.identity_matches,
+    ))
 }
 
 /// Commit an explicit default-home sign-in after its successful provider status check.
@@ -1752,35 +1816,57 @@ pub(crate) fn record_default_sign_in(
         return Err("login provider differs from its account store".into());
     }
     let mut outcome = DefaultSignIn::WrongIdentity;
-    transact_login_observation(store, roster_path, witness, now, |row, state, logins| {
-        if row.dir.is_some() {
-            return Err("default login observation names an isolated login".into());
-        }
-        if logins.shared.required(row)?.is_some() {
-            return Err("this account requires a fresh root-authorized shared sign-in".into());
-        }
-        if logins.sign_in_receipts.get(&row.label).copied() != witness.sign_in_receipt {
-            return Err("a newer sign-in superseded this login; nothing recorded".into());
-        }
-        if state
-            .accounts
-            .get(&row.label)
-            .is_some_and(|account| account.auth_at.is_some_and(|held| held > now))
-        {
-            return Err(
-                "a newer authentication observation superseded this login; nothing recorded".into(),
-            );
-        }
-        if !default_login_identity_matches(cli, home, row) {
-            return Ok(accounts::note_login_end(state, logins, &row.label, now));
-        }
-        let events = accounts::note_checked_sign_in(state, logins, &row.label, now);
-        if events.is_empty() {
-            return Err("the verified sign-in could not be recorded".into());
-        }
-        outcome = DefaultSignIn::Accepted;
-        Ok(events)
-    })?;
+    transact_login_observation(
+        store,
+        roster_path,
+        witness,
+        now,
+        |row, raw_row, state, logins| {
+            if row.dir.is_some() {
+                return Err("default login observation names an isolated login".into());
+            }
+            if logins.shared.required(row)?.is_some() {
+                return Err("this account requires a fresh root-authorized shared sign-in".into());
+            }
+            if logins.sign_in_receipts.get(&row.label).copied() != witness.sign_in_receipt {
+                return Err("a newer sign-in superseded this login; nothing recorded".into());
+            }
+            if state.accounts.get(&row.label).is_some_and(|account| {
+                (state.contextual_auth || account.current_auth(row) != accounts::Auth::Unseen)
+                    && account.auth_at.is_some_and(|held| held > now)
+            }) {
+                return Err(
+                    "a newer authentication observation superseded this login; nothing recorded"
+                        .into(),
+                );
+            }
+            if cli == Cli::Codex {
+                let (context, identity_matches) = checked_codex_auth_context(store, row)
+                    .ok_or("sign-in credentials cannot be read; nothing recorded")?;
+                if witness.auth_context.as_ref() != Some(&context) {
+                    return Err(
+                        "credentials changed during sign-in status; nothing recorded".into(),
+                    );
+                }
+                if !identity_matches {
+                    accounts::stage_login_end(state, raw_row, logins, context, now);
+                    return Ok(Vec::new());
+                }
+                accounts::stage_checked_sign_in(state, raw_row, logins, context, now);
+                outcome = DefaultSignIn::Accepted;
+                return Ok(Vec::new());
+            }
+            if !default_login_identity_matches(cli, home, row) {
+                return Ok(accounts::note_login_end(state, logins, &row.label, now));
+            }
+            let events = accounts::note_checked_sign_in(state, logins, &row.label, now);
+            if events.is_empty() {
+                return Err("the verified sign-in could not be recorded".into());
+            }
+            outcome = DefaultSignIn::Accepted;
+            Ok(events)
+        },
+    )?;
     Ok(outcome)
 }
 
@@ -1794,11 +1880,12 @@ fn observe_default_success(
     now: i64,
 ) -> Result<Vec<accounts::Event>, String> {
     let label = &row.label;
-    if state
-        .accounts
-        .get(label)
-        .is_some_and(|account| account.auth == accounts::Auth::SignedOut)
-    {
+    if state.accounts.get(label).is_some_and(|account| {
+        account.auth == accounts::Auth::SignedOut
+            || (!state.contextual_auth
+                && account.auth != accounts::Auth::Unseen
+                && account.current_auth(row) == accounts::Auth::Unseen)
+    }) {
         if !default_login_identity_matches(cli, home, row) {
             return Err(
                 "default login identity changed or cannot be verified; nothing recorded".into(),
@@ -1811,14 +1898,64 @@ fn observe_default_success(
         return Ok(events);
     }
     if served
-        && state
-            .accounts
-            .get(label)
-            .is_none_or(|account| account.auth_at.is_none_or(|at| at <= now))
+        && state.accounts.get(label).is_none_or(|account| {
+            (!state.contextual_auth && account.current_auth(row) == accounts::Auth::Unseen)
+                || account.auth_at.is_none_or(|at| at <= now)
+        })
     {
         accounts::note_served_login(logins, label, now);
     }
     Ok(Vec::new())
+}
+
+/// Records an explicit sign-in's final signed-out status, which may describe newly
+/// written credentials. The pre-run policy and sign-in receipt still fence this result.
+///
+/// # Errors
+///
+/// The writer or records are unavailable, policy or a newer sign-in superseded this
+/// operation, or credentials changed or became unavailable during the status read.
+pub(crate) fn record_default_sign_out(
+    store: &accounts::Store,
+    cli: Cli,
+    roster_path: &Path,
+    witness: &LoginWitness,
+    home: &Path,
+    now: i64,
+) -> Result<Vec<accounts::Event>, String> {
+    if cli != Cli::Codex {
+        return record_review_login(
+            store,
+            cli,
+            roster_path,
+            witness,
+            home,
+            crate::ai::store::Outcome::Ended(crate::ai::store::Ended::StatusSignedOut),
+            now,
+        );
+    }
+    transact_login_observation(
+        store,
+        roster_path,
+        witness,
+        now,
+        |row, raw, state, logins| {
+            if logins.sign_in_receipts.get(&row.label).copied() != witness.sign_in_receipt {
+                return Err("a newer sign-in superseded this status; nothing recorded".into());
+            }
+            if !had_a_login(cli, row, state, logins, home) {
+                return Ok(Vec::new());
+            }
+            let context = store
+                .capture_auth_context(row)
+                .ok_or("sign-in credentials cannot be read; nothing recorded")?;
+            if witness.auth_context.as_ref() != Some(&context) {
+                return Err("credentials changed during sign-in status; nothing recorded".into());
+            }
+            accounts::stage_login_end(state, raw, logins, context, now);
+            Ok(Vec::new())
+        },
+    )
 }
 
 /// Attribute every review outcome to the policy and login captured before it ran.
@@ -1872,45 +2009,115 @@ pub(crate) fn record_review_login(
     now: i64,
 ) -> Result<Vec<accounts::Event>, String> {
     use crate::ai::store::Outcome;
-    transact_login_observation(store, roster_path, witness, now, |row, state, logins| {
-        let label = &row.label;
-        if logins.sign_in_receipts.get(label).copied() != witness.sign_in_receipt {
-            return Err("a newer sign-in superseded this review; nothing recorded".into());
-        }
-        match outcome {
-            Outcome::Worked if row.dir.is_none() => {
-                observe_default_success(cli, row, state, logins, home, true, now)
+    transact_login_observation(
+        store,
+        roster_path,
+        witness,
+        now,
+        |row, raw_row, state, logins| {
+            let label = &row.label;
+            if logins.sign_in_receipts.get(label).copied() != witness.sign_in_receipt {
+                return Err("a newer sign-in superseded this review; nothing recorded".into());
             }
-            Outcome::Worked => {
-                let events = accounts::note_signed_back(state, logins, label, now);
-                accounts::note_served_login(logins, label, now);
-                Ok(events)
+            if matches!(outcome, Outcome::Ended(_)) && !had_a_login(cli, row, state, logins, home) {
+                return Ok(Vec::new());
             }
-            Outcome::Ended(_) => Ok(accounts::note_login_end(state, logins, label, now)),
-            Outcome::Limited(until) => {
-                if state.accounts.get(label).is_some_and(|account| {
-                    account
-                        // Tied seconds cannot establish that this result
-                        // followed the clear. Preserve the explicit clear.
-                        .cleared_since("five_hour", witness.observed_at.saturating_sub(1), now)
-                        .is_some()
-                }) {
-                    return Err(
-                        "quota observation predates or ties an account clear; nothing recorded"
-                            .into(),
-                    );
+            if cli == Cli::Codex {
+                let context = witness
+                    .auth_context
+                    .as_ref()
+                    .ok_or("review credentials were unavailable; nothing recorded")?;
+                if store.capture_auth_context(row).as_ref() != Some(context) {
+                    return Err("credentials changed or became unavailable during the review; nothing recorded".into());
                 }
-                Ok(accounts::note_wall(
-                    state,
-                    label,
-                    "five_hour",
-                    until,
-                    witness.observed_at,
-                    now,
-                ))
+                match outcome {
+                    Outcome::Worked => {
+                        let (checked, identity_matches) = checked_codex_auth_context(store, row)
+                            .ok_or("review credentials cannot be read; nothing recorded")?;
+                        if checked != *context || !identity_matches {
+                            return Err("default login identity changed or cannot be verified; nothing recorded".into());
+                        }
+                        accounts::stage_signed_back(state, raw_row, logins, context.clone(), now);
+                        return Ok(Vec::new());
+                    }
+                    Outcome::Ended(_) => {
+                        accounts::stage_login_end(state, raw_row, logins, context.clone(), now);
+                        return Ok(Vec::new());
+                    }
+                    Outcome::Limited(_) => {
+                        accounts::stage_auth_check(state, raw_row, logins, context.clone(), now);
+                    }
+                }
             }
-        }
-    })
+            match outcome {
+                Outcome::Worked if row.dir.is_none() => {
+                    observe_default_success(cli, row, state, logins, home, true, now)
+                }
+                Outcome::Worked => {
+                    let events = accounts::note_signed_back(state, logins, label, now);
+                    accounts::note_served_login(logins, label, now);
+                    Ok(events)
+                }
+                // No login here and none ever bound: nothing ended, and the row stays never signed in.
+                Outcome::Ended(_) if !had_a_login(cli, row, state, logins, home) => Ok(Vec::new()),
+                Outcome::Ended(_) => Ok(accounts::note_login_end(state, logins, label, now)),
+                Outcome::Limited(until) => {
+                    if state.accounts.get(label).is_some_and(|account| {
+                        account
+                            // Tied seconds cannot establish that this result
+                            // followed the clear. Preserve the explicit clear.
+                            .cleared_since("five_hour", witness.observed_at.saturating_sub(1), now)
+                            .is_some()
+                    }) {
+                        return Err(
+                            "quota observation predates or ties an account clear; nothing recorded"
+                                .into(),
+                        );
+                    }
+                    Ok(accounts::note_wall(
+                        state,
+                        label,
+                        "five_hour",
+                        until,
+                        witness.observed_at,
+                        now,
+                    ))
+                }
+            }
+        },
+    )
+}
+
+/// Whether `row` has held a login: one is stored in its home (`home` for the row on the default
+/// login), Claude Code's profile there names an account (a Mac keeps that login in its keychain,
+/// with no file, as the accounts report reads it), or its records say one was renewed, served or
+/// ended, or it was seen signed out.
+fn had_a_login(
+    cli: Cli,
+    row: &Row,
+    state: &accounts::State,
+    logins: &accounts::Logins,
+    home: &Path,
+) -> bool {
+    let dir = row.dir.as_deref().map_or(home, Path::new);
+    let profile_names_one = || match &row.dir {
+        Some(_) => super::profile::key_in_home(dir).is_some(),
+        None => home
+            .parent()
+            .and_then(super::profile::default_home_key)
+            .is_some(),
+    };
+    crate::ai::connector::stored_login_file(cli.connector(), dir).is_some()
+        || (cli == Cli::Claude && profile_names_one())
+        || logins.get(&row.label).is_some_and(|binding| {
+            binding.renewed_at.is_some()
+                || binding.served_at.is_some()
+                || binding.ended_at.is_some()
+        })
+        || state
+            .accounts
+            .get(&row.label)
+            .is_some_and(|account| account.auth == accounts::Auth::SignedOut)
 }
 
 fn transact_login_observation(
@@ -1919,6 +2126,7 @@ fn transact_login_observation(
     witness: &LoginWitness,
     now: i64,
     record: impl FnOnce(
+        &Row,
         &Row,
         &mut accounts::State,
         &mut accounts::Logins,
@@ -1938,7 +2146,12 @@ fn transact_login_observation(
             if current.row(label) != Some(&witness.row) || !witness.parent.matches(logins, label) {
                 return Err("login policy changed during the run; nothing recorded".into());
             }
-            record(&witness.row, state, logins)
+            record(
+                &witness.row,
+                raw.row(label).ok_or("observed account disappeared")?,
+                state,
+                logins,
+            )
         },
     )
 }
@@ -2350,6 +2563,7 @@ pub fn build_machine_roster(
             .unwrap_or(&acct.email);
         accounts::email_matches(expected, email)
     };
+    let keeps_rows = fleet.keeps_rows && existing.is_some_and(|ex| !ex.rows.is_empty());
     let unlisted = default_email
         .filter(|de| !fleet_rows.iter().any(|r| matches_identity(r, de)))
         .and_then(|de| {
@@ -2359,19 +2573,20 @@ pub fn build_machine_roster(
                         .is_some_and(|re| accounts::email_matches(re, de))
                 })
             });
+            // A dirless row that names no address (the first `add`'s `main`) already lists
+            // the default login: retain keeps it as it is, and the account is not listed
+            // beside it as a second row with no login directory (a roster nobody can parse).
+            // No address is written into it here, since what is on record under it may be another
+            // account's (`check_new_labels` refuses that assignment): a sync of a CLI whose login
+            // names its address may write one where that is known ([`merge_default_twin`]).
+            let listed = kept.is_none()
+                && existing
+                    .and_then(|ex| ex.row_for_login(None))
+                    .is_some_and(|row| row.expected_identity_email().is_none());
+            if listed && (fleet.alab.is_some() || keeps_rows) {
+                return None;
+            }
             if fleet.alab.is_some() {
-                // A dirless row that names no address (the first `add`'s `main`) already lists
-                // the default login: retain keeps it as it is, and the account is not listed
-                // beside it as a second row with no login directory (a roster nobody can parse).
-                // No address is written into it either: what is on record under it may be
-                // another account's (`check_new_labels` refuses that assignment).
-                let listed = kept.is_none()
-                    && existing
-                        .and_then(|ex| ex.row_for_login(None))
-                        .is_some_and(|row| row.expected_identity_email().is_none());
-                if listed {
-                    return None;
-                }
                 return alab_default_account(fleet, existing, kept, de, &matches_identity);
             }
             fleet
@@ -2431,11 +2646,11 @@ pub fn build_machine_roster(
                 .filter(|r| fleet_rows.iter().any(|fr| fr.label == r.label))
                 .map(|r| r.label.clone())
         })
-        // Under the lab no row is made the default login unasked: a row that has a login
-        // directory keeps it (taking it away would leave that login behind, signed out), and a
-        // Mac whose default login the lab does not name has no dirless row. The sheet path makes
-        // its first row the default login, as it always did.
-        .or_else(|| fleet.alab.is_none().then(|| fleet_rows[0].label.clone()));
+        // Under the lab, and over the rows a discovered fleet keeps, no row is made the default
+        // login unasked: a row that has a login directory keeps it (taking it away would leave
+        // that login behind, signed out), and a Mac whose default login the lab does not name has
+        // no dirless row. The sheet path makes its first row the default login, as it always did.
+        .or_else(|| (fleet.alab.is_none() && !keeps_rows).then(|| fleet_rows[0].label.clone()));
 
     let mut rows = Vec::with_capacity(fleet_rows.len());
     for acct in &fleet_rows {
@@ -3010,12 +3225,18 @@ pub(super) fn sheet_read_here() -> bool {
     !super::alab_roster::names_this_mac() && !super::alab_roster::pending()
 }
 
-/// The refusal of a sheet named as a source on a Mac the lab names ([`sheet_read_here`]).
-fn sheet_refused(source: &str) -> String {
+/// The refusal of a sheet named as a source of `cli`'s pool on a Mac the lab names
+/// ([`sheet_read_here`]).
+fn sheet_refused(source: &str, cli: Cli) -> String {
+    let flag = if cli == Cli::Claude {
+        String::new()
+    } else {
+        format!(" --cli {}", cli.id())
+    };
     format!(
         "{source} is an accounts sheet, which the lab registry's importer reads (`aterm db alab \
          import`): the lab names this Mac, so its accounts come from the lab (`aterm harness \
-         accounts sync alab`); nothing was read"
+         accounts sync alab{flag}`); no account was read"
     )
 }
 
@@ -3197,7 +3418,7 @@ fn load_fleet_source_for_machine(
     } else if sheet_read_here() {
         parse_accounting_csv(&raw, &chosen)
     } else {
-        Err(sheet_refused(&chosen))
+        Err(sheet_refused(&chosen, Cli::Claude))
     }?;
     // A discovered fleet stays discovery's through every sync of the local file that holds it.
     let opt_in = if opt_in == OptIn::Named
@@ -3416,16 +3637,73 @@ fn local_shows(env: &Env) -> Shown {
     shown
 }
 
+/// The address the Claude Code profile in the login directory `dir` names, where it names one.
+fn login_dir_address(dir: &Path) -> Option<String> {
+    let text = read_local_source_text(&dir.join(".claude.json")).ok()?;
+    let doc = aterm_json::from_str::<Value>(&text).ok()?;
+    doc.get("oauthAccount")?
+        .get("emailAddress")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// The row of `roster` that holds `email`, whichever way a row can: its own login address or
+/// provider identity first ([`accounts::email_matches`]), then the address the login it runs on
+/// names, which an address of its own does not (`login_of`, the row's login directory's profile,
+/// or the default login's for a row on it that names no address). So one row's login is never
+/// listed as a second account (an alias with no `identity_email`, or a login that names someone
+/// else: [`note_wrong_account_logins`] reports that one). A row on the default login that names
+/// an address is not matched by what that login names: the login moved off it, and the sync's
+/// `displaced` step follows the account.
+fn row_holding<'a>(
+    roster: &'a Roster,
+    email: &str,
+    login_of: &dyn Fn(&Row) -> Option<String>,
+) -> Option<&'a Row> {
+    let names = |held: Option<&str>| held.is_some_and(|held| accounts::email_matches(held, email));
+    roster
+        .rows
+        .iter()
+        .find(|row| names(row.email.as_deref()) || names(row.identity_email.as_deref()))
+        .or_else(|| {
+            roster
+                .rows
+                .iter()
+                .filter(|row| row.dir.is_some() || row.expected_identity_email().is_none())
+                .find(|row| names(login_of(row).as_deref()))
+        })
+}
+
 /// The fleet discovery makes of what `shown` holds ([`Shown::all`]) for `env`'s machine, where
-/// it lists at least `min_accounts`.
+/// it lists at least `min_accounts`. An address a row of this Mac's roster holds ([`row_holding`])
+/// is that row's, under the label, order, browser profile and vendor keys it has, and a row that
+/// names no address has no line of it here and stays as it is ([`keep_discovered_rows`]); only an
+/// address no row holds is labelled from the machine and the address's own slot, under a label no
+/// row has.
 fn discovered_fleet(env: &Env, shown: &Shown, min_accounts: usize) -> Option<FleetRoster> {
     let emails = shown.all();
     if emails.is_empty() {
         return None;
     }
     let machine = machine_for(env.config.as_deref(), None)?;
+    let existing = env
+        .accounts_roster()
+        .and_then(|path| Roster::load(&path).ok())
+        .unwrap_or_default();
+    let default_address = read_default_profile_email(env);
+    let login_of = |row: &Row| match row.dir.as_deref() {
+        Some(dir) => login_dir_address(Path::new(dir)),
+        None => default_address.clone(),
+    };
+    let mut held: Vec<&Row> = Vec::new();
     let mut rows_with_slot: Vec<(Option<u32>, Vec<String>, String)> = Vec::new();
     for email in emails {
+        if let Some(row) = row_holding(&existing, &email, &login_of) {
+            if !held.iter().any(|kept| kept.label == row.label) {
+                held.push(row);
+            }
+            continue;
+        }
         let (mut machines, slot) = email_machines_and_slot(&email);
         if machines.is_empty() {
             machines.push(machine.clone());
@@ -3436,8 +3714,21 @@ fn discovered_fleet(env: &Env, shown: &Shown, min_accounts: usize) -> Option<Fle
         rows_with_slot.push((slot, machines, email));
     }
     rows_with_slot.sort_by_key(|(slot, _, email)| (slot.unwrap_or(1), email.clone()));
-    let mut used_labels = BTreeSet::new();
-    let mut accounts = Vec::new();
+    let mut used_labels: BTreeSet<String> =
+        existing.rows.iter().map(|row| row.label.clone()).collect();
+    let mut accounts: Vec<FleetAccount> = held
+        .into_iter()
+        .filter_map(|row| {
+            Some(FleetAccount {
+                label: row.label.clone(),
+                machines: vec![machine.clone()],
+                class: row.class,
+                email: row.email.clone()?,
+                browser: row.browser.clone(),
+                vendor: row.vendor,
+            })
+        })
+        .collect();
     for (slot, machines, email) in rows_with_slot {
         let base_label = discovered_label(&machines, slot);
         let mut label = base_label.clone();
@@ -3990,6 +4281,352 @@ struct SyncedAccounts {
     /// Whether the sync changed anything: a file whose bytes differ from what it held (each is
     /// written only then), account state or logins, or a ledger row.
     changed: bool,
+    /// What it did to rows it kept ([`RowChanges`]).
+    rows_changed: RowChanges,
+    /// Each account the lab prefers here left out for a label clash ([`FleetRoster::clashes`]).
+    clashes: Vec<(String, String)>,
+}
+
+/// The accounts a sync left out for a label clash, in its `--json`.
+fn clashes_json(clashes: &[(String, String)]) -> Value {
+    Value::Array(
+        clashes
+            .iter()
+            .map(|(label, email)| {
+                let mut m = Map::new();
+                m.insert("label".to_owned(), Value::from(label.clone()));
+                m.insert("email".to_owned(), Value::from(email.clone()));
+                Value::Object(m)
+            })
+            .collect(),
+    )
+}
+
+/// The accounts a sync left out for a label clash, one line each in its receipt.
+fn write_clash_lines(clashes: &[(String, String)], out: &mut dyn Write) {
+    for (label, email) in clashes {
+        let _ = writeln!(
+            out,
+            "left out: {email}, which the lab prefers here under the label `{label}`, since a \
+             row of another account holds that label"
+        );
+    }
+}
+
+/// What a sync of Codex read of its default login and did about it: one account listed twice
+/// beside it ([`merge_default_twin`]), or a row it moved off ([`reassign_codex_default`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DefaultLogin {
+    /// The address the default login names, where one can be read
+    /// ([`accounts::default_login_address`]).
+    pub address: Option<String>,
+    /// The row on the default login, which now names the address, and the row of that address the
+    /// sync folded into it, which held no login or record.
+    pub merged: Option<(String, String)>,
+    /// The row on the default login, and the row of its address, which holds a login or a record
+    /// of its own, so both stay.
+    pub twin: Option<(String, String)>,
+    /// The row that took the default login, the one of the address it names.
+    pub reassigned: Option<String>,
+    /// The row still on the default login though that login names another address, and the row's
+    /// own address ([`accounts::default_login_moved_off`]).
+    pub moved_off: Option<(String, String)>,
+    /// Why the login could not be followed to the row of its address. What the sync wrote before
+    /// that stands, and its receipt says so.
+    pub refused: Option<String>,
+}
+
+impl DefaultLogin {
+    /// Whether the login names another account than its row, which a sync with no source to read
+    /// still answers for, since following it reads none.
+    fn stands(&self) -> bool {
+        self.reassigned.is_some() || self.moved_off.is_some() || self.refused.is_some()
+    }
+
+    fn put_json(&self, o: &mut Map) {
+        let pair = |pair: &Option<(String, String)>, (a, b): (&str, &str)| {
+            pair.as_ref().map_or(Value::Null, |(first, second)| {
+                let mut m = Map::new();
+                m.insert(a.to_owned(), Value::from(first.clone()));
+                m.insert(b.to_owned(), Value::from(second.clone()));
+                Value::Object(m)
+            })
+        };
+        o.insert(
+            "default_login_names".to_owned(),
+            self.address.clone().map_or(Value::Null, Value::from),
+        );
+        o.insert(
+            "twin_merged".to_owned(),
+            pair(&self.merged, ("row", "merged")),
+        );
+        o.insert("twin".to_owned(), pair(&self.twin, ("row", "twin")));
+        o.insert(
+            "default_login_moved_off".to_owned(),
+            pair(&self.moved_off, ("row", "email")),
+        );
+        o.insert(
+            "default_login_refused".to_owned(),
+            self.refused.clone().map_or(Value::Null, Value::from),
+        );
+    }
+
+    fn write_lines(&self, out: &mut dyn Write) {
+        let address = self.address.as_deref().unwrap_or("another account");
+        if let Some((row, merged)) = &self.merged {
+            let _ = writeln!(
+                out,
+                "one account: `{merged}` was {address}, which `{row}` is on the default login; \
+                 it held no login or record, so `{row}` now stands for both"
+            );
+        }
+        if let Some((row, twin)) = &self.twin {
+            let _ = writeln!(
+                out,
+                "one account: `{row}` on the default login and `{twin}` are both {address}; \
+                 `{twin}` holds a login or a record of its own, so both stay, and no weekly \
+                 limit moves a session between them"
+            );
+        }
+        if let (Some((row, email)), None) = (&self.moved_off, &self.refused) {
+            let _ = writeln!(
+                out,
+                "default login: it names {address}, and `{row}` on it is {email}: no launch takes \
+                 `{row}` until that login names {email} again (`codex login`)"
+            );
+        }
+    }
+
+    /// Why the sync did not follow the login to the row of its address, in the words of its error
+    /// line, with the step every such refusal leaves.
+    fn refusal_words(&self) -> Option<String> {
+        let why = self.refused.as_deref()?;
+        Some(match (&self.moved_off, &self.address) {
+            (Some((row, email)), Some(address)) => format!(
+                "the default login names {address}, and `{row}` stays on it, so no launch takes \
+                 `{row}` until that login names {email} again (`codex login`): {why}"
+            ),
+            _ => why.to_owned(),
+        })
+    }
+}
+
+/// Where the row on the default login names no address and another row names the one that login
+/// names (Codex's `auth.json` under a file store, [`accounts::default_login_address`]: no keyring
+/// is read and no CLI runs), one account is listed twice. The row a person called something keeps
+/// its label and takes the address; the other is dropped where it holds no login or record, else
+/// both stay and the receipt says so. A row the sync would add for that account is never added. A
+/// row held for another Mac, under shared custody or bound to a directory elsewhere is left as it
+/// is, as is every row where nothing can be read. A default row that names another address is
+/// [`reassign_codex_default`]'s.
+fn merge_default_twin(
+    cli: Cli,
+    fleet: &FleetRoster,
+    store: &accounts::Store,
+    (kept, new, added): (&mut Vec<Row>, &mut Vec<Row>, &mut Vec<String>),
+    now: i64,
+) -> Result<DefaultLogin, String> {
+    let Some(login) = store
+        .user_home()
+        .and_then(|home| accounts::default_login_address(cli, home))
+    else {
+        return Ok(DefaultLogin::default());
+    };
+    let mut follow = DefaultLogin {
+        address: Some(login.clone()),
+        ..DefaultLogin::default()
+    };
+    let (logins, _) = store.load_logins(now)?;
+    let bound = accounts::bound(&Roster { rows: kept.clone() }, &logins);
+    let Some(own) = bound.row_for_login(None) else {
+        return Ok(follow);
+    };
+    if !row_free_here(own, &logins) || own.expected_identity_email().is_some() {
+        return Ok(follow);
+    }
+    let holds = |row: &Row| {
+        row.expected_identity_email()
+            .is_some_and(|held| accounts::email_matches(held, &login))
+    };
+    let mut state = store.load(now)?.0;
+    store.hydrate_auth_contexts(&mut state, &bound);
+    let may_name = default_row_may_name(own, &login, fleet, &state, now);
+    let own_label = own.label.clone();
+    if let Some(twin) = new.iter().find(|row| holds(row)).cloned() {
+        if may_name {
+            new.retain(|row| row.label != twin.label);
+            added.retain(|label| *label != twin.label);
+            name_row(kept, &own_label, &login);
+            follow.merged = Some((own_label, twin.label));
+        }
+    } else if let Some(twin) = bound.rows.iter().find(|row| holds(row)).cloned() {
+        if may_name && twin_holds_nothing(&twin, &state, &logins) {
+            name_row(kept, &own_label, &login);
+            kept.retain(|row| row.label != twin.label);
+            follow.merged = Some((own_label, twin.label));
+        } else {
+            follow.twin = Some((own_label, twin.label));
+        }
+    }
+    Ok(follow)
+}
+
+/// `label`'s row of `rows` takes the address `email`.
+fn name_row(rows: &mut [Row], label: &str, email: &str) {
+    if let Some(row) = rows.iter_mut().find(|row| row.label == label) {
+        row.email = Some(email.to_owned());
+    }
+}
+
+/// Whether a sync may change `row` as this Mac's own: no other Mac's hold, and no shared custody.
+fn row_free_here(row: &Row, logins: &accounts::Logins) -> bool {
+    row.held_by.is_none() && matches!(logins.shared.required(row), Ok(None))
+}
+
+/// Whether the row on the default login may take the address that login names: the source gives
+/// its label no other, and it is not known signed out, which would make the login a stale one.
+fn default_row_may_name(
+    own: &Row,
+    login: &str,
+    fleet: &FleetRoster,
+    state: &accounts::State,
+    now: i64,
+) -> bool {
+    !fleet.accounts.iter().any(|account| {
+        account.label == own.label && !accounts::email_matches(&account.email, login)
+    }) && accounts::condition(own, state, true, now) != accounts::Condition::SignedOut
+}
+
+/// Whether dropping `twin`, a row bound as `logins` say, loses nothing: no login in its directory,
+/// no other Mac's hold or shared custody, and no record under its label, a directory bound
+/// elsewhere among them.
+fn twin_holds_nothing(twin: &Row, state: &accounts::State, logins: &accounts::Logins) -> bool {
+    twin.dir
+        .as_deref()
+        .is_some_and(|dir| !accounts::login_made(Path::new(dir)))
+        && row_free_here(twin, logins)
+        && !accounts::label_is_retained(state, logins, &twin.label)
+}
+
+/// What a sync reads for `cli` where no source is named, for what it would do to the rows here
+/// ([`default_twin_folds`]). `None` where nothing is there to read or it cannot be read, so a sync
+/// does nothing a report could name; it never fetches.
+pub(super) fn sync_source_here(cli: Cli, env: &Env) -> Option<FleetRoster> {
+    let home = env.home.as_deref()?;
+    let no_network = |_: &Env, _: &str| Err("a report fetches no source".to_owned());
+    load_cli_fleet_source(cli, env, home, None, None, &no_network)
+        .ok()
+        .flatten()
+        .map(|(fleet, _, _)| fleet.roster)
+}
+
+/// Whether a sync from `fleet` folds `twin` into `own`, the row on the default login, whose login
+/// names `login`, as [`merge_default_twin`] does on the records as they stand (`logins` binds both
+/// rows).
+pub(super) fn default_twin_folds(
+    (own, twin): (&Row, &Row),
+    login: &str,
+    fleet: &FleetRoster,
+    (state, logins): (&accounts::State, &accounts::Logins),
+    now: i64,
+) -> bool {
+    row_free_here(own, logins)
+        && default_row_may_name(own, login, fleet, state, now)
+        && twin_holds_nothing(twin, state, logins)
+}
+
+/// What a sync did to rows it kept, so its receipt can name each: a hold it cleared or set, and an
+/// order it changed. A row's hold decides whether aterm signs it in here, so a change to one is
+/// never left for a person to find in the roster.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RowChanges {
+    /// Each row whose hold changed: its label, the Mac it was held for, the Mac it is held for.
+    pub holds: Vec<(String, Option<String>, Option<String>)>,
+    /// Each row whose order changed: its label, the order it had, the order it has.
+    pub orders: Vec<(String, Class, Class)>,
+}
+
+impl RowChanges {
+    /// What differs between `was` and `now` for each row in both, by label.
+    fn between(was: &[Row], now: &[Row]) -> Self {
+        let mut changes = Self::default();
+        for prev in was {
+            let Some(row) = now.iter().find(|row| row.label == prev.label) else {
+                continue;
+            };
+            if prev.held_by != row.held_by {
+                changes.holds.push((
+                    prev.label.clone(),
+                    prev.held_by.clone(),
+                    row.held_by.clone(),
+                ));
+            }
+            if prev.class != row.class {
+                changes
+                    .orders
+                    .push((prev.label.clone(), prev.class, row.class));
+            }
+        }
+        changes
+    }
+
+    /// Their `holds_changed` and `orders_changed` in a sync's `--json`.
+    fn put_json(&self, o: &mut Map) {
+        let word = |held: &Option<String>| held.clone().map_or(Value::Null, Value::from);
+        o.insert(
+            "holds_changed".to_owned(),
+            Value::Array(
+                self.holds
+                    .iter()
+                    .map(|(label, was, now)| {
+                        let mut m = Map::new();
+                        m.insert("label".to_owned(), Value::from(label.clone()));
+                        m.insert("was".to_owned(), word(was));
+                        m.insert("now".to_owned(), word(now));
+                        Value::Object(m)
+                    })
+                    .collect(),
+            ),
+        );
+        o.insert(
+            "orders_changed".to_owned(),
+            Value::Array(
+                self.orders
+                    .iter()
+                    .map(|(label, was, now)| {
+                        let mut m = Map::new();
+                        m.insert("label".to_owned(), Value::from(label.clone()));
+                        m.insert("was".to_owned(), Value::from(was.as_str().to_owned()));
+                        m.insert("now".to_owned(), Value::from(now.as_str().to_owned()));
+                        Value::Object(m)
+                    })
+                    .collect(),
+            ),
+        );
+    }
+
+    /// Their lines in a sync's receipt, one for each row.
+    fn write_lines(&self, out: &mut dyn Write) {
+        for (label, was, now) in &self.holds {
+            let _ = match (was, now) {
+                (Some(was), None) => writeln!(
+                    out,
+                    "hold cleared: `{label}` was held for {was}; this Mac may sign it in and run \
+                     it now"
+                ),
+                (_, Some(now)) => writeln!(out, "held: `{label}` is held for {now} now"),
+                (None, None) => Ok(()),
+            };
+        }
+        for (label, was, now) in &self.orders {
+            let _ = writeln!(
+                out,
+                "order changed: `{label}` from {} to {}",
+                was.as_str(),
+                now.as_str()
+            );
+        }
+    }
 }
 
 struct FleetSnapshot {
@@ -4445,6 +5082,9 @@ pub(super) fn compose_roster(
     if fleet.alab.is_some() {
         roster = super::alab_roster::retain(roster, existing, lab, Cli::Claude, machine);
     }
+    if fleet.keeps_rows {
+        roster = keep_discovered_rows(roster, existing);
+    }
     retain_shared_rows(
         &mut roster,
         existing,
@@ -4452,6 +5092,68 @@ pub(super) fn compose_roster(
         fleet.alab.is_some(),
     )?;
     Ok(roster)
+}
+
+/// `roster`, built from a fleet discovery made, with every row of `existing` kept as a person
+/// listed it: discovery found these rows' addresses in this Mac's own files, which says nothing of
+/// the order, hold, browser profile or vendor keys a row was given. A row that names no address,
+/// which a fleet cannot list, stays too, and so does a row a person renamed: the account a discovery
+/// still lists under the old label is that row. The rows keep their sequence in the file, and a new
+/// one follows them. A row's login directory is the build's: where the default login moved, it
+/// follows the account ([`default_relocation`]).
+fn keep_discovered_rows(mut roster: Roster, existing: &Roster) -> Roster {
+    roster.rows.retain(|row| {
+        !existing
+            .rows
+            .iter()
+            .any(|prev| prev.label != row.label && same_account(prev, row))
+    });
+    for prev in &existing.rows {
+        match roster.rows.iter_mut().find(|row| row.label == prev.label) {
+            Some(row) if same_account(prev, row) => {
+                row.class = prev.class;
+                row.browser.clone_from(&prev.browser);
+                row.held_by.clone_from(&prev.held_by);
+                row.vendor = prev.vendor;
+                row.was.clone_from(&prev.was);
+            }
+            Some(_) => {}
+            None => roster.rows.push(prev.clone()),
+        }
+    }
+    roster.rows.sort_by_key(|row| {
+        existing
+            .rows
+            .iter()
+            .position(|prev| prev.label == row.label)
+            .unwrap_or(existing.rows.len())
+    });
+    roster
+}
+
+/// Records each row of `roster` whose own login directory's profile names another account than
+/// the row expects as a wrong-account login, as a renewal that signed in the wrong account does
+/// ([`accounts::note_wrong_account`]: the report's `last renewal: wrong account`, `accounts::wrong_accounts`
+/// and a `wrong-account` line in the ledger), once for each finding. The row stays on its
+/// directory and a launch stays refused ([`super::accounts_pool::check_login_identity`]) until a
+/// sign-in names the row's account.
+fn note_wrong_account_logins(
+    roster: &Roster,
+    logins: &mut accounts::Logins,
+    now: i64,
+) -> Vec<accounts::Event> {
+    let mut events = Vec::new();
+    for row in &roster.rows {
+        let Some((dir, expected)) = row.dir.as_deref().zip(row.expected_identity_email()) else {
+            continue;
+        };
+        let wrong =
+            super::profile::identity_in_home(Path::new(dir), expected).email_matches == Some(false);
+        if wrong && logins.get(&row.label).is_none_or(|b| b.wrong_at.is_none()) {
+            events.extend(accounts::note_wrong_account(logins, &row.label, now));
+        }
+    }
+    events
 }
 
 fn apply_pool_to_claude_roster(
@@ -4668,7 +5370,8 @@ fn persist_accounts_sync_with_pool(
     };
     // Under the lab a dirless row that names no address (the first `add`'s `main`) is kept as
     // the default login's, as it was (`build_machine_roster`): it still lists it.
-    let listed_bare = fleet.alab.is_some()
+    let keeps_rows = fleet.alab.is_some() || fleet.keeps_rows;
+    let listed_bare = keeps_rows
         && roster
             .row_for_login(None)
             .is_some_and(|row| row.expected_identity_email().is_none());
@@ -4690,6 +5393,8 @@ fn persist_accounts_sync_with_pool(
                 "the lab prefers no account of this Mac's yet; nothing was written".to_owned(),
             ),
             changed: recovered,
+            rows_changed: RowChanges::default(),
+            clashes: fleet.clashes.clone(),
         });
     }
     if roster.rows.is_empty() {
@@ -4720,7 +5425,7 @@ fn persist_accounts_sync_with_pool(
             .map(|found| (found.from.clone(), found.to.clone())),
     );
     let mut departed = departed_labels(&existing, &roster);
-    if fleet.alab.is_some() {
+    if keeps_rows {
         // A row `alab_roster::retain` kept that names no address is known by its label alone:
         // it has not departed. A label another account now holds has.
         departed.retain(|label| {
@@ -4963,7 +5668,11 @@ fn persist_accounts_sync_with_pool(
                 }
             }
             let mut events = Vec::new();
-            if let Some(label) = &default_row_label {
+            if let Some(default_row) = default_row_label
+                .as_deref()
+                .and_then(|label| roster.row(label))
+            {
+                let label = &default_row.label;
                 let unseen_default = state
                     .accounts
                     .get(label)
@@ -4981,10 +5690,10 @@ fn persist_accounts_sync_with_pool(
                 let ended_since = state
                     .accounts
                     .get(label)
-                    .filter(|a| a.auth == accounts::Auth::SignedOut)
+                    .filter(|a| a.current_auth(default_row) == accounts::Auth::SignedOut)
                     .and_then(|a| a.auth_at)
                     .into_iter()
-                    .chain(logins.get(label).and_then(|b| b.ended_at))
+                    .chain(accounts::login_ended_at(default_row, logins, state))
                     .any(|at| at >= now);
                 // A row bound to a renewal directory of its own launches from that directory:
                 // the vendor's sign-in made a second login of its account on the default login
@@ -5000,12 +5709,14 @@ fn persist_accounts_sync_with_pool(
                     .as_deref()
                     .filter(|was| logins.get(was).is_none_or(|b| b.dir.is_none()));
                 if made_now {
-                    events.extend(accounts::note_default_login_made(
-                        state, logins, label, was, now,
+                    events.extend(accounts::note_default_login_made_observed(
+                        state, logins, default_row, was, now,
                     ));
-                } else if default_matched && unseen_default {
-                    accounts::note_served_login(logins, label, now);
-                    events.extend(accounts::note_auth(state, label, accounts::Auth::Ok, now));
+                } else if default_matched && unseen_default && !bound_elsewhere {
+                    accounts::note_served_login_for_observed_row(logins, default_row, now);
+                    events.extend(accounts::note_auth_for_observed_row(
+                        state, logins, default_row, accounts::Auth::Ok, now,
+                    ));
                 }
                 if default_matched
                     && bound_elsewhere
@@ -5035,19 +5746,31 @@ fn persist_accounts_sync_with_pool(
                     .get(&row.label)
                     .and_then(|b| b.dir.clone())
                     .or_else(|| row.dir.clone());
-                if dir.is_some_and(|dir| !accounts::login_made(Path::new(&dir)))
+                if let Some(dir) = dir
+                    && !accounts::login_made(Path::new(&dir))
                     && state
                         .accounts
                         .get(&row.label)
-                        .is_some_and(|a| a.auth == accounts::Auth::Ok)
+                        .is_some_and(|a| {
+                            a.auth == accounts::Auth::Ok
+                                || (a.auth != accounts::Auth::Unseen
+                                    && a.current_auth(row) == accounts::Auth::Unseen)
+                                || displaced.as_deref() == Some(row.label.as_str())
+                        })
                 {
-                    events.extend(accounts::note_auth(
+                    let mut observed_row = row.clone();
+                    observed_row.dir = Some(dir);
+                    events.extend(accounts::note_auth_for_observed_row(
                         state,
-                        &row.label,
+                        logins,
+                        &observed_row,
                         accounts::Auth::SignedOut,
                         now,
                     ));
                 }
+            }
+            if opt_in == OptIn::Discovered {
+                events.extend(note_wrong_account_logins(&roster, logins, now));
             }
             for (wall_label, wall) in standing_walls {
                 if roster.row(wall_label).is_none() {
@@ -5132,6 +5855,8 @@ fn persist_accounts_sync_with_pool(
         fleet_path,
         note,
         changed,
+        rows_changed: RowChanges::between(&existing.rows, &roster.rows),
+        clashes: fleet.clashes.clone(),
     })
 }
 
@@ -5189,6 +5914,13 @@ struct SyncPublication {
     changed: bool,
     /// The sheet's conflicts this machine's pool skips ([`conflict_names`]).
     conflicts: Vec<SheetConflict>,
+    /// Whether the source was the lab's: `fleet_accounts` then counts what the lab prefers here,
+    /// and no fleet file was written ([`persist_accounts_sync_with_pool`]).
+    lab: bool,
+    /// What this sync did to rows it kept ([`RowChanges`]).
+    rows_changed: RowChanges,
+    /// Each account the lab prefers here left out for a label clash ([`FleetRoster::clashes`]).
+    clashes: Vec<(String, String)>,
 }
 
 /// One observation after sync and sign-in recovery. The source metadata describes
@@ -5223,7 +5955,9 @@ impl SyncReport {
                         .state
                         .accounts
                         .get(&row.label)
-                        .is_none_or(|account| account.auth != accounts::Auth::SignedOut)
+                        .is_none_or(|account| {
+                            account.current_auth(row) != accounts::Auth::SignedOut
+                        })
             })
             .count();
         InitSynced {
@@ -5258,8 +5992,9 @@ fn sync_accounts_with(
         env.now,
         how.ladder,
     )?;
-    let (fleet, opt_in, pool_ctx) =
+    let (mut fleet, opt_in, pool_ctx) =
         load_fleet_source_for_machine(env, source, machine_override, how.fetch)?;
+    fleet.keeps_rows = opt_in == OptIn::Discovered;
     let default_email = read_default_profile_email(env);
     let machine = if let Some(ctx) = &pool_ctx {
         ctx.identity.primary.clone()
@@ -5322,6 +6057,9 @@ fn sync_accounts_with(
                 changed: state_wrote || fleet_wrote || recovered_commit,
                 // A pool's fleet reads no sheet, so it skips no sheet conflict.
                 conflicts: Vec::new(),
+                lab: false,
+                rows_changed: RowChanges::default(),
+                clashes: Vec::new(),
             },
             None,
         );
@@ -5351,6 +6089,8 @@ fn sync_accounts_with(
         fleet_path,
         note,
         changed,
+        rows_changed,
+        clashes,
     } = persist_accounts_sync_with_pool(
         &store,
         &roster_path,
@@ -5385,6 +6125,9 @@ fn sync_accounts_with(
                 || recovered
                 || healed.as_ref().is_some_and(|(healed, _)| *healed),
             conflicts,
+            lab: fleet.alab.is_some(),
+            rows_changed,
+            clashes,
         },
         note,
     )?;
@@ -5471,6 +6214,9 @@ fn write_sync_report(
                 fleet_accounts,
                 changed,
                 conflicts,
+                lab,
+                rows_changed,
+                clashes,
             },
         records,
         enrolled,
@@ -5495,13 +6241,19 @@ fn write_sync_report(
         );
         o.insert(
             "fleet_roster".to_owned(),
-            Value::from(fleet_path.display().to_string()),
+            if *lab {
+                Value::Null
+            } else {
+                Value::from(fleet_path.display().to_string())
+            },
         );
         o.insert(
             "fleet_accounts".to_owned(),
             Value::from(u64::try_from(*fleet_accounts).unwrap_or(0)),
         );
         o.insert("changed".to_owned(), Value::from(*changed));
+        rows_changed.put_json(&mut o);
+        o.insert("label_clashes".to_owned(), clashes_json(clashes));
         o.insert(
             "machine_accounts".to_owned(),
             Value::Array(
@@ -5538,13 +6290,23 @@ fn write_sync_report(
     } else {
         let _ = writeln!(
             out,
-            "synced machine `{machine}` ({} accounts on this machine, {} across fleet){}",
+            "synced machine `{machine}` ({} accounts on this machine, {} {}){}",
             roster.rows.len(),
             fleet_accounts,
+            if *lab {
+                "the lab prefers here"
+            } else {
+                "across fleet"
+            },
             if *changed { "" } else { "; no account changes" }
         );
         let _ = writeln!(out, "roster: {}", roster_path.display());
-        let _ = writeln!(out, "fleet:  {}", fleet_path.display());
+        // The lab's source writes no fleet file beside the roster.
+        if !*lab {
+            let _ = writeln!(out, "fleet:  {}", fleet_path.display());
+        }
+        rows_changed.write_lines(out);
+        write_clash_lines(clashes, out);
         for row in &roster.rows {
             let here = row.dir.is_none() || enrolled.contains(&row.label);
             let cond = match accounts::condition(row, state, here, now) {
@@ -6025,7 +6787,7 @@ fn default_login_heal_due(
         return None;
     }
     let account = state.accounts.get(&row.label)?;
-    if account.auth != accounts::Auth::SignedOut {
+    if account.current_auth(row) != accounts::Auth::SignedOut {
         return None;
     }
     let signed_out_at = account.auth_at?;
@@ -6072,13 +6834,16 @@ fn apply_default_heal(
         now,
         &mut note,
         |raw, state, logins| {
-            let standing = state.accounts.get(&heal.label).is_some_and(|a| {
-                a.auth == accounts::Auth::SignedOut && a.auth_at == Some(heal.signed_out_at)
+            let current = accounts::bound(raw, logins);
+            let standing = current.row(&heal.label).is_some_and(|row| {
+                state.accounts.get(&heal.label).is_some_and(|account| {
+                    account.current_auth(row) == accounts::Auth::SignedOut
+                        && account.auth_at == Some(heal.signed_out_at)
+                })
             }) && logins.get(&heal.label).is_none_or(|b| b.dir.is_none());
             if !standing {
                 return Ok(Vec::new());
             }
-            let current = accounts::bound(raw, logins);
             if !current.row(&heal.label).is_some_and(|row| {
                 row.expected_identity_email().is_some_and(|expected| {
                     accounts::email_matches(expected, &heal.expected_identity)
@@ -6457,7 +7222,15 @@ pub(crate) fn sign_ins_off(config: &Path) -> Option<&'static str> {
 /// CLI's sign-ins off and no other's.
 pub(crate) fn sign_ins_off_for(config: &Path, cli: Cli) -> Option<&'static str> {
     let (cfg, _) = crate::supervise::config::SupervisorConfig::from_path(Some(config));
-    harness_sign_ins_off(&cfg).or_else(|| {
+    sign_ins_off_under(&cfg, cli)
+}
+
+/// [`sign_ins_off_for`] of the config `cfg` as it was read.
+pub(crate) fn sign_ins_off_under(
+    cfg: &crate::supervise::config::SupervisorConfig,
+    cli: Cli,
+) -> Option<&'static str> {
+    harness_sign_ins_off(cfg).or_else(|| {
         if cfg.on_for(cli.program()) {
             return None;
         }
@@ -7787,6 +8560,9 @@ fn resync_with(
                 done.synced = true;
                 done.changed |= synced.changed;
             }
+            Ok(CliSync::NoSourceDefaultLogin(login)) => {
+                done.changed |= login.reassigned.is_some();
+            }
             Ok(
                 CliSync::Off | CliSync::Left { .. } | CliSync::NoSource | CliSync::Unlisted { .. },
             ) => {}
@@ -8032,6 +8808,9 @@ pub enum CliSync {
     /// Opted in or synced by default, and no fleet of the CLI's is there to read: neither its
     /// fleet file ([`cli_fleet_file`]) nor its column of the sheet ([`ACCOUNTS_CSV_FILE`]).
     NoSource,
+    /// [`Self::NoSource`], with a default login that names another account than its row: what the
+    /// sync came to of that, which takes no source ([`reassign_codex_default`]).
+    NoSourceDefaultLogin(Box<DefaultLogin>),
     /// Synced by default with no roster kept here, and the fleet lists no account of this
     /// machine's, or no `m<N>` names this machine: nothing was written, not even a lock (but
     /// for the recovery of an interrupted sync of the pool's own, which runs first).
@@ -8045,7 +8824,7 @@ pub enum CliSync {
         conflicts: Vec<SheetConflict>,
     },
     /// The fleet was read.
-    Synced(CliSynced),
+    Synced(Box<CliSynced>),
 }
 
 /// A sync that read the fleet ([`CliSync::Synced`]).
@@ -8074,9 +8853,19 @@ pub struct CliSynced {
     pub conflicts: Vec<SheetConflict>,
     /// Whether the sync changed the roster, account state or a recovered staging renewal.
     pub changed: bool,
+    /// The row this sync discovers on the default login, either on first sync or after a
+    /// checked Codex default-login reassignment. Its login file already exists.
+    pub own_row: Option<String>,
     /// Whether the fleet is the lab's and this Mac prefers no account of the CLI: the sync
     /// added nothing and kept every row (§0: no preference limits nothing).
     pub prefers_none: bool,
+    /// What the sync did to rows it kept: holds it cleared or set, orders it changed.
+    pub rows_changed: RowChanges,
+    /// Each account the lab prefers here that the sync left out because a row of another account
+    /// holds its label: `(label, address)` ([`FleetRoster::clashes`]).
+    pub clashes: Vec<(String, String)>,
+    /// What it read of the default login and did about it ([`DefaultLogin`]).
+    pub default_login: DefaultLogin,
 }
 
 /// An [`Env`] for a sync run from init, the vault's verbs or a window's upkeep: it names the
@@ -8213,7 +9002,7 @@ fn load_cli_fleet_source(
     } else if sheet_read_here() {
         parse_accounting_csv_for(cli, &raw, &chosen)?
     } else {
-        return Err(sheet_refused(&chosen));
+        return Err(sheet_refused(&chosen, cli));
     };
     let machine = machine_for(env.config.as_deref(), machine_override);
     Ok(Some((fleet, None, machine)))
@@ -8390,7 +9179,7 @@ fn sync_cli_with_replan(
     let Some((fleet, pool_ctx, machine)) =
         load_cli_fleet_source(cli, &env, home, source, machine_override, fetch)?
     else {
-        return Ok(CliSync::NoSource);
+        return sync_without_source(cli, (&env, &store), &roster_path, ladder, now);
     };
     let machine = if by_default {
         match by_default_admits(&store, &fleet, machine, now)? {
@@ -8448,7 +9237,16 @@ fn sync_cli_with_replan(
     let mut creation_signin = None;
     let mut after_unlock = Some(after_unlock);
     let mut roster_wrote = false;
-    let (write_to, total, added, kept, final_rows) = loop {
+    let (
+        write_to,
+        total,
+        added,
+        kept,
+        mut final_rows,
+        mut own_row,
+        rows_changed,
+        mut default_login,
+    ) = loop {
         let (write_to, keep_mode) = super::cli::roster_target(&roster_path)?;
         let existing_text = accounts::roster_text(&write_to)?.unwrap_or_default();
         let existing = Roster::parse_for(cli, &existing_text).map_err(|why| {
@@ -8520,17 +9318,28 @@ fn sync_cli_with_replan(
                 }
             }
         }
-        let mut total = merged_existing.len() + rows.len();
+        let default_login = merge_default_twin(
+            cli,
+            &fleet.roster,
+            &store,
+            (&mut merged_existing, &mut rows, &mut added),
+            now,
+        )?;
+        held_changed |= default_login.merged.is_some();
+        let mut total = merged_existing.len();
+        let mut own_row = None;
         if !rows.is_empty() {
             if merged_existing.is_empty() {
-                rows.insert(
-                    0,
-                    Row {
-                        label: ACCOUNTS_OWN_LABEL.to_owned(),
-                        ..Row::default()
-                    },
-                );
-                total += 1;
+                own_row = first_sync_own_row(cli, &fleet.roster, &store, &mut rows, &mut added);
+                if own_row.is_none() {
+                    rows.insert(
+                        0,
+                        Row {
+                            label: ACCOUNTS_OWN_LABEL.to_owned(),
+                            ..Row::default()
+                        },
+                    );
+                }
             }
             let text = if held_changed {
                 let mut all_rows = merged_existing.clone();
@@ -8570,6 +9379,7 @@ fn sync_cli_with_replan(
             super::upgrade_models::write_atomic_mode(&write_to, &text, keep_mode)
                 .map_err(|why| format!("could not write {}: {why}", write_to.display()))?;
             roster_wrote = true;
+            total = merged_existing.len() + rows.len();
             merged_existing.extend(rows);
         } else if held_changed {
             let text = accounts::append_rows_for(cli, "", &merged_existing).map_err(|why| {
@@ -8581,11 +9391,34 @@ fn sync_cli_with_replan(
                 roster_wrote = true;
             }
         }
-        break (write_to, total, added, kept, merged_existing);
+        let rows_changed = RowChanges::between(&existing.rows, &merged_existing);
+        break (
+            write_to,
+            total,
+            added,
+            kept,
+            merged_existing,
+            own_row,
+            rows_changed,
+            default_login,
+        );
     };
     drop(lock);
     // Recovery takes the sign-in lock too and must see this publication ended.
     drop(creation_signin);
+    let reassigned = follow_default_login(
+        cli,
+        (&env, &store),
+        (&roster_path, &write_to),
+        ladder,
+        &mut default_login,
+    );
+    let default_changed = reassigned.is_some();
+    if let Some(roster) = reassigned {
+        final_rows = roster.rows;
+        own_row.clone_from(&default_login.reassigned);
+    }
+    note_moved_off(&mut default_login, &store, final_rows.clone(), now);
     let mut state_wrote = false;
     if let Some(ctx) = &pool_ctx
         && (total > 0 || store.dir.exists())
@@ -8620,13 +9453,18 @@ fn sync_cli_with_replan(
         now,
         shared_renewal::CheckpointAuthority::live(Some(home), &write_to),
     );
-    let changed = !added.is_empty() || roster_wrote || state_wrote || recovered_commit || recovered;
+    let changed = !added.is_empty()
+        || roster_wrote
+        || default_changed
+        || state_wrote
+        || recovered_commit
+        || recovered;
     // A sync that added nothing wrote nothing, and wakes no watcher.
     if changed {
         let _ = store.touch_wake();
     }
     let conflicts = fleet.roster.conflicts_for(Some(&machine));
-    Ok(CliSync::Synced(CliSynced {
+    Ok(CliSync::Synced(Box::new(CliSynced {
         cli,
         machine,
         roster: roster_path,
@@ -8634,12 +9472,442 @@ fn sync_cli_with_replan(
         fleet_accounts,
         rows: total,
         added,
+        own_row,
         held,
         kept,
         conflicts,
         changed,
         prefers_none: lab_fleet && mine.is_empty(),
-    }))
+        rows_changed,
+        clashes: fleet.roster.clashes.clone(),
+        default_login,
+    })))
+}
+
+/// Follows `cli`'s default login to the row of the address it names, where it moved
+/// ([`reassign_codex_default`]): the roster that came of it, or `None`, with `follow` saying which
+/// row took it or why none did. A refusal is the receipt's to say beside what the sync wrote before
+/// it, so it fails no sync here.
+fn follow_default_login(
+    cli: Cli,
+    (env, store): (&Env, &accounts::Store),
+    (configured, path): (&Path, &Path),
+    ladder: &[Duration],
+    follow: &mut DefaultLogin,
+) -> Option<Roster> {
+    if cli != Cli::Codex {
+        return None;
+    }
+    match reassign_codex_default(env, store, configured, path, ladder, || {}) {
+        Ok(Some((roster, label))) => {
+            follow.reassigned = Some(label);
+            Some(roster)
+        }
+        Ok(None) => None,
+        Err(why) => {
+            follow.refused = Some(why);
+            None
+        }
+    }
+}
+
+/// `follow` names the row still on the default login among `rows`, as the store binds them, where
+/// that login names another account ([`accounts::default_login_moved_off`]). Bindings it cannot read
+/// leave nothing named, as a launch refuses on them anyway.
+fn note_moved_off(follow: &mut DefaultLogin, store: &accounts::Store, rows: Vec<Row>, now: i64) {
+    if follow.address.is_none() {
+        return;
+    }
+    let Ok((logins, _)) = store.load_logins(now) else {
+        return;
+    };
+    let roster = accounts::bound(&Roster { rows }, &logins);
+    follow.moved_off = accounts::default_login_moved_off(&roster, follow.address.as_deref())
+        .and_then(|row| Some((row.label.clone(), row.expected_identity_email()?.to_owned())));
+}
+
+/// A sync with no fleet to read ([`CliSync::NoSource`]): where this Mac's default login names an
+/// address and it keeps a roster, what comes of following that login, which reads no source.
+fn sync_without_source(
+    cli: Cli,
+    (env, store): (&Env, &accounts::Store),
+    roster_path: &Path,
+    ladder: &[Duration],
+    now: i64,
+) -> Result<CliSync, String> {
+    let address = store
+        .user_home()
+        .and_then(|home| accounts::default_login_address(cli, home));
+    if address.is_none() || !roster_path.is_file() {
+        return Ok(CliSync::NoSource);
+    }
+    let mut follow = DefaultLogin {
+        address,
+        ..DefaultLogin::default()
+    };
+    let (write_to, _) = super::cli::roster_target(roster_path)?;
+    let rows = match follow_default_login(
+        cli,
+        (env, store),
+        (roster_path, &write_to),
+        ladder,
+        &mut follow,
+    ) {
+        Some(roster) => roster.rows,
+        None => accounts::roster_text(&write_to)?.map_or(Ok(Vec::new()), |text| {
+            Roster::parse_for(cli, &text).map(|roster| roster.rows)
+        })?,
+    };
+    note_moved_off(&mut follow, store, rows, now);
+    if follow.reassigned.is_some() {
+        let _ = store.touch_wake();
+    }
+    Ok(if follow.stands() {
+        CliSync::NoSourceDefaultLogin(Box::new(follow))
+    } else {
+        CliSync::NoSource
+    })
+}
+
+/// Whether a row displaced from the default login may take `dir`, its managed login directory: it
+/// holds nothing, or it is a directory the row left (`was`, [`accounts::Binding::was`]) whose login
+/// names the row's `email`, which it takes back with nothing lost. Anything else stays where it is.
+fn displaced_dir_admits(dir: &str, was: &[Option<String>], email: &str) -> Result<bool, String> {
+    let home = Path::new(dir);
+    match std::fs::read_dir(home) {
+        Ok(mut entries) => match entries.next() {
+            None => Ok(true),
+            Some(entry) => {
+                entry.map_err(|e| e.to_string())?;
+                Ok(accounts::lists_directory(was, dir)?
+                    && crate::ai::facts::codex_file_store(home)
+                    && super::codex_app_login::read_account_email(home)
+                        .is_some_and(|named| accounts::email_matches(&named, email)))
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Reassign a named default login only after observing another uniquely declared account.
+/// This changes login locations, not account identity, provider authority or existing sessions.
+/// The sync receipt publishes the roster and binding fences together; no credential is copied.
+fn reassign_codex_default(
+    env: &Env,
+    store: &accounts::Store,
+    configured: &Path,
+    path: &Path,
+    ladder: &[Duration],
+    before_publish: impl FnOnce(),
+) -> Result<Option<(Roster, String)>, String> {
+    let (target, mode) = super::cli::roster_target(configured)?;
+    if target != path {
+        return Err(
+            "the configured roster target changed before Codex reassignment; no row moved".into(),
+        );
+    }
+    let Some(text) = accounts::roster_text(path)? else {
+        return Ok(None);
+    };
+    let roster = Roster::parse_for(Cli::Codex, &text)?;
+    let Some(from) = roster.row_for_login(None) else {
+        return Ok(None);
+    };
+    let Some(expected) = from.expected_identity_email() else {
+        return Ok(None);
+    };
+    let Some(home) = store.default_home() else {
+        return Ok(None);
+    };
+    if !crate::ai::facts::codex_file_store(&home) {
+        return Ok(None);
+    }
+    let Some(email) = super::codex_app_login::read_account_email(&home) else {
+        return Ok(None);
+    };
+    if accounts::email_matches(expected, &email) {
+        return Ok(None);
+    }
+    let mut candidates = roster.rows.iter().filter(|row| {
+        row.expected_identity_email()
+            .is_some_and(|expected| accounts::email_matches(expected, &email))
+            && accounts::same_provider_realm(Cli::Codex, from.vendor.region, row.vendor.region)
+    });
+    let Some(to) = candidates.next() else {
+        return Ok(None);
+    };
+    if candidates.next().is_some() {
+        return Err(
+            "the default Codex login matches multiple declared accounts; no row moved".into(),
+        );
+    }
+    if from.held_by.is_some() || to.held_by.is_some() {
+        return Err("the default Codex reassignment includes a held account; no row moved".into());
+    }
+    super::codex_app_login::check_login_identity(&home, Some(&email)).map_err(|e| e.to_string())?;
+    let policy = codex_completion_source(env, to)?;
+    if policy.held_by.is_some() {
+        return Err("the source holds the default Codex account; no row moved".into());
+    }
+    if let Some(fleet) = &policy.fleet {
+        let mut declared = fleet.roster.accounts.iter().filter(|account| {
+            account.label == to.label && fleet_matches_identity(Cli::Codex, to, account)
+        });
+        if declared.next().is_none() || declared.next().is_some() {
+            return Err(
+                "the source does not uniquely declare the default Codex account; no row moved"
+                    .into(),
+            );
+        }
+    }
+    let config = env
+        .config
+        .as_deref()
+        .ok_or("the account configuration is unavailable")?;
+    let configuration = accounts::roster_text(config)?;
+    let _signing = store
+        .signin_now()
+        .map_err(|e| e.to_string())?
+        .ok_or(accounts::SIGNIN_HELD)?;
+    let held = store
+        .acquire_within(ladder)
+        .map_err(|e| e.to_string())?
+        .ok_or(accounts::LOCK_HELD)?;
+    let _auth = super::codex_app_login::AuthLock::try_take(&home.join("auth.json"))
+        .map_err(|e| e.to_string())?
+        .ok_or("the default Codex login is being changed; no row moved")?;
+    let (mut state, state_note) = store.load(env.now)?;
+    let (logins, logins_note) = store.load_logins(env.now)?;
+    if state_note.is_some() || logins_note.is_some() {
+        return Err("account records could not be read consistently; no row moved".into());
+    }
+    // The transaction applies this same machine-name normalization before its edit.
+    if let Ok(machine) = store.machine_id(&state.machine) {
+        state.machine = machine;
+    }
+    let mut updated = roster.clone();
+    let independent = logins
+        .get(&from.label)
+        .and_then(|binding| binding.dir.clone());
+    let directory = independent
+        .clone()
+        .or_else(|| {
+            store
+                .login_dir(&from.label)
+                .and_then(|path| path.to_str().map(str::to_owned))
+        })
+        .ok_or("the displaced account has no managed login location")?;
+    if accounts::retained_directory_owner(&logins, &roster.rows, &from.label, &directory)?.is_some()
+        || accounts::shared_staging_retained(&logins, &directory)?
+    {
+        return Err("the displaced account's directory has another owner; no row moved".into());
+    }
+    if accounts::naming_row(
+        std::iter::once(&Row {
+            dir: Some(directory.clone()),
+            ..Row::default()
+        }),
+        home.to_str().ok_or("the default Codex home is not UTF-8")?,
+    )?
+    .is_some()
+    {
+        return Err(
+            "the displaced account's directory aliases the default login; no row moved".into(),
+        );
+    }
+    let left: Vec<Option<String>> = logins
+        .get(&from.label)
+        .map(|binding| binding.was.clone())
+        .unwrap_or_default();
+    if independent.is_none() && !displaced_dir_admits(&directory, &left, expected)? {
+        return Err(format!(
+            "`{}`'s managed directory {directory} holds a login that is not its own; no row moved: \
+             move that directory away and sync again",
+            from.label
+        ));
+    }
+    updated
+        .rows
+        .iter_mut()
+        .find(|row| row.label == from.label)
+        .unwrap()
+        .dir = Some(directory.clone());
+    updated
+        .rows
+        .iter_mut()
+        .find(|row| row.label == to.label)
+        .unwrap()
+        .dir = None;
+    if accounts::retained_directory_owner(
+        &logins,
+        &updated.rows,
+        &to.label,
+        home.to_str().ok_or("the default Codex home is not UTF-8")?,
+    )?
+    .is_some()
+        || accounts::shared_staging_retained(
+            &logins,
+            home.to_str().ok_or("the default Codex home is not UTF-8")?,
+        )?
+    {
+        return Err("the default Codex directory has another retained owner; no row moved".into());
+    }
+    let next_text = accounts::append_rows_for(Cli::Codex, "", &updated.rows)?;
+    before_publish();
+    let recheck = || -> Result<(), String> {
+        if super::cli::roster_target(configured)? != (target.clone(), mode)
+            || accounts::roster_text(path)?.as_deref() != Some(&text)
+            || accounts::roster_text(config)? != configuration
+            || !crate::ai::facts::codex_file_store(&home)
+            || !super::codex_app_login::read_account_email(&home)
+                .is_some_and(|now| accounts::email_matches(&now, &email))
+            || codex_completion_source(env, to)? != policy
+        {
+            return Err(
+                "Codex account identity or policy changed before reassignment; no row moved".into(),
+            );
+        }
+        if accounts::retained_directory_owner(&logins, &roster.rows, &from.label, &directory)?
+            .is_some()
+            || accounts::retained_directory_owner(
+                &logins,
+                &updated.rows,
+                &to.label,
+                home.to_str().ok_or("the default Codex home is not UTF-8")?,
+            )?
+            .is_some()
+            || accounts::shared_staging_retained(&logins, &directory)?
+            || accounts::shared_staging_retained(
+                &logins,
+                home.to_str().ok_or("the default Codex home is not UTF-8")?,
+            )?
+        {
+            return Err("Codex login directory ownership changed; no row moved".into());
+        }
+        if independent.is_none() && !displaced_dir_admits(&directory, &left, expected)? {
+            return Err("the displaced account's directory became occupied; no row moved".into());
+        }
+        super::codex_app_login::check_login_identity(&home, Some(&email)).map_err(|e| e.to_string())
+    };
+    recheck()?;
+    store.transact_sync_held(
+        &held,
+        env.now,
+        &mut None,
+        accounts::SyncTarget {
+            path,
+            before: Some(&text),
+            after: Some(&next_text),
+            mode,
+        },
+        |current, bindings| {
+            if *current != state || *bindings != logins {
+                return Err(
+                    "account custody changed before Codex reassignment; no row moved".into(),
+                );
+            }
+            recheck()?;
+            for label in [&from.label, &to.label] {
+                bindings.pending_sign_in_invalidations.insert(label.clone());
+            }
+            if independent.is_none() {
+                let mut was = bindings
+                    .get(&from.label)
+                    .map(|binding| binding.was.clone())
+                    .unwrap_or_default();
+                was.retain(|kept| kept.as_deref().is_some_and(|kept| kept != directory));
+                was.truncate(accounts::MAX_LEFT - 1);
+                was.push(None);
+                bindings.labels.insert(
+                    from.label.clone(),
+                    accounts::Binding {
+                        dir: Some(directory.clone()),
+                        was,
+                        ..accounts::Binding::default()
+                    },
+                );
+            } else if let Some(binding) = bindings.labels.get_mut(&from.label) {
+                binding.was.retain(Option::is_some);
+                binding.was.truncate(accounts::MAX_LEFT - 1);
+                binding.was.push(None);
+            }
+            let previous = bindings.get(&to.label).cloned().unwrap_or_default();
+            let mut was = previous.was;
+            if let Some(directory) = previous.dir.or_else(|| to.dir.clone()) {
+                was.retain(|kept| kept.as_deref().is_some_and(|kept| kept != directory));
+                was.truncate(accounts::MAX_LEFT - 1);
+                was.push(Some(directory));
+            }
+            bindings.labels.insert(
+                to.label.clone(),
+                accounts::Binding {
+                    was,
+                    ..accounts::Binding::default()
+                },
+            );
+            Ok(Vec::new())
+        },
+        || Ok(()),
+    )?;
+    Ok(Some((updated, to.label.clone())))
+}
+
+/// A first sync under the lab, whose roster has no rows yet, of a CLI whose default login names
+/// its account (Codex's `auth.json`): the row of that account is this machine's own login's, under
+/// its lab label and with its address, so one account is listed once. A row this sync adds for
+/// that account gives up the login directory it would have had; an account the lab knows and does
+/// not prefer here joins as a pool row. `None` where the identity cannot be read (Grok Build's and
+/// Kimi Code's logins name none, and a login kept in the OS keyring is not read, whatever account a
+/// leftover `auth.json` beside it names) or the lab does not know the account: the caller lists the
+/// default login as `main`, as for any other source.
+fn first_sync_own_row(
+    cli: Cli,
+    fleet: &FleetRoster,
+    store: &accounts::Store,
+    rows: &mut Vec<Row>,
+    added: &mut Vec<String>,
+) -> Option<String> {
+    fleet.alab.as_ref()?;
+    if cli != Cli::Codex {
+        return None;
+    }
+    let default_home = store.default_home()?;
+    if !crate::ai::facts::codex_file_store(&default_home) {
+        return None;
+    }
+    let email = super::codex_app_login::read_account_email(&default_home)?;
+    if let Some(at) = rows.iter().position(|row| {
+        row.email
+            .as_deref()
+            .is_some_and(|e| accounts::email_matches(e, &email))
+    }) {
+        let mut row = rows.remove(at);
+        row.dir = None;
+        let label = row.label.clone();
+        rows.insert(0, row);
+        return Some(label);
+    }
+    let known = alab_default_account(fleet, None, None, &email, &|account, email| {
+        accounts::email_matches(&account.email, email)
+    })?;
+    let label = known.label.clone();
+    rows.insert(
+        0,
+        Row {
+            label: known.label,
+            class: known.class,
+            dir: None,
+            email: Some(known.email),
+            identity_email: None,
+            browser: known.browser,
+            held_by: None,
+            was: Vec::new(),
+            vendor: known.vendor,
+        },
+    );
+    added.push(label.clone());
+    Some(label)
 }
 
 #[cfg_attr(
@@ -8798,12 +10066,13 @@ fn run_cli_accounts_sync_with(
         Ok(CliSync::NoSource) => {
             let _ = writeln!(
                 err,
-                "aterm harness accounts sync {flag}: nothing to read: neither ~/.secrets/{} nor a \
-                 `{}` column in ~/.secrets/{ACCOUNTS_CSV_FILE} is there; the roster is unchanged",
-                cli_fleet_file(cli),
-                csv_columns(cli).first().copied().unwrap_or(cli.id())
+                "aterm harness accounts sync {flag}: {}; the roster is unchanged",
+                nothing_to_read_words(cli)
             );
             return ExitCode::FAILURE;
+        }
+        Ok(CliSync::NoSourceDefaultLogin(login)) => {
+            return no_source_default_login_receipt(cli, &login, json, (out, err));
         }
         Ok(CliSync::Unlisted {
             machine,
@@ -8865,24 +10134,37 @@ fn run_cli_accounts_sync_with(
             "sheet_conflicts".to_owned(),
             conflicts_json(&synced.conflicts),
         );
+        synced.rows_changed.put_json(&mut o);
+        o.insert("label_clashes".to_owned(), clashes_json(&synced.clashes));
+        synced.default_login.put_json(&mut o);
         let _ = writeln!(
             out,
             "{}",
             aterm_json::to_string(&Value::Object(o)).unwrap_or_default()
         );
-        return ExitCode::SUCCESS;
+        return write_default_refusal(&synced.default_login, &flag, err);
     }
+    let elsewhere = if synced.source == super::alab_roster::SOURCE {
+        "the lab prefers here"
+    } else {
+        "across the fleet"
+    };
     let _ = writeln!(
         out,
-        "synced {product}'s pool for machine `{}` ({} added; {} rows in the roster, {} across \
-         the fleet)",
+        "synced {product}'s pool for machine `{}` ({} added; {} rows in the roster, {} {elsewhere})",
         synced.machine,
         synced.added.len(),
         synced.rows,
         synced.fleet_accounts
     );
+    if let Some(own) = &synced.own_row {
+        let _ = writeln!(out, "on this machine's own login: {own}");
+    }
     let _ = writeln!(out, "roster: {}", synced.roster.display());
     let _ = writeln!(out, "source: {}", synced.source);
+    synced.rows_changed.write_lines(out);
+    write_clash_lines(&synced.clashes, out);
+    synced.default_login.write_lines(out);
     if synced.prefers_none {
         let _ = writeln!(
             out,
@@ -8905,15 +10187,35 @@ fn run_cli_accounts_sync_with(
             synced.kept.join(" ")
         );
     }
-    if !synced.added.is_empty() && cli.renews_headlessly() {
+    let unsigned: Vec<&str> = synced
+        .added
+        .iter()
+        .map(String::as_str)
+        .filter(|label| synced.own_row.as_deref() != Some(label))
+        .collect();
+    let beside = synced.roster.parent().map(|dir| dir.join("aterm.toml"));
+    let off = env
+        .config
+        .as_deref()
+        .or(beside.as_deref())
+        .and_then(|config| sign_ins_off_for(config, cli));
+    if let (false, true, Some(switch)) = (unsigned.is_empty(), cli.renews_headlessly(), off) {
+        let _ = writeln!(
+            out,
+            "not signed in yet: {}; {switch} keeps aterm's unattended sign-ins off here \
+             (`aterm harness accounts renew {} {flag}` runs one now)",
+            unsigned.join(", "),
+            unsigned.join(" ")
+        );
+    } else if !unsigned.is_empty() && cli.renews_headlessly() {
         let _ = writeln!(
             out,
             "not signed in yet: {}; aterm signs one in by itself once a session needs it \
              (`aterm harness accounts renew {} {flag}` runs that now)",
-            synced.added.join(", "),
-            synced.added.join(" ")
+            unsigned.join(", "),
+            unsigned.join(" ")
         );
-    } else if !synced.added.is_empty() {
+    } else if !unsigned.is_empty() {
         let _ = writeln!(
             out,
             "not signed in yet: {}; {product}'s sign-in page answers aterm's headless browser \
@@ -8923,7 +10225,81 @@ fn run_cli_accounts_sync_with(
             cli.sign_in_verb(true)
         );
     }
-    ExitCode::SUCCESS
+    write_default_refusal(&synced.default_login, &flag, err)
+}
+
+/// What a sync of `cli` found no source in, in its error line's words.
+fn nothing_to_read_words(cli: Cli) -> String {
+    format!(
+        "nothing to read: neither ~/.secrets/{}, nor ~/.secrets/{}, nor a `{}` column in \
+         ~/.secrets/{ACCOUNTS_CSV_FILE} is there",
+        super::ai_pool::AI_POOL_FILE,
+        cli_fleet_file(cli),
+        csv_columns(cli).first().copied().unwrap_or(cli.id())
+    )
+}
+
+/// The error line of a sync that could not follow the default login, and its exit code; success
+/// where none stands.
+fn write_default_refusal(login: &DefaultLogin, flag: &str, err: &mut dyn Write) -> ExitCode {
+    let Some(words) = login.refusal_words() else {
+        return ExitCode::SUCCESS;
+    };
+    let _ = writeln!(err, "aterm harness accounts sync {flag}: {words}");
+    ExitCode::FAILURE
+}
+
+/// The receipt of a sync with no source to read whose default login names another account than its
+/// row: a row that took that login is what the sync came to do, so it succeeds; else it fails as a
+/// sync with nothing to read does, and says what stands.
+fn no_source_default_login_receipt(
+    cli: Cli,
+    login: &DefaultLogin,
+    json: bool,
+    (out, err): (&mut dyn Write, &mut dyn Write),
+) -> ExitCode {
+    let flag = format!("--cli {}", cli.id());
+    let nothing = nothing_to_read_words(cli);
+    if json {
+        let mut o = Map::new();
+        o.insert("schema".to_owned(), Value::from(1u64));
+        o.insert("kind".to_owned(), Value::from("accounts-sync".to_owned()));
+        o.insert("cli".to_owned(), Value::from(cli.id().to_owned()));
+        o.insert("source".to_owned(), Value::Null);
+        o.insert(
+            "own_row".to_owned(),
+            login.reassigned.clone().map_or(Value::Null, Value::from),
+        );
+        login.put_json(&mut o);
+        let _ = writeln!(
+            out,
+            "{}",
+            aterm_json::to_string(&Value::Object(o)).unwrap_or_default()
+        );
+    } else {
+        if let Some(row) = &login.reassigned {
+            let _ = writeln!(out, "on this machine's own login: {row}");
+        }
+        login.write_lines(out);
+        // With no source in the way, a row of the login's address is all a sync needs.
+        if let (Some(address), Some(_), None) = (&login.address, &login.moved_off, &login.refused) {
+            let _ = writeln!(
+                out,
+                "or list that account, and a sync moves the login to it: `aterm harness accounts \
+                 add <label> {flag} --email {address}`"
+            );
+        }
+    }
+    if login.reassigned.is_some() {
+        let _ = writeln!(
+            err,
+            "aterm harness accounts sync {flag}: {nothing}, so only the default login was followed"
+        );
+        return ExitCode::SUCCESS;
+    }
+    let _ = write_default_refusal(login, &flag, err);
+    let _ = writeln!(err, "aterm harness accounts sync {flag}: {nothing}");
+    ExitCode::FAILURE
 }
 
 /// THE DEFAULT SYNC'S ADMISSION, for a pool syncing by default ([`syncs_by_default`]) with no
@@ -9037,7 +10413,8 @@ fn sync_cli_accounts_with(
                 (None, None),
                 now,
                 (fetch, &ladder),
-            );
+            )
+            .and_then(default_refusal_fails);
             let synced = if cli == Cli::Codex && synced.is_ok() {
                 let env = quiet_env(home, state_dir, &config, now);
                 super::cli::default_completion::complete(
@@ -9052,6 +10429,17 @@ fn sync_cli_accounts_with(
             (cli, synced)
         })
         .collect()
+}
+
+/// `synced`, or the refusal it carries of following the default login, for a caller that prints no
+/// receipt: what the sync wrote before it stands and has woken the pool's watchers.
+fn default_refusal_fails(synced: CliSync) -> Result<CliSync, String> {
+    let refused = match &synced {
+        CliSync::Synced(synced) => synced.default_login.refused.clone(),
+        CliSync::NoSourceDefaultLogin(login) => login.refused.clone(),
+        _ => None,
+    };
+    refused.map_or(Ok(synced), Err)
 }
 
 /// One other CLI's pool as this machine keeps it ([`cli_pools`]).
@@ -9262,7 +10650,7 @@ fn default_sync_holds(
 /// which says nothing of what it read.
 fn default_sync_settled(synced: &Result<CliSync, String>) -> bool {
     match synced {
-        Ok(CliSync::Synced(_)) => false,
+        Ok(CliSync::Synced(_) | CliSync::NoSourceDefaultLogin(_)) => false,
         Ok(CliSync::Off | CliSync::Left { .. } | CliSync::NoSource | CliSync::Unlisted { .. }) => {
             true
         }
@@ -11155,7 +12543,9 @@ fn rank_renewal_candidates(
             a.limited_until(now).is_some()
                 || a.low(now)
                 || a.warned(now)
-                || a.auth == accounts::Auth::SignedOut
+                || roster
+                    .row(label)
+                    .is_some_and(|row| a.current_auth(row) == accounts::Auth::SignedOut)
         })
     };
     let is_limited = |label: &str| {
@@ -11211,7 +12601,7 @@ fn rank_renewal_candidates(
                 && state
                     .accounts
                     .get(&row.label)
-                    .is_some_and(|a| a.auth == accounts::Auth::SignedOut)
+                    .is_some_and(|a| a.current_auth(row) == accounts::Auth::SignedOut)
         })
     {
         if seen.insert(row.label.clone()) {
@@ -11243,7 +12633,10 @@ fn rank_renewal_candidates(
             }
             if let Some(me_label) = me
                 && state.accounts.get(me_label).is_some_and(|a| {
-                    a.auth == accounts::Auth::SignedOut && a.limited_until(now).is_none()
+                    roster
+                        .row(me_label)
+                        .is_some_and(|row| a.current_auth(row) == accounts::Auth::SignedOut)
+                        && a.limited_until(now).is_none()
                 })
                 && let Some(me_row) = roster.row(me_label).cloned()
                 && me_row.held_by.is_none()
@@ -12068,19 +13461,28 @@ fn recover_interrupted_staging_renewals_checked(
                     {
                         return Ok(Vec::new());
                     }
-                    let is_signed_out = state
-                        .accounts
-                        .get(&row.label)
-                        .is_some_and(|a| a.auth == accounts::Auth::SignedOut);
+                    let needs_auth_recovery =
+                        state.accounts.get(&row.label).is_some_and(|account| {
+                            let auth = account.current_auth(row);
+                            auth == accounts::Auth::SignedOut
+                                || (account.auth != accounts::Auth::Unseen
+                                    && auth == accounts::Auth::Unseen)
+                        });
                     let pending_shared =
                         cli == Cli::Claude && logins.shared.pending_for(row, principal);
                     let needs_recovery =
-                        !enrolled.contains(&row.label) || is_signed_out || pending_shared;
+                        !enrolled.contains(&row.label) || needs_auth_recovery || pending_shared;
                     if state
                         .accounts
                         .get(&row.label)
                         .is_some_and(|a| a.limited_until(now).is_some())
-                        || !accounts::checkpoint_current(row, state, logins, &proof)
+                        || !accounts::checkpoint_current(
+                            row,
+                            state,
+                            logins,
+                            &proof,
+                            store.dir.parent(),
+                        )
                         || !needs_recovery
                     {
                         return Ok(Vec::new());
@@ -15041,6 +16443,10 @@ mod alias_relabel_tests;
 #[cfg(test)]
 #[path = "accounts_sync_report_tests.rs"]
 mod sync_report_tests;
+
+#[cfg(test)]
+#[path = "accounts_sync_default_login_tests.rs"]
+mod default_login_tests;
 
 #[cfg(test)]
 #[path = "accounts_dashboard_tests.rs"]
@@ -18353,8 +19759,9 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                 binding
                     .was
                     .push(Some(another.to_string_lossy().into_owned()));
-                Ok(accounts::note_auth(
+                Ok(accounts::note_auth_in_context(
                     state,
+                    logins,
                     "m27-2",
                     accounts::Auth::SignedOut,
                     UPKEEP_NOW + 30,
@@ -18880,6 +20287,25 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             .expect("m27 row in sync output");
         assert_eq!(m27_entry["enrolled"].as_bool(), Some(true));
         assert_eq!(m27_entry["condition"].as_str(), Some("usable"));
+        let recovered = store
+            .read_account_records(Some(&cfg_dir.join(accounts::ACCOUNTS_FILE)), UPKEEP_NOW)
+            .unwrap();
+        assert_eq!(
+            recovered
+                .state
+                .account("m27")
+                .current_auth(recovered.roster.row("m27").unwrap()),
+            accounts::Auth::Ok,
+        );
+        assert_eq!(
+            store
+                .load_logins(UPKEEP_NOW)
+                .unwrap()
+                .0
+                .get("m27")
+                .and_then(|binding| binding.dir.as_deref()),
+            staged_m27.to_str(),
+        );
         let needs_renew: Vec<&str> = sync_json["needs_renew"]
             .as_array()
             .unwrap()
@@ -21281,6 +22707,10 @@ totp = "JBSWY3DPEHPK3PXP"
 #[cfg(test)]
 #[path = "accounts_sync_cli_tests.rs"]
 mod cli_pool_tests;
+
+#[cfg(test)]
+#[path = "accounts_sync_codex_identity_tests.rs"]
+mod codex_default_identity_tests;
 
 #[cfg(test)]
 #[path = "accounts_sync_alab_tests.rs"]

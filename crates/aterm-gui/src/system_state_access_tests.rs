@@ -7401,3 +7401,891 @@ fn the_doors_key_rest_needs_focus_and_the_steps_quiet_seconds() {
         "no aterm window has keyboard focus"
     );
 }
+
+/// When the window stops a Local Network alert watch that [`watch_through`] drives, as a time
+/// since its first read: the hold it may end ended another way (the person's time, the
+/// re-probe's answer), which stops the watch, as an alert never answered leaves it. It comes
+/// past the watch's first looks ([`super::LOCAL_NETWORK_ALERT_FIRST_LOOKS`]), so a watch that
+/// finds the person away reads at the away pace before it.
+const WATCH_STOPPED: Duration = Duration::from_secs(60);
+
+/// Windows of the alert's owner, each on screen.
+fn on(numbers: &[u32]) -> Vec<super::AlertWindow> {
+    numbers
+        .iter()
+        .map(|&number| super::AlertWindow {
+            number,
+            on_screen: true,
+        })
+        .collect()
+}
+
+/// Windows of the alert's owner, each listed off screen (ordered out).
+fn off(numbers: &[u32]) -> Vec<super::AlertWindow> {
+    numbers
+        .iter()
+        .map(|&number| super::AlertWindow {
+            number,
+            on_screen: false,
+        })
+        .collect()
+}
+
+/// One Local Network alert watch ([`super::watch_alert`]) driven by explicit times: its first
+/// read, the baseline the trigger waits for, at `t0`, with the trigger arming it then; then, as
+/// the live worker paces its reads, one every [`super::LOCAL_NETWORK_ALERT_LOOK`] after a read
+/// within [`super::LOCAL_NETWORK_ALERT_FIRST_LOOKS`] of `t0` or one that found the person
+/// present, and every [`super::LOCAL_NETWORK_ALERT_AWAY_LOOK`] after a later one that found them
+/// away, while that look comes before `t0 + WATCH_STOPPED`, as the live worker's look ends once
+/// the window stops the watch. Each read is `listed` at its time since `t0` (`None`: a window list that could not be
+/// read), and the person is `present` at it. How the watch ended, and the times since `t0` it
+/// read at.
+fn watch_with(
+    t0: Instant,
+    listed: impl Fn(Duration) -> Option<Vec<super::AlertWindow>>,
+    present: impl Fn(Duration) -> bool,
+) -> (super::AlertWatchEnd, Vec<Duration>) {
+    let at = std::cell::Cell::new(t0);
+    let reads = RefCell::new(Vec::new());
+    let end = super::watch_alert(
+        || {
+            let since = at.get().duration_since(t0);
+            reads.borrow_mut().push(since);
+            listed(since)
+        },
+        || present(at.get().duration_since(t0)),
+        |here| {
+            let first = at.get().duration_since(t0) < super::LOCAL_NETWORK_ALERT_FIRST_LOOKS;
+            let next = at.get()
+                + if here || first {
+                    super::LOCAL_NETWORK_ALERT_LOOK
+                } else {
+                    super::LOCAL_NETWORK_ALERT_AWAY_LOOK
+                };
+            if next >= t0 + WATCH_STOPPED {
+                return false;
+            }
+            at.set(next);
+            true
+        },
+    );
+    (end, reads.into_inner())
+}
+
+/// [`watch_with`] with the person at the Mac throughout.
+fn watch_through(
+    t0: Instant,
+    listed: impl Fn(Duration) -> Option<Vec<super::AlertWindow>>,
+) -> (super::AlertWatchEnd, Vec<Duration>) {
+    watch_with(t0, listed, |_| true)
+}
+
+/// The last look before the window stops the watch, as a time since its first read.
+fn last_look() -> Duration {
+    WATCH_STOPPED - super::LOCAL_NETWORK_ALERT_LOOK
+}
+
+/// macOS's Local Network alert seen on screen after the trigger ends the watch `Answered` at the
+/// first read that lists no window of the alert's owner at all, and not before: a window of the
+/// owner that was up at the first read and stays holds it after the seen window is gone, since
+/// it may be the alert itself, and a read that could not see the list ends nothing. NEGATIVE
+/// CONTROL: a watch that ends once every seen window is gone, whatever the first read's windows
+/// do (`listed.is_empty()` read as `seen.iter().all(|n| !listed.iter().any(|w| w.number == *n))`),
+/// ends at 2 s, with window 7 still up.
+#[test]
+fn the_alert_watch_ends_at_the_read_that_lists_no_window_of_its_owner() {
+    use super::AlertWatchEnd;
+    let t0 = Instant::now();
+    let (end, reads) = watch_through(t0, |at| match at.as_millis() {
+        0..1000 => Some(on(&[7])),
+        1000..1500 => Some(on(&[7, 48])),
+        1500 => None,
+        1750 => Some(on(&[48, 7])),
+        2000..3000 => Some(on(&[7])),
+        _ => Some(Vec::new()),
+    });
+    assert_eq!(end, AlertWatchEnd::Answered);
+    assert_eq!(
+        reads.last(),
+        Some(&Duration::from_millis(3000)),
+        "it ends at the read that lists no window of the owner"
+    );
+    assert_eq!(reads.len(), 13, "a read every quarter second until then");
+}
+
+/// A seen window that leaves the screen but stays in the window list (ordered out: a Space
+/// switch, or a CFUserNotification taken down by its client, which stays listed off screen for
+/// about 8 s, `docs/measured/unc-alert-window-list-2026-11-03.md`) ends nothing; the watch ends
+/// `Answered` at the first read that lists no window of the owner, on screen or off. NEGATIVE
+/// CONTROL: a watch that reads only the screen (`listed.is_empty()` read as
+/// `listed.iter().all(|w| !w.on_screen)`) ends at 1 s, with window 48 still listed.
+#[test]
+fn a_seen_window_ordered_out_ends_the_alert_watch_only_once_it_leaves_the_list() {
+    use super::AlertWatchEnd;
+    let t0 = Instant::now();
+    let (end, reads) = watch_through(t0, |at| match at.as_millis() {
+        0..250 => Some(Vec::new()),
+        250..1000 => Some(on(&[48])),
+        1000..3000 => Some(off(&[48])),
+        _ => Some(Vec::new()),
+    });
+    assert_eq!(end, AlertWatchEnd::Answered);
+    assert_eq!(
+        reads.last(),
+        Some(&Duration::from_millis(3000)),
+        "it ends once the window leaves the list"
+    );
+}
+
+/// A window listed off screen at the first read (an alert taken down just before, still
+/// listed) is not taken for one up before the trigger: drawn on screen after the trigger, it is
+/// seen, and its going ends the watch `Answered`. NEGATIVE CONTROL: a baseline of every window
+/// the first read lists (its `.filter(|window| window.on_screen)` taken out) never sees window 48
+/// and ends `NeverSeen`.
+#[test]
+fn a_window_listed_off_screen_before_the_trigger_is_seen_once_drawn_after_it() {
+    use super::AlertWatchEnd;
+    let t0 = Instant::now();
+    let (end, reads) = watch_through(t0, |at| match at.as_millis() {
+        0 => Some(off(&[48])),
+        250..1000 => Some(on(&[48])),
+        _ => Some(Vec::new()),
+    });
+    assert_eq!(end, AlertWatchEnd::Answered);
+    assert_eq!(reads.last(), Some(&Duration::from_millis(1000)));
+}
+
+/// A seen window's going ends nothing while the person is away (no touch within a minute, or
+/// the screen locked or switched away for another login): an alert stands, unanswered, while
+/// nobody is there, and its window going then is not known to be an answer. The watch reads
+/// every quarter second for its first looks ([`super::LOCAL_NETWORK_ALERT_FIRST_LOOKS`]), then
+/// every [`super::LOCAL_NETWORK_ALERT_AWAY_LOOK`] while the person is away, and ends `Answered`
+/// at the first read that finds them back with no window of the owner listed. NEGATIVE
+/// CONTROLS: a watch that ends whether or not the person is there (`&& here` taken out) ends at
+/// 1 s; one that reads every quarter second while they are away (`look_again` given `true`
+/// whatever the person) reads 181 times and ends at 45 s.
+#[test]
+fn an_alert_gone_while_the_person_is_away_ends_the_watch_only_once_they_are_back() {
+    use super::AlertWatchEnd;
+    let t0 = Instant::now();
+    let (end, reads) = watch_with(
+        t0,
+        |at| match at.as_millis() {
+            0..250 => Some(Vec::new()),
+            250..1000 => Some(on(&[48])),
+            _ => Some(Vec::new()),
+        },
+        |at| at < Duration::from_secs(1) || at >= Duration::from_secs(45),
+    );
+    assert_eq!(end, AlertWatchEnd::Answered);
+    let ms: Vec<u128> = reads.iter().map(Duration::as_millis).collect();
+    let paced: Vec<u128> = (0..=120)
+        .map(|look| look * 250)
+        .chain([35_000, 40_000, 45_000])
+        .collect();
+    assert_eq!(
+        ms, paced,
+        "a quarter second apart for the first 30 s, then five seconds apart while away"
+    );
+}
+
+/// A seen window gone while the person is away, and the watch stopped before they come back,
+/// ends it `GoneWhileAway`, never `Answered`. NEGATIVE CONTROL: an end that reads the last read
+/// as `StillUp` whatever it listed (its `(false, true)` arm taken out) ends `StillUp`.
+#[test]
+fn an_alert_watch_stopped_while_the_person_is_away_ends_gone_while_away() {
+    use super::AlertWatchEnd;
+    let t0 = Instant::now();
+    let (end, _) = watch_with(
+        t0,
+        |at| match at.as_millis() {
+            0..250 => Some(Vec::new()),
+            250..1000 => Some(on(&[48])),
+            _ => Some(Vec::new()),
+        },
+        |at| at < Duration::from_secs(1),
+    );
+    assert_eq!(end, AlertWatchEnd::GoneWhileAway);
+}
+
+/// A Local Network alert already up at the watch's first read (an earlier LAN use raised it, and
+/// macOS draws no second one) while another window of the same owner comes and is answered (a
+/// tccd consent prompt): the first read's window 7 is still up, so the watch never ends
+/// `Answered` and reads on until the window stops it, `StillUp`. NEGATIVE CONTROL: a watch that
+/// ends once every seen window is gone (`listed.is_empty()` read as
+/// `seen.iter().all(|n| !listed.iter().any(|w| w.number == *n))`) ends `Answered` as window 90
+/// goes, with the alert still on screen.
+#[test]
+fn another_alert_of_the_owner_answered_while_the_first_reads_window_stays_ends_nothing() {
+    use super::AlertWatchEnd;
+    let t0 = Instant::now();
+    let (end, reads) = watch_through(t0, |at| match at.as_millis() {
+        0..1000 => Some(on(&[7])),
+        1000..4000 => Some(on(&[7, 90])),
+        _ => Some(on(&[7])),
+    });
+    assert_eq!(end, AlertWatchEnd::StillUp);
+    assert_eq!(
+        reads.last(),
+        Some(&last_look()),
+        "it reads until it is stopped"
+    );
+}
+
+/// With no window of the alert's owner coming up after the trigger (macOS asked aterm before and
+/// raises no alert), the watch reads every quarter second until the window stops it and ends
+/// `NeverSeen`, so the hold ends only by the re-probe's answer or the person's time; it reads
+/// nothing once stopped. NEGATIVE CONTROL: a watch that takes "no seen window is up" for the
+/// answer (its `!seen.is_empty()` taken out) ends `Answered` at its first look.
+#[test]
+fn an_alert_watch_that_sees_no_alert_reads_until_it_is_stopped() {
+    use super::AlertWatchEnd;
+    let t0 = Instant::now();
+    let (end, reads) = watch_through(t0, |_| Some(Vec::new()));
+    assert_eq!(end, AlertWatchEnd::NeverSeen);
+    assert_eq!(
+        reads.len(),
+        240,
+        "the trigger's read and one each quarter second"
+    );
+    assert_eq!(reads.last(), Some(&last_look()), "none once it is stopped");
+}
+
+/// A window of the alert's owner already up at the first read (another app's alert, or one an
+/// earlier ask left up) going away, with no new window seen, ends nothing: the trigger's alert may
+/// still come, so the watch reads until it is stopped and ends `NeverSeen`. NEGATIVE CONTROL: a
+/// watch that counts the first read's windows as seen (its `!baseline.contains(..)` taken out)
+/// ends `Answered` as that window goes.
+#[test]
+fn a_window_up_before_the_trigger_going_away_does_not_end_the_alert_watch() {
+    use super::AlertWatchEnd;
+    let t0 = Instant::now();
+    let (end, reads) = watch_through(t0, |at| {
+        Some(if at < Duration::from_secs(1) {
+            on(&[7])
+        } else {
+            Vec::new()
+        })
+    });
+    assert_eq!(end, AlertWatchEnd::NeverSeen);
+    assert_eq!(
+        reads.last(),
+        Some(&last_look()),
+        "it reads until it is stopped"
+    );
+}
+
+/// macOS's alert seen after the trigger and still up when the window stops the watch ends it
+/// `StillUp` at its last look; one of two seen windows going while the other stays ends nothing.
+/// NEGATIVE CONTROL: a watch that takes any seen window gone for the answer
+/// (`listed.is_empty()` read as `seen.iter().any(|n| !listed.iter().any(|w| w.number == *n))`)
+/// ends `Answered` as the second goes.
+#[test]
+fn an_alert_still_up_when_its_watch_is_stopped_ends_it_still_up() {
+    use super::AlertWatchEnd;
+    let t0 = Instant::now();
+    let (end, reads) = watch_through(t0, |at| match at.as_millis() {
+        0..250 => Some(Vec::new()),
+        250..500 => Some(on(&[48, 49])),
+        _ => Some(on(&[48])),
+    });
+    assert_eq!(end, AlertWatchEnd::StillUp);
+    assert_eq!(
+        reads.last(),
+        Some(&last_look()),
+        "it reads until it is stopped"
+    );
+}
+
+/// A window list the watch could not read before the trigger leaves nothing to tell the alert
+/// from: the watch ends `Blind` after that one read, whatever comes up later, so the hold ends
+/// only by the re-probe's answer or the person's time. NEGATIVE CONTROL: a watch that takes the
+/// failed read for an empty list (`unwrap_or_default` in place of its `Blind` arm) ends
+/// `Answered` once a window came and went.
+#[test]
+fn an_alert_watch_that_cannot_read_the_list_at_the_trigger_ends_blind() {
+    use super::AlertWatchEnd;
+    let t0 = Instant::now();
+    let (end, reads) = watch_through(t0, |at| match at.as_millis() {
+        0 => None,
+        250..1000 => Some(on(&[48])),
+        _ => Some(Vec::new()),
+    });
+    assert_eq!(end, AlertWatchEnd::Blind);
+    assert_eq!(reads, [Duration::ZERO], "one read, at the trigger");
+}
+
+/// The alert watch starts only on a macOS whose Local Network alert was measured as a window of
+/// UserNotificationCenter, Tahoe 26 and Golden Gate 27; on any other, or an unknown version, no
+/// watch starts and the hold ends only by the re-probe's answer or the person's time. NEGATIVE
+/// CONTROL: with `alert_host_measured` answering `true` whatever the version, 28.0, 15.7.1 and an
+/// unknown version start a watch.
+#[test]
+fn the_alert_watch_starts_only_where_its_alerts_host_was_measured() {
+    use super::alert_host_measured;
+    for measured in ["26.6.2", "26.0", "27.0", "27.0.1"] {
+        assert!(alert_host_measured(Some(measured)), "{measured}");
+    }
+    for other in ["28.0", "15.7.1", "2", "", "27x"] {
+        assert!(!alert_host_measured(Some(other)), "{other}");
+    }
+    assert!(!alert_host_measured(None), "an unknown version");
+}
+
+/// Every end of an alert watch makes one log record of its own kind, a watch the window stopped
+/// first included (the hold's end by the person's time or the re-probe's answer, a later
+/// start), with its revision and what its first read found; a watch that never read after its
+/// first is told apart from one that read and saw nothing. Only an answer from the watch still
+/// the window's is left and wakes the window. Each kind's aterm.log line differs from every
+/// other's and names the revision. NEGATIVE CONTROLS: a worker that leaves before its record
+/// once the watch is no longer the window's (an `if !live { return; }` after `settle`) logs
+/// nothing for a stopped watch; a `NeverSeen` that ignores its looks logs `NeverSeen` for a watch
+/// that never read again; a line for `AnsweredOnceStopped` that is `Answered`'s fails the check
+/// that the kinds' lines differ.
+#[test]
+fn every_end_of_an_alert_watch_makes_one_record_of_its_kind() {
+    use super::{
+        AlertWatchEnd as End, AlertWatchEnded as Ended, AlertWatchLooks as Looks, BaselineRead,
+        finish_alert_watch,
+    };
+    let cases = [
+        (End::Answered, Looks::Read, true, Ended::Answered),
+        (
+            End::Answered,
+            Looks::Read,
+            false,
+            Ended::AnsweredOnceStopped,
+        ),
+        (End::StillUp, Looks::Read, true, Ended::StillUp),
+        (End::StillUp, Looks::Read, false, Ended::StillUp),
+        (End::GoneWhileAway, Looks::Read, false, Ended::GoneWhileAway),
+        (End::NeverSeen, Looks::Read, false, Ended::NeverSeen),
+        (End::NeverSeen, Looks::Stopped, false, Ended::StoppedUnarmed),
+        (
+            End::NeverSeen,
+            Looks::ArmWaitRanOut,
+            true,
+            Ended::ArmWaitRanOut,
+        ),
+        (End::Blind, Looks::Stopped, true, Ended::Blind),
+        (End::Blind, Looks::Stopped, false, Ended::Blind),
+    ];
+    let mut lines: Vec<(Ended, String)> = Vec::new();
+    for (end, looks, live, ended) in cases {
+        let baseline = Some(BaselineRead {
+            after: Duration::from_millis(12),
+            windows: (end != End::Blind).then_some(1),
+        });
+        let left = std::cell::Cell::new(false);
+        let woke = std::cell::Cell::new(false);
+        let records = RefCell::new(Vec::new());
+        finish_alert_watch(
+            end,
+            looks,
+            9,
+            baseline,
+            |answered| {
+                left.set(answered && live);
+                live
+            },
+            || woke.set(true),
+            |report| records.borrow_mut().push(report),
+        );
+        let records = records.into_inner();
+        assert_eq!(
+            records,
+            [super::AlertWatchReport {
+                revision: 9,
+                ended,
+                baseline,
+            }],
+            "{end:?} after {looks:?} (live {live}): one record of its kind"
+        );
+        let answers = live && end == End::Answered;
+        assert_eq!(
+            left.get(),
+            answers,
+            "{end:?} (live {live}): the answer left"
+        );
+        assert_eq!(
+            woke.get(),
+            answers,
+            "{end:?} (live {live}): the window woken"
+        );
+        let line = records[0].to_string();
+        assert!(line.contains("revision 9"), "{line}");
+        if lines.iter().all(|(kind, _)| *kind != ended) {
+            lines.push((ended, line));
+        }
+    }
+    assert_eq!(lines.len(), 8, "every kind of end is reached");
+    for (i, (kind, line)) in lines.iter().enumerate() {
+        for (other, other_line) in &lines[i + 1..] {
+            assert_ne!(line, other_line, "{kind:?} and {other:?} log one line");
+        }
+    }
+}
+
+/// How long a test waits for an alert watch's worker to do what it must: a hang detector.
+const WATCH_HANG: Duration = Duration::from_secs(60);
+
+/// A pace for a scripted alert watch's worker whose looks come at once, both with the person
+/// there and away, and whose wait for its arm outlasts [`WATCH_HANG`], so a worker the window
+/// does not wake shows as a hang.
+const AT_ONCE: super::AlertWatchPace = super::AlertWatchPace {
+    look: Duration::ZERO,
+    away: Duration::ZERO,
+    first: Duration::ZERO,
+    arm_wait: Duration::from_secs(600),
+};
+
+/// What a scripted alert watch's worker did.
+#[derive(Debug, PartialEq)]
+enum WatchEvent {
+    /// It asked for a read of the window list; it waits for [`ScriptedWatch::answer`].
+    Read,
+    /// It woke the window.
+    Woke,
+    /// It ended, with this record.
+    Logged(super::AlertWatchReport),
+}
+
+/// A live alert watch's worker ([`super::run_alert_watch`]) driven through a scripted window
+/// list: each read waits for the test's answer, the list and whether the person is at the Mac.
+struct ScriptedWatch {
+    events: std::sync::mpsc::Receiver<WatchEvent>,
+    lists: std::sync::mpsc::Sender<(Option<Vec<super::AlertWindow>>, bool)>,
+}
+
+impl ScriptedWatch {
+    /// The worker's reach, wired to a new script, with `pace`.
+    fn new(pace: super::AlertWatchPace) -> (super::AlertWatchIo, Self) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (sent, events) = std::sync::mpsc::channel();
+        let (lists, listed) = std::sync::mpsc::channel();
+        let here = Arc::new(AtomicBool::new(true));
+        let read_here = Arc::clone(&here);
+        let read_sent = sent.clone();
+        let wake_sent = sent.clone();
+        let io = super::AlertWatchIo {
+            read: Box::new(move || {
+                let _ = read_sent.send(WatchEvent::Read);
+                let (list, present) = listed.recv_timeout(WATCH_HANG).ok()?;
+                read_here.store(present, Ordering::SeqCst);
+                list
+            }),
+            present: Box::new(move || here.load(Ordering::SeqCst)),
+            wake: Box::new(move || {
+                let _ = wake_sent.send(WatchEvent::Woke);
+            }),
+            log: Box::new(move |report| {
+                let _ = sent.send(WatchEvent::Logged(report));
+            }),
+            pace,
+        };
+        (io, Self { events, lists })
+    }
+
+    /// The worker's next act, within the hang detector.
+    fn next(&self) -> WatchEvent {
+        self.events
+            .recv_timeout(WATCH_HANG)
+            .expect("hang detector: the alert watch's worker did nothing within a minute")
+    }
+
+    /// Answer the read the worker asked for: `list`, with the person `present`.
+    fn answer(&self, list: Option<Vec<super::AlertWindow>>, present: bool) {
+        self.lists
+            .send((list, present))
+            .expect("the worker is still reading");
+    }
+
+    /// The worker's end, which must be its next act: its record.
+    fn ended(&self) -> super::AlertWatchReport {
+        match self.next() {
+            WatchEvent::Logged(report) => report,
+            other => panic!("the worker went on: {other:?}"),
+        }
+    }
+}
+
+/// Wait until a worker on `slot` has begun its `nth` wait on the window's moves: once that count
+/// is read, a stop or an arm, which takes the slot's lock, finds the worker asleep, so only its
+/// wake gets it going again. A hang detector, not a latency budget.
+fn await_worker_asleep(slot: &super::AlertWatchSlot, nth: usize) {
+    let since = Instant::now();
+    while slot.waits() < nth {
+        assert!(
+            since.elapsed() < WATCH_HANG,
+            "hang detector: the alert watch's worker never began wait {nth}"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// A live alert watch's first read, which its trigger waits for, marks the baseline in only once
+/// it has come back, and wakes the window; a stop then ends its worker, which logs that it never
+/// read again. NEGATIVE CONTROL: a worker that never marks the baseline in (`mark_baseline_in`'s
+/// body taken out) leaves `baseline_in` false after its wake.
+#[test]
+fn a_live_alert_watchs_first_read_lets_its_trigger_go_and_wakes_the_window() {
+    static SLOT: super::AlertWatchSlot = super::AlertWatchSlot::new();
+    let (io, watch) = ScriptedWatch::new(AT_ONCE);
+    assert!(super::start_alert_watch(&SLOT, 4, Some("27.0.1"), io));
+    assert_eq!(
+        watch.next(),
+        WatchEvent::Read,
+        "its first read goes at once"
+    );
+    assert!(!SLOT.baseline_in(), "not in before that read comes back");
+    watch.answer(Some(Vec::new()), true);
+    assert_eq!(watch.next(), WatchEvent::Woke);
+    assert!(SLOT.baseline_in(), "in once it came back");
+    SLOT.cancel();
+    let report = watch.ended();
+    assert_eq!(
+        (report.revision, report.ended),
+        (4, super::AlertWatchEnded::StoppedUnarmed)
+    );
+    assert!(!SLOT.baseline_in(), "a stop takes the baseline back");
+}
+
+/// Arming a live alert watch wakes its worker at once: it reads in the arm's turn, not when its
+/// wait for the arm runs out. NEGATIVE CONTROL: an arm that does not wake the worker (its
+/// `notify_all` taken out) leaves it asleep for its 600 s wait, past the hang detector.
+#[test]
+fn arming_a_live_alert_watch_wakes_its_worker_at_once() {
+    static SLOT: super::AlertWatchSlot = super::AlertWatchSlot::new();
+    let (io, watch) = ScriptedWatch::new(AT_ONCE);
+    assert!(super::start_alert_watch(&SLOT, 5, Some("26.6.2"), io));
+    assert_eq!(watch.next(), WatchEvent::Read);
+    watch.answer(Some(Vec::new()), true);
+    assert_eq!(watch.next(), WatchEvent::Woke);
+    await_worker_asleep(&SLOT, 1);
+    SLOT.arm();
+    assert_eq!(watch.next(), WatchEvent::Read, "the arm wakes it to read");
+    SLOT.cancel();
+    watch.answer(Some(Vec::new()), true);
+    assert_eq!(watch.ended().ended, super::AlertWatchEnded::NeverSeen);
+}
+
+/// Stopping a live alert watch wakes its worker at once, whether it waits for its arm or for its
+/// next look, and drops an answer it left that the window has not drained. NEGATIVE CONTROLS: a
+/// stop that does not wake the worker (`cancel`'s `notify_all` taken out) leaves it asleep past
+/// the hang detector; one that keeps the answer (`state.answer = None` taken out) lets the
+/// window drain an answer for a hold that already ended.
+#[test]
+fn stopping_a_live_alert_watch_wakes_its_worker_and_drops_its_answer() {
+    let slow = super::AlertWatchPace {
+        look: Duration::from_secs(600),
+        away: Duration::from_secs(600),
+        first: Duration::ZERO,
+        arm_wait: Duration::from_secs(600),
+    };
+    static FOR_ARM: super::AlertWatchSlot = super::AlertWatchSlot::new();
+    let (io, watch) = ScriptedWatch::new(slow);
+    assert!(super::start_alert_watch(&FOR_ARM, 6, Some("27.0"), io));
+    assert_eq!(watch.next(), WatchEvent::Read);
+    watch.answer(Some(Vec::new()), true);
+    assert_eq!(watch.next(), WatchEvent::Woke);
+    await_worker_asleep(&FOR_ARM, 1);
+    FOR_ARM.cancel();
+    assert_eq!(
+        watch.ended().ended,
+        super::AlertWatchEnded::StoppedUnarmed,
+        "a stop wakes a worker waiting for its arm"
+    );
+
+    static FOR_LOOK: super::AlertWatchSlot = super::AlertWatchSlot::new();
+    let (io, watch) = ScriptedWatch::new(slow);
+    assert!(super::start_alert_watch(&FOR_LOOK, 7, Some("27.0"), io));
+    assert_eq!(watch.next(), WatchEvent::Read);
+    watch.answer(Some(Vec::new()), true);
+    assert_eq!(watch.next(), WatchEvent::Woke);
+    await_worker_asleep(&FOR_LOOK, 1);
+    FOR_LOOK.arm();
+    await_worker_asleep(&FOR_LOOK, 2);
+    FOR_LOOK.cancel();
+    assert_eq!(
+        watch.ended().revision,
+        7,
+        "a stop wakes a worker waiting out its look"
+    );
+
+    static ANSWERED: super::AlertWatchSlot = super::AlertWatchSlot::new();
+    let (io, watch) = ScriptedWatch::new(AT_ONCE);
+    assert!(super::start_alert_watch(&ANSWERED, 8, Some("27.0"), io));
+    assert_eq!(watch.next(), WatchEvent::Read);
+    watch.answer(Some(Vec::new()), true);
+    assert_eq!(watch.next(), WatchEvent::Woke);
+    ANSWERED.arm();
+    assert_eq!(watch.next(), WatchEvent::Read);
+    watch.answer(Some(on(&[48])), true);
+    assert_eq!(watch.next(), WatchEvent::Read);
+    watch.answer(Some(Vec::new()), true);
+    assert_eq!(
+        watch.next(),
+        WatchEvent::Woke,
+        "its answer wakes the window"
+    );
+    assert_eq!(watch.ended().ended, super::AlertWatchEnded::Answered);
+    assert_eq!(ANSWERED.state().answer, Some(8), "the answer is left");
+    ANSWERED.cancel();
+    assert_eq!(ANSWERED.take_answer(), None, "a stop drops it");
+}
+
+/// A later start of the live alert watch begins from nothing: the last watch's first read,
+/// arm and answer are gone before the new watch's first read is in. NEGATIVE CONTROL: a start
+/// that keeps them (`*state = AlertWatchState { id, last_id: id, ..*state }`) leaves the last
+/// watch's answer for the window to drain beside a hold whose own alert was never seen.
+#[test]
+fn a_later_start_of_the_live_alert_watch_resets_what_the_last_one_left() {
+    static SLOT: super::AlertWatchSlot = super::AlertWatchSlot::new();
+    let (io, first) = ScriptedWatch::new(AT_ONCE);
+    assert!(super::start_alert_watch(&SLOT, 1, Some("27.0"), io));
+    assert_eq!(first.next(), WatchEvent::Read);
+    first.answer(Some(Vec::new()), true);
+    assert_eq!(first.next(), WatchEvent::Woke);
+    SLOT.arm();
+    assert_eq!(first.next(), WatchEvent::Read);
+    first.answer(Some(on(&[48])), true);
+    assert_eq!(first.next(), WatchEvent::Read);
+    first.answer(Some(Vec::new()), true);
+    assert_eq!(first.next(), WatchEvent::Woke);
+    assert_eq!(first.ended().ended, super::AlertWatchEnded::Answered);
+
+    let (io, second) = ScriptedWatch::new(AT_ONCE);
+    assert!(super::start_alert_watch(&SLOT, 2, Some("27.0"), io));
+    assert_eq!(second.next(), WatchEvent::Read);
+    assert_eq!(
+        SLOT.state(),
+        super::AlertWatchState {
+            id: 2,
+            last_id: 2,
+            baseline_in: false,
+            armed: None,
+            answer: None,
+        },
+        "nothing the first watch left stands for the second"
+    );
+    assert_eq!(SLOT.take_answer(), None);
+    second.answer(Some(Vec::new()), true);
+    assert_eq!(second.next(), WatchEvent::Woke);
+    SLOT.cancel();
+    assert_eq!(second.ended().ended, super::AlertWatchEnded::StoppedUnarmed);
+}
+
+/// A later start wakes the worker of the watch it replaces, asleep in its wait for the arm,
+/// which then stops at once and logs that it never read again. NEGATIVE CONTROL: a start that
+/// does not wake it (`begin`'s `notify_all` taken out) leaves it asleep for its 600 s wait,
+/// past the hang detector.
+#[test]
+fn a_later_start_wakes_the_worker_of_the_watch_it_replaces() {
+    static SLOT: super::AlertWatchSlot = super::AlertWatchSlot::new();
+    let slow = super::AlertWatchPace {
+        look: Duration::from_secs(600),
+        away: Duration::from_secs(600),
+        first: Duration::ZERO,
+        arm_wait: Duration::from_secs(600),
+    };
+    let (io, first) = ScriptedWatch::new(slow);
+    assert!(super::start_alert_watch(&SLOT, 1, Some("27.0"), io));
+    assert_eq!(first.next(), WatchEvent::Read);
+    first.answer(Some(Vec::new()), true);
+    assert_eq!(first.next(), WatchEvent::Woke);
+    await_worker_asleep(&SLOT, 1);
+    let (io, second) = ScriptedWatch::new(slow);
+    assert!(super::start_alert_watch(&SLOT, 2, Some("27.0"), io));
+    let report = first.ended();
+    assert_eq!(
+        (report.revision, report.ended),
+        (1, super::AlertWatchEnded::StoppedUnarmed),
+        "the replaced worker stops at the start"
+    );
+    assert_eq!(second.next(), WatchEvent::Read);
+    second.answer(Some(Vec::new()), true);
+    assert_eq!(second.next(), WatchEvent::Woke);
+    SLOT.cancel();
+    assert_eq!(second.ended().ended, super::AlertWatchEnded::StoppedUnarmed);
+}
+
+/// An answer a replaced watch's worker sees once a later start took the slot is never left: the
+/// window drains nothing for the new watch, and the old watch logs its answer as one a stop
+/// overtook. NEGATIVE CONTROL: a settle that leaves the answer whatever the live watch is
+/// (`let live = state.id == id;` read as `let live = true;`) leaves revision 1's answer for
+/// revision 2's hold.
+#[test]
+fn an_answer_a_replaced_live_alert_watch_saw_is_never_left_for_the_next() {
+    static SLOT: super::AlertWatchSlot = super::AlertWatchSlot::new();
+    let (io, first) = ScriptedWatch::new(AT_ONCE);
+    assert!(super::start_alert_watch(&SLOT, 1, Some("27.0"), io));
+    assert_eq!(first.next(), WatchEvent::Read);
+    first.answer(Some(Vec::new()), true);
+    assert_eq!(first.next(), WatchEvent::Woke);
+    SLOT.arm();
+    assert_eq!(first.next(), WatchEvent::Read);
+    first.answer(Some(on(&[48])), true);
+    assert_eq!(first.next(), WatchEvent::Read, "the first worker reads on");
+
+    let (io, second) = ScriptedWatch::new(AT_ONCE);
+    assert!(super::start_alert_watch(&SLOT, 2, Some("27.0"), io));
+    assert_eq!(second.next(), WatchEvent::Read);
+    first.answer(Some(Vec::new()), true);
+    assert_eq!(
+        first.ended().ended,
+        super::AlertWatchEnded::AnsweredOnceStopped,
+        "its answer came once a later start took the slot: no wake, nothing left"
+    );
+    assert_eq!(SLOT.take_answer(), None);
+    second.answer(Some(Vec::new()), true);
+    assert_eq!(second.next(), WatchEvent::Woke);
+    SLOT.cancel();
+    assert_eq!(second.ended().ended, super::AlertWatchEnded::StoppedUnarmed);
+}
+
+/// No live alert watch starts on a macOS whose alert's host was not measured, or whose version is
+/// unknown: no worker reads, and the slot is untouched. NEGATIVE CONTROL: a start without its
+/// `alert_host_measured` gate starts a worker, whose first read comes.
+#[test]
+fn no_live_alert_watch_starts_where_its_alerts_host_was_not_measured() {
+    static SLOT: super::AlertWatchSlot = super::AlertWatchSlot::new();
+    for version in [Some("28.0"), Some("15.7.1"), None] {
+        let (io, watch) = ScriptedWatch::new(AT_ONCE);
+        assert!(
+            !super::start_alert_watch(&SLOT, 3, version, io),
+            "{version:?}"
+        );
+        assert!(
+            matches!(
+                watch.events.recv_timeout(WATCH_HANG),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+            ),
+            "{version:?}: no worker, its reach dropped unread"
+        );
+        assert_eq!(
+            SLOT.state().last_id,
+            0,
+            "{version:?}: the slot is untouched"
+        );
+    }
+}
+
+/// Past its first looks (none here), the live worker hands the person's presence to its pace and
+/// its end: after a read that found the person away it looks again after the away pace, after
+/// one that found them there after the present pace, and a window gone while they are away ends
+/// nothing until a read finds them back. Each pace here is either at once or past the hang
+/// detector, so a worker that picks the wrong one hangs. NEGATIVE CONTROLS: a worker that looks
+/// at the present pace whatever the person (`if here || …` read as `if true`) hangs after its
+/// away first read; one at the away pace whatever the person (`if false`) hangs in the second
+/// watch; a watch that ends whether or not the person is there (`&& here` taken out of
+/// `watch_alert`) ends at the away read.
+#[test]
+fn a_live_alert_watch_paces_and_ends_by_the_persons_presence() {
+    static AWAY: super::AlertWatchSlot = super::AlertWatchSlot::new();
+    let (io, watch) = ScriptedWatch::new(super::AlertWatchPace {
+        look: Duration::from_secs(600),
+        away: Duration::ZERO,
+        first: Duration::ZERO,
+        arm_wait: Duration::from_secs(600),
+    });
+    assert!(super::start_alert_watch(&AWAY, 1, Some("27.0"), io));
+    assert_eq!(watch.next(), WatchEvent::Read);
+    watch.answer(Some(Vec::new()), false);
+    assert_eq!(watch.next(), WatchEvent::Woke);
+    AWAY.arm();
+    assert_eq!(
+        watch.next(),
+        WatchEvent::Read,
+        "the away pace after an away read"
+    );
+    watch.answer(Some(on(&[48])), false);
+    assert_eq!(watch.next(), WatchEvent::Read);
+    watch.answer(Some(Vec::new()), false);
+    assert_eq!(
+        watch.next(),
+        WatchEvent::Read,
+        "no window left, with the person away: it reads on"
+    );
+    watch.answer(Some(Vec::new()), true);
+    assert_eq!(
+        watch.next(),
+        WatchEvent::Woke,
+        "the person back: it answers"
+    );
+    assert_eq!(watch.ended().ended, super::AlertWatchEnded::Answered);
+    assert_eq!(AWAY.take_answer(), Some(1));
+    AWAY.cancel();
+
+    static HERE: super::AlertWatchSlot = super::AlertWatchSlot::new();
+    let (io, watch) = ScriptedWatch::new(super::AlertWatchPace {
+        look: Duration::ZERO,
+        away: Duration::from_secs(600),
+        first: Duration::ZERO,
+        arm_wait: Duration::from_secs(600),
+    });
+    assert!(super::start_alert_watch(&HERE, 2, Some("27.0"), io));
+    assert_eq!(watch.next(), WatchEvent::Read);
+    watch.answer(Some(Vec::new()), true);
+    assert_eq!(watch.next(), WatchEvent::Woke);
+    HERE.arm();
+    assert_eq!(
+        watch.next(),
+        WatchEvent::Read,
+        "the present pace after a present read"
+    );
+    watch.answer(Some(on(&[48])), true);
+    assert_eq!(watch.next(), WatchEvent::Read);
+    watch.answer(Some(Vec::new()), true);
+    assert_eq!(watch.next(), WatchEvent::Woke);
+    assert_eq!(watch.ended().ended, super::AlertWatchEnded::Answered);
+    HERE.cancel();
+}
+
+/// For its first looks after the arm the live worker reads at the present pace whatever the
+/// person, so an alert drawn after the trigger is seen though the person, admitted to the step's
+/// moment by a touch minutes before, reads as away; the alert's going still ends nothing until a
+/// read finds them there. The away pace is past the hang detector and the first looks outlast
+/// it, so a worker that paces its first looks by the person hangs. NEGATIVE CONTROL: a worker
+/// whose pace leaves out its first looks (`|| armed.elapsed() < pace.first` taken out of
+/// `run_alert_watch`) waits out the away pace after its away first read and hangs.
+#[test]
+fn a_live_alert_watch_reads_at_the_present_pace_for_its_first_looks_whatever_the_person() {
+    static SLOT: super::AlertWatchSlot = super::AlertWatchSlot::new();
+    let (io, watch) = ScriptedWatch::new(super::AlertWatchPace {
+        look: Duration::ZERO,
+        away: Duration::from_secs(600),
+        first: Duration::from_secs(600),
+        arm_wait: Duration::from_secs(600),
+    });
+    assert!(super::start_alert_watch(&SLOT, 3, Some("27.0.1"), io));
+    assert_eq!(watch.next(), WatchEvent::Read);
+    watch.answer(Some(Vec::new()), false);
+    assert_eq!(watch.next(), WatchEvent::Woke);
+    SLOT.arm();
+    assert_eq!(
+        watch.next(),
+        WatchEvent::Read,
+        "the present pace after the arm, the person away"
+    );
+    watch.answer(Some(on(&[48])), false);
+    assert_eq!(
+        watch.next(),
+        WatchEvent::Read,
+        "the present pace after a read that saw the alert, the person away"
+    );
+    watch.answer(Some(Vec::new()), false);
+    assert_eq!(
+        watch.next(),
+        WatchEvent::Read,
+        "no window left, with the person away: it reads on"
+    );
+    watch.answer(Some(Vec::new()), true);
+    assert_eq!(
+        watch.next(),
+        WatchEvent::Woke,
+        "the person there: it answers"
+    );
+    assert_eq!(watch.ended().ended, super::AlertWatchEnded::Answered);
+    assert_eq!(SLOT.take_answer(), Some(3));
+    SLOT.cancel();
+}

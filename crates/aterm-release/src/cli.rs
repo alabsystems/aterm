@@ -221,7 +221,8 @@ USAGE
                            unchanged HARNESS_VER gets its minor raised by one, and
                            CHANGELOG [Unreleased] a line naming it. A harness
                            version is MAJOR.MINOR, never a third part; one bump per
-                           release window covers every change in it
+                           release window covers every change in it. `ship release
+                           --bump` writes the same bumps into its version commit
   targo --unverified ship trust run (-p <crate>... | --whole-tree | --remeasure)
         [--jobs N|auto] [--target-root DIR] [--crate-budget SECONDS] [--prover BIN-DIR]
         [--update-ratchet [--reason WHY]] [--try-refused] [--obligations|--no-obligations]

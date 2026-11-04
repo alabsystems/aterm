@@ -41,8 +41,8 @@ use aterm_agent::harness::upgrade_wake::{ActivationWake, WakeTrigger};
 use aterm_agent::harness::witness::{self, RouteKey, Target};
 use aterm_agent::supervise::memory::AgentMemory;
 use aterm_agent::supervise::policy::turn_end::{
-    AccountAdvice, AccountAt, AccountBad, AccountPoint, HeldBy, Reach, Ready, RosterWord,
-    SignInNext,
+    AccountAdvice, AccountAt, AccountBad, AccountPoint, HeldBy, Reach, Ready, RestartAsk,
+    RosterWord, SignInNext,
 };
 use aterm_agent::supervise::policy::{
     ResetAsk, ResetEnd, ResetGo, ResetNo, ResetOffer, ResetOutcome, ResetWord,
@@ -2692,8 +2692,50 @@ pub(crate) struct ViewNext {
     /// The records the look could not read that keep a live tab as it stands ([`upgrade_drive::View::unreadable`]).
     pub(crate) unreadable: Vec<PathBuf>,
 }
-type RestartFn =
-    dyn Fn(&str, u32, &Restart, Option<&relaunch::AccountRestart>) -> String + Send + Sync;
+type RestartFn = dyn Fn(&str, u32, &Restart, &RestartAsk, Option<&relaunch::AccountRestart>) -> RestartSaid
+    + Send
+    + Sync;
+
+/// What a restart in place answered ([`Acts::restart`]): its step, and the agent's pid its report
+/// names after it (`None`: it names none), the process the restart left in the tab: the one it
+/// started where it made one, the one it was asked by where it made none
+/// ([`IdleHost::restart_left`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RestartSaid {
+    pub(crate) step: String,
+    pub(crate) pid: Option<u32>,
+}
+
+impl RestartSaid {
+    /// `step`, its report naming no process.
+    pub(crate) fn step(step: impl Into<String>) -> Self {
+        Self {
+            step: step.into(),
+            pid: None,
+        }
+    }
+
+    /// What the restart's report `r` says: its step and its pid (`0`: none).
+    fn of(r: upgrade_drive::Report) -> Self {
+        Self {
+            pid: (r.pid != 0).then_some(r.pid),
+            step: r.step,
+        }
+    }
+}
+
+/// A restart hook answering what `answer` steps, its report naming no process: a test's.
+#[cfg(test)]
+pub(crate) fn restart_answering(
+    answer: impl Fn(&str, u32, &Restart, Option<&relaunch::AccountRestart>) -> String
+    + Send
+    + Sync
+    + 'static,
+) -> Arc<RestartFn> {
+    Arc::new(move |sid, grace, why, _ask, selected| {
+        RestartSaid::step(answer(sid, grace, why, selected))
+    })
+}
 /// The watch of one tab's upgrade records off any point ([`upgrade_drive::watch`]).
 type WatchFn = dyn Fn(&str, u32, &upgrade_drive::Watcher) -> upgrade_drive::Watched + Send + Sync;
 /// An agent's route to its API, read now from its pid, argv and directory ([`Acts::route`]).
@@ -4547,6 +4589,9 @@ pub(crate) struct WorkerIdle {
     /// The group of the session's agent, as its job's ([`WorkerJob::group`]): the one a work
     /// record read is put for ([`Acts::work_put`]).
     group: Arc<AtomicI32>,
+    /// The agent's pid the last restart in place this worker asked named in its report
+    /// ([`RestartSaid`], [`IdleHost::restart_left`]).
+    restart_left: Mutex<Option<u32>>,
 }
 
 /// Which told wait a worker last handed the window ([`WorkerIdle::told`]).
@@ -4572,6 +4617,23 @@ impl Told {
 }
 
 impl WorkerIdle {
+    /// A test's restart in place `why` ([`IdleHost::restart`]), asked as the one ask of a run of
+    /// its own, first asked at the epoch ([`RestartAsk::of`]).
+    #[cfg(test)]
+    pub(crate) fn restart_once(&self, why: &Restart) -> Option<String> {
+        IdleHost::restart(self, why, &RestartAsk::of(why, 0))
+    }
+
+    /// What a restart in place answered ([`RestartSaid`]): its step, the process its report
+    /// names kept for [`IdleHost::restart_left`].
+    fn said(&self, said: RestartSaid) -> String {
+        *self
+            .restart_left
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = said.pid;
+        said.step
+    }
+
     /// The kept snapshot, followed first: what this worker's own readers decide by.
     fn followed_kept(&self) -> Option<Snapshot> {
         follow_caught(&self.sid, &self.kept, &self.hooks);
@@ -5319,13 +5381,19 @@ impl IdleHost for WorkerIdle {
         self.points.withheld(guard, crate::upgrade_host::now_s());
     }
 
-    /// The restart in place its loop asks for ([`Restart`]).
-    fn restart(&self, why: &Restart) -> Option<String> {
+    /// The restart in place its loop asks for ([`Restart`]), as `ask` ([`RestartAsk`], which the
+    /// relaunch's claim keeps); the process its report names after it is kept for
+    /// [`IdleHost::restart_left`].
+    fn restart(&self, why: &Restart, ask: &RestartAsk) -> Option<String> {
+        *self
+            .restart_left
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
         if !self.can_restart() || self.beside() || self.native_stands_down() {
             return None;
         }
         if let Restart::Account { to, at } = why {
-            let step = self.account_move(why, to, *at);
+            let step = self.account_move(why, ask, to, *at);
             aterm_log::info!("harness @{}: account move to {to}: {step}", self.sid);
             if relaunch_took(&step) {
                 self.login_abandon();
@@ -5336,7 +5404,8 @@ impl IdleHost for WorkerIdle {
             return self.on().then_some(step);
         }
         let hooks = &self.hooks;
-        let step = self.act(|| (hooks.acts.restart)(&self.sid, self.grace, why, None));
+        let step =
+            self.said(self.act(|| (hooks.acts.restart)(&self.sid, self.grace, why, ask, None)));
         if !self.on() {
             return None;
         }
@@ -5389,6 +5458,16 @@ impl IdleHost for WorkerIdle {
             .snapshot
             .as_ref()
             .map(|snap| snap.pid)
+    }
+
+    /// The process the restart in place last asked of this worker left in the tab, as its report
+    /// named it ([`IdleHost::restart_left`]): the kept snapshot may name the process it ended
+    /// for a while after ([`Self::reread_after_act`] is bounded).
+    fn restart_left(&self) -> Option<aterm_agent::supervise::custody::Process> {
+        self.restart_left
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .map(|pid| (Some(pid), None))
     }
 
     /// When the kept snapshot's process started ([`process_started`]).
@@ -6106,7 +6185,12 @@ impl IdleHost for WorkerIdle {
             &look,
             label,
             |state, logins, now| {
-                let signed_out = state.account(label).auth == accounts::Auth::SignedOut;
+                let account = state.account(label);
+                let signed_out = account.auth == accounts::Auth::SignedOut
+                    || (account.auth != accounts::Auth::Unseen
+                        && roster.row(label).is_some_and(|row| {
+                            account.current_auth(row) == accounts::Auth::Unseen
+                        }));
                 if !self.login_identity_permits(&seat, &roster, &look, label, signed_out) {
                     return Err("sign-in identity is not confirmed; nothing proven".into());
                 }
@@ -6115,7 +6199,7 @@ impl IdleHost for WorkerIdle {
                 } else {
                     Vec::new()
                 };
-                events.extend(accounts::prove(state, label, now));
+                events.extend(accounts::prove_in_context(state, logins, label, now));
                 if let Some(notes) =
                     look.note_session(&self.kept, state, &self.sid, label, None, now)
                 {
@@ -7810,7 +7894,12 @@ impl WorkerIdle {
             look,
             label,
             |state, logins, now| {
-                if state.account(label).auth != accounts::Auth::SignedOut {
+                let account = state.account(label);
+                let historical = account.auth != accounts::Auth::Unseen
+                    && roster
+                        .row(label)
+                        .is_some_and(|row| account.current_auth(row) == accounts::Auth::Unseen);
+                if account.auth != accounts::Auth::SignedOut && !historical {
                     return Ok(Vec::new());
                 }
                 if !self.login_identity_permits(seat, roster, look, label, true) {
@@ -7839,9 +7928,21 @@ impl WorkerIdle {
             return;
         };
         let fresh = accounts::Store::at(&seat.state)
-            .load_logins(seat.now)
+            .bounded_by(seat.ladder)
+            .read_account_records(seat.roster.as_deref(), seat.now)
             .ok()
-            .and_then(|(logins, _)| logins.get(&label).and_then(|b| b.served_at))
+            .and_then(|records| {
+                let row = match records.roster.row(&label) {
+                    Some(row) if roster.row(&label) == Some(row) => row,
+                    None if records.roster.rows.is_empty()
+                        && *roster == accounts::Roster::own() =>
+                    {
+                        roster.row(&label)?
+                    }
+                    _ => return None,
+                };
+                accounts::login_served_at(row, &records.logins, &records.state)
+            })
             .is_some_and(|at| (0..ACCOUNT_ROW_STALE_S).contains(&seat.now.saturating_sub(at)));
         if fresh {
             return;
@@ -8807,7 +8908,7 @@ impl WorkerIdle {
             project = "harness_host::tests::account_immediate::immediate_transition"
         )
     )]
-    fn account_move(&self, why: &Restart, to: &str, at: AccountAt) -> String {
+    fn account_move(&self, why: &Restart, ask: &RestartAsk, to: &str, at: AccountAt) -> String {
         const CHANGED: &str = "wait:account-changed";
         const STATE: &str = "wait:account-state";
         let hooks = &self.hooks;
@@ -9063,7 +9164,9 @@ impl WorkerIdle {
                 })
         });
         let step = if self.can_restart() {
-            self.act(|| (hooks.acts.restart)(&self.sid, self.grace, why, Some(&selected)))
+            self.said(
+                self.act(|| (hooks.acts.restart)(&self.sid, self.grace, why, ask, Some(&selected))),
+            )
         } else {
             "refused:supervisor-off".to_string()
         };
@@ -16814,6 +16917,7 @@ fn start_worker(
         beside: Arc::clone(&beside),
         told: AtomicU8::new(0),
         repo_probe: Default::default(),
+        restart_left: Mutex::default(),
         group: Arc::clone(&group),
     });
     if let Some(seat) = (hooks.acts.account_seat)() {
@@ -18016,14 +18120,14 @@ fn live_acts(store: Store, sock: String) -> Acts {
                 },
             )
         }),
-        restart: Arc::new(move |sid, grace, why, selected| {
+        restart: Arc::new(move |sid, grace, why, ask, selected| {
             let Some(o) = o8(sid, grace) else {
-                return "refused:no-home".to_string();
+                return RestartSaid::step("refused:no-home");
             };
             let r = match why {
                 Restart::Account { .. } => {
                     let Some(selected) = selected else {
-                        return "wait:account-changed".to_string();
+                        return RestartSaid::step("wait:account-changed");
                     };
                     let roster = match (harness_state(), aterm_time::unix_secs()) {
                         (Some(state), Some(now)) => match read_account_roster(
@@ -18032,18 +18136,18 @@ fn live_acts(store: Store, sock: String) -> Acts {
                             i64::try_from(now).unwrap_or(i64::MAX),
                         ) {
                             Ok(roster) => roster,
-                            Err(_) => return "wait:account-state".to_string(),
+                            Err(_) => return RestartSaid::step("wait:account-state"),
                         },
-                        _ => return "wait:account-state".to_string(),
+                        _ => return RestartSaid::step("wait:account-state"),
                     };
-                    relaunch::restart_under(&o, why, &roster, selected)
+                    relaunch::restart_under(&o, why, ask, &roster, selected)
                 }
                 // Every other restart re-applies the login its process had; the tap's logins
                 // ride in `o.usage_tap` (`tap::Armed::lone_for`), as every relaunch line's do.
-                _ => relaunch::restart_here(&o, why),
+                _ => relaunch::restart_here(&o, why, ask),
             };
             w10(sid, &format!("restart:{}", why.word()), &r);
-            r.step
+            RestartSaid::of(r)
         }),
         tasked: Arc::new(move |sid, snap, memo| {
             let o = o10(sid, 0)?;
@@ -20847,10 +20951,8 @@ fn checked_account_advice(
         }
         candidates
             .get_or_insert_with(|| state.clone())
-            .accounts
-            .entry(to.clone())
-            .or_default()
-            .auth = accounts::Auth::SignedOut;
+            .excluded_accounts
+            .insert(to.clone());
     }
 }
 
@@ -21091,7 +21193,7 @@ fn account_signed_out(
         state
             .accounts
             .get(&row.label)
-            .is_some_and(|a| a.auth == accounts::Auth::SignedOut)
+            .is_some_and(|a| a.current_auth(row) == accounts::Auth::SignedOut)
     })
 }
 
@@ -21776,9 +21878,10 @@ fn disk_look_pass(
                 },
                 || {
                     let pass = disk_sweep_journalled(&state, now, board, |record| {
-                        atpkg::build_cache::reclaim_home_watched(
-                            atpkg::build_cache::RECLAIM_GONE,
+                        atpkg::build_cache::reclaim_home_told(
+                            atpkg::build_cache::ReclaimAfter::CALM,
                             placing.as_ref(),
+                            &crate::disk_board::beat,
                             record,
                         )
                     });
@@ -21901,21 +22004,22 @@ fn disk_look_pass(
     let placing = aterm_agent::harness::disk::discover::placing_of(&home, &table);
     // Known producer receipts are independent of broad discovery's 128-result budget. Keep
     // them on the existing background pressure cadence even while a session is supervised.
-    let free = if (!sids.is_empty() || demand.is_some() || projected.is_some())
+    // Below the floor the shared cache joins them: its stale parts of a profile in use have no
+    // other route at this look. Each stops at `goal`.
+    let (free, swept, sweep_unrecorded) = if (!sids.is_empty()
+        || demand.is_some()
+        || projected.is_some())
         && config.dead_build_dirs
     {
         let at = Instant::now();
         let goal = demand.unwrap_or(0).max(config.pressure_target_bytes());
         let pass = disk_sweep_journalled(&state, now, board, |record| {
-            atpkg::build_cache::registered::reclaim(
+            atpkg::build_cache::reclaim_beside_sessions(
                 &home,
                 std::time::SystemTime::now(),
-                if short {
-                    atpkg::build_cache::RECLAIM_GONE_UNDER_PRESSURE
-                } else {
-                    atpkg::build_cache::RECLAIM_GONE
-                },
+                short,
                 placing.as_ref(),
+                &crate::disk_board::beat,
                 &mut |path, why| {
                     measure().is_some_and(|reading| reading.free < goal) && record(path, why)
                 },
@@ -21932,27 +22036,36 @@ fn disk_look_pass(
             if let Some(key) = home_key.as_ref() {
                 disk_fill_credit(&key.spelled(), freed, free, after, at.elapsed());
             }
-            let (bytes, went) = disk_episode_freed(board, freed, &went);
-            note(HostNote::DiskFreed { bytes, went });
+            let (bytes, lines) = disk_episode_freed(board, freed, &went);
+            note(HostNote::DiskFreed { bytes, went: lines });
+            // Into the episode now (a level of `Unknown` changes nothing else), so what the rest
+            // of this look says adds to it.
+            disk_episode_after(board, Level::Unknown, freed, &went);
         }
-        after
+        (after, freed, pass.unrecorded)
     } else {
-        free
+        (free, 0, false)
     };
     let started = Instant::now();
     let demand_cwds: Vec<std::path::PathBuf> = adopted.map(|(_, cwds)| cwds).unwrap_or_default();
     let demand_only = sids.is_empty();
-    // A pressing projection runs the disk pass, whose fences (no lock, no process under it, its
-    // owner gone under the locks) are the pass's, never the sweep's shorter window.
+    // Above the floor a pressing projection runs the disk pass, whose fences (no lock, no process
+    // under it, its owner gone under the locks) are the pass's, never the sweep's shorter window.
     if sids.is_empty() && demand.is_none() && projected.is_none() {
-        let gone_after = if short {
-            atpkg::build_cache::RECLAIM_GONE_UNDER_PRESSURE
-        } else {
-            atpkg::build_cache::RECLAIM_GONE
-        };
+        let after = atpkg::build_cache::ReclaimAfter::by_floor(short);
+        let goal = config.pressure_target_bytes();
         let journalled = if config.dead_build_dirs {
             disk_sweep_journalled(&state, now, board, |record| {
-                atpkg::build_cache::reclaim_home_watched(gone_after, placing.as_ref(), record)
+                atpkg::build_cache::reclaim_home_told(
+                    after,
+                    placing.as_ref(),
+                    &crate::disk_board::beat,
+                    &mut |path, why| {
+                        // The hour's wait reaches live worktrees, so it ends with the shortage.
+                        (!short || measure().is_some_and(|reading| reading.free < goal))
+                            && record(path, why)
+                    },
+                )
             })
         } else {
             SweepJournalled::default()
@@ -22214,6 +22327,8 @@ fn disk_look_pass(
             });
         });
     }
+    let freed_any = freed || swept > 0;
+    // The episode already holds what the sweep freed, and the alert adds the episode's.
     disk_alert(
         board,
         level_after,
@@ -22221,18 +22336,26 @@ fn disk_look_pass(
         after,
         freed_bytes,
         &glass,
-        disk_full_cause(&thresholds, after, pass_cause(&tick)),
+        disk_full_cause(
+            &thresholds,
+            after,
+            if sweep_unrecorded {
+                DiskFullCause::Unrecorded
+            } else {
+                pass_cause(&tick)
+            },
+        ),
         note,
     );
     disk_episode_after(board, level_after, freed_bytes, &went);
     disk_pass_ran(
         started,
         free,
-        !freed
+        !freed_any
             && (level_after == Level::Emergency
                 || (level_after == Level::Unknown && level == Level::Emergency)),
         pass_level,
-        freed,
+        freed_any,
     );
     let tiers: Vec<u8> = match &tick {
         aterm_agent::harness::cli::DiskTick::Reclaimed(done, _) => {
@@ -22254,7 +22377,7 @@ fn disk_look_pass(
         home_key.as_ref(),
         after,
         (tiers, ran_out),
-        freed_bytes,
+        freed_bytes.saturating_add(swept),
         demand,
         &config,
         left,
@@ -22262,7 +22385,7 @@ fn disk_look_pass(
     if level_after == Level::Unknown {
         return;
     }
-    match DISK_RUNS.pass(freed, after, config) {
+    match DISK_RUNS.pass(freed_any, after, config) {
         DiskOutcome::Plenty => note(HostNote::DiskPlenty),
         DiskOutcome::Short => {}
         DiskOutcome::Low {
@@ -24692,7 +24815,7 @@ impl Acts {
             in_flight_here: Arc::new(|_, _| false),
             agent_resumed: Arc::new(|_, _| false),
             carry_in_flight: Arc::new(|_, _| None),
-            restart: Arc::new(|_, _, _, _| "refused:inert".to_string()),
+            restart: Arc::new(|_, _, _, _, _| RestartSaid::step("refused:inert")),
             tasked: Arc::new(|_, _, _| None),
             finished: Arc::new(|_, _, _| None),
             limit_reset: Arc::new(|_| None),

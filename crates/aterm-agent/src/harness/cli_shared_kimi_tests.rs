@@ -128,7 +128,7 @@ fn replaced_config_credential_link_and_empty_configs_fail_closed() {
 
 #[test]
 fn kimi_adapter_uses_intrinsic_device_route_and_requires_explicit_region() {
-    struct Host;
+    struct Host(bool);
     impl AccountsHost for Host {
         fn now(&self) -> i64 {
             1000
@@ -150,7 +150,11 @@ fn kimi_adapter_uses_intrinsic_device_route_and_requires_explicit_region() {
             assert_eq!(req.row.vendor.region, Some(Region::Global));
             assert!(req.hosts.contains(&"auth.kimi.ai"));
             login_drive::Drove {
-                outcome: login_drive::Outcome::NotRun("fixture no start".into()),
+                outcome: if self.0 {
+                    login_drive::Outcome::Unverified("fixture no start".into())
+                } else {
+                    login_drive::Outcome::NotRun("fixture no start".into())
+                },
                 host: None,
             }
         }
@@ -181,9 +185,10 @@ fn kimi_adapter_uses_intrinsic_device_route_and_requires_explicit_region() {
     };
     let store = accounts::Store::at_for(&env.state, Cli::Kimi, temp.path());
     let context = Context {
+        admission: None,
         env: &env,
         store: &store,
-        host: &Host,
+        host: &Host(false),
     };
     let mut row = accounts::Row {
         email: Some(EMAIL.into()),
@@ -198,9 +203,87 @@ fn kimi_adapter_uses_intrinsic_device_route_and_requires_explicit_region() {
         KimiOauth.execute_attempt(&context, &row, temp.path(), &RenewBrowser::Default),
         Execution::NotStarted(_)
     ));
+    let uncertain = Context {
+        host: &Host(true),
+        ..context
+    };
+    assert!(matches!(
+        KimiOauth.execute_attempt(&uncertain, &row, temp.path(), &RenewBrowser::Default),
+        Execution::Unknown(_)
+    ));
     row.vendor.region = None;
     assert!(request(&context, &row, temp.path()).is_err());
     row.vendor.region = Some(Region::Global);
     row.vendor.flow = Some(Flow::Browser);
     assert!(request(&context, &row, temp.path()).is_err());
+}
+
+#[test]
+fn identity_outage_does_not_request_another_native_authentication() {
+    assert!(matches!(
+        observation_error(NativeError::Temporary),
+        ObservationError::Unavailable(_)
+    ));
+    for error in [
+        NativeError::Expired,
+        NativeError::Rejected,
+        NativeError::Refused("provider refusal".into()),
+        NativeError::Local("unsafe credential".into()),
+    ] {
+        assert!(matches!(
+            observation_error(error),
+            ObservationError::RecoveryRequired(_)
+        ));
+    }
+}
+
+#[test]
+fn only_supported_elapsed_credentials_are_classified_as_expired() {
+    let dir = home();
+    for (fields, expired) in [
+        (
+            aterm_json::json!({"access_token":"fixture", "token_type":"Bearer", "expires_at":1000}),
+            true,
+        ),
+        (
+            aterm_json::json!({"access_token":"fixture", "token_type":"Bearer", "expires_at":999}),
+            true,
+        ),
+        (
+            aterm_json::json!({"access_token":"fixture", "token_type":"Other", "expires_at":999}),
+            false,
+        ),
+        (
+            aterm_json::json!({"access_token":"", "token_type":"Bearer", "expires_at":999}),
+            false,
+        ),
+        (
+            aterm_json::json!({"access_token":"fixture", "token_type":"Bearer", "expires_at":"999"}),
+            false,
+        ),
+        (
+            aterm_json::json!({"access_token":"fixture", "token_type":"Bearer"}),
+            false,
+        ),
+    ] {
+        aterm_secrets::fsx::write_atomic(
+            &dir.path().join(GLOBAL_FILE),
+            &aterm_json::to_vec(&fields).unwrap(),
+            0o600,
+        )
+        .unwrap();
+        let error = verify_native_classified(
+            dir.path(),
+            Region::Global,
+            EMAIL,
+            1000,
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        )
+        .err()
+        .expect("local credential must be refused before I/O");
+        assert_eq!(matches!(error, NativeError::Expired), expired);
+        if !expired {
+            assert!(matches!(error, NativeError::Local(_)));
+        }
+    }
 }

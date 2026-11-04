@@ -30,7 +30,7 @@
 
 use super::*;
 use crate::commons::binding::Request;
-use crate::members::bundle::Handed;
+use crate::members::bundle::{Handed, Reader};
 use crate::members::desk::{Handing, Handout};
 use crate::members::{Allowed, Bundle};
 use crate::membership_log::{
@@ -60,13 +60,15 @@ pub enum ByLog {
 /// What this Mac signed to let a new Mac in on the log path ([`admit_by_phrase`]).
 #[derive(Debug)]
 pub struct LogAdmission {
+    /// The capacity and crossed state captured with this exact records snapshot.
+    pub source: crate::crossing::RecordsBound,
     /// The `Admit` of the new Mac: the one this Mac signed, or the one the log already held.
     pub admit: RecordId,
     /// The label the log gives the new Mac.
     pub label: String,
     /// The records this call signed (`Admit` first, then `Wrap`s), possibly none.
     pub signed: Vec<Record>,
-    /// This Mac's whole record store afterwards, genesis first.
+    /// This Mac's complete record history afterwards, genesis first. Waiting records stay local.
     pub records: Vec<u8>,
 }
 
@@ -411,10 +413,11 @@ pub fn admit_by_phrase(
     name: &str,
     now_ms: u64,
 ) -> crate::Result<ByLog> {
-    log_path(paths, request, node, name, now_ms, (true, false), None)
+    log_path(paths, request, node, name, now_ms, (None, false), None)
 }
 
-/// [`admit_by_phrase`] where `sign`; otherwise only whether the log keeps the Mac out, read
+/// [`admit_by_phrase`] for a local request or a log reader; a files reader asks only whether
+/// the log keeps the Mac out, read
 /// without the state lock (the records file is written whole), for a new Mac that takes F10's
 /// files: [`ByLog::KeptOut`] or [`ByLog::NotHere`]. Signing takes the state lock, unless `held`
 /// holds it already for this run (a member's desk took it before the run touched its phrase).
@@ -424,10 +427,10 @@ fn log_path(
     node: [u8; 32],
     name: &str,
     now_ms: u64,
-    (sign, restore): (bool, bool),
+    (reader, restore): (Option<Reader>, bool),
     held: Option<&super::HandoverHold>,
 ) -> crate::Result<ByLog> {
-    if !sign {
+    if reader.is_some_and(|reader| !reader.reads_log()) {
         return Ok(
             trusted_log_keeps_out(paths, request.binding(), node, restore, None)?
                 .map_or(ByLog::NotHere, ByLog::KeptOut),
@@ -452,6 +455,12 @@ fn log_path(
                 .map_or(ByLog::NotHere, ByLog::KeptOut),
         );
     };
+    let source = records_bound(paths, &store)?;
+    if reader.is_some_and(|reader| !reader.can_take(source)) {
+        return Err(Error::new(
+            "the joining device cannot receive this membership history",
+        ));
+    }
     if let Some(why) = kept_out_with_node(&log, request.binding(), node, restore) {
         return Ok(ByLog::KeptOut(why));
     }
@@ -549,13 +558,28 @@ fn log_path(
     let (admit, label, signed) = signed;
     if !signed.is_empty() {
         store.ingest(&encode_records(&signed))?;
+        if signed
+            .iter()
+            .any(|record| store.get_bytes(record.id()).is_none())
+        {
+            return Err(Error::new("the admission cannot be retained in full"));
+        }
+    }
+    let source = records_bound(paths, &store)?;
+    if reader.is_some_and(|reader| !reader.can_take(source)) {
+        return Err(Error::new(
+            "the admission exceeds the joining device's record capacity",
+        ));
+    }
+    if !signed.is_empty() {
         super::write_records(paths, &store)?;
     }
     Ok(ByLog::Admitted(LogAdmission {
+        source,
         admit,
         label,
         signed,
-        records: store.encode(),
+        records: store.encode_held(),
     }))
 }
 
@@ -693,50 +717,49 @@ pub fn log_admitted_actors(paths: &Paths) -> BTreeSet<crate::membership_log::Mem
 /// membership log with its `Admit` ([`admit_by_phrase`]) where the new Mac reads it and the log
 /// path applies, else F10's `[everyone]` files ([`handover_bundle`]). Where this Mac holds a log
 /// that removed the new Mac or left it out on purpose, neither: the run ends with the reason. A
-/// log path that fails here (a records file this Mac cannot read, a store at its bound) hands
-/// F10's files too, as where no log applies, and says why in [`Handout::note`]. Both are built
+/// log path that fails here (a records file this Mac cannot read, a store at its bound or a
+/// receiver with incompatible capacity) refuses the handover. Both payloads are built
 /// under [`Handing::held`] where the desk holds this Mac's state for the run (it took it before
 /// the run touched its phrase), which neither takes again.
 ///
 /// # Errors
 /// The log keeps the new Mac out ([`ByLog::KeptOut`]), a vault pass holds this Mac's state past
 /// [`super::HANDOVER_LOCK_WAIT`] where the desk holds none for the run ([`ByLog::Busy`]), or
-/// neither path can hand a bundle from this Mac's state.
+/// the receiver cannot hold the whole log, or neither path can hand a bundle from this Mac's state.
 pub fn hand_over(paths: &Paths, handing: &Handing<'_>) -> crate::Result<Handout> {
-    let note = match log_path(
+    match log_path(
         paths,
         handing.request,
         handing.node,
         handing.name,
         aterm_time::unix_millis().unwrap_or(0),
-        (handing.reads_log, handing.restore),
+        (Some(handing.reader), handing.restore),
         handing.held,
-    ) {
-        Ok(ByLog::Admitted(admission)) => {
+    )? {
+        ByLog::Admitted(admission) => {
             let policy = handing.held.filter(|held| held.holds(paths)).map_or_else(
                 || handover::policy_servers(paths),
                 |held| held.policy.clone(),
             );
-            let bundle = log_bundle(paths, handing.allowed, admission, policy)?;
+            let bundle = log_bundle(paths, handing.allowed, admission, policy, handing.reader)?;
             return Ok(Handout {
                 bundle: bundle.encode()?,
                 logged: true,
                 note: None,
             });
         }
-        Ok(ByLog::KeptOut(why)) => return Err(Error::new(why)),
-        Ok(ByLog::Busy) => {
+        ByLog::KeptOut(why) => return Err(Error::new(why)),
+        ByLog::Busy => {
             return Err(Error::new(
                 "a vault pass on this Mac still holds its state; Allow the new Mac again once it ends",
             ));
         }
-        Ok(ByLog::NotHere) => None,
-        Err(error) => Some(format!("the membership log path failed here: {error}")),
-    };
+        ByLog::NotHere => {}
+    }
     Ok(Handout {
         bundle: handover::handover_bundle_held(paths, handing.allowed, handing.held)?.encode()?,
         logged: false,
-        note,
+        note: None,
     })
 }
 
@@ -745,7 +768,13 @@ pub(super) fn log_bundle(
     allowed: &Allowed,
     admission: LogAdmission,
     policy: Vec<String>,
+    reader: Reader,
 ) -> crate::Result<Bundle> {
+    if !reader.can_take(admission.source) {
+        return Err(Error::new(
+            "the joining device cannot receive this membership history",
+        ));
+    }
     let config = config(paths)?.ok_or_else(|| Error::new("no vault configured"))?;
     let signer = config
         .signer
@@ -762,6 +791,7 @@ pub(super) fn log_bundle(
         servers: handover::bundle_servers(url, policy),
         allowed: allowed.clone(),
         handed: Handed::Log {
+            source: matches!(reader, Reader::BoundedLog(_)).then_some(admission.source),
             admit: admission.admit,
             records: admission.records,
         },
@@ -775,7 +805,8 @@ pub(super) fn log_bundle(
 /// posts end within one exchange deadline.
 ///
 /// # Errors
-/// No vault is configured, or every server refused the records.
+/// No vault is configured, the configuration or the records file cannot be read, the crossed
+/// mark cannot be looked for ([`super::records_bound`]), or every server refused the records.
 pub fn post_records_to_servers(paths: &Paths) -> crate::Result<usize> {
     post_records_to_servers_by(paths, super::fan_out::one_exchange())
 }
@@ -799,9 +830,10 @@ pub(super) fn post_records_to_servers_by(paths: &Paths, by: Instant) -> crate::R
             urls.push(url);
         }
     }
+    let bound = super::records_bound(paths, &store)?;
     let mut posted = 0;
     let mut first_err = None;
-    for answered in super::fan_out::post_records_to(&urls, &wire, by) {
+    for answered in super::fan_out::post_records_to(&urls, &wire, bound, by) {
         match answered {
             Ok(()) => posted += 1,
             Err(err) if first_err.is_none() => first_err = Some(err),
@@ -832,30 +864,41 @@ pub(super) fn post_records_to_servers_by(paths: &Paths, by: Instant) -> crate::R
 ///
 /// # Errors
 /// This Mac is already in a vault, the bundle is not a log bundle for this Mac's key, any check
-/// above fails, or a write failed.
+/// above fails, the source capacity is incompatible, the whole offered and retained history
+/// cannot fit, or a write failed. A required crossed mark is stored before any new custody.
 pub fn write_from_log_bundle(paths: &Paths, bundle: &Bundle) -> crate::Result<Report> {
     let _lock = StateLock::take(paths)?;
     let CheckedLog {
         config,
-        mut state,
+        state,
         store,
         entries,
         digest,
+        requires_crossed_mark,
     } = checked_log_bundle(paths, bundle)?;
-    save_config(paths, &config)?;
-    super::write_records(paths, &store)?;
-    let report = apply_entries(paths, &mut state, &entries)?;
-    state.membership = Stored::In;
-    state.failed = apply_failed(&report);
-    state.records_digest = Some(digest);
-    state.proof = None;
-    state.refused = None;
-    state.source_identity = (!state.failed).then(|| source_identity(&config));
-    // The first subscriber pass posts the `Allowed` at once.
-    state.requested = 0;
-    save_state(paths, &state)?;
-    handover::keep_allowed(paths, &bundle.allowed)?;
-    Ok(report)
+    let publish = || {
+        let mut state = state;
+        super::records_file_for_write(paths, &store)?;
+        save_config(paths, &config)?;
+        super::write_records(paths, &store)?;
+        let report = apply_entries(paths, &mut state, &entries)?;
+        state.membership = Stored::In;
+        state.failed = apply_failed(&report);
+        state.records_digest = Some(digest);
+        state.proof = None;
+        state.refused = None;
+        state.source_identity = (!state.failed).then(|| source_identity(&config));
+        // The first subscriber pass posts the `Allowed` at once.
+        state.requested = 0;
+        save_state(paths, &state)?;
+        handover::keep_allowed(paths, &bundle.allowed)?;
+        Ok(report)
+    };
+    if requires_crossed_mark {
+        super::after_crossed_mark(&super::crossing_mark(paths), publish)
+    } else {
+        publish()
+    }
 }
 
 /// Whether this Mac takes a member's join bundle, by every check its write runs
@@ -880,13 +923,38 @@ struct CheckedLog {
     store: membership_log::Store,
     entries: Vec<Entry>,
     digest: [u8; 32],
+    requires_crossed_mark: bool,
 }
 
 /// [`write_from_log_bundle`]'s checks, writing nothing.
 fn checked_log_bundle(paths: &Paths, bundle: &Bundle) -> crate::Result<CheckedLog> {
-    let Handed::Log { admit, records } = &bundle.handed else {
+    let Handed::Log {
+        source,
+        admit,
+        records,
+    } = &bundle.handed
+    else {
         return Err(Error::new("the member's bundle carries no membership log"));
     };
+    let previous = load_records(paths)?;
+    let local = records_bound(paths, &previous)?;
+    if source.is_some_and(|source| !local.can_exchange(source))
+        || (source.is_none() && local.crossed)
+    {
+        return Err(Error::new(
+            "the member's join bundle has incompatible record capacity",
+        ));
+    }
+    let limit = source.map_or(crate::membership_log::LEGACY_RECORDS, |source| {
+        (source.held as usize).min(if source.crossed {
+            local.held as usize
+        } else {
+            (local.held as usize).min(crate::membership_log::LEGACY_RECORDS)
+        })
+    });
+    let decoded = crate::membership_log::store::decode_records_bounded(records, limit)?;
+    let offered: std::collections::BTreeSet<_> =
+        decoded.iter().map(|record| *record.id()).collect();
     let current = config(paths)?;
     let state = load_state(paths)?;
     if current.is_some() && state.membership == Stored::In {
@@ -935,8 +1003,37 @@ fn checked_log_bundle(paths: &Paths, bundle: &Bundle) -> crate::Result<CheckedLo
         records_store_for(Some(&config))?.1
     };
     store
-        .ingest(records)
+        .ingest_records(decoded)
         .map_err(|error| Error::new(format!("the member's records: {error}")))?;
+    let mut carried = std::collections::BTreeSet::new();
+    if let (Some(own), Some(incoming)) = (previous.log(), store.log())
+        && own.network() == incoming.network()
+    {
+        carried = previous.inventory();
+        let records = own
+            .records()
+            .chain(carried.iter().filter_map(|id| previous.uncomplete(id)))
+            .cloned()
+            .collect();
+        store.ingest_records(records)?;
+    }
+    let retained = store.inventory();
+    if !offered.is_subset(&retained) || !carried.is_subset(&retained) {
+        return Err(Error::new(
+            "the member's join bundle cannot be retained in full",
+        ));
+    }
+    let learned_complete = store
+        .complete_inventory()
+        .difference(&previous.complete_inventory())
+        .next()
+        .is_some();
+    let crossed_source = source.is_some_and(|source| source.crossed);
+    if crossed_source && !learned_complete && !retained.is_subset(&previous.inventory()) {
+        return Err(Error::new(
+            "the crossed join bundle adds no complete records",
+        ));
+    }
     let log = store
         .log()
         .ok_or_else(|| Error::new("the member's records hold no genesis"))?;
@@ -964,7 +1061,7 @@ fn checked_log_bundle(paths: &Paths, bundle: &Bundle) -> crate::Result<CheckedLo
         .ok_or_else(|| Error::new("the member's records hand this Mac no key"))?;
     let mut r =
         log_entries::roster_from_doc_or_opened(None, Some(&opened), Some(log)).unwrap_or_default();
-    roster::overlay_log_membership(log, &mut r);
+    roster::overlay_log_membership(log, Some(&identity.recipient()), &mut r);
     if log_entries::member_denied_by_roster(&r, entry)
         || log_entries::recipient_denied_by_roster_or_log(Some(&r), log, &identity.recipient())
     {
@@ -999,14 +1096,21 @@ fn checked_log_bundle(paths: &Paths, bundle: &Bundle) -> crate::Result<CheckedLo
         .open_entries(&identity)?
         .ok_or_else(|| Error::new("the member's records hand this Mac no key"))?;
     let digest = log_entries::records_heads_digest(log);
+    let requires_crossed_mark =
+        (crossed_source && learned_complete) || crate::crossing::past_legacy(log.held_count());
     Ok(CheckedLog {
         config,
         state,
         store,
         entries,
         digest,
+        requires_crossed_mark,
     })
 }
+
+#[cfg(test)]
+#[path = "admit_bounded_tests.rs"]
+mod bounded_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1365,6 +1469,7 @@ mod tests {
             servers: vec!["http://127.0.0.1:9/v1/test-vault".to_owned()],
             allowed: allowed.clone(),
             handed: Handed::Log {
+                source: None,
                 admit: admit3_id,
                 records: encode_records(l.records()),
             },

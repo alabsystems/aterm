@@ -140,10 +140,8 @@ fn pause_progress(value: &mut AccountProgress, off: bool, current_work: bool) {
     );
 }
 
-fn retire_judgment(value: &mut AccountProgress, point: AccountPoint) {
-    use aterm_agent::harness::account_progress::{
-        BINDINGS_CHANGED_FINDING, RECOVERY_HISTORY_PREFIX,
-    };
+fn retire_judgment(value: &mut AccountProgress, point: AccountPoint, finding: &str) {
+    use aterm_agent::harness::account_progress::RECOVERY_HISTORY_PREFIX;
     if value.phase != ProgressPhase::Disabled {
         value.phase = ProgressPhase::Unknown;
     }
@@ -156,7 +154,7 @@ fn retire_judgment(value: &mut AccountProgress, point: AccountPoint) {
             *detail = format!("{RECOVERY_HISTORY_PREFIX}{detail}");
         }
     }
-    value.details.insert(0, BINDINGS_CHANGED_FINDING.into());
+    value.details.insert(0, finding.into());
 }
 
 fn replace_execution_progress(kept: &mut Kept, next: Option<BoundProgress>, now: Instant) -> bool {
@@ -509,38 +507,39 @@ impl WorkerIdle {
             execution_until: None,
             value,
         };
+        // Advice predates these reads. A failed recheck cannot keep its eligibility,
+        // cleared wall or deadline current; independently observed work is overlaid later.
+        let unconfirmed = |mut bound: BoundProgress, finding: &str| {
+            if advice.is_some() {
+                retire_judgment(&mut bound.value, point, finding);
+            } else {
+                bound.value.details.push(finding.into());
+            }
+            Some(bound)
+        };
         let Some(seat) = (self.hooks.acts.account_seat)() else {
-            bound
-                .value
-                .details
-                .push("Account state is unavailable".into());
-            return Some(bound);
+            return unconfirmed(bound, "Account state is unavailable");
         };
         bound.value.observed_at = seat.now;
         bound.state = Some(seat.state.clone());
         let roster = match roster_read(&seat) {
             Ok(roster) => roster,
             Err(why) => {
-                bound.value.details.push(
+                return unconfirmed(
+                    bound,
                     match why {
                         RosterUnread::Nothing => "No accounts are listed",
                         RosterUnread::Refused => "The account roster could not be read",
                         RosterUnread::LoginsUnread => "Stored logins could not be read",
-                    }
-                    .into(),
+                    },
                 );
-                return Some(bound);
             }
         };
         bound.labels = roster.rows.iter().map(|r| r.label.clone()).collect();
         bound.rows = roster.rows.clone().into();
         bound.value.known = Some(roster.rows.len());
         let Some(who) = exec_login(&self.hooks, &bound.snapshot) else {
-            bound
-                .value
-                .details
-                .push("This process's account identity is unavailable".into());
-            return Some(bound);
+            return unconfirmed(bound, "This process's account identity is unavailable");
         };
         let me = who.me(&roster);
         bound.value.account = me.label().map(str::to_owned);
@@ -548,11 +547,7 @@ impl WorkerIdle {
         let (Ok((state, None)), Ok((logins, None))) =
             (store.load(seat.now), store.load_logins(seat.now))
         else {
-            bound
-                .value
-                .details
-                .push("Account records could not be read consistently".into());
-            return Some(bound);
+            return unconfirmed(bound, "Account records could not be read consistently");
         };
         let (point, mut identities) = match judged {
             Some(judged)
@@ -561,7 +556,11 @@ impl WorkerIdle {
                 (Some(&judged.point), Some(&mut judged.identities))
             }
             Some(_) => {
-                retire_judgment(&mut bound.value, point);
+                retire_judgment(
+                    &mut bound.value,
+                    point,
+                    aterm_agent::harness::account_progress::BINDINGS_CHANGED_FINDING,
+                );
                 (None, None)
             }
             None => (None, None),

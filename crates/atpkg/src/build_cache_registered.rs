@@ -1915,7 +1915,7 @@ fn retire_on(
     let removed = reclaim_selected_on(
         home,
         std::time::SystemTime::now(),
-        super::RECLAIM_GONE,
+        super::ReclaimAfter::CALM,
         None,
         record,
         fence,
@@ -2045,6 +2045,7 @@ pub fn plan(home: &Path, now: std::time::SystemTime) -> Vec<super::Planned> {
                 store.as_deref(),
             ),
             now,
+            super::RECLAIM_STALE,
         );
         if !doomed.is_empty() {
             let incremental = doomed
@@ -2079,14 +2080,14 @@ pub fn plan(home: &Path, now: std::time::SystemTime) -> Vec<super::Planned> {
 pub fn reclaim(
     home: &Path,
     now: std::time::SystemTime,
-    gone_after: std::time::Duration,
+    after: super::ReclaimAfter,
     placing: Option<&super::checkout::Placing>,
     record: &mut dyn FnMut(&Path, super::Unused) -> bool,
 ) -> Vec<(PathBuf, super::Unused)> {
     reclaim_on(
         home,
         now,
-        gone_after,
+        after,
         placing,
         record,
         &super::fence::Fence::default(),
@@ -2097,7 +2098,7 @@ pub fn reclaim(
 pub(super) fn reclaim_on(
     home: &Path,
     now: std::time::SystemTime,
-    gone_after: std::time::Duration,
+    after: super::ReclaimAfter,
     placing: Option<&super::checkout::Placing>,
     record: &mut dyn FnMut(&Path, super::Unused) -> bool,
     fence: &super::fence::Fence<'_>,
@@ -2105,7 +2106,7 @@ pub(super) fn reclaim_on(
     reclaim_selected_on(
         home,
         now,
-        gone_after,
+        after,
         placing,
         record,
         fence,
@@ -2113,9 +2114,41 @@ pub(super) fn reclaim_on(
     )
 }
 
+/// [`reclaim_on`] short of a live cache's stale parts and of every package target: what costs
+/// nobody a compile, which a pass takes in every root before any live part
+/// ([`super::reclaim_roots`]).
+#[cfg(unix)]
+pub(super) fn reclaim_dead_on(
+    home: &Path,
+    now: std::time::SystemTime,
+    after: super::ReclaimAfter,
+    placing: Option<&super::checkout::Placing>,
+    record: &mut dyn FnMut(&Path, super::Unused) -> bool,
+    fence: &super::fence::Fence<'_>,
+) -> Vec<(PathBuf, super::Unused)> {
+    reclaim_selected_on(home, now, after, placing, record, fence, Selection::Dead)
+}
+
+/// What [`reclaim_dead_on`] left to the end of a pass: a live cache's stale parts, and each package
+/// target whole. Retiring one costs a cold build, and only here has a low-disk reason read what
+/// the rest of the pass freed. What that run left of the rest is its to leave.
+#[cfg(unix)]
+pub(super) fn reclaim_live_on(
+    home: &Path,
+    now: std::time::SystemTime,
+    after: super::ReclaimAfter,
+    placing: Option<&super::checkout::Placing>,
+    record: &mut dyn FnMut(&Path, super::Unused) -> bool,
+    fence: &super::fence::Fence<'_>,
+) -> Vec<(PathBuf, super::Unused)> {
+    reclaim_selected_on(home, now, after, placing, record, fence, Selection::Live)
+}
+
 #[cfg(unix)]
 enum Selection<'a> {
     Automatic,
+    Dead,
+    Live,
     Package(package::Context<'a>),
     Requested(&'a Registered),
 }
@@ -2124,14 +2157,18 @@ enum Selection<'a> {
 fn reclaim_selected_on(
     home: &Path,
     now: std::time::SystemTime,
-    gone_after: std::time::Duration,
+    after: super::ReclaimAfter,
     placing: Option<&super::checkout::Placing>,
     record: &mut dyn FnMut(&Path, super::Unused) -> bool,
     fence: &super::fence::Fence<'_>,
     selection: Selection<'_>,
 ) -> Vec<(PathBuf, super::Unused)> {
+    let dead_only = matches!(selection, Selection::Dead);
+    let live_only = matches!(selection, Selection::Live);
     let (selected_cache, requested, kernel) = match selection {
-        Selection::Automatic => (None, None, &package::Live as &dyn package::Kernel),
+        Selection::Automatic | Selection::Dead | Selection::Live => {
+            (None, None, &package::Live as &dyn package::Kernel)
+        }
         Selection::Package(context) => (context.cache, None, context.kernel),
         Selection::Requested(root) => (None, Some(root), &package::Live as &dyn package::Kernel),
     };
@@ -2147,6 +2184,10 @@ fn reclaim_selected_on(
         if selected_cache.is_some_and(|selected| !package::belongs(&preliminary, selected)) {
             continue;
         }
+        if dead_only && preliminary.package.is_some() {
+            continue;
+        }
+        let takes = !live_only || preliminary.package.is_some();
         // Take a package's whole-build coordinator BEFORE its receipt gate, including the
         // resume path. Keep it alive until the last staged entry and receipt are settled.
         let Ok(coordination) = package::coordinate(home, &preliminary) else {
@@ -2184,6 +2225,9 @@ fn reclaim_selected_on(
             continue;
         }
         if let Some(mut pending) = receipt.pending.clone() {
+            if !takes {
+                continue;
+            }
             // The remover may have finished before the final receipt write reached disk.
             // A policy's coordinator still excludes another generation: only two genuinely
             // absent names and unchanged authorization permit this metadata-only settlement.
@@ -2253,6 +2297,7 @@ fn reclaim_selected_on(
                     &receipt,
                     &pending,
                     coordination.as_ref(),
+                    fence,
                 ) {
                     Ok(left) => left,
                     Err(revoked) => {
@@ -2310,15 +2355,18 @@ fn reclaim_selected_on(
                         gone.then(|| {
                             super::unused(&cache.root, &|seen| {
                                 let idle = super::age(now, seen.newest);
-                                (idle >= gone_after).then_some(super::Unused::Gone {
+                                (idle >= after.gone).then_some(super::Unused::Gone {
                                     idle,
-                                    after: gone_after,
+                                    after: after.gone,
                                 })
                             })
                         })
                     })
             });
         if let Some(Some((held_cargo, why))) = whole {
+            if !takes {
+                continue;
+            }
             if !same(home, &receipt)
                 || read(&cache.receipt_path).as_ref() != Some(&receipt)
                 || coordination
@@ -2419,6 +2467,7 @@ fn reclaim_selected_on(
                 &receipt,
                 pending,
                 coordination.as_ref(),
+                fence,
             ) {
                 Ok(left) => left,
                 Err(revoked) => {
@@ -2459,25 +2508,29 @@ fn reclaim_selected_on(
                 root: &cache.root,
                 home: Some(home),
                 now,
-                gone_after,
+                after,
                 placing,
                 moved: false,
                 compiler_store: super::compiler_store(Some(home)),
                 intents: &mut intents,
                 fence,
                 permitted: &permitted,
+                pruning: Vec::new(),
+                declined: false,
             };
             // `prune` makes a fresh stage; only `walk` finishes older stages now. A registered
             // target is not a mirror tree, so finish just its own stages under this receipt gate.
-            for stage in super::stages_in(&cache.root, std::ffi::OsStr::new(super::DOOMED)) {
-                if !same(home, &receipt) {
-                    break;
-                }
-                if sweep.stage_recorded(&stage, &cache.root) && same(home, &receipt) {
-                    sweep.finish_stage(&stage, &cache.root);
+            if takes {
+                for stage in super::stages_in(&cache.root, std::ffi::OsStr::new(super::DOOMED)) {
+                    if !same(home, &receipt) {
+                        break;
+                    }
+                    if sweep.stage_recorded(&stage, &cache.root) && same(home, &receipt) {
+                        sweep.finish_stage(&stage, &cache.root);
+                    }
                 }
             }
-            if same(home, &receipt) {
+            if !dead_only && same(home, &receipt) {
                 let _ = sweep.prune(&cache.root, &cache.root);
             }
         }
@@ -2510,11 +2563,13 @@ fn remove_pending(
     receipt: &Receipt,
     pending: &Pending,
     coordination: Option<&package::Coordination>,
+    fence: &super::fence::Fence<'_>,
 ) -> Result<super::remove::Left, super::remove::Revoked> {
     let payload = pending.directory.join(PAYLOAD);
     // Custody is read by path above the payload, its stage's own included; the payload's own is
     // the walk's to read, through the folder it holds ([`retention::allows_walk`]).
     let permitted = || {
+        fence.working();
         retention::allows(path, receipt)
             && retention::allows_walk(&payload)
             && coordination.is_none_or(package::Coordination::removal_allowed)
@@ -2587,9 +2642,33 @@ fn forecast_pending(_: &Receipt, pending: &Pending) -> super::remove::Forecast {
 pub fn reclaim(
     _: &Path,
     _: std::time::SystemTime,
-    _: std::time::Duration,
+    _: super::ReclaimAfter,
     _: Option<&super::checkout::Placing>,
     _: &mut dyn FnMut(&Path, super::Unused) -> bool,
+) -> Vec<(PathBuf, super::Unused)> {
+    Vec::new()
+}
+
+#[cfg(not(unix))]
+pub(super) fn reclaim_dead_on(
+    _: &Path,
+    _: std::time::SystemTime,
+    _: super::ReclaimAfter,
+    _: Option<&super::checkout::Placing>,
+    _: &mut dyn FnMut(&Path, super::Unused) -> bool,
+    _: &super::fence::Fence<'_>,
+) -> Vec<(PathBuf, super::Unused)> {
+    Vec::new()
+}
+
+#[cfg(not(unix))]
+pub(super) fn reclaim_live_on(
+    _: &Path,
+    _: std::time::SystemTime,
+    _: super::ReclaimAfter,
+    _: Option<&super::checkout::Placing>,
+    _: &mut dyn FnMut(&Path, super::Unused) -> bool,
+    _: &super::fence::Fence<'_>,
 ) -> Vec<(PathBuf, super::Unused)> {
     Vec::new()
 }
@@ -2704,7 +2783,10 @@ mod tests {
             reclaim_on(
                 &world.home,
                 world.later(),
-                Duration::ZERO,
+                super::super::ReclaimAfter {
+                    gone: Duration::ZERO,
+                    ..super::super::ReclaimAfter::CALM
+                },
                 None,
                 &mut |_, _| true,
                 &fence
@@ -2945,7 +3027,10 @@ mod tests {
             let removed = reclaim_selected_on(
                 &world.home,
                 SystemTime::now(),
-                Duration::ZERO,
+                super::super::ReclaimAfter {
+                    gone: Duration::ZERO,
+                    ..super::super::ReclaimAfter::CALM
+                },
                 None,
                 &mut |_, _| true,
                 &super::super::fence::Fence::new(&clear),
@@ -3651,7 +3736,7 @@ mod tests {
             reclaim(
                 &world.home,
                 world.later(),
-                super::super::RECLAIM_GONE,
+                super::super::ReclaimAfter::CALM,
                 None,
                 &mut |_, _| true
             )
@@ -3665,7 +3750,7 @@ mod tests {
             reclaim(
                 &world.home,
                 world.later(),
-                super::super::RECLAIM_GONE,
+                super::super::ReclaimAfter::CALM,
                 None,
                 &mut |_, _| true
             )
@@ -3675,12 +3760,158 @@ mod tests {
         let removed = reclaim(
             &world.home,
             world.later(),
-            super::super::RECLAIM_GONE,
+            super::super::ReclaimAfter::CALM,
             None,
             &mut |_, _| true,
         );
         assert_eq!(removed.len(), 1);
         assert!(!world.target.exists());
+    }
+
+    /// A live worktree of the shared cache, its crate folder as old as the fixture's clock says.
+    #[cfg(target_os = "macos")]
+    fn live_in_shared_cache(world: &World) -> PathBuf {
+        let live = world.home.join("live");
+        std::fs::create_dir(&live).unwrap();
+        std::fs::write(live.join("Cargo.toml"), "[workspace]\n").unwrap();
+        let root = super::super::cache_root(&world.home);
+        let profile = super::super::build_dir(&root, &live).join("debug");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(profile.join(".cargo-build-lock"), b"").unwrap();
+        let folder = profile.join("incremental/ws-1k116trr0a0xf");
+        std::fs::create_dir_all(folder.join("s-hneouhc0uf-1tn8o9j-2awpw")).unwrap();
+        folder
+    }
+
+    /// DEAD FIRST HOLDS ACROSS ROOTS: with room for two removals, a pass takes the root the cache
+    /// moved from and a registered cache whose owners are gone, and the shared cache's live
+    /// worktree keeps its warm folder. NEGATIVE CONTROL: the third ask is that folder's.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_pass_takes_every_roots_dead_before_any_live_part() {
+        let world = World::new();
+        world.build();
+        std::fs::remove_dir_all(&world.owner).unwrap();
+        let folder = live_in_shared_cache(&world);
+        let moved = super::super::moved_from(&world.home).join("Users/gone");
+        let moved_leaf = moved.join(super::super::LEAF);
+        std::fs::create_dir_all(moved_leaf.join("debug/deps")).unwrap();
+
+        let mut asked = Vec::new();
+        super::super::reclaim_beside_sessions(
+            &world.home,
+            world.later(),
+            true,
+            None,
+            &|| {},
+            &mut |_, why| {
+                asked.push(why);
+                asked.len() <= 2
+            },
+        );
+
+        assert!(
+            matches!(
+                asked.as_slice(),
+                [
+                    super::super::Unused::Moved { .. },
+                    super::super::Unused::Gone { .. },
+                    super::super::Unused::Stale { .. },
+                ]
+            ),
+            "{asked:?}"
+        );
+        assert!(!moved_leaf.exists() && !world.target.exists());
+        assert!(folder.is_dir());
+    }
+
+    /// THE SHARED CACHE'S DECLINE SPEAKS FOR A REGISTERED CACHE'S PRUNE: a record that declines the
+    /// first is not asked of the second, whose parts would only move aside and back. A record
+    /// that takes them gets both, the shared cache's first.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_decline_of_a_shared_prune_spares_a_registered_cache_the_move() {
+        let world = World::new();
+        world.build();
+        let unit = world.target.join("debug/incremental/old-unit");
+        std::fs::create_dir_all(&unit).unwrap();
+        let folder = live_in_shared_cache(&world);
+        let pass = |record: &mut dyn FnMut(&Path, super::super::Unused) -> bool| {
+            super::super::reclaim_beside_sessions(
+                &world.home,
+                world.later(),
+                true,
+                None,
+                &|| {},
+                record,
+            )
+        };
+
+        let mut asked = Vec::new();
+        pass(&mut |path, _| {
+            asked.push(path.to_path_buf());
+            false
+        });
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert!(unit.is_dir() && folder.is_dir());
+
+        let mut asked = Vec::new();
+        pass(&mut |path, _| {
+            asked.push(path.to_path_buf());
+            true
+        });
+        assert_eq!(asked.len(), 2, "{asked:?}");
+        assert!(!asked[0].starts_with(&world.target), "{asked:?}");
+        assert!(asked[1].starts_with(&world.target), "{asked:?}");
+        assert!(!unit.exists() && !folder.exists());
+        assert!(world.target.join("debug/deps/keep").is_file());
+    }
+
+    /// WHAT A PASS LEFT OF THE DEAD IT DOES NOT ASK ABOUT AGAIN: its prunes come after, and only
+    /// prune. NEGATIVE CONTROL: the shared cache's prune went, so the prunes ran.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_pass_asks_of_a_dead_cache_once() {
+        let world = World::new();
+        world.build();
+        std::fs::remove_dir_all(&world.owner).unwrap();
+        let folder = live_in_shared_cache(&world);
+        let mut gone = 0;
+        super::super::reclaim_beside_sessions(
+            &world.home,
+            world.later(),
+            true,
+            None,
+            &|| {},
+            &mut |_, why| {
+                let dead = matches!(why, super::super::Unused::Gone { .. });
+                gone += usize::from(dead);
+                !dead
+            },
+        );
+        assert_eq!(gone, 1);
+        assert!(world.target.is_dir() && !folder.exists());
+    }
+
+    /// A REGISTERED CACHE'S REMOVAL SAYS IT IS WORKING: nothing else of its pass does.
+    #[test]
+    fn a_registered_removal_says_it_is_working() {
+        let world = World::new();
+        world.build();
+        std::fs::remove_dir_all(&world.owner).unwrap();
+        let heard = std::cell::Cell::new(false);
+        let hears = || heard.set(true);
+        let fence = super::super::fence::Fence::default().telling(&hears);
+        let went = reclaim_on(
+            &world.home,
+            world.later(),
+            super::super::ReclaimAfter::CALM,
+            None,
+            &mut |_, _| true,
+            &fence,
+        );
+        assert!(!world.target.exists(), "{went:?}");
+        assert!(heard.get());
     }
 
     #[test]
@@ -3704,7 +3935,7 @@ mod tests {
         let went = reclaim(
             &world.home,
             now,
-            super::super::RECLAIM_GONE,
+            super::super::ReclaimAfter::CALM,
             None,
             &mut |_, _| true,
         );
@@ -3736,7 +3967,7 @@ mod tests {
             reclaim(
                 &world.home,
                 now,
-                super::super::RECLAIM_GONE,
+                super::super::ReclaimAfter::CALM,
                 None,
                 &mut |_, _| true
             )
@@ -3747,7 +3978,7 @@ mod tests {
             reclaim(
                 &world.home,
                 now,
-                super::super::RECLAIM_GONE,
+                super::super::ReclaimAfter::CALM,
                 None,
                 &mut |p, _| p != stage
             )
@@ -3757,7 +3988,7 @@ mod tests {
         let retried = reclaim(
             &world.home,
             now,
-            super::super::RECLAIM_GONE,
+            super::super::ReclaimAfter::CALM,
             None,
             &mut |_, _| true,
         );
@@ -3862,7 +4093,7 @@ mod tests {
             let removed = reclaim(
                 &world.home,
                 world.later(),
-                super::super::RECLAIM_GONE,
+                super::super::ReclaimAfter::CALM,
                 None,
                 &mut |_, _| true,
             );
@@ -3917,7 +4148,7 @@ mod tests {
         let removed = reclaim(
             &world.home,
             world.later(),
-            super::super::RECLAIM_GONE,
+            super::super::ReclaimAfter::CALM,
             None,
             &mut |_, _| true,
         );
@@ -3954,7 +4185,7 @@ mod tests {
         let removed = reclaim(
             &world.home,
             world.later(),
-            super::super::RECLAIM_GONE,
+            super::super::ReclaimAfter::CALM,
             None,
             &mut |path, _| {
                 asked.push(path.to_path_buf());
@@ -3978,7 +4209,7 @@ mod tests {
             reclaim(
                 &world.home,
                 world.later(),
-                super::super::RECLAIM_GONE,
+                super::super::ReclaimAfter::CALM,
                 None,
                 &mut |_, _| true,
             )
@@ -4029,7 +4260,7 @@ mod tests {
             reclaim_on(
                 &world.home,
                 world.later(),
-                super::super::RECLAIM_GONE,
+                super::super::ReclaimAfter::CALM,
                 None,
                 &mut |_, _| {
                     asked.set(true);
@@ -4080,7 +4311,7 @@ mod tests {
         let removed = reclaim(
             &world.home,
             world.later(),
-            super::super::RECLAIM_GONE,
+            super::super::ReclaimAfter::CALM,
             None,
             &mut |path, _| {
                 if path == world.target && !swapped {
@@ -4492,6 +4723,7 @@ mod tests {
             "--unverified".into(),
             "check".into(),
             "--offline".into(),
+            "--message-format=json".into(),
             "-j1".into(),
             target.clone(),
         ];
@@ -4574,10 +4806,35 @@ mod tests {
             tag
         );
         assert!(same(&world.home, &after));
+        let mut artifacts = Vec::new();
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let Ok(message) = aterm_json::from_str::<aterm_json::Value>(line) else {
+                continue;
+            };
+            if message.get("reason").and_then(aterm_json::Value::as_str)
+                == Some("compiler-artifact")
+            {
+                for artifact in message
+                    .get("filenames")
+                    .and_then(aterm_json::Value::as_array)
+                    .expect("compiler artifact paths")
+                {
+                    artifacts.push(PathBuf::from(artifact.as_str().expect("artifact path")));
+                }
+            }
+        }
         assert!(
-            world.target.join("debug/deps").is_dir(),
-            "the actual compiler wrote output"
+            !artifacts.is_empty(),
+            "the actual compiler reported its output: {out:?}"
         );
+        let target = world.target.canonicalize().unwrap();
+        for artifact in artifacts {
+            assert!(
+                artifact.is_file() && artifact.canonicalize().unwrap().starts_with(&target),
+                "actual compiler output in the managed target: {}",
+                artifact.display()
+            );
+        }
     }
 
     #[test]
@@ -4649,7 +4906,7 @@ mod tests {
             reclaim(
                 &world.home,
                 world.later(),
-                super::super::RECLAIM_GONE,
+                super::super::ReclaimAfter::CALM,
                 None,
                 &mut |_, _| true
             )
@@ -4704,7 +4961,7 @@ mod tests {
                 reclaim(
                     &world.home,
                     world.later(),
-                    super::super::RECLAIM_GONE,
+                    super::super::ReclaimAfter::CALM,
                     None,
                     &mut |_, _| true
                 )

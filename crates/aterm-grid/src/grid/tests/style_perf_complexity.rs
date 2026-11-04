@@ -47,21 +47,8 @@ fn scroll_up_linear_time() {
         large_scroll, 0,
         "scroll_up(50) should defer row_to_line (lazy promotion), got {large_scroll} ops"
     );
-
-    assert!(
-        small_drain > 0,
-        "drain after scroll_up(10) should perform row_to_line ops, got 0"
-    );
-
-    let ratio = large_drain as f64 / small_drain as f64;
-    assert!(
-        ratio < 10.0,
-        "drain ops ratio {ratio:.1}x suggests non-linear behavior (10 lines: {small_drain}, 50 lines: {large_drain})"
-    );
-    assert!(
-        ratio > 2.0,
-        "drain ops ratio {ratio:.1}x is too low - expected ~5x (10 lines: {small_drain}, 50 lines: {large_drain})"
-    );
+    assert_eq!(small_drain, 10);
+    assert_eq!(large_drain, 50);
 }
 
 #[test]
@@ -93,23 +80,8 @@ fn reflow_linear_time() {
         take_reflow_row_ops()
     }
 
-    let small_ops = measure_reflow_ops(80, 120, 60);
-    let large_ops = measure_reflow_ops(400, 120, 60);
-
-    assert!(
-        small_ops > 0,
-        "reflow(80 rows) should perform row ops, got 0"
-    );
-
-    let ratio = large_ops as f64 / small_ops as f64;
-    assert!(
-        ratio < 10.0,
-        "reflow ops ratio {ratio:.1}x suggests non-linear behavior (80 rows: {small_ops}, 400 rows: {large_ops})"
-    );
-    assert!(
-        ratio > 2.0,
-        "reflow ops ratio {ratio:.1}x is too low - expected ~5x (80 rows: {small_ops}, 400 rows: {large_ops})"
-    );
+    assert_eq!(measure_reflow_ops(80, 120, 60), 80);
+    assert_eq!(measure_reflow_ops(400, 120, 60), 400);
 }
 
 #[test]
@@ -136,30 +108,10 @@ fn reflow_linear_time_columns() {
 
     let rows = 100;
 
-    let small_ops = measure_reflow_cells(rows, 80, 40);
-    let large_ops = measure_reflow_cells(rows, 320, 160);
-
-    assert!(
-        small_ops > 0,
-        "expected nonzero cell ops for shrink (80→40)"
-    );
-    let ratio = large_ops as f64 / small_ops as f64;
-    assert!(
-        ratio < 6.0,
-        "reflow shrink cell-ops ratio {ratio:.1}x suggests non-linear column scaling \
-         (80 cols: {small_ops}, 320 cols: {large_ops})",
-    );
-
-    let grow_small = measure_reflow_cells(rows, 40, 80);
-    let grow_large = measure_reflow_cells(rows, 160, 320);
-
-    assert!(grow_small > 0, "expected nonzero cell ops for grow (40→80)");
-    let ratio = grow_large as f64 / grow_small as f64;
-    assert!(
-        ratio < 6.0,
-        "reflow grow cell-ops ratio {ratio:.1}x suggests non-linear column scaling \
-         (40→80: {grow_small}, 160→320: {grow_large})",
-    );
+    assert_eq!(measure_reflow_cells(rows, 80, 40), 8_000);
+    assert_eq!(measure_reflow_cells(rows, 320, 160), 32_000);
+    assert_eq!(measure_reflow_cells(rows, 40, 80), 4_000);
+    assert_eq!(measure_reflow_cells(rows, 160, 320), 16_000);
 }
 
 #[test]
@@ -203,20 +155,8 @@ fn scroll_single_line_constant_time() {
         large_scroll, 0,
         "scroll_up(1) on 1000-row grid should defer row_to_line, got {large_scroll} ops"
     );
-
-    assert!(
-        small_drain > 0,
-        "drain after scroll_up(1) on 100-row grid should perform row_to_line ops, got 0"
-    );
-    assert!(
-        large_drain > 0,
-        "drain after scroll_up(1) on 1000-row grid should perform row_to_line ops, got 0"
-    );
-
-    assert!(
-        large_drain <= small_drain * 2,
-        "Single-line drain should be O(1): 100-row grid {small_drain} ops, 1000-row grid {large_drain} ops (10x grid size should not increase ops)"
-    );
+    assert_eq!(small_drain, 1);
+    assert_eq!(large_drain, 1);
 }
 
 #[test]
@@ -247,7 +187,8 @@ fn row_to_line_extracts_hyperlinks() {
     }
 
     let row = grid.row(0).unwrap();
-    let line = Grid::row_to_line_with_hyperlinks(row, &extras, 0);
+    let stored = Grid::extract_row_extras(row, &extras, 0);
+    let line = Grid::row_to_line_with_stored_extras(row, &stored);
 
     assert_eq!(line.to_string(), "Hello World Test123");
 

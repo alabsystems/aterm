@@ -3,7 +3,7 @@
 
 //! Reconnecting `subscribe` streams and blocking reads across aterm self-updates.
 
-use std::io::{self, BufReader, Read as _};
+use std::io::{self, Read as _};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -342,7 +342,7 @@ fn version_at(path: &str, wait: Duration) -> Option<(Option<u32>, String)> {
     let pid = server_pid(&stream);
     let _ = stream.set_read_timeout(Some(wait));
     let _ = stream.set_write_timeout(Some(wait));
-    let mut reader = BufReader::new(&stream);
+    let mut reader = super::reply_on(&stream);
     match ask_once(&stream, &mut reader, token.as_deref(), "version\n") {
         Answer::Line(line) if !line.is_empty() => Some((pid, line)),
         Answer::Line(_) | Answer::Gone => None,
@@ -1127,7 +1127,7 @@ pub(crate) enum Answer {
 /// Put `request` to the successor `stream` is connected to and read its status line.
 pub(crate) fn ask_once(
     stream: &CtlStream,
-    reader: &mut BufReader<&CtlStream>,
+    reader: &mut super::Reply<'_>,
     token: Option<&str>,
     request: &str,
 ) -> Answer {
@@ -1242,7 +1242,7 @@ enum Leg {
 
 fn pump(
     stream: &CtlStream,
-    reader: &mut BufReader<&CtlStream>,
+    reader: &mut super::Reply<'_>,
     out: &mut impl io::Write,
     tracker: &mut FrameTracker,
     watch: Option<(Instant, Duration)>,
@@ -1285,7 +1285,7 @@ fn pump(
 /// The first leg of a `subscribe` relay, already past its `OK subscribe` ack.
 pub(crate) struct FirstLeg<'a, 'b> {
     pub(crate) stream: &'b CtlStream,
-    pub(crate) reader: &'a mut BufReader<&'b CtlStream>,
+    pub(crate) reader: &'a mut super::Reply<'b>,
     /// The path it was dialled at, resolved.
     pub(crate) dialed: &'a str,
     /// The server's pid, when the platform can say.
@@ -1394,7 +1394,7 @@ pub(crate) fn relay_subscription(
             });
             let _ = stream.set_write_timeout(Some(handshake));
             let _ = stream.set_read_timeout(Some(handshake));
-            let mut reader = BufReader::new(&stream);
+            let mut reader = super::reply_on(&stream);
             let answer = ask_once(&stream, &mut reader, token.as_deref(), &ask.request);
             let busy = matches!(&answer, Answer::Line(line) if is_busy(line));
             let silent = matches!(&answer, Answer::Gone)

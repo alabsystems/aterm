@@ -7,6 +7,8 @@
 use super::super::accounts_sync::shared_renewal::{Candidate, resumes_unstarted};
 use super::*;
 use accounts::shared::{Intent, Outcome};
+#[path = "cli_shared_admission.rs"]
+mod admission;
 use std::fs;
 
 struct LocalPolicy<'a> {
@@ -372,7 +374,7 @@ pub(in crate::harness) fn adopt(
         provider,
         ordinary_renewal,
     } = candidate;
-    let context = shared_provider::Context { env, store, host };
+    let source_authority = authority.clone();
     let checked = LocalPolicy {
         authority: authority.as_ref(),
         roster: roster_path,
@@ -623,6 +625,25 @@ pub(in crate::harness) fn adopt(
             staging.display()
         ));
     }
+    let native_admission = admission::Current {
+        authority: source_authority,
+        grant: grant.clone(),
+        row: row.clone(),
+        store: store.clone(),
+        roster: roster_path.to_owned(),
+        target: target.clone(),
+        before: before.clone(),
+        rows: raw.rows.clone(),
+        intent: retained.intent.clone(),
+        now: env.now,
+    }
+    .admit(run_provider);
+    let context = shared_provider::Context {
+        env,
+        store,
+        host,
+        admission: Some(&native_admission),
+    };
     let mut execution_error = None;
     if run_provider {
         if selected_browser.is_none() {
@@ -674,12 +695,16 @@ pub(in crate::harness) fn adopt(
     let observed = provider.observe(&context, &row, &staging);
     let proof = match observed {
         Ok(Some(proof)) => proof,
+        Err(shared_provider::ObservationError::Unavailable(why)) => {
+            current()?;
+            return Err(why);
+        }
         missing => {
             request_recovery(Outcome::Pending)?;
             if let Some(why) = execution_error {
                 return Err(why);
             }
-            return missing.map(|_| false);
+            return missing.map(|_| false).map_err(|error| error.to_string());
         }
     };
     let principal = proof.principal();

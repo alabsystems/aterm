@@ -125,14 +125,31 @@ trust_island! {
 const PERF_EMA_ALPHA: f64 = 0.5;
 const PERF_SHED_FACTOR: f64 = 1.5;
 const PERF_CLEAR_FACTOR: f64 = 0.8;
-const PERF_HYSTERESIS_FRAMES: u32 = 3;
+/// Consecutive frames past the threshold required to flip the load-shed latch.
+pub(crate) const PERF_HYSTERESIS_FRAMES: u32 = 3;
 /// Minimum shed dwell.
 pub(crate) const PERF_SHED_DWELL_MIN: std::time::Duration = std::time::Duration::from_millis(1500);
-const PERF_SHED_DWELL_MAX: std::time::Duration = std::time::Duration::from_secs(30);
-const PERF_RESHED_QUICK_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
+/// Maximum shed dwell after repeated quick re-sheds.
+pub(crate) const PERF_SHED_DWELL_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+/// Window after clearing inside which a re-shed doubles the dwell.
+pub(crate) const PERF_RESHED_QUICK_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
 const SHED_FADE_OUT_SECS: f32 = 0.45;
 const SHED_FADE_IN_SECS: f32 = 0.25;
 const SYNC_HOLD_CAP: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Next anti-flap shed dwell when entering load shed, given the previous `current` dwell and
+/// elapsed time `since_clear` since the last latch flip (`None` on the first shed).
+pub(crate) fn next_shed_dwell(
+    current: std::time::Duration,
+    since_clear: Option<std::time::Duration>,
+) -> std::time::Duration {
+    match since_clear {
+        Some(elapsed) if elapsed < PERF_RESHED_QUICK_WINDOW => {
+            current.saturating_mul(2).min(PERF_SHED_DWELL_MAX)
+        }
+        _ => PERF_SHED_DWELL_MIN,
+    }
+}
 
 /// How long one key/text egress holds the cursor-effect typed wake ([`App::cursor_fx_focus`]) for its window.
 pub(crate) const CURSOR_FX_TYPED_WAKE: std::time::Duration = std::time::Duration::from_secs(8);
@@ -2761,43 +2778,6 @@ const fn blend_rgb(bg: u32, fg: u32, a: u32) -> u32 {
     (r << 16) | (g << 8) | b
 }
 
-#[cfg(test)]
-pub(crate) fn apply_drop_overlay(pixels: &mut [u32], w: usize, h: usize, accent: u32) {
-    apply_drop_overlay_at(pixels, w, h, 0, 0, w, h, accent);
-}
-
-#[cfg(test)]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "a raw surface + a placed frame rect is irreducibly 7 geometry scalars; bundling them into a struct only relocates the list"
-)]
-pub(crate) fn apply_drop_overlay_at(
-    pixels: &mut [u32],
-    sw: usize,
-    sh: usize,
-    ox: i64,
-    oy: i64,
-    fw: usize,
-    fh: usize,
-    accent: u32,
-) {
-    apply_overlay_at(
-        pixels,
-        sw,
-        sh,
-        ox,
-        oy,
-        fw,
-        fh,
-        OverlayGlow {
-            accent,
-            wash_a: DROP_WASH_ALPHA as u8,
-            border_a: DROP_BORDER_ALPHA as u8,
-            border_scale_q4: 0,
-        },
-    );
-}
-
 /// The alpha-parametrized core of the inset-accent-border overlay (the drop target's fixed alphas or the upgrade rim's pulsing ones).
 #[allow(
     clippy::too_many_arguments,
@@ -2850,16 +2830,6 @@ pub(crate) fn apply_overlay_at(
 
 fn ox_clamp(off: i64, len: usize) -> usize {
     off.clamp(0, len as i64) as usize
-}
-
-#[cfg(test)]
-pub(crate) fn composite_tray(
-    pixels: &mut [u32],
-    fb_w: usize,
-    fb_h: usize,
-    card: &crate::SettingsCard,
-) {
-    composite_tray_at(pixels, fb_w, fb_h, 0, 0, card);
 }
 
 /// Project one cached tray card into the portion at or below `floor_y`.
@@ -3017,21 +2987,6 @@ pub(crate) fn stamped_tray_quad<'a>(
         });
     }
     quad
-}
-
-#[cfg(test)]
-pub(crate) fn composite_tray_at(
-    pixels: &mut [u32],
-    fb_w: usize,
-    fb_h: usize,
-    ox: i64,
-    oy: i64,
-    card: &crate::SettingsCard,
-) {
-    let Some(card) = tray_quad_below_y(card, 0) else {
-        return;
-    };
-    composite_tray_quad_at(pixels, fb_w, fb_h, ox, oy, card);
 }
 
 /// Raw-quad twin used after [`tray_quad_below_y`] has cropped a cached card.
@@ -8134,12 +8089,8 @@ impl App {
                 self.perf_run = 0;
             }
             if self.perf_run >= PERF_HYSTERESIS_FRAMES {
-                self.perf_shed_dwell = match self.perf_flip_at {
-                    Some(t) if now.saturating_duration_since(t) < PERF_RESHED_QUICK_WINDOW => {
-                        (self.perf_shed_dwell * 2).min(PERF_SHED_DWELL_MAX)
-                    }
-                    _ => PERF_SHED_DWELL_MIN,
-                };
+                let since_clear = self.perf_flip_at.map(|t| now.saturating_duration_since(t));
+                self.perf_shed_dwell = next_shed_dwell(self.perf_shed_dwell, since_clear);
                 self.flip_shed_latch(now, true);
             }
         }

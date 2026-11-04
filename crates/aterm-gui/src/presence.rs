@@ -459,12 +459,7 @@ pub(crate) fn agent_verdict(
     } else {
         return AgentVerdict::NotAgent;
     };
-    let (rows, cursor) =
-        if whole.len() > rows.len() && reader.prompt(rows).is_some_and(|p| p.head_off_screen) {
-            (whole, cursor)
-        } else {
-            (rows, cursor.on_rows_from(whole.len() - rows.len()))
-        };
+    let (rows, cursor) = verdict_rows(reader, whole, cursor);
     let (reading, subject, turn) = classify(reader, rows, cursor, now);
     AgentVerdict::Agent {
         reading,
@@ -472,6 +467,22 @@ pub(crate) fn agent_verdict(
         subject,
         program: reader.program(),
         turn,
+    }
+}
+
+/// The rows a verdict classifies and the cursor on them: the live zone ([`live_zone`]), or the
+/// whole screen when the zone cuts the head off a box (a prompt read `head_off_screen`) that a
+/// taller screen may hold whole.
+fn verdict_rows<'a>(
+    reader: &dyn aterm_phase::ScreenReader,
+    whole: &'a [String],
+    cursor: Cursor,
+) -> (&'a [String], Cursor) {
+    let rows = live_zone(whole);
+    if whole.len() > rows.len() && reader.prompt(rows).is_some_and(|p| p.head_off_screen) {
+        (whole, cursor)
+    } else {
+        (rows, cursor.on_rows_from(whole.len() - rows.len()))
     }
 }
 
@@ -879,6 +890,30 @@ mod tests {
         assert!(
             live_zone(&rows).len() < under,
             "PRECONDITION: the zone cuts the intro"
+        );
+        let reader = aterm_phase::identify(Some("claude"), live_zone(&rows));
+        let (read, _) = verdict_rows(reader, &rows, Cursor::At(Some(under)));
+        assert_eq!(read.len(), rows.len(), "the whole screen is read");
+        assert!(
+            reader
+                .prompt(read)
+                .is_some_and(|p| !p.head_off_screen && p.chrome_intro_confirm().is_some()),
+            "and holds the intro whole"
+        );
+        // CONTROL: an intro the zone holds whole, under rows the zone leaves out, is read in the
+        // zone.
+        let mut wide: Vec<String> = (0..50).map(|i| format!("  earlier output {i}")).collect();
+        wide.push(String::new());
+        wide.extend(screen(CHROME_INTRO_INLINE[0].1));
+        assert!(
+            live_zone(&wide).len() < wide.len(),
+            "PRECONDITION: the zone is shorter than the screen"
+        );
+        let (read, _) = verdict_rows(reader, &wide, Cursor::Unknown);
+        assert_eq!(read.len(), live_zone(&wide).len(), "CONTROL: the zone");
+        assert!(
+            reader.prompt(read).is_some_and(|p| !p.head_off_screen),
+            "CONTROL: whole in the zone"
         );
         let v = agent_verdict(
             Some("claude"),

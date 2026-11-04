@@ -2253,7 +2253,7 @@ pub fn unenroll(
     })?;
     let ids: Vec<u64> = state.github_keys.iter().map(|(_, id)| *id).collect();
     if let (Some(github), false) = (&inv.github, ids.is_empty()) {
-        super::github::revoke_via(sys, github, &ids)?;
+        super::github::revoke_via(sys, paths, github, &ids)?;
         let _ = writeln!(
             out,
             "deleted {} GitHub key(s) from {}",
@@ -4212,7 +4212,7 @@ mod tests {
     fn unenroll_deletes_the_keys_over_agh_when_the_row_says() {
         let fake = agh_fake::FakeGithub::start();
         let login = super::super::github_keys_tests::LOGIN;
-        let (sys, _token) = super::super::github_keys_tests::inline_on(Fake::root(), &fake);
+        let (sys, _token) = super::super::github_keys_tests::inline_on(Fake::root(), &ctl(), &fake);
         let inventory = format!(
             "schema = 1\n[github]\naccount = \"{login}\"\nkeys = \"agh-inline\"\n[[host]]\nname \
              = \"lab-03\"\nuuid = \"{VM_UUID}\"\naddress = \"192.168.64.4\"\nuser = \"admin\"\n"

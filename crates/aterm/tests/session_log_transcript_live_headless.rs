@@ -395,13 +395,17 @@ fn session_log_transcript_live_headless() {
     assert!(ended.contains(&format!(" close {turn} turn ")), "{ended}");
 
     let got = log(&inst, &sid, "host");
+    let named_turns: Vec<_> = having(&got, " vref=vlive01 ")
+        .into_iter()
+        .filter(|record| record.contains(" turn "))
+        .collect();
     assert_eq!(
-        having(&got, " vref=vlive01 ").len(),
+        named_turns.len(),
         1,
         "the prompt names its turn once: {got:#?}"
     );
     assert!(
-        having(&got, " vref=vlive01 ")[0].contains(&format!(" amend {turn} turn ")),
+        named_turns[0].contains(&format!(" amend {turn} turn ")),
         "{got:#?}"
     );
     assert_eq!(

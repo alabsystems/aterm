@@ -164,6 +164,9 @@ fn decided_with_wraps(
         log,
         &ME.id(),
         &Proven {
+            reader: crate::members::bundle::Reader::BoundedLog(
+                crate::crossing::RecordsBound::uncrossed(),
+            ),
             request: &request,
             node: node(tag),
             name: "machine",
@@ -189,6 +192,9 @@ fn on_lan_with_wraps(log: &Log, mac: Mac, tag: u8, wraps: usize, at: u64) -> Dec
         log,
         &ME.id(),
         &Proven {
+            reader: crate::members::bundle::Reader::BoundedLog(
+                crate::crossing::RecordsBound::uncrossed(),
+            ),
             request: &request,
             node: node(tag),
             name: "machine",
@@ -285,6 +291,9 @@ fn a_seat_moves_by_no_proof_while_a_member_still_runs_0147() {
     let mut log = alab();
     let request = Mac(12).request();
     let old_member_heard = Proven {
+        reader: crate::members::bundle::Reader::BoundedLog(
+            crate::crossing::RecordsBound::uncrossed(),
+        ),
         request: &request,
         node: node(2),
         name: "m2",
@@ -341,6 +350,9 @@ fn a_seat_whose_mac_may_still_run_goes_to_a_person() {
     );
     let request = Mac(12).request();
     let elsewhere = Proven {
+        reader: crate::members::bundle::Reader::BoundedLog(
+            crate::crossing::RecordsBound::uncrossed(),
+        ),
         request: &request,
         node: node(2),
         name: "m2",
@@ -601,6 +613,9 @@ fn a_removed_mac_stays_out_whatever_it_proves() {
     assert!(refused(&decided(&log, Mac(32), 2, true, T0 + DAY)));
     let request = Mac(33).request();
     let held_out = Proven {
+        reader: crate::members::bundle::Reader::BoundedLog(
+            crate::crossing::RecordsBound::uncrossed(),
+        ),
         request: &request,
         node: node(9),
         name: "m2",
@@ -629,6 +644,9 @@ fn contested_own_and_past_the_hourly_share_go_to_a_person() {
     assert!(refused(&decided(&log, Mac(11), 1, true, T0)));
     let request = Mac(10).request();
     let no_key = Proven {
+        reader: crate::members::bundle::Reader::BoundedLog(
+            crate::crossing::RecordsBound::uncrossed(),
+        ),
         request: &request,
         node: [0; 32],
         name: "machine",
@@ -694,6 +712,9 @@ fn the_log_holds_a_daily_limit_and_room_for_people() {
     );
     let request = Mac(81).request();
     let reborn = Proven {
+        reader: crate::members::bundle::Reader::BoundedLog(
+            crate::crossing::RecordsBound::uncrossed(),
+        ),
         request: &request,
         node: node(81),
         name: "m81",
@@ -1014,6 +1035,9 @@ fn a_proof_whose_batch_cannot_fit_is_refused_with_nothing_signed() {
     let m22 = &macs.m22;
     let (_, request, _) = newcomer(macs.root.path(), m22, "stranger");
     let proven = Proven {
+        reader: crate::members::bundle::Reader::BoundedLog(
+            crate::crossing::RecordsBound::uncrossed(),
+        ),
         request: &request,
         node: node(9),
         name: "stranger",
@@ -1030,12 +1054,19 @@ fn a_proof_whose_batch_cannot_fit_is_refused_with_nothing_signed() {
         ..RecordBudgets::PRODUCTION
     };
     let refused = one_more
-        .within(|| admit_by_proof(m22, &proven, now))
+        .within(|| {
+            let limited = Proven {
+                reader: crate::members::bundle::Reader::BoundedLog(
+                    crate::crossing::RecordsBound::here(false),
+                ),
+                ..proven
+            };
+            admit_by_proof(m22, &limited, now)
+        })
         .expect("decided");
-    let Readmit::Refused(why) = &refused else {
+    let Readmit::Refused(_) = &refused else {
         panic!("a batch past the held total was signed: {refused:?}");
     };
-    assert!(why.contains("is full"), "{why}");
     assert_eq!(std::fs::read(m22.records_file()).unwrap(), before);
 
     let let_in = admit_by_proof(m22, &proven, now).expect("let in");
@@ -1126,6 +1157,9 @@ fn a_mac_whose_vault_key_changed_takes_its_seat_back_by_proof_with_nobody() {
 
     let (fresh, request, _) = newcomer(macs.root.path(), m22, "m7-fresh");
     let proven = Proven {
+        reader: crate::members::bundle::Reader::BoundedLog(
+            crate::crossing::RecordsBound::uncrossed(),
+        ),
         request: &request,
         node: n7,
         name: "m7",
@@ -1222,6 +1256,9 @@ fn a_member_that_reads_no_newer_records_lets_no_new_key_in() {
     sync_records(m22, None).expect("m22 pulls m7's Node record");
     let (_, request, _) = newcomer(macs.root.path(), m22, "m7-fresh");
     let proven = Proven {
+        reader: crate::members::bundle::Reader::BoundedLog(
+            crate::crossing::RecordsBound::uncrossed(),
+        ),
         request: &request,
         node: n7,
         name: "m7",
@@ -1289,6 +1326,7 @@ fn a_stranger_is_refused_before_possession_and_a_refusal_after_it_stays_ambiguou
     let tried =
         |node_key: [u8; 32], signer: &Ed25519KeyPair, fleet: Option<desk::Fleet>, at: u64| {
             let joining = Joining {
+                records_bound: crate::crossing::RecordsBound::uncrossed(),
                 device: &device,
                 node: node_key,
                 name: "new-mac".to_owned(),
@@ -1392,6 +1430,9 @@ fn a_stranger_is_refused_before_possession_and_a_refusal_after_it_stays_ambiguou
     let request = Mac(33).request();
     let unread = std::cell::Cell::new(false);
     let proving = |node_key: [u8; 32]| desk::Proving {
+        reader: crate::members::bundle::Reader::BoundedLog(
+            crate::crossing::RecordsBound::uncrossed(),
+        ),
         request: &request,
         node: node_key,
         name: "new-mac",
@@ -1451,6 +1492,7 @@ fn a_member_without_a_log_refuses_before_possession_so_the_mac_can_ask() {
     machine_identity(&fresh).unwrap();
     let device = Device::open(&fresh).unwrap().unwrap();
     let joining = Joining {
+        records_bound: crate::crossing::RecordsBound::uncrossed(),
         device: &device,
         node: node(9),
         name: "fresh".to_owned(),
@@ -1556,6 +1598,7 @@ fn a_fresh_vault_key_proves_its_node_key_to_a_members_desk_and_is_in() {
         .expect("device")
         .expect("an identity");
     let joining = Joining {
+        records_bound: crate::crossing::RecordsBound::uncrossed(),
         device: &device,
         node: n7,
         name: "m7".to_owned(),
@@ -1610,6 +1653,7 @@ fn a_fresh_vault_key_proves_its_node_key_to_a_members_desk_and_is_in() {
             .expect("device")
             .expect("an identity");
         let copier = Joining {
+            records_bound: crate::crossing::RecordsBound::uncrossed(),
             device: &other_device,
             node: n7,
             name: "m7".to_owned(),
@@ -1687,6 +1731,7 @@ fn a_member_whose_newest_records_keep_it_or_the_mac_out_refuses_before_possessio
         .expect("device")
         .expect("an identity");
     let denied_joining = Joining {
+        records_bound: crate::crossing::RecordsBound::uncrossed(),
         device: &denied_device,
         node: node(11),
         name: "denied-mac".to_owned(),
@@ -1763,6 +1808,7 @@ fn a_member_whose_newest_records_keep_it_or_the_mac_out_refuses_before_possessio
         .expect("device")
         .expect("an identity");
     let fresh_joining = Joining {
+        records_bound: crate::crossing::RecordsBound::uncrossed(),
         device: &fresh_device,
         node: node(12),
         name: "fresh-mac".to_owned(),

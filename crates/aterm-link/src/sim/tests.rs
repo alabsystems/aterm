@@ -493,7 +493,7 @@ fn each_rule_switched_off_is_caught() {
                 o
             }),
             "mirror:",
-            130,
+            320,
         ),
         (
             "a replaced log forgets the mirror's cursors (aterm-gui's `forget_landed`)",
@@ -580,7 +580,7 @@ fn each_rule_switched_off_is_caught() {
             "the recovery a write error stopped is done before the run record",
             Box::new(|s| Opts::seed(s).with(Mutant::BeginRunPastAFailedRecovery)),
             "liveness",
-            299,
+            171,
         ),
         (
             "the mirror judges its pin once the recovery reconciled it",
@@ -593,6 +593,12 @@ fn each_rule_switched_off_is_caught() {
             Box::new(|s| Opts::seed(s).with(Mutant::DeliverPastAStandingEntry)),
             "dup delivery",
             14,
+        ),
+        (
+            "a mirror takes only once its open made the pin's fence durable (D06)",
+            Box::new(|s| Opts::seed(s).with(Mutant::TakeAheadOfTheFence)),
+            "mirror fence:",
+            2,
         ),
         (
             "a mirror floor covers a batch only once this open made it durable",
@@ -678,13 +684,13 @@ fn each_rule_switched_off_is_caught() {
             "a session below the node inbox's oldest reads its own lane up to it",
             Box::new(|s| Opts::seed(s).with(Mutant::RefillJoinBelowTheOldest)),
             "refill:",
-            2,
+            5,
         ),
         (
             "the inbox's gap notice moves no commit past the held records in it",
             Box::new(|s| scaled(s).with(Mutant::CommitPastTheGap)),
             "model:",
-            10,
+            5,
         ),
         (
             "the inbox's gap notice is told to aterm",
@@ -732,7 +738,7 @@ fn each_rule_switched_off_is_caught() {
             "a topic catch-up tells the uncounted notice below the first broadcast it delivers (F4)",
             Box::new(|s| asking(s).with(Mutant::TopicReplayDropsAnUncountedNotice)),
             "silent skip",
-            635,
+            105,
         ),
         (
             "the broadcast face's gap notice hands its cursors to the catch-up (F4)",
@@ -762,7 +768,7 @@ fn each_rule_switched_off_is_caught() {
             "an attach takes a hand-off's files before its incarnation (F4)",
             Box::new(|s| asking_erring(s).with(Mutant::AdoptAfterTheAttach)),
             "dup post|answered 2 times| expired 2 times",
-            1670,
+            106,
         ),
         (
             "an adoption names the attach of the hand-off it takes (F4)",
@@ -1026,6 +1032,16 @@ const FOUND_ERRING: &[(u64, usize, &str)] = &[
         400,
         "a sweep a write error stopped, closed by the run record",
     ),
+    // D06's first-pass hold (the mirror's first pass after an attach held for the deliveries
+    // the attach owes), in its first form (behind what the loop held queued), moved 299's, 31's,
+    // 93's, 125's and 185's trajectories off this bug (each holds every law still; 299 reached
+    // it again with the hold off); 171, the first seed of a plain search to 60,000 that reached
+    // it then with its rule off, reaches it under the hold as it stands too.
+    (
+        171,
+        400,
+        "a sweep a write error stopped, closed by the run record",
+    ),
     (
         187,
         400,
@@ -1092,6 +1108,23 @@ const FOUND_ERRING: &[(u64, usize, &str)] = &[
         400,
         "a record dropped while the disk refused the drop",
     ),
+    // D06's first-pass hold, in its first form, moved 494's, 10236's, 8680's and 1851's
+    // trajectories off this bug (each holds every law still; 494 reached it again with the hold
+    // off); 23209, the first seed of this world to 60,000 that reached it then with its rule off,
+    // reaches it under the hold as it stands too.
+    (
+        23209,
+        400,
+        "a record dropped while the disk refused the drop",
+    ),
+    // D06's first-pass hold, as it stands (held for a post the attach's drain listed), moved
+    // 558's, 9002's and 22702's trajectories off this bug (each holds every law still); the
+    // first seed of a plain search to 60,000 that reaches it with its rule off.
+    (
+        31196,
+        400,
+        "an entry read back from its head on a log a move continued below it",
+    ),
 ];
 
 const FOUND_BOTH_WAYS: &[(u64, usize, &str)] = &[
@@ -1138,6 +1171,14 @@ const FOUND_BOTH_WAYS_ERRING: &[(u64, usize, &str)] = &[
         400,
         "a move an `auto` mirror met before its hello left its pinned batch to recover",
     ),
+    // D06's first-pass hold, as it stands, moved 6751's, 7755's, 735's and 2270's trajectories
+    // off this bug (each holds every law still); the first seed of this world to 60,000 that
+    // reaches it with its rule off.
+    (
+        3018,
+        400,
+        "a move an `auto` mirror met before its hello left its pinned batch to recover",
+    ),
     (
         4067,
         400,
@@ -1160,12 +1201,23 @@ const FOUND_BOTH_WAYS_ERRING: &[(u64, usize, &str)] = &[
 type FoundIn = (fn(u64) -> Opts, u64, usize, &'static str);
 
 /// Found seeds of the retained worlds that are none of the lists above (aterm-link B05 review).
-const FOUND_RETAINED: &[FoundIn] = &[(
-    windowed,
-    3924,
-    400,
-    "a hello's judge that said the mirror runs kept the wait it no longer showed",
-)];
+const FOUND_RETAINED: &[FoundIn] = &[
+    (
+        windowed,
+        3924,
+        400,
+        "a hello's judge that said the mirror runs kept the wait it no longer showed",
+    ),
+    // D06's first-pass hold, in its first form, moved 3924's trajectory off this bug (it holds
+    // every law still, and reached it again with the hold off); 3834, the first windowed seed to
+    // 60,000 that reached it then with its rule off, reaches it under the hold as it stands too.
+    (
+        windowed,
+        3834,
+        400,
+        "a hello's judge that said the mirror runs kept the wait it no longer showed",
+    ),
+];
 
 const FOUND_QUITTING: &[FoundIn] = &[
     (
@@ -3486,7 +3538,7 @@ fn a_post_the_log_lost_stays_lost_after_a_later_power_cut() {
         o
     };
     let republishing = move |s: u64| world(s).with(Mutant::RepublishInFlightOfAnEarlierBoot);
-    let out = breaking_at(&republishing, "order:", 1335, RARE_SEEDS)
+    let out = breaking_at(&republishing, "order:", 1746, RARE_SEEDS)
         .expect("NEGATIVE CONTROL: the old republish puts some post out of its sender's order");
     eprintln!(
         "the old republish at seed {}: {}",
@@ -3761,28 +3813,57 @@ fn a_reservation_a_power_cut_left_holds_nothing_back_past_the_next_boot() {
         &Opts::reclaiming(7, Tier::Strict).with(Mutant::KeepEarlierBootReservations),
     );
     for (arm, out, held_after) in [("fixed", &fixed, false), ("CONTROL", &control, true)] {
+        held_across_a_cut(arm, out, held_after);
+    }
+}
+
+/// **OFF THE BOOT VOLUME TOO** (item RZ2): the world of
+/// [`a_reservation_a_power_cut_left_holds_nothing_back_past_the_next_boot`] with its state dir
+/// off the boot volume ([`Opts::off_boot_volume`]), whose page cache vouches for no lease and
+/// where every lease names the kernel's boot all the same: the next boot's first start finds
+/// the earlier boot, retires the reservation, and the subjects go back; every law of a world
+/// holds. NEGATIVE CONTROL: the leases name no boot there, as before RZ2
+/// ([`Mutant::LeaseNamesNoBootOffTheBootVolume`]), and every subject stays charged.
+#[test]
+fn off_the_boot_volume_a_reservation_a_power_cut_left_holds_nothing_back_past_the_next_boot() {
+    let off = |opts: Opts| Opts {
+        off_boot_volume: true,
+        ..opts
+    };
+    let fixed = super::world::run_reclaim_across_a_cut(&off(Opts::reclaiming(7, Tier::Strict)));
+    let control = super::world::run_reclaim_across_a_cut(&off(
+        Opts::reclaiming(7, Tier::Strict).with(Mutant::LeaseNamesNoBootOffTheBootVolume)
+    ));
+    for (arm, out, held_after) in [("fixed", &fixed, false), ("CONTROL", &control, true)] {
+        held_across_a_cut(arm, out, held_after);
+    }
+}
+
+/// Every law of the world held, the post was reserved and unretired when the power went, and
+/// each subject it charged then is charged once the next boot's reclaim was due iff `held_after`.
+fn held_across_a_cut(arm: &str, out: &super::world::ReclaimedAcrossACut, held_after: bool) {
+    assert!(
+        out.violations.is_empty(),
+        "{arm}: {:#?}\n{}",
+        out.violations,
+        out.trace.join("\n")
+    );
+    assert!(
+        out.pinned_at_the_cut,
+        "{arm}: the post was not reserved, on the bus and unretired when the power went:\n{}",
+        out.trace.join("\n")
+    );
+    assert!(!out.subjects.is_empty(), "{arm}: no subject was judged");
+    for (subject, then, now) in &out.subjects {
         assert!(
-            out.violations.is_empty(),
-            "{arm}: {:#?}\n{}",
-            out.violations,
+            *then,
+            "{arm}: {subject} was not charged when the power went"
+        );
+        assert_eq!(
+            *now,
+            held_after,
+            "{arm}: {subject} once the next boot's reclaim was due:\n{}",
             out.trace.join("\n")
         );
-        assert!(
-            out.pinned_at_the_cut,
-            "{arm}: the post was not reserved, on the bus and unretired when the power went:\n{}",
-            out.trace.join("\n")
-        );
-        for (subject, then, now) in &out.subjects {
-            assert!(
-                *then,
-                "{arm}: {subject} was not charged when the power went"
-            );
-            assert_eq!(
-                *now,
-                held_after,
-                "{arm}: {subject} once the next boot's reclaim was due:\n{}",
-                out.trace.join("\n")
-            );
-        }
     }
 }

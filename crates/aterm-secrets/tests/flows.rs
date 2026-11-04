@@ -686,6 +686,7 @@ fn allow_through(member: &Paths, joiner: &Paths, host: &str) -> Bundle {
     client::machine_identity(joiner).expect("identity");
     let device = Device::open(joiner).expect("device").expect("an identity");
     let joining = joiner::Joining {
+        records_bound: aterm_secrets::crossing::RecordsBound::uncrossed(),
         device: &device,
         node: [7; 32],
         name: host.into(),
@@ -765,6 +766,7 @@ fn the_install_lane_returns_within_its_bound_and_leaves_a_pending_request() {
         .expect("device")
         .expect("an identity");
     let joining = joiner::Joining {
+        records_bound: aterm_secrets::crossing::RecordsBound::uncrossed(),
         device: &device,
         node: [7; 32],
         name: "mb".into(),
@@ -911,6 +913,7 @@ fn a_member_busy_with_a_vault_pass_keeps_the_phrase_and_lets_the_new_mac_in_once
         .expect("device")
         .expect("an identity");
     let joining = joiner::Joining {
+        records_bound: aterm_secrets::crossing::RecordsBound::uncrossed(),
         device: &device,
         node: [7; 32],
         name: "mb".into(),
@@ -1041,6 +1044,7 @@ fn a_member_busy_until_the_phrase_lapses_is_asked_again_only_while_it_lives() {
         .expect("device")
         .expect("an identity");
     let joining = joiner::Joining {
+        records_bound: aterm_secrets::crossing::RecordsBound::uncrossed(),
         device: &device,
         node: [7; 32],
         name: "mb".into(),
@@ -1163,6 +1167,7 @@ fn a_bundle_the_new_mac_would_refuse_goes_unacknowledged_and_the_row_stays_allow
         .expect("device")
         .expect("an identity");
     let joining = joiner::Joining {
+        records_bound: aterm_secrets::crossing::RecordsBound::uncrossed(),
         device: &device,
         node: [7; 32],
         name: "mb".into(),

@@ -13,7 +13,7 @@ use crate::wall::{Placement, Wall, WallKind, classify_wall};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 9, "0.9");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 10, "0.10");
 
 /// The worker's phase.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -268,7 +268,9 @@ fn carried_wait(rows: &[String], top: usize) -> bool {
     carried_row(rows, top).is_some()
 }
 
-/// The waiting row [`carried_wait`] reads, its first row as drawn.
+/// The waiting row [`carried_wait`] reads, its first row as drawn: the first glyph row above the
+/// composer's top rule `top` waits for work of Claude Code's own process, and not all of that
+/// work ended in the rows drawn under it ([`waited_out`]).
 fn carried_row(rows: &[String], top: usize) -> Option<usize> {
     const WAITING: [&str; 3] = [
         "waiting for a dynamic workflow",
@@ -278,9 +280,67 @@ fn carried_row(rows: &[String], top: usize) -> Option<usize> {
     let width = crate::question::screen_width(rows);
     let i = glyph_above(rows, top)?;
     let end = status_line_end(rows, i, top, width).unwrap_or(i);
-    status_busy(&status_text(&rows[i..=end]))
-        .is_some_and(|rule| WAITING.contains(&rule))
-        .then_some(i)
+    let text = status_text(&rows[i..=end]);
+    (status_busy(&text).is_some_and(|rule| WAITING.contains(&rule))
+        && !waited_out(&text, &rows[end + 1..top]))
+    .then_some(i)
+}
+
+/// WHETHER EVERY DYNAMIC WORKFLOW A CARRIED WAIT NAMES ENDED UNDER IT: the waiting row's words
+/// `text` name dynamic workflows and nothing else (`Waiting for N dynamic workflow(s) to
+/// finish`), and the rows drawn between it and the composer, `below`, hold a `⏺ Dynamic workflow
+/// "…" completed` row for each of them and for each workflow launched there (`⏺ Workflow(…)`).
+/// That row is the wake a workflow's end opens a turn with, measured on 2.1.304
+/// (`claude-2.1.304-agents-panel-workflow-done-3m20s-120col.txt`, and the walled wake of
+/// `idle-after-limit-and-model-switch.txt`), each followed there by a done row; where no done row
+/// is drawn after it (`showTurnDuration` off), the waiting row stays the first glyph row above the
+/// composer and would name the ended work for as long as it stood. A wait for a background agent
+/// or other work never ends here: no completion row of theirs is measured.
+fn waited_out(text: &str, below: &[String]) -> bool {
+    let Some(waited) = workflows_waited(text) else {
+        return false;
+    };
+    let mut ended = 0usize;
+    let mut launched = 0usize;
+    for (i, row) in below.iter().enumerate() {
+        let Some(said) = row.strip_prefix('⏺').or_else(|| row.strip_prefix('●')) else {
+            continue;
+        };
+        let said = crate::text::trim_start(said);
+        if said.starts_with("Workflow(") {
+            launched += 1;
+        } else if said.starts_with("Dynamic workflow \"")
+            && wrapped_item(&below[i..]).contains("\" completed")
+        {
+            ended += 1;
+        }
+    }
+    ended >= waited.saturating_add(launched)
+}
+
+/// `N` of a waiting row's words `text` that wait for `N dynamic workflow(s)` alone.
+fn workflows_waited(text: &str) -> Option<usize> {
+    let (_, rest) = text.split_once("Waiting for ")?;
+    let (count, rest) = rest.split_once(' ')?;
+    let n = count.parse().ok()?;
+    (rest.starts_with("dynamic workflow to finish")
+        || rest.starts_with("dynamic workflows to finish"))
+    .then_some(n)
+}
+
+/// A transcript item's words, its first row `rows[0]` joined with the indented rows its text
+/// wrapped onto, up to the first blank row.
+fn wrapped_item(rows: &[String]) -> String {
+    let mut item = rows.first().cloned().unwrap_or_default();
+    for row in rows
+        .iter()
+        .skip(1)
+        .take_while(|r| r.starts_with(' ') && !crate::text::trim(r).is_empty())
+    {
+        item.push(' ');
+        item.push_str(crate::text::trim(row));
+    }
+    item
 }
 
 /// The screen reads busy by nothing but the wait claude code carries.
@@ -589,6 +649,52 @@ pub fn in_process_work(rows: &[String]) -> Option<&'static str> {
             (is_done_row(&line) && left_in_process(&line))
                 .then_some("background work still running")
         })
+}
+
+/// THE AGENT'S OWN WORK RUNNING UNDER A TURN'S END THAT A RESTART IN PLACE WOULD END, AS CLAUDE
+/// CODE'S SCREEN NAMES IT: the work it runs in its own process ([`in_process_work`]: its `Waiting
+/// for …`, the wait it carries above its own wake until the workflows it waits for completed
+/// under it, a done row's `… still running` naming more than shells and monitors), which no
+/// process row names, else a shell or a monitor the turn left running, which the process table
+/// names too ([`shell_or_monitor_left`], read wherever the screen names one). Never a footer's workflow progress row or count alone: measured on 2.1.304, a
+/// workflow's progress row stays drawn at its full bar after the workflow ended
+/// (`claude-2.1.304-agents-panel-workflow-done-3m20s-120col.txt`), so a restart held on it would
+/// be held for as long as the row stays drawn, while a workflow still running is named by its
+/// status row's `Waiting for …`. `None` with no composer frame or a message submitted under the
+/// status row ([`background_wait`]'s bounds).
+#[must_use]
+pub fn work_running(rows: &[String]) -> Option<&'static str> {
+    in_process_work(rows).or_else(|| shell_or_monitor_left(rows))
+}
+
+/// A SHELL OR A MONITOR THE TURN LEFT RUNNING, read off each place the screen names one, in
+/// [`busy_signal`]'s words and order ([`LEFT_RUNNING_RULES`]: the status row's `N shell(s) still
+/// running`, a footer row's `N shell(s)`, the status row's `N monitor(s) still running`, a footer
+/// row's `N monitor(s)`), whatever rule [`busy_signal`] reads first: its one rule can be a footer
+/// workflow progress row's, which outlives its workflow and comes ahead of a monitor in either
+/// place and of a shell a later footer row counts. `None` with no composer frame or a message
+/// submitted under the status row ([`background_wait`]'s bounds).
+fn shell_or_monitor_left(rows: &[String]) -> Option<&'static str> {
+    let frame = composer_frame(rows)?;
+    if turn_just_begun(rows) {
+        return None;
+    }
+    let block = status_block(rows, frame.top);
+    let line = block.line(rows);
+    let status = line.as_deref();
+    let footer = &rows[frame.bottom + 1..];
+    let counted = |noun: &str| footer.iter().any(|r| footer_count(r, noun));
+    if status.is_some_and(|r| still_running(r, "shell")) {
+        Some("a shell still running")
+    } else if counted("shell") {
+        Some("a shell running")
+    } else if status.is_some_and(|r| still_running(r, "monitor")) {
+        Some("a monitor still running")
+    } else if counted("monitor") {
+        Some("a monitor running")
+    } else {
+        None
+    }
 }
 
 /// A done row that says work other than shells and monitors (the process table's) is `still
@@ -4055,6 +4161,76 @@ mod tests {
         assert_eq!(work_left(&replied), None);
     }
 
+    /// THE WORK A RESTART IN PLACE WOULD END IS READ ONLY WHERE THE SCREEN NAMES IT LIVE
+    /// ([`work_running`]): a workflow Claude Code waits on, a background agent a done row names
+    /// still running, a shell or a monitor the turn left; never the progress row a workflow
+    /// leaves drawn at its full bar once it ended, which [`background_wait`] still reads as a
+    /// workflow running (measured on 2.1.304), nor a screen that names no work.
+    #[test]
+    fn the_work_a_restart_would_end_is_read_only_where_the_screen_names_it_live() {
+        let outlived = crate::prompt::fixtures::screen(include_str!(
+            "fixtures/claude-2.1.304-agents-panel-workflow-done-3m20s-120col.txt"
+        ));
+        assert_eq!(background_wait(&outlived), Some("a workflow running"));
+        assert_eq!(
+            work_running(&outlived),
+            None,
+            "a progress row outlives its work"
+        );
+        let done_at = outlived
+            .iter()
+            .position(|r| r.starts_with("✻ Brewed for 3m 20s"))
+            .expect("the done row");
+        let mut monitored = outlived.clone();
+        monitored[done_at].push_str(" · 1 monitor still running");
+        assert_eq!(
+            work_running(&monitored),
+            Some("a monitor still running"),
+            "a monitor its done row names, under a progress row its workflow outlived"
+        );
+        let footer_at = outlived
+            .iter()
+            .position(|r| r.starts_with("  ⏵⏵ bypass permissions on"))
+            .expect("the footer");
+        let mut counted = outlived.clone();
+        counted[footer_at] =
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle) · 1 monitor".to_string();
+        assert_eq!(
+            work_running(&counted),
+            Some("a monitor running"),
+            "a monitor its footer counts, under a progress row its workflow outlived"
+        );
+        let workflow = waiter_capture(include_str!("fixtures/wait_bg.out"));
+        assert_eq!(
+            work_running(&workflow),
+            Some("waiting for a dynamic workflow")
+        );
+        let shell = waiter_capture(include_str!("fixtures/wait_bg4.out"));
+        assert_eq!(work_running(&shell), Some("a shell still running"));
+        let done = "✻ Crunched for 9m 27s · done 11:07 AM · 1 shell still running";
+        let at = shell.iter().position(|r| r == done).expect("the done row");
+        let mut monitor = with_footer(shell.clone(), IDLE_AUTO_FOOTER);
+        monitor[at] = "✻ Crunched for 9m 27s · done 11:07 AM · 1 monitor still running".to_string();
+        assert_eq!(work_running(&monitor), Some("a monitor still running"));
+        let mut agents = shell.clone();
+        agents[at] =
+            "✻ Crunched for 9m 27s · done 11:07 AM · 1 shell, 1 agent still running".to_string();
+        assert_eq!(
+            work_running(&agents),
+            Some("background work still running"),
+            "work of its own process, ahead of the shell"
+        );
+        let (compacted, _) = compacted_over_a_shell("✻ Worked for 23s");
+        let footer = compacted
+            .iter()
+            .rposition(|r| r.contains("· 1 shell"))
+            .expect("the footer");
+        assert_eq!(work_running(&compacted), Some("a shell running"));
+        let mut ended = compacted.clone();
+        ended[footer] = "  ⏵⏵ bypass permissions on".to_string();
+        assert_eq!(work_running(&ended), None, "the shell ended");
+    }
+
     /// WHAT THE TURN LEFT IS NAMED ONLY WHERE THE SCREEN NAMES IT: a shell or a monitor under a
     /// done row, drawn live or left above an idle compaction, whichever the composer holds.
     /// Every other wait keeps its `None`, and with it the title as its witness: work of Claude
@@ -5618,6 +5794,93 @@ mod tests {
         assert_eq!(worker_phase(&bare), Phase::Idle);
         assert!(status_unseen(&bare));
         assert!(!status_unseen(&drawn));
+    }
+
+    /// A WAIT CLAUDE CODE CARRIES ABOVE ITS OWN WAKES ENDS WITH THE WORKFLOWS IT WAITS FOR: its
+    /// `✻ Waiting for N dynamic workflow(s) to finish` stays the first glyph row above the
+    /// composer where no done row is drawn after it (`showTurnDuration` off), and once a
+    /// `⏺ Dynamic workflow "…" completed` row is drawn under it for each workflow it waits for
+    /// and each one launched under it (`⏺ Workflow(…)`), nothing it names still runs (measured on
+    /// 2.1.304: `claude-2.1.304-agents-panel-workflow-done-3m20s-120col.txt`, and the walled wake of
+    /// `idle-after-limit-and-model-switch.txt`, each with its done row after it). The screen then
+    /// reads no work running, at an idle point and under a limit's notice its wake drew alike;
+    /// before, the stale wait read `background work still running` there for as long as it stood
+    /// the first glyph row, and held every restart in place but the memory one. A wait for more
+    /// workflows than completed, one a launch under it renews, and a wait for a background agent
+    /// (whose completion row is unmeasured) still stand.
+    #[test]
+    fn a_wait_carried_above_its_wakes_ends_with_the_workflows_it_waits_for() {
+        const LEFT: &str = "background work still running";
+        let footer = "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents";
+        let completed = "⏺ Dynamic workflow \"Second review pass\" completed · 5s";
+        let carried = |waiting: &str, under: &[&str]| {
+            let mut body = vec![waiting, ""];
+            body.extend_from_slice(under);
+            body.push("");
+            screen(&body, footer)
+        };
+        let one = "✻ Waiting for 1 dynamic workflow to finish";
+        let ended = carried(one, &[completed, "", "⏺ The review is in; nothing to fix."]);
+        assert_eq!(busy_signal(&ended), None, "{ended:#?}");
+        assert_eq!(in_process_work(&ended), None);
+        assert_eq!(work_running(&ended), None);
+        assert_eq!(worker_phase(&ended), Phase::Idle);
+        let walled = carried(
+            one,
+            &[
+                completed,
+                "  ⎿  You've reached your Fable limit. Run /usage-credits to continue or switch models with /model.",
+            ],
+        );
+        assert!(
+            matches!(worker_phase(&walled), Phase::Limited { .. }),
+            "{walled:#?}"
+        );
+        assert_eq!(
+            in_process_work(&walled),
+            None,
+            "a walled wake ended the wait"
+        );
+        assert_eq!(work_running(&walled), None);
+        for (name, waiting, under) in [
+            (
+                "a monitor's wake",
+                one,
+                vec!["⏺ Monitor event: \"lander\"", "", "⏺ Restarted it."],
+            ),
+            (
+                "two waited, one completed",
+                "✻ Waiting for 2 dynamic workflows to finish",
+                vec![completed, "", "⏺ One pass is in."],
+            ),
+            (
+                "a launch under it",
+                one,
+                vec![
+                    "⏺ Workflow(Third review pass)",
+                    "  ⎿  /workflows to view dynamic workflow runs",
+                    "",
+                    completed,
+                    "",
+                    "⏺ One pass is in.",
+                ],
+            ),
+            (
+                "an agent waited",
+                "✻ Waiting for 1 background agent to finish",
+                vec![completed, "", "⏺ The review is in."],
+            ),
+            (
+                "an agent and a workflow waited",
+                "✻ Waiting for 1 background agent and 1 dynamic workflow to finish",
+                vec![completed, "", "⏺ The review is in."],
+            ),
+        ] {
+            let r = carried(waiting, &under);
+            assert_eq!(in_process_work(&r), Some(LEFT), "{name}: {r:#?}");
+            assert_eq!(work_running(&r), Some(LEFT), "{name}");
+            assert!(carried_wait_alone(&r), "{name}");
+        }
     }
 
     /// [`in_process_work`] reads the work Claude Code runs in its own process off its status

@@ -115,6 +115,16 @@ fn fixture() -> (Vec<JobRow>, Vec<SweepProc>, Vec<JobProc>) {
 }
 
 fn qualify(rows: &mut [JobRow], sweep: &[SweepProc], facts: &[JobProc], joined: Option<u32>) {
+    qualify_members(rows, sweep, facts, joined, &HashMap::new());
+}
+
+fn qualify_members(
+    rows: &mut [JobRow],
+    sweep: &[SweepProc],
+    facts: &[JobProc],
+    joined: Option<u32>,
+    members: &ShellMembers<'_>,
+) {
     let sweep = sweep.iter().map(|p| (p.pid, p)).collect();
     let facts = facts.iter().map(|p| (p.pid, p)).collect();
     let calls = joined
@@ -126,10 +136,156 @@ fn qualify(rows: &mut [JobRow], sweep: &[SweepProc], facts: &[JobProc], joined: 
         .collect();
     let tabs = [JobTab {
         key: 1,
+        shell_pid: 300,
         calls,
         ..JobTab::default()
     }];
-    note_working_descendants(rows, &sweep, &facts, &tabs, 1000);
+    note_working_descendants(rows, &sweep, &facts, &tabs, members, 1000);
+}
+
+fn shell_owner(
+    rows: &mut [JobRow],
+    sweep: &mut [SweepProc],
+    facts: &mut [JobProc],
+) -> ShellMembers<'static> {
+    let row = &mut rows[0];
+    row.id = "b1".into();
+    row.kind = JobKind::Shell;
+    row.leader = (300, Some(3000));
+    row.pgid = 400;
+    row.class = Class::Polling;
+    row.verdict = Verdict::Stuck;
+    sweep[0].pgid = 300;
+    facts[0].pgid = 300;
+    sweep[1].has_tty = Some(true);
+    sweep[1].pgid = 400;
+    facts[1].pgid = 400;
+    HashMap::from([((1, "b1"), vec![(400, 4000)])])
+}
+
+#[test]
+fn shell_wrapper_exposes_detached_activity_without_erasing_its_local_stall() {
+    for kind in [JobKind::Shell, JobKind::ShellBg] {
+        for activity in [Class::BusySilent, Class::Running] {
+            let (mut rows, mut sweep, mut facts) = fixture();
+            let members = shell_owner(&mut rows, &mut sweep, &mut facts);
+            rows[0].kind = kind;
+            rows[2].class = activity;
+            qualify_members(&mut rows, &sweep, &facts, None, &members);
+            assert_eq!(rows[0].working_descendant, Some((402, 4020)));
+            assert_eq!(rows[0].verdict, Verdict::Stuck);
+            assert!(rows[0].no_progress);
+            assert_eq!(rows[1].working_descendant, Some((402, 4020)));
+        }
+    }
+}
+
+#[test]
+fn shell_activity_requires_current_owned_members_and_consistent_terminal_evidence() {
+    for defect in [
+        "missing-member",
+        "unrelated-member",
+        "member-reused",
+        "owner-reused",
+        "owner-user",
+        "owner-age",
+        "owner-younger",
+        "owner-group-unread",
+        "owner-sweep",
+        "terminal-group",
+        "other-command-group",
+        "terminal-user",
+        "terminal-start",
+        "terminal-age",
+        "terminal-younger",
+        "terminal-parent",
+        "exited-owner",
+        "refused-child",
+        "idle-child",
+        "expired-child",
+        "joined-call",
+    ] {
+        let (mut rows, mut sweep, mut facts) = fixture();
+        let mut members = shell_owner(&mut rows, &mut sweep, &mut facts);
+        let mut joined = None;
+        match defect {
+            "missing-member" => members.clear(),
+            "unrelated-member" => members.get_mut(&(1, "b1")).unwrap()[0].0 = 999,
+            "member-reused" => members.get_mut(&(1, "b1")).unwrap()[0].1 = 999,
+            "owner-reused" => facts[0].start = Some(999),
+            "owner-user" => {
+                facts[0].uid = Some(502);
+                sweep[0].uid = Some(502);
+            }
+            "owner-age" => facts[0].age_ms = None,
+            "owner-younger" => facts[0].age_ms = Some(500),
+            "owner-group-unread" => {
+                facts[0].pgid = 0;
+                sweep[0].pgid = 0;
+            }
+            "owner-sweep" => sweep[0].ppid = 999,
+            "terminal-group" => sweep[1].pgid = 999,
+            "other-command-group" => {
+                facts[1].pgid = 999;
+                sweep[1].pgid = 999;
+            }
+            "terminal-user" => {
+                facts[1].uid = Some(502);
+                sweep[1].uid = Some(502);
+            }
+            "terminal-start" => facts[1].start = None,
+            "terminal-age" => facts[1].age_ms = None,
+            "terminal-younger" => facts[1].age_ms = Some(500),
+            "terminal-parent" => sweep[1].ppid = 999,
+            "exited-owner" => rows[0].verdict = Verdict::Exited,
+            "refused-child" => rows[2].tick.refused = true,
+            "idle-child" => rows[2].cpu_mc = Some(0),
+            "expired-child" => rows[2].class = Class::Waiting,
+            "joined-call" => joined = Some(401),
+            _ => unreachable!(),
+        }
+        qualify_members(&mut rows, &sweep, &facts, joined, &members);
+        assert_eq!(rows[0].working_descendant, None, "{defect}");
+    }
+}
+
+#[test]
+fn the_persistent_shell_does_not_attribute_an_earlier_blocks_child_to_a_new_command() {
+    let (mut rows, mut sweep, mut facts) = fixture();
+    let mut members = shell_owner(&mut rows, &mut sweep, &mut facts);
+    // The detached call now parents directly to the persistent shell. The shell is a
+    // current member, but that identity alone does not say which command spawned the call.
+    facts[2].ppid = 300;
+    sweep[2].ppid = 300;
+    rows[0].pgid = 300;
+    members.insert((1, "b1"), vec![(300, 3000)]);
+    qualify_members(&mut rows, &sweep, &facts, None, &members);
+    assert_eq!(rows[0].working_descendant, None);
+    assert_eq!(rows[0].verdict, Verdict::Stuck);
+}
+
+#[test]
+fn shell_members_inside_a_joined_context_do_not_bridge_its_boundary() {
+    for joined in [400, 401] {
+        let (mut rows, mut sweep, mut facts) = fixture();
+        let mut members = shell_owner(&mut rows, &mut sweep, &mut facts);
+        facts[2].pgid = 400;
+        sweep[2].pgid = 400;
+        members.get_mut(&(1, "b1")).unwrap().push((401, 4010));
+        qualify_members(&mut rows, &sweep, &facts, Some(joined), &members);
+        assert_eq!(rows[0].working_descendant, None, "joined at {joined}");
+        assert_eq!(rows[1].working_descendant, Some((402, 4020)));
+    }
+    let (mut rows, mut sweep, mut facts) = fixture();
+    let mut members = shell_owner(&mut rows, &mut sweep, &mut facts);
+    facts[2].pgid = 400;
+    sweep[2].pgid = 400;
+    members.insert((1, "b1"), vec![(401, 4010)]);
+    qualify_members(&mut rows, &sweep, &facts, None, &members);
+    assert_eq!(
+        rows[0].working_descendant, None,
+        "no owned terminal endpoint"
+    );
 }
 
 #[test]

@@ -61,7 +61,8 @@ impl Paths {
         self.baselines().join(format!("{name}.toml"))
     }
 
-    /// `keys/`: the fleet SSH key, the signing keys and the control sockets.
+    /// `keys/`: the fleet SSH key, the signing keys, the GitHub token file and the control
+    /// sockets.
     #[must_use]
     pub fn keys(&self) -> PathBuf {
         self.root.join("keys")
@@ -77,6 +78,13 @@ impl Paths {
     #[must_use]
     pub fn signing_key(&self) -> PathBuf {
         self.keys().join("signing")
+    }
+
+    /// `keys/github_token` (0600): the `[github]` machine user's token, as `aterm machines
+    /// github login` stores it, never in the login keychain.
+    #[must_use]
+    pub fn github_token(&self) -> PathBuf {
+        self.keys().join("github_token")
     }
 
     /// `keys/recovery.pub` (the recovery key's public half; the private half goes offline).
@@ -244,7 +252,7 @@ pub enum KeysVia {
     /// The REST key path, as today (`System::github_rest`): the default until WP15.
     #[default]
     Gh,
-    /// agh's library, the token still from the keychain's `git credential fill` (5a).
+    /// agh's library, the token from the controller's `keys/github_token` (5a).
     AghInline,
     /// agh's library, the token from agh.toml's `fleet` profile (5b).
     AghFleet,

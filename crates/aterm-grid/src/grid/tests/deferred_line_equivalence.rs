@@ -70,6 +70,8 @@ impl RowBuilder {
     }
 }
 
+/// NEGATIVE CONTROL: non-default styles follow multi-byte complex glyphs, combining marks, and
+/// wide CJK cells so `assert_lines_equivalent` catches any char-index vs byte-offset or column skew.
 /// `DeferredLine::to_line` and `into_line` match `row_to_line_with_stored_extras` across row shapes and extras.
 #[test]
 fn deferred_line_matches_the_eager_conversion() {
@@ -123,17 +125,30 @@ fn deferred_line_matches_the_eager_conversion() {
         ),
     ];
 
-    let mut cells = ascii(b"AAAAA");
+    let mut cells = ascii(b"AAA");
+    cells.extend(styled(
+        b"AA",
+        PackedColor::indexed(3),
+        PackedColor::indexed(5),
+        CellFlags::ITALIC,
+    ));
     complex(&mut cells, 2);
     let mut extras = ScrolledRowExtras::default();
     extras.complex_chars.push((2, Arc::from("\u{1F600}")));
     cases.push(("complex char", cells, extras, false));
 
+    let mut cells = ascii(b"ca");
+    cells.extend(styled(
+        b"fe",
+        PackedColor::indexed(6),
+        PackedColor::indexed(1),
+        CellFlags::UNDERLINE,
+    ));
     let mut extras = ScrolledRowExtras::default();
     extras
         .combining
-        .push((3, SmallVec::from_elem('\u{0301}', 1)));
-    cases.push(("combining mark", ascii(b"cafe"), extras, false));
+        .push((1, SmallVec::from_elem('\u{0301}', 1)));
+    cases.push(("combining mark", cells, extras, false));
 
     let mut extras = ScrolledRowExtras::default();
     extras.hyperlinks.push(link(0, 2, "https://foo.com"));
@@ -162,7 +177,12 @@ fn deferred_line_matches_the_eager_conversion() {
     ));
     cells.push(Cell::new('\u{FFFD}'));
     complex(&mut cells, 4);
-    cells.extend(ascii(b"ef"));
+    cells.extend(styled(
+        b"ef",
+        PackedColor::indexed(5),
+        PackedColor::indexed(7),
+        CellFlags::ITALIC | CellFlags::UNDERLINE,
+    ));
     let mut extras = ScrolledRowExtras::default();
     extras.complex_chars.push((4, Arc::from("\u{1F680}")));
     extras
@@ -187,7 +207,12 @@ fn deferred_line_matches_the_eager_conversion() {
             CellFlags::WIDE,
         ),
     );
-    cells.extend(ascii(b"B"));
+    cells.extend(styled(
+        b"B",
+        PackedColor::indexed(9),
+        PackedColor::indexed(2),
+        CellFlags::BOLD,
+    ));
     cases.push(("wide", cells, ScrolledRowExtras::default(), false));
 
     let mut rb = RowBuilder::new();
@@ -201,6 +226,12 @@ fn deferred_line_matches_the_eager_conversion() {
         assert_lines_equivalent(&eager, &by_ref, &format!("{name} (to_line)"));
         assert_lines_equivalent(&eager, &owned, &format!("{name} (into_line)"));
         assert_eq!(owned.is_wrapped(), wrapped, "{name}");
+        if name == "wide" {
+            // "A\u{4E16}B" has 3 chars (5 UTF-8 bytes, 4 columns): char index 2 is styled 'B',
+            // while byte offset 4 is out of bounds and falls back to the unstyled default of 'A'.
+            assert_ne!(owned.get_attr(2), owned.get_attr(0));
+            assert_eq!(owned.get_attr(4), owned.get_attr(0));
+        }
     }
 }
 

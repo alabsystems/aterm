@@ -221,7 +221,7 @@ fn a_stale_crate_folder_and_an_old_compilers_unit_go_with_their_entries() {
         })
     );
     assert_eq!(
-        paths(&decide(&s, now())),
+        paths(&decide(&s, now(), RECLAIM_STALE)),
         vec![
             (
                 Part::Incremental,
@@ -242,10 +242,31 @@ fn a_stale_crate_folder_and_an_old_compilers_unit_go_with_their_entries() {
     );
 }
 
+/// THE WINDOW IS THE PASS'S: parts written four hours ago stay for a pass with room and go for
+/// a pass below the floor, the unit by the same window as the folder. Parts written 59 minutes
+/// ago stay for both, as does the folder written just now.
+#[test]
+fn below_the_floor_the_same_parts_go_after_an_hour() {
+    const HOUR: Duration = Duration::from_secs(60 * 60);
+    let hours = surveyed(&world(now() - 3 * HOUR, 4 * HOUR));
+    assert_eq!(decide(&hours, now(), RECLAIM_STALE), Vec::new());
+    let parts: Vec<Part> = decide(&hours, now(), RECLAIM_STALE_UNDER_PRESSURE)
+        .iter()
+        .map(|doomed| doomed.part)
+        .collect();
+    assert_eq!(parts, vec![Part::Incremental, Part::Unit]);
+
+    let minutes = surveyed(&world(now() - 3 * HOUR, Duration::from_secs(59 * 60)));
+    assert_eq!(
+        decide(&minutes, now(), RECLAIM_STALE_UNDER_PRESSURE),
+        Vec::new()
+    );
+}
+
 #[test]
 fn nothing_goes_while_any_of_it_was_written_within_the_window() {
     let young = world(now() - DAY, 2 * DAY);
-    assert_eq!(decide(&surveyed(&young), now()), Vec::new());
+    assert_eq!(decide(&surveyed(&young), now(), RECLAIM_STALE), Vec::new());
 
     let mut touched = world(now() - 2 * DAY, 4 * DAY);
     touched.touch(
@@ -253,7 +274,7 @@ fn nothing_goes_while_any_of_it_was_written_within_the_window() {
         now(),
     );
     assert_eq!(
-        paths(&decide(&surveyed(&touched), now()))
+        paths(&decide(&surveyed(&touched), now(), RECLAIM_STALE))
             .into_iter()
             .map(|(part, _)| part)
             .collect::<Vec<_>>(),
@@ -270,7 +291,7 @@ fn nothing_goes_while_any_of_it_was_written_within_the_window() {
         let s = surveyed(&unread);
         assert_eq!(s.profiles[0].units[0].rustc, None);
         assert!(
-            decide(&s, now())
+            decide(&s, now(), RECLAIM_STALE)
                 .iter()
                 .all(|d| d.part == Part::Incremental)
         );
@@ -312,7 +333,10 @@ fn a_sysroot_laid_aside_is_the_build_its_link_names() {
 fn units_stay_where_the_current_compiler_cannot_be_named() {
     let incremental_only = |fs: &Fake| {
         let s = surveyed(fs);
-        let parts: Vec<Part> = decide(&s, now()).iter().map(|d| d.part).collect();
+        let parts: Vec<Part> = decide(&s, now(), RECLAIM_STALE)
+            .iter()
+            .map(|d| d.part)
+            .collect();
         assert_eq!(parts, vec![Part::Incremental]);
         s.last_built
     };
@@ -345,7 +369,7 @@ fn units_stay_where_the_current_compiler_cannot_be_named() {
     assert_eq!(s.last_built, None);
     assert!(no_store.looked.borrow().iter().all(|p| p.starts_with(LEAF)));
     assert!(
-        decide(&s, now())
+        decide(&s, now(), RECLAIM_STALE)
             .iter()
             .all(|d| d.part == Part::Incremental)
     );
@@ -435,7 +459,7 @@ fn a_workspace_left_on_the_previous_compiler_loses_every_unit_once_stale() {
             since: now() - DAY
         })
     );
-    let units: Vec<PathBuf> = decide(&s, now())
+    let units: Vec<PathBuf> = decide(&s, now(), RECLAIM_STALE)
         .into_iter()
         .filter(|d| d.part == Part::Unit)
         .map(|d| d.witness.path)
@@ -445,7 +469,7 @@ fn a_workspace_left_on_the_previous_compiler_loses_every_unit_once_stale() {
     assert_eq!(units, [OLD, NEW, FRESH].map(fingerprint_of));
 
     fs.file(&info, now() - 5 * DAY, &rustc_info(&["/store/trust/15698"]));
-    let parts: Vec<Part> = decide(&surveyed(&fs), now())
+    let parts: Vec<Part> = decide(&surveyed(&fs), now(), RECLAIM_STALE)
         .iter()
         .map(|d| d.part)
         .collect();
@@ -458,7 +482,7 @@ fn a_workspace_left_on_the_previous_compiler_loses_every_unit_once_stale() {
 #[cfg(unix)]
 fn what_was_written_since_the_survey_is_kept() {
     let mut fs = world(now() - 2 * DAY, 4 * DAY);
-    let doomed = decide(&surveyed(&fs), now());
+    let doomed = decide(&surveyed(&fs), now(), RECLAIM_STALE);
     assert!(doomed.iter().all(|d| unchanged(&fs, d)));
     fs.touch(
         &format!("{PROFILE}/incremental/aterm_grid-1k116trr0a0xf/s-hneouhc0uf-1tn8o9j.lock"),
@@ -471,24 +495,24 @@ fn what_was_written_since_the_survey_is_kept() {
     assert!(doomed.iter().all(|d| !unchanged(&fs, d)));
 
     let mut artifact = world(now() - 2 * DAY, 4 * DAY);
-    let before = decide(&surveyed(&artifact), now());
+    let before = decide(&surveyed(&artifact), now(), RECLAIM_STALE);
     assert!(before.iter().any(|d| d.part == Part::Unit));
     artifact.touch(&format!("{PROFILE}/deps/libaterm_grid-{OLD}.rlib"), now());
     assert!(
-        decide(&surveyed(&artifact), now())
+        decide(&surveyed(&artifact), now(), RECLAIM_STALE)
             .iter()
             .all(|d| d.part == Part::Incremental)
     );
 
     let mut moved = world(now() - 2 * DAY, 4 * DAY);
     assert!(
-        decide(&surveyed(&moved), now())
+        decide(&surveyed(&moved), now(), RECLAIM_STALE)
             .iter()
             .any(|d| d.part == Part::Unit)
     );
     moved.link("/store/trust/current", now() + DAY, "15698");
     assert!(
-        decide(&surveyed(&moved), now())
+        decide(&surveyed(&moved), now(), RECLAIM_STALE)
             .iter()
             .all(|d| d.part == Part::Incremental)
     );
@@ -499,7 +523,11 @@ fn what_was_written_since_the_survey_is_kept() {
     )));
     let s = surveyed(&hidden);
     assert_eq!(s.profiles[0].crates[0].newest, None);
-    assert!(decide(&s, now()).iter().all(|d| d.part == Part::Unit));
+    assert!(
+        decide(&s, now(), RECLAIM_STALE)
+            .iter()
+            .all(|d| d.part == Part::Unit)
+    );
 }
 
 #[test]

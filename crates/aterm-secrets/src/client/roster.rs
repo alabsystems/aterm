@@ -155,7 +155,7 @@ fn swarm_roster_held_with(
     after_base();
     if let Some(mut roster) = base {
         if let Some(log) = log_entries::trusted_local_log(paths, &expected)? {
-            overlay_log_membership(&log, &mut roster);
+            overlay_log_membership(&log, None, &mut roster);
         } else {
             let active_nodes: BTreeSet<String> = roster
                 .members
@@ -204,7 +204,7 @@ fn swarm_roster_held_with(
         && log.wraps_to(&identity.recipient())
     {
         let mut roster = SwarmRoster::default();
-        overlay_log_membership(&log, &mut roster);
+        overlay_log_membership(&log, Some(&identity.recipient()), &mut roster);
         if !roster.members.is_empty()
             || !roster.deny_labels.is_empty()
             || !roster.deny_nodes.is_empty()
@@ -507,9 +507,26 @@ pub(super) fn lift_restored_from_roster(
     lifted
 }
 
-pub(super) fn overlay_log_membership(log: &crate::membership_log::Log, roster: &mut SwarmRoster) {
+/// Fold the log's membership into `roster`: a Mac the log removed, or left out of `[everyone]`
+/// on purpose, moves to the deny lists. Where `reader` names the Mac reading it, a Mac whose
+/// `[everyone]` `Wrap` another Mac's batch may still deliver there ([`Log::in_flight`]) is not
+/// left out; with none, every missing `Wrap` reads as left out on purpose.
+///
+/// [`Log::in_flight`]: crate::membership_log::Log::in_flight
+pub(super) fn overlay_log_membership(
+    log: &crate::membership_log::Log,
+    reader: Option<&Recipient>,
+    roster: &mut SwarmRoster,
+) {
     let _ = lift_restored_from_roster(log, roster);
     let membership = log.membership();
+    let flight = reader
+        .map(|mine| log.in_flight(&crate::membership_log::EpochAudience::Everyone, mine))
+        .unwrap_or_default();
+    let left_out = |rec: &Recipient| {
+        log.audience_left_out_recipient(&crate::membership_log::EpochAudience::Everyone, rec)
+            && !flight.contains(rec)
+    };
     let log_removed_node_hexes: BTreeSet<String> = membership
         .nodes()
         .iter()
@@ -533,10 +550,7 @@ pub(super) fn overlay_log_membership(log: &crate::membership_log::Log, roster: &
             || Recipient::parse(&m.recipient).is_ok_and(|rec| {
                 log.recipient_is_removed(&rec)
                     || log_entries::recipient_denied_by_roster_or_log(None, log, &rec)
-                    || log.audience_left_out_recipient(
-                        &crate::membership_log::EpochAudience::Everyone,
-                        &rec,
-                    )
+                    || left_out(&rec)
             })
         {
             log_removed_rows.push(m);
@@ -605,12 +619,7 @@ pub(super) fn overlay_log_membership(log: &crate::membership_log::Log, roster: &
         roster.deny_nodes.push(nk_hex.clone());
     }
     for founder in membership.unproved() {
-        if log.recipient_is_removed(&founder.recipient)
-            || log.audience_left_out_recipient(
-                &crate::membership_log::EpochAudience::Everyone,
-                &founder.recipient,
-            )
-        {
+        if log.recipient_is_removed(&founder.recipient) || left_out(&founder.recipient) {
             if let Some((_, canon)) = leading_m_label(&founder.label)
                 .filter(|(_, c)| c == &founder.label)
                 .or_else(|| leading_m_label(&founder.name).filter(|(_, c)| c == &founder.name))
@@ -730,11 +739,9 @@ pub(super) fn overlay_log_membership(log: &crate::membership_log::Log, roster: &
     for (actor, member) in membership.members() {
         let recipient = member.binding.recipient();
         if log.recipient_is_removed(&recipient)
-            || log.audience_left_out(&crate::membership_log::EpochAudience::Everyone, actor)
-            || log.audience_left_out_recipient(
-                &crate::membership_log::EpochAudience::Everyone,
-                &recipient,
-            )
+            || (log.audience_left_out(&crate::membership_log::EpochAudience::Everyone, actor)
+                && !flight.contains(&recipient))
+            || left_out(&recipient)
         {
             if let Some((_, canon)) = leading_m_label(&member.label)
                 .filter(|(_, c)| c == &member.label)
@@ -1622,7 +1629,7 @@ mod tests {
                         "negative control: blindly replacing the key loses its denial"
                     );
                 }
-                overlay_log_membership(&log, &mut roster);
+                overlay_log_membership(&log, None, &mut roster);
                 assert_eq!(
                     roster.is_node_denied(&new_key),
                     denial != 0,
@@ -1636,7 +1643,7 @@ mod tests {
                     denial != 0
                 );
                 let denied = roster.deny_nodes.clone();
-                overlay_log_membership(&log, &mut roster);
+                overlay_log_membership(&log, None, &mut roster);
                 assert_eq!(
                     roster.deny_nodes, denied,
                     "replaying the overlay preserves the denied keys"
@@ -1987,7 +1994,7 @@ email = "one@example.org"
             deny_labels: Vec::new(),
             deny_nodes: Vec::new(),
         };
-        overlay_log_membership(&log, &mut roster);
+        overlay_log_membership(&log, None, &mut roster);
 
         assert_eq!(roster.members.len(), 1);
         assert_eq!(roster.members[0].label, "m1");
@@ -2072,7 +2079,7 @@ email = "one@example.org"
                 deny_labels: Vec::new(),
                 deny_nodes: vec![second_nk.clone(), third_nk.clone()],
             };
-            overlay_log_membership(&log, &mut roster);
+            overlay_log_membership(&log, None, &mut roster);
             assert_eq!(roster.members.len(), 1);
             assert_eq!(roster.members[0].label, "m1");
             assert_eq!(
@@ -2187,7 +2194,7 @@ email = "one@example.org"
             deny_nodes: Vec::new(),
         };
 
-        overlay_log_membership(&log, &mut roster);
+        overlay_log_membership(&log, None, &mut roster);
         assert!(
             roster.is_label_denied("m2"),
             "removed m2 must be added to deny_labels despite m70's colliding m2.local hostname"
@@ -2371,7 +2378,7 @@ email = "one@example.org"
             deny_nodes: Vec::new(),
         };
 
-        overlay_log_membership(&log, &mut roster);
+        overlay_log_membership(&log, None, &mut roster);
         assert!(
             roster.is_label_denied("m2"),
             "removed m2 must be added to deny_labels: {:?}",
@@ -2479,7 +2486,7 @@ email = "one@example.org"
             deny_labels: vec!["m40".to_owned()],
             deny_nodes: Vec::new(),
         };
-        overlay_log_membership(&log, &mut stale_row_roster);
+        overlay_log_membership(&log, None, &mut stale_row_roster);
         assert!(
             !stale_row_roster.is_node_denied(&m1_nk)
                 && !stale_row_roster.is_node_denied("00000000000000000000000000000001")

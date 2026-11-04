@@ -103,9 +103,19 @@ impl AccountsHost for Host {
         &self,
         token: &str,
         _: std::time::Duration,
-    ) -> Result<shared_provider::ClaudeProfile, String> {
+    ) -> Result<shared_provider::ClaudeProfile, shared_provider::ObservationError> {
         assert_eq!(token, "synthetic-access");
         self.online_calls.fetch_add(1, Ordering::SeqCst);
+        if self.mode == 9 {
+            return Err(shared_provider::ObservationError::Unavailable(
+                "fixture canonical provider outage".into(),
+            ));
+        }
+        if self.mode == 10 {
+            return Err(shared_provider::ObservationError::RecoveryRequired(
+                "fixture rejected token".into(),
+            ));
+        }
         Ok(shared_provider::ClaudeProfile {
             email: if self.mode == 6 {
                 "other@example.test"
@@ -404,7 +414,8 @@ impl shared_provider::Provider for FirstResult {
         context: &shared_provider::Context<'_>,
         row: &accounts::Row,
         staging: &Path,
-    ) -> Result<Option<Box<dyn shared_provider::LoginProof>>, String> {
+    ) -> Result<Option<Box<dyn shared_provider::LoginProof>>, shared_provider::ObservationError>
+    {
         shared_provider::ClaudeOauth.observe(context, row, staging)
     }
 }
@@ -730,7 +741,8 @@ impl shared_provider::Provider for ChangeDuringProof {
         context: &shared_provider::Context<'_>,
         row: &accounts::Row,
         staging: &Path,
-    ) -> Result<Option<Box<dyn shared_provider::LoginProof>>, String> {
+    ) -> Result<Option<Box<dyn shared_provider::LoginProof>>, shared_provider::ObservationError>
+    {
         Ok(shared_provider::Provider::observe(
             &shared_provider::ClaudeOauth,
             context,
@@ -874,3 +886,128 @@ mod recovery;
 
 #[path = "cli_shared_adoption_staging_tests.rs"]
 mod staging;
+
+#[cfg(unix)]
+struct AdmissionProbe {
+    approval: Arc<Approval>,
+    mode: u8,
+    seen: std::sync::Mutex<Vec<crate::harness::login_drive::RecoveryAdmission>>,
+}
+
+#[cfg(unix)]
+impl shared_provider::Provider for AdmissionProbe {
+    fn execute(
+        &self,
+        context: &shared_provider::Context<'_>,
+        row: &accounts::Row,
+        staging: &Path,
+        browser: &RenewBrowser,
+    ) -> Result<(), String> {
+        shared_provider::ClaudeOauth.execute(context, row, staging, browser)
+    }
+    fn observe(
+        &self,
+        context: &shared_provider::Context<'_>,
+        row: &accounts::Row,
+        staging: &Path,
+    ) -> Result<Option<Box<dyn shared_provider::LoginProof>>, shared_provider::ObservationError>
+    {
+        let admission = context
+            .admission
+            .expect("root adoption needs live native admission");
+        admission.current(None).unwrap();
+        admission
+            .current(Some(profile::principal_id("provider-uuid").unwrap()))
+            .unwrap();
+        assert!(admission.current(Some([99; 32])).is_err());
+        let count = {
+            let mut seen = self.seen.lock().unwrap();
+            seen.push(admission.clone());
+            seen.len()
+        };
+        match self.mode {
+            1 => self.approval.live.store(false, Ordering::SeqCst),
+            2 => fs::write(context.env.accounts_roster().unwrap(), "# changed roster\n").unwrap(),
+            3 => {
+                context
+                    .store
+                    .transact_logins(NOW, &mut None, |state, logins| {
+                        accounts::forget_account(state, logins, &row.label);
+                        Ok(Vec::new())
+                    })
+                    .unwrap();
+            }
+            4 => self.approval.generation.store(2, Ordering::SeqCst),
+            5 => fs::remove_dir_all(staging).unwrap(),
+            _ => {}
+        }
+        if self.mode != 0 {
+            assert!(admission.current(None).is_err());
+            return Err(shared_provider::ObservationError::Unavailable(
+                "admission changed".into(),
+            ));
+        }
+        if count < 3 {
+            return Err(shared_provider::ObservationError::Unavailable(
+                "retain the exact attempt".into(),
+            ));
+        }
+        shared_provider::ClaudeOauth.observe(context, row, staging)
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn shared_native_admission_survives_observation_restart_but_not_reissue_or_publication() {
+    for reissue in [false, true] {
+        let (_tmp, env, approval, host) = fixture(0);
+        let provider = Arc::new(AdmissionProbe {
+            approval: approval.clone(),
+            mode: 0,
+            seen: Default::default(),
+        });
+        assert!(run_with_provider(&env, &host, &approval, provider.clone()).is_err());
+        assert!(run_with_provider(&env, &host, &approval, provider.clone()).is_err());
+        {
+            let seen = provider.seen.lock().unwrap();
+            assert_eq!(seen[0].key(), seen[1].key());
+            seen[0].current(None).unwrap();
+            if reissue {
+                approval.generation.store(2, Ordering::SeqCst);
+                assert!(seen[0].current(None).is_err());
+            }
+        }
+        assert_eq!(
+            run_with_provider(&env, &host, &approval, provider.clone()),
+            Ok(true)
+        );
+        let seen = provider.seen.lock().unwrap();
+        assert_eq!(seen[0].key() != seen[2].key(), reissue);
+        assert!(
+            seen.iter()
+                .all(|admission| admission.current(None).is_err())
+        );
+        assert_eq!(
+            host.calls.load(Ordering::SeqCst),
+            if reissue { 2 } else { 1 }
+        );
+        assert_eq!(approval.recoveries.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn shared_native_admission_rechecks_root_roster_and_binding_during_observation() {
+    for mode in 1..=5 {
+        let (_tmp, env, approval, host) = fixture(0);
+        let provider = Arc::new(AdmissionProbe {
+            approval: approval.clone(),
+            mode,
+            seen: Default::default(),
+        });
+        assert!(run_with_provider(&env, &host, &approval, provider.clone()).is_err());
+        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(approval.recoveries.load(Ordering::SeqCst), 0);
+        assert!(provider.seen.lock().unwrap()[0].current(None).is_err());
+    }
+}

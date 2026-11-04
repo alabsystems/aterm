@@ -20,7 +20,15 @@
 //!   its own that waits for no walk still to come, and that walk waits for it and its alert's hold
 //!   ([`App::local_network_step_to_come`]) until the step alone has held a ready walk for
 //!   `permission_walk::LOCAL_NETWORK_WAIT` of unbroken looks (`App::waited_out_local_network`):
-//!   the walk then goes first, and the step asks once it is over.
+//!   the walk then goes first, and the step asks once it is over. The alert's hold ends once the
+//!   LAN re-probe hears the answer, once a worker reading the window list, whose first read the
+//!   trigger waits for, saw a new window of the alert's owner come and then, at a read with the
+//!   person at the Mac, no window of that owner left on screen or off
+//!   ([`App::on_local_network_alert_answered`]), or once the person has been at the Mac for
+//!   [`LOCAL_NETWORK_ALERT_HOLD`] ([`App::look_at_local_network_alert`]). Only the alert this
+//!   step's own trigger raised is watched: a question a first LAN use asked through the door
+//!   (`aterm_types::macos_setup::lan_first_use`) holds the dialog slot for the person's time
+//!   with no watch.
 //! * A panel's Not now holds the window's page, and a control client's act on its row, for
 //!   the rest of its revision (`devtools_helper::declined_for`). A new revision, even one
 //!   approved while aterm runs ([`App::rearm_access_steps`]), asks again.
@@ -52,12 +60,84 @@ use crate::system_state::ToolsWait;
 use crate::{App, SetupStatus, devtools_helper};
 
 /// How long the person must have been at the Mac, counted from their first input after the
-/// step's trigger, for macOS's Local Network alert to count as seen and answered when the LAN
-/// re-probe heard no answer ([`aterm_types::macos_setup::LOCAL_NETWORK_QUESTION_HOLD`]): macOS
-/// reports neither the alert nor its answer, and the alert stands, unanswered, while nobody is
-/// there ([`App::look_at_local_network_alert`]).
+/// step's trigger, for macOS's Local Network alert to count as seen and answered
+/// ([`aterm_types::macos_setup::LOCAL_NETWORK_QUESTION_HOLD`]) when neither the LAN re-probe
+/// heard an answer nor the alert watch saw the alert go ([`App::on_local_network_alert_answered`]):
+/// macOS reports neither the alert nor its answer, and the alert stands, unanswered, while nobody
+/// is there ([`App::look_at_local_network_alert`]).
 pub(crate) const LOCAL_NETWORK_ALERT_HOLD: Duration =
     aterm_types::macos_setup::LOCAL_NETWORK_QUESTION_HOLD;
+
+/// How long the Local Network alert watch's worker waits, once its trigger armed it, between the
+/// end of one read of the window list and the next while its last read found the person at the
+/// Mac, and whatever the person for [`LOCAL_NETWORK_ALERT_FIRST_LOOKS`] after the arm
+/// ([`watch_alert`]). A read takes its own time on top (WindowServer's: a median of about
+/// 1 ms on a 27.0.1 Mac, `docs/measured/unc-alert-window-list-2026-11-03.md`; reads on a
+/// 0.25 s cadence came up to 1.007 s apart in a VM,
+/// `docs/measured/fda-quit-reopen-sheet-window-list-2026-10-28.md`).
+#[cfg(any(target_os = "macos", test))]
+pub(crate) const LOCAL_NETWORK_ALERT_LOOK: Duration = Duration::from_millis(250);
+
+/// [`LOCAL_NETWORK_ALERT_LOOK`] once the watch's first looks are over
+/// ([`LOCAL_NETWORK_ALERT_FIRST_LOOKS`]) while its last read found the person away (no touch of
+/// the keyboard or pointer within the last minute, or the screen locked or switched away for
+/// another login): such a read never ends the hold ([`watch_alert`]), which may stand for hours
+/// while nobody is there, so the watch reads only this often then. An alert already seen that
+/// the person answers then ends the hold at most this long after its window leaves the list,
+/// while the press that answered it still counts as their touch.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) const LOCAL_NETWORK_ALERT_AWAY_LOOK: Duration = Duration::from_secs(5);
+
+/// How long after its trigger armed it the watch's worker reads every
+/// [`LOCAL_NETWORK_ALERT_LOOK`] whatever the person, before it paces its reads by the person
+/// ([`LOCAL_NETWORK_ALERT_AWAY_LOOK`] while away). The alert must be seen on screen before its
+/// going counts ([`watch_alert`]), and the step's moment ([`App::step_moment_is_quiet`]) admits
+/// a person whose last touch was up to 5 minutes before it ([`devtools_helper::PRESENT_WITHIN`]),
+/// whom the watch's own minute reads as away: at the away pace, an alert drawn after the trigger
+/// and answered within one away look would never be seen. This is meant to cover the alert's
+/// coming up: a CFUserNotification's window was listed within 0.12 s of its request
+/// (`docs/measured/unc-alert-window-list-2026-11-03.md`), while the Local Network alert's own
+/// delay after its trigger was not measured. Past it, an alert drawn while the last read found
+/// the person away and answered within one away look is not seen, and the hold ends by the
+/// person's time ([`LOCAL_NETWORK_ALERT_HOLD`]). It costs about 120 reads of about 1 ms each.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) const LOCAL_NETWORK_ALERT_FIRST_LOOKS: Duration = Duration::from_secs(30);
+
+/// How long the Local Network trigger waits for its alert watch's first read, the baseline
+/// ([`StepsReach::local_network_alert_baseline_in`]). Past it the trigger goes without the watch,
+/// which is stopped, and its hold ends only by the re-probe's answer or the person's time: the
+/// wait is one window-list read, whose time WindowServer's load decides (see
+/// [`LOCAL_NETWORK_ALERT_LOOK`]), and the trigger goes at most this long after its moment.
+pub(crate) const LOCAL_NETWORK_ALERT_BASELINE_WAIT: Duration = Duration::from_secs(1);
+
+/// How long the live alert watch's worker waits, after its first read, for its trigger to arm
+/// it or stop it: a hang detector, since the trigger does one or the other within
+/// [`LOCAL_NETWORK_ALERT_BASELINE_WAIT`] and a turn of the window.
+#[cfg(any(target_os = "macos", test))]
+const LOCAL_NETWORK_ALERT_ARM_WAIT: Duration = Duration::from_secs(60);
+
+/// The process that owns macOS's Local Network alert window: UserNotificationCenter on Tahoe
+/// 26.6.2 and on Golden Gate 27.0 (`docs/measured/fda-quit-reopen-sheet-window-list-2026-10-28.md`,
+/// its windows table: layer 8, 260 points wide, read without a Screen Recording grant), and the
+/// 27.0 rows' dialog census (`docs/measured/commons-ln-first-use-2026-10-28.md`) counts it as
+/// UserNotificationCenter's, whose Allow the person pressed. UserNotificationCenter draws every
+/// CFUserNotification, tccd's consent prompts among them, so a window of it is not told apart
+/// from the alert: the watch ends a hold only at a read that lists no window of it at all, on
+/// screen or off ([`watch_alert`]). The watch starts only on a macOS whose alert host was
+/// measured ([`alert_host_measured`]); on any other, the hold ends only by the re-probe's answer
+/// or the person's time.
+#[cfg(any(target_os = "macos", test))]
+const LOCAL_NETWORK_ALERT_OWNERS: [&str; 1] = ["UserNotificationCenter"];
+
+/// Whether macOS `product_version` (`SystemVersion.plist`'s `ProductVersion`) is one whose Local
+/// Network alert was measured as a window of [`LOCAL_NETWORK_ALERT_OWNERS`]: Tahoe 26 and Golden
+/// Gate 27. An unknown version is not.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn alert_host_measured(product_version: Option<&str>) -> bool {
+    product_version
+        .and_then(|version| version.split('.').next())
+        .is_some_and(|major| matches!(major, "26" | "27"))
+}
 
 /// Within how long a touch of the keyboard or pointer reads the person present while the Local
 /// Network alert's hold counts their time ([`App::look_at_local_network_alert`]): the permission
@@ -199,10 +279,33 @@ pub(crate) struct StepsReach {
     /// Drain a completed LAN grant re-probe (`(revision, outcome)`), if any.
     pub(crate) take_local_network_probe: fn() -> Option<(u64, LocalNetworkProbe)>,
     /// Local Network's answer moved as the window heard it: its question went up (recorded
-    /// `triggered`, which the access record keeps as asked), or the re-probe after it ended,
-    /// whatever it heard. Each LAN reader looks again now, the converge pass's `sync.peers` among
-    /// them ([`crate::network_moved::local_network_moved`]).
+    /// `triggered`, which the access record keeps as asked), the alert watch saw no window of the
+    /// alert's owner left with the person at the Mac ([`App::on_local_network_alert_answered`]),
+    /// or the re-probe after it ended, whatever it heard. Each LAN reader looks again now, the
+    /// converge pass's `sync.peers` among them ([`crate::network_moved::local_network_moved`]).
     pub(crate) lan_answer_moved: fn(),
+    /// Start watching for macOS's Local Network alert that the trigger to come for `revision`
+    /// raises, in place of any watch before it: the watch takes its first read, the baseline,
+    /// and the trigger waits for it ([`Self::local_network_alert_baseline_in`]). `false` when no
+    /// watch starts (INERT; live, a macOS whose alert host was not measured,
+    /// [`alert_host_measured`], or no worker), so the trigger goes at once and its hold ends only
+    /// by the re-probe's answer or the person's time. Live ([`start_alert_watch`]): a lane worker
+    /// in the window process runs [`watch_alert`] on the window list, never on the main thread,
+    /// and wakes the window ([`crate::Wake::LocalNetworkAlertWatch`]) once its first read is in
+    /// and once it saw the alert answered.
+    pub(crate) start_local_network_alert_watch: fn(u64) -> bool,
+    /// Whether the alert watch's first read has come back (read, or found unreadable), so the
+    /// trigger waiting for it may go.
+    pub(crate) local_network_alert_baseline_in: fn() -> bool,
+    /// The trigger went: the alert watch reads the window list from now on, until it is stopped
+    /// ([`Self::cancel_local_network_alert_watch`]), as the hold it may end has no end of its own
+    /// on the clock.
+    pub(crate) arm_local_network_alert_watch: fn(),
+    /// Drain the revision whose alert the watch saw answered, if any.
+    pub(crate) take_local_network_alert_answer: fn() -> Option<u64>,
+    /// Stop the alert watch and drop an answer not yet drained: its hold ended, or its trigger
+    /// went without it or named no LAN.
+    pub(crate) cancel_local_network_alert_watch: fn(),
     /// Open a named access pane; injected so headless fixtures reach no OS API.
     pub(crate) open_pane: fn(&App, Access) -> bool,
     /// Append one step's outcome, reporting any failure to the retry owner.
@@ -259,6 +362,11 @@ impl StepsReach {
         start_local_network_probe: |_| {},
         take_local_network_probe: || None,
         lan_answer_moved: || {},
+        start_local_network_alert_watch: |_| false,
+        local_network_alert_baseline_in: || false,
+        arm_local_network_alert_watch: || {},
+        take_local_network_alert_answer: || None,
+        cancel_local_network_alert_watch: || {},
         open_pane: |_, _| false,
         record: |_, _, _| Ok(()),
         recorded: |_, _| None,
@@ -282,6 +390,11 @@ impl StepsReach {
             start_local_network_probe: live_start_local_network_probe,
             take_local_network_probe: live_take_local_network_probe,
             lan_answer_moved: crate::network_moved::local_network_moved,
+            start_local_network_alert_watch: live_start_local_network_alert_watch,
+            local_network_alert_baseline_in: live_local_network_alert_baseline_in,
+            arm_local_network_alert_watch: live_arm_local_network_alert_watch,
+            take_local_network_alert_answer: live_take_local_network_alert_answer,
+            cancel_local_network_alert_watch: live_cancel_local_network_alert_watch,
             open_pane: live_open_access_pane,
             record: live_record,
             recorded: live_recorded,
@@ -303,14 +416,22 @@ impl StepsReach {
 /// The steps' own state in the App.
 pub(crate) struct AccessSteps {
     reach: StepsReach,
-    /// The revision whose Local Network step this process finished (triggered,
-    /// found recorded, or found no LAN to name).
+    /// The revision whose Local Network step this process finished (triggered, its trigger
+    /// waiting for the alert watch's first read, found recorded, or found no LAN to name).
     local_network_done: Option<u64>,
     /// The revision whose record this process read for Local Network.
     local_network_read: Option<u64>,
+    /// The revision whose Local Network trigger waits for its alert watch's first read, and the
+    /// last moment it waits ([`LOCAL_NETWORK_ALERT_BASELINE_WAIT`]). The alert counts as up
+    /// meanwhile for the window's gestures, so the dialog slot stays held and every later step
+    /// waits ([`AccessSteps::local_network_alert_up`]).
+    local_network_baseline: Option<(u64, Instant)>,
     /// macOS's Local Network alert the step raised, while it counts as up
     /// ([`App::look_at_local_network_alert`]).
     local_network_alert: Option<LocalNetworkAlert>,
+    /// The revision whose trigger went with the alert watch armed, which may still end its hold
+    /// ([`App::on_local_network_alert_answered`]); `None` while no such hold stands.
+    local_network_watch: Option<u64>,
     /// The revision whose Local Network trigger found nothing to connect to, and when to try it
     /// again: a minute after one that named a LAN but had no socket, `None` once this Mac's
     /// network moves ([`Self::network_moved`]) after one that found no LAN to name.
@@ -412,6 +533,271 @@ struct RecordedAccess {
     retry_at: Option<Instant>,
 }
 
+/// One window of the Local Network alert's owner as one read of the window list lists it
+/// ([`watch_alert`]).
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AlertWindow {
+    /// Its window number, which WindowServer gives each window anew.
+    pub(crate) number: u32,
+    /// Whether it is on screen. A window ordered out stays in the list off screen: a
+    /// CFUserNotification taken down by `CFUserNotificationCancel` was listed off screen for
+    /// about 8 s before it left the list (`docs/measured/unc-alert-window-list-2026-11-03.md`).
+    pub(crate) on_screen: bool,
+}
+
+/// How a watch of macOS's Local Network alert ended ([`watch_alert`]).
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AlertWatchEnd {
+    /// A window that the first read did not list on screen was seen on screen, and a later read,
+    /// with the person at the Mac, listed no window of the alert's owner at all, on screen or
+    /// off: whatever the person answered, no alert of that owner is up, the one the trigger
+    /// raised included.
+    Answered,
+    /// Such a window was seen, and the last read that could read the list listed a window of the
+    /// alert's owner (that one, or one the first read listed, which may be the alert itself), on
+    /// screen or off, when the watch stopped.
+    StillUp,
+    /// Such a window was seen, and the last read that could read the list listed no window of
+    /// the alert's owner, but found the person away, which ends nothing.
+    GoneWhileAway,
+    /// No such window was seen before the watch stopped: macOS raised no alert, drew it only
+    /// after the watch's last read, drew and took it down between two reads, or had it up before
+    /// the first read (an earlier LAN use raised it, and macOS does not draw it twice), which
+    /// then listed it.
+    NeverSeen,
+    /// The first read could not read the window list, so no window can be told to be the alert.
+    Blind,
+}
+
+/// Watch for macOS's Local Network alert (pure, run on the alert watch's worker): `read` is one
+/// read of the window list's windows of the alert's owner, on screen or off (`None` when the
+/// list could not be read); `present` says whether the person is at the Mac now, read after
+/// each read of the list; and `look_again` waits for the next look, given whether the last
+/// such reading found the person present, and says whether there is one (`false` once the
+/// watch was stopped). The first read, which the trigger waits for, is the baseline: no window
+/// it lists on screen is one the trigger raised. A window a later read lists on screen that the
+/// baseline does not is seen, and the watch ends [`AlertWatchEnd::Answered`] at the first read
+/// that lists no window of the owner at all, on screen or off, with the person present. The
+/// owner draws other alerts too, a baseline window still up may be the alert itself, and a
+/// window ordered out (off screen) is still up, so a read that lists any window of it ends
+/// nothing. A window's going is not known to mean an answer while nobody is at the Mac (an
+/// alert stands, unanswered, while nobody is there), so a read that finds the person away ends
+/// nothing either, and a later read with them present decides. A read that failed changes
+/// nothing, and a baseline window going away, with nothing seen, ends nothing.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn watch_alert(
+    mut read: impl FnMut() -> Option<Vec<AlertWindow>>,
+    mut present: impl FnMut() -> bool,
+    mut look_again: impl FnMut(bool) -> bool,
+) -> AlertWatchEnd {
+    let Some(baseline) = read() else {
+        return AlertWatchEnd::Blind;
+    };
+    let baseline: Vec<u32> = baseline
+        .iter()
+        .filter(|window| window.on_screen)
+        .map(|window| window.number)
+        .collect();
+    let mut here = present();
+    let mut seen: Vec<u32> = Vec::new();
+    let mut listed_none = false;
+    while look_again(here) {
+        let listed = read();
+        here = present();
+        let Some(listed) = listed else {
+            continue;
+        };
+        for window in &listed {
+            if window.on_screen
+                && !baseline.contains(&window.number)
+                && !seen.contains(&window.number)
+            {
+                seen.push(window.number);
+            }
+        }
+        listed_none = listed.is_empty();
+        if !seen.is_empty() && listed_none && here {
+            return AlertWatchEnd::Answered;
+        }
+    }
+    match (seen.is_empty(), listed_none) {
+        (true, _) => AlertWatchEnd::NeverSeen,
+        (false, true) => AlertWatchEnd::GoneWhileAway,
+        (false, false) => AlertWatchEnd::StillUp,
+    }
+}
+
+/// What an alert watch's first read, the baseline, found: how long after the watch's start it
+/// came back, and how many windows of the alert's owner it listed, on screen or off (`None`:
+/// the window list could not be read).
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BaselineRead {
+    pub(crate) after: Duration,
+    pub(crate) windows: Option<usize>,
+}
+
+/// What an alert watch's worker did after its first read, besides what [`watch_alert`] saw.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AlertWatchLooks {
+    /// Its trigger armed it, and it read the list again at least once.
+    Read,
+    /// It was stopped or replaced before it read the list again: its trigger went without it
+    /// (its first read came back too late) or named no LAN, or a stop or a later start came
+    /// first.
+    Stopped,
+    /// Its trigger neither armed nor stopped it within the arm's wait, a hang detector.
+    ArmWaitRanOut,
+}
+
+/// How an alert watch ended, as its one log record names it ([`AlertWatchReport`]).
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AlertWatchEnded {
+    /// [`AlertWatchEnd::Answered`] while the watch was still the window's: it left the answer.
+    Answered,
+    /// [`AlertWatchEnd::Answered`] once a stop or a later start had overtaken it: it left none.
+    AnsweredOnceStopped,
+    /// [`AlertWatchEnd::StillUp`].
+    StillUp,
+    /// [`AlertWatchEnd::GoneWhileAway`].
+    GoneWhileAway,
+    /// [`AlertWatchEnd::NeverSeen`], after it read the list again ([`AlertWatchLooks::Read`]).
+    NeverSeen,
+    /// [`AlertWatchEnd::NeverSeen`] with no read after its first ([`AlertWatchLooks::Stopped`]).
+    StoppedUnarmed,
+    /// [`AlertWatchEnd::NeverSeen`] with no read after its first
+    /// ([`AlertWatchLooks::ArmWaitRanOut`]).
+    ArmWaitRanOut,
+    /// [`AlertWatchEnd::Blind`].
+    Blind,
+}
+
+/// The one log record an alert watch's end makes ([`finish_alert_watch`]); its `Display` is
+/// the aterm.log line.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AlertWatchReport {
+    pub(crate) revision: u64,
+    pub(crate) ended: AlertWatchEnded,
+    pub(crate) baseline: Option<BaselineRead>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl std::fmt::Display for AlertWatchReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let owner = LOCAL_NETWORK_ALERT_OWNERS[0];
+        let watch = "system state: the Local Network alert watch";
+        match self.ended {
+            AlertWatchEnded::Answered => write!(
+                f,
+                "{watch} saw a new window of {owner} come and then, with the person at the Mac, \
+                 no window of {owner} left"
+            ),
+            AlertWatchEnded::AnsweredOnceStopped => write!(
+                f,
+                "{watch} saw a new window of {owner} come and then, with the person at the Mac, \
+                 no window of {owner} left, after it was stopped"
+            ),
+            AlertWatchEnded::StillUp => write!(
+                f,
+                "{watch} stopped with a window of {owner} still listed, after a new one came"
+            ),
+            AlertWatchEnded::GoneWhileAway => write!(
+                f,
+                "{watch} stopped after a new window of {owner} came and its last read listed \
+                 none, with the person away, which it does not take for an answer"
+            ),
+            AlertWatchEnded::NeverSeen => write!(
+                f,
+                "{watch} stopped with no new window of {owner} on screen after its first read: \
+                 macOS raised no alert, had it up before that read, or drew and took it down \
+                 between two reads"
+            ),
+            AlertWatchEnded::StoppedUnarmed => write!(
+                f,
+                "{watch} was stopped before it read the list again after its first read: its \
+                 trigger went without it or named no LAN, or a stop or a later start came first"
+            ),
+            AlertWatchEnded::ArmWaitRanOut => write!(
+                f,
+                "{watch} was neither armed nor stopped within {} s of its first read, and \
+                 stopped reading",
+                LOCAL_NETWORK_ALERT_ARM_WAIT.as_secs()
+            ),
+            AlertWatchEnded::Blind => write!(
+                f,
+                "{watch} could not read the window list before its trigger: its hold ends only \
+                 by the re-probe's answer or the person's time"
+            ),
+        }?;
+        write!(f, " (revision {}; ", self.revision)?;
+        match self.baseline {
+            Some(BaselineRead {
+                after,
+                windows: Some(windows),
+            }) => write!(
+                f,
+                "its first read listed {windows} window(s) of {owner}, {} ms after its start)",
+                after.as_millis()
+            ),
+            Some(BaselineRead {
+                after,
+                windows: None,
+            }) => write!(
+                f,
+                "its first read found the window list unreadable, {} ms after its start)",
+                after.as_millis()
+            ),
+            None => f.write_str("it made no first read)"),
+        }
+    }
+}
+
+/// The end of an alert watch's worker once [`watch_alert`] returned `end` after `looks`.
+/// `settle` is given whether the watch answered; it leaves `revision` for the window when it did
+/// and the watch is still the window's, and says whether the watch is still the window's. Only
+/// such an answer wakes the window (`wake`). Every end then makes one log record (`log`), a
+/// watch a stop overtook included (its hold's end, the re-probe's answer, a later start), with
+/// what its first read found, so a run's log says how each watch ended and when its baseline
+/// came back.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn finish_alert_watch(
+    end: AlertWatchEnd,
+    looks: AlertWatchLooks,
+    revision: u64,
+    baseline: Option<BaselineRead>,
+    settle: impl FnOnce(bool) -> bool,
+    wake: impl FnOnce(),
+    log: impl FnOnce(AlertWatchReport),
+) {
+    let answered = end == AlertWatchEnd::Answered;
+    let live = settle(answered);
+    if answered && live {
+        wake();
+    }
+    let ended = match end {
+        AlertWatchEnd::Answered if live => AlertWatchEnded::Answered,
+        AlertWatchEnd::Answered => AlertWatchEnded::AnsweredOnceStopped,
+        AlertWatchEnd::StillUp => AlertWatchEnded::StillUp,
+        AlertWatchEnd::GoneWhileAway => AlertWatchEnded::GoneWhileAway,
+        AlertWatchEnd::NeverSeen => match looks {
+            AlertWatchLooks::Read => AlertWatchEnded::NeverSeen,
+            AlertWatchLooks::Stopped => AlertWatchEnded::StoppedUnarmed,
+            AlertWatchLooks::ArmWaitRanOut => AlertWatchEnded::ArmWaitRanOut,
+        },
+        AlertWatchEnd::Blind => AlertWatchEnded::Blind,
+    };
+    log(AlertWatchReport {
+        revision,
+        ended,
+        baseline,
+    });
+}
+
 impl RecordedAccess {
     fn save(
         &mut self,
@@ -441,7 +827,9 @@ impl AccessSteps {
             reach,
             local_network_done: None,
             local_network_read: None,
+            local_network_baseline: None,
             local_network_alert: None,
+            local_network_watch: None,
             local_network_retry: None,
             local_network_recheck: None,
             network_moved: Arc::new(AtomicBool::new(false)),
@@ -496,11 +884,38 @@ impl AccessSteps {
         self.fda_regressed
     }
 
-    /// Whether macOS's Local Network alert the step raised counts as up: until the LAN re-probe
-    /// hears its answer, or the person has had [`LOCAL_NETWORK_ALERT_HOLD`] with it
-    /// ([`App::look_at_local_network_alert`]).
+    /// Whether macOS's Local Network alert counts as up for the window's gestures: the alert the
+    /// step raised, until the LAN re-probe hears its answer, the alert watch sees it go
+    /// ([`App::on_local_network_alert_answered`]) or the person has had
+    /// [`LOCAL_NETWORK_ALERT_HOLD`] with it ([`App::look_at_local_network_alert`]); or the step's
+    /// trigger waiting for its alert watch's first read, which goes within
+    /// [`LOCAL_NETWORK_ALERT_BASELINE_WAIT`]. Only a raised alert names Local Network as the
+    /// page's headline step (`App::system_state_access_step`).
     const fn local_network_alert_up(&self) -> bool {
-        self.local_network_alert.is_some()
+        self.local_network_baseline.is_some() || self.local_network_alert.is_some()
+    }
+
+    /// End the Local Network alert's hold, and stop its alert watch: an answer the watch hears
+    /// from here on has no hold to end. A trigger still waiting for the watch's first read never
+    /// goes, so its step is not done: it runs again at its next moment. Every end of the hold
+    /// goes through here: the re-probe's answer and `[swarm] enabled = false`
+    /// ([`App::on_local_network_probe_ready`]), the person's time
+    /// ([`App::look_at_local_network_alert`]), the watch's answer
+    /// ([`App::on_local_network_alert_answered`]) and a wait dropped without its trigger
+    /// (`App::local_network_trigger_waits`). A wait that ends in its trigger does not come here:
+    /// `App::local_network_trigger_waits` clears it, and stops the watch itself when the first
+    /// read did not come back in time.
+    fn end_local_network_hold(&mut self) {
+        self.local_network_alert = None;
+        let waiting = self.local_network_baseline.take();
+        if let Some((revision, _)) = waiting
+            && self.local_network_done == Some(revision)
+        {
+            self.local_network_done = None;
+        }
+        if self.local_network_watch.take().is_some() || waiting.is_some() {
+            (self.reach.cancel_local_network_alert_watch)();
+        }
     }
 
     fn pane_up(&self, now: Instant) -> bool {
@@ -1198,8 +1613,11 @@ impl App {
         if self.consent_warmup.is_live() {
             hold("the launch folder pass is walking");
         }
-        if self.access_steps.local_network_alert_up() {
+        if self.access_steps.local_network_alert.is_some() {
             hold("the Local Network alert's hold");
+        }
+        if self.access_steps.local_network_baseline.is_some() {
+            hold("the Local Network trigger's wait for its alert watch's first read");
         }
         if self.access_steps.pane_up(now) {
             hold("the hold of a System Settings pane aterm opened");
@@ -1266,8 +1684,10 @@ impl App {
     /// A control verb's moment (`devtools_helper::Origin::Ctl`): its own quiet moment, with no
     /// approved revision and no System State in front needed (`App::devtools_moment_is_quiet`),
     /// held to the steps' one-gesture rule, so its page waits out a panel or installer the window
-    /// has up and the Local Network alert's or a pane's hold (bounds, not readings: macOS does not
-    /// say when either closes).
+    /// has up, a pane's hold (a bound, not a reading: macOS does not say when a pane closes) and
+    /// the Local Network alert's hold (the person's counted time, ended sooner by the re-probe's
+    /// answer or once the alert watch sees no window of the alert's owner left,
+    /// [`Self::on_local_network_alert_answered`]).
     pub(crate) fn control_ask_moment(&self, now: Instant) -> bool {
         self.no_gesture_up(now) && self.devtools_moment_is_quiet(now)
     }
@@ -1292,8 +1712,10 @@ impl App {
     /// ([`Self::local_network_on_record`]), so a revision the record already holds is done at this
     /// look. The first permission walk to start by itself waits for it, as every step after
     /// it does (`App::look_for_walk_start`): its alert goes first in the run, and its hold
-    /// ([`LOCAL_NETWORK_ALERT_HOLD`], ended early by the LAN re-probe's answer,
-    /// [`Self::on_local_network_probe_ready`]) is one of the window's gestures
+    /// ([`LOCAL_NETWORK_ALERT_HOLD`] of the person's time, ended early by the LAN re-probe's
+    /// answer, [`Self::on_local_network_probe_ready`], or once the alert watch sees no window of
+    /// the alert's owner left, [`Self::on_local_network_alert_answered`]) is one of the window's
+    /// gestures
     /// ([`Self::access_gesture_up`]). The walk's wait ends once the step alone has held it ready
     /// for `permission_walk::LOCAL_NETWORK_WAIT` of unbroken looks
     /// (`App::waited_out_local_network`): the walk then goes first, and the step asks once it is
@@ -1386,7 +1808,7 @@ impl App {
     pub(crate) fn on_local_network_probe_ready(&mut self, now: Instant) {
         if !self.config.swarm_enabled() {
             cancel_local_network_probe();
-            self.access_steps.local_network_alert = None;
+            self.access_steps.end_local_network_hold();
             self.access_steps.local_network_recheck = None;
             self.release_unused_access_dialog(now);
             return;
@@ -1408,7 +1830,7 @@ impl App {
         // person's time with the alert ([`Self::look_at_local_network_alert`]): one raised while
         // they were away still stands, unanswered, when they come back.
         if probe_heard_an_answer(probe) {
-            self.access_steps.local_network_alert = None;
+            self.access_steps.end_local_network_hold();
             self.release_unused_access_dialog(now);
         }
         if probe == LocalNetworkProbe::Granted {
@@ -1422,9 +1844,12 @@ impl App {
 
     /// Count the person's time with macOS's Local Network alert the step raised, and end its hold
     /// once they have had [`LOCAL_NETWORK_ALERT_HOLD`] with it. macOS says neither whether the
-    /// alert is still up nor how it was answered, and the re-probe hears an answer only where a
-    /// LAN server answers or macOS refuses (`on_local_network_probe_ready` ends the hold then); an
-    /// alert raised while the person was away (present within the steps' five minutes, the step's
+    /// alert is still up nor how it was answered: the re-probe hears an answer only where a LAN
+    /// server answers or macOS refuses (`on_local_network_probe_ready` ends the hold then), and
+    /// the alert watch sees the alert go only on a macOS whose alert host was measured, once a
+    /// new window of its owner came and, at a read with the person at the Mac, no window of that
+    /// owner is left (`on_local_network_alert_answered` ends the hold then); an alert raised
+    /// while the person was away (present within the steps' five minutes, the step's
     /// moment, but not at the screen) stands, unanswered, until they come back. So the count
     /// starts at the first look that reads them present ([`ALERT_PRESENT_WITHIN`], the screen not
     /// locked or switched away) with a touch of the keyboard or pointer since the ask
@@ -1458,7 +1883,7 @@ impl App {
             .present_for
             .is_some_and(|counted| counted >= LOCAL_NETWORK_ALERT_HOLD)
         {
-            self.access_steps.local_network_alert = None;
+            self.access_steps.end_local_network_hold();
             aterm_log::info!(
                 "system state: the Local Network alert's hold is over: the person has been at \
                  the Mac {} s since their first input after the ask",
@@ -1467,6 +1892,45 @@ impl App {
         } else {
             self.access_steps.local_network_alert = Some(alert);
         }
+    }
+
+    /// Drain the alert watch's answer ([`StepsReach::take_local_network_alert_answer`]; live, a
+    /// worker's [`watch_alert`] read the window list, and [`crate::Wake::LocalNetworkAlertWatch`]
+    /// brings it): a window of the alert's owner that its first read did not list on screen came,
+    /// and a later read, with the person at the Mac, listed no window of that owner at all, on
+    /// screen or off, so no alert of it is up, the one the step's trigger raised included,
+    /// whatever the person answered. The hold ends now: the
+    /// dialog slot goes as the LAN re-probe's answer lets it go
+    /// ([`Self::on_local_network_probe_ready`]), and the LAN readers look again
+    /// ([`StepsReach::lan_answer_moved`]). Nothing is recorded: the answer is not known, and the
+    /// re-probe still records a grant it hears later. An answer ends only the hold whose trigger
+    /// armed its watch, while that hold stands: one heard once the hold ended (the person's time,
+    /// the re-probe's answer, the swarm switched off) ends nothing. With no answer (no new window
+    /// on screen at any read after the first, so also an alert drawn and taken down between two
+    /// reads; a window list the watch could not read before the trigger; a window of the owner
+    /// still listed, on screen or off; the person away at every read that listed none; no watch
+    /// on this macOS; or the question asked through a first LAN use's door, which no watch
+    /// follows) the hold ends only by the re-probe's answer or the person's time
+    /// ([`Self::look_at_local_network_alert`]). The consent lanes' turn drains it before the
+    /// permission walk looks for its start, so a walk waiting on the hold starts in the same
+    /// turn.
+    pub(crate) fn on_local_network_alert_answered(&mut self, now: Instant) {
+        let Some(revision) = (self.access_steps.reach.take_local_network_alert_answer)() else {
+            return;
+        };
+        if !self.config.swarm_enabled()
+            || self.access_steps.local_network_watch != Some(revision)
+            || self.access_steps.local_network_alert.is_none()
+        {
+            return;
+        }
+        self.access_steps.end_local_network_hold();
+        self.release_unused_access_dialog(now);
+        (self.access_steps.reach.lan_answer_moved)();
+        aterm_log::info!(
+            "system state: no window of macOS's Local Network alert's owner is left, with the \
+             person at the Mac (revision {revision}); its hold ends"
+        );
     }
 
     /// When the next look at the Local Network alert's hold may end it
@@ -1486,13 +1950,20 @@ impl App {
     /// The Local Network step, first in the run: once per approved revision, a UDP connect
     /// (nothing sent) to a host on an attached subnet, or a short Bonjour browse of its own on a
     /// network with no IPv4 subnet to name ([`lan_ask`]), which makes macOS ask its Local Network
-    /// question; recorded `triggered`. A revision already recorded is done. On no network at all
-    /// the other steps go on, and it looks again, at its moment only, after its watch subscribes
-    /// and when this Mac's network moves ([`StepsReach::watch_network`]), not on a timer: nothing
-    /// else changes what it finds, and the Local Network row reads calm meanwhile
-    /// ([`LOCAL_NETWORK_NOTHING_TO_ASK`]). aterm.log says so once per such look. A trigger that
-    /// had a network to ask on but no socket or browse
-    /// looks again [`LOCAL_NETWORK_RETRY`] later, at its moment only: one due away from it is
+    /// question; recorded `triggered`. At its moment the step takes the dialog slot and starts an
+    /// alert watch, and the trigger waits for the watch's first read
+    /// ([`Self::local_network_trigger_waits`]), so the baseline is read before the connect can
+    /// raise the alert. Its alert's hold starts at the trigger, which arms the watch, and the
+    /// watch ends it sooner once, with the person at the Mac, no window of the alert's owner is
+    /// left ([`Self::on_local_network_alert_answered`]). Where no watch starts, the trigger goes
+    /// at once; a trigger that named no LAN stops the watch. A question asked through a first LAN
+    /// use's door ([`StepsReach::door_asked`]) starts no watch. A revision already recorded is
+    /// done. On no network at all the other steps go on, and it looks again, at its moment only,
+    /// after its watch subscribes and when this Mac's network moves
+    /// ([`StepsReach::watch_network`]), not on a timer: nothing else changes what it finds, and
+    /// the Local Network row reads calm meanwhile ([`LOCAL_NETWORK_NOTHING_TO_ASK`]). aterm.log
+    /// says so once per such look. A trigger that had a network to ask on but no socket or
+    /// browse looks again [`LOCAL_NETWORK_RETRY`] later, at its moment only: one due away from it is
     /// moved on. A retry is dropped only for another approved revision; while none is approved
     /// it is kept but arms no deadline ([`Self::next_access_step_deadline`]), so the same
     /// revision coming back looks again.
@@ -1508,6 +1979,11 @@ impl App {
             .is_some_and(|until| now >= until)
         {
             self.access_steps.pane_until = None;
+        }
+        // A trigger waiting for its alert watch's first read goes, or is dropped, before the
+        // step's recheck, retry or record look in this turn.
+        if self.local_network_trigger_waits(now) {
+            return;
         }
         let Some(revision) = self.access_revision() else {
             if self.access_steps.local_network_done.is_none() {
@@ -1588,6 +2064,60 @@ impl App {
             self.access_steps.dialog = Some(dialog);
         }
         self.access_steps.local_network_done = Some(revision);
+        if (self.access_steps.reach.start_local_network_alert_watch)(revision) {
+            // The trigger waits for the watch's first read, the windows up before it, so no
+            // alert it raises can be in that read; one already in goes in this turn.
+            self.access_steps.local_network_baseline =
+                Some((revision, now + LOCAL_NETWORK_ALERT_BASELINE_WAIT));
+            self.local_network_trigger_waits(now);
+        } else {
+            self.fire_local_network_trigger(revision, now, false);
+        }
+    }
+
+    /// A Local Network trigger waiting for its alert watch's first read
+    /// ([`StepsReach::local_network_alert_baseline_in`]) goes once that read is in, the watch
+    /// armed; or, once [`LOCAL_NETWORK_ALERT_BASELINE_WAIT`] has passed without it, goes with the
+    /// watch stopped, so its hold ends only by the re-probe's answer or the person's time. The
+    /// moment the step took stands for it: the wait is one window-list read. A wait whose
+    /// revision is no longer the approved one, or whose `[privacy]` switches went off, is
+    /// dropped ([`AccessSteps::end_local_network_hold`]): its trigger never goes, nothing is
+    /// recorded, a network move told before it stays told, and the step runs again at its next
+    /// moment. Whether a trigger waited in this turn (still waiting, or gone now), so the step
+    /// does nothing more in it.
+    fn local_network_trigger_waits(&mut self, now: Instant) -> bool {
+        let Some((revision, by)) = self.access_steps.local_network_baseline else {
+            return false;
+        };
+        if self.access_revision() != Some(revision) || !self.access_steps_allowed() {
+            self.access_steps.end_local_network_hold();
+            self.release_unused_access_dialog(now);
+            return false;
+        }
+        let baseline_in = (self.access_steps.reach.local_network_alert_baseline_in)();
+        if !baseline_in && now < by {
+            return true;
+        }
+        self.access_steps.local_network_baseline = None;
+        if !baseline_in {
+            (self.access_steps.reach.cancel_local_network_alert_watch)();
+            aterm_log::info!(
+                "system state: the Local Network alert watch's first read did not come back \
+                 within {} ms (revision {revision}): the trigger goes without the watch, and its \
+                 hold ends only by the re-probe's answer or the person's time",
+                LOCAL_NETWORK_ALERT_BASELINE_WAIT.as_millis()
+            );
+        }
+        self.fire_local_network_trigger(revision, now, baseline_in);
+        true
+    }
+
+    /// The Local Network step's trigger for `revision`, its dialog slot held: a trigger that
+    /// named a LAN hands the LAN over, raises the alert's hold, arms the alert watch when
+    /// `watched` (its first read is in), records `triggered` and starts the LAN re-probe; one
+    /// that named none stops the watch when `watched`, lets the slot go and looks again
+    /// ([`Self::local_network_named_nothing`]).
+    fn fire_local_network_trigger(&mut self, revision: u64, now: Instant, watched: bool) {
         // This look reads the network as it is now: a move told before it is spent.
         self.access_steps
             .network_moved
@@ -1598,6 +2128,12 @@ impl App {
             self.access_steps.local_network_retry = None;
             self.access_steps.nothing_to_ask = false;
             self.access_steps.local_network_alert = Some(LocalNetworkAlert::asked(now));
+            if watched {
+                // The hold has no end on the clock, so the watch reads until the hold's end
+                // stops it ([`AccessSteps::end_local_network_hold`]).
+                (self.access_steps.reach.arm_local_network_alert_watch)();
+                self.access_steps.local_network_watch = Some(revision);
+            }
             self.record_access_step(Access::LocalNetwork, AccessOutcome::Triggered);
             // The record now says asked, so a LAN look made before it (`sync.peers`' "macOS has
             // not asked") is stale from here: the readers look again now.
@@ -1605,6 +2141,9 @@ impl App {
             (self.access_steps.reach.start_local_network_probe)(revision);
             aterm_log::info!("system state: Local Network asked for (revision {revision})");
         } else {
+            if watched {
+                (self.access_steps.reach.cancel_local_network_alert_watch)();
+            }
             self.access_steps.dialog = None;
             self.local_network_named_nothing(revision, now);
         }
@@ -1616,6 +2155,8 @@ impl App {
     /// process's dialog slot for the question's hold, counting the person's time as the step's
     /// alert hold does. So the step raises nothing, holds no alert of its own and hands nothing
     /// over: one question, one hold. The re-probe listens for the answer as after the step's own.
+    /// No alert watch starts for that question, so the door's hold is not ended by one
+    /// ([`Self::on_local_network_alert_answered`] ends only the step's own hold).
     fn local_network_asked_through_the_door(&mut self, revision: u64) {
         self.access_steps.local_network_held = None;
         self.access_steps.local_network_done = Some(revision);
@@ -1816,15 +2357,19 @@ impl App {
         }
     }
 
-    /// The access steps' next look: a hold ending; while the Local Network step or a client's
+    /// The access steps' next look: a hold ending, or the end of a Local Network trigger's wait
+    /// for its alert watch's first read; while the Local Network step or a client's
     /// pane act waits with an aterm window focused, the next look for the moment; and the
     /// approved revision's Local Network retry while its moment can come (the switches on and a
     /// window focused; a focus gain wakes the loop). The step's tick moves a retry that fell due
     /// away from its moment, so this never arms a deadline that is due again at once.
     pub(crate) fn next_access_step_deadline(&self, now: Instant) -> Option<Instant> {
+        // A trigger waiting for its alert watch's first read goes, at the latest, at the wait's
+        // end; the watch's answer wakes the loop itself, so no look of it is armed here.
         let hold = self
             .local_network_alert_deadline(now)
             .into_iter()
+            .chain(self.access_steps.local_network_baseline.map(|(_, by)| by))
             .chain(self.access_steps.pane_until);
         let waits = (self.local_network_pending() && self.access_steps.reach.holds_dialog)
             || self.access_steps.pane_act.is_some();
@@ -2028,16 +2573,21 @@ impl App {
         if let Some(panel) = self.devtools_helper.panel() {
             return Some(panel.page().access());
         }
-        if self.access_steps.local_network_alert_up() {
+        // Only an alert the step raised names Local Network: a trigger still waiting for its
+        // alert watch's first read has raised none.
+        if self.access_steps.local_network_alert.is_some() {
             return Some(Access::LocalNetwork);
         }
         let revision = self.access_revision()?;
         if !self.access_steps_allowed() || !(self.access_steps.reach.frontmost)(self) {
             return None;
         }
-        if self.access_steps.local_network_done != Some(revision) {
-            // A check waiting to start is not evidence that macOS needs an answer. The
-            // actual alert above, or a refused observation in the row, names that need.
+        if self.access_steps.local_network_done != Some(revision)
+            || self.access_steps.local_network_baseline.is_some()
+        {
+            // A check waiting to start, or a trigger waiting for its alert watch's first read,
+            // is not evidence that macOS needs an answer, and no later step starts beside it.
+            // The actual alert above, or a refused observation in the row, names that need.
             None
         } else if self.devtools_helper.fda_waiting() {
             Some(Access::FullDiskAccess)
@@ -2780,6 +3330,453 @@ fn watch_network_moves(
         }
     }
 }
+
+/// What a Local Network alert watch's window and worker share under the watch's lock.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AlertWatchState {
+    /// The live watch, by the id its start took; 0 for none. A start or a stop moves it on, so a
+    /// worker an earlier start began stops at once and leaves no answer.
+    id: u64,
+    /// The last id a start took.
+    last_id: u64,
+    /// Whether the live watch's first read came back (read, or found unreadable).
+    baseline_in: bool,
+    /// When the live watch's trigger went (`None` until it does), so it reads until it is
+    /// stopped.
+    armed: Option<Instant>,
+    /// The revision whose alert the live watch saw answered, until the window drains it.
+    answer: Option<u64>,
+}
+
+/// A process's Local Network alert watch, which the window (through [`StepsReach`]'s arms) and
+/// the watch's worker ([`run_alert_watch`]) share: the window process's own is
+/// [`LIVE_ALERT_WATCH`], and a test makes its own.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) struct AlertWatchSlot {
+    state: std::sync::Mutex<AlertWatchState>,
+    /// Wakes the worker when the window arms, stops or replaces its watch.
+    moved: std::sync::Condvar,
+    /// How many waits on `moved` a worker began, each counted under the lock it then gives up
+    /// to wait: a test that reads a new count and then takes the lock knows the worker sleeps.
+    #[cfg(test)]
+    waits: std::sync::atomic::AtomicUsize,
+}
+
+/// What a worker's wait for its next look came to ([`AlertWatchSlot::next_look`]).
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Look {
+    /// Its trigger armed it and its wait is over: it reads again.
+    Again,
+    /// It was stopped or replaced.
+    Stopped,
+    /// Its trigger neither armed nor stopped it within the arm's wait.
+    ArmWaitRanOut,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl AlertWatchSlot {
+    pub(crate) const fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(AlertWatchState {
+                id: 0,
+                last_id: 0,
+                baseline_in: false,
+                armed: None,
+                answer: None,
+            }),
+            moved: std::sync::Condvar::new(),
+            #[cfg(test)]
+            waits: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Take a new watch's id in place of any watch before it, whose worker this wakes, so it
+    /// stops at once and leaves no answer; an answer not yet drained is dropped. `None` when the
+    /// lock was poisoned.
+    fn begin(&self) -> Option<u64> {
+        let id = {
+            let mut state = self.state.lock().ok()?;
+            let id = state.last_id + 1;
+            *state = AlertWatchState {
+                id,
+                last_id: id,
+                baseline_in: false,
+                armed: None,
+                answer: None,
+            };
+            id
+        };
+        self.moved.notify_all();
+        Some(id)
+    }
+
+    /// Whether the live watch's first read came back (read, or found unreadable).
+    pub(crate) fn baseline_in(&self) -> bool {
+        self.state
+            .lock()
+            .is_ok_and(|state| state.id != 0 && state.baseline_in)
+    }
+
+    /// The watch `id`'s first read came back: the trigger waiting for it may go, if `id` is still
+    /// the live watch.
+    fn mark_baseline_in(&self, id: u64) {
+        if let Ok(mut state) = self.state.lock()
+            && state.id == id
+        {
+            state.baseline_in = true;
+        }
+    }
+
+    /// Arm the live watch: its trigger went now, so its worker, woken now, reads until it is
+    /// stopped. A second arm of the same watch keeps the first's time.
+    pub(crate) fn arm(&self) {
+        if let Ok(mut state) = self.state.lock()
+            && state.id != 0
+        {
+            state.armed.get_or_insert_with(Instant::now);
+        }
+        self.moved.notify_all();
+    }
+
+    /// Drain the revision whose alert the live watch saw answered, if any.
+    pub(crate) fn take_answer(&self) -> Option<u64> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|mut state| state.answer.take())
+    }
+
+    /// Stop the live watch: its worker, woken now, leaves no answer from here on and stops at
+    /// once, and an answer it left is dropped.
+    pub(crate) fn cancel(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.id = 0;
+            state.baseline_in = false;
+            state.armed = None;
+            state.answer = None;
+        }
+        self.moved.notify_all();
+    }
+
+    /// The watch `id`'s end, under the lock, given whether it `answered`: a stop, which empties
+    /// the answer under that lock, either came first and this leaves nothing, or comes after and
+    /// empties what this left. Leaves `revision` iff it answered and `id` is still the live
+    /// watch, and says whether it is.
+    fn settle(&self, id: u64, revision: u64, answered: bool) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        let live = state.id == id;
+        if live && answered {
+            state.answer = Some(revision);
+        }
+        live
+    }
+
+    /// The watch `id`'s next look: before its trigger has armed it, it waits for that, at most
+    /// `arm_wait` (a hang detector for a window that never comes back to it); then it waits
+    /// `period(armed)`, given when the trigger armed it. [`Look::Stopped`] at once, without
+    /// waiting out either, once the watch was stopped or replaced (each wakes it). It holds the
+    /// lock only while it waits on it, never across a read.
+    fn next_look(
+        &self,
+        id: u64,
+        period: impl FnOnce(Instant) -> Duration,
+        arm_wait: Duration,
+    ) -> Look {
+        let Ok(mut state) = self.state.lock() else {
+            return Look::Stopped;
+        };
+        let asked = Instant::now();
+        while state.id == id && state.armed.is_none() {
+            let left = (asked + arm_wait).saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Look::ArmWaitRanOut;
+            }
+            #[cfg(test)]
+            self.waits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            state = match self.moved.wait_timeout(state, left) {
+                Ok((state, _)) => state,
+                Err(_) => return Look::Stopped,
+            };
+        }
+        let armed = match state.armed {
+            Some(armed) if state.id == id => armed,
+            _ => return Look::Stopped,
+        };
+        let next = Instant::now() + period(armed);
+        loop {
+            if state.id != id {
+                return Look::Stopped;
+            }
+            let left = next.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Look::Again;
+            }
+            #[cfg(test)]
+            self.waits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            state = match self.moved.wait_timeout(state, left) {
+                Ok((state, _)) => state,
+                Err(_) => return Look::Stopped,
+            };
+        }
+    }
+
+    /// How many waits on the window's moves a worker began ([`Self::next_look`]).
+    #[cfg(test)]
+    fn waits(&self) -> usize {
+        self.waits.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// What the lock holds now, for a test to read.
+    #[cfg(test)]
+    fn state(&self) -> AlertWatchState {
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// How often an alert watch's worker reads ([`run_alert_watch`]): every `look` for `first`
+/// after its trigger armed it, whatever the person; past that, every `look` while its last read
+/// found the person at the Mac and every `away` while it found them away; and at most
+/// `arm_wait` for its trigger to arm or stop it.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AlertWatchPace {
+    pub(crate) look: Duration,
+    pub(crate) away: Duration,
+    pub(crate) first: Duration,
+    pub(crate) arm_wait: Duration,
+}
+
+/// What an alert watch's worker reaches ([`run_alert_watch`]), injected so a test drives the
+/// worker with a scripted window list and reads what it wakes and logs.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) struct AlertWatchIo {
+    /// One read of the window list's windows of the alert's owner ([`watch_alert`]'s `read`).
+    pub(crate) read: Box<dyn FnMut() -> Option<Vec<AlertWindow>> + Send>,
+    /// Whether the person is at the Mac now ([`watch_alert`]'s `present`).
+    pub(crate) present: Box<dyn FnMut() -> bool + Send>,
+    /// Wake the window: the first read came back, or the watch left its answer.
+    pub(crate) wake: Box<dyn Fn() + Send>,
+    /// Log the watch's end ([`finish_alert_watch`]).
+    pub(crate) log: Box<dyn FnOnce(AlertWatchReport) + Send>,
+    pub(crate) pace: AlertWatchPace,
+}
+
+/// Start a Local Network alert watch for `revision` on `slot` in place of any watch before it,
+/// on a macOS whose alert host was measured (`product_version`, [`alert_host_measured`]): a
+/// [`crate::qos::Role::Responsive`] lane worker runs [`run_alert_watch`] over `io`. `false`, with
+/// no worker and `slot` untouched, on any other macOS (logged), and `false`, with the watch
+/// stopped, when the worker did not start.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn start_alert_watch(
+    slot: &'static AlertWatchSlot,
+    revision: u64,
+    product_version: Option<&str>,
+    io: AlertWatchIo,
+) -> bool {
+    if !alert_host_measured(product_version) {
+        aterm_log::info!(
+            "system state: no Local Network alert watch on macOS {} (revision {revision}): its \
+             alert's window was measured on 26 and 27 only, so its hold ends only by the \
+             re-probe's answer or the person's time",
+            product_version.unwrap_or("of an unknown version")
+        );
+        return false;
+    }
+    let started = Instant::now();
+    let Some(id) = slot.begin() else {
+        return false;
+    };
+    let spawned = crate::qos::spawn_lane_thread(
+        "aterm-local-network-alert",
+        crate::qos::Role::Responsive,
+        move || run_alert_watch(slot, id, revision, started, io),
+    );
+    if let Err(error) = spawned {
+        aterm_log::warn!("system state: the Local Network alert watch did not start: {error}");
+        slot.cancel();
+        return false;
+    }
+    true
+}
+
+/// An alert watch's worker, for the watch `id` on `slot` that `revision`'s step started at
+/// `started`: [`watch_alert`] over `io`'s reads. Its first read goes at once; once it is back the
+/// worker marks it in ([`AlertWatchSlot::baseline_in`]) and wakes the window, whose trigger waits
+/// for it. It then waits for the trigger to arm it ([`AlertWatchSlot::arm`]; at most
+/// `pace.arm_wait`, a hang detector) and reads until it is stopped ([`AlertWatchSlot::cancel`],
+/// which every end of the hold calls) or replaced: every `pace.look` for `pace.first` after the
+/// arm, whatever the person, so an alert drawn then is seen unless it goes within one
+/// `pace.look`; past that, every `pace.look` while its last read found the person at the Mac and
+/// every `pace.away` while it found them away. It never holds the slot's lock across a read. An
+/// answer is left on the slot for the window, which a wake brings to drain it, and every end
+/// makes one log record ([`finish_alert_watch`]).
+#[cfg(any(target_os = "macos", test))]
+fn run_alert_watch(
+    slot: &AlertWatchSlot,
+    id: u64,
+    revision: u64,
+    started: Instant,
+    io: AlertWatchIo,
+) {
+    let AlertWatchIo {
+        mut read,
+        present,
+        wake,
+        log,
+        pace,
+    } = io;
+    let mut baseline = None;
+    let mut looks = AlertWatchLooks::Stopped;
+    let end = watch_alert(
+        || {
+            let listed = read();
+            if baseline.is_none() {
+                baseline = Some(BaselineRead {
+                    after: started.elapsed(),
+                    windows: listed.as_ref().map(Vec::len),
+                });
+                slot.mark_baseline_in(id);
+                // The trigger waiting for this read goes in the window's next turn.
+                wake();
+            }
+            listed
+        },
+        present,
+        |here| {
+            let period = |armed: Instant| {
+                if here || armed.elapsed() < pace.first {
+                    pace.look
+                } else {
+                    pace.away
+                }
+            };
+            match slot.next_look(id, period, pace.arm_wait) {
+                Look::Again => {
+                    looks = AlertWatchLooks::Read;
+                    true
+                }
+                Look::Stopped => false,
+                Look::ArmWaitRanOut => {
+                    looks = AlertWatchLooks::ArmWaitRanOut;
+                    false
+                }
+            }
+        },
+    );
+    finish_alert_watch(
+        end,
+        looks,
+        revision,
+        baseline,
+        |answered| slot.settle(id, revision, answered),
+        wake,
+        log,
+    );
+}
+
+/// The window process's Local Network alert watch ([`StepsReach::live`]'s arms).
+#[cfg(target_os = "macos")]
+static LIVE_ALERT_WATCH: AlertWatchSlot = AlertWatchSlot::new();
+
+// The live watch reads the person as `crate::person_at_this_screen` does (a touch within
+// `PERSON_PRESENT_WITHIN`, the screen neither locked nor switched away), which is how
+// `App::look_at_local_network_alert` counts the person's time with the alert.
+#[cfg(target_os = "macos")]
+const _: () = assert!(
+    ALERT_PRESENT_WITHIN.as_millis() == crate::system_state_host::PERSON_PRESENT_WITHIN.as_millis()
+);
+
+/// The live alert watch: [`start_alert_watch`] on [`LIVE_ALERT_WATCH`] over this macOS's
+/// version, the window list's windows of [`LOCAL_NETWORK_ALERT_OWNERS`], on screen or off
+/// (`devtools_helper::live::windows_owned_by`: owner names, window numbers and whether each is on
+/// screen, no title, so no Screen Recording grant), the person read as
+/// `crate::person_at_this_screen` reads them from any thread, [`crate::Wake::LocalNetworkAlertWatch`]
+/// and aterm.log, reading every [`LOCAL_NETWORK_ALERT_LOOK`] for
+/// [`LOCAL_NETWORK_ALERT_FIRST_LOOKS`] after the arm and then with the person at the Mac, and
+/// every [`LOCAL_NETWORK_ALERT_AWAY_LOOK`] past those first looks with them away. Only
+/// [`StepsReach::live`] reaches it, which a windowed macOS instance alone uses: a headless
+/// instance starts no watch. A window-list read waits on WindowServer, so none runs on the main
+/// thread.
+#[cfg(target_os = "macos")]
+fn live_start_local_network_alert_watch(revision: u64) -> bool {
+    start_alert_watch(
+        &LIVE_ALERT_WATCH,
+        revision,
+        crate::signing_identity::os_version(),
+        AlertWatchIo {
+            read: Box::new(|| {
+                devtools_helper::live::windows_owned_by(&LOCAL_NETWORK_ALERT_OWNERS).map(
+                    |windows| {
+                        windows
+                            .into_iter()
+                            .map(|(number, on_screen)| AlertWindow { number, on_screen })
+                            .collect()
+                    },
+                )
+            }),
+            present: Box::new(crate::person_at_this_screen),
+            wake: Box::new(|| {
+                let _ =
+                    crate::workstation_setup::send_setup_wake(crate::Wake::LocalNetworkAlertWatch);
+            }),
+            log: Box::new(|report| aterm_log::info!("{report}")),
+            pace: AlertWatchPace {
+                look: LOCAL_NETWORK_ALERT_LOOK,
+                away: LOCAL_NETWORK_ALERT_AWAY_LOOK,
+                first: LOCAL_NETWORK_ALERT_FIRST_LOOKS,
+                arm_wait: LOCAL_NETWORK_ALERT_ARM_WAIT,
+            },
+        },
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn live_start_local_network_alert_watch(_revision: u64) -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn live_local_network_alert_baseline_in() -> bool {
+    LIVE_ALERT_WATCH.baseline_in()
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn live_local_network_alert_baseline_in() -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn live_arm_local_network_alert_watch() {
+    LIVE_ALERT_WATCH.arm();
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn live_arm_local_network_alert_watch() {}
+
+#[cfg(target_os = "macos")]
+fn live_take_local_network_alert_answer() -> Option<u64> {
+    LIVE_ALERT_WATCH.take_answer()
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn live_take_local_network_alert_answer() -> Option<u64> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn live_cancel_local_network_alert_watch() {
+    LIVE_ALERT_WATCH.cancel();
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn live_cancel_local_network_alert_watch() {}
 
 #[cfg(target_os = "macos")]
 static ACTIVE_LOCAL_NETWORK_PROBE_REVISION: std::sync::atomic::AtomicU64 =

@@ -44,6 +44,9 @@ mod log_wake_loop;
 #[path = "woken_turn_loop_tests.rs"]
 pub(super) mod woken_turn_loop;
 
+#[path = "draft_hold_loop_tests.rs"]
+mod draft_hold_loop;
+
 #[path = "probe_own_line_tests.rs"]
 mod probe_own_line;
 
@@ -598,9 +601,11 @@ fn a_draft_over_a_selection_drawn_in_colour_only_is_sent_only_onto_its_own_entry
         let mut opts = hosted(3);
         opts.policy.human_grace_s = 0;
         let (lines, _) = watch_lines(&mut m, &opts);
-        assert!(
+        // No glyph's cell answered, no draft is told, so no entry's cell is asked.
+        assert_eq!(
             m.requests.iter().any(|r| r.starts_with("cell 8 2")),
-            "{what}: the entries' cells were read: {:#?}",
+            !unanswered,
+            "{what}: the entries' cells: {:#?}",
             m.requests
         );
         let enters = m
@@ -668,9 +673,11 @@ fn a_draft_over_an_at_menu_is_sent_only_with_no_entry_selected() {
         let mut opts = hosted(3);
         opts.policy.human_grace_s = 0;
         let (lines, _) = watch_lines(&mut m, &opts);
-        assert!(
+        // No glyph's cell answered, no draft is told, so no entry's cell is asked.
+        assert_eq!(
             m.requests.iter().any(|r| r.starts_with("cell 11 2")),
-            "{what}: the entries' cells were read: {:#?}",
+            !unanswered,
+            "{what}: the entries' cells: {:#?}",
             m.requests
         );
         let enters = m
@@ -2960,11 +2967,12 @@ fn a_screen_unmoved_since_the_write_is_waited_past_where_it_reads_as_another_tex
 /// a new point and however long it stands: a screen that moves 300 s after the write, past the
 /// give-up at the echo's minute and [`turn_end_loop::UNDRAWN_INPUT_HANG`] after it, as one that
 /// moves at 100 s. The hold raises nothing (no badge, no `ESCALATED`) and journals one record per
-/// change of what holds it, however often it is looked at; on a limit wall it is no session at
-/// rest, so no restart in place, though its host could make one ([`no_rest_no_restart`]).
-/// Negative controls: once the screen moves, the next decision acts, an Enter fenced on that
-/// read; by mutation, [`Session::custody_at_rest`] reading every session at rest: the restart
-/// asked on the wall.
+/// change of what holds it, however often it is looked at; the limit's point after its reset is a
+/// turn's end at rest, so the line read and undrawn past its minute there is lost, and with
+/// relaunch off it waits, writing nothing ([`lost_at_rest_no_restart`]). Negative controls: once
+/// the screen moves, the next decision acts, an Enter fenced on that read; by mutation,
+/// [`Session::custody_at_rest`] reading an idle phase alone at rest: no loss judged at the
+/// limit's point.
 #[test]
 fn a_line_held_on_an_unmoved_screen_is_never_typed_again_through_the_loop() {
     for stands in [100, 300] {
@@ -3005,8 +3013,8 @@ fn a_line_held_on_an_unmoved_screen_is_never_typed_again_through_the_loop() {
             held.len()
         );
         assert!(
-            no_rest_no_restart(&noted),
-            "{stands} s: on the wall, no rest and no restart: {noted:#?}"
+            lost_at_rest_no_restart(&noted),
+            "{stands} s: lost at rest at the limit's point, no restart: {noted:#?}"
         );
         assert_eq!(
             t.enters().len(),
@@ -3080,11 +3088,15 @@ fn escalated_drawn_as(
     let (dir, journal) = journal_file(&format!(
         "unmoved-escalated-{stands}{tag}-{rekeyed}-{keeps}"
     ));
-    // A host that would make a restart in place: the wall alone keeps the session from rest.
+    // A host that would make a restart in place, with relaunch off: the limit's point after its
+    // reset is a turn's end at rest (`policy::turn_end::turn_ended`), so a line read and undrawn
+    // past its minute there is lost and, with no restart to make, waits writing nothing until the
+    // screen moves.
     let host = AccountHost::scripted(&[], &["relaunched"]);
     let opts = SuperviseOpts {
         policy: SupervisorConfig {
             human_grace_s: 0,
+            relaunch: false,
             ..owners_policy()
         },
         journal: Some(journal.clone()),
@@ -3104,13 +3116,14 @@ fn escalated_drawn_as(
     (Typed { m, lines }, noted)
 }
 
-/// Whether the journal `noted` says the wall kept a line read and undrawn from a restart in place
-/// though its host could make one: a `SKIPPED` record that the session is not at rest, and no
-/// restart asked.
-fn no_rest_no_restart(noted: &[String]) -> bool {
+/// Whether the journal `noted` says a line read and undrawn was judged lost at rest at the limit's
+/// point with relaunch off: a `WAITING` record of the loss that names
+/// [`super::super::turn_end_loop::RELAUNCH_OFF`], and no restart in place asked.
+fn lost_at_rest_no_restart(noted: &[String]) -> bool {
+    let off = super::super::turn_end_loop::RELAUNCH_OFF;
     noted
         .iter()
-        .any(|l| l.starts_with("SKIPPED ") && l.contains("the session is not at rest"))
+        .any(|l| l.starts_with("WAITING ") && l.contains(off))
         && !noted
             .iter()
             .any(|l| l.contains("restart:input-lost") || l.contains("restarting it in place"))
@@ -4470,12 +4483,13 @@ fn a_left_line_a_person_cleared_lets_the_session_go_on() {
 /// taken into custody on, and that read holds it with no clock of its own but a doubling due. The
 /// screen stands 300 s, so a hold that ran out [`turn_end_loop::UNDRAWN_INPUT_HANG`] after the
 /// queue last read unread would write the line again on the unmoved screen; a later clear read
-/// proves it read, and on a limit wall no session is at rest, so no restart, though its host
-/// could make one ([`no_rest_no_restart`]). The continuation is written once and raises nothing,
-/// and every record of the hold is on that screen. NEGATIVE CONTROLS: the status read of the
-/// unread input is in the journal (the read the hold must outlast happened), and once the screen
-/// moves the next decision acts, an Enter fenced on that read; by mutation,
-/// [`Session::custody_at_rest`] reading every session at rest: the restart asked on the wall.
+/// proves it read, and its minute past at rest (the limit's point after its reset, a turn's end)
+/// the line is lost, with relaunch off a wait that writes nothing ([`lost_at_rest_no_restart`]).
+/// The continuation is written once and raises nothing, and every record of the hold is on that
+/// screen. NEGATIVE CONTROLS: the status read of the unread input is in the journal (the read the
+/// hold must outlast happened), and once the screen moves the next decision acts, an Enter fenced
+/// on that read; by mutation, [`Session::custody_at_rest`] reading an idle phase alone at rest: no
+/// loss judged at the limit's point.
 #[test]
 fn a_held_lines_hold_outlasts_a_status_read_of_it_unread() {
     let (t, noted) = escalated_on_an_unmoved_screen(300, Some(70));
@@ -4499,8 +4513,8 @@ fn a_held_lines_hold_outlasts_a_status_read_of_it_unread() {
         skips.len()
     );
     assert!(
-        no_rest_no_restart(&noted),
-        "on the wall, no rest and no restart: {noted:#?}"
+        lost_at_rest_no_restart(&noted),
+        "lost at rest at the limit's point, no restart: {noted:#?}"
     );
     assert_eq!(
         t.enters().len(),
@@ -7221,7 +7235,7 @@ impl IdleHost for ReachHost {
             .or_else(|| self.script.lock().unwrap().front().copied())
             .unwrap_or_else(|| *self.last.lock().unwrap())
     }
-    fn restart(&self, _: &Restart) -> Option<String> {
+    fn restart(&self, _: &Restart, _: &RestartAsk) -> Option<String> {
         self.restarts.lock().unwrap().map(str::to_string)
     }
     fn answered(&self, ago_ms: u64) {
@@ -9384,6 +9398,7 @@ fn a_suggestion_on_a_grid_drawn_one_row_high_is_not_a_draft_at_a_wall() {
         let (screen, caret) = suggesting();
         let mut m = Mock::new(vec![busy_screen(), screen]);
         m.vanish_after = Some(3);
+        m.dim_past = true;
         m.cell_attrs = attrs;
         m.cursor_col = cursor_col;
         m.gen_fence = true;
@@ -9417,12 +9432,18 @@ fn a_suggestion_on_a_grid_drawn_one_row_high_is_not_a_draft_at_a_wall() {
     }
     let (turns, enters, lines, requests) = run(Some(1), None, "none");
     assert_eq!((turns, enters), (0, 1), "{lines:#?}\n{requests:#?}");
-    for k in [None, Some(1)] {
-        let (turns, enters, lines, requests) = run(k, Some(30), "dim");
+    // Grey with the cursor past it says neither (`Session::composer_draft`): no line typed over
+    // it, no Enter on it. Plain is a draft wherever the cursor stands.
+    for (k, attrs, want) in [
+        (None, "dim", (0, 0)),
+        (Some(1), "dim", (0, 0)),
+        (Some(1), "none", (0, 1)),
+    ] {
+        let (turns, enters, lines, requests) = run(k, Some(30), attrs);
         assert_eq!(
             (turns, enters),
-            (0, 1),
-            "cursor row {k:?}: {lines:#?}\n{requests:#?}"
+            want,
+            "cursor row {k:?}, {attrs}: {lines:#?}\n{requests:#?}"
         );
     }
 }
@@ -15106,7 +15127,7 @@ fn a_persons_exchange_stays_theirs_under_an_idle_compaction() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-use crate::supervise::policy::turn_end::{AccountAt, RULE_ACCOUNT, Restart, Unmade};
+use crate::supervise::policy::turn_end::{AccountAt, RULE_ACCOUNT, Restart, RestartAsk, Unmade};
 
 /// A roster host as a test drives it: its advice ([`IdleHost::account`]) and relaunch answers
 /// ([`IdleHost::restart`]) are scripted (each ask the next entry, the last for ever), and all
@@ -15124,6 +15145,10 @@ struct AccountHost {
     answers: std::sync::Mutex<VecDeque<&'static str>>,
     answered: std::sync::Mutex<Option<&'static str>>,
     said: std::sync::Mutex<Vec<String>>,
+    /// Each restart the loop asked for ([`IdleHost::restart`]), in order.
+    asked: std::sync::Mutex<Vec<Restart>>,
+    /// The ask each of [`Self::asked`] came as, in the same order.
+    asks: std::sync::Mutex<Vec<RestartAsk>>,
     /// [`IdleHost::account_stamp`], as a test moves it.
     stamp: std::sync::atomic::AtomicU64,
     /// The stamp moves by itself right after the first ask for advice: news that lands while
@@ -15217,6 +15242,15 @@ struct AccountHost {
     /// ([`IdleHost::restart`]) was asked, in order.
     clock: std::sync::Mutex<Option<Arc<crate::supervise::fx::ScriptedClock>>>,
     restarted_at: std::sync::Mutex<Vec<Instant>>,
+    /// The process the host names after each restart it is asked for, in order (the last for
+    /// ever; none: the process stands as it was): a restart made moves it, one that ended
+    /// nothing leaves it.
+    pids_on_restart: std::sync::Mutex<VecDeque<u32>>,
+    /// The process each restart's own report names after it, in order (the last for ever; none:
+    /// its report names none, and the loop goes by the process the host names), as a window's
+    /// host answers [`IdleHost::restart_left`]; and the one the last restart's report named.
+    left_on_restart: std::sync::Mutex<VecDeque<u32>>,
+    left: std::sync::Mutex<Option<u32>>,
 }
 
 impl AccountHost {
@@ -15335,12 +15369,14 @@ impl IdleHost for AccountHost {
         self.relaunch_off_asked.fetch_add(1, Ordering::SeqCst);
         self.relaunch_off.load(Ordering::SeqCst)
     }
-    fn restart(&self, why: &Restart) -> Option<String> {
+    fn restart(&self, why: &Restart, ask: &RestartAsk) -> Option<String> {
         let what = match why {
             Restart::Account { to, .. } => format!("restart:{}:{to}", why.word()),
             other => format!("restart:{}", other.word()),
         };
         self.said.lock().unwrap().push(what);
+        self.asked.lock().unwrap().push(why.clone());
+        self.asks.lock().unwrap().push(ask.clone());
         if let Some(clock) = self.clock.lock().unwrap().as_ref() {
             self.restarted_at.lock().unwrap().push(clock.mono());
         }
@@ -15354,7 +15390,25 @@ impl IdleHost for AccountHost {
         if *last == Some("adopted") && self.parks.load(Ordering::SeqCst) {
             self.carry.store(true, Ordering::SeqCst);
         }
+        let mut pids = self.pids_on_restart.lock().unwrap();
+        let moved = if pids.len() > 1 {
+            pids.pop_front()
+        } else {
+            pids.front().copied()
+        };
+        if moved.is_some() {
+            *self.pid.lock().unwrap() = moved;
+        }
+        let mut lefts = self.left_on_restart.lock().unwrap();
+        *self.left.lock().unwrap() = if lefts.len() > 1 {
+            lefts.pop_front()
+        } else {
+            lefts.front().copied()
+        };
         last.map(str::to_string)
+    }
+    fn restart_left(&self) -> Option<crate::supervise::custody::Process> {
+        self.left.lock().unwrap().map(|pid| (Some(pid), None))
     }
     fn account(&self, point: AccountPoint) -> Option<AccountAdvice> {
         let at = match point {
@@ -18695,10 +18749,12 @@ fn a_draft_cleared_at_a_weekly_limit_lets_the_move_be_asked() {
         .position(|r| r == "❯")
         .expect("the caret row");
     drafted[caret] = draft.to_string();
+    // The cursor on the caret's row, after the draft or home at column 2.
     let at = |s: &Session<'_, Mock>, rows: &[String], cursor_col: usize| {
         s.turn_of(Screen {
             rows: rows.to_vec(),
             seq: 102,
+            cursor_row: caret,
             cursor_col,
             ..Screen::default()
         })
@@ -26428,6 +26484,8 @@ fn usage_left_typed_over_its_own_menu_entry_is_still_the_probes_to_send() {
     world(&mut m).menu = true;
     m.tick_at_key = 1;
     m.vanish_after = Some(700);
+    // The menu drawn under the composer: the cursor stands after `/usage` on the caret's row.
+    m.cursor_on_caret = true;
     let (lines, journal) = probe_run(
         "te-probe-left-menu",
         &mut m,
@@ -28579,7 +28637,20 @@ fn watchdog_run(
     grace: u32,
 ) -> (Mock, Vec<String>, Vec<String>) {
     let (dir, path) = journal_file(tag);
+    // The cursor stands on the composer's row after what it holds, as Claude Code draws it: an
+    // Esc's restored prompt reads typed by the column alone.
+    let cols: std::collections::BTreeMap<usize, usize> = screens
+        .iter()
+        .enumerate()
+        .filter_map(|(i, rows)| {
+            let caret = rows.iter().rfind(|r| r.starts_with('❯'))?;
+            let text = caret.trim_start_matches('❯').trim_start();
+            Some((i, 2 + text.chars().count()))
+        })
+        .collect();
     let mut m = Mock::new(screens);
+    m.cursor_on_caret = true;
+    m.screen_cols = cols;
     m.turn_releases = Some(1);
     m.vanish_after = Some(8);
     m.stall_sleep = Some(Duration::from_millis(20));

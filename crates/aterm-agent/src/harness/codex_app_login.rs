@@ -280,29 +280,21 @@ pub fn lock_path(auth_file: &Path) -> PathBuf {
 }
 
 fn read_auth_file_bounded(home: &Path) -> Option<String> {
+    read_auth_file_bounded_with(home, aterm_uds::regular_file::open)
+}
+
+fn read_auth_file_bounded_with(
+    home: &Path,
+    open: impl FnOnce(&Path) -> std::io::Result<(std::fs::File, std::fs::Metadata)>,
+) -> Option<String> {
     if std::fs::symlink_metadata(home).is_ok_and(|md| md.file_type().is_symlink()) {
         return None;
     }
     let path = auth_path_in_home(home);
-    #[cfg(not(unix))]
-    if std::fs::symlink_metadata(&path)
-        .ok()?
-        .file_type()
-        .is_symlink()
-    {
-        return None;
-    }
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
-    }
-    let file = options.open(&path).ok()?;
-    if !file.metadata().ok()?.is_file() {
-        return None;
-    }
+    // The shared opener rejects final links/reparse points using the opened handle,
+    // including a name replaced after its preliminary check. It fails closed on
+    // unsupported platforms and never creates or modifies the credential file.
+    let (file, _) = open(&path).ok()?;
     let limit = AUTH_FILE_MAX as u64;
     let mut bytes = Vec::new();
     file.take(limit.saturating_add(1))
@@ -900,10 +892,12 @@ fn recover_journal(home: &Path, deadline: Instant) {
 
 /// Reads the ChatGPT account stored in `<home>/auth.json` directly from its OAuth JWT claims,
 /// spawning no subprocess. Returns `None` when `auth.json` is absent, unreadable, API-key-only,
-/// holds no decodable ChatGPT token, or its tokens name different known users.
+/// holds no decodable ChatGPT token, or its tokens name different known users or account emails.
 #[must_use]
 pub fn read_account_in_home(home: &Path) -> Option<Account> {
     let stored = load_stored_auth(home)?;
+    let email = preferred_email(&stored).map(str::to_owned);
+    check_stored_identity(&stored, email.as_deref()).ok()?;
     let StoredAuth {
         id_claims,
         access_claims,
@@ -912,14 +906,23 @@ pub fn read_account_in_home(home: &Path) -> Option<Account> {
     if id_claims.is_none() && access_claims.is_none() {
         return None;
     }
-    let email = id_claims
-        .as_ref()
-        .and_then(|c| c.email.clone())
-        .or_else(|| access_claims.as_ref().and_then(|c| c.email.clone()));
     let plan = id_claims
         .and_then(|c| c.plan)
         .or_else(|| access_claims.and_then(|c| c.plan));
     Some(Account { email, plan })
+}
+
+fn preferred_email(stored: &StoredAuth) -> Option<&str> {
+    stored
+        .id_claims
+        .as_ref()
+        .and_then(|claims| claims.email.as_deref())
+        .or_else(|| {
+            stored
+                .access_claims
+                .as_ref()
+                .and_then(|claims| claims.email.as_deref())
+        })
 }
 
 /// Domain-separated native identity proof for a same-account renewal handoff.
@@ -1776,13 +1779,129 @@ fn get_usage_once_using(
         )
         .limit(MESSAGE_MAX)
         .backstop(wait);
-    if let Some(account_id) = stored.account_id.as_deref()
-        && account_id.bytes().all(|b| (0x20..0x7f).contains(&b))
-    {
+    if let Some(account_id) = request_account_id(stored) {
         req = req.header("ChatGPT-Account-Id", account_id);
     }
     let resp = req.send(&[]).ok()?;
     Some((resp.status(), resp.body().to_vec()))
+}
+
+fn request_account_id(stored: &StoredAuth) -> Option<&str> {
+    stored
+        .account_id
+        .as_deref()
+        .filter(|account| account.bytes().all(|byte| (0x20..0x7f).contains(&byte)))
+}
+
+/// Opaque local evidence of the credentials and route used for an auth observation.
+/// This is neither provider identity proof nor a lease on the credential file.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct CredentialContext([u8; 32]);
+
+impl std::fmt::Debug for CredentialContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CredentialContext([redacted])")
+    }
+}
+
+impl CredentialContext {
+    /// Private local persistence only; never include this value in logs or public output.
+    pub(crate) fn to_private_wire(&self) -> String {
+        format!("v1:{}", aterm_codec::hex::encode_lower(&self.0))
+    }
+
+    /// Read only the canonical, bounded private spelling, without accepting other versions.
+    pub(crate) fn from_private_wire(text: &str) -> Option<Self> {
+        let hex = text.strip_prefix("v1:")?;
+        if !aterm_codec::hex::is_lower(hex, 64) {
+            return None;
+        }
+        let mut bytes = [0; 32];
+        aterm_codec::hex::decode_into(hex.as_bytes(), &mut bytes).then_some(Self(bytes))
+    }
+
+    fn for_login(stored: &StoredAuth, usage_url: &str, fallback_token_url: &str) -> Self {
+        let mut hash = aterm_digest::Sha256::new();
+        hash.update(b"aterm-codex-auth-observation-v1");
+        let mut field = |value: Option<&str>| match value {
+            None => hash.update([0]),
+            Some(value) => {
+                hash.update([1]);
+                hash.update((value.len() as u64).to_be_bytes());
+                hash.update(value.as_bytes());
+            }
+        };
+        field(stored.id_token.as_deref());
+        field(Some(&stored.access_token));
+        field(stored.refresh_token.as_deref());
+        field(request_account_id(stored));
+        field(Some(usage_url));
+        let authority = stored
+            .refresh_token
+            .as_ref()
+            .and_then(|_| refresh_authority(stored, fallback_token_url));
+        field(
+            authority
+                .as_ref()
+                .map(|authority| authority.token_url.as_str()),
+        );
+        field(
+            authority
+                .as_ref()
+                .map(|authority| authority.client_id.as_str()),
+        );
+        Self(hash.finalize())
+    }
+}
+
+/// A provider result with the exact final credential context that produced it.
+pub(crate) struct ObservedLogin {
+    pub reading: Reading,
+    pub context: Option<CredentialContext>,
+}
+
+/// File material and expected-identity applicability from one immutable snapshot.
+pub(crate) struct CurrentLoginContext {
+    pub context: CredentialContext,
+    pub identity_matches: bool,
+}
+
+struct LoginSnapshot {
+    reading: Reading,
+    identity: Option<super::codex_renewal::Identity>,
+    context: Option<CredentialContext>,
+}
+
+impl LoginSnapshot {
+    fn unread() -> Self {
+        Self {
+            reading: Reading::Unread,
+            identity: None,
+            context: None,
+        }
+    }
+
+    fn read(reading: Reading, stored: &StoredAuth, usage_url: &str, token_url: &str) -> Self {
+        let context = (!matches!(&reading, Reading::Unread))
+            .then(|| CredentialContext::for_login(stored, usage_url, token_url));
+        let identity = if matches!(&reading, Reading::SignedOut) {
+            None
+        } else {
+            stored_identity(stored)
+        };
+        Self {
+            reading,
+            identity,
+            context,
+        }
+    }
+
+    fn observed(self) -> ObservedLogin {
+        ObservedLogin {
+            reading: self.reading,
+            context: self.context,
+        }
+    }
 }
 
 /// What one read of a Codex login's usage found ([`read_login_with`]).
@@ -1882,7 +2001,7 @@ pub fn read_login_with(
         now,
         expected_email,
     )
-    .0
+    .reading
 }
 
 /// Successful usage tied to the immutable credential snapshot used by the HTTP
@@ -1904,7 +2023,7 @@ pub fn read_identified_login_with(
     now: i64,
     expected_email: Option<&str>,
 ) -> Option<IdentifiedUsage> {
-    let (reading, identity) = read_login_snapshot(
+    let snapshot = read_login_snapshot(
         home,
         usage_url,
         fallback_token_url,
@@ -1913,8 +2032,8 @@ pub fn read_identified_login_with(
         expected_email,
     );
     Some(IdentifiedUsage {
-        identity: identity?,
-        usage: reading.usage()?,
+        identity: snapshot.identity?,
+        usage: snapshot.reading.usage()?,
     })
 }
 
@@ -1925,7 +2044,7 @@ fn read_login_snapshot(
     wait: Duration,
     now: i64,
     expected_email: Option<&str>,
-) -> (Reading, Option<super::codex_renewal::Identity>) {
+) -> LoginSnapshot {
     read_login_snapshot_using(
         home,
         usage_url,
@@ -1945,7 +2064,7 @@ fn read_login_snapshot_using(
     now: i64,
     expected_email: Option<&str>,
     usage_client: Option<&Client>,
-) -> (Reading, Option<super::codex_renewal::Identity>) {
+) -> LoginSnapshot {
     let get_usage = |stored: &StoredAuth, left: Duration| match usage_client {
         Some(client) => get_usage_once_using(usage_url, stored, left, expected_email, client),
         None => get_usage_once(usage_url, stored, left, expected_email),
@@ -1956,10 +2075,10 @@ fn read_login_snapshot_using(
     let left = || deadline.saturating_duration_since(Instant::now());
     recover_journal(home, deadline);
     let Some(mut stored) = load_stored_auth(home) else {
-        return (Reading::Unread, None);
+        return LoginSnapshot::unread();
     };
     if check_stored_identity(&stored, expected_email).is_err() {
-        return (Reading::Unread, None);
+        return LoginSnapshot::unread();
     }
     if needs_proactive_refresh(&stored, now) {
         if let Some(reloaded) = reload_updated_disk_auth(home, &stored) {
@@ -1980,14 +2099,14 @@ fn read_login_snapshot_using(
         }
     }
     let Some((mut status, mut body)) = get_usage(&stored, left()) else {
-        return (Reading::Unread, None);
+        return LoginSnapshot::unread();
     };
     if status == 401
         && let Some(reloaded) = reload_updated_disk_auth(home, &stored)
     {
         stored = reloaded;
         let Some(again) = get_usage(&stored, left()) else {
-            return (Reading::Unread, None);
+            return LoginSnapshot::unread();
         };
         (status, body) = again;
     }
@@ -1996,7 +2115,7 @@ fn read_login_snapshot_using(
             return confirmed_signed_out(
                 home,
                 &stored,
-                usage_url,
+                (usage_url, fallback_token_url),
                 deadline,
                 now,
                 expected_email,
@@ -2013,7 +2132,7 @@ fn read_login_snapshot_using(
         ) {
             Refreshed::Done(refreshed) => {
                 let Some(again) = get_usage(&refreshed, left()) else {
-                    return (Reading::Unread, None);
+                    return LoginSnapshot::unread();
                 };
                 (status, body) = again;
                 stored = *refreshed;
@@ -2024,17 +2143,22 @@ fn read_login_snapshot_using(
                 return confirmed_signed_out(
                     home,
                     &stored,
-                    usage_url,
+                    (usage_url, fallback_token_url),
                     deadline,
                     now,
                     expected_email,
                     usage_client,
                 );
             }
-            Refreshed::Failed => return (Reading::Unread, None),
+            Refreshed::Failed => return LoginSnapshot::unread(),
         }
     }
-    (usage_reading(status, &body, now), stored_identity(&stored))
+    LoginSnapshot::read(
+        usage_reading(status, &body, now),
+        &stored,
+        usage_url,
+        fallback_token_url,
+    )
 }
 
 /// A `/wham/usage` answer's [`Reading`]: its usage where it served one.
@@ -2059,17 +2183,17 @@ fn usage_reading(status: u16, body: &[u8], now: i64) -> Reading {
 fn confirmed_signed_out(
     home: &Path,
     stored: &StoredAuth,
-    usage_url: &str,
+    (usage_url, fallback_token_url): (&str, &str),
     deadline: Instant,
     now: i64,
     expected_email: Option<&str>,
     usage_client: Option<&Client>,
-) -> (Reading, Option<super::codex_renewal::Identity>) {
+) -> LoginSnapshot {
     let Some(end) = Instant::now()
         .checked_add(SIGNED_OUT_CONFIRM)
         .filter(|end| *end < deadline)
     else {
-        return (Reading::Unread, None);
+        return LoginSnapshot::unread();
     };
     let rotated = loop {
         if let Some(rotated) = reload_updated_disk_auth(home, stored) {
@@ -2088,12 +2212,17 @@ fn confirmed_signed_out(
         None => get_usage_once(usage_url, login, left, expected_email),
     };
     let Some((status, body)) = response else {
-        return (Reading::Unread, None);
+        return LoginSnapshot::unread();
     };
     if status == 401 && rotated.is_none() {
-        return (Reading::SignedOut, None);
+        return LoginSnapshot::read(Reading::SignedOut, login, usage_url, fallback_token_url);
     }
-    (usage_reading(status, &body, now), stored_identity(login))
+    LoginSnapshot::read(
+        usage_reading(status, &body, now),
+        login,
+        usage_url,
+        fallback_token_url,
+    )
 }
 
 /// Reads one Codex login's live usage in `home` directly over HTTPS (`/wham/usage` or
@@ -2131,7 +2260,62 @@ pub fn read_login_in_home(
 ) -> Reading {
     let usage_url = resolve_usage_url(home, user_home);
     let token_url = format!("{DEFAULT_ISSUER}/oauth/token");
-    read_login_with(home, &usage_url, &token_url, wait, now, expected_email)
+    read_login_snapshot(home, &usage_url, &token_url, wait, now, expected_email).reading
+}
+
+/// Read a file-backed login while retaining the credentials actually used by its final request.
+pub(crate) fn observed_in_home(
+    home: &Path,
+    user_home: &Path,
+    wait: Duration,
+    now: i64,
+    expected_email: Option<&str>,
+) -> ObservedLogin {
+    if !file_context_available(home) {
+        return LoginSnapshot::unread().observed();
+    }
+    let usage_url = resolve_usage_url(home, user_home);
+    let token_url = format!("{DEFAULT_ISSUER}/oauth/token");
+    read_login_snapshot(home, &usage_url, &token_url, wait, now, expected_email).observed()
+}
+
+/// Observe current semantic file credentials and route without refreshing or contacting a provider.
+/// Missing, unreadable or non-file storage is unavailable, not proof that credentials changed.
+pub(crate) fn current_context(home: &Path, user_home: &Path) -> Option<CredentialContext> {
+    Some(current_login_context(home, user_home, None)?.context)
+}
+
+/// Capture exact material even when its identity contradicts the expected row.
+/// Identity failure is not evidence of a credential change; both facts share one read.
+pub(crate) fn current_login_context(
+    home: &Path,
+    user_home: &Path,
+    expected_email: Option<&str>,
+) -> Option<CurrentLoginContext> {
+    if !file_context_available(home) {
+        return None;
+    }
+    let stored = read_stored_auth(home)?;
+    let email = preferred_email(&stored);
+    let identity_matches = check_stored_identity(&stored, email).is_ok()
+        && expected_email.is_none_or(|expected| {
+            email.is_some_and(|email| super::accounts::email_matches(expected, email))
+        });
+    let context = CredentialContext::for_login(
+        &stored,
+        &resolve_usage_url(home, user_home),
+        &format!("{DEFAULT_ISSUER}/oauth/token"),
+    );
+    Some(CurrentLoginContext {
+        context,
+        identity_matches,
+    })
+}
+
+fn file_context_available(home: &Path) -> bool {
+    auth_path_in_home(home)
+        .parent()
+        .is_some_and(crate::ai::facts::codex_file_store)
 }
 
 /// Read fresh usage using credentials in `home` and the route in the running
@@ -2169,7 +2353,7 @@ pub fn read_identified_login_with_fixture_roots(
         return None;
     }
     let client = Client::new(Trust::Roots(roots), ProxyMode::Direct, wait);
-    let (reading, identity) = read_login_snapshot_using(
+    let snapshot = read_login_snapshot_using(
         home,
         &usage_url,
         &format!("{DEFAULT_ISSUER}/oauth/token"),
@@ -2179,8 +2363,8 @@ pub fn read_identified_login_with_fixture_roots(
         Some(&client),
     );
     Some(IdentifiedUsage {
-        identity: identity?,
-        usage: reading.usage()?,
+        identity: snapshot.identity?,
+        usage: snapshot.reading.usage()?,
     })
 }
 
@@ -2959,7 +3143,7 @@ pub fn login_with(
             cancelled.store(true, Ordering::SeqCst);
             let _ = server_thread.join();
             return Drove {
-                outcome: Outcome::NotRun(why),
+                outcome: Outcome::Unverified(why),
                 host,
             };
         }

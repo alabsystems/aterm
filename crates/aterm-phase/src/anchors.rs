@@ -2172,6 +2172,121 @@ mod tests {
     #[cfg(unix)]
     use crate::vendor_files::*;
 
+    const MACHO_HEADER: usize = 32;
+    const MACHO_SEGMENT: usize = 72;
+    const MACHO_SECTION: usize = 80;
+    const MACHO_TEXT: usize = MACHO_HEADER + MACHO_SEGMENT;
+    const MACHO_LAST: usize = MACHO_TEXT + MACHO_SEGMENT + 2 * MACHO_SECTION;
+    const MACHO_LAST_SIZE: usize = 24;
+
+    /// A thin 64-bit Mach-O laid out as a real build is: a segment of no sections (`__PAGEZERO`), a
+    /// segment of one code section and one data section, then a command the walk passes over. That
+    /// last command comes after the code, so a walk that trusted a bad one would still have blanked.
+    fn macho(code: &[u8], data: &[u8]) -> Vec<u8> {
+        let code_at = MACHO_LAST + MACHO_LAST_SIZE;
+        let data_at = code_at + code.len();
+        let mut file = vec![0; data_at + data.len()];
+        let mut put = |at: usize, value: usize| {
+            let value = u32::try_from(value).unwrap();
+            file[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        };
+        put(0, 0xfeed_facf);
+        put(16, 3);
+        put(20, code_at - MACHO_HEADER);
+        put(MACHO_HEADER, 0x19);
+        put(MACHO_HEADER + 4, MACHO_SEGMENT);
+        put(MACHO_TEXT, 0x19);
+        put(MACHO_TEXT + 4, MACHO_LAST - MACHO_TEXT);
+        put(MACHO_TEXT + 64, 2);
+        put(MACHO_LAST, 0x1b);
+        put(MACHO_LAST + 4, MACHO_LAST_SIZE);
+        let sections = [(code_at, code.len(), 0x8000_0400), (data_at, data.len(), 0)];
+        for (index, (at, size, flags)) in sections.into_iter().enumerate() {
+            let section = MACHO_TEXT + MACHO_SEGMENT + index * MACHO_SECTION;
+            put(section + 40, size);
+            put(section + 48, at);
+            put(section + 64, flags);
+        }
+        file[code_at..data_at].copy_from_slice(code);
+        file[data_at..].copy_from_slice(data);
+        file
+    }
+
+    /// Claude Code 2.1.316 and 2.1.317 passed `box.ide_diff.mark` on three bytes of ARM64 code.
+    #[test]
+    fn an_anchor_only_machine_code_holds_is_missing() {
+        let table = [lit("glyph", "⧉", "2.1.280")];
+        let mut build = macho("⧉".as_bytes(), b"no such text");
+        assert!(missing(&build, &table).is_empty(), "the code matches whole");
+        blank_code(&mut build);
+        assert_eq!(missing(&build, &table), ["glyph"]);
+    }
+
+    /// Claude Code's bundle spells the same glyph `\u29C9` in every build.
+    #[test]
+    fn a_bundle_holds_a_glyph_as_its_source_spells_it() {
+        let table = [lit("glyph", "a ⧉", "2.1.280")];
+        let mut build = macho(b"", br"Opened changes in a \u29C9");
+        blank_code(&mut build);
+        assert!(missing(&build, &table).is_empty());
+        assert_eq!(missing(br"a \u29C8", &table), ["glyph"]);
+    }
+
+    /// Every part of every anchor is answered in turn, so one anchor's missing part cannot shift
+    /// the next anchor's answer.
+    #[test]
+    fn each_anchor_answers_for_all_its_parts() {
+        let table = [
+            lit("first", "aaaa · bbbb", "2.1.280"),
+            lit("second", "cccc", "2.1.280"),
+            lit("third", "dddd · ↑ eeee", "2.1.280"),
+        ];
+        assert_eq!(missing(b"aaaa cccc", &table), ["first", "third"]);
+        assert_eq!(
+            missing(br"bbbb dddd \u2191 eeee", &table),
+            ["first", "second"]
+        );
+        assert!(missing(br"aaaa bbbb cccc dddd \u2191 eeee", &table).is_empty());
+    }
+
+    #[test]
+    fn a_character_is_escaped_as_a_bundle_spells_it() {
+        assert_eq!(js_escaped("plain"), "plain");
+        assert_eq!(js_escaped("a·b"), r"a\xB7b");
+        assert_eq!(js_escaped("↑/↓"), r"\u2191/\u2193");
+        assert_eq!(js_escaped("😀"), r"\uD83D\uDE00");
+    }
+
+    /// A build loses its code and keeps its data; a file this walk cannot follow keeps every byte.
+    #[test]
+    fn only_a_mach_o_the_walk_can_follow_loses_its_code() {
+        // Long enough that a section read past its command lands in the file, not off its end.
+        let data = [b"data".as_slice(), &[0; 128]].concat();
+        let whole = macho(b"code", &data);
+        let mut blanked = whole.clone();
+        blank_code(&mut blanked);
+        assert!(!contains(&blanked, "code"), "the control: the code goes");
+        assert!(contains(&blanked, "data"), "the control: the data stays");
+        let code_section = MACHO_TEXT + MACHO_SEGMENT;
+        let past_the_file = u32::try_from(whole.len()).unwrap();
+        for (what, at, value) in [
+            ("a 32-bit magic", 0, 0xfeed_face),
+            ("one command too many", 16, 4),
+            ("every command at once", 16, u32::MAX),
+            ("commands past the file", 20, past_the_file),
+            ("a command past the commands", MACHO_LAST + 4, 4096),
+            ("an empty command", MACHO_LAST + 4, 0),
+            ("sections past their command", MACHO_TEXT + 64, 3),
+            ("code past the file", code_section + 48, past_the_file),
+        ] {
+            let mut file = whole.clone();
+            file[at..at + 4].copy_from_slice(&value.to_le_bytes());
+            let before = file.clone();
+            blank_code(&mut file);
+            assert_eq!(file, before, "{what}");
+        }
+    }
+
     #[test]
     #[should_panic(expected = "no anchor")]
     fn an_unknown_id_panics() {
@@ -2551,7 +2666,10 @@ mod tests {
     /// word changed.
     #[test]
     fn the_auto_notice_is_held_whole_or_by_its_parts_and_its_flag_off() {
-        let templates = composed_templates();
+        let templates: Vec<_> = composed_templates()
+            .into_iter()
+            .filter(|(name, _)| name.starts_with("effort"))
+            .collect();
         let older = b"Wb={label:\"Effort level set to auto\",f:1}".as_slice();
         assert!(missing_templates(older, &templates).is_empty());
         let parts = "function Re(){return!1}function E1(){return Re()?\"adaptive\":\"auto\"}\
@@ -2571,6 +2689,30 @@ mod tests {
         assert_eq!(
             missing_templates(called.as_bytes(), &templates),
             ["effort auto notice"]
+        );
+    }
+
+    /// The title as 2.1.317 and 2.1.318 hold it, minified names apart. The glyph's other uses in
+    /// the bundle are no evidence for it: a title that drops the glyph is missing beside them.
+    #[test]
+    fn the_ide_diff_title_is_held_whole_with_its_glyph() {
+        let title: Vec<_> = composed_templates()
+            .into_iter()
+            .filter(|(name, _)| *name == "IDE diff title")
+            .collect();
+        for held in [
+            r#"pn=h.showingDiffInIDE?Mxi`Opened changes in ${$le(h.ideName??"IDE")} \u29C9`:void 0"#,
+            r#"Tn=h.showingDiffInIDE?r1i`Opened changes in ${rue(h.ideName??"IDE")} \u29C9`:void 0"#,
+        ] {
+            assert!(
+                missing_templates(held.as_bytes(), &title).is_empty(),
+                "{held}"
+            );
+        }
+        let dropped = r#"r1i`Opened changes in ${rue(h.ideName??"IDE")}`,x="\u29C9 open files""#;
+        assert_eq!(
+            missing_templates(dropped.as_bytes(), &title),
+            ["IDE diff title"]
         );
     }
 

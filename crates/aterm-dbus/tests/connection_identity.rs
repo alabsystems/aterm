@@ -45,7 +45,8 @@ fn hello_name(name: &'static str) -> Result<String, Error> {
         reply.serial = 1;
         bus.write_all(&reply.encode().unwrap()).unwrap();
     });
-    let result = Connection::handshake(ours, 1000, None).map(|conn| conn.unique_name().to_owned());
+    let result = Connection::handshake_within(ours, 1000, None, HANG)
+        .map(|conn| conn.unique_name().to_owned());
     served.join().unwrap();
     result
 }

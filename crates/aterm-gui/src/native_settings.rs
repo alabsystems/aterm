@@ -4651,7 +4651,7 @@ impl SettingsApp {
                 cx.harness(crate::native_app::HarnessRequest::AiLook);
             }
             if route == SettingsRoute::Lab {
-                cx.harness(crate::native_app::HarnessRequest::LabRefresh);
+                cx.harness(crate::native_app::HarnessRequest::LabAccountsRefresh);
             }
             cx.invalidate_presentation();
             cx.repaint(crate::native_app::DamageRegion::All);

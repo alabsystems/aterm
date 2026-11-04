@@ -83,21 +83,24 @@ fn a_failed_in_place_relogin_can_leave_its_own_proven_unpinned_account() {
             let other = if default { "work" } else { "main" };
             let store = world.seat().store(Cli::Codex);
             store
-                .transact(NOW, &mut None, |state| {
+                .transact_logins(NOW, &mut None, |state, logins| {
                     state.active = Some(source.into());
                     state.proven = mode != 2;
                     state.pinned = mode == 1;
-                    Ok(accounts::note_auth(state, source, accounts::Auth::Ok, NOW))
+                    Ok(stage_current_auth(
+                        &world,
+                        Cli::Codex,
+                        state,
+                        logins,
+                        source,
+                        accounts::Auth::Ok,
+                        NOW,
+                    ))
                 })
                 .unwrap();
             let auth = work.join("auth.json").to_string_lossy().into_owned();
             let env = [("CODEX_AUTH_PATH", auth.as_str())];
-            let mut session = session(
-                Cli::Codex,
-                Supervisor::Aterm,
-                Mode::Early,
-                Path::new("/opt/codex"),
-            );
+            let mut session = session(Cli::Codex, Supervisor::Aterm, Mode::Early, &world.exe);
             if !default {
                 session.env = &env;
             }

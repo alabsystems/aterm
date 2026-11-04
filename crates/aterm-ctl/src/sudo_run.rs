@@ -74,7 +74,7 @@ fn final_line_code(line: &str) -> Result<u8, String> {
 fn read_line(stream: &crate::CtlStream) -> io::Result<String> {
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
-    let mut reader = stream;
+    let mut reader = aterm_uds::hangup::Awake(stream);
     loop {
         if reader.read(&mut byte)? == 0 {
             return Err(io::Error::new(
@@ -162,15 +162,17 @@ pub(crate) fn run(
         crate::Acceptance::NotAccepted(_) => return Err(io::ErrorKind::TimedOut.into()),
         crate::Acceptance::Dropped => return Err(io::ErrorKind::UnexpectedEof.into()),
     };
+    // The socket's options are all set before what aterm answers: aterm closes once it has
+    // refused or the command ended, and macOS then refuses an option (EINVAL) though the answer
+    // is still there to read. `open_accepted` left the read bounded by `CONNECT_WAIT`.
     (&stream).write_all(request.as_bytes())?;
-    stream.set_read_timeout(Some(CONNECT_WAIT))?;
     let admitted = read_line(&stream)?;
     if admitted != "OK sudo stdio" {
         return Err(io::Error::other(admitted));
     }
-    send_stdio(&stream)?;
     // No deadline: the command runs as long as it runs, and this process is its caller.
     stream.set_read_timeout(None)?;
+    send_stdio(&stream)?;
     let last = read_line(&stream)?;
     final_line_code(&last)
         .map(ExitCode::from)
@@ -180,6 +182,23 @@ pub(crate) fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A read of a nonblocking stream says `WouldBlock` at once, so a line that arrives here was
+    /// waited for in `poll(2)`. This read has no deadline once the command runs.
+    #[cfg(unix)]
+    #[test]
+    fn a_line_is_waited_for_in_poll() {
+        use std::io::Write as _;
+        let (near, far) = aterm_uds::kept_out(crate::CtlStream::pair).unwrap();
+        near.set_nonblocking(true).unwrap();
+        let answering = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            (&far).write_all(b"OK sudo stdio\n").unwrap();
+            far
+        });
+        assert_eq!(read_line(&near).unwrap(), "OK sudo stdio");
+        drop(answering.join().unwrap());
+    }
 
     fn parts(words: &[&str]) -> Vec<String> {
         words.iter().map(|w| (*w).to_string()).collect()

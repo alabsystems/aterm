@@ -2667,7 +2667,12 @@ fn live_stats(log: &str) -> Result<(), AsbErr> {
             )))
         }
     };
-    let h = read.health;
+    Ok(say(&served_line(&read.health, writer))?)
+}
+
+// `asb stats`' line for a live broker's snapshot `h`, written by a broker `writer` says
+// is serving or cannot be judged.
+fn served_line(h: &astream_broker::BrokerHealth, writer: &str) -> String {
     let poisoned = match &h.poisoned {
         Some(why) => format!("yes {why}"),
         None => "no".to_string(),
@@ -2677,12 +2682,17 @@ fn live_stats(log: &str) -> Result<(), AsbErr> {
         Some(t) => count(t).to_string(),
         None => "-".to_string(),
     };
-    Ok(say(&format!(
+    // Residency the same way: `-` for a broker built before it joined the sidecar.
+    let resident = |count: fn(&astream_broker::Residency) -> u64| match &h.resident {
+        Some(r) => count(r).to_string(),
+        None => "-".to_string(),
+    };
+    format!(
         "base={} head={} records={} bytes={} subjects={} producers={} wills={} groups={} \
          replica={} visible={} durable={} connections={} parked_tails={} served={} \
          flush_barrier={} flush_full={} flush_skipped={} flush_failed={} process_flush_full={} \
-         process_flush_barrier={} process_flush_plain={} writer={writer} pid={} at_ms={} \
-         poisoned={poisoned}",
+         process_flush_barrier={} process_flush_plain={} resident_records={} resident_bytes={} \
+         writer={writer} pid={} at_ms={} poisoned={poisoned}",
         h.base,
         h.head,
         h.retained_records,
@@ -2704,9 +2714,11 @@ fn live_stats(log: &str) -> Result<(), AsbErr> {
         tally(|t| t.full),
         tally(|t| t.barrier),
         tally(|t| t.plain),
+        resident(|r| r.records),
+        resident(|r| r.bytes),
         h.pid,
         h.written_at_ms,
-    ))?)
+    )
 }
 
 // State-carrying log compaction (`REQUIREMENTS` R4): compact `<log>` to `<min_offset>`,
@@ -4282,7 +4294,9 @@ fn read_retain_file(path: &str) -> Result<astream_broker::Retention, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{advance_seq_file, decode_hex, format_records_into, sync_parent_dir_by};
+    use super::{
+        advance_seq_file, decode_hex, format_records_into, served_line, sync_parent_dir_by,
+    };
 
     /// Removes a test's scratch directory when dropped, so the test leaves nothing
     /// behind whether it passes or panics.
@@ -4557,5 +4571,35 @@ mod tests {
             rest = &rest[n + 1..];
         }
         assert!(rest.is_empty(), "nothing after the last record");
+    }
+
+    /// A snapshot an older broker wrote carries no residency and no flush tally: the
+    /// served line prints `-` for each, never a zero a reader would take for a count.
+    /// Negative control: a snapshot that names an empty residency and a zero tally
+    /// prints those zeros.
+    #[test]
+    fn an_older_brokers_snapshot_prints_its_residency_and_tally_unknown() {
+        let older = astream_broker::BrokerHealth::default();
+        assert_eq!((older.resident, older.process_flushes), (None, None));
+        let line = served_line(&older, "serving");
+        assert!(
+            line.contains(
+                " process_flush_full=- process_flush_barrier=- process_flush_plain=- \
+                 resident_records=- resident_bytes=- writer=serving "
+            ),
+            "{line}"
+        );
+
+        let mut current = astream_broker::BrokerHealth::default();
+        current.resident = Some(astream_broker::Residency::default());
+        current.process_flushes = Some(astream_sys::FlushTally::default());
+        let line = served_line(&current, "serving");
+        assert!(
+            line.contains(
+                " process_flush_full=0 process_flush_barrier=0 process_flush_plain=0 \
+                 resident_records=0 resident_bytes=0 writer=serving "
+            ),
+            "{line}"
+        );
     }
 }

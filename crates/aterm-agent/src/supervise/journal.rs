@@ -89,6 +89,14 @@ pub const LINE_READ_UNDRAWN: &str = "the worker read the line and has drawn none
 /// with the host's step from the next due on. The host is asked once, never again at each due.
 pub const LINE_RESTART_UNMADE: &str = "the restart in place could not be made";
 
+/// Where the host answered the restart in place asked for a line held in custody with a word that
+/// it made it, but the process the line was written to is named after it, by the restart's own
+/// report or, where that names none, by the host (`custody::Restarted::Stands`): the words the
+/// `WAITING` record of that ask carries after the host's step. Nothing shows the restart ended
+/// that process, so the line stands held and the restart is asked again on its back-off, as a
+/// deferral is.
+pub const LINE_RESTART_STANDS: &str = "no evidence it ended the process the line was written to";
+
 /// `NOTE seq=<n> rule=<r> the line held <how>: <text>`, the text in backticks: how a line held in
 /// custody settled (`is drawn`, `is under a person's keys`, `went with a turn` or `ended with its
 /// program`).

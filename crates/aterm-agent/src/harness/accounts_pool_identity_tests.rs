@@ -31,12 +31,7 @@ fn a_pooled_turn_end_cannot_prove_a_known_wrong_identity() {
             })
             .unwrap();
         let roster = world.seat().bound_roster(provider).unwrap();
-        let mut s = session(
-            provider,
-            Supervisor::Aterm,
-            Mode::Early,
-            Path::new("/opt/codex"),
-        );
+        let mut s = session(provider, Supervisor::Aterm, Mode::Early, &world.exe);
         s.sample = None;
         let who = accounts::ProcessLogin {
             login: Some(directory.display().to_string()),
@@ -207,12 +202,7 @@ fn finish_case(
             .map(|value| (name, value))
             .into_iter()
             .collect();
-        let mut session = session(
-            provider,
-            Supervisor::Aterm,
-            Mode::Early,
-            Path::new("/opt/provider"),
-        );
+        let mut session = session(provider, Supervisor::Aterm, Mode::Early, &world.exe);
         session.env = &env;
         session.point = Point::Wall {
             window: "five_hour".into(),

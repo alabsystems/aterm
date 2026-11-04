@@ -118,6 +118,22 @@ fn a_broker_seals_a_plaintext_log_at_the_start_that_finds_a_key() {
     );
     assert!(!holds_sentinel(&log), "no sentinel in the sealed log");
     assert_eq!(records(&log, harness::REST_KEY), 4, "every record reads");
+    // The start line says what of the log it keeps decoded (D10): aterm sets no residency
+    // budget, so every record it found.
+    let (resident, retained) = resident_of(&sealing).expect("the start line's residency");
+    assert!(
+        retained >= 2 && resident == retained,
+        "{resident} of {retained}: {sealing}"
+    );
+}
+
+/// The `resident=<records>/<bytes> of <retained>` a broker's start line names: its records and
+/// its retained.
+fn resident_of(start: &str) -> Option<(u64, u64)> {
+    let rest = start.split(" resident=").nth(1)?;
+    let (records, rest) = rest.split_once('/')?;
+    let retained = rest.split(" of ").nth(1)?.split(';').next()?;
+    Some((records.parse().ok()?, retained.parse().ok()?))
 }
 
 /// A sealed log with its key gone: the broker refuses, naming the key and `--retire-log`, and the

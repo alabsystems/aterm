@@ -741,7 +741,10 @@ struct PreparedReview {
     refused: Option<String>,
 }
 
+/// `[harness] accounts` as a launch of `cli` reads it (`SupervisorConfig::accounts_for`): off too
+/// where the harness or `cli` is switched off, so a review takes the row that launch would.
 fn review_mode(
+    cli: crate::harness::accounts::Cli,
     roster: &Path,
     override_mode: Option<crate::harness::accounts::Mode>,
     config: Option<&Path>,
@@ -750,8 +753,21 @@ fn review_mode(
         let beside = roster.parent().map(|dir| dir.join("aterm.toml"));
         crate::supervise::config::SupervisorConfig::from_path(config.or(beside.as_deref()))
             .0
-            .accounts
+            .accounts_for(cli.program())
     })
+}
+
+/// The row `aterm ai review` of `fact`'s CLI runs under on the records as they stand, `None` where
+/// it takes none, or why it runs nothing ([`refresh_review_account`]): for the law that holds it to
+/// what a launch takes.
+#[cfg(test)]
+pub(crate) fn review_row(
+    fact: &mut Facts,
+    now: i64,
+    config: Option<&Path>,
+) -> Result<Option<String>, String> {
+    Ok(refresh_review_account(fact, now, config)?
+        .and_then(|(_, witness)| witness.row().map(|row| row.label.clone())))
 }
 
 fn refresh_review_account(
@@ -784,6 +800,7 @@ fn refresh_review_account(
             source.store.clone(),
             Some(source.roster.clone()),
             review_mode(
+                source.store.cli(),
                 &source.roster,
                 source.mode_override,
                 config.or(source.config.as_deref()),
@@ -795,16 +812,20 @@ fn refresh_review_account(
             (
                 store.clone(),
                 Some(pool.roster.clone()),
-                review_mode(&pool.roster, pool.mode_override, config),
+                review_mode(store.cli(), &pool.roster, pool.mode_override, config),
                 pool.program.clone(),
             )
         })
     } else {
         fact.accounts.as_ref().and_then(|account| {
-            account
-                .store
-                .as_ref()
-                .map(|store| (store.clone(), account.roster.clone(), Mode::Early, None))
+            account.store.as_ref().map(|store| {
+                // `[harness] accounts` as a launch reads it: under rotation off a review, like
+                // a new session, starts on the login it is started with.
+                let mode = account.roster.as_deref().map_or(Mode::Early, |roster| {
+                    review_mode(store.cli(), roster, None, config)
+                });
+                (store.clone(), account.roster.clone(), mode, None)
+            })
         })
     };
     let Some((store, roster, mode, program)) = source else {

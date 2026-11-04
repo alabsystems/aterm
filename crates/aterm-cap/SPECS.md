@@ -11,8 +11,8 @@ and feature graph) retires the tests §2 maps to it. Gap numbers are the rows of
 ## 0. Notation used in the statements
 
 - `rank` is `Tier::rank`: `Untrusted` 0, `Trusted` 1, `Certified` 2. `Cap::satisfies` compares
-  ranks (`self.tier.rank() >= min.rank()`), not the derived `PartialOrd` that the
-  `cap-satisfies-is-tier-order` row names; the two agree, since the derive is declaration order.
+  ranks (`self.tier.rank() >= min.rank()`), which agrees with the declaration-order `PartialOrd`
+  derive on `Tier`.
 - `tierOf(c)` is the private field `c.tier` of `c: Cap<E>`, which also carries
   `PhantomData<fn() -> E>` and a private ZST `Seal`.
 - `E` ranges over every effect marker type (for example `effects::Spawn`). It is phantom, so
@@ -41,7 +41,7 @@ must handle), `blocking_gaps` (audit §7 numbers).
 ```tsv
 id	kind	functions	statement	subsumes	rust_features	blocking_gaps
 cap-grant-tier	contract	Authority::grant, Cap::tier	∀ E, a: &Authority, t: Tier: tierOf(a.grant::<E>(t)) = t, and ∀ c: &Cap<E>: c.tier() = tierOf(*c). Hence a.grant::<E>(t).tier() = t. Both are total: no precondition, no panic.	src/lib.rs::tests::granted_cap_carries_its_tier (the tier() assert)	A generic phantom E (PhantomData<fn() -> E>). A struct carrier with private fields and a ZST Seal. An enum Tier value. An &self view. Straight-line code.	0, 1, 2, 11
-cap-satisfies-is-tier-order	table-property	Cap::satisfies, <Tier as PartialOrd>::ge (derived)	∀ E, c: &Cap<E>, min: Tier: c.satisfies(min) ⇔ rank(tierOf(c)) ≥ rank(min). As a 3×3 table, true exactly at (U,U), (T,U), (T,T), (C,U), (C,T), (C,C). Corollaries: monotone in the cap's tier, antitone in min; a Certified cap satisfies every minimum; every cap satisfies Untrusted.	src/lib.rs::tests::granted_cap_carries_its_tier (the three satisfies asserts)	A call to the derived PartialOrd on a fieldless enum (a discriminant compare, or a match after derive expansion). An &self view. A generic E.	0, 1, 2, 3, 11
+cap-satisfies-is-tier-order	table-property	Cap::satisfies, Tier::rank	∀ E, c: &Cap<E>, min: Tier: c.satisfies(min) ⇔ rank(tierOf(c)) ≥ rank(min). As a 3×3 table, true exactly at (U,U), (T,U), (T,T), (C,U), (C,T), (C,C). Corollaries: monotone in the cap's tier, antitone in min; a Certified cap satisfies every minimum; every cap satisfies Untrusted.	src/lib.rs::tests::granted_cap_carries_its_tier (the rank and satisfies asserts)	A three-arm match on a fieldless enum in Tier::rank returning u8 literals and u8 >= comparison. An &self view. A generic E.	0, 1, 2, 11
 require-gate	contract	require, Cap::satisfies, Cap::tier	∀ E, cap: &Cap<E>, min: Tier: require(cap, min) = if rank(tierOf(cap)) ≥ rank(min) then Ok(()) else Err(Denied { have: tierOf(cap), need: min }). Corollaries: require(cap, min).is_ok() ⇔ cap.satisfies(min); on Err(d), d.need = min and rank(d.have) < rank(d.need). Total; never panics. The proof composes cap-satisfies-is-tier-order and cap-grant-tier at the call sites.	src/lib.rs::tests::require_gates_on_tier	A Result<(), Denied> carrier (an enum over a struct of two enums). Calls to admitted fns (satisfies, tier) and an if on a bool. A generic fn. An & reference parameter.	0, 1, 2, 3, 4, 11
 mint-launcher-only	invariant	Authority::root_authority, Authority's constructors, the workspace call graph and resolver-2 feature graph for aterm-cap/launcher-mint, Guard (aterm-census guards::mint::launcher_mint)	Establishes NoUntrustedTop on the tree. (a) Authority has no constructor other than Mint: its private _seal field rules out a struct literal elsewhere, and the only expression of type Authority in aterm-cap is Mint's body. (b) ∀ workspace crate k ∉ Launchers: ProdCalls(k) = ∅. (c) In the resolver-2 feature graph, the only production (non-dev) edges that enable aterm-cap/launcher-mint come from Launchers. This counts [dependencies], [target.*.dependencies], dotted [dependencies.aterm-cap] tables, renamed packages, [features] entries and workspace-inherited features. (d) Mint exists only under cfg(any(test, feature = "launcher-mint")) and is an unsafe fn: a crate whose build does not enable launcher-mint cannot name it, and every call site is an audited unsafe block. NoUntrustedTop follows from (a) and (b). Feature unification compiles aterm-cap with launcher-mint for every crate in a launcher's build graph, so (c) and (d) alone do not stop a non-launcher crate from naming Mint there (§5.1); in that build Guard checks (b) and (c) by source text today (§5.3 and §5.4 say where it falls short). The model's stronger claim also needs (e): no production call path from a non-launcher crate reaches a call of Mint, including transitively through a launcher library's API (§5.2).	-	Not a property of one function body. cfg and feature semantics plus the resolver-2 feature graph (from cargo metadata). Field privacy. A cross-crate MIR call graph under the production cfg for (b) and (e). Guard reads source text and manifests; the spec should not. Until Trust can state it, Guard is its interim home; cargo metadata resolved features and MIR call edges, plus a compile-fail negative control, would close §5.3 and §5.4.	0, 8, 12
 ```
@@ -75,9 +75,7 @@ and (c) on the shipped build.
 
 ## 4. Tests that are not spec samples
 
-`cap_grant_and_denied_wire_roundtrip` samples the audit wire codecs (`encode_cap_grant_wire`,
-`decode_cap_grant_wire`, `encode_cap_denied_wire`, `decode_cap_denied_wire`), which no spec
-covers.
+None.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
@@ -115,11 +113,9 @@ or the effects and cross-crate surfaces (gaps 8, 12). The order runs from the sm
    branches. Gap 11 can be sidestepped by proving the monomorphic instance `Cap<effects::Spawn>`
    first, because `E` is phantom and the body does not depend on it. This is the smallest test of
    an enum and struct carrier with an `&self` view in Trust.
-2. **`cap-satisfies-is-tier-order`** (gaps 0, 1, 2, 3, 11). Same shape, plus the derived `ge`
-   call. Gap 3 can be avoided by admitting derived `PartialOrd` on fieldless enums as a
-   discriminant compare, or by writing the body as `self.tier as u8 >= min as u8`, which means
-   the same thing. Being a 3×3 table, it is decidable by evaluation once stated. With item 1 it
-   retires `granted_cap_carries_its_tier`.
+2. **`cap-satisfies-is-tier-order`** (gaps 0, 1, 2, 11). Same shape, plus the three-arm match in
+   `Tier::rank` and a `u8 >=` comparison (no derived `PartialOrd` call). Being a 3×3 table, it is
+   decidable by evaluation once stated. With item 1 it retires `granted_cap_carries_its_tier`.
 3. **`require-gate`** (gaps 0, 1, 2, 3, 4, 11). It adds the `Result`/`Denied` carriers and
    callee-ensures composition. Once items 1 and 2 are Certified, it retires
    `require_gates_on_tier`.

@@ -3,13 +3,8 @@
 
 use super::*;
 
-fn weekly_session() -> Session<'static> {
-    let mut s = session(
-        Cli::Codex,
-        Supervisor::Own,
-        Mode::Early,
-        Path::new("/opt/codex"),
-    );
+fn weekly_session(world: &World) -> Session<'_> {
+    let mut s = session(Cli::Codex, Supervisor::Own, Mode::Early, &world.exe);
     s.point = Point::Wall {
         window: "seven_day".into(),
         at: Some(NOW),
@@ -23,7 +18,7 @@ fn native_weekly_plan_uses_pool_policy_without_giving_the_window_ownership() {
     let world = World::new("native-weekly-plan");
     world.two(Cli::Codex);
     world.on_main(Cli::Codex, &[]);
-    let s = weekly_session();
+    let s = weekly_session(&world);
     let ordinary = super::super::session_plan(&world.seat(), &s, |note| note.record());
     assert!(matches!(
         ordinary.advice(),
@@ -49,7 +44,7 @@ fn native_plan_refuses_nonweekly_unstamped_and_foreign_session_requests() {
     world.two(Cli::Codex);
     world.on_main(Cli::Codex, &[]);
     for case in 0..5 {
-        let mut s = weekly_session();
+        let mut s = weekly_session(&world);
         match case {
             0 => s.point = Point::TurnEnd,
             1 => {
@@ -80,7 +75,7 @@ fn native_commit_rechecks_policy_and_target_generation() {
         let world = World::new("native-weekly-changed");
         world.two(Cli::Codex);
         world.on_main(Cli::Codex, &[]);
-        let s = weekly_session();
+        let s = weekly_session(&world);
         let plan = super::super::native_quota_plan(&world.seat(), &s, |note| note.record());
         assert!(plan.selected_rows().is_some());
         if change_generation {
@@ -136,13 +131,14 @@ fn native_exec_quota_plan_keeps_typed_dispatch_and_commits_shared_selection() {
     let world = World::new("native-exec-selection");
     world.two(Cli::Codex);
     world.on_main(Cli::Codex, &[]);
-    let mut request = weekly_session();
+    let mut request = weekly_session(&world);
     let flags = ["exec".into(), "--json".into()];
     request.relaunch.flags = &flags;
     request.relaunch.resume = None;
     let plan = super::super::native_exec_quota_plan(
         &world.seat(),
         &request,
+        &world.exe,
         |note| note.record(),
         |row| Some(exec_command(&world, row)),
     );
@@ -158,6 +154,39 @@ fn native_exec_quota_plan_keeps_typed_dispatch_and_commits_shared_selection() {
     assert_eq!(after.rotations, [NOW]);
 }
 
+/// A NATIVE MOVE IS REFUSED ON A BUILD THAT KEEPS NO ROW'S LOGIN ITS OWN, as a relaunch's is: the
+/// exec handoff names its own image, and the weekly handoff the session's program. CONTROL: on a
+/// build that keeps it (each test above), each moves to `work`.
+#[test]
+#[cfg(unix)]
+fn a_native_move_has_no_line_on_a_build_that_keeps_no_rows_login() {
+    let world = World::new("native-old-build");
+    world.two(Cli::Codex);
+    world.on_main(Cli::Codex, &[]);
+    let old = crate::harness::codex_alab::lay_package(&world.root.join("store/old"), false);
+    let session = weekly_session(&world);
+    let exec = super::super::native_exec_quota_plan(
+        &world.seat(),
+        &session,
+        &old,
+        |note| note.record(),
+        |row| Some(exec_command(&world, row)),
+    );
+    assert!(
+        matches!(exec.advice(), Advice::Stay(StayWhy::NoLine)),
+        "exec: {:?}",
+        exec.advice()
+    );
+    let mut relaunch = weekly_session(&world);
+    relaunch.relaunch.exe = &old;
+    let weekly = super::super::native_quota_plan(&world.seat(), &relaunch, |note| note.record());
+    assert!(
+        matches!(weekly.advice(), Advice::Stay(StayWhy::NoLine)),
+        "weekly: {:?}",
+        weekly.advice()
+    );
+}
+
 #[test]
 #[cfg(unix)]
 fn native_exec_quota_plan_rejects_foreign_auth_and_stale_generation() {
@@ -165,10 +194,11 @@ fn native_exec_quota_plan_rejects_foreign_auth_and_stale_generation() {
         let world = World::new("native-exec-binding");
         world.two(Cli::Codex);
         world.on_main(Cli::Codex, &[]);
-        let request = weekly_session();
+        let request = weekly_session(&world);
         let plan = super::super::native_exec_quota_plan(
             &world.seat(),
             &request,
+            &world.exe,
             |note| note.record(),
             |row| {
                 let mut command = exec_command(&world, row);

@@ -181,7 +181,7 @@ impl World {
         super::super::reclaim_selected_on(
             &self.home,
             now,
-            super::super::super::RECLAIM_GONE,
+            super::super::super::ReclaimAfter::CALM,
             None,
             &mut |_, _| true,
             fence,
@@ -439,7 +439,7 @@ fn a_preserve_request_after_candidate_recording_prevents_the_rename() {
     let removed = super::super::reclaim_selected_on(
         &world.home,
         std::time::SystemTime::now(),
-        super::super::super::RECLAIM_GONE,
+        super::super::super::ReclaimAfter::CALM,
         None,
         &mut |_, _| {
             recorded = true;
@@ -592,6 +592,53 @@ fn partial_allocation(removed: &[(PathBuf, super::super::super::Unused)]) -> u64
             _ => panic!("a retained retirement must not be reported complete: {removed:?}"),
         })
         .sum()
+}
+
+/// RETIRING A PACKAGE TARGET COSTS A COLD BUILD, SO A PASS LEAVES IT TO THE END: its first run does
+/// not touch one, so what the shared cache frees reaches its low-disk reason first, and its second
+/// retires it. The second also asks once, not for each run.
+#[test]
+fn a_pass_leaves_a_package_target_to_its_second_run() {
+    let world = released_retirement(false);
+    let now = std::time::SystemTime::now();
+    let after = super::super::super::ReclaimAfter::CALM;
+    let fence = Fence::default();
+
+    let mut asked = 0;
+    let first = super::super::reclaim_dead_on(
+        &world.home,
+        now,
+        after,
+        None,
+        &mut |_, _| {
+            asked += 1;
+            true
+        },
+        &fence,
+    );
+    assert_eq!((first, asked), (Vec::new(), 0));
+    assert!(world.target.join("debug/deps/unit").exists());
+
+    let second = super::super::reclaim_live_on(
+        &world.home,
+        now,
+        after,
+        None,
+        &mut |_, _| {
+            asked += 1;
+            true
+        },
+        &fence,
+    );
+    assert_eq!(asked, 1, "{second:?}");
+    assert!(
+        matches!(
+            second.as_slice(),
+            [(_, super::super::super::Unused::PackageBudget { .. })]
+        ),
+        "{second:?}"
+    );
+    assert!(!world.target.exists());
 }
 
 #[test]
@@ -1600,7 +1647,7 @@ fn a_late_coordinator_replacement_after_candidate_recording_retains_the_original
     let removed = super::super::reclaim_selected_on(
         &world.home,
         std::time::SystemTime::now(),
-        super::super::super::RECLAIM_GONE,
+        super::super::super::ReclaimAfter::CALM,
         None,
         &mut |_, _| {
             called = true;

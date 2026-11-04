@@ -475,6 +475,7 @@ pub(super) fn admin_cached_unlocked(paths: &Paths) -> crate::Result<Admin> {
         commons_eligibility: crate::commons::membership::Eligibility::from_document(&doc),
         admissions,
         published_doc: doc.clone(),
+        published_control: super::inspection::PublishedControl::read(&opened.doc)?,
         served_machines,
         doc,
         config,
@@ -489,6 +490,7 @@ pub(super) fn admin_cached_unlocked(paths: &Paths) -> crate::Result<Admin> {
             &[envelope.digest()],
             &[envelope.parents.as_slice()],
         ),
+        parented: !envelope.parents.is_empty(),
         log_base,
         resolve: BTreeSet::new(),
     })

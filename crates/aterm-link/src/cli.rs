@@ -414,7 +414,9 @@ usage: aterm link broker <socket> [log] [--secret-file <path>] [--durability <ti
                        and marks its log closed on SIGTERM, SIGINT or SIGHUP; an unclean
                        stop across a reboot advances the log's generation.
   --lifeline-fd <n>    descriptor <n> is the read end of a pipe or FIFO its launcher holds
-                       and never writes: the broker exits cleanly within seconds of its
+                       and never writes, opened by the launcher before it starts the
+                       broker (on macOS a FIFO opened just as its writer closes can miss
+                       its end): the broker exits cleanly within seconds of its
                        end-of-file. For a test's or tool's throwaway broker; a supervised
                        one takes none
   --repair <log>       cut <log> at its first corrupt record and exit (`nothing to repair`
@@ -424,8 +426,10 @@ usage: aterm link broker <socket> [log] [--secret-file <path>] [--durability <ti
                        move it, its sidecars and its key to a `retired-<ms>` folder beside
                        it, nothing deleted, and mint a new key, so the next start begins a
                        new log with a new identity; refused while it opens or a broker
-                       holds it, and for a folder or a file that is no log. One a crash
-                       stopped is run again: until then a start refuses and mints nothing
+                       holds it, while a seal's switch or a compaction a crash stopped
+                       waits for a start to finish it, and for a folder or a file that is
+                       no log. A retire a crash stopped is run again: until then a start
+                       refuses and mints nothing
 
 A `rest.key` beside <log> (`aterm fabric on` mints one; 32 bytes, 0600, in a 0700 dir)
 seals the log and its sidecars at rest: a plaintext log is sealed once at this start, under its
@@ -642,13 +646,14 @@ so every session that node serves names it in `inbox` (`given_up=`) and marks it
         let _ = writeln!(
             std::io::stderr(),
             "aterm link broker: unix socket on {endpoint}{guard_note}, durability {}: {}; \
-             {retained}; at-rest={}; log {}",
+             {retained}; {}; at-rest={}; log {}",
             durability.name(),
             crate::durability::describe_served(
                 durability,
                 Some(broker.served_durability()),
                 Some(guarded)
             ),
+            crate::broker_health::residency_of(&broker),
             crate::at_rest::word(std::path::Path::new(&log)),
             broker.log_identity()
         );

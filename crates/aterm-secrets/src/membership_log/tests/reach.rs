@@ -452,7 +452,7 @@ const LIVE_REMOVED: std::ops::RangeInclusive<u8> = 46..=53;
 /// signer's previous record whose first record follows the heads (sometimes an older view of
 /// them, which forks a head that a later batch merges), as rotations, admissions and writes
 /// do. Wrap capsules and Put ciphertexts are filler: nothing here opens them.
-fn live_shape() -> &'static Log {
+pub(super) fn live_shape() -> &'static Log {
     static LIVE: OnceLock<Log> = OnceLock::new();
     LIVE.get_or_init(|| {
         let macs: Vec<LiveMac> = (1..=LIVE_MACS)
@@ -620,14 +620,17 @@ fn the_live_shape_index_matches_a_depth_first_walk() {
 
 /// Reloading the live shape from its stream (which orders records afresh) ORs exactly each
 /// parent's row into each record's, the sum over records of the sum over parents `j` of
-/// `ceil(j / 64)` words, copies no chunk, and leaves the index exact.
+/// `ceil(j / 64)` words, copies no chunk, and leaves the index exact; the store's footprint is
+/// its stream's bytes and the bytes the bound reserves for that many records' index.
 #[test]
 fn a_live_shape_reload_costs_exactly_its_parents_row_words() {
     let live = live_shape();
     let mut store = Store::with_compiled(Some(*live.network()));
+    let stream = encode_records(live.records());
+    assert_eq!(store.ingest(&stream).unwrap(), live.held_count());
     assert_eq!(
-        store.ingest(&encode_records(live.records())).unwrap(),
-        live.held_count()
+        store.footprint(),
+        stream.len() + reserved_for(live.held_count())
     );
     let log = store.log().unwrap();
     assert_eq!(log.held_count(), live.held_count());

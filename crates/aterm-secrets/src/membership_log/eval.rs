@@ -88,6 +88,8 @@ use super::{Body, Entrant, Founder, Kind, MemberId, Record, RecordId};
 use crate::age::Recipient;
 use crate::commons::binding::Binding;
 use aterm_digest::Sha256;
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -148,7 +150,7 @@ pub(super) fn with_authorization_allocation_probe(
     for at in 1..records.len() {
         assert!(graph.before(0, at));
     }
-    let mut scratch = AuthScratch::new(records.len());
+    let mut scratch = graph.scratch();
     let states = {
         let candidates = graph.candidates();
         assert!(count <= candidates.len());
@@ -156,8 +158,8 @@ pub(super) fn with_authorization_allocation_probe(
         let mut seen = BTreeSet::new();
         let mut states = Vec::with_capacity(count);
         for &candidate in apart.weighed.keys() {
-            let void = graph.effects(&candidates, &[candidate]).void;
-            if seen.insert(graph.membership_void(&void)) {
+            let void = graph.weighed_void(&candidates, &[candidate]);
+            if seen.insert(membership_void(&void)) {
                 states.push(void);
                 if states.len() == count {
                     break;
@@ -171,7 +173,7 @@ pub(super) fn with_authorization_allocation_probe(
         let mut memo = Memo::new();
         let retained: Vec<_> = states
             .iter()
-            .map(|void| graph.authorized(void, &mut memo, &mut scratch))
+            .map(|void| graph.authorize(void, &mut memo, &mut scratch))
             .collect();
         let checksum = retained
             .iter()
@@ -186,7 +188,38 @@ pub(super) fn with_authorization_allocation_probe(
 #[cfg(test)]
 mod dense_oracle_tests;
 #[cfg(test)]
+mod full_pass_oracle;
+#[cfg(test)]
+pub(super) use full_pass_oracle::reader_pass_disagreements;
+#[cfg(test)]
 mod relation_baseline_tests;
+
+/// A broken weighing, for the tests' negative controls.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Mutant {
+    /// The reader pass leaves the first `Remove` unauthorized, as if it skipped that reader.
+    SkipReader,
+    /// Liveness is read at a weighed record's index among all records, as a pass over every
+    /// record would index it, rather than at its slot.
+    ReadByRecord,
+    /// Every signer is an actor, not only the founders and the signers, entrants and targets of
+    /// weighed records.
+    InternEverySigner,
+    /// The reader pass also reads authorization at each record of another kind before a weighed
+    /// one, as the full pass over every record did, and drops what it found there.
+    PassOverEveryRecord,
+    /// The log keeps its weighing when it holds a record of this kind.
+    CarryAcross(Kind),
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The mutant this thread's weighing runs as, if any.
+    pub(super) static MUTANT: Cell<Option<Mutant>> = const { Cell::new(None) };
+    /// How many weighings [`weigh`] ran on this thread, for the pins of what a log carries.
+    pub(super) static WEIGHINGS: Cell<usize> = const { Cell::new(0) };
+}
 
 /// One member, as the log says it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -399,27 +432,44 @@ impl<'a> Seat<'a> {
 /// Evaluate `records`: a log's held records, the genesis first and each after its parents.
 #[cfg(test)]
 pub(super) fn evaluate(records: &[Record]) -> Membership {
-    evaluate_with(Indexed::of(records).history(records))
+    let indexed = Indexed::of(records);
+    let history = indexed.history(records);
+    evaluate_with(history, &weigh(history))
 }
 
-pub(super) fn evaluate_with(history: History<'_>) -> Membership {
-    Graph::new(history).evaluate(&mut Memo::new())
+/// Weigh the quorum candidates of `history`'s weighed records ([`Weighing`]).
+pub(super) fn weigh(history: History<'_>) -> Weighing {
+    #[cfg(test)]
+    WEIGHINGS.set(WEIGHINGS.get() + 1);
+    let graph = Graph::new(history);
+    graph.weighing(&mut Memo::new(), &mut graph.scratch())
+}
+
+/// Membership as `history` says it, given its weighing.
+pub(super) fn evaluate_with(history: History<'_>, weighing: &Weighing) -> Membership {
+    let graph = Graph::new(history);
+    graph.evaluate(weighing, &mut graph.scratch())
 }
 
 /// How many authorization passes evaluating `records` runs: one for each set of candidates whose
 /// void records it weighs under.
 #[cfg(test)]
 pub(super) fn authorization_passes(records: &[Record]) -> usize {
-    let indexed = Indexed::of(records);
-    let mut memo = Memo::new();
-    let _ = Graph::new(indexed.history(records)).evaluate(&mut memo);
-    memo.len()
+    weigh_cost(records).passes
 }
 
 /// What weighing the quorum candidates of `records` cost, counted (never timed).
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct WeighCost {
+    /// Authorization passes: one for each set of candidates whose void records it weighs under.
+    pub(super) passes: usize,
+    /// `Graph::is_member_before` calls: what the passes read, one per weighed record but the
+    /// genesis in each.
+    pub(super) before_calls: usize,
+    /// The bytes the walk's classes hold: each one's void and authorized records, the reader
+    /// records whose liveness it changes, and its memo key.
+    pub(super) class_bytes: usize,
     /// `Graph::is_member_upto` calls.
     pub(super) evaluations: usize,
     /// Their scans: one per call and per uncached `Graph::admit_effective_upto`, plus one per
@@ -438,8 +488,11 @@ pub(super) struct WeighCost {
 
 #[cfg(test)]
 impl WeighCost {
-    fn of(scratch: &AuthScratch) -> Self {
+    fn of(scratch: &AuthScratch, memo: &Memo) -> Self {
         Self {
+            passes: memo.len(),
+            before_calls: scratch.before_calls,
+            class_bytes: scratch.class_bytes,
             evaluations: scratch.upto_calls,
             scans: scratch.scans,
             bookkeeping: scratch.bookkeeping,
@@ -459,9 +512,21 @@ impl WeighCost {
 #[cfg(test)]
 pub(super) fn weigh_cost(records: &[Record]) -> WeighCost {
     let indexed = Indexed::of(records);
-    let mut scratch = AuthScratch::new(records.len());
-    let _ = Graph::new(indexed.history(records)).evaluate_in(&mut Memo::new(), &mut scratch);
-    WeighCost::of(&scratch)
+    let graph = Graph::new(indexed.history(records));
+    let mut scratch = graph.scratch();
+    let mut memo = Memo::new();
+    let _ = graph.weighing(&mut memo, &mut scratch);
+    WeighCost::of(&scratch, &memo)
+}
+
+/// How many member ids the weighing of `history` keeps of its apart weighing
+/// ([`weigh::Apart::kept_for`]), and how many the whole apart weighing held.
+#[cfg(test)]
+pub(super) fn apart_ids(history: History<'_>, weighing: &Weighing) -> (usize, usize) {
+    let graph = Graph::new(history);
+    let candidates = graph.candidates();
+    let (_, whole, _) = graph.weigh_all(&candidates, &mut Memo::new(), &mut graph.scratch());
+    (weighing.apart.ids(), whole.ids())
 }
 
 /// What weighing the candidates of `records` costs the pair loop the walk replaced: one full
@@ -471,10 +536,11 @@ pub(super) fn weigh_cost(records: &[Record]) -> WeighCost {
 pub(super) fn weigh_cost_by_pairs(records: &[Record]) -> WeighCost {
     let indexed = Indexed::of(records);
     let graph = Graph::new(indexed.history(records));
-    let mut scratch = AuthScratch::new(records.len());
+    let mut scratch = graph.scratch();
     let candidates = graph.candidates();
-    let _ = graph.accepted_by_pairs(&candidates, &mut Memo::new(), &mut scratch);
-    WeighCost::of(&scratch)
+    let mut memo = Memo::new();
+    let _ = graph.accepted_by_pairs(&candidates, &mut memo, &mut scratch);
+    WeighCost::of(&scratch, &memo)
 }
 
 /// A candidate by content: its member and its cutoff's id.
@@ -496,7 +562,7 @@ pub(super) type NamedRelations = (
 pub(super) fn weigh_relations(records: &[Record], by_pairs: bool) -> NamedRelations {
     let indexed = Indexed::of(records);
     let graph = Graph::new(indexed.history(records));
-    let mut scratch = AuthScratch::new(records.len());
+    let mut scratch = graph.scratch();
     let candidates = graph.candidates();
     let mut memo = Memo::new();
     let (accepted, relations) = if by_pairs {
@@ -569,51 +635,63 @@ impl Effective {
     }
 }
 
-/// Compute [`Effective`] over `history`'s records.
-pub(super) fn effective_records(history: History<'_>) -> Effective {
-    Graph::new(history).effective()
+/// Compute [`Effective`] over `history`'s records, given its weighing.
+pub(super) fn effective_records(history: History<'_>, weighing: &Weighing) -> Effective {
+    Graph::new(history).effective(weighing)
 }
 
 /// Founding `Genesis` or effective `Admit` [`RecordId`] that grants `binding` a seat in
 /// `history`, excluding actors taken out for good by an effective quorum `Remove`.
-pub(super) fn historical_seat_entry(history: History<'_>, binding: &Binding) -> Option<RecordId> {
-    Graph::new(history).historical_seat_entry(binding)
+pub(super) fn historical_seat_entry(
+    history: History<'_>,
+    weighing: &Weighing,
+    binding: &Binding,
+) -> Option<RecordId> {
+    Graph::new(history).historical_seat_entry(weighing, binding)
 }
 
 /// Whether `binding` holds a founding or effective admitted seat in `history`, excluding actors
 /// taken out for good by an effective quorum `Remove`.
-pub(super) fn has_historical_seat(history: History<'_>, binding: &Binding) -> bool {
-    historical_seat_entry(history, binding).is_some()
+pub(super) fn has_historical_seat(
+    history: History<'_>,
+    weighing: &Weighing,
+    binding: &Binding,
+) -> bool {
+    historical_seat_entry(history, weighing, binding).is_some()
 }
 
 /// Whether `actor` holds a founding or non-void, authorized, non-cut-off admitted seat in
 /// `history` (including actors later retired by an ordinary or quorum `Remove`).
-pub(super) fn has_known_actor(history: History<'_>, actor: &MemberId) -> bool {
-    Graph::new(history).has_known_actor(actor)
+pub(super) fn has_known_actor(history: History<'_>, weighing: &Weighing, actor: &MemberId) -> bool {
+    Graph::new(history).has_known_actor(weighing, actor)
 }
 
 /// The cutoff of F16's quorum `Remove` of `actor` ([`super::Log::undo_cutoff`]).
-pub(super) fn undo_cutoff(history: History<'_>, actor: &MemberId) -> Option<RecordId> {
+pub(super) fn undo_cutoff(
+    history: History<'_>,
+    weighing: &Weighing,
+    actor: &MemberId,
+) -> Option<RecordId> {
     let records = history.records;
     let graph = Graph::new(history);
-    let mut scratch = AuthScratch::new(records.len());
-    let plain = graph.authorized(&vec![false; records.len()], &mut Memo::new(), &mut scratch);
+    let mut scratch = graph.scratch();
+    let plain = graph.authorized_records(&graph.no_void(), &weighing.apart.plain, &mut scratch);
     graph
-        .undo_cutoff(actor, &plain, &mut scratch)
+        .undo_cutoff(actor, &plain, weighing, &mut scratch)
         .map(|at| *records[at].id())
 }
 
 /// Where F16's quorum `Remove` of `actor` stands ([`super::Log::undo`]); `took_effect` is left
 /// for the caller, which holds the whole membership.
-pub(super) fn undo(history: History<'_>, actor: &MemberId) -> Option<Undo> {
+pub(super) fn undo(history: History<'_>, weighing: &Weighing, actor: &MemberId) -> Option<Undo> {
     let records = history.records;
     let graph = Graph::new(history);
-    let no_void = vec![false; records.len()];
-    let mut scratch = AuthScratch::new(records.len());
-    let plain = graph.authorized(&no_void, &mut Memo::new(), &mut scratch);
-    let cutoff = graph.undo_cutoff(actor, &plain, &mut scratch)?;
+    let no_void = graph.no_void();
+    let mut scratch = graph.scratch();
+    let plain = graph.authorized_records(&no_void, &weighing.apart.plain, &mut scratch);
+    let cutoff = graph.undo_cutoff(actor, &plain, weighing, &mut scratch)?;
     let voters: BTreeSet<MemberId> = graph
-        .members_at_cutoff(cutoff, &no_void, &plain, &mut scratch)
+        .members_at_cutoff(cutoff, &no_void, &weighing.apart.plain, &mut scratch)
         .unwrap_or_default()
         .into_iter()
         .filter(|mac| mac != actor)
@@ -641,9 +719,40 @@ pub(super) fn undo(history: History<'_>, actor: &MemberId) -> Option<Undo> {
 /// effective `Epoch` record at `epoch_index`.
 pub(super) fn historical_bindings_for_epoch(
     history: History<'_>,
+    weighing: &Weighing,
     epoch_index: usize,
 ) -> Option<Vec<Binding>> {
-    Graph::new(history).historical_bindings_for_epoch(epoch_index)
+    Graph::new(history).historical_bindings_for_epoch(weighing, epoch_index)
+}
+
+/// The quorum weighing of a log's weighed records (the genesis, every `Admit` and every
+/// `Remove`): the candidates, those that take effect and how each was weighed apart, and
+/// authorization at the weighed records with nothing void and under the quorums that take
+/// effect.
+///
+/// It reads nothing of any other record but the cutoffs the candidates name. Authorization at a
+/// weighed record reads only the liveness of the `Remove`s and `Admit`s before it
+/// ([`Graph::is_member_before`]); a vote reads the members at a cutoff, over that cutoff's past
+/// ([`Graph::is_member_upto`]); and the actors are the founders and the signers, entrants and
+/// targets of weighed records ([`Graph::new`]). A record of another kind that a log holds next
+/// lies in no held record's past, so it changes none of these, and the log carries the weighing
+/// across it (`Log::hold`).
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct Weighing {
+    candidates: Vec<Candidate>,
+    /// The candidates that take effect, by index: each holds under its own effects, and no
+    /// candidate that takes effect defeats it. One defeats another when the records one voids
+    /// undo the other while the other's do not undo one, or when both undo each other but only
+    /// one's take votes away (the Macs its member let in after its cutoff). Two that undo each
+    /// other only by voiding shares defeat neither, and both take effect.
+    accepted: Vec<usize>,
+    /// Authorization with nothing void, and of each candidate that takes effect how it was
+    /// weighed apart and the members at its cutoff ([`weigh::Apart::kept_for`]).
+    apart: weigh::Apart,
+    /// The weighed records the quorums that take effect void, by slot.
+    void: Vec<bool>,
+    /// Authorization at the weighed records under those quorums, by slot.
+    settled: Authorization,
 }
 
 /// The previous exact all-pairs implementation, retained only as a test oracle.
@@ -668,7 +777,7 @@ fn dense_past(records: &[Record]) -> Vec<Bits> {
     past
 }
 
-/// A set of record indexes.
+/// A set of record indexes, or of weighed records' slots.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Bits(Vec<u64>);
 
@@ -693,8 +802,15 @@ impl Bits {
 /// Reusable per-pass memo for [`Graph::admit_effective_in_past`] and
 /// [`Graph::admit_effective_upto`], keyed by an epoch counter so resetting per scope is `O(1)`.
 struct AuthScratch {
+    /// Per weighed record, by slot: the scope its `Admit`'s effectiveness was last found in.
     admit_epoch: Vec<u32>,
     epoch: u32,
+    /// [`Graph::is_member_before`] calls ([`WeighCost::before_calls`]).
+    #[cfg(test)]
+    before_calls: usize,
+    /// The bytes the walk's classes hold ([`WeighCost::class_bytes`]).
+    #[cfg(test)]
+    class_bytes: usize,
     /// [`Graph::is_member_upto`] calls, for the weighing cost tests ([`WeighCost`]).
     #[cfg(test)]
     upto_calls: usize,
@@ -713,10 +829,15 @@ struct AuthScratch {
 }
 
 impl AuthScratch {
-    fn new(len: usize) -> Self {
+    /// Scratch for a graph of `slots` weighed records ([`Graph::scratch`]).
+    fn new(slots: usize) -> Self {
         Self {
-            admit_epoch: vec![0; len],
+            admit_epoch: vec![0; slots],
             epoch: 0,
+            #[cfg(test)]
+            before_calls: 0,
+            #[cfg(test)]
+            class_bytes: 0,
             #[cfg(test)]
             upto_calls: 0,
             #[cfg(test)]
@@ -747,17 +868,17 @@ struct Effects {
 }
 
 /// How each record stands, for F21's rule 1: authorized with nothing void (`plain`), authorized
-/// under the quorums that take effect (`authorized`), and void under them (`void`); and those
-/// quorums (`accepted`, indexes into `candidates`), for judging a write by what its own past holds.
+/// under the quorums that take effect (`authorized`), and void under them (`void`); and the
+/// weighing those quorums came from, for judging a write by what its own past holds.
 struct Authority<'a> {
     plain: &'a [bool],
     authorized: &'a [bool],
     void: &'a [bool],
-    candidates: &'a [Candidate],
-    accepted: &'a [usize],
+    weighing: &'a Weighing,
 }
 
 /// One quorum `Remove` the log holds: the `Remove`s that name one member and one cutoff.
+#[derive(Debug, PartialEq, Eq)]
 struct Candidate {
     member: MemberId,
     /// The cutoff's record index.
@@ -768,7 +889,7 @@ struct Candidate {
 
 /// One candidate weighed: the members at its cutoff, its member excluded, and those whose shares
 /// count.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 struct Weighed {
     voters: BTreeSet<MemberId>,
     counted: BTreeSet<MemberId>,
@@ -795,6 +916,9 @@ struct Standing {
     nodes: BTreeMap<MemberId, Vec<usize>>,
 }
 
+/// A slot no weighed record holds: [`Graph::slot`] of a record of any other kind.
+const NOT_WEIGHED: usize = usize::MAX;
+
 struct Graph<'a> {
     records: &'a [Record],
     /// Each held record's index, by id.
@@ -805,17 +929,33 @@ struct Graph<'a> {
     oracle: Option<Vec<Bits>>,
     /// Each `Remove`'s cutoff, by record index.
     cutoffs: BTreeMap<usize, usize>,
-    /// Compact actor table (`0..actors.len()`) over every founder, signer, entrant and target.
+    /// The weighed records (the genesis, every `Admit` and every `Remove`), ascending: every
+    /// record the weighing reads the liveness of. A weighed record's slot is its place here, and
+    /// the weighing's states (void, authorized) are sets of slots.
+    weighed: Vec<usize>,
+    /// Each record's slot, [`NOT_WEIGHED`] for a record of any other kind.
+    slot: Vec<usize>,
+    /// Compact actor table (`0..actors.len()`): every founder the genesis binds, and every
+    /// signer, entrant and target of a weighed record. A Mac only other records name is no
+    /// actor, so records of other kinds, however many keys sign them, never grow it.
     actors: Vec<MemberId>,
-    /// `signer_actor[i]` is the compact actor index of `records[i].actor()`.
+    /// Each actor's index, by member.
+    actor_at: BTreeMap<MemberId, usize>,
+    /// `signer_actor[i]` is the compact actor index of `records[i].actor()`, or the no-seat
+    /// actor `actors.len()` for a signer that is no actor (and for the genesis).
     signer_actor: Vec<usize>,
-    /// Whether actor `a` is bound in the genesis.
+    /// Whether actor `a` is bound in the genesis. This, `removes_of` and `admits_of` hold one
+    /// entry more than `actors`: the no-seat actor's, empty. No genesis binds it, no `Admit`
+    /// names it and no `Remove` takes it out, so it is a member nowhere, as each such Mac is.
     is_founder: Vec<bool>,
     /// For each target actor `a`, `(record_idx, cutoff_idx)` of every `Remove` naming `a`, in
     /// record order.
     removes_of: Vec<Vec<(usize, usize)>>,
-    /// For each entrant actor `a`, `record_idx` of every `Admit` naming `a`, in record order.
+    /// For each entrant actor `a`, `record_idx` of every `Admit` naming `a` that another Mac
+    /// signed, in record order.
     admits_of: Vec<Vec<usize>>,
+    /// Per actor: the slots of the weighed records it signed, ascending.
+    signed: Vec<Vec<usize>>,
 }
 
 impl<'a> Graph<'a> {
@@ -833,16 +973,24 @@ impl<'a> Graph<'a> {
                 _ => None,
             })
             .collect();
+        let mut weighed = Vec::new();
+        let mut slot = vec![NOT_WEIGHED; records.len()];
+        for (i, record) in records.iter().enumerate() {
+            if record.kind().weighed() {
+                slot[i] = weighed.len();
+                weighed.push(i);
+            }
+        }
 
-        let mut actor_ids: BTreeMap<MemberId, usize> = BTreeMap::new();
+        let mut actor_at: BTreeMap<MemberId, usize> = BTreeMap::new();
         let mut actors: Vec<MemberId> = Vec::new();
         let mut intern = |id: MemberId| -> usize {
-            if let Some(&idx) = actor_ids.get(&id) {
+            if let Some(&idx) = actor_at.get(&id) {
                 idx
             } else {
                 let idx = actors.len();
                 actors.push(id);
-                actor_ids.insert(id, idx);
+                actor_at.insert(id, idx);
                 idx
             }
         };
@@ -854,13 +1002,9 @@ impl<'a> Graph<'a> {
         for seat in listed.iter().filter_map(Seat::founder) {
             founder_indices.push(intern(seat.member()));
         }
-        let mut signer_actor = Vec::with_capacity(records.len());
-        for (i, record) in records.iter().enumerate() {
-            if i == 0 {
-                signer_actor.push(0);
-                continue;
-            }
-            signer_actor.push(intern(*record.actor()));
+        for &i in weighed.iter().skip(1) {
+            let record = &records[i];
+            let _ = intern(*record.actor());
             match record.body() {
                 Body::Admit { entrant, .. } => {
                     let _ = intern(entrant.member());
@@ -871,21 +1015,39 @@ impl<'a> Graph<'a> {
                 _ => {}
             }
         }
-        let mut is_founder = vec![false; actors.len()];
+        #[cfg(test)]
+        if MUTANT.get() == Some(Mutant::InternEverySigner) {
+            for record in records.iter().skip(1) {
+                let _ = intern(*record.actor());
+            }
+        }
+        let no_seat = actors.len();
+        let signer_actor: Vec<usize> = records
+            .iter()
+            .enumerate()
+            .map(|(i, record)| match i {
+                0 => no_seat,
+                _ => actor_at.get(record.actor()).copied().unwrap_or(no_seat),
+            })
+            .collect();
+        let mut is_founder = vec![false; no_seat + 1];
         for idx in founder_indices {
             is_founder[idx] = true;
         }
-        let mut removes_of = vec![Vec::new(); actors.len()];
-        let mut admits_of = vec![Vec::new(); actors.len()];
-        for (i, record) in records.iter().enumerate().skip(1) {
+        let mut removes_of = vec![Vec::new(); no_seat + 1];
+        let mut admits_of = vec![Vec::new(); no_seat + 1];
+        let mut signed = vec![Vec::new(); no_seat];
+        for (s, &i) in weighed.iter().enumerate().skip(1) {
+            let record = &records[i];
+            signed[signer_actor[i]].push(s);
             match record.body() {
                 Body::Remove { member, .. } => {
                     if let Some(&cutoff) = cutoffs.get(&i) {
-                        removes_of[actor_ids[member]].push((i, cutoff));
+                        removes_of[actor_at[member]].push((i, cutoff));
                     }
                 }
                 Body::Admit { entrant, .. } if record.actor() != &entrant.member() => {
-                    admits_of[actor_ids[&entrant.member()]].push(i);
+                    admits_of[actor_at[&entrant.member()]].push(i);
                 }
                 _ => {}
             }
@@ -898,11 +1060,15 @@ impl<'a> Graph<'a> {
             #[cfg(test)]
             oracle: None,
             cutoffs,
+            weighed,
+            slot,
             actors,
+            actor_at,
             signer_actor,
             is_founder,
             removes_of,
             admits_of,
+            signed,
         }
     }
 
@@ -932,31 +1098,27 @@ impl<'a> Graph<'a> {
         self.reach.upto(a, b)
     }
 
-    fn union_past_into(&self, b: usize, into: &mut Bits) {
-        #[cfg(test)]
-        if let Some(past) = &self.oracle {
-            into.union(&past[b]);
-            return;
-        }
-        self.reach.union_past_into(b, &mut into.0);
+    /// Scratch for one evaluation's passes over this graph's weighed records.
+    fn scratch(&self) -> AuthScratch {
+        AuthScratch::new(self.weighed.len())
     }
 
-    fn copy_past_into(&self, b: usize, into: &mut Bits) {
-        #[cfg(test)]
-        if let Some(past) = &self.oracle {
-            into.0.copy_from_slice(&past[b].0);
-            return;
-        }
-        self.reach.copy_past_into(b, &mut into.0);
+    /// Nothing void, as a state of the weighed records.
+    fn no_void(&self) -> Vec<bool> {
+        vec![false; self.weighed.len()]
     }
 
-    fn past_intersects(&self, b: usize, set: &Bits) -> bool {
+    /// Whether the weighed record `r` is live in a state of the weighed records (`void` and
+    /// `auth`, by slot): authorized there and not void.
+    fn live(&self, r: usize, void: &[bool], auth: &[bool]) -> bool {
         #[cfg(test)]
-        if let Some(past) = &self.oracle {
-            return past[b].0.iter().zip(&set.0).any(|(a, b)| a & b != 0);
+        if MUTANT.get() == Some(Mutant::ReadByRecord) {
+            return void.get(r) == Some(&false) && auth.get(r) == Some(&true);
         }
-        self.reach.past_intersects(b, &set.0)
+        let s = self.slot[r];
+        !void[s] && auth[s]
     }
+
     fn signer(&self, i: usize) -> &MemberId {
         self.records[i].actor()
     }
@@ -971,18 +1133,49 @@ impl<'a> Graph<'a> {
         self.listed().iter().filter_map(Seat::founder)
     }
 
-    fn evaluate(&self, memo: &mut Memo) -> Membership {
-        self.evaluate_in(memo, &mut AuthScratch::new(self.records.len()))
-    }
-
-    fn evaluate_in(&self, memo: &mut Memo, scratch: &mut AuthScratch) -> Membership {
+    /// Weigh the quorum candidates ([`Weighing`]).
+    fn weighing(&self, memo: &mut Memo, scratch: &mut AuthScratch) -> Weighing {
         let candidates = self.candidates();
         let (accepted, apart, _) = self.weigh_all(&candidates, memo, scratch);
-        let effects = self.effects(&candidates, &accepted);
-        let authorized = self.authorized(&effects.void, memo, scratch);
+        let apart = apart.kept_for(&candidates, &accepted);
+        let void = self.weighed_void(&candidates, &accepted);
+        let settled = self.authorize(&void, memo, scratch);
+        Weighing {
+            candidates,
+            accepted,
+            apart,
+            void,
+            settled,
+        }
+    }
+
+    /// What the quorums `weighing` lets take effect do to every record: the records they void,
+    /// the Macs they take out, and which records are authorized under them.
+    ///
+    /// # Panics
+    /// `weighing` weighed other weighed records than this graph's.
+    fn settled(&self, weighing: &Weighing, scratch: &mut AuthScratch) -> (Effects, Vec<bool>) {
+        assert_eq!(
+            weighing.void.len(),
+            self.weighed.len(),
+            "the weighing is of this history's weighed records"
+        );
+        let effects = self.effects(&weighing.candidates, &weighing.accepted);
+        let authorized = self.authorized_records(&weighing.void, &weighing.settled, scratch);
+        (effects, authorized)
+    }
+
+    fn evaluate(&self, weighing: &Weighing, scratch: &mut AuthScratch) -> Membership {
+        let Weighing {
+            candidates,
+            accepted,
+            apart,
+            ..
+        } = weighing;
+        let (effects, authorized) = self.settled(weighing, scratch);
         let all = |_: usize| true;
         let standing = self.standing(&all, &effects.void, &effects.out, &authorized);
-        let plain = self.authorized(&vec![false; self.records.len()], memo, scratch);
+        let plain = self.authorized_records(&self.no_void(), &apart.plain, scratch);
         let labels = self.labels(&plain, &authorized, &standing, &effects.out, &effects.void);
         // A quorum's signers are the shares that counted for it weighed with nothing void (what
         // `weigh(q, None)` gives), as the walk weighed it apart.
@@ -1592,21 +1785,6 @@ impl<'a> Graph<'a> {
             .collect()
     }
 
-    /// The candidates that take effect, by index: each holds under its own effects, and no
-    /// candidate that takes effect defeats it. One defeats another when the records one voids
-    /// undo the other while the other's do not undo one, or when both undo each other but only
-    /// one's take votes away (the Macs its member let in after its cutoff). Two that undo each
-    /// other only by voiding shares defeat neither, and both take effect.
-    fn accepted(
-        &self,
-        candidates: &[Candidate],
-        memo: &mut Memo,
-        scratch: &mut AuthScratch,
-    ) -> Vec<usize> {
-        // The relations come from the walk (`weigh.rs`), never one membership pass per pair.
-        self.weigh_all(candidates, memo, scratch).0
-    }
-
     /// Candidate `q` weighed when its own effects and `other`'s void records: its voters, and
     /// the voters whose shares count.
     ///
@@ -1633,13 +1811,15 @@ impl<'a> Graph<'a> {
         scratch: &mut AuthScratch,
     ) -> Weighed {
         let set: Vec<usize> = other.into_iter().collect();
-        let void = self.effects(candidates, &set).void;
-        let authorized = self.authorized(&void, memo, scratch);
+        let void = self.weighed_void(candidates, &set);
+        let authorized = self.authorize(&void, memo, scratch);
         let cand = &candidates[q];
         let at_cutoff = self.members_at_cutoff(cand.cutoff, &void, &authorized, scratch);
         self.weigh_with_members(cand, at_cutoff.as_ref(), &void)
     }
 
+    /// Candidate `cand` weighed at `members_at_cutoff` (`None`: no cutoff), its shares void as
+    /// `void` (a state of the weighed records, by slot) says.
     fn weigh_with_members(
         &self,
         cand: &Candidate,
@@ -1657,13 +1837,15 @@ impl<'a> Graph<'a> {
         let counted = cand
             .shares
             .iter()
-            .filter(|&&s| !void[s])
+            .filter(|&&s| !void[self.slot[s]])
             .map(|&s| *self.signer(s))
             .filter(|signer| voters.contains(signer))
             .collect();
         Weighed { voters, counted }
     }
 
+    /// The members at `cutoff` in a state of the weighed records (`void` and `authorized`, by
+    /// slot); `None` where the cutoff is an `Admit` that state leaves unauthorized.
     fn members_at_cutoff(
         &self,
         cutoff: usize,
@@ -1671,7 +1853,7 @@ impl<'a> Graph<'a> {
         authorized: &[bool],
         scratch: &mut AuthScratch,
     ) -> Option<BTreeSet<MemberId>> {
-        if self.records[cutoff].kind() == Kind::Admit && !authorized[cutoff] {
+        if self.records[cutoff].kind() == Kind::Admit && !authorized[self.slot[cutoff]] {
             return None;
         }
         scratch.next_scope();
@@ -1684,58 +1866,90 @@ impl<'a> Graph<'a> {
         Some(members)
     }
 
-    /// Which [`Kind::Admit`] and [`Kind::Remove`] records `void` voids: non-membership payloads
-    /// (`Name`, `Epoch`, `Wrap`, `Put`, `Delete`) never change authorization or voters.
-    fn membership_void(&self, void: &[bool]) -> Bits {
-        let mut bits = Bits::new(self.records.len());
-        for (i, &is_void) in void.iter().enumerate().skip(1) {
-            if is_void && matches!(self.records[i].kind(), Kind::Admit | Kind::Remove) {
-                bits.set(i);
-            }
-        }
-        bits
-    }
-
     /// What the candidates `quorums` do: each one's member is out for good, and its records
     /// outside its cutoff's causal past are void.
     fn effects(&self, candidates: &[Candidate], quorums: &[usize]) -> Effects {
-        let mut effects = Effects {
-            void: vec![false; self.records.len()],
-            out: BTreeSet::new(),
-        };
+        let mut out = BTreeSet::new();
+        // Each member's cutoffs, by actor: a candidate's member is a `Remove`'s target.
+        let mut cuts: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
         for &q in quorums {
             let Candidate { member, cutoff, .. } = &candidates[q];
-            effects.out.insert(*member);
-            for (i, is_void) in effects.void.iter_mut().enumerate().skip(1) {
-                if self.signer(i) == member && !self.upto(i, *cutoff) {
-                    *is_void = true;
+            out.insert(*member);
+            cuts.entry(self.actor_at[member]).or_default().push(*cutoff);
+        }
+        let mut void = vec![false; self.records.len()];
+        if !cuts.is_empty() {
+            for (i, is_void) in void.iter_mut().enumerate().skip(1) {
+                if let Some(cutoffs) = cuts.get(&self.signer_actor[i]) {
+                    *is_void = cutoffs.iter().any(|&cutoff| !self.upto(i, cutoff));
                 }
             }
         }
-        effects
+        Effects { void, out }
     }
 
-    /// Whether each record is authorized when `void` holds the void records: its signer is a
-    /// member in its strict causal past. Out for good does not reach back, so what a quorum's
-    /// member signed before its cutoff stands. The voided membership records key the memo.
-    /// Its immutable result is shared with the walk's classes and historical dependency views.
-    fn authorized(
+    /// The weighed records the candidates `quorums` void, by slot: what [`Graph::effects`]
+    /// voids among them, read off each member's own weighed records alone.
+    fn weighed_void(&self, candidates: &[Candidate], quorums: &[usize]) -> Vec<bool> {
+        let mut void = self.no_void();
+        for &q in quorums {
+            let Candidate { member, cutoff, .. } = &candidates[q];
+            for &s in &self.signed[self.actor_at[member]] {
+                if !self.upto(self.weighed[s], *cutoff) {
+                    void[s] = true;
+                }
+            }
+        }
+        void
+    }
+
+    /// The reader pass: whether each weighed record is authorized when `void` holds the void
+    /// ones (both by slot): its signer is a member in its strict causal past. Out for good does
+    /// not reach back, so what a quorum's member signed before its cutoff stands.
+    ///
+    /// A weighed record's authorization reads only that of the `Remove`s and `Admit`s before it
+    /// ([`Graph::is_member_before`]), so the pass reads no record of any other kind and stays
+    /// exact; [`Graph::authorized_records`] extends it to every record. The void records key the
+    /// memo, and its immutable result is shared with the walk's classes and the dependency views.
+    fn authorize(
         &self,
         void: &[bool],
         memo: &mut Memo,
         scratch: &mut AuthScratch,
     ) -> Authorization {
-        let key = self.membership_void(void);
+        let key = membership_void(void);
         if let Some(found) = memo.get(&key) {
             return Arc::clone(found);
         }
-        let mut authorized = vec![false; self.records.len()];
-        if !authorized.is_empty() {
-            authorized[0] = true;
-        }
-        for i in 1..self.records.len() {
+        let mut authorized = self.no_void();
+        authorized[0] = true;
+        #[cfg(test)]
+        let skipped = if MUTANT.get() == Some(Mutant::SkipReader) {
+            (1..self.weighed.len()).find(|&s| self.records[self.weighed[s]].kind() == Kind::Remove)
+        } else {
+            None
+        };
+        for s in 1..self.weighed.len() {
+            #[cfg(test)]
+            if skipped == Some(s) {
+                continue;
+            }
+            let i = self.weighed[s];
+            #[cfg(test)]
+            if MUTANT.get() == Some(Mutant::PassOverEveryRecord) {
+                for other in self.weighed[s - 1] + 1..i {
+                    scratch.next_scope();
+                    let _ = self.is_member_before(
+                        self.signer_actor[other],
+                        other,
+                        void,
+                        &authorized,
+                        scratch,
+                    );
+                }
+            }
             scratch.next_scope();
-            authorized[i] =
+            authorized[s] =
                 self.is_member_before(self.signer_actor[i], i, void, &authorized, scratch);
         }
         let authorized: Authorization = authorized.into();
@@ -1743,6 +1957,30 @@ impl<'a> Graph<'a> {
         authorized
     }
 
+    /// Whether each record is authorized, given which weighed records are void (`void`) and
+    /// authorized there (`auth`, [`Graph::authorize`]'s pass under `void`), both by slot: a
+    /// weighed record as the pass says, any other as [`Graph::is_member_before`] reads the
+    /// pass, in one sweep.
+    fn authorized_records(
+        &self,
+        void: &[bool],
+        auth: &[bool],
+        scratch: &mut AuthScratch,
+    ) -> Vec<bool> {
+        (0..self.records.len())
+            .map(|i| match self.slot[i] {
+                NOT_WEIGHED => {
+                    scratch.next_scope();
+                    self.is_member_before(self.signer_actor[i], i, void, auth, scratch)
+                }
+                s => auth[s],
+            })
+            .collect()
+    }
+
+    /// Whether `actor` is a member in record `i`'s strict causal past, in a state of the
+    /// weighed records (`void` and `authorized`, by slot) that holds every weighed record before
+    /// `i`.
     fn is_member_before(
         &self,
         actor: usize,
@@ -1751,12 +1989,16 @@ impl<'a> Graph<'a> {
         authorized: &[bool],
         scratch: &mut AuthScratch,
     ) -> bool {
+        #[cfg(test)]
+        {
+            scratch.before_calls += 1;
+        }
         let mut any_remove = false;
         for &(r, _) in &self.removes_of[actor] {
             if r >= i {
                 break;
             }
-            if !void[r] && authorized[r] && self.before(r, i) {
+            if self.live(r, void, authorized) && self.before(r, i) {
                 any_remove = true;
                 break;
             }
@@ -1768,13 +2010,13 @@ impl<'a> Graph<'a> {
             if e >= i {
                 break;
             }
-            if void[e] || !authorized[e] || !self.before(e, i) {
+            if !self.live(e, void, authorized) || !self.before(e, i) {
                 continue;
             }
             let after_every_remove = self.removes_of[actor]
                 .iter()
                 .take_while(|&&(r, _)| r < i)
-                .filter(|&&(r, _)| !void[r] && authorized[r] && self.before(r, i))
+                .filter(|&&(r, _)| self.live(r, void, authorized) && self.before(r, i))
                 .all(|&(r, _)| self.before(r, e));
             if after_every_remove && self.admit_effective_in_past(e, i, void, authorized, scratch) {
                 return true;
@@ -1791,7 +2033,8 @@ impl<'a> Graph<'a> {
         authorized: &[bool],
         scratch: &mut AuthScratch,
     ) -> bool {
-        let cached = scratch.admit_epoch[e];
+        let at = self.slot[e];
+        let cached = scratch.admit_epoch[at];
         if cached == scratch.epoch {
             return false;
         }
@@ -1803,7 +2046,7 @@ impl<'a> Graph<'a> {
             if r >= i {
                 break;
             }
-            if void[r] || !authorized[r] || !self.before(r, i) || self.upto(e, cutoff) {
+            if !self.live(r, void, authorized) || !self.before(r, i) || self.upto(e, cutoff) {
                 continue;
             }
             let restored = self.admits_of[signer]
@@ -1811,23 +2054,22 @@ impl<'a> Graph<'a> {
                 .copied()
                 .take_while(|&e2| e2 < e)
                 .any(|e2| {
-                    !void[e2]
-                        && authorized[e2]
+                    self.live(e2, void, authorized)
                         && self.before(r, e2)
                         && self.before(e2, e)
                         && self.admit_effective_in_past(e2, i, void, authorized, scratch)
                 });
             if !restored {
-                scratch.admit_epoch[e] = scratch.epoch;
+                scratch.admit_epoch[at] = scratch.epoch;
                 return false;
             }
         }
-        scratch.admit_epoch[e] = scratch.epoch + 1;
+        scratch.admit_epoch[at] = scratch.epoch + 1;
         true
     }
 
-    /// Whether `actor` is a member at `cutoff`: over the cutoff's causal past, given which records
-    /// are void and authorized.
+    /// Whether `actor` is a member at `cutoff`: over the cutoff's causal past, given which weighed
+    /// records are void and authorized (by slot).
     ///
     /// It reads the state only through whether each `Remove` and `Admit` of `actor` up to the
     /// cutoff is live (authorized and not void), and whether each such `Admit` is effective there
@@ -1852,7 +2094,7 @@ impl<'a> Graph<'a> {
             if r > cutoff {
                 break;
             }
-            if !void[r] && authorized[r] && self.upto(r, cutoff) {
+            if self.live(r, void, authorized) && self.upto(r, cutoff) {
                 any_remove = true;
                 break;
             }
@@ -1864,13 +2106,13 @@ impl<'a> Graph<'a> {
             if e > cutoff {
                 break;
             }
-            if void[e] || !authorized[e] || !self.upto(e, cutoff) {
+            if !self.live(e, void, authorized) || !self.upto(e, cutoff) {
                 continue;
             }
             let after_every_remove = self.removes_of[actor]
                 .iter()
                 .take_while(|&&(r, _)| r <= cutoff)
-                .filter(|&&(r, _)| !void[r] && authorized[r] && self.upto(r, cutoff))
+                .filter(|&&(r, _)| self.live(r, void, authorized) && self.upto(r, cutoff))
                 .all(|&(r, _)| self.before(r, e));
             if after_every_remove && self.admit_effective_upto(e, cutoff, void, authorized, scratch)
             {
@@ -1895,7 +2137,8 @@ impl<'a> Graph<'a> {
         authorized: &[bool],
         scratch: &mut AuthScratch,
     ) -> bool {
-        let cached = scratch.admit_epoch[e];
+        let at = self.slot[e];
+        let cached = scratch.admit_epoch[at];
         if cached == scratch.epoch {
             return false;
         }
@@ -1911,7 +2154,10 @@ impl<'a> Graph<'a> {
             if r > cutoff_scope {
                 break;
             }
-            if void[r] || !authorized[r] || !self.upto(r, cutoff_scope) || self.upto(e, r_cutoff) {
+            if !self.live(r, void, authorized)
+                || !self.upto(r, cutoff_scope)
+                || self.upto(e, r_cutoff)
+            {
                 continue;
             }
             let restored = self.admits_of[signer]
@@ -1919,18 +2165,17 @@ impl<'a> Graph<'a> {
                 .copied()
                 .take_while(|&e2| e2 < e)
                 .any(|e2| {
-                    !void[e2]
-                        && authorized[e2]
+                    self.live(e2, void, authorized)
                         && self.before(r, e2)
                         && self.before(e2, e)
                         && self.admit_effective_upto(e2, cutoff_scope, void, authorized, scratch)
                 });
             if !restored {
-                scratch.admit_epoch[e] = scratch.epoch;
+                scratch.admit_epoch[at] = scratch.epoch;
                 return false;
             }
         }
-        scratch.admit_epoch[e] = scratch.epoch + 1;
+        scratch.admit_epoch[at] = scratch.epoch + 1;
         true
     }
 
@@ -2010,15 +2255,10 @@ impl<'a> Graph<'a> {
         }
     }
 
-    fn effective(self) -> Effective {
-        let mut scratch = AuthScratch::new(self.records.len());
-        let candidates = self.candidates();
-        let mut memo = Memo::new();
-        let accepted = self.accepted(&candidates, &mut memo, &mut scratch);
-        let effects = self.effects(&candidates, &accepted);
-        let authorized = self.authorized(&effects.void, &mut memo, &mut scratch);
-        // `accepted` already filled the memo's empty-void key, so this is a memo hit.
-        let plain = self.authorized(&vec![false; self.records.len()], &mut memo, &mut scratch);
+    fn effective(self, weighing: &Weighing) -> Effective {
+        let mut scratch = self.scratch();
+        let (effects, authorized) = self.settled(weighing, &mut scratch);
+        let plain = self.authorized_records(&self.no_void(), &weighing.apart.plain, &mut scratch);
         let all = |_: usize| true;
         let standing = self.standing(&all, &effects.void, &effects.out, &authorized);
         let mut counts = vec![false; self.records.len()];
@@ -2036,10 +2276,8 @@ impl<'a> Graph<'a> {
                 plain: &plain,
                 authorized: &authorized,
                 void: &effects.void,
-                candidates: &candidates,
-                accepted: &accepted,
+                weighing,
             },
-            &mut memo,
             &mut scratch,
         );
         let mut keyed = vec![false; self.records.len()];
@@ -2066,18 +2304,31 @@ impl<'a> Graph<'a> {
     /// a quorum whose shares that past does not yet hold (an Undo's lone share, signed by a Mac the
     /// epoch's signer removed) was no removal where the write was signed, so it trips nothing.
     /// The view of a past without every quorum is computed only for a write some standing
-    /// `Remove` would otherwise trip, once per set of quorums that past holds.
+    /// `Remove` would otherwise trip, once per set of quorums that past holds, as a reader pass
+    /// over the weighed records (a `Remove` is one).
     fn dependents(
         &self,
         counts: &[bool],
         auth: &Authority<'_>,
-        memo: &mut Memo,
         scratch: &mut AuthScratch,
     ) -> BTreeMap<usize, Vec<usize>> {
+        let Weighing {
+            candidates,
+            accepted,
+            apart,
+            void: settled_void,
+            settled,
+        } = auth.weighing;
+        // The weighing's own passes, so a view of every quorum or of none reads them again.
+        let mut memo = Memo::from([
+            (membership_void(&self.no_void()), Arc::clone(&apart.plain)),
+            (membership_void(settled_void), Arc::clone(settled)),
+        ]);
         let mut dependents: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-        // Each set of quorums some write's past holds: the records void and authorized there.
+        // Each set of quorums some write's past holds: the weighed records void and authorized
+        // there, by slot.
         let mut views: BTreeMap<Vec<usize>, (Vec<bool>, Authorization)> = BTreeMap::new();
-        let mut voters: BTreeMap<usize, Option<BTreeSet<MemberId>>> = BTreeMap::new();
+        let no_void = self.no_void();
         for (d, record) in self.records.iter().enumerate().skip(1) {
             let (Body::Put { epoch, .. } | Body::Delete { epoch, .. }) = record.body() else {
                 continue;
@@ -2091,15 +2342,14 @@ impl<'a> Graph<'a> {
             let mut held: Option<Vec<usize>> = None;
             let mut stands_at_d = |r: usize| {
                 let held = held.get_or_insert_with(|| {
-                    auth.accepted
+                    accepted
                         .iter()
                         .copied()
                         .filter(|&q| {
-                            let cand = &auth.candidates[q];
-                            let at_cutoff = voters.entry(cand.cutoff).or_insert_with(|| {
-                                let no_void = vec![false; self.records.len()];
-                                self.members_at_cutoff(cand.cutoff, &no_void, auth.plain, scratch)
-                            });
+                            let cand = &candidates[q];
+                            // A candidate that takes effect held apart, weighed at the members
+                            // its cutoff has with nothing void.
+                            let at_cutoff = &apart.at_cutoff[&cand.cutoff];
                             let seen = Candidate {
                                 member: cand.member,
                                 cutoff: cand.cutoff,
@@ -2110,21 +2360,20 @@ impl<'a> Graph<'a> {
                                     .filter(|&share| self.before(share, d))
                                     .collect(),
                             };
-                            let no_void = vec![false; self.records.len()];
                             self.weigh_with_members(&seen, at_cutoff.as_ref(), &no_void)
                                 .holds()
                         })
                         .collect()
                 });
-                if held.len() == auth.accepted.len() {
+                if held.len() == accepted.len() {
                     return true;
                 }
                 let (void, authorized) = views.entry(held.clone()).or_insert_with(|| {
-                    let void = self.effects(auth.candidates, held).void;
-                    let authorized = self.authorized(&void, memo, scratch);
+                    let void = self.weighed_void(candidates, held);
+                    let authorized = self.authorize(&void, &mut memo, scratch);
                     (void, authorized)
                 });
-                authorized[r] && !void[r]
+                self.live(r, void, authorized)
             };
             if self.depends(d, e, counts, auth, &mut stands_at_d) {
                 dependents.entry(e).or_default().push(d);
@@ -2205,17 +2454,16 @@ impl<'a> Graph<'a> {
         usable
     }
 
-    fn historical_seat_entry(self, binding: &Binding) -> Option<RecordId> {
-        let mut scratch = AuthScratch::new(self.records.len());
-        let candidates = self.candidates();
-        let mut memo = Memo::new();
-        let accepted = self.accepted(&candidates, &mut memo, &mut scratch);
-        let effects = self.effects(&candidates, &accepted);
+    fn historical_seat_entry(self, weighing: &Weighing, binding: &Binding) -> Option<RecordId> {
         let actor = binding.actor();
-        if effects.out.contains(&actor) {
+        if weighing
+            .accepted
+            .iter()
+            .any(|&q| weighing.candidates[q].member == actor)
+        {
             return None;
         }
-        let authorized = self.authorized(&effects.void, &mut memo, &mut scratch);
+        let (effects, authorized) = self.settled(weighing, &mut self.scratch());
         let all = |_: usize| true;
         let standing = self.standing(&all, &effects.void, &effects.out, &authorized);
         if let Some(&entry) = standing.members.get(&actor) {
@@ -2272,31 +2520,25 @@ impl<'a> Graph<'a> {
         })
     }
 
-    fn has_known_actor(self, actor: &MemberId) -> bool {
+    fn has_known_actor(self, weighing: &Weighing, actor: &MemberId) -> bool {
         if self.founders().any(|seat| seat.member() == *actor) {
             return true;
         }
-        let mut scratch = AuthScratch::new(self.records.len());
-        let candidates = self.candidates();
-        let mut memo = Memo::new();
-        let accepted = self.accepted(&candidates, &mut memo, &mut scratch);
-        let effects = self.effects(&candidates, &accepted);
-        let authorized = self.authorized(&effects.void, &mut memo, &mut scratch);
+        let (effects, authorized) = self.settled(weighing, &mut self.scratch());
         let all = |_: usize| true;
         let standing = self.standing(&all, &effects.void, &effects.out, &authorized);
         standing.admits.contains_key(actor)
     }
 
-    fn historical_bindings_for_epoch(self, epoch_index: usize) -> Option<Vec<Binding>> {
+    fn historical_bindings_for_epoch(
+        self,
+        weighing: &Weighing,
+        epoch_index: usize,
+    ) -> Option<Vec<Binding>> {
         if epoch_index == 0 || epoch_index >= self.records.len() {
             return None;
         }
-        let mut scratch = AuthScratch::new(self.records.len());
-        let candidates = self.candidates();
-        let mut memo = Memo::new();
-        let accepted = self.accepted(&candidates, &mut memo, &mut scratch);
-        let effects = self.effects(&candidates, &accepted);
-        let authorized = self.authorized(&effects.void, &mut memo, &mut scratch);
+        let (effects, authorized) = self.settled(weighing, &mut self.scratch());
         let all = |_: usize| true;
         let standing = self.standing(&all, &effects.void, &effects.out, &authorized);
         let counts = |i: usize| {
@@ -2374,7 +2616,8 @@ impl<'a> Graph<'a> {
     }
 
     /// The cutoff of a quorum `Remove` of `actor` that every honest Mac holding these records
-    /// signs (§3.3.7, F16's "Undo"), by record index; `plain` is authorization with nothing void.
+    /// signs (§3.3.7, F16's "Undo"), by record index; `plain` is authorization with nothing void,
+    /// at every record, and `weighing` the log's ([`Weighing`]).
     ///
     /// `actor`'s acts are its `Admit`s and its `Remove`s of other Macs. An act is acknowledged
     /// when an independent Mac built on it before it saw a later act: an authorized record whose
@@ -2404,6 +2647,7 @@ impl<'a> Graph<'a> {
         &self,
         actor: &MemberId,
         plain: &[bool],
+        weighing: &Weighing,
         scratch: &mut AuthScratch,
     ) -> Option<usize> {
         let n = self.records.len();
@@ -2498,9 +2742,11 @@ impl<'a> Graph<'a> {
                     .min_by(|&a, &b| self.records[a].id().cmp(self.records[b].id()))
             })
         };
-        let no_void = vec![false; n];
+        let no_void = self.no_void();
         let mut reachable = |cutoff: usize| -> bool {
-            let Some(members) = self.members_at_cutoff(cutoff, &no_void, plain, scratch) else {
+            let Some(members) =
+                self.members_at_cutoff(cutoff, &no_void, &weighing.apart.plain, scratch)
+            else {
                 return false;
             };
             let voters: BTreeSet<MemberId> =
@@ -2670,7 +2916,20 @@ impl<'a> Graph<'a> {
     }
 }
 
-/// One completed authorization pass, shared by the memo and its read-only consumers.
+/// The weighed records `void` (a state of them, by slot) voids, as a set of slots: what keys an
+/// authorization pass, since records of other kinds never change authorization or voters.
+fn membership_void(void: &[bool]) -> Bits {
+    let mut bits = Bits::new(void.len());
+    for (s, &is_void) in void.iter().enumerate() {
+        if is_void {
+            bits.set(s);
+        }
+    }
+    bits
+}
+
+/// One completed reader pass: authorization at the weighed records, by slot, shared by the memo
+/// and its read-only consumers.
 type Authorization = Arc<[bool]>;
-/// Authorization under the voided membership records of a candidate set.
+/// Authorization under the voided weighed records of a candidate set.
 type Memo = BTreeMap<Bits, Authorization>;

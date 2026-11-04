@@ -3834,6 +3834,8 @@ struct TestHost {
     steps: std::sync::atomic::AtomicUsize,
     restarts: std::sync::Mutex<VecDeque<Option<&'static str>>>,
     restarted: std::sync::Mutex<Vec<&'static str>>,
+    /// The ask each restart of [`Self::restarted`] came as (`RestartAsk::word`), in order.
+    restart_asks: std::sync::Mutex<Vec<String>>,
     restartable: AtomicBool,
     backgrounds: std::sync::atomic::AtomicUsize,
     releases_at_break: AtomicBool,
@@ -3971,8 +3973,16 @@ impl IdleHost for TestHost {
     fn waiting(&self, plan: Option<crate::supervise::WaitPlan>) {
         self.told.lock().unwrap().push(plan.map(|p| p.at_unix));
     }
-    fn restart(&self, why: &crate::supervise::policy::turn_end::Restart) -> Option<String> {
+    fn restart(
+        &self,
+        why: &crate::supervise::policy::turn_end::Restart,
+        ask: &crate::supervise::policy::turn_end::RestartAsk,
+    ) -> Option<String> {
         self.restarted.lock().unwrap().push(why.word());
+        self.restart_asks
+            .lock()
+            .unwrap()
+            .push(ask.word().to_string());
         let fell = self.memory_at_restart.swap(0, Ordering::SeqCst);
         if fell > 0 {
             self.memory_mib.store(fell, Ordering::SeqCst);
@@ -5635,7 +5645,8 @@ fn a_memory_banner_is_the_hosts_restart_and_escalated_only_when_it_cannot_be() {
         let _ = std::fs::remove_dir_all(&jdir);
         let lines: Vec<String> = records.into_iter().map(|r| r.line).collect();
         let restarted = host.restarted.lock().unwrap().clone();
-        (m, lines, restarted)
+        let asks = host.restart_asks.lock().unwrap().clone();
+        (m, lines, restarted, asks)
     };
     let escalated = |m: &Mock| {
         m.requests
@@ -5646,8 +5657,12 @@ fn a_memory_banner_is_the_hosts_restart_and_escalated_only_when_it_cannot_be() {
     };
     let typed = |m: &Mock| count(m, "@s-1 turn") + count(m, "@s-1 send") + count(m, "@s-1 key");
 
-    let (m, lines, restarted) = run(vec![Some("wait:held"), Some("adopted")]);
+    let (m, lines, restarted, asks) = run(vec![Some("wait:held"), Some("adopted")]);
     assert_eq!(restarted, ["memory", "memory"], "{lines:#?}");
+    assert!(
+        matches!(asks.as_slice(), [first, again] if first == again && first.starts_with("memory@")),
+        "asked again after its deferral as the same ask of its run: {asks:?}"
+    );
     assert!(
         lines
             .iter()
@@ -5676,7 +5691,7 @@ fn a_memory_banner_is_the_hosts_restart_and_escalated_only_when_it_cannot_be() {
             "the restart could not be made (refused:line)",
         ),
     ] {
-        let (m, _, _) = run(answers);
+        let (m, _, _, _) = run(answers);
         let set = escalated(&m);
         assert!(
             set.iter().any(|r| r.contains(why)),

@@ -89,12 +89,7 @@ fn observe_case(state: &ModelState, legacy: bool, capture_late: bool) -> [(&'sta
         default_home: true,
         stored_login: true,
     };
-    let mut s = session(
-        provider,
-        Supervisor::Aterm,
-        Mode::Early,
-        Path::new("/opt/provider"),
-    );
+    let mut s = session(provider, Supervisor::Aterm, Mode::Early, &world.exe);
     if state["point"] == 1 {
         s.point = Point::Wall {
             window: "session".into(),
@@ -258,12 +253,7 @@ fn an_observation_uses_the_identity_policy_current_inside_the_writer() {
         default_home: true,
         stored_login: true,
     };
-    let s = session(
-        provider,
-        Supervisor::Aterm,
-        Mode::Early,
-        Path::new("/opt/codex"),
-    );
+    let s = session(provider, Supervisor::Aterm, Mode::Early, &world.exe);
     assert!(super::super::record_session(&world.seat(), &s, &who, &captured).is_err());
     assert_eq!(
         before,
@@ -287,12 +277,7 @@ fn the_public_session_path_refuses_wrong_identity_before_preparing_a_move() {
                 _ => directory.display().to_string(),
             };
             let env = [(provider.accounts().seam.var(), text.as_str())];
-            let mut s = session(
-                provider,
-                Supervisor::Aterm,
-                Mode::Early,
-                Path::new("/opt/provider"),
-            );
+            let mut s = session(provider, Supervisor::Aterm, Mode::Early, &world.exe);
             if !default {
                 s.env = &env;
             }

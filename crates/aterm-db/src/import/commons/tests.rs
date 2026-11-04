@@ -701,3 +701,44 @@ fn rows_older_builds_replicated_keep_validating() {
         assert!(validate(&key, &row(hint)).is_err(), "{hint}");
     }
 }
+
+/// AN IMPORT TABLE NOBODY DECLARED IS NO FAILURE TO READ ONE: `snapshot_if_declared` is `None` on a
+/// Mac with no Commons, and in a Commons that declared only another table, where `snapshot` refuses.
+/// CONTROL: once an import declares it, it reads what `snapshot` reads.
+#[test]
+fn an_import_table_nobody_declared_reads_as_none() {
+    let lab = Lab::new(&[Role::Writer]);
+    let db = Imports::at(lab.paths[0].clone());
+    let no_commons = aterm_secrets::client::Paths::for_home(&lab._home.path().join("no-commons"));
+    assert!(
+        Imports::at(no_commons)
+            .snapshot_if_declared()
+            .unwrap()
+            .is_none(),
+        "no Commons"
+    );
+    crate::accounts::proposals::Proposals::at(lab.paths[0].clone())
+        .write(
+            [1; 16],
+            vec![crate::database::Change {
+                collection: "accounts".into(),
+                key: "one".into(),
+                value: Some(aterm_json::json!({
+                    "provider":"google","method":"email-link","plan":"initial",
+                    "email":"first@example.com",
+                    "auth":[{"kind":"email-link","mailbox":"inbox","requirements":["email-access"]}]
+                })),
+            }],
+        )
+        .unwrap();
+    assert!(db.snapshot().is_err(), "PRECONDITION: undeclared");
+    assert!(
+        db.snapshot_if_declared().unwrap().is_none(),
+        "another table"
+    );
+    let source = lab._home.path().join("first.csv");
+    std::fs::write(&source, "email,google\nfirst@example.com,1\n").unwrap();
+    db.apply(&source, [41; 16]).unwrap();
+    let declared = db.snapshot_if_declared().unwrap().expect("declared");
+    assert_eq!(declared.cells, db.snapshot().unwrap().cells, "CONTROL");
+}

@@ -145,9 +145,18 @@ impl BirthAttempt {
 pub struct ObservedSpawned {
     key: BirthKey,
     child: Child,
+    custody: std::sync::Arc<()>,
 }
 
 impl ObservedSpawned {
+    /// Whether mutable borrowing still holds this receipt's exact original
+    /// Child handle. Moving it preserves identity; replacing it does not, even
+    /// if the replacement later obtains the same numeric pid.
+    #[must_use]
+    pub fn is_original_child(&self) -> bool {
+        self.child.owns_custody(&self.custody)
+    }
+
     /// The actual attempt observation, for comparison with its durable arm record.
     #[must_use]
     pub const fn key(&self) -> &BirthKey {
@@ -175,6 +184,12 @@ pub struct Spawned {
 }
 
 impl Spawned {
+    /// Whether this receipt still holds the original native child handle.
+    #[must_use]
+    pub fn is_original_child(&self) -> bool {
+        self.observed.is_original_child()
+    }
+
     /// The actual attempt observation, for comparison with its durable arm record.
     #[must_use]
     pub const fn key(&self) -> &BirthKey {
@@ -267,6 +282,7 @@ pub(super) fn observe(
     }
     match spawn() {
         Ok(child) => Ok(ObservedSpawned {
+            custody: child.custody_key(),
             key: attempt.key,
             child,
         }),
@@ -292,6 +308,42 @@ pub(super) fn observe_cohort(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mutable_child_replacement_cannot_retarget_its_birth_receipt() {
+        for dedicated in [false, true] {
+            let mut command = super::super::command("/bin/cat");
+            command.stdin(super::super::Stdio::piped());
+            let mut observed = if dedicated {
+                command
+                    .spawn_cohort(BirthAttempt::new().unwrap())
+                    .unwrap()
+                    .observed
+            } else {
+                command
+                    .spawn_observed(BirthAttempt::new().unwrap())
+                    .unwrap()
+            };
+            let mut replacement = super::super::command("/bin/cat")
+                .stdin(super::super::Stdio::piped())
+                .spawn()
+                .unwrap();
+            assert!(observed.is_original_child());
+            std::mem::swap(observed.child_mut(), &mut replacement);
+            let substituted = observed.is_original_child();
+            std::mem::swap(observed.child_mut(), &mut replacement);
+            let restored = observed.is_original_child();
+            observed.child_mut().kill().unwrap();
+            observed.child_mut().wait().unwrap();
+            replacement.kill().unwrap();
+            replacement.wait().unwrap();
+            assert!(
+                !substituted,
+                "an actual different child cannot inherit the receipt"
+            );
+            assert!(restored, "moving the original child preserves its seal");
+        }
+    }
 
     #[test]
     fn no_child_receipt_names_the_consumed_attempt() {

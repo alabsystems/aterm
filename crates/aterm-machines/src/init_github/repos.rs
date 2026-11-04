@@ -790,91 +790,35 @@ fn admit_endpoint(
     Ok(effective.to_owned())
 }
 
+/// What every step of a guarded clone checks first: that the vault snapshot the clone reads is
+/// still the current one.
 pub(super) struct CloneGuard<'a> {
-    account: Option<&'a str>,
     current: &'a (dyn Fn() -> Result<(), String> + Sync),
 }
 
 impl<'a> CloneGuard<'a> {
-    /// Clones that ask the login keychain alone for `account`'s credential, whatever git's own
-    /// settings name, each step only while `current` holds.
-    pub(super) fn pinned(
-        account: &'a str,
-        current: &'a (dyn Fn() -> Result<(), String> + Sync),
-    ) -> Self {
-        Self {
-            account: Some(account),
-            current,
-        }
-    }
-
-    /// Clones that use git's own configured credential helpers without writing or pinning the
-    /// keychain, while still verifying `current` before every step.
-    pub(super) fn current_only(current: &'a (dyn Fn() -> Result<(), String> + Sync)) -> Self {
-        Self {
-            account: None,
-            current,
-        }
+    /// Clones that check `current` before every step.
+    pub(super) fn new(current: &'a (dyn Fn() -> Result<(), String> + Sync)) -> Self {
+        Self { current }
     }
 }
 
-fn network_git(sys: &dyn System, cmd: Cmd, endpoint: &str, guard: Option<&CloneGuard<'_>>) -> Cmd {
-    let Some(account) = guard.and_then(|guard| guard.account) else {
-        return cmd;
-    };
-    // Command-line config only. The exact effective URL outranks less-specific
-    // credential settings and clears every inherited helper for this request.
-    cmd.env("GIT_ASKPASS", "").args([
-        "-c".to_owned(),
-        format!("credential.{endpoint}.helper="),
-        "-c".to_owned(),
-        format!(
-            "credential.{endpoint}.helper={}",
-            crate::git_credential::Git::keychain(sys).helper()
-        ),
-        "-c".to_owned(),
-        format!("credential.{endpoint}.username={account}"),
-        "-c".to_owned(),
-        format!("credential.{endpoint}.useHttpPath=false"),
-    ])
-}
-
-/// The exact command configuration admitted for the next network operation. A keychain
-/// credential is usable only over HTTPS; a same-repository GitHub SSH rewrite is kept in
-/// the user's configuration but outranked for this request alone.
+/// The command a clone's network step runs: `ordinary` with aterm's own credential route
+/// ([`crate::git_credential::pinned`]), once its effective URL reads as the listed repository's
+/// ([`admit_endpoint`]). The person's URL rewrites stay theirs; no helper their files name runs.
 fn clone_command(
     sys: &dyn System,
+    user: &User,
     ordinary: Cmd,
     owner: &str,
     repo: &Repo,
     url: &str,
-    guard: Option<&CloneGuard<'_>>,
 ) -> Result<Cmd, String> {
-    let endpoint = admit_endpoint(sys, &ordinary, owner, repo, url)?;
-    if guard.and_then(|guard| guard.account).is_none() {
-        return Ok(ordinary);
-    }
-    let rewritten = !endpoint.starts_with("https://github.com/");
-    let mut command = network_git(
-        sys,
+    admit_endpoint(sys, &ordinary, owner, repo, url)?;
+    Ok(crate::git_credential::pinned(
         ordinary,
-        if rewritten { url } else { &endpoint },
-        guard,
-    );
-    if rewritten {
-        command = canonical_https(command, url);
-    }
-    // Use the very same -c options for admission and the network operation. In particular,
-    // an equally specific conflicting rewrite must still fail instead of falling back to SSH.
-    let admitted = admit_endpoint(sys, &command, owner, repo, url)?;
-    if !admitted.starts_with("https://github.com/") || (rewritten && admitted != url) {
-        return Err("the keychain's GitHub credential this clone pins needs a GitHub HTTPS endpoint (a url.insteadOf rewrite names another); no clone started".into());
-    }
-    Ok(command)
-}
-
-fn canonical_https(command: Cmd, url: &str) -> Cmd {
-    command.args(["-c".to_owned(), format!("url.{url}.insteadOf={url}")])
+        super::helper(sys, user).as_ref(),
+    ))
 }
 
 #[cfg(test)]
@@ -882,7 +826,6 @@ pub(super) fn clone_one_guarded(
     sys: &dyn System,
     user: &User,
     repo: &Repo,
-    account: &str,
     current: &(dyn Fn() -> Result<(), String> + Sync),
 ) -> Result<(), String> {
     clone_one_with(
@@ -890,7 +833,7 @@ pub(super) fn clone_one_guarded(
         user,
         &repo.owner,
         repo,
-        Some(&CloneGuard::pinned(account, current)),
+        Some(&CloneGuard::new(current)),
         None,
     )
 }
@@ -1027,7 +970,7 @@ fn clone_one_with(
     }
     let url = format!("https://github.com/{owner}/{}.git", repo.name);
     current()?;
-    let command = clone_command(sys, git(sys, user, None), owner, repo, &url, guard)?;
+    let command = clone_command(sys, user, git(sys, user, None), owner, repo, &url)?;
     let source = text(
         sys,
         &command.args([
@@ -1066,7 +1009,7 @@ fn clone_one_with(
     // Refuse a changed route before allocating staging; check again after staging is
     // ready so the eventual network command does not reuse an earlier admission.
     current()?;
-    clone_command(sys, git(sys, user, None), owner, repo, &url, guard)?;
+    clone_command(sys, user, git(sys, user, None), owner, repo, &url)?;
     let mut staging = match staging {
         Some(staging) => staging,
         None => Scratch::new_in(sys, home, "github-clone")
@@ -1084,7 +1027,7 @@ fn clone_one_with(
     let _ = sys.rename(&marking, &staging.path().join(OWNER));
     let clone = staging.path().join("repo");
     current()?;
-    let command = clone_command(sys, git(sys, user, None), owner, repo, &url, guard)?
+    let command = clone_command(sys, user, git(sys, user, None), owner, repo, &url)?
         .budget(CLONE_BUDGET)
         .args([
             "clone",
@@ -1314,7 +1257,7 @@ fn verify_new(
 pub(super) mod tests {
     use super::*;
     use crate::engine::{self, NoJournal};
-    use crate::git_credential::{GITHUB, script};
+    use crate::git_credential::script;
     use crate::items::defaults::tests::{ctx, user};
     use crate::model::{Mode, Outcome};
     use crate::port::{Fake, GithubResponse, Live, Ran, Stat};
@@ -1323,7 +1266,9 @@ pub(super) mod tests {
     mod clone_route_tests;
     mod staging_tests;
 
-    const KEYCHAIN: &str = "fixture_keychain_token_only";
+    const TOKEN: &str = "fixture_synced_token_only";
+    /// alice's token file, as the vault leaves it.
+    const SOURCE: &str = "/Users//alice/.secrets/github";
     const BASE: &str =
         "/user/repos?affiliation=owner&visibility=all&per_page=30&sort=full_name&direction=asc";
     const A: &str = "1111111111111111111111111111111111111111";
@@ -1344,13 +1289,13 @@ pub(super) mod tests {
         Github {
             account: "alice".into(),
             owner: "alice".into(),
-            token_file: "/unread-credential-source".into(),
+            token_file: SOURCE.into(),
             token_key: None,
         }
     }
 
     fn token() -> Secret {
-        Secret::new(KEYCHAIN.as_bytes()).unwrap()
+        Secret::new(TOKEN.as_bytes()).unwrap()
     }
 
     fn fixture() -> (Fake, User, Github) {
@@ -1359,8 +1304,21 @@ pub(super) mod tests {
         sys.euid = who.uid;
         sys.stat_of(&who.home, directory(who.uid));
         sys.file(crate::items::github::CLT_GIT, b"synthetic git");
-        script::configured(&sys, &who, "alice");
-        script::holds(&sys, Some(&who), GITHUB, "alice", KEYCHAIN);
+        // Her token file, which aterm's route over that file hands back.
+        sys.file(SOURCE, TOKEN.as_bytes()).stat_of(
+            SOURCE,
+            Stat {
+                uid: who.uid,
+                gid: 20,
+                mode: 0o600,
+                dir: false,
+                symlink: false,
+                len: TOKEN.len() as u64,
+            },
+        );
+        script::launcher(&sys, &who);
+        let helper = config().helper(&sys, &who).expect("the launcher is there");
+        script::hands_back(&sys, &who, &helper, TOKEN);
         sys.on_github_api(&who, "/user", json(r#"{"login":"alice"}"#));
         (sys, who, config())
     }
@@ -1622,7 +1580,7 @@ pub(super) mod tests {
             }
             script_read(&sys, &who, &dirty, "dirty", " M README\0");
             sys.on(
-                &git(&sys, &who, Some(&dirty))
+                &crate::checkout::network(&sys, &who, Some(&dirty))
                     .args(["ls-remote", "--symref", "origin", "HEAD"])
                     .display(),
                 Ran::ok(&format!("ref: refs/heads/main\tHEAD\n{B}\tHEAD\n")),
@@ -1642,7 +1600,8 @@ pub(super) mod tests {
                     }
                     let mut state = state.lock().unwrap();
                     let (head, fetched) = (state.0.clone(), state.1);
-                    Some(match args[2..].join(" ").as_str() {
+                    let line = args[2..].join(" ");
+                    Some(match script::without_route(&line) {
                         "rev-parse --verify --quiet HEAD^{commit}" => Ran::ok(&format!("{head}\n")),
                         "ls-remote --symref origin HEAD" => {
                             Ran::ok(&format!("ref: refs/heads/main\tHEAD\n{B}\tHEAD\n"))
@@ -1872,7 +1831,7 @@ pub(super) mod tests {
         // 8 GiB above the floor: room for one clone of about 5 GiB, not for two.
         sys.volume = Some(volume(16 * GIB));
         let sized = |name: &str, sequence| {
-            let (mut repo, _, _) = script_clone_named(&sys, &who, name, sequence, false, None);
+            let (mut repo, _, _) = script_clone_named(&sys, &who, name, sequence, false);
             repo.size_kib = GIB / 1024;
             repo
         };
@@ -1913,7 +1872,7 @@ pub(super) mod tests {
             script_existing(&sys, &who, &present, "present");
             script_read(&sys, &who, &present, "present", "");
             sys.on(
-                &git(&sys, &who, Some(&present))
+                &crate::checkout::network(&sys, &who, Some(&present))
                     .args(["ls-remote", "--symref", "origin", "HEAD"])
                     .display(),
                 Ran::exit(128, stderr),
@@ -1978,20 +1937,13 @@ pub(super) mod tests {
             sys.stat_of(aterm.to_str().unwrap(), directory(who.uid));
             script_existing(&sys, &who, &aterm, "aterm");
             script_read(&sys, &who, &aterm, "aterm", "");
-            let remote_head = git(&sys, &who, Some(&aterm))
-                .args(["ls-remote", "--symref", "origin", "HEAD"])
-                .display();
-            sys.on(
-                &remote_head,
-                Ran::ok(&format!("ref: refs/heads/main\tHEAD\n{A}\tHEAD\n")),
-            );
             sys.on_github_api(
                 &who,
                 &format!("{BASE}&page=1"),
                 page(vec![value("aterm", 1, true)], None),
             );
             let mut profile = "[github]\naccount = \"alice\"\nowner = \"alice\"\ntoken_file = \
-                               \"/unread-credential-source\"\n"
+                               \"~/.secrets/github\"\n"
                 .to_owned();
             if develop {
                 profile.push_str("\n[develop]\ncheckouts = [\"~/aterm\"]\n");
@@ -2003,6 +1955,14 @@ pub(super) mod tests {
                 0o600,
             )
             .unwrap();
+            // After the profile: its `token_file` is what the route's helper names.
+            let remote_head = crate::checkout::network(&sys, &who, Some(&aterm))
+                .args(["ls-remote", "--symref", "origin", "HEAD"])
+                .display();
+            sys.on(
+                &remote_head,
+                Ran::ok(&format!("ref: refs/heads/main\tHEAD\n{A}\tHEAD\n")),
+            );
             let ctx = ctx(std::slice::from_ref(&who));
             let items = crate::init_github::items(&sys, &ctx, None).unwrap();
             let repositories = items
@@ -2123,16 +2083,7 @@ pub(super) mod tests {
     }
 
     fn script_clone(sys: &Fake, who: &User, empty: bool) -> (Repo, PathBuf, String) {
-        script_clone_with(sys, who, empty, None)
-    }
-
-    fn script_clone_with(
-        sys: &Fake,
-        who: &User,
-        empty: bool,
-        guard: Option<&CloneGuard<'_>>,
-    ) -> (Repo, PathBuf, String) {
-        script_clone_named(sys, who, "new", 0, empty, guard)
+        script_clone_named(sys, who, "new", 0, empty)
     }
 
     /// A clone of github.com/alice/`name` into the `sequence`th staging directory the run
@@ -2143,18 +2094,18 @@ pub(super) mod tests {
         name: &str,
         sequence: u64,
         empty: bool,
-        guard: Option<&CloneGuard<'_>>,
     ) -> (Repo, PathBuf, String) {
-        script_clone_named_route(sys, who, name, sequence, empty, guard, false)
+        script_clone_named_route(sys, who, name, sequence, empty, false)
     }
 
+    /// [`script_clone_named`], its effective URL a same-repository SSH rewrite when `rewritten`:
+    /// the person's own URL, which the clone keeps, under aterm's credential route.
     pub(in crate::init_github) fn script_clone_named_route(
         sys: &Fake,
         who: &User,
         name: &str,
         sequence: u64,
         empty: bool,
-        guard: Option<&CloneGuard<'_>>,
         rewritten: bool,
     ) -> (Repo, PathBuf, String) {
         let repo = Repo {
@@ -2178,22 +2129,7 @@ pub(super) mod tests {
                 .display(),
             Ran::ok(&endpoint),
         );
-        let route = || {
-            let command = network_git(sys, git(sys, who, None), url, guard);
-            if rewritten {
-                canonical_https(command, url)
-            } else {
-                command
-            }
-        };
-        if guard.and_then(|guard| guard.account).is_some() {
-            sys.on(
-                &route()
-                    .args(["ls-remote", "--get-url", "--", url])
-                    .display(),
-                Ran::ok(url),
-            );
-        }
+        let route = || crate::checkout::network(sys, who, None);
         let remote = if empty {
             String::new()
         } else {
@@ -2331,12 +2267,10 @@ pub(super) mod tests {
                     Ok(())
                 }
             };
-            let guard = CloneGuard::pinned("captured-account", &current);
-            let (repo, _staged, _) = script_clone_with(&sys, &who, false, Some(&guard));
+            let (repo, _staged, _) = script_clone(&sys, &who, false);
             let latch = sys.boundary.latch_handoff(Duration::from_secs(60));
             let result = std::thread::scope(|scope| {
-                let worker = scope
-                    .spawn(|| clone_one_guarded(&sys, &who, &repo, "captured-account", &current));
+                let worker = scope.spawn(|| clone_one_guarded(&sys, &who, &repo, &current));
                 let deadline = std::time::Instant::now() + Duration::from_secs(60);
                 while sys.boundary.waiting() == 0 {
                     assert!(
@@ -2422,8 +2356,10 @@ pub(super) mod tests {
         }
     }
 
+    /// A guarded clone carries aterm's credential route and no keychain helper, and refuses to
+    /// go on once the vault snapshot changed.
     #[test]
-    fn guarded_clones_pin_the_snapshot_helper_and_refuse_newer_versions() {
+    fn guarded_clones_carry_the_route_and_refuse_newer_versions() {
         for changed in [false, true] {
             let (sys, who, _) = fixture();
             let current = || {
@@ -2433,9 +2369,8 @@ pub(super) mod tests {
                     Ok(())
                 }
             };
-            let guard = CloneGuard::pinned("captured-account", &current);
-            let (repo, _staged, _) = script_clone_with(&sys, &who, false, Some(&guard));
-            let result = clone_one_guarded(&sys, &who, &repo, "captured-account", &current);
+            let (repo, _staged, _) = script_clone(&sys, &who, false);
+            let result = clone_one_guarded(&sys, &who, &repo, &current);
             assert_eq!(result.is_ok(), !changed, "{result:?}");
             let final_path = Path::new(&who.home).join("new");
             assert_eq!(sys.stat(&final_path).is_ok(), !changed);
@@ -2448,9 +2383,9 @@ pub(super) mod tests {
             assert!(
                 network
                     .iter()
-                    .all(|call| call.contains(".helper=osxkeychain")
-                        && call.contains(".username=captured-account")
-                        && call.contains(".useHttpPath=false"))
+                    .all(|call| call.contains("-c credential.helper= ")
+                        && !call.contains("osxkeychain")),
+                "{network:?}"
             );
             assert!(calls.iter().all(|call| !call.contains("--global")));
             assert_eq!(
@@ -2459,45 +2394,6 @@ pub(super) mod tests {
                     .any(|call| call.starts_with("rename-noreplace ")),
                 !changed
             );
-        }
-    }
-
-    #[test]
-    fn guarded_clones_refuse_an_ssh_rewrite_that_still_wins_the_scoped_override() {
-        for endpoint in [
-            "git@github.com:alice/new.git",
-            "ssh://git@github.com/alice/new.git",
-        ] {
-            let (sys, who, _) = fixture();
-            let repo = Repo {
-                owner: "alice".into(),
-                name: "new".into(),
-                default_branch: Some("main".into()),
-                size_kib: 0,
-                fork: false,
-                archived: false,
-            };
-            let url = "https://github.com/alice/new.git";
-            sys.on(
-                &git(&sys, &who, None)
-                    .args(["ls-remote", "--get-url", "--", url])
-                    .display(),
-                Ran::ok(endpoint),
-            );
-            let guard = CloneGuard::pinned("alice", &|| Ok(()));
-            sys.on(
-                &canonical_https(
-                    network_git(&sys, git(&sys, &who, None), url, Some(&guard)),
-                    url,
-                )
-                .args(["ls-remote", "--get-url", "--", url])
-                .display(),
-                Ran::ok(endpoint),
-            );
-            assert!(clone_one_guarded(&sys, &who, &repo, "alice", &|| Ok(())).is_err());
-            assert!(sys.calls().iter().all(|call| !call.contains("--symref")
-                && !call.contains(" clone ")
-                && !call.contains("scratch")));
         }
     }
 

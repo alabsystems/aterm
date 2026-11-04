@@ -164,6 +164,19 @@ mod tests {
             super::duration_to_millis_saturating(Duration::from_secs(u64::MAX)),
             u64::MAX
         );
+        let max_whole_ms_secs = u64::MAX / 1_000;
+        assert_eq!(
+            super::duration_to_millis_saturating(Duration::new(max_whole_ms_secs, 614_999_999)),
+            u64::MAX - 1
+        );
+        assert_eq!(
+            super::duration_to_millis_saturating(Duration::new(max_whole_ms_secs, 615_999_999)),
+            u64::MAX
+        );
+        assert_eq!(
+            super::duration_to_millis_saturating(Duration::new(max_whole_ms_secs, 616_000_000)),
+            u64::MAX
+        );
 
         let now = SystemTime::now();
         let d = super::since_epoch_at(now).expect("wall clock is at or after the Unix epoch");

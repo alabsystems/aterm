@@ -6,20 +6,24 @@
 //! member reads it from, the member's signed [`Allowed`], and then one of two payloads
 //! ([`Handed`]):
 //!
-//! - **The membership log** (`alab-join-bundle/2`, F15), where the member's vault has one and
+//! - **The membership log** (`alab-join-bundle/3`, F15), where the member's vault has one and
 //!   the member holds a seat and its epochs: the id of the `Admit` the member signed for the new
-//!   Mac, and the member's whole record store, from the genesis through that `Admit` and its
-//!   `Wrap`s. The new Mac checks the path to the genesis and reads its files from the log.
+//!   Mac, and the member's complete record history, from the genesis through that `Admit` and its
+//!   `Wrap`s, with the source's capacity and crossed state. The new Mac checks the path to the
+//!   genesis and reads its files from the log. Version two carries no source bound and is
+//!   reserved for explicitly negotiated legacy readers and uncrossed history.
 //! - **The member's `[everyone]` files** (`alab-join-bundle/1`, the F10 interim), as locker
 //!   text, everywhere else: a vault with no log (ALab until F12b), or a member with no seat in
 //!   it. An admin's approver then records the admission.
 
 use super::Allowed;
+use crate::crossing::RecordsBound;
 use crate::membership_log::{MAX_RECORDS_STREAM, RecordId};
 use crate::{Error, Result, SecretBytes};
 
 const HEADER: &str = "alab-join-bundle/1";
 const HEADER_LOG: &str = "alab-join-bundle/2";
+const HEADER_BOUNDED_LOG: &str = "alab-join-bundle/3";
 /// The largest bundle either side handles, sealed or opened: a whole record store
 /// ([`MAX_RECORDS_STREAM`]) and its header lines.
 pub const MAX_BUNDLE: usize = MAX_RECORDS_STREAM + (1 << 16);
@@ -27,6 +31,31 @@ pub const MAX_BUNDLE: usize = MAX_RECORDS_STREAM + (1 << 16);
 const MAX_FILES: usize = 1 << 20;
 const MAX_SERVERS: usize = 8;
 const MAX_FOLLOWED: usize = 64;
+
+/// The joining device's explicit payload and capacity capability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reader {
+    /// An older device asks for the files payload and cannot take a membership log.
+    Files,
+    /// Version two reads a complete, uncrossed legacy log.
+    LegacyLog,
+    /// Version three states its own capacity and crossed history.
+    BoundedLog(RecordsBound),
+}
+
+impl Reader {
+    pub(crate) const fn reads_log(self) -> bool {
+        !matches!(self, Self::Files)
+    }
+
+    pub(crate) const fn can_take(self, source: RecordsBound) -> bool {
+        match self {
+            Self::Files => false,
+            Self::LegacyLog => source.held != 0 && !source.crossed,
+            Self::BoundedLog(peer) => peer.can_exchange(source),
+        }
+    }
+}
 
 /// One join bundle. Its files are wiped with it.
 pub struct Bundle {
@@ -48,9 +77,11 @@ pub struct Bundle {
 pub enum Handed {
     /// The F10 interim: the member's `[everyone]` entries, as one `[everyone]` locker's text.
     Files(SecretBytes),
-    /// F15: the member's `Admit` of the new Mac, and every record the member holds (that
+    /// F15: the member's `Admit` of the new Mac, and every complete record it holds (that
     /// `Admit` and its `Wrap`s included), as one record stream.
     Log {
+        /// The source's capacity and crossed state; `None` is the legacy version-two wire.
+        source: Option<RecordsBound>,
         /// The `Admit`'s id.
         admit: RecordId,
         /// The records, genesis first ([`crate::membership_log::Store::encode`]).
@@ -63,7 +94,10 @@ impl Handed {
     const fn header(&self) -> &'static str {
         match self {
             Handed::Files(_) => HEADER,
-            Handed::Log { .. } => HEADER_LOG,
+            Handed::Log { source: None, .. } => HEADER_LOG,
+            Handed::Log {
+                source: Some(_), ..
+            } => HEADER_BOUNDED_LOG,
         }
     }
 }
@@ -104,10 +138,12 @@ impl Bundle {
     }
 
     /// Its text: a header, one `key value` line per field, then `files` and the locker text, or
-    /// `admit <id>`, `records` and the record stream.
+    /// a version-three `records-bound` line, `admit <id>`, `records` and the record stream.
+    /// A legacy version-two log bundle omits the bound line.
     ///
     /// # Errors
-    /// The bundle would exceed [`MAX_BUNDLE`], or a field cannot be written on one line.
+    /// The bundle would exceed [`MAX_BUNDLE`], a field cannot be written on one line, or the
+    /// source records bound is invalid.
     pub fn encode(&self) -> Result<SecretBytes> {
         if !crate::envelope::valid_name(&self.vault)
             || self.servers.is_empty()
@@ -138,11 +174,22 @@ impl Bundle {
                 head.push_str("files\n");
                 files.as_slice()
             }
-            Handed::Log { admit, records } => {
+            Handed::Log {
+                source,
+                admit,
+                records,
+            } => {
                 if records.len() > MAX_RECORDS_STREAM {
                     return Err(Error::new(
                         "this Mac's records exceed a join bundle's bound",
                     ));
+                }
+                if let Some(source) = source {
+                    let value = source.value();
+                    if RecordsBound::parse(&value) != Some(*source) {
+                        return Err(Error::new("this Mac's records bound is invalid"));
+                    }
+                    head.push_str(&format!("records-bound {value}\n"));
                 }
                 head.push_str(&format!("admit {}\nrecords\n", super::wire::hex(admit)));
                 records.as_slice()
@@ -169,9 +216,10 @@ impl Bundle {
             rest = &tail[1..];
             std::str::from_utf8(head).map_err(|_| bad())
         };
-        let log = match line()? {
-            HEADER => false,
-            HEADER_LOG => true,
+        let (log, bounded) = match line()? {
+            HEADER => (false, false),
+            HEADER_LOG => (true, false),
+            HEADER_BOUNDED_LOG => (true, true),
             _ => return Err(bad()),
         };
         let vault = line()?
@@ -204,6 +252,16 @@ impl Bundle {
             return Err(bad());
         }
         let handed = if log {
+            let source = if bounded {
+                Some(
+                    line()?
+                        .strip_prefix("records-bound ")
+                        .and_then(RecordsBound::parse)
+                        .ok_or_else(bad)?,
+                )
+            } else {
+                None
+            };
             let admit = line()?
                 .strip_prefix("admit ")
                 .and_then(super::wire::unhex::<32>)
@@ -212,6 +270,7 @@ impl Bundle {
                 return Err(bad());
             }
             Handed::Log {
+                source,
                 admit,
                 records: rest.to_vec(),
             }

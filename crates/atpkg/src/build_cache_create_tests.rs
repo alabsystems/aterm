@@ -678,7 +678,7 @@ fn an_adopted_target_stays_while_its_workspace_does_and_is_retired_once_it_goes(
         super::super::reclaim(
             &world.home,
             later,
-            super::super::super::RECLAIM_GONE,
+            super::super::super::ReclaimAfter::CALM,
             None,
             &mut |_, _| true,
         )

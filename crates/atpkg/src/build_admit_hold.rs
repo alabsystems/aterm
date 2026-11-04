@@ -46,7 +46,8 @@ pub const SURVIVORS_HELD_WITHIN: std::time::Duration = std::time::Duration::from
 pub const SURVIVORS_IDLE_UNDER: u64 = 64 << 20;
 
 /// The longest a killed build's survivors keep its claim once their footprint stopped growing:
-/// `supervise`'s bound for what a killed build leaves ([`super::TREE_ENDS_WITHIN`]). Memory they
+/// `supervise`'s grace for what a killed build leaves, before it is killed
+/// ([`super::TREE_ENDS_WITHIN`]). Memory they
 /// hold still is counted by every reading of the machine; what the claim held beyond it was room
 /// for them to grow.
 #[cfg(unix)]
@@ -266,6 +267,7 @@ fn hold(words: &Words) -> u8 {
         claim,
         key: words.key.clone(),
         own: words.own.clone(),
+        cohort: false,
     };
     let held = match end {
         End::Status(status) if libc::WIFSIGNALED(status) => survive(held, &meter, words),
@@ -463,25 +465,51 @@ impl Survival {
 
 /// KEEP THE CLAIM FOR THE BUILD'S SURVIVORS while they work ([`Survival`]): credit them with their
 /// use, read again every [`aterm_capacity::tree_meter::READ_EVERY`], and come back once a look lets
-/// it go, or the front's pid is another process's.
+/// it go, or the front's pid is another process's. A read of the known group that fails
+/// ([`aterm_capacity::tree_meter::Survivors::Unread`]) lets nothing go: it is no reading of
+/// none left, so the claim is kept to the next read, [`SURVIVORS_HELD_WITHIN`] from the
+/// build's death at the latest. Where no read ever found the group
+/// ([`aterm_capacity::tree_meter::Survivors::Unobserved`]) no survivor was ever observed to
+/// keep the claim for, and it goes at once, as a read of none did.
 #[cfg(target_os = "macos")]
 fn survive(
     mut held: super::Held,
     meter: &aterm_capacity::tree_meter::TreeMeter,
     words: &Words,
 ) -> super::Held {
+    use aterm_capacity::tree_meter::Survivors;
     let from = std::time::Instant::now();
     let mut judged = Survival::default();
     let mut credited: Vec<u32> = Vec::new();
     let pid = i32::try_from(words.pid).unwrap_or(0);
     loop {
-        #[cfg(not(any(test, debug_assertions)))]
-        let (mut now, footprint) = meter.survivors_using();
+        let (mut now, footprint) = match meter.survivors_using_observed() {
+            Survivors::Read(now, footprint) => (now, footprint),
+            Survivors::Unobserved => {
+                #[cfg(any(test, debug_assertions))]
+                trace_record(
+                    || aterm_json::json!({"kind": "survival-ended", "reason": "survivors-unobserved"}),
+                );
+                return held;
+            }
+            Survivors::Unread => {
+                if from.elapsed() >= SURVIVORS_HELD_WITHIN {
+                    #[cfg(any(test, debug_assertions))]
+                    trace_record(|| {
+                        aterm_json::json!({
+                            "kind": "survival-ended", "reason": format!("{:?}", Gone::Spent),
+                        })
+                    });
+                    return held;
+                }
+                std::thread::sleep(aterm_capacity::tree_meter::READ_EVERY);
+                meter.read();
+                continue;
+            }
+        };
         #[cfg(any(test, debug_assertions))]
-        let (mut now, footprint) = {
+        {
             let observed = meter.survivors_observed();
-            let now = observed.pids;
-            let footprint = observed.footprint;
             trace_record(|| {
                 let members: Vec<_> = observed
                     .members
@@ -499,8 +527,7 @@ fn survive(
                     "members": members, "footprint": footprint,
                 })
             });
-            (now, footprint)
-        };
+        }
         now.sort_unstable();
         if let Some(gone) = judged.look(from.elapsed(), !now.is_empty(), footprint) {
             #[cfg(any(test, debug_assertions))]

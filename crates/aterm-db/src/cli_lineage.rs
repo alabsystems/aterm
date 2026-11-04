@@ -22,7 +22,7 @@ fn read_at(paths: &Paths, deadline: Instant) -> Result<Value> {
         return Err(Error::new("Commons lineage observation expired"));
     }
     let bindings = crate::application_lineage_until(paths, deadline)
-        .map_err(|_| Error::new("Commons lineage is unavailable or changed"))?;
+        .map_err(|error| error.context("Commons lineage"))?;
     if Instant::now() >= deadline {
         return Err(Error::new("Commons lineage observation expired"));
     }

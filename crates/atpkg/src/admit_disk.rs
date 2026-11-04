@@ -6,7 +6,7 @@
 //! ledger (`aterm_capacity`), what their last runs of that kind wrote ([`aterm_capacity::Footprints`]),
 //! or, where none was measured here, the kind's cold budget less what its directories hold. A
 //! volume short of it is relieved first: the build cache's pass under pressure
-//! ([`crate::build_cache::RECLAIM_GONE_UNDER_PRESSURE`]) and, inside aterm, the window's disk
+//! ([`crate::build_cache::ReclaimAfter::for_claim`]) and, inside aterm, the window's disk
 //! watch asked for the room (`await sys free>=`). Then the run waits, saying once a minute what
 //! it needs, what is free and what holds the most, instead of failing at `ENOSPC` hours in,
 //! having said first why it needs that ([`aterm_capacity::Estimate`]). A
@@ -25,6 +25,9 @@
 //! when it grew, and the run's writes are measured from it ([`Sizing`]).
 //! SIGINT, SIGTERM or SIGHUP ends the claim, its measuring and its relief within a second
 //! ([`aterm_toolchain::interrupt`]), with [`Error::Stopped`] and nothing left in the ledger.
+//! Under `--admit now`, which relieves nothing and measures before any wait, only the claim's
+//! wait for the ledger's lock ends so, and a signal during its measuring reaches the process's
+//! own handling.
 //! While it runs, its own measure of its writes is its claim's progress
 //! ([`aterm_capacity::Meter`]), and what it took is kept for the next run, tagged with the
 //! directories it measured ([`dirs_tag`]) and what it built there ([`scope_tag`]): a run tagged
@@ -375,8 +378,17 @@ pub type Passed = (u64, Vec<PathBuf>, Vec<String>);
 /// is left of its work once it says so.
 pub type Stopped<'a> = &'a dyn Fn() -> bool;
 
-/// The build cache's pass under pressure, given the short volume's mount.
-pub type Pass = Box<dyn FnMut(&Path, Stopped<'_>) -> Passed>;
+/// What the build cache's pass under pressure reads of a short volume.
+#[derive(Clone, Copy, Debug)]
+pub struct Room<'a> {
+    /// The short volume's mount.
+    pub mount: &'a Path,
+    /// How long what it takes must stand unwritten.
+    pub after: crate::build_cache::ReclaimAfter,
+}
+
+/// The build cache's pass under pressure, given the short volume.
+pub type Pass = Box<dyn FnMut(Room<'_>, Stopped<'_>) -> Passed>;
 
 /// The window's disk watch asked for a number of bytes free on the volume mounted at a path:
 /// its answer, or `None` outside aterm.
@@ -388,7 +400,7 @@ pub type Largest = Box<dyn FnMut(&Path, Stopped<'_>) -> Vec<(PathBuf, u64)>>;
 /// WHAT A SHORT VOLUME IS RELIEVED BY before a run waits on it, and who a wait line names as
 /// holding the rest.
 pub struct Reclaim {
-    /// The build cache's pass under pressure, given the short volume's mount.
+    /// The build cache's pass under pressure, given the short volume.
     pass: Pass,
     /// The window's disk watch asked for `bytes` free on the volume mounted at `mount`: its
     /// answer, or `None` outside aterm.
@@ -416,9 +428,9 @@ impl Reclaim {
         }
     }
 
-    /// The live relief: [`crate::build_cache::reclaim_home_watched`] with
-    /// [`crate::build_cache::RECLAIM_GONE_UNDER_PRESSURE`] where the build cache is on the short
-    /// volume ([`cache_on`]), keeping `own` (the run's directories, [`recorder`]), then inside
+    /// The live relief: [`crate::build_cache::reclaim_home_watched`] where the build cache is on
+    /// the short volume ([`cache_on`]), by [`Room::after`], keeping `own` (the run's directories,
+    /// [`recorder`]), then inside
     /// aterm `aterm ctl @self await sys free>=<bytes> vol=<mount>` for up to [`ASK_FOR`]; the
     /// largest holders are the build cache's directories on the volume and `own`. Once an
     /// interrupt came, the pass is left behind removing nothing more ([`on_thread`]), the ask
@@ -427,23 +439,24 @@ impl Reclaim {
     pub fn live(own: &[PathBuf]) -> Reclaim {
         let (keep, own) = (own.to_vec(), own.to_vec());
         Reclaim::of(
-            Box::new(move |mount, stopped| {
-                if !cache_on(mount) {
+            Box::new(move |room: Room<'_>, stopped| {
+                if !cache_on(room.mount) {
                     return (0, Vec::new(), Vec::new());
                 }
-                let before = free_on(mount);
+                let before = free_on(room.mount);
                 let keep = keep.clone();
+                let after = room.after;
                 let (removed, stayed) = on_thread(stopped, move |halt| {
                     let mut removed = Vec::new();
                     let went = crate::build_cache::reclaim_home_watched(
-                        crate::build_cache::RECLAIM_GONE_UNDER_PRESSURE,
+                        after,
                         None,
                         &mut recorder(&keep, halt, &mut removed),
                     );
                     (went_of(removed, &went), stayed_notes(&went))
                 })
                 .unwrap_or_default();
-                (free_on(mount).saturating_sub(before), removed, stayed)
+                (free_on(room.mount).saturating_sub(before), removed, stayed)
             }),
             Box::new(ask_watch),
             Box::new(move |mount, stopped| largest_on(mount, &own, stopped)),
@@ -464,8 +477,11 @@ impl Reclaim {
 /// rewrite at the kind's cold budget), which the keep trades for the warm build: the pass is not
 /// sized to the run's shortfall, so it would take that build whenever it ran, even when the rest
 /// it freed was room enough, and where it was not, the run's wait line names that directory
-/// among the largest holders. A part of a directory the run uses that no build reads again
-/// (`Unused::Stale`, staged beside it) goes.
+/// among the largest holders. It takes all it may, since a look still short after it asks it again
+/// only where its need grew or, for a need that could not fit, where a claim its last call did not
+/// count now reserves that disk ([`aterm_capacity::Relief`]). A stale part of a directory the run
+/// uses (`Unused::Stale`, staged beside it) goes: below the floor, where stale means an hour
+/// unwritten, that can cost the run a cold compile.
 fn recorder<'a>(
     own: &'a [PathBuf],
     halt: &'a AtomicBool,
@@ -494,10 +510,14 @@ fn recorder<'a>(
 
 impl Relief for Reclaim {
     fn relieve(&mut self, short: &Shortfall, say: &mut dyn FnMut(&str), stopped: Stopped<'_>) {
-        let Some((need, mount, floor, reserved)) = disk_short(short) else {
+        let Some((need, mount, floor, reserved, above_floor)) = disk_short(short) else {
             return;
         };
-        let (freed, removed, stayed) = (self.pass)(&mount, stopped);
+        let room = Room {
+            mount: &mount,
+            after: crate::build_cache::ReclaimAfter::for_claim(above_floor == 0),
+        };
+        let (freed, removed, stayed) = (self.pass)(room, stopped);
         self.touched |= !removed.is_empty();
         if stopped() {
             return;
@@ -538,7 +558,7 @@ impl Relief for Reclaim {
     }
 
     fn holders(&mut self, short: &Shortfall, stopped: Stopped<'_>) -> Option<String> {
-        let (_, mount, _, _) = disk_short(short)?;
+        let (_, mount, ..) = disk_short(short)?;
         let named = self.named.get_or_insert_with(|| {
             let found = (self.largest)(&mount, stopped);
             if found.is_empty() {
@@ -554,16 +574,16 @@ impl Relief for Reclaim {
     }
 }
 
-/// The disk a shortfall is short of: `(need, mount, floor, reserved)`.
-fn disk_short(short: &Shortfall) -> Option<(u64, PathBuf, u64, u64)> {
+/// The disk a shortfall is short of: `(need, mount, floor, reserved, above_floor)`.
+fn disk_short(short: &Shortfall) -> Option<(u64, PathBuf, u64, u64, u64)> {
     short.shorts.iter().find_map(|s| match s {
         Short::Disk {
             need,
             mount,
             floor,
             reserved,
-            ..
-        } => Some((*need, mount.clone(), *floor, *reserved)),
+            above_floor,
+        } => Some((*need, mount.clone(), *floor, *reserved, *above_floor)),
         _ => None,
     })
 }

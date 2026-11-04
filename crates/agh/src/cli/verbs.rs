@@ -944,7 +944,7 @@ pub static VERBS: &[Verb] = &[
     Verb {
         path: &["api"],
         class: Class::ByMethod,
-        usage: "agh api PATH [-X GET|HEAD|POST|PATCH|PUT|DELETE] [-f k=v]... [-F k=v]... [--all] [--include] [--accept MEDIA] [-R REPO] [--confirm PATH] [--dry-run]",
+        usage: "agh api PATH [-X GET|HEAD|POST|PATCH|PUT|DELETE] [-f k=v]... [-F k=v]... [--input FILE] [--all] [--include] [--accept MEDIA] [-R REPO] [--confirm PATH] [--dry-run]",
         summary: "one request to any API path: a read, every page of one, or a write",
         example: "agh api /repos/alabsystems/aterm --jq .default_branch",
         noun: Noun::Raw,
@@ -970,6 +970,10 @@ pub static VERBS: &[Verb] = &[
                 'F',
             ),
             on("--all", "every page; not with -X HEAD"),
+            value(
+                "--input",
+                "a write's JSON body from a regular file, at most 8 MiB; not with -f/-F",
+            ),
             on("--include", "the status and headers too; not with --all"),
             value("--accept", "the Accept media type"),
             value("--confirm", "a DELETE's path, typed again"),

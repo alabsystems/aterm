@@ -3,6 +3,7 @@
 
 //! Time formatting, string truncation, shell quoting, and safe scratch I/O.
 
+use std::ffi::OsString;
 use std::io;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -219,7 +220,16 @@ pub fn targo(args: &[&str]) -> aterm_uds::spawnfd::Command {
     if let Some(build_dir) = build_dir {
         cmd.env(atpkg::build_cache::BUILD_DIR_ENV, build_dir);
     }
-    for (name, _) in std::env::vars_os() {
+    clear_cargo_run_env(&mut cmd, std::env::vars_os().map(|(name, _)| name));
+    cmd
+}
+
+/// Remove Cargo's run metadata from a nested build's inherited environment.
+fn clear_cargo_run_env(
+    cmd: &mut aterm_uds::spawnfd::Command,
+    names: impl IntoIterator<Item = OsString>,
+) {
+    for name in names {
         if name
             .to_str()
             .is_some_and(atpkg::build_cache::said_by_cargo_run)
@@ -227,7 +237,6 @@ pub fn targo(args: &[&str]) -> aterm_uds::spawnfd::Command {
             cmd.env_remove(name);
         }
     }
-    cmd
 }
 
 /// A heavy build's memory claim ([`claim_build`]): held until the build ends, `None` where
@@ -394,6 +403,11 @@ pub fn scratch_text(path: &Path) -> String {
 /// Maximum size (256 MiB) accepted when reading a regular file in the lab.
 pub const MAX_LAB_FILE_BYTES: u64 = 256 << 20;
 
+/// Maximum size (1 GiB) accepted when reading an executable whole ([`read_program`]). A vendor's
+/// build (Claude Code's is 304 MiB, Muse Code's 404 MiB) or a debug build of aterm (515 MiB) is
+/// past [`MAX_LAB_FILE_BYTES`].
+pub const MAX_LAB_PROGRAM_BYTES: u64 = 1 << 30;
+
 /// Opens a regular file at `path` with `O_NONBLOCK | O_CLOEXEC | flags` and returns its metadata.
 fn open_regular_with_meta(
     path: &Path,
@@ -422,21 +436,23 @@ pub fn open_regular_file(path: &Path) -> io::Result<std::fs::File> {
 fn read_regular_with_meta(
     file: std::fs::File,
     meta: std::fs::Metadata,
+    limit: u64,
 ) -> io::Result<(Vec<u8>, std::fs::Metadata)> {
     use io::Read as _;
-    if meta.len() > MAX_LAB_FILE_BYTES {
+    let mib = limit >> 20;
+    if meta.len() > limit {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "file exceeds 256 MiB limit",
+            format!("file exceeds {mib} MiB limit"),
         ));
     }
-    let cap = usize::try_from(meta.len().min(MAX_LAB_FILE_BYTES).saturating_add(1)).unwrap_or(0);
+    let cap = usize::try_from(meta.len().min(limit).saturating_add(1)).unwrap_or(0);
     let mut buf = Vec::with_capacity(cap);
-    file.take(MAX_LAB_FILE_BYTES + 1).read_to_end(&mut buf)?;
-    if buf.len() as u64 > MAX_LAB_FILE_BYTES {
+    file.take(limit + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > limit {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "file grew past 256 MiB limit while reading",
+            format!("file grew past {mib} MiB limit while reading"),
         ));
     }
     Ok((buf, meta))
@@ -445,7 +461,7 @@ fn read_regular_with_meta(
 /// Reads a regular file at `path` up to [`MAX_LAB_FILE_BYTES`] and returns its metadata.
 pub fn read_regular_file_with_meta(path: &Path) -> io::Result<(Vec<u8>, std::fs::Metadata)> {
     let (file, meta) = open_regular_with_meta(path, 0)?;
-    read_regular_with_meta(file, meta)
+    read_regular_with_meta(file, meta, MAX_LAB_FILE_BYTES)
 }
 
 /// Reads a regular file at `path` up to [`MAX_LAB_FILE_BYTES`].
@@ -453,10 +469,16 @@ pub fn read_regular_file(path: &Path) -> io::Result<Vec<u8>> {
     read_regular_file_with_meta(path).map(|(buf, _)| buf)
 }
 
+/// Reads the executable at `path` whole, up to [`MAX_LAB_PROGRAM_BYTES`].
+pub fn read_program(path: &Path) -> io::Result<Vec<u8>> {
+    let (file, meta) = open_regular_with_meta(path, 0)?;
+    read_regular_with_meta(file, meta, MAX_LAB_PROGRAM_BYTES).map(|(buf, _)| buf)
+}
+
 /// Reads a retained regular artifact without following a linked final entry.
 pub fn read_artifact(path: &Path) -> io::Result<Vec<u8>> {
     let (file, meta) = open_regular_with_meta(path, libc::O_NOFOLLOW)?;
-    read_regular_with_meta(file, meta).map(|(buf, _)| buf)
+    read_regular_with_meta(file, meta, MAX_LAB_FILE_BYTES).map(|(buf, _)| buf)
 }
 
 /// Reads UTF-8 text from a regular file at `path` up to [`MAX_LAB_FILE_BYTES`].
@@ -835,12 +857,19 @@ mod tests {
 
     #[test]
     fn a_nested_targo_starts_at_the_checkout_without_what_cargo_said_about_the_lab() {
-        // CONTROL: cargo hands this test binary what it hands the lab under `targo run`
-        // (`OUT_DIR` too: aterm-lab has a build script).
-        for name in ["CARGO_PKG_NAME", "CARGO_MANIFEST_DIR", "OUT_DIR"] {
-            assert!(std::env::var_os(name).is_some(), "{name}");
+        // Inject the inherited names: a runner need not provide Cargo's build-script OUT_DIR.
+        let names = [
+            "CARGO_PKG_NAME",
+            "CARGO_MANIFEST_DIR",
+            "OUT_DIR",
+            "PATH",
+            "HOME",
+        ];
+        let mut cmd = super::targo(&["--unverified", "build"]);
+        for name in names {
+            cmd.env(name, "inherited");
         }
-        let cmd = super::targo(&["--unverified", "build"]);
+        super::clear_cargo_run_env(&mut cmd, names.map(std::ffi::OsString::from));
         let removed: Vec<String> = cmd
             .get_envs()
             .filter(|(_, v)| v.is_none())
@@ -1022,6 +1051,30 @@ mod tests {
         assert_eq!(py_repr("it's"), "\"it's\"");
         assert_eq!(py_repr("a\nb"), "'a\\nb'");
         assert_eq!(py_repr("❯\u{a0}hi\u{80}\u{2028}"), "'❯\\xa0hi\\x80\\u2028'");
+    }
+
+    /// An executable past the lab's ordinary limit reads whole, as Claude Code's and a debug
+    /// aterm are. NEGATIVE CONTROL: the ordinary read refuses that file, and a file past the
+    /// program limit is refused before a byte is read.
+    #[test]
+    fn read_program_takes_what_the_ordinary_limit_refuses() {
+        let dir = std::fs::canonicalize(
+            crate::sys::make_temp_dir("/tmp/lab-program-read.XXXXXX").unwrap(),
+        )
+        .unwrap();
+        let file = dir.join("program");
+        let sparse = |len| {
+            std::fs::File::create(&file).unwrap().set_len(len).unwrap();
+        };
+        sparse(MAX_LAB_FILE_BYTES + 1);
+        assert!(read_regular_file(&file).is_err());
+        assert_eq!(
+            read_program(&file).unwrap().len() as u64,
+            MAX_LAB_FILE_BYTES + 1
+        );
+        sparse(MAX_LAB_PROGRAM_BYTES + 1);
+        assert!(read_program(&file).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

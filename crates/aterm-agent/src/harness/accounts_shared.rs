@@ -332,6 +332,14 @@ impl State {
             project = "aterm_agent::harness::accounts_sync::shared_selection_tests::selection_transition"
         )
     )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountRenewalGeneration",
+            action = "BeginAttempt",
+            project = "aterm_agent::harness::accounts::generation_tests::generation_transition"
+        )
+    )]
     pub fn begin(
         &mut self,
         mut intent: Intent,

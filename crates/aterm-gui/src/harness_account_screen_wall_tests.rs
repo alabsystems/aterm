@@ -96,7 +96,8 @@ fn a_screen_only_wall_rotates_and_records_the_current_account() {
             }
             assert_eq!(moves(&idle.account(point)), Some("work-2"));
             assert_eq!(
-                idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+                idle.restart_once(&move_to("work-2", AccountAt::Wall))
+                    .as_deref(),
                 Some("adopted")
             );
             let state = a.state();
@@ -295,7 +296,8 @@ fn a_screen_wall_still_reports_a_move_that_landed_after_its_wait() {
     a.unread.store(true, Ordering::SeqCst);
     assert_eq!(moves(&idle.account(point)), Some("work-2"));
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("wait:account-unverified")
     );
     a.readable();

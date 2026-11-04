@@ -122,7 +122,12 @@ impl Rig {
         let (state, stamp) = (self.state, at(self.now));
         self.tr.transcript(&mut self.log, ev, pos, state, stamp);
         self.took(seq_twins::tx_step(&ev, &pos, state, self.now), seq0);
+        // These replays judge structural edits. Raw vendor observations remain in
+        // the log and the full seq twin; their contents and deduplication have direct controls.
         self.since(seq0)
+            .into_iter()
+            .filter(|record| !vendor_observation(record))
+            .collect()
     }
 
     fn tx(&mut self, ev: TxEvent<'_>) -> Vec<Rec> {
@@ -193,6 +198,14 @@ impl Rig {
             panic!("{e}:\n{}", lines(&self.log).join("\n"));
         }
     }
+}
+
+fn vendor_observation(record: &Rec) -> bool {
+    record.op == Op::Mark
+        && record.k == Kind::Meta
+        && record.src == Src::Transcript
+        && record.by == Actor::Vendor
+        && record.f.get_str(Key::Field) == Some("vendor-turn")
 }
 
 fn v(s: &str) -> ShortId {
@@ -913,6 +926,114 @@ fn a_late_end_follows_every_continuation_to_its_dated_segment() {
     assert_eq!(r.tr.tx_view().dropped, 1, "unknown ancestry is counted");
 }
 
+#[test]
+fn a_measured_ambiguous_end_closes_without_replacing_the_named_metrics() {
+    let mut r = Rig::bound();
+    r.see(Verdict::Busy);
+    let node = r.turn();
+    r.tx(prompt("first"));
+    r.see(Verdict::Wall(WallKind::UsageSession));
+    r.now = 20;
+    r.tx(TxEvent::TurnEnd {
+        vdur_ms: 10,
+        tok_in: 11,
+        tok_out: 13,
+    });
+    assert_eq!(r.tr.turn(), Some(node));
+    r.now = 30;
+    r.tx(prompt("second"));
+    r.see(Verdict::Busy);
+    r.now = 40;
+    let closed = r.tx(TxEvent::TurnEnd {
+        vdur_ms: 12,
+        tok_in: 17,
+        tok_out: 19,
+    });
+    assert_eq!(ops(&closed, Op::Close, Lvl::Turn).len(), 1, "{closed:?}");
+    assert_eq!(r.tr.turn(), None);
+    let last = r.log.state().last[1].as_ref().unwrap();
+    assert_eq!(last.node, node);
+    assert_eq!(last.f.get(Key::Vref), Some(&Val::Id(v("first"))));
+    assert_eq!(last.f.get(Key::VdurMs), Some(&Val::U(10)));
+    assert_eq!(last.f.get(Key::TokIn), Some(&Val::U(11)));
+    assert_eq!(last.f.get(Key::TokOut), Some(&Val::U(13)));
+    let evidence = r
+        .log
+        .window()
+        .filter(|record| {
+            vendor_observation(record)
+                && record.f.get_str(Key::Vref) == Some("second")
+                && record.f.get_word(Key::State) == Some("done")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(evidence.len(), 1);
+    assert_eq!(evidence[0].f.get_u(Key::TokOut), Some(19));
+    assert_eq!(evidence[0].f.get_word(Key::Why), Some("ambiguous"));
+}
+
+#[test]
+fn a_late_ambiguous_vendor_end_preserves_its_named_continuation_ancestor() {
+    let mut r = Rig::bound_at(TxState::Partial);
+    r.see(Verdict::Busy);
+    let first = r.turn();
+    r.tx(prompt("first"));
+    r.now = 20;
+    r.tx(TxEvent::TurnEnd {
+        vdur_ms: 10,
+        tok_in: 11,
+        tok_out: 13,
+    });
+    r.now = 30;
+    r.tx(prompt("second"));
+    r.now = 100;
+    r.see(Verdict::Idle);
+    r.wait(1_000);
+    r.now += 300;
+    r.see(Verdict::Busy);
+    let continuation = r.turn();
+    assert_ne!(continuation, first);
+    assert_eq!(
+        r.log.state().turn().unwrap().f.get(Key::Cont),
+        Some(&Val::Id(v(&first.to_string())))
+    );
+    assert!(r.log.state().turn().unwrap().f.get(Key::Vref).is_none());
+    let before = r.log.state().last[1].as_ref().unwrap().clone();
+    assert_eq!(before.f.get(Key::Vref), Some(&Val::Id(v("first"))));
+    let seq = r.log.last_seq();
+    let structural = r.tx_at(
+        TxEvent::TurnEnd {
+            vdur_ms: 12,
+            tok_in: 17,
+            tok_out: 19,
+        },
+        WALL0 + 40,
+    );
+    assert!(
+        structural.is_empty(),
+        "an ambiguous end changes no ancestor or continuation"
+    );
+    assert_eq!(r.tr.turn(), Some(continuation));
+    assert_eq!(r.log.state().last[1].as_ref().unwrap(), &before);
+    let evidence = r
+        .log
+        .window()
+        .filter(|record| record.seq > seq && vendor_observation(record))
+        .collect::<Vec<_>>();
+    assert_eq!(evidence.len(), 1);
+    let ended = evidence[0];
+    assert_eq!(ended.node, r.run);
+    assert_eq!(ended.t, WALL0 + 40);
+    assert_eq!(ended.f.get_str(Key::Vref), Some("second"));
+    assert_eq!(
+        ended.f.get_str(Key::Parent),
+        Some(first.to_string().as_str())
+    );
+    assert_eq!(ended.f.get_word(Key::Why), Some("ambiguous"));
+    assert_eq!(ended.f.get_u(Key::VdurMs), Some(12));
+    assert_eq!(ended.f.get_u(Key::TokIn), Some(17));
+    assert_eq!(ended.f.get_u(Key::TokOut), Some(19));
+}
+
 pub(crate) fn a_row_at_the_watermark_is_never_applied_again() {
     let mut r = Rig::bound();
     r.see(Verdict::Busy);
@@ -1422,6 +1543,18 @@ fn the_worst_tracker_line_fits_a_carry_line() {
     let id40 = "a".repeat(ShortId::MAX);
     let max = u64::MAX;
     let detail = "%E9".repeat(16);
+    let mut raw = Vec::new();
+    raw.extend_from_slice(&(max - 2).to_le_bytes());
+    raw.extend_from_slice(&(max - 3).to_le_bytes());
+    raw.push(3);
+    let raw = aterm_codec::base64::encode(&raw).unwrap();
+    let mut vendor = Vec::new();
+    vendor.extend_from_slice(&(max - 1).to_le_bytes());
+    vendor.extend_from_slice(&max.to_le_bytes());
+    vendor.extend_from_slice(&max.to_le_bytes());
+    vendor.extend_from_slice(&u32::MAX.to_le_bytes());
+    vendor.push(5);
+    let vendor = aterm_codec::base64::encode(&vendor).unwrap();
     let worst = format!(
         "tracker run=r4294967295 turn=t4294967295 word=wall:usage-session interrupted=1 \
          step=p4294967295 step_under=1 step_what=wall step_wall=usage-session step_detail={detail} \
@@ -1430,11 +1563,15 @@ fn the_worst_tracker_line_fits_a_carry_line() {
          input_by={id40} input_wall={max} input_cause={id40} \
          tx_fp={max:016x} tx_off={max} tx_id={max:x}:{max:x} tx_v={id40} tx_vt=t4294967295 \
          tx_ve={max} tx_vp={max} tx_ref=usage-session tx_st=partial tx_ds=1 tx_dr={max} \
-         tx_du=1"
+         tx_du=1 irq=v raw=t4294967295,{raw} vi={id40},{vendor}"
     );
     let now = at(10_000);
     let tr = TurnTracker::from_carry_line(&worst, now).expect("the worst line reads");
     let back = tr.carry_line(now);
+    assert!(
+        back.contains(" raw=t4294967295,") && back.contains(&format!(" vi={id40},")),
+        "the bound includes nonempty maximum-width new provenance: {back}"
+    );
     assert!(
         "host ".len() + back.len() <= CARRY_MAX_LINE,
         "{} bytes: {back}",
@@ -1817,6 +1954,527 @@ pub(crate) fn a_stopped_exact_reader_hands_the_turns_back_to_the_claims() {
     );
     assert_eq!(ops(&r.records(), Op::Open, Lvl::Turn).len(), 2);
     r.ordered();
+}
+
+/// A vendor interruption read before the preceding claim's retained end.
+fn pending_next_interrupt(state: TxState) -> Rig {
+    let mut r = Rig::new();
+    r.now = 15;
+    r.claim(Claimed::Working);
+    r.state = state;
+    r.now = 45;
+    r.tx_at(
+        TxEvent::Bind {
+            len: 0,
+            floor_ms: WALL0,
+        },
+        WALL0,
+    );
+    r.tx_at(prompt("next"), WALL0 + 30);
+    r.tx_at(TxEvent::Interrupt, WALL0 + 40);
+    r
+}
+
+fn last_turn_out(r: &Rig) -> Option<&str> {
+    r.log.state().last[1].as_ref().map(|closed| closed.out)
+}
+
+#[test]
+fn a_pending_vendor_interrupt_survives_the_previous_close_and_carry() {
+    for state in [TxState::Partial, TxState::On] {
+        for carry_after_close in [false, true] {
+            let mut r = pending_next_interrupt(state);
+            let original = r.turn();
+            if !carry_after_close {
+                let line = r.tr.carry_line(at(r.now));
+                r.adopt(&line);
+                assert_eq!(r.tr.turn(), Some(original), "carry retains the live owner");
+            }
+            r.edge(Claimed::Rested, 20, true);
+            assert_eq!(
+                last_turn_out(&r),
+                Some("done"),
+                "the previous interval excludes the vendor prompt"
+            );
+            if carry_after_close {
+                let line = r.tr.carry_line(at(r.now));
+                r.adopt(&line);
+            }
+            r.edge(Claimed::Working, 30, true);
+            // A held non-edge observation inside the same claim is not a missing boundary.
+            r.tr.claim(&mut r.log, Claimed::Working, at(35));
+            let line = r.tr.carry_line(at(r.now));
+            r.adopt(&line);
+            r.edge(Claimed::Rested, 40, true);
+            assert_eq!(
+                last_turn_out(&r),
+                Some("interrupted"),
+                "the exact next interval owns the pending fact"
+            );
+            r.ordered();
+        }
+    }
+}
+
+#[test]
+fn damaged_interrupt_metadata_degrades_only_its_provenance() {
+    for damage in ["legacy", "duplicate"] {
+        let mut r = Rig::new();
+        r.now = 15;
+        r.claim(Claimed::Working);
+        let owner = r.turn();
+        r.tr.note_interrupted();
+        let mut line = r.tr.carry_line(at(r.now));
+        if damage == "legacy" {
+            line = line.replace(" irq=s", "");
+        } else {
+            line.push_str(" irq=s");
+        }
+        r.adopt(&line);
+        assert_eq!(
+            r.tr.turn(),
+            Some(owner),
+            "{damage}: core ownership must not be discarded"
+        );
+        r.edge(Claimed::Rested, 20, true);
+        assert_eq!(last_turn_out(&r), Some("unknown"), "{damage}");
+        r.edge(Claimed::Working, 30, true);
+        r.edge(Claimed::Rested, 40, true);
+        assert_eq!(
+            last_turn_out(&r),
+            Some("done"),
+            "unknown provenance belongs only to its old owner"
+        );
+    }
+
+    for damage in [
+        "duplicate",
+        "quality",
+        "forged-bound",
+        "desync-duplicate",
+        "desync-invalid",
+    ] {
+        let mut r = pending_next_interrupt(TxState::Partial);
+        let owner = r.turn();
+        let mut line = r.tr.carry_line(at(r.now));
+        let token = line
+            .split_whitespace()
+            .find(|field| field.starts_with("vi="))
+            .unwrap()
+            .to_owned();
+        match damage {
+            "duplicate" => {
+                line.push(' ');
+                line.push_str(&token);
+            }
+            "quality" => line.push_str(" tx_st=on"),
+            "desync-duplicate" => line.push_str(" tx_ds=0 tx_ds=1"),
+            "desync-invalid" => line.push_str(" tx_ds=unread"),
+            _ => {
+                let (head, encoded) = token.split_once(',').unwrap();
+                let mut payload = aterm_codec::base64::decode_strict(encoded.as_bytes()).unwrap();
+                payload[24..28].copy_from_slice(&owner.n.to_le_bytes());
+                payload[28] = 5; // Deliberately claim an original transcript binding to Engine A.
+                line = line.replace(
+                    &token,
+                    &format!("{head},{}", aterm_codec::base64::encode(&payload).unwrap()),
+                );
+            }
+        }
+        r.adopt(&line);
+        assert_eq!(r.tr.turn(), Some(owner));
+        r.edge(Claimed::Rested, 20, true);
+        assert_eq!(
+            last_turn_out(&r),
+            Some("done"),
+            "{damage}: damaged future metadata cannot taint the earlier claim"
+        );
+        r.edge(Claimed::Working, 30, true);
+        let line = r.tr.carry_line(at(r.now));
+        r.adopt(&line);
+        r.edge(Claimed::Rested, 40, true);
+        assert_eq!(
+            last_turn_out(&r),
+            Some("unknown"),
+            "{damage}: readable clocks preserve only the damaged fact's scope"
+        );
+    }
+}
+
+#[test]
+fn overloaded_vendor_interrupts_keep_each_overlapping_interval_unknown() {
+    let mut r = pending_next_interrupt(TxState::Partial);
+    r.now = 65;
+    r.tx_at(prompt("later"), WALL0 + 50);
+    r.tx_at(TxEvent::Interrupt, WALL0 + 60);
+    let line = r.tr.carry_line(at(r.now));
+    r.adopt(&line);
+    r.edge(Claimed::Rested, 20, true);
+    assert_eq!(last_turn_out(&r), Some("done"));
+    for (begin, end) in [(30, 40), (50, 60)] {
+        r.edge(Claimed::Working, begin, true);
+        r.edge(Claimed::Rested, end, true);
+        assert_eq!(
+            last_turn_out(&r),
+            Some("unknown"),
+            "one slot cannot assign either overlapping vendor fact"
+        );
+    }
+    r.edge(Claimed::Working, 70, true);
+    r.edge(Claimed::Rested, 80, true);
+    assert_eq!(
+        last_turn_out(&r),
+        Some("done"),
+        "later unrelated turns retain their own outcome"
+    );
+}
+
+#[test]
+fn a_refused_begin_cannot_supply_an_adjacent_interval_fence() {
+    let mut r = Rig::new();
+    r.now = 10;
+    r.claim(Claimed::Working);
+    r.edge(Claimed::Rested, 20, true);
+    r.edge(Claimed::Working, 25, false);
+    r.edge(Claimed::Rested, 30, true);
+    r.edge(Claimed::Working, 40, true);
+    r.state = TxState::Partial;
+    r.now = 55;
+    r.tx_at(
+        TxEvent::Bind {
+            len: 0,
+            floor_ms: WALL0,
+        },
+        WALL0,
+    );
+    r.tx_at(prompt("next"), WALL0 + 40);
+    r.tx_at(TxEvent::Interrupt, WALL0 + 50);
+    r.edge(Claimed::Rested, 50, true);
+    assert_eq!(
+        last_turn_out(&r),
+        Some("unknown"),
+        "the older close is not the missing span's end"
+    );
+}
+
+#[test]
+fn vendor_source_loss_does_not_erase_independent_screen_interruption() {
+    let mut r = Rig::bound();
+    r.see(Verdict::Busy);
+    r.tx(prompt("same"));
+    r.tx(TxEvent::Interrupt);
+    r.tr.note_interrupted();
+    r.tx(TxEvent::Overflow { n: 1 });
+    let line = r.tr.carry_line(at(r.now));
+    r.adopt(&line);
+    r.see(Verdict::Idle);
+    r.wait(1_000);
+    assert_eq!(
+        last_turn_out(&r),
+        Some("interrupted"),
+        "vendor damage cannot revoke the screen's own evidence"
+    );
+}
+
+#[test]
+fn invalidated_vendor_binding_does_not_erase_screen_approval_freshness() {
+    let mut r = Rig::bound();
+    r.see(Verdict::Busy);
+    r.see(bash());
+    r.tx(prompt("same"));
+    r.tx(TxEvent::Interrupt);
+    r.tr.note_interrupted();
+    r.state = TxState::Partial;
+    r.tx(TxEvent::Bind {
+        len: r.off,
+        floor_ms: WALL0,
+    });
+    r.tx(TxEvent::Flush);
+    let closed = ops(&r.see(Verdict::Idle), Op::Close, Lvl::Step);
+    assert!(
+        closed
+            .iter()
+            .any(|step| step.k == Kind::Approval && step.out() == Some("declined")),
+        "the screen's independent interruption still declines its approval: {closed:?}"
+    );
+}
+
+#[test]
+fn duplicated_source_quality_cannot_restore_measured_screen_authority() {
+    let mut r = Rig::bound();
+    r.see(Verdict::Busy);
+    let owner = r.turn();
+    r.tx(prompt("same"));
+    r.tx(TxEvent::Interrupt);
+    let mut line = r.tr.carry_line(at(r.now));
+    line.push_str(" tx_st=partial");
+    r.adopt(&line);
+    assert_eq!(
+        r.tr.turn(),
+        Some(owner),
+        "only proof quality degrades, never the live owner"
+    );
+    r.claim(Claimed::Rested);
+    assert_eq!(
+        last_turn_out(&r),
+        Some("unknown"),
+        "a first-match On field is not unique measured-source authority"
+    );
+}
+
+#[test]
+fn ambiguous_carried_join_fields_cannot_authorize_a_new_interrupt() {
+    for extra in [
+        "tx_v=other".to_owned(),
+        format!("tx_vp={}", WALL0 + 16),
+        "tx_vt=t2".to_owned(),
+        "tx_ve=0 tx_ve=1".to_owned(),
+        "tx_ds=0 tx_ds=1".to_owned(),
+        "tx_ds=unread".to_owned(),
+    ] {
+        let mut r = Rig::new();
+        r.now = 15;
+        r.claim(Claimed::Working);
+        r.state = TxState::Partial;
+        r.now = 45;
+        r.tx_at(
+            TxEvent::Bind {
+                len: 0,
+                floor_ms: WALL0,
+            },
+            WALL0,
+        );
+        r.tx_at(prompt("next"), WALL0 + 30);
+        let owner = r.turn();
+        let line = format!("{} {extra}", r.tr.carry_line(at(r.now)));
+        r.adopt(&line);
+        assert_eq!(
+            r.tr.turn(),
+            Some(owner),
+            "join ambiguity does not destroy the owner"
+        );
+        r.now = 65;
+        r.tx_at(TxEvent::Interrupt, WALL0 + 60);
+        r.edge(Claimed::Rested, 20, true);
+        r.edge(Claimed::Working, 30, true);
+        r.edge(Claimed::Rested, 60, true);
+        assert_ne!(
+            last_turn_out(&r),
+            Some("interrupted"),
+            "{extra}: a first-match join is not new vendor evidence"
+        );
+        assert!(
+            r.tr.tx_view().dropped > 0,
+            "the unavailable join is recorded as lost evidence"
+        );
+    }
+    for key in ["run", "turn"] {
+        let mut r = pending_next_interrupt(TxState::Partial);
+        let owner = r.turn();
+        let value = if key == "run" { r.run } else { owner };
+        let line = format!("{} {key}={value}", r.tr.carry_line(at(r.now)));
+        r.adopt(&line);
+        assert_eq!(r.tr.turn(), Some(owner));
+        r.edge(Claimed::Rested, 20, true);
+        r.edge(Claimed::Working, 30, true);
+        let line = r.tr.carry_line(at(r.now));
+        r.adopt(&line);
+        r.edge(Claimed::Rested, 40, true);
+        assert_eq!(
+            last_turn_out(&r),
+            Some("unknown"),
+            "ambiguous core identity cannot regain interval authority through a later clean carry"
+        );
+    }
+}
+
+#[test]
+fn malformed_carried_cur_cannot_borrow_zero_clock_measured_screen_authority() {
+    for (key, bad) in [
+        ("tx_ve", "unread"),
+        ("tx_vp", "unread"),
+        ("tx_vt", "not-a-node"),
+        ("tx_ds", "unread"),
+    ] {
+        let mut r = Rig::bound();
+        r.see(Verdict::Busy);
+        r.tx(prompt("same"));
+        let owner = r.turn();
+        let line = r.tr.carry_line(at(r.now));
+        let field = format!("{key}={bad}");
+        let had = line
+            .split_whitespace()
+            .any(|token| token.starts_with(&format!("{key}=")));
+        let mut line = line
+            .split_whitespace()
+            .map(|token| {
+                if token.starts_with(&format!("{key}=")) {
+                    field.as_str()
+                } else {
+                    token
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !had {
+            line.push(' ');
+            line.push_str(&field);
+        }
+        r.adopt(&line);
+        assert_eq!(r.tr.turn(), Some(owner));
+        r.see(bash()); // An actual new screen observation restores Screen mode, not the old join.
+        r.tx(TxEvent::Interrupt);
+        r.see(Verdict::Idle);
+        r.wait(1_000);
+        assert_eq!(
+            last_turn_out(&r),
+            Some("done"),
+            "{key}: malformed old join facts cannot authorize a fresh interruption"
+        );
+        assert!(r.tr.tx_view().dropped > 0);
+    }
+}
+
+#[test]
+fn ambiguous_vendor_clocks_and_screen_nodes_cannot_supply_engine_authority() {
+    for (prompt_ms, interrupt_ms) in [(30, 30), (35, 30)] {
+        let mut r = Rig::new();
+        r.now = 15;
+        r.claim(Claimed::Working);
+        r.state = TxState::Partial;
+        r.now = 45;
+        r.tx_at(
+            TxEvent::Bind {
+                len: 0,
+                floor_ms: WALL0,
+            },
+            WALL0,
+        );
+        r.tx_at(prompt("next"), WALL0 + prompt_ms);
+        r.tx_at(TxEvent::Interrupt, WALL0 + interrupt_ms);
+        r.edge(Claimed::Rested, 20, true);
+        r.edge(Claimed::Working, 30, true);
+        r.edge(Claimed::Rested, 40, true);
+        assert_eq!(
+            last_turn_out(&r),
+            Some("unknown"),
+            "equal or reversed vendor clocks are not an interval proof"
+        );
+    }
+
+    let mut r = Rig::new();
+    r.now = 15;
+    r.see(Verdict::Busy);
+    let owner = r.turn();
+    r.state = TxState::Partial;
+    r.now = 45;
+    r.tx_at(
+        TxEvent::Bind {
+            len: 0,
+            floor_ms: WALL0,
+        },
+        WALL0,
+    );
+    r.tx_at(prompt("same"), WALL0 + 30);
+    r.tx_at(TxEvent::Interrupt, WALL0 + 40);
+    let mut claimed = Rig::new();
+    claimed.now = 15;
+    claimed.claim(Claimed::Working);
+    assert_eq!(
+        claimed.turn(),
+        owner,
+        "the planted interval has the same node and clock, only the original source differs"
+    );
+    let claimed_line = claimed.tr.carry_line(at(claimed.now));
+    let forged_raw = claimed_line
+        .split_whitespace()
+        .find(|field| field.starts_with("raw="))
+        .unwrap();
+    let line =
+        r.tr.carry_line(at(r.now))
+            .split_whitespace()
+            .map(|field| {
+                if field.starts_with("raw=") {
+                    forged_raw
+                } else {
+                    field
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+    r.adopt(&line);
+    assert_eq!(r.tr.turn(), Some(owner));
+    r.edge(Claimed::Rested, 40, true);
+    assert_eq!(
+        last_turn_out(&r),
+        Some("unknown"),
+        "a carried Screen opening is not an Engine/Claim interval"
+    );
+}
+
+#[test]
+fn a_new_transcript_epoch_preserves_independent_raw_claim_observations() {
+    let mut r = Rig::new();
+    r.now = 15;
+    r.claim(Claimed::Working);
+    r.state = TxState::Partial;
+    r.now = 25;
+    r.tx_at(
+        TxEvent::Bind {
+            len: 0,
+            floor_ms: WALL0,
+        },
+        WALL0,
+    );
+    let pos = |off, wall_ms| TxPos {
+        fp: FP + 1,
+        id: ID,
+        off,
+        wall_ms,
+    };
+    r.call(
+        TxEvent::Bind {
+            len: 0,
+            floor_ms: WALL0,
+        },
+        pos(0, WALL0),
+    );
+    r.call(prompt("new-source"), pos(1, WALL0 + 18));
+    r.call(TxEvent::Interrupt, pos(2, WALL0 + 19));
+    r.edge(Claimed::Rested, 20, true);
+    assert_eq!(
+        last_turn_out(&r),
+        Some("interrupted"),
+        "the new source proves its own strict interior while raw Engine facts remain independent"
+    );
+}
+
+#[test]
+fn a_clamped_claim_opening_cannot_be_reconstructed_as_a_raw_begin() {
+    let mut r = Rig::new();
+    r.now = 10;
+    r.claim(Claimed::Working);
+    r.edge(Claimed::Rested, 50, true);
+    r.edge(Claimed::Working, 40, true);
+    r.state = TxState::Partial;
+    r.now = 75;
+    r.tx_at(
+        TxEvent::Bind {
+            len: 0,
+            floor_ms: WALL0,
+        },
+        WALL0,
+    );
+    r.tx_at(prompt("same"), WALL0 + 55);
+    r.tx_at(TxEvent::Interrupt, WALL0 + 60);
+    let line = r.tr.carry_line(at(r.now));
+    r.adopt(&line);
+    r.edge(Claimed::Rested, 70, true);
+    assert_eq!(
+        last_turn_out(&r),
+        Some("unknown"),
+        "the displayed 50ms floor is not the observed 40ms beginning"
+    );
 }
 
 /// AN ESC ON A CLAIM'S TURN: the program's claim has no interrupted state, so a transcript read

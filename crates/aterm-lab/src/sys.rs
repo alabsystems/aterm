@@ -573,7 +573,7 @@ pub fn mach_timebase() -> Option<(u32, u32)> {
 /// # Errors
 /// The file cannot be read.
 pub fn digest_file(path: &std::path::Path, domain: &[u8]) -> Result<Digest, String> {
-    let bytes = crate::util::read_regular_file(path)
+    let bytes = crate::util::read_program(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     Ok(Digest::of(domain, &[&bytes]))
 }

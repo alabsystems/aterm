@@ -321,6 +321,7 @@ pub struct Access {
     key: SecretBytes,
     log_paths: Option<crate::client::Paths>,
     log_heads_digest: Option<[u8; 32]>,
+    seals: bool,
 }
 impl Access {
     pub const fn head(&self) -> &[u8; 32] {
@@ -341,6 +342,12 @@ impl Access {
     /// Whether this observation derives from the peer-synced membership log (`F18`).
     pub const fn is_log_backed(&self) -> bool {
         self.log_paths.is_some()
+    }
+    /// Whether a writer may seal new rows under [`Self::basis`]: not while the log still wraps
+    /// that epoch to a Mac it removed ([`crate::membership_log::CommonsEpochView::wraps_removed`]),
+    /// whose key would open them, until the removal's rotation lands. Reading is unaffected.
+    pub const fn seals(&self) -> bool {
+        self.seals
     }
     pub fn members(&self) -> &[Member] {
         &self.members
@@ -954,6 +961,7 @@ pub(super) fn current_from_loaded_log(
         Vec<Member>,
         usize,
         Zeroizing<[u8; 32]>,
+        bool,
     )>;
     static ACCESS_CACHE: std::sync::Mutex<
         std::collections::VecDeque<(AccessCacheKey, AccessCacheVal)>,
@@ -965,17 +973,20 @@ pub(super) fn current_from_loaded_log(
         && let Some((_, cached)) = cache.iter().find(|(k, _)| *k == cache_key)
     {
         return Ok(cached.as_ref().map(
-            |(head, control_history_head, basis, generation, members, local, key_bytes)| Access {
-                trust,
-                head: *head,
-                control_history_head: *control_history_head,
-                basis: *basis,
-                generation: *generation,
-                members: members.clone(),
-                local: *local,
-                key: SecretBytes::from(key_bytes.as_slice()),
-                log_paths: Some(paths.clone()),
-                log_heads_digest: Some(state_digest),
+            |(head, control_history_head, basis, generation, members, local, key_bytes, seals)| {
+                Access {
+                    trust,
+                    head: *head,
+                    control_history_head: *control_history_head,
+                    basis: *basis,
+                    generation: *generation,
+                    members: members.clone(),
+                    local: *local,
+                    key: SecretBytes::from(key_bytes.as_slice()),
+                    log_paths: Some(paths.clone()),
+                    log_heads_digest: Some(state_digest),
+                    seals: *seals,
+                }
             },
         ));
     }
@@ -1127,6 +1138,7 @@ pub(super) fn current_from_loaded_log(
                 members.clone(),
                 local,
                 view.key.clone(),
+                !view.wraps_removed,
             )),
         ));
     }
@@ -1141,6 +1153,7 @@ pub(super) fn current_from_loaded_log(
         key: SecretBytes::from(view.key.as_slice()),
         log_paths: Some(paths.clone()),
         log_heads_digest: Some(state_digest),
+        seals: !view.wraps_removed,
     }))
 }
 
@@ -1282,6 +1295,7 @@ fn validate(
         key: SecretBytes::from(key.as_slice()),
         log_paths: None,
         log_heads_digest: None,
+        seals: true,
     })
 }
 

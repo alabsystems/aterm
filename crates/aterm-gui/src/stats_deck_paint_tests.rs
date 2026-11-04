@@ -669,6 +669,7 @@ pub(crate) fn scene_input(snap: &Snapshot, form: DeckForm) -> DeckInput<'_> {
         network: None,
         network_place: None,
         network_target: crate::network_deck::Target::Overview,
+        lab: None,
         snap: Some(snap),
         prev_snap: None,
         tab_panes: vec![FRONT],

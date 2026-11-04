@@ -1385,7 +1385,7 @@ fn unsigned_why(outcome: &Outcome) -> String {
         }
         Outcome::Exited(None) => "grok was ended by a signal".to_owned(),
         Outcome::SignedIn { .. } => "grok said it signed in but left no login file".to_owned(),
-        Outcome::NotRun(why) => why.clone(),
+        Outcome::NotRun(why) | Outcome::Unverified(why) => why.clone(),
         Outcome::Refused(why)
         | Outcome::NeedsYou(why)
         | Outcome::NeedsSignIn(why)

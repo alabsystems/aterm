@@ -114,8 +114,120 @@ pub struct MemoryBrowser {
     context: String,
     deadline: Instant,
     _profile: aterm_tempfile::TempDir,
-    _identity: Session,
+    _identity: Option<Session>,
     identity: Identity,
+    previous_snapshot: Option<[u8; 32]>,
+}
+
+/// Unpublished Google cookies, wiped on drop and protected by the original identity claim.
+/// Only a canonically verified native grant can commit them to encrypted storage.
+pub(super) struct PendingSession {
+    cookies: aterm_secrets::SecretBytes,
+    identity: Identity,
+    claim: Session,
+    home: std::path::PathBuf,
+    previous: Option<[u8; 32]>,
+}
+
+impl PendingSession {
+    pub(super) fn recovery_cookies(
+        &self,
+        identity: &Identity,
+        home: &Path,
+    ) -> Result<(&[u8], Option<[u8; 32]>), Error> {
+        if &self.identity != identity
+            || std::fs::canonicalize(&self.home).map_err(|_| Error::Session)?
+                != std::fs::canonicalize(home).map_err(|_| Error::Session)?
+        {
+            return Err(Error::Session);
+        }
+        Ok((self.cookies.as_slice(), self.previous))
+    }
+
+    /// Quarantined cookies remain unpublished and cannot be restored into a browser.
+    pub(super) fn recover(
+        identity: &Identity,
+        state: &Path,
+        home: &Path,
+        cookies: aterm_secrets::SecretBytes,
+        previous: Option<[u8; 32]>,
+    ) -> Result<Self, Error> {
+        if cookies.is_empty() || cookies.len() > super::google_browser_store::MAX_BYTES {
+            return Err(Error::Session);
+        }
+        Ok(Self {
+            cookies,
+            identity: identity.clone(),
+            claim: identity.claim(state).map_err(|_| Error::IdentityBusy)?,
+            home: home.into(),
+            previous,
+        })
+    }
+
+    pub(super) fn commit(
+        self,
+        proof: &super::agy_signin::VerifiedGoogleGrant,
+    ) -> Result<(), Error> {
+        self.commit_using(|identity| {
+            proof
+                .check_browser_identity(identity)
+                .map_err(|_| Error::Session)?;
+            if !identity
+                .email()
+                .eq_ignore_ascii_case(&proof.profile().email)
+            {
+                return Err(Error::Session);
+            }
+            Ok(())
+        })
+    }
+
+    pub(super) fn commit_kimi(
+        self,
+        proof: &super::google_federation::VerifiedKimiGoogle<'_>,
+    ) -> Result<(), Error> {
+        self.commit_using(|identity| {
+            proof
+                .check_browser_identity(identity)
+                .map_err(|_| Error::Session)
+        })
+    }
+
+    fn commit_using(self, check: impl Fn(&Identity) -> Result<(), Error>) -> Result<(), Error> {
+        check(&self.identity)?;
+        if super::google_browser_store::fingerprint(&self.claim).map_err(|_| Error::Session)?
+            != self.previous
+        {
+            // A publication made while this candidate was stopped wins. The native
+            // proof can still be used without rolling its newer browser session back.
+            return check(&self.identity);
+        }
+        super::google_browser_store::save(
+            &self.home,
+            &self.identity,
+            &self.claim,
+            self.cookies.as_slice(),
+        )
+        .map_err(|_| Error::Session)?;
+        check(&self.identity)
+    }
+}
+
+#[cfg(test)]
+pub(super) fn pending_fixture(
+    identity: &Identity,
+    state: &Path,
+    home: &Path,
+    cookies: &[u8],
+) -> PendingSession {
+    let claim = identity.claim(state).unwrap();
+    PendingSession {
+        cookies: aterm_secrets::SecretBytes::from(cookies),
+        identity: identity.clone(),
+        previous: super::google_browser_store::fingerprint(&claim).unwrap(),
+        claim,
+        home: home.into(),
+    }
 }
 
 impl MemoryBrowser {
@@ -134,6 +246,8 @@ impl MemoryBrowser {
         let claim = identity
             .claim(machine_state)
             .map_err(|_| Error::IdentityBusy)?;
+        let previous_snapshot =
+            super::google_browser_store::fingerprint(&claim).map_err(|_| Error::Session)?;
         let browser = super::browser_window::fetch_window_browser(
             home,
             &mut super::headless_fetch::Curl,
@@ -181,8 +295,9 @@ impl MemoryBrowser {
             context,
             deadline,
             _profile: profile,
-            _identity: claim,
+            _identity: Some(claim),
             identity: identity.clone(),
+            previous_snapshot,
         })
     }
 
@@ -192,8 +307,12 @@ impl MemoryBrowser {
     /// # Errors
     /// Protected storage, cookie validation or browser control failed.
     pub fn restore_session(&mut self, home: &Path) -> Result<bool, Error> {
-        let Some(bytes) = super::google_browser_store::load(home, &self.identity, &self._identity)
-            .map_err(|_| Error::Session)?
+        let Some(bytes) = super::google_browser_store::load(
+            home,
+            &self.identity,
+            self._identity.as_ref().ok_or(Error::IdentityBusy)?,
+        )
+        .map_err(|_| Error::Session)?
         else {
             return Ok(false);
         };
@@ -215,6 +334,47 @@ impl MemoryBrowser {
     /// # Errors
     /// Cookie validation, protected storage or browser control failed.
     pub fn save_session(&mut self, home: &Path) -> Result<(), Error> {
+        let bytes = self.session_bytes()?;
+        if super::google_browser_store::fingerprint(
+            self._identity.as_ref().ok_or(Error::IdentityBusy)?,
+        )
+        .map_err(|_| Error::Session)?
+            != self.previous_snapshot
+        {
+            return Err(Error::Session);
+        }
+        super::google_browser_store::save(
+            home,
+            &self.identity,
+            self._identity.as_ref().ok_or(Error::IdentityBusy)?,
+            bytes.as_slice(),
+        )
+        .map_err(|_| Error::Session)?;
+        self.previous_snapshot = super::google_browser_store::fingerprint(
+            self._identity.as_ref().ok_or(Error::IdentityBusy)?,
+        )
+        .map_err(|_| Error::Session)?;
+        Ok(())
+    }
+
+    /// Capture cookies in memory and retain this identity's claim after closing the browser.
+    /// No snapshot is written until the native grant proves the expected Google account.
+    ///
+    /// # Errors
+    /// Cookie capture or validation failed, or the identity claim is unavailable.
+    pub(super) fn into_pending_session(mut self, home: &Path) -> Result<PendingSession, Error> {
+        let cookies = self.session_bytes()?;
+        let claim = self._identity.take().ok_or(Error::IdentityBusy)?;
+        Ok(PendingSession {
+            cookies,
+            identity: self.identity.clone(),
+            claim,
+            home: home.into(),
+            previous: self.previous_snapshot,
+        })
+    }
+
+    fn session_bytes(&mut self) -> Result<aterm_secrets::SecretBytes, Error> {
         let value = SecretValue(self.call(
             None,
             "Storage.getCookies",
@@ -224,11 +384,9 @@ impl MemoryBrowser {
         if cookies.0.as_array().is_none_or(Vec::is_empty) {
             return Err(Error::Session);
         }
-        let bytes = aterm_secrets::SecretBytes::from(
+        Ok(aterm_secrets::SecretBytes::from(
             aterm_json::to_vec(&cookies.0).map_err(|_| Error::Session)?,
-        );
-        super::google_browser_store::save(home, &self.identity, &self._identity, bytes.as_slice())
-            .map_err(|_| Error::Session)
+        ))
     }
 
     /// Open a page inside this identity's memory-only context.
@@ -802,6 +960,130 @@ mod tests {
                 .unwrap(),
         );
         assert!(default.0["cookies"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    #[ignore = "verifies deferred cookie commit and restart through the pinned full browser; account proof is synthetic"]
+    fn native_pending_session_survives_browser_exit_and_commits_after_proof() {
+        let state = aterm_tempfile::tempdir().unwrap();
+        let home = aterm_tempfile::tempdir().unwrap();
+        let profile = aterm_tempfile::tempdir().unwrap();
+        let text = "[[identities]]\nid='pending'\nemail='fixture@example.invalid'\n[[bindings]]\nprovider='agy'\naccount='one'\nidentity='pending'\nexpected_email='fixture@example.invalid'\n[[bindings]]\nprovider='kimi-global'\naccount='one'\nidentity='pending'\nexpected_email='fixture@example.invalid'\n";
+        aterm_secrets::fsx::write_atomic(
+            &state.path().join("google-identities.toml"),
+            text.as_bytes(),
+            0o600,
+        )
+        .unwrap();
+        let registry = super::super::google_identity::Registry::parse(text).unwrap();
+        let identity = registry.resolve("agy", "one").unwrap().0;
+        let browser_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut browser =
+            MemoryBrowser::start(identity, state.path(), browser_home.as_deref(), deadline)
+                .unwrap();
+        browser.call(None,"Storage.setCookies",json!({"browserContextId":browser.context,"cookies":[{"name":"fixture","value":"pending-cookie","domain":".google.com","path":"/","secure":true,"httpOnly":true},{"name":"vendor","value":"excluded-cookie","domain":"example.invalid","path":"/"}]})).unwrap();
+        let scratch = browser._profile.path().to_owned();
+        let pending = browser.into_pending_session(home.path()).unwrap();
+        assert!(
+            !scratch.exists(),
+            "cookie candidate retained the native browser"
+        );
+        assert!(
+            identity.claim(state.path()).is_err(),
+            "browser exit released the pending identity"
+        );
+        let path = pending.claim.profile().join("session.age");
+        assert!(
+            !path.exists(),
+            "cookies were persisted before account proof"
+        );
+        let proof = super::super::agy_signin::publication_fixture(
+            state.path(),
+            profile.path(),
+            "one",
+            "fixture@example.invalid",
+        );
+        pending.commit(&proof).unwrap();
+        let saved = std::fs::read(&path).unwrap();
+        assert!(
+            !saved
+                .windows(b"pending-cookie".len())
+                .any(|part| part == b"pending-cookie")
+        );
+        let kimi_store = super::super::accounts::Store::at_for(
+            state.path(),
+            crate::ai::connector::Cli::Kimi,
+            home.path(),
+        );
+        let approver = super::super::headless_oauth::VendorApprover::with_mailbox(
+            crate::ai::connector::Cli::Kimi,
+            "one",
+            &kimi_store.shared_dir(),
+            home.path(),
+            super::super::headless_oauth::MailboxConfig::default(),
+        );
+        assert_eq!(identity, registry.resolve("kimi-global", "one").unwrap().0);
+        let mut restarted = MemoryBrowser::start(
+            identity,
+            &approver.google_state,
+            browser_home.as_deref(),
+            deadline,
+        )
+        .unwrap();
+        assert!(restarted.restore_session(home.path()).unwrap());
+        let cookies = SecretValue(
+            restarted
+                .call(
+                    None,
+                    "Storage.getCookies",
+                    json!({"browserContextId":restarted.context}),
+                )
+                .unwrap(),
+        );
+        assert_eq!(cookies.0["cookies"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            cookies.0["cookies"][0]["value"].as_str(),
+            Some("pending-cookie")
+        );
+        restarted.call(None,"Storage.setCookies",json!({"browserContextId":restarted.context,"cookies":[{"name":"fixture","value":"discarded-cookie","domain":".google.com","path":"/","secure":true,"httpOnly":true}]})).unwrap();
+        let discarded = restarted.into_pending_session(home.path()).unwrap();
+        drop(discarded);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            saved,
+            "discarding a candidate replaced the committed session"
+        );
+        assert!(identity.claim(state.path()).is_ok());
+        let mut active =
+            MemoryBrowser::start(identity, state.path(), browser_home.as_deref(), deadline)
+                .unwrap();
+        assert!(active.restore_session(home.path()).unwrap());
+        active.call(None,"Storage.setCookies",json!({"browserContextId":active.context,"cookies":[{"name":"fixture","value":"older-live-context","domain":".google.com","path":"/","secure":true,"httpOnly":true}]})).unwrap();
+        let newer = br#"[{"name":"fixture","value":"newer-publication","domain":".google.com","path":"/","secure":true}]"#;
+        super::super::google_browser_store::save(
+            home.path(),
+            identity,
+            active._identity.as_ref().unwrap(),
+            newer,
+        )
+        .unwrap();
+        let ciphertext = std::fs::read(&path).unwrap();
+        let older = active.into_pending_session(home.path()).unwrap();
+        older.commit(&proof).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            ciphertext,
+            "a live context rolled a later snapshot back during completion"
+        );
+        let claim = identity.claim(state.path()).unwrap();
+        assert_eq!(
+            super::super::google_browser_store::load(home.path(), identity, &claim)
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            newer
+        );
     }
 
     #[test]

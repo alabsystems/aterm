@@ -17,6 +17,10 @@ mod persistence_tests;
 #[path = "server/reply_tests.rs"]
 mod reply_tests;
 
+#[cfg(test)]
+#[path = "server/crossing_tests.rs"]
+mod crossing_tests;
+
 use crate::envelope::{self, MAX_ENVELOPE};
 use crate::transport::{JoinRequest, parse_join_line};
 use crate::wake::{Bell, Wake};
@@ -1107,6 +1111,9 @@ impl Drop for Writing<'_> {
 struct State {
     vaults: BTreeMap<String, Slot>,
     records: BTreeMap<String, RecordSlot>,
+    /// The vaults whose records this server found crossed ([`Shared::crossed`]): crossing is
+    /// one-way, so once found it is not looked for again.
+    crossed: BTreeSet<String>,
     joins: BTreeMap<String, Vec<Queued>>,
     heard: heard::History,
     heard_flushed: BTreeMap<String, u64>,
@@ -1313,6 +1320,68 @@ impl Shared {
         self.store.join(format!("{name}.records"))
     }
 
+    /// `name`'s crossed mark ([`crate::crossing::Mark`]), beside its records file.
+    fn crossing_mark(&self, name: &str) -> crate::crossing::Mark {
+        crate::crossing::Mark::at(self.store.join(format!("{name}.crossed")))
+    }
+
+    /// Whether `name`'s records have crossed ([`crate::crossing`]): `state` found them so
+    /// before, their log holds more than [`crate::membership_log::LEGACY_RECORDS`] records, or
+    /// their mark is stored.
+    ///
+    /// # Errors
+    /// The look for the mark failed (an `lstat` that fails but for its absence): a `500` the
+    /// caller answers, so on a failed look nothing is served, taken or stated, and the next
+    /// request looks again.
+    fn crossed(&self, state: &mut State, name: &str) -> Result<bool, Reply> {
+        if state.crossed.contains(name) {
+            return Ok(true);
+        }
+        let held = state
+            .records
+            .get(name)
+            .and_then(|slot| slot.store.log())
+            .map_or(0, crate::membership_log::Log::held_count);
+        let crossed = crate::crossing::past_legacy(held)
+            || match self.crossing_mark(name).stored() {
+                Ok(stored) => stored,
+                Err(e) => {
+                    note(&format!("{name}: could not look for the crossed mark: {e}"));
+                    return Err(Reply::text(
+                        500,
+                        "the server could not look for whether its records crossed",
+                    ));
+                }
+            };
+        if crossed {
+            state.crossed.insert(name.to_owned());
+        }
+        Ok(crossed)
+    }
+
+    /// [`Shared::crossed`], taking the state lock.
+    ///
+    /// # Errors
+    /// As [`Shared::crossed`].
+    fn records_crossed(&self, name: &str) -> Result<bool, Reply> {
+        self.crossed(&mut self.lock_server_state(), name)
+    }
+
+    /// Store `name`'s crossed mark, before this server takes a record of a crossed log or holds
+    /// more than [`crate::membership_log::LEGACY_RECORDS`]: a `500` where it cannot, and the
+    /// caller then takes nothing.
+    fn mark_crossed(&self, name: &str) -> Result<(), Reply> {
+        if let Err(e) = self.crossing_mark(name).store() {
+            note(&format!("{name}: could not store the crossed mark: {e}"));
+            return Err(Reply::text(
+                500,
+                "the server could not store that its records crossed",
+            ));
+        }
+        self.lock_server_state().crossed.insert(name.to_owned());
+        Ok(())
+    }
+
     fn wake_advertiser(&self) {
         if let Some(bell) = self
             .advertiser
@@ -1396,6 +1465,10 @@ fn load_with_pins(store: &Path, now: u64, pins: &[(String, [u8; 32])]) -> crate:
                 note(&format!(
                     "{file}: skipped; the server holds at most {MAX_VAULTS} vaults"
                 ));
+                continue;
+            }
+            if let Err(error) = crate::records_storage::recover_pending(&path) {
+                note(&format!("{file}: storage recovery refused: {error}"));
                 continue;
             }
             let keys = held_keys(&state, name).or_else(|| {
@@ -1929,6 +2002,11 @@ struct Reply {
     /// GET reply does. A flag, not the id: a wider field makes every `Result<_, Reply>` an
     /// error variant clippy calls too large.
     records_boot: bool,
+    /// What the reply states of the vault's records ([`crate::transport::RECORDS_BOUND_HEADER`]),
+    /// as every records reply does: `Some(crossed)`, stated with this build's held bound
+    /// ([`crate::crossing::RecordsBound::here`]). Whether crossed alone, for the same reason
+    /// `records_boot` is a flag.
+    records_bound: Option<bool>,
 }
 
 enum Body {
@@ -1951,6 +2029,7 @@ impl Reply {
             retry_after: None,
             records_need: false,
             records_boot: false,
+            records_bound: None,
         }
     }
 
@@ -1971,6 +2050,7 @@ impl Reply {
             retry_after: None,
             records_need: false,
             records_boot: false,
+            records_bound: None,
         }
     }
 }
@@ -2080,6 +2160,13 @@ fn write_reply_to(
             crate::transport::RECORDS_BOOT_HEADER
         ));
     }
+    if let Some(crossed) = reply.records_bound {
+        head.push_str(&format!(
+            "{}: {}\r\n",
+            crate::transport::RECORDS_BOUND_HEADER,
+            crate::crossing::RecordsBound::here(crossed).value()
+        ));
+    }
     if let Some(secs) = reply.retry_after {
         head.push_str(&format!("Retry-After: {secs}\r\n"));
     }
@@ -2174,6 +2261,9 @@ struct Request {
     subscriber: Option<String>,
     observer: bool,
     no_wait: bool,
+    /// What the client stated of its records ([`crate::transport::RECORDS_BOUND_HEADER`]):
+    /// `None` where it sent none, sent it twice, or sent a value that is not a bound's.
+    records_bound: Option<crate::crossing::RecordsBound>,
     /// Body bytes that arrived with the head.
     early: Vec<u8>,
 }
@@ -2311,6 +2401,8 @@ fn parse_head(head: &[u8], early: Vec<u8>) -> Result<Request, Reply> {
     let mut subscriber: Option<String> = None;
     let mut observer = false;
     let mut no_wait = false;
+    // `Some(None)` once the bound header came twice or did not parse.
+    let mut records_bound: Option<Option<crate::crossing::RecordsBound>> = None;
     for line in lines {
         if line.starts_with([' ', '\t']) {
             return Err(bad("folded header lines are not accepted"));
@@ -2364,6 +2456,11 @@ fn parse_head(head: &[u8], early: Vec<u8>) -> Result<Request, Reply> {
             no_wait = true;
         } else if name.eq_ignore_ascii_case(crate::transport::OBSERVER_HEADER) && value == "1" {
             observer = true;
+        } else if name.eq_ignore_ascii_case(crate::transport::RECORDS_BOUND_HEADER) {
+            records_bound = Some(match records_bound {
+                None => crate::crossing::RecordsBound::parse(value),
+                Some(_) => None,
+            });
         }
     }
     let (path, query) = match target.split_once('?') {
@@ -2379,6 +2476,7 @@ fn parse_head(head: &[u8], early: Vec<u8>) -> Result<Request, Reply> {
         subscriber,
         observer,
         no_wait,
+        records_bound: records_bound.flatten(),
         early,
     })
 }
@@ -2428,7 +2526,55 @@ fn route(path: &str) -> Option<Route<'_>> {
     envelope::valid_name(name).then_some(route)
 }
 
-fn respond(shared: &Shared, stream: &mut TcpStream, peer: IpAddr, mut request: Request) -> Reply {
+/// [`answer`] `request`: a reply to one at a vault's records also states what this server holds
+/// of them ([`Reply::records_bound`]), whatever its status. Where this server cannot look for
+/// whether they crossed ([`Shared::crossed`]), the reply is that look's `500`, stating no bound:
+/// a bound it cannot vouch for would cross a client for good, or leave one uncrossed beside a
+/// crossed log's records.
+fn respond(shared: &Shared, stream: &mut TcpStream, peer: IpAddr, request: Request) -> Reply {
+    let records = match route(&request.path) {
+        Some(Route::Records(name)) => Some(name.to_owned()),
+        _ => None,
+    };
+    let mut reply = answer(shared, stream, peer, request);
+    if let Some(name) = records {
+        match shared.records_crossed(&name) {
+            Ok(crossed) => reply.records_bound = Some(crossed),
+            Err(failed) => reply = failed,
+        }
+    }
+    reply
+}
+
+/// What a records request without [`crate::transport::RECORDS_BOUND_HEADER`] gets from a server
+/// whose records crossed ([`crate::crossing`]): `409` and no record, which every build before the
+/// fence takes for a source that failed, so it holds what it held rather than part of a batch.
+fn fenced() -> Reply {
+    Reply::text(
+        409,
+        "this server's membership log holds records a build before the crossed fence cannot take \
+         whole: it serves and takes records only from a client that states its records bound \
+         (X-Aterm-Records-Bound)",
+    )
+}
+
+/// Refuse incompatible capacities before any record is exposed or retained.
+fn records_fence(crossed: bool, peer: Option<crate::crossing::RecordsBound>) -> Option<Reply> {
+    let own = crate::crossing::RecordsBound::here(crossed);
+    match peer {
+        Some(peer) if !own.can_exchange(peer) => Some(Reply::text(
+            409,
+            format!(
+                "incompatible membership records capacities: local {}, peer {}",
+                own.held, peer.held
+            ),
+        )),
+        None if crossed => Some(fenced()),
+        _ => None,
+    }
+}
+
+fn answer(shared: &Shared, stream: &mut TcpStream, peer: IpAddr, mut request: Request) -> Reply {
     let path = std::mem::take(&mut request.path);
     let Some(route) = route(&path) else {
         return Reply::text(
@@ -2462,8 +2608,18 @@ fn respond(shared: &Shared, stream: &mut TcpStream, peer: IpAddr, mut request: R
         (&route, method),
         (Route::Vault(_) | Route::Records(_) | Route::Join(_), "GET")
     );
-    if request.query.is_some() && !waits {
+    // A crossed poster's records POST carries the one query every build before the fence
+    // refuses unread ([`crate::transport::CROSSED_POST_QUERY`]), and says it crossed.
+    let crossed_post = matches!((&route, method), (Route::Records(_), "POST"))
+        && request.query.as_deref() == Some(crate::transport::CROSSED_POST_QUERY);
+    if request.query.is_some() && !waits && !crossed_post {
         return Reply::text(400, "this path takes no query");
+    }
+    if crossed_post && !request.records_bound.is_some_and(|bound| bound.crossed) {
+        return Reply::text(
+            400,
+            "a records POST carries crossed=2 only beside a records bound that says crossed",
+        );
     }
     match (route, method) {
         (Route::Vault(name), "GET") => {
@@ -2506,15 +2662,29 @@ fn respond(shared: &Shared, stream: &mut TcpStream, peer: IpAddr, mut request: R
                 shared,
                 stream,
                 name,
-                request.query.as_deref(),
-                request.subscriber.as_deref(),
-                request.no_wait,
-                local,
+                &RecordsGet {
+                    query: request.query.as_deref(),
+                    subscriber: request.subscriber.as_deref(),
+                    no_wait: request.no_wait,
+                    local,
+                    stated: request.records_bound,
+                },
             );
             reply.records_boot = true;
             reply
         }
         (Route::Records(name), _) => {
+            // Before the body is read: a crossed server takes no record from a poster that
+            // states no bound ([`apply_records`] asks again once it holds the store).
+            match shared.records_crossed(name) {
+                Ok(crossed) => {
+                    if let Some(reply) = records_fence(crossed, request.records_bound) {
+                        return reply;
+                    }
+                }
+                Err(failed) => return failed,
+            }
+            let stated = request.records_bound;
             let length = match body_length(&request, crate::membership_log::MAX_RECORDS_STREAM) {
                 Ok(length) => length,
                 Err(reply) => return reply,
@@ -2530,7 +2700,7 @@ fn respond(shared: &Shared, stream: &mut TcpStream, peer: IpAddr, mut request: R
                 Err(reply) => return reply,
             };
             match records_input::from_http(shared, name, stream, request, length) {
-                Ok(records) => apply_records(shared, name, records, local),
+                Ok(records) => apply_records(shared, name, records, local, stated),
                 Err(reply) => reply,
             }
         }
@@ -2707,6 +2877,7 @@ fn envelope_reply(held: &Held) -> Reply {
         retry_after: None,
         records_need: false,
         records_boot: false,
+        records_bound: None,
     }
 }
 
@@ -3214,6 +3385,9 @@ fn look_at_records_with(
     if state.records.get(name).is_some_and(|slot| slot.writing) {
         return Ok(());
     }
+    let entry = path;
+    let data_path = crate::records_storage::data_path(path).map_err(fsx::Unread::Failed)?;
+    let path = data_path.as_path();
     let Some(seen) = fsx::stamp(path) else {
         return Ok(());
     };
@@ -3227,7 +3401,11 @@ fn look_at_records_with(
         let Some(mut reader) = fsx::open_owned_reader_classified(path)? else {
             return Ok(None);
         };
-        let decoded = crate::membership_log::Store::read_records(reader.file())
+        let limit = state.records.get(name).map_or_else(
+            || crate::membership_log::RecordBudgets::current().held,
+            |slot| slot.store.budgets().held,
+        );
+        let decoded = crate::membership_log::Store::read_records(reader.file(), limit)
             .map_err(fsx::Unread::Failed)?;
         after_decode();
         // The shared decoder consumes at most the client's recovery prefix. Servers refuse
@@ -3246,6 +3424,7 @@ fn look_at_records_with(
             }
         };
         reader.check_unchanged_classified()?;
+        crate::records_storage::data_path(entry).map_err(fsx::Unread::Failed)?;
         if more {
             return Err(fsx::Unread::Refused(Error::new(format!(
                 "{}: larger than {} bytes",
@@ -3360,6 +3539,7 @@ fn records_reply(records: Vec<crate::membership_log::Record>, records_need: bool
         retry_after: None,
         records_need,
         records_boot: false,
+        records_bound: None,
     }
 }
 
@@ -3372,15 +3552,32 @@ fn server_lacks_have(state: &State, name: &str, have: &[crate::membership_log::R
             .is_some_and(|log| have.iter().all(|id| log.get(id).is_some()))
 }
 
-fn get_records(
-    shared: &Shared,
-    stream: &TcpStream,
-    name: &str,
-    query: Option<&str>,
-    subscriber: Option<&str>,
+/// What a records GET asks ([`get_records`]).
+struct RecordsGet<'a> {
+    /// Its query (`have=…`).
+    query: Option<&'a str>,
+    /// The subscriber it reads for ([`crate::transport::SUBSCRIBER_HEADER`]).
+    subscriber: Option<&'a str>,
+    /// Whether it asks the server not to wait ([`crate::transport::NO_WAIT_HEADER`]).
     no_wait: bool,
+    /// Whether it came from this host.
     local: bool,
-) -> Reply {
+    /// What it states of the client's records ([`crate::transport::RECORDS_BOUND_HEADER`]).
+    stated: Option<crate::crossing::RecordsBound>,
+}
+
+/// Answer a records GET: the records past what it names that the store holds, at once or once
+/// some arrive. A client that states no records bound gets [`fenced`] once the vault's records
+/// crossed, also where they crossed while it waited, and the failed look's `500` where this
+/// server cannot look for whether they crossed ([`Shared::crossed`]).
+fn get_records(shared: &Shared, stream: &TcpStream, name: &str, get: &RecordsGet<'_>) -> Reply {
+    let &RecordsGet {
+        query,
+        subscriber,
+        no_wait,
+        local,
+        stated,
+    } = get;
     let have = match have_query(query) {
         Ok(have) => have,
         Err(reply) => return reply,
@@ -3397,6 +3594,14 @@ fn get_records(
         || local;
     if !known_vault {
         return Reply::text(404, format!("no vault named {name} here"));
+    }
+    match shared.crossed(&mut state, name) {
+        Ok(crossed) => {
+            if let Some(reply) = records_fence(crossed, stated) {
+                return reply;
+            }
+        }
+        Err(failed) => return failed,
     }
     if let Some(subscriber) = subscriber
         && (holds_records(&state, name) || state.vaults.contains_key(name))
@@ -3446,16 +3651,25 @@ fn get_records(
             .is_some_and(|slot| !slot.store.missing(&have).is_empty())
     });
     let lacks = server_lacks_have(&state, name, &have);
-    let reply = match state
-        .records
-        .get(name)
-        .map(|slot| slot.store.missing(&have))
-    {
-        Some(missing) if !missing.is_empty() => records_reply(missing, lacks),
-        _ => {
-            let mut reply = Reply::empty(204);
-            reply.records_need = lacks;
-            reply
+    // The records may have crossed while it waited: what came may be a crossed log's.
+    let fence = match shared.crossed(&mut state, name) {
+        Ok(crossed) => records_fence(crossed, stated),
+        Err(failed) => Some(failed),
+    };
+    let reply = if let Some(fence) = fence {
+        fence
+    } else {
+        match state
+            .records
+            .get(name)
+            .map(|slot| slot.store.missing(&have))
+        {
+            Some(missing) if !missing.is_empty() => records_reply(missing, lacks),
+            _ => {
+                let mut reply = Reply::empty(204);
+                reply.records_need = lacks;
+                reply
+            }
         }
     };
     drop(wake);
@@ -3470,21 +3684,42 @@ fn get_records(
     reply
 }
 
-/// The slice adapter uses the same strict staging and application as a real HTTP POST.
+/// The slice adapter uses the same strict staging and application as a real HTTP POST, from a
+/// poster that states it has not crossed.
 #[cfg(test)]
 fn post_records(shared: &Shared, name: &str, body: &[u8], local: bool) -> Reply {
+    post_records_stating(
+        shared,
+        name,
+        body,
+        local,
+        Some(crate::crossing::RecordsBound::uncrossed()),
+    )
+}
+
+/// [`post_records`] from a poster that states `stated` of its records.
+#[cfg(test)]
+fn post_records_stating(
+    shared: &Shared,
+    name: &str,
+    body: &[u8],
+    local: bool,
+    stated: Option<crate::crossing::RecordsBound>,
+) -> Reply {
     match records_input::from_bytes(shared, name, body) {
-        Ok(records) => apply_records(shared, name, records, local),
+        Ok(records) => apply_records(shared, name, records, local, stated),
         Err(reply) => reply,
     }
 }
 
 /// A completed peer response keeps its original frame metadata through both candidates.
-/// Selection does not bypass the current-state checks in the common application path.
+/// Selection does not bypass the current-state checks in the common application path, which
+/// takes them as from a poster stating what the peer `stated` of its records.
 fn apply_pulled_records(
     shared: &Shared,
     name: &str,
     received: crate::membership_log::untaken::ReceivedFrames,
+    stated: Option<crate::crossing::RecordsBound>,
 ) -> (crate::membership_log::untaken::Sent, Reply) {
     let length = received.byte_len();
     let mut reply = match received.whole() {
@@ -3493,6 +3728,7 @@ fn apply_pulled_records(
             name,
             records_input::StagedRecords::from_verified(records),
             false,
+            stated,
         ),
         None => Reply::text(400, "the peer records do not verify as a whole"),
     };
@@ -3505,6 +3741,7 @@ fn apply_pulled_records(
                 name,
                 records_input::StagedRecords::from_verified(part),
                 false,
+                stated,
             );
         }
     }
@@ -3564,7 +3801,19 @@ fn persist_records(
     stamp: Option<fsx::FileStamp>,
     on_file: Option<usize>,
 ) -> Result<Option<fsx::FileStamp>, Box<PersistFailure>> {
-    let path = shared.records_path(name);
+    let path = (|| {
+        let crossed = shared.crossing_mark(name).stored()?;
+        let large = accepted
+            .log()
+            .is_some_and(|log| crate::crossing::past_legacy(log.held_count()));
+        crate::records_storage::write_path(&shared.records_path(name), crossed || large)
+    })()
+    .map_err(|error| {
+        Box::new(PersistFailure {
+            error,
+            attempted: None,
+        })
+    })?;
     let tail = match (on_file, stamp) {
         (Some(from), Some(stamp)) => Some(AppendAttempt {
             stamp,
@@ -3621,6 +3870,18 @@ fn persist_records(
 /// lets its highest waiting record go for each complete one, and a new record that lands before
 /// that record's parent in the same body (or another POST meanwhile) could let it go before its
 /// parent lands.
+///
+/// `stated` is what the poster stated of its records ([`crate::transport::RECORDS_BOUND_HEADER`];
+/// a peer pull's, what the peer's answer stated). Once `name`'s records crossed
+/// ([`crate::crossing`]), a poster that states none gets [`fenced`] and nothing is taken; where
+/// this server cannot look for whether they crossed, nothing is taken (the answer is that look's
+/// `500`, or `204` to a poster that states a bound and brings only records the store holds). A
+/// store that has not crossed ingests a crossed poster's records into its
+/// private copy first, and where the copy's complete log grows,
+/// stores its mark ([`Shared::mark_crossed`]) before the slot or the file takes the copy; it does
+/// so too before it holds more than [`crate::membership_log::LEGACY_RECORDS`] records. A crossed
+/// poster's batch that brings only waiting records is dropped and stores no mark. Where the
+/// mark cannot be stored the answer is 500 and neither the slot nor the file takes a record.
 #[cfg_attr(
     all(unix, any(test, debug_assertions)),
     aterm_spec_anchor::refines(
@@ -3658,7 +3919,22 @@ fn apply_records(
     name: &str,
     staged: records_input::StagedRecords,
     local: bool,
+    stated: Option<crate::crossing::RecordsBound>,
 ) -> Reply {
+    match crate::records_storage::pending(&shared.records_path(name)) {
+        Ok(true) => {
+            let _writing = shared
+                .record_writes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Err(error) = crate::records_storage::recover_pending(&shared.records_path(name))
+            {
+                return Reply::text(500, error.to_string());
+            }
+        }
+        Err(error) => return Reply::text(500, error.to_string()),
+        Ok(false) => {}
+    }
     {
         let mut state = shared.lock_server_state();
         if let Some(reply) = unreadable_records(shared, &mut state, name) {
@@ -3666,6 +3942,14 @@ fn apply_records(
         }
         if let Some(reply) = refuse_unheld_records(shared, &state, name, local) {
             return reply;
+        }
+        match shared.crossed(&mut state, name) {
+            Ok(crossed) => {
+                if let Some(reply) = records_fence(crossed, stated) {
+                    return reply;
+                }
+            }
+            Err(failed) => return failed,
         }
         if state.records.get(name).is_some_and(|slot| {
             staged
@@ -3680,12 +3964,19 @@ fn apply_records(
         .record_writes
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    let (mut copy, stamp, on_file) = {
+    let (mut copy, stamp, on_file, crossed) = {
         let mut state = shared.lock_server_state();
         if let Some(reply) = unreadable_records(shared, &mut state, name) {
             return reply;
         }
         if let Some(reply) = refuse_unheld_records(shared, &state, name, local) {
+            return reply;
+        }
+        let crossed = match shared.crossed(&mut state, name) {
+            Ok(crossed) => crossed,
+            Err(failed) => return failed,
+        };
+        if let Some(reply) = records_fence(crossed, stated) {
             return reply;
         }
         if state.records.get(name).is_some_and(|slot| {
@@ -3706,13 +3997,26 @@ fn apply_records(
                 },
                 slot.stamp,
                 slot.on_file,
+                crossed,
             ),
             None => match crate::membership_log::Store::for_vault(name) {
-                Ok(store) => (follow_held(store, keys.as_deref()), None, None),
+                Ok(store) => (follow_held(store, keys.as_deref()), None, None, crossed),
                 Err(e) => return Reply::text(500, e.to_string()),
             },
         }
     };
+    // What a crossed log brings crosses this store where the store takes a complete record of
+    // it.
+    let from_crossed = !crossed && stated.is_some_and(|bound| bound.crossed);
+    // MUTANT (`crate::crossing::Faults::mark_on_receipt`): the mark before the copy shows it
+    // takes anything.
+    #[cfg(test)]
+    if from_crossed
+        && crate::crossing::faults(shared.crossing_mark(name).path()).mark_on_receipt
+        && let Err(reply) = shared.mark_crossed(name)
+    {
+        return reply;
+    }
     let held_before = copy.log().map_or(0, crate::membership_log::Log::held_count);
     let mut records = staged.into_records();
     records.retain(|record| !copy.holds(record.id()));
@@ -3738,23 +4042,42 @@ fn apply_records(
         );
     };
     if held == held_before {
-        // Only waiting records came: nothing for the file, and nothing new to serve. The slot
-        // takes the stamp and `on_file` it had when copied, so a file a look read meanwhile is
-        // read again.
-        let mut state = shared.lock_server_state();
-        match state.records.get_mut(name) {
-            Some(slot) => {
-                slot.store = copy;
-                slot.stamp = stamp;
-                slot.on_file = on_file;
+        // Only waiting records came. A crossed log's are not taken, and store no mark: a record
+        // waits for any signer that ever held a seat (`Log::insert`), a removed Mac's among
+        // them, with a parent that may never come, so taking them would let such a key cross
+        // this vault for good with a record that, its parent made up, is never served. An
+        // honest crossed poster's records wait here only on a parent this server lost (a
+        // restart) or could not take, and they come again with it when the poster next posts
+        // its whole store (`client::Reposted`), the mark then stored before any of them is
+        // held.
+        if from_crossed {
+            // MUTANT (`crate::crossing::Faults::mark_on_waiting`): the mark for them, and the
+            // slot takes them.
+            #[cfg(test)]
+            if crate::crossing::faults(shared.crossing_mark(name).path()).mark_on_waiting {
+                if let Err(reply) = mark_before_take(shared, name) {
+                    return reply;
+                }
+                hold_waiting(shared, name, copy, stamp, on_file);
             }
-            None => {
-                state
-                    .records
-                    .insert(name.to_owned(), RecordSlot::stamped(copy, stamp, on_file));
-            }
+            return Reply::empty(204);
         }
+        hold_waiting(shared, name, copy, stamp, on_file);
         return Reply::empty(204);
+    }
+    // The copy holds more complete records than the slot. Where a crossed log taught them, the
+    // mark before the slot or the file takes the copy, so nothing a crossed log taught this
+    // server is held without the mark. Nothing has seen the copy yet, so a batch it takes none
+    // of (a `400`, a `422`, records it holds, records that only wait on a parent) stores no
+    // mark.
+    if from_crossed && let Err(reply) = mark_before_take(shared, name) {
+        return reply;
+    }
+    // A log past the legacy bound crosses this store: the mark before the file or the slot holds
+    // it.
+    let past_legacy = !crossed && !from_crossed && crate::crossing::past_legacy(held);
+    if past_legacy && let Err(reply) = mark_before_take(shared, name) {
+        return reply;
     }
     let path = shared.records_path(name);
     let _writing = Writing::mark(shared, name);
@@ -3770,7 +4093,9 @@ fn apply_records(
             // them would answer 204 while they are not durable), and the next growth writes
             // the file whole. A file another writer put there keeps the slot's stamp, so a
             // look reads it.
-            let now = fsx::stamp(&path);
+            let now = crate::records_storage::data_path(&path)
+                .ok()
+                .and_then(|path| fsx::stamp(&path));
             let mut state = shared.lock_server_state();
             if let (Some(attempted), Some(now), Some(slot)) =
                 (failure.attempted, now, state.records.get_mut(name))
@@ -3805,7 +4130,79 @@ fn apply_records(
                 .insert(name.to_owned(), RecordSlot::stamped(copy, written, on_file));
         }
     }
+    drop(state);
+    #[cfg(test)]
+    if (from_crossed || past_legacy)
+        && let Err(reply) = mutant_mark_after_take(shared, name)
+    {
+        return reply;
+    }
     Reply::empty(204)
+}
+
+/// The slot for `name` takes `copy`, which holds no complete record past the slot's, only
+/// records waiting on a parent: nothing for the file, and nothing new to serve. The slot takes
+/// the `stamp` and `on_file` it had when copied, so a file a look read meanwhile is read again.
+fn hold_waiting(
+    shared: &Shared,
+    name: &str,
+    copy: crate::membership_log::Store,
+    stamp: Option<fsx::FileStamp>,
+    on_file: Option<usize>,
+) {
+    let mut state = shared.lock_server_state();
+    match state.records.get_mut(name) {
+        Some(slot) => {
+            slot.store = copy;
+            slot.stamp = stamp;
+            slot.on_file = on_file;
+        }
+        None => {
+            state
+                .records
+                .insert(name.to_owned(), RecordSlot::stamped(copy, stamp, on_file));
+        }
+    }
+}
+
+/// Store `name`'s crossed mark before its store takes records that cross it
+/// ([`Shared::mark_crossed`]). In a test, the server may die right after
+/// ([`crate::crossing::Faults::dies_between`]), or under the mutant that takes first
+/// ([`crate::crossing::Faults::mark_after_take`]) store nothing here.
+fn mark_before_take(shared: &Shared, name: &str) -> Result<(), Reply> {
+    #[cfg(test)]
+    let faults = crate::crossing::faults(shared.crossing_mark(name).path());
+    #[cfg(test)]
+    if faults.mark_after_take {
+        return Ok(());
+    }
+    shared.mark_crossed(name)?;
+    #[cfg(test)]
+    if faults.dies_between {
+        return Err(died_here());
+    }
+    Ok(())
+}
+
+/// MUTANT ([`crate::crossing::Faults::mark_after_take`]): the mark once the store took the
+/// records that crossed it, the server dying first where the test says so.
+#[cfg(test)]
+fn mutant_mark_after_take(shared: &Shared, name: &str) -> Result<(), Reply> {
+    let faults = crate::crossing::faults(shared.crossing_mark(name).path());
+    if !faults.mark_after_take {
+        return Ok(());
+    }
+    if faults.dies_between {
+        return Err(died_here());
+    }
+    shared.mark_crossed(name)
+}
+
+/// What a test's server answers where it dies ([`crate::crossing::Faults::dies_between`]): the
+/// test reads what it left on disk with a server started anew, as after a process that ended.
+#[cfg(test)]
+fn died_here() -> Reply {
+    Reply::text(500, "a test's server died here")
 }
 
 /// A records application's look at `name`'s file ([`look_for_records`]): a 500 when the read failed,
@@ -4072,6 +4469,7 @@ fn list_joins(shared: &Shared, stream: &TcpStream, name: &str, query: Option<&st
         retry_after: None,
         records_need: false,
         records_boot: false,
+        records_bound: None,
     }
 }
 
@@ -4164,6 +4562,7 @@ fn list_heard(shared: &Shared, name: &str) -> Reply {
         retry_after: None,
         records_need: false,
         records_boot: false,
+        records_bound: None,
     }
 }
 
@@ -4187,6 +4586,7 @@ fn list_verdicts(shared: &Shared, name: &str) -> Reply {
         retry_after: None,
         records_need: false,
         records_boot: false,
+        records_bound: None,
     }
 }
 
@@ -4782,6 +5182,12 @@ fn pull_from_peers_shared(
 /// (no answer within its budget, a refused or dropped connection, an answer no server gives)
 /// ends this pass's pulls from `peer`: one more would cost the same budget to hear the same
 /// silence. Returns how many vaults advanced.
+///
+/// A records pull states what this server holds of the vault's records, as a member's does
+/// ([`crate::crossing`]): once they crossed, it takes nothing from a peer whose answer states no
+/// bound, and records from a peer that states it crossed are taken as a crossed poster's
+/// ([`apply_records`] stores the mark first). A vault whose crossing this server cannot look for
+/// is not pulled this pass.
 fn pull_from_peer(
     shared: &Shared,
     peer: &crate::discover::DiscoveredVault,
@@ -4906,17 +5312,28 @@ fn pull_from_peer(
                     None => (Vec::new(), Vec::new()),
                 }
             };
-            let received = match crate::transport::fetch_record_frames_with_known(
+            // A pull that cannot say whether the records crossed takes nothing this pass.
+            let Ok(crossed) = shared.records_crossed(&vault_name) else {
+                continue;
+            };
+            let answer = match crate::transport::fetch_record_frames_with_known(
                 &vault_url,
                 &have_records,
                 None,
                 budget,
                 None,
+                crate::crossing::RecordsBound::here(crossed),
                 |id| records_input::known_record(shared, &vault_name, id),
             ) {
-                Ok(answer) => answer.received,
+                Ok(answer) => answer,
                 Err(_) => return stored,
             };
+            let stated = answer.bound.stated();
+            // A crossed server takes nothing from a peer of a build before the fence.
+            if crossed && stated.is_none() {
+                continue;
+            }
+            let received = answer.received;
             if received.byte_len() == 0 {
                 continue;
             }
@@ -4925,7 +5342,7 @@ fn pull_from_peer(
                 .records
                 .get(&vault_name)
                 .map_or(0, |slot| slot.store.len());
-            let (stream, reply) = apply_pulled_records(shared, &vault_name, received);
+            let (stream, reply) = apply_pulled_records(shared, &vault_name, received, stated);
             // Only a verdict says what the store cannot take: a `204` (it took what it could), or
             // a `400` (every record refused, or none this build reads). A `500` (it could not
             // write its store), `507` or `403` judged none of it, and the same pull may land
@@ -12096,6 +12513,112 @@ mod tests {
         opts
     }
 
+    #[test]
+    fn expanded_server_custody_fences_old_writers_and_reopens_for_append() {
+        use crate::crossing::{RecordsBound, fixture::RAISED};
+        use crate::membership_log::{LEGACY_RECORDS, encode_records};
+        RAISED.within(|| {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let options = team_options(root.path());
+            let running = run(&options);
+            let mut founded = Founded::new();
+            let mut base = vec![founded.genesis.clone()];
+            for n in 1..LEGACY_RECORDS {
+                base.push(founded.mint(10_000 + n as u64, &format!("fence-{n}")));
+            }
+            assert_eq!(
+                post_records_stating(
+                    &running.shared,
+                    "team",
+                    &encode_records(&base),
+                    false,
+                    Some(RecordsBound::here(false))
+                )
+                .status,
+                204
+            );
+            let legacy = root.path().join("team.records");
+            let earlier = std::fs::read(&legacy).unwrap();
+            let extra = founded.mint(20_000, "crossed");
+            assert_eq!(
+                post_records_stating(
+                    &running.shared,
+                    "team",
+                    extra.bytes(),
+                    false,
+                    Some(RecordsBound::here(true))
+                )
+                .status,
+                204
+            );
+            assert!(fsx::write_atomic(&legacy, &earlier, 0o600).is_err());
+            assert!(fsx::read_owned(&legacy, crate::membership_log::MAX_RECORDS_STREAM).is_err());
+            let current = crate::records_storage::data_path(&legacy).unwrap();
+            let inode = fsx::stamp(&current).unwrap().ino;
+            let later = founded.mint(20_001, "after-fence");
+            assert_eq!(
+                post_records_stating(
+                    &running.shared,
+                    "team",
+                    later.bytes(),
+                    false,
+                    Some(RecordsBound::here(true))
+                )
+                .status,
+                204
+            );
+            assert_eq!(
+                fsx::stamp(&current).unwrap().ino,
+                inode,
+                "later writes append to current"
+            );
+            let expected = running.stored_records("team").complete_inventory();
+            assert_eq!(expected.len(), LEGACY_RECORDS + 2);
+            running.stop();
+            let reopened = run(&options);
+            let actual = reopened.stored_records("team").complete_inventory();
+            assert!(
+                actual == expected,
+                "reopened {} of {} records",
+                actual.len(),
+                expected.len()
+            );
+            reopened.stop();
+        });
+    }
+
+    #[test]
+    fn server_startup_finishes_a_prepared_records_layout_without_changing_history() {
+        use crate::membership_log::encode_records;
+        let root = aterm_tempfile::tempdir().unwrap();
+        let options = team_options(root.path());
+        let running = run(&options);
+        let mut founded = Founded::new();
+        let next = founded.mint(2_000, "before-interruption");
+        assert_eq!(
+            post_records(
+                &running.shared,
+                "team",
+                &encode_records([&founded.genesis, &next]),
+                false
+            )
+            .status,
+            204
+        );
+        let expected = running.stored_records("team").complete_inventory();
+        running.stop();
+        let legacy = root.path().join("team.records");
+        assert!(crate::records_storage::interrupt_after_exchange(&legacy).is_err());
+        assert!(crate::records_storage::data_path(&legacy).is_err());
+        let reopened = run(&options);
+        assert_eq!(
+            reopened.stored_records("team").complete_inventory(),
+            expected
+        );
+        assert!(crate::records_storage::data_path(&legacy).is_ok());
+        reopened.stop();
+    }
+
     /// The founder `m1` of vault `team`'s network, its genesis and its log.
     struct Founded {
         writer: [u8; 32],
@@ -13135,8 +13658,15 @@ mod tests {
         let founded = Founded::new();
         let boots = |url: &str| {
             let fetch = |have: &[crate::membership_log::RecordId]| {
-                crate::transport::fetch_records_sync(url, have, None, HANG_DETECTOR, None)
-                    .expect("a records GET")
+                crate::transport::fetch_records_sync(
+                    url,
+                    have,
+                    None,
+                    HANG_DETECTOR,
+                    None,
+                    crate::crossing::RecordsBound::uncrossed(),
+                )
+                .expect("a records GET")
             };
             let (whole, frontier) = (fetch(&[]), fetch(&[*founded.genesis.id()]));
             assert_eq!(

@@ -146,12 +146,7 @@ fn native_quota_commit_claims_the_destination_and_refuses_a_senior_peer() {
         world.two(Cli::Codex);
         world.claimed_two(Cli::Codex);
         world.on_main(Cli::Codex, &[]);
-        let mut request = session(
-            Cli::Codex,
-            Supervisor::Own,
-            Mode::Early,
-            Path::new("/opt/codex"),
-        );
+        let mut request = session(Cli::Codex, Supervisor::Own, Mode::Early, &world.exe);
         request.point = Point::Wall {
             window: "seven_day".into(),
             at: Some(NOW),

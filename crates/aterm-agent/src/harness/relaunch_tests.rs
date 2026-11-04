@@ -2280,7 +2280,14 @@ fn a_restart_for_a_lost_line_ends_its_agent_and_keeps_its_model() {
         (None, Some("claude-fable-5-2")),
         (Some("claude-opus-5-5"), Some("claude-fable-5-2")),
     ] {
-        let lost = at(&Restart::InputLost, riding, hand);
+        let lost = at(
+            &Restart::InputLost {
+                of: (None, None),
+                line: crate::supervise::custody::LineAsk { at_ms: 0, nth: 0 },
+            },
+            riding,
+            hand,
+        );
         let memory = at(&Restart::Memory, riding, hand);
         assert_eq!(lost.cause, CAUSE_INPUT_LOST, "{riding:?} {hand:?}");
         assert_eq!(

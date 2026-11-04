@@ -495,21 +495,127 @@ fn utf8(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Orphaned login plists in `~/Library/LaunchAgents` whose executable is gone ([`is_label`]).
+/// Orphaned login plists in `~/Library/LaunchAgents` whose executable is gone ([`is_label`]),
+/// of those this Mac may judge ([`judged`], with [`Paths::launch_agents_local`]). One it may not
+/// judge whose executable is gone here stays, and is only unloaded here, while it has no process
+/// ([`unload_stranded`]).
 #[must_use]
 pub fn orphans(paths: &Paths) -> Vec<(String, std::path::PathBuf)> {
-    login_jobs(paths, is_label, &SERVE_ARGS, program_gone)
+    let local = paths.launch_agents_local();
+    login_jobs(paths, is_label, &SERVE_ARGS, |program| {
+        judged(program, &paths.home, local) && program_gone(program)
+    })
 }
 
-/// The login plists in `~/Library/LaunchAgents` named for a label `is_label` takes, each a
-/// regular file whose ProgramArguments are a program and `serve_args`, with `pick` true of that
-/// program: `(label, plist)`, sorted.
+/// A login job this Mac may not judge ([`judged`]), which stays for another Mac that shares the
+/// home ([`unload_stranded`]).
+#[cfg(unix)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Unjudged {
+    /// Its label.
+    pub(crate) label: String,
+    /// Its plist in `~/Library/LaunchAgents`.
+    pub(crate) plist: std::path::PathBuf,
+    /// The program its ProgramArguments run.
+    pub(crate) program: std::path::PathBuf,
+    /// What the unload did with it where that program is gone here ([`program_gone`]); `None`
+    /// where it is not, and nothing was asked of launchd.
+    pub(crate) unload: Option<Unload>,
+}
+
+/// Unload with `unload` ([`unload_idle`] live, which boots a job out of this Mac's own domain
+/// only while it has no process) each login job `is_label` and `serve_args` name
+/// ([`login_job_programs`]) that this Mac may not judge ([`judged`], with
+/// [`Paths::launch_agents_local`]) and whose program is gone here ([`program_gone`]). Its plist
+/// stays, as another Mac that shares the home may run that program from there, and asking
+/// whether it is gone runs no program. This Mac cannot start it. Where its program was already
+/// gone when launchd here loaded it at login, its start failed, and macOS 27.0's launchd then
+/// keeps it loaded with no process, waiting for the program to appear rather than retrying
+/// (measured 2026-11-03). The bootout of such a job leaves this Mac's launchd with no job it
+/// cannot run, whatever its policy for a failed start, for this login alone; the next login loads
+/// it again, and nothing another Mac reads changes. Where its start succeeded and its program
+/// went later, the job may still have a process here (an old mug that re-execs into its own copy
+/// of aterm, which keeps launchd's pid, before the app is removed, say): such a job is left
+/// loaded while that process runs, as a bootout would end it ([`Unload::Running`]). Every login
+/// job this Mac may not judge, sorted, each with what `unload` said it did where its program is
+/// gone here.
+#[cfg(unix)]
+pub(crate) fn unload_stranded(
+    paths: &Paths,
+    is_label: fn(&str) -> bool,
+    serve_args: &[&str],
+    unload: impl Fn(&str) -> Unload,
+) -> Vec<Unjudged> {
+    let local = paths.launch_agents_local();
+    login_job_programs(paths, is_label, serve_args)
+        .into_iter()
+        .filter(|(_, _, program)| !judged(program, &paths.home, local))
+        .map(|(label, plist, program)| {
+            let unload = program_gone(&program).then(|| unload(&label));
+            Unjudged {
+                label,
+                plist,
+                program,
+                unload,
+            }
+        })
+        .collect()
+}
+
+/// Whether this Mac may judge a login job by its `program`: always where the plists are on a
+/// volume local to it (`local`), and on a network home, which another Mac may read at the same
+/// time, only a program inside `home`. One outside it, in this Mac's `/Applications` say, may be
+/// another Mac's, there, whose Enable at Startup a removal here would turn off.
+pub(crate) fn judged(program: &Path, home: &Path, local: bool) -> bool {
+    local || program.starts_with(home)
+}
+
+/// Whether `path` is on a volume local to this Mac (`statfs`'s `MNT_LOCAL`): `false` where it
+/// cannot be read.
+#[cfg(target_os = "macos")]
+pub(crate) fn on_local_volume(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+    const MNT_LOCAL: u32 = 0x0000_1000;
+    let Ok(name) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `statfs` is integers and arrays: all-zero is a value.
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: a NUL-terminated path the call reads and does not retain, and a writable `statfs`.
+    if unsafe { libc::statfs(name.as_ptr(), &raw mut st) } != 0 {
+        return false;
+    }
+    st.f_flags & MNT_LOCAL != 0
+}
+
+/// Off macOS no home is shared with a Mac.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn on_local_volume(_path: &Path) -> bool {
+    true
+}
+
+/// The [`login_job_programs`] with `pick` true of their program: `(label, plist)`, sorted.
 pub(crate) fn login_jobs(
     paths: &Paths,
     is_label: fn(&str) -> bool,
     serve_args: &[&str],
     pick: impl Fn(&Path) -> bool,
 ) -> Vec<(String, std::path::PathBuf)> {
+    login_job_programs(paths, is_label, serve_args)
+        .into_iter()
+        .filter(|(_, _, program)| pick(program))
+        .map(|(label, plist, _)| (label, plist))
+        .collect()
+}
+
+/// The login plists in `~/Library/LaunchAgents` named for a label `is_label` takes, each a
+/// regular file whose ProgramArguments are a program and `serve_args`: `(label, plist,
+/// program)`, sorted.
+pub(crate) fn login_job_programs(
+    paths: &Paths,
+    is_label: fn(&str) -> bool,
+    serve_args: &[&str],
+) -> Vec<(String, std::path::PathBuf, std::path::PathBuf)> {
     if !matches!(check_existing_launch_agents_dir(paths), Ok(true)) {
         return Vec::new();
     }
@@ -540,8 +646,8 @@ pub(crate) fn login_jobs(
         let [program, rest @ ..] = args.as_slice() else {
             continue;
         };
-        if rest == serve_args && pick(Path::new(program)) {
-            found.push((label, plist));
+        if rest == serve_args {
+            found.push((label, plist, std::path::PathBuf::from(program)));
         }
     }
     found.sort();
@@ -621,24 +727,27 @@ fn plists_with_temps(dir: &Path) -> io::Result<Vec<std::path::PathBuf>> {
     Ok(plists.into_iter().collect())
 }
 
-/// Remove every [`orphans`] plist.
+/// Remove every [`orphans`] plist, and unload each job kept on a network home whose program is
+/// gone here and that has no process ([`unload_stranded`]).
 #[cfg(unix)]
 pub fn prune_orphans(paths: &Paths) {
-    let _ = retire(orphans(paths));
+    prune_orphans_with(paths, unload_idle);
 }
 
-/// Remove each job's plist, and unload a job launchd has loaded but not running, so it is not
-/// started again this login ([`unload_idle`]). What could not be removed, one line each.
+/// [`prune_orphans`], unloading each job with `unload`.
 #[cfg(unix)]
-pub(crate) fn retire(jobs: Vec<(String, std::path::PathBuf)>) -> Vec<String> {
-    retire_with(jobs, unload_idle)
+fn prune_orphans_with(paths: &Paths, unload: impl Fn(&str) -> Unload) {
+    let _ = retire_with(orphans(paths), &unload);
+    let _ = unload_stranded(paths, is_label, &SERVE_ARGS, unload);
 }
 
-/// [`retire`], unloading each job's label with `unload` once its plist is removed or fails to be.
+/// Remove each job's plist, then unload its label with `unload` whether or not the plist went
+/// ([`unload_idle`] live, which unloads a job launchd has loaded but not running, so it is not
+/// started again this login). What could not be removed, one line each.
 #[cfg(unix)]
 pub(crate) fn retire_with(
     jobs: Vec<(String, std::path::PathBuf)>,
-    unload: impl Fn(&str),
+    unload: impl Fn(&str) -> Unload,
 ) -> Vec<String> {
     let mut failed = Vec::new();
     for (label, plist) in jobs {
@@ -647,16 +756,55 @@ pub(crate) fn retire_with(
         {
             failed.push(format!("{}: {e}", plist.display()));
         }
-        unload(&label);
+        let _ = unload(&label);
     }
     failed
 }
 
-/// Boot out the job `label` when launchd has it loaded but not running.
+/// What [`unload_idle`] did with a job in this Mac's launchd.
 #[cfg(unix)]
-pub(crate) fn unload_idle(label: &str) {
-    if matches!(job_state(label), Ok(JobState::Loaded { pid: None })) {
-        let _ = bootout(label);
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Unload {
+    /// launchd had it loaded with no process, and booted it out for this login.
+    Unloaded,
+    /// launchd has no such job loaded: it had none, or another pass booted it out first.
+    NotLoaded,
+    /// It had a process, this pid, so it stays loaded: a bootout would end that process.
+    Running(u32),
+    /// `launchctl` could not tell its state, or refused the bootout: why.
+    Failed(String),
+}
+
+/// Boot out the job `label` when launchd has it loaded but not running, and say what was done
+/// ([`unload_idle_with`]).
+#[cfg(unix)]
+pub(crate) fn unload_idle(label: &str) -> Unload {
+    unload_idle_with(|| job_state(label), || bootout(label))
+}
+
+/// [`unload_idle`] for a job whose state in launchd `state` reads, booting it out with `bootout`
+/// only when it is loaded with no process. A refused bootout is judged by the state read again
+/// after it: another pass that unloads the same job (a window's tidy, the old `caffeine serve`
+/// or the converge pass's retire, none of which takes a lock) may have booted it out between this
+/// one's read and its bootout, and `launchctl` refuses the bootout of a job it no longer has. A job gone by then is
+/// [`Unload::NotLoaded`]; one still loaded, or whose state cannot be read again, is
+/// [`Unload::Failed`] with the bootout's refusal.
+#[cfg(unix)]
+fn unload_idle_with(
+    mut state: impl FnMut() -> io::Result<JobState>,
+    bootout: impl FnOnce() -> io::Result<()>,
+) -> Unload {
+    match state() {
+        Ok(JobState::Loaded { pid: None }) => match bootout() {
+            Ok(()) => Unload::Unloaded,
+            Err(e) => match state() {
+                Ok(JobState::Absent) => Unload::NotLoaded,
+                Ok(JobState::Loaded { .. }) | Err(_) => Unload::Failed(e.to_string()),
+            },
+        },
+        Ok(JobState::Loaded { pid: Some(pid) }) => Unload::Running(pid),
+        Ok(JobState::Absent) => Unload::NotLoaded,
+        Err(e) => Unload::Failed(e.to_string()),
     }
 }
 
@@ -1068,6 +1216,7 @@ mod tests {
             state_dir: root.path().join("state"),
             home: root.path().join("home"),
             logs_dir: root.path().join("logs"),
+            local_volume: |_| true,
         };
         assert_eq!(orphans(&paths), [], "no LaunchAgents at all");
         let present = root.path().join("aterm");
@@ -1110,6 +1259,175 @@ mod tests {
                 (orphan.to_string(), paths.startup_plist(orphan)),
             ]
         );
+        assert!(
+            on_local_volume(&agents),
+            "a temporary folder is on this Mac"
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            !on_local_volume(&agents.join("missing")),
+            "a path statfs cannot read is not judged local"
+        );
+
+        assert_eq!(
+            unload_stranded(&paths, is_label, &SERVE_ARGS, |label| {
+                panic!(
+                    "{label} is this Mac's to judge, and so its orphan to retire, never stranded"
+                )
+            }),
+            [],
+            "a home on this Mac leaves no job unjudged"
+        );
+
+        let in_home = "com.aterm.aterm.acaffiene.dev.0000000f";
+        plant(in_home, &paths.home.join("worktree/aterm"));
+        let network = Paths {
+            local_volume: |_| false,
+            ..paths.clone()
+        };
+        assert_eq!(
+            orphans(&network),
+            [(in_home.to_string(), paths.startup_plist(in_home))],
+            "on a network home only a program inside it is judged gone: one outside may be \
+             another Mac's"
+        );
+
+        let unloaded = std::cell::RefCell::new(Vec::new());
+        prune_orphans_with(&network, |label| {
+            unloaded.borrow_mut().push(label.to_string());
+            Unload::Unloaded
+        });
+        assert!(!paths.startup_plist(in_home).exists(), "the orphan goes");
+        assert!(
+            paths.startup_plist(INSTALLED_LABEL).is_file() && paths.startup_plist(orphan).is_file(),
+            "a job whose program outside the home is gone here stays for another Mac"
+        );
+        assert_eq!(
+            unloaded.into_inner(),
+            [in_home, INSTALLED_LABEL, orphan],
+            "the orphan is unloaded, and so is each job kept whose program is gone here, which \
+             this Mac cannot run; none whose program is here, on a volume or unreadable"
+        );
+
+        let kept = |label: &str, program: &Path, unload: Option<Unload>| Unjudged {
+            label: label.to_string(),
+            plist: paths.startup_plist(label),
+            program: program.to_path_buf(),
+            unload,
+        };
+        assert_eq!(
+            unload_stranded(&network, is_label, &SERVE_ARGS, |label| {
+                if label == INSTALLED_LABEL {
+                    Unload::Running(4242)
+                } else {
+                    Unload::Unloaded
+                }
+            }),
+            [
+                kept(INSTALLED_LABEL, &gone, Some(Unload::Running(4242))),
+                kept(orphan, &gone, Some(Unload::Unloaded)),
+                kept("com.aterm.aterm.acaffiene.dev.0000000b", &present, None),
+                kept(
+                    "com.aterm.aterm.acaffiene.dev.0000000c",
+                    Path::new("/Volumes/Ejected/aterm.app/Contents/MacOS/aterm"),
+                    None
+                ),
+                kept("com.aterm.aterm.acaffiene.dev.0000000e", &uncertain, None),
+            ],
+            "each job kept carries what its unload did, and only one whose program is gone here \
+             has one"
+        );
+
+        let unloaded = std::cell::RefCell::new(Vec::new());
+        prune_orphans_with(&paths, |label| {
+            unloaded.borrow_mut().push(label.to_string());
+            Unload::Unloaded
+        });
+        assert!(
+            !paths.startup_plist(INSTALLED_LABEL).exists() && !paths.startup_plist(orphan).exists()
+        );
+        assert_eq!(
+            unloaded.into_inner(),
+            [INSTALLED_LABEL, orphan],
+            "on a home on this Mac each orphan goes and is unloaded once, and nothing else is"
+        );
+    }
+
+    /// An idle job is booted out; one with a process is left loaded and booted out never, as a
+    /// bootout would end that process; one launchd has not loaded, or whose state cannot be read,
+    /// is not booted out either. A refused bootout of a job launchd no longer has, as when another
+    /// pass booted it out first, finds it not loaded; one of a job still loaded, or whose state
+    /// cannot be read again, is a failure that says why.
+    #[test]
+    #[cfg(unix)]
+    fn only_a_job_with_no_process_is_unloaded() {
+        let booted = std::cell::Cell::new(0);
+        let boot = |answer: io::Result<()>| {
+            let booted = &booted;
+            move || {
+                booted.set(booted.get() + 1);
+                answer
+            }
+        };
+        let reads = |states: Vec<io::Result<JobState>>| {
+            let mut states = states.into_iter();
+            move || {
+                states
+                    .next()
+                    .expect("launchd's state is read no more often than planned")
+            }
+        };
+        let idle = || Ok(JobState::Loaded { pid: None });
+        assert_eq!(
+            unload_idle_with(reads(vec![idle()]), boot(Ok(()))),
+            Unload::Unloaded
+        );
+        assert_eq!(booted.replace(0), 1, "an idle job is booted out");
+        for (again, unload) in [
+            (idle(), Unload::Failed("refused".to_string())),
+            (
+                Ok(JobState::Loaded { pid: Some(4242) }),
+                Unload::Failed("refused".to_string()),
+            ),
+            (
+                Err(io::Error::other("hung")),
+                Unload::Failed("refused".to_string()),
+            ),
+            (Ok(JobState::Absent), Unload::NotLoaded),
+        ] {
+            assert_eq!(
+                unload_idle_with(
+                    reads(vec![idle(), again]),
+                    boot(Err(io::Error::other("refused")))
+                ),
+                unload
+            );
+            assert_eq!(booted.replace(0), 1, "{unload:?} after one bootout");
+        }
+        for (state, unload) in [
+            (
+                Ok(JobState::Loaded { pid: Some(4242) }),
+                Unload::Running(4242),
+            ),
+            (Ok(JobState::Absent), Unload::NotLoaded),
+            (
+                Err(io::Error::other("hung")),
+                Unload::Failed("hung".to_string()),
+            ),
+        ] {
+            assert_eq!(unload_idle_with(reads(vec![state]), boot(Ok(()))), unload);
+            assert_eq!(booted.get(), 0, "{unload:?} is never booted out");
+        }
+    }
+
+    #[test]
+    fn only_a_program_inside_a_network_home_is_judged_here() {
+        let home = Path::new("/Network/Users//x");
+        let inside = Path::new("/Network/Users//x/Applications/aterm.app/Contents/MacOS/aterm");
+        let outside = Path::new("/Applications/aterm.app/Contents/MacOS/aterm");
+        assert!(judged(inside, home, true) && judged(outside, home, true));
+        assert!(judged(inside, home, false));
+        assert!(!judged(outside, home, false));
     }
 
     #[test]
@@ -1264,6 +1582,7 @@ mod tests {
             state_dir: root.path().join("state"),
             home: root.path().join("home"),
             logs_dir: root.path().join("logs"),
+            local_volume: |_| true,
         };
         let label = "com.aterm.aterm.acaffiene.dev.0123abcd";
         let program = std::path::PathBuf::from("/t/target/debug/aterm");
@@ -1310,6 +1629,7 @@ mod tests {
             state_dir: root.path().join("state"),
             home: root.path().join("home"),
             logs_dir: root.path().join("logs"),
+            local_volume: |_| true,
         };
         let label = "com.aterm.aterm.acaffiene.dev.0123abcd";
         let program = std::path::PathBuf::from("/t/target/debug/aterm");
@@ -1364,6 +1684,7 @@ mod tests {
             state_dir: root.path().join("state"),
             home: root.path().join("home"),
             logs_dir: root.path().join("logs"),
+            local_volume: |_| true,
         };
         let program = app.join("Contents").join("MacOS").join("aterm");
         set_startup(&paths, "l", &program, true).expect("on");
@@ -1380,6 +1701,7 @@ mod tests {
             state_dir: root.path().join("state"),
             home: root.path().join("home"),
             logs_dir: root.path().join("logs"),
+            local_volume: |_| true,
         };
         let plist = paths.session_plist("l");
         write_session_plist(&paths, &plist, "l", Path::new("/t/aterm"), None).expect("write");
@@ -1433,6 +1755,7 @@ mod tests {
             state_dir: root.path().join("state"),
             home: root.path().join("home"),
             logs_dir: root.path().join("logs"),
+            local_volume: |_| true,
         };
         assert!(sweep_plist_temps(&paths).is_empty(), "no folders at all");
         let ago = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 60 * 60);
@@ -1553,6 +1876,7 @@ mod tests {
             state_dir: root.path().join("state"),
             home: root.path().join("home"),
             logs_dir: root.path().join("logs"),
+            local_volume: |_| true,
         };
         let label = "com.aterm.aterm.acaffiene.dev.0123abcd";
         let program = Path::new("/t/aterm");
@@ -1676,6 +2000,7 @@ mod tests {
                     .join(format!("state-{}", case.replace(' ', "-"))),
                 home: make_home,
                 logs_dir: root.path().join("logs"),
+                local_volume: |_| true,
             };
             assert!(!startup_enabled(&aliased_home, label), "{case}");
             assert_eq!(
@@ -1717,6 +2042,7 @@ mod tests {
             state_dir: root.path().join("state-aliased-logs"),
             home: root.path().join("home-aliased-logs"),
             logs_dir: symlink_logs,
+            local_volume: |_| true,
         };
         assert!(
             set_startup(&aliased_logs, label, program, true).is_err(),

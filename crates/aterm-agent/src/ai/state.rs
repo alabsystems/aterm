@@ -24,6 +24,8 @@ pub enum State {
     Due(i64),
     /// It has run here, and nothing says whether a login exists.
     Unproven,
+    /// Its pool's roster is refused whole: no launch, sync or sign-in of it runs.
+    Refused,
     /// No login exists, or its login has ended.
     SignedOut,
     /// Wanted and served here, and not installed.
@@ -43,6 +45,7 @@ impl State {
             State::Limited(_) => "limited",
             State::Due(_) => "due",
             State::Unproven => "unproven",
+            State::Refused => "refused",
             State::SignedOut => "signed-out",
             State::NotInstalled => "not-installed",
             State::Off => "off",
@@ -536,6 +539,29 @@ pub fn assess(f: &Facts, wanted: bool, now: i64) -> Row {
         row.fact = why.clone();
         return row;
     }
+    let mut row = rate_login(f, row, unmeasured, now);
+    // A roster the pool refuses whole runs no launch, sync or sign-in of it, whatever the login
+    // this machine holds says, there or not: the row says so, and the fix is a person's edit of
+    // that file.
+    if let Some(pool) = f.login_pool().filter(|pool| pool.refused.is_some()) {
+        let id = c.id;
+        row.state = State::Refused;
+        row.mark = row.mark.max(Mark::Warn);
+        row.fix = None;
+        row.mend = Some(format!(
+            "mend {}, which refuses every launch, sync and sign-in of {id} until it admits \
+             (`aterm harness accounts --cli {id}` says why)",
+            pool.roster.display()
+        ));
+        row.actor = Some(Actor::Person);
+    }
+    row
+}
+
+/// [`assess`] of an installed CLI with a home aterm can place: what its login's records and files
+/// say, whatever its pool's roster does ([`State::Refused`] is `assess`'s).
+fn rate_login(f: &Facts, mut row: Row, unmeasured: &str, now: i64) -> Row {
+    let c = f.connector;
     let served_at = f
         .accounts
         .as_ref()
@@ -823,31 +849,39 @@ pub fn assess(f: &Facts, wanted: bool, now: i64) -> Row {
     if let (Some(p), Some(why)) = (f.login_pool(), launch_refused) {
         use super::facts::LaunchEnd;
         words.push(format!("a launch aterm makes of it now is refused: {why}"));
-        if matches!(row.state, State::Ok | State::Idle) {
-            let id = c.id;
-            let mend = match (&p.launch_end, &p.launch_step) {
-                (Some(LaunchEnd::Pool) | None, _) => None,
-                (_, Some(step)) => Some(format!(
-                    "re-pin {id}'s account pool so its launches run: {step}"
-                )),
-                (Some(LaunchEnd::SignIn(label)), None) => Some(format!(
-                    "sign in `{label}`, the row the owner's pin holds {id}'s launches to, or pin \
-                     another row (`aterm harness accounts --cli {id}` says each row's state)"
-                )),
-                (Some(LaunchEnd::Owner), None) => Some(format!(
-                    "mend the pin or roster that refuses {id}'s launches (`aterm harness accounts \
-                     --cli {id}` says each row's state)"
-                )),
-            };
-            match mend {
-                Some(mend) => {
-                    row.mark = Mark::Warn;
-                    row.fix = None;
-                    row.mend = Some(mend);
-                    row.actor = Some(Actor::Person);
-                }
-                None => row.mark = Mark::Note,
+        let id = c.id;
+        let mend = match (&p.launch_end, &p.launch_step) {
+            (Some(LaunchEnd::Pool) | None, _) => None,
+            (_, Some(step)) => Some(format!(
+                "re-pin {id}'s account pool so its launches run: {step}"
+            )),
+            // The row's own sign-in is the pool's, and it signs in the pinned row: that fix ends
+            // the refusal.
+            (Some(LaunchEnd::SignIn(label)), None)
+                if row.fix.is_some() && p.next.as_deref() == Some(label.as_str()) =>
+            {
+                None
             }
+            (Some(LaunchEnd::SignIn(label)), None) => Some(format!(
+                "sign in `{label}`, the row the owner's pin holds {id}'s launches to, or pin \
+                 another row (`aterm harness accounts --cli {id}` says each row's state)"
+            )),
+            (Some(LaunchEnd::Owner), None) => Some(format!(
+                "mend the pin or roster that refuses {id}'s launches (`aterm harness accounts \
+                 --cli {id}` says each row's state)"
+            )),
+        };
+        // A person's step stands whatever else the row is (a renewal due, a limit): it, not the
+        // sign-in the row would otherwise offer, is what lets a launch run.
+        match mend {
+            Some(mend) => {
+                row.mark = row.mark.max(Mark::Warn);
+                row.fix = None;
+                row.mend = Some(mend);
+                row.actor = Some(Actor::Person);
+            }
+            None if matches!(row.state, State::Ok | State::Idle) => row.mark = Mark::Note,
+            None => {}
         }
     }
     if let Some(why) = f
@@ -891,7 +925,7 @@ fn pool_words(f: &Facts) -> Option<String> {
     if let Some(why) = &pool.refused {
         return Some(format!(
             "its pool's roster ({file}) is refused: {}",
-            crate::harness::one_line(why, 120)
+            crate::harness::one_line(why, why.len())
         ));
     }
     let mut words = format!(

@@ -58,6 +58,26 @@ pub(crate) fn rewrites(record: &[(Cmd, Option<Vec<u8>>)]) -> Vec<String> {
         .collect()
 }
 
+/// The runs in `record` that reach a remote, or may (a partial clone's merge fetches what it
+/// lacks), without aterm's credential route, by their lines: a helper a file names would answer
+/// them.
+pub(crate) fn unrouted(record: &[(Cmd, Option<Vec<u8>>)]) -> Vec<String> {
+    record
+        .iter()
+        .filter(|(cmd, _)| {
+            let local = |word: &str| cmd.args.iter().any(|arg| arg == word);
+            match subcommand(cmd).as_deref() {
+                Some("fetch" | "clone" | "merge") => true,
+                Some("ls-remote") => !local("--get-url"),
+                Some("submodule") => local("update"),
+                _ => false,
+            }
+        })
+        .filter(|(cmd, _)| !cmd.args.iter().any(|arg| arg == "credential.helper="))
+        .map(|(cmd, _)| cmd.display())
+        .collect()
+}
+
 /// The git subcommands `record` ran, in order.
 pub(crate) fn subcommands(record: &[(Cmd, Option<Vec<u8>>)]) -> Vec<String> {
     record
@@ -229,8 +249,10 @@ fn a_clean_checkout_behind_its_origin_fast_forwards() {
         let record = sys.record();
         let ran = subcommands(&record);
         assert!(ran.iter().any(|sub| sub == "fetch"), "{ran:?}");
+        assert!(ran.iter().any(|sub| sub == "ls-remote"), "{ran:?}");
         assert!(ran.iter().any(|sub| sub == "merge"), "{ran:?}");
         assert_eq!(rewrites(&record), Vec::<String>::new());
+        assert_eq!(unrouted(&record), Vec::<String>::new());
     }
     let repos = Repos::new(&live, "checkout-control");
     let control = Spawns::new(&live);

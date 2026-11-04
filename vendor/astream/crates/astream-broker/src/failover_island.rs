@@ -214,4 +214,7 @@ clean {
 
     def failover_fences_stale_isl (leader_gen : UInt64) (adopted_gen : UInt64) : Bool :=
       decide (leader_gen < adopted_gen)
+
+    def failover_lease_expired_isl (now_ms : UInt64) (threshold_ms : UInt64) : Bool :=
+      decide (threshold_ms ≤ now_ms)
 }

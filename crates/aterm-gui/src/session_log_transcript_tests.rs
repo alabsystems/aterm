@@ -712,12 +712,12 @@ fn a_turn_that_ends_under_its_own_background_work_closes_and_so_does_its_wake() 
         1,
         "the wake's end is its own turn's: {got:#?}"
     );
-    assert_eq!(having(&got, " turn vref=v2 ").len(), 1, "{got:#?}");
+    assert_eq!(having(&got, " amend t2 turn vref=v2 ").len(), 1, "{got:#?}");
     time_order_holds(&got).unwrap();
 
     // CONTROL: the same rows with the screen read as the reader's phase alone (`busy`, what the
-    // stalled build published) reproduce the stall: one turn, never closed, and the wake's end
-    // folded into it (the live log's `amend t4098 turn vdur_ms=… by=vendor src=transcript`).
+    // stalled build published) reproduce the stall: one turn, never closed. The
+    // second vendor's end remains ambiguous evidence without replacing its metrics.
     let reader_phase = aterm_phase::read(Some("claude"), &rows, None).phase;
     assert_eq!(reader_phase, aterm_phase::Phase::Busy);
     let stalled = turns_over_background_work("slog-tx-bg-busy", reader_phase.name());
@@ -725,7 +725,13 @@ fn a_turn_that_ends_under_its_own_background_work_closes_and_so_does_its_wake() 
     assert_eq!(having(&stalled, " open t").len(), 1, "{stalled:#?}");
     assert_eq!(
         having(&stalled, " amend t1 turn vdur_ms=").len(),
-        2,
+        1,
+        "{stalled:#?}"
+    );
+    let second = having(&stalled, " meta field=vendor-turn vref=v2 state=done ");
+    assert_eq!(second.len(), 1, "{stalled:#?}");
+    assert!(
+        second[0].contains(" parent=t1 why=ambiguous vdur_ms=300 "),
         "{stalled:#?}"
     );
 }
@@ -1324,7 +1330,11 @@ fn an_unmeasured_codex_alabs_turns_are_its_claims_filled_by_its_rollout() {
         "{got:#?}"
     );
     for vref in ["turn-1", "turn-2"] {
-        let named = having(&got, &format!(" vref={vref} "));
+        let named = having(&got, &format!(" turn vref={vref} "));
+        let named: Vec<_> = named
+            .into_iter()
+            .filter(|l| l.contains(" amend t"))
+            .collect();
         assert!(
             named.len() == 1
                 && named[0].contains(" amend t")
@@ -1481,7 +1491,7 @@ fn a_claimed_rest_read_before_the_rollouts_end_continues_no_turn() {
         "{got:#?}"
     );
     assert!(having(&got, " cont=").is_empty(), "{got:#?}");
-    let named = having(&got, " vref=turn-2 ");
+    let named = having(&got, " amend t2 turn vref=turn-2 ");
     assert!(
         named.len() == 1 && named[0].contains(" amend t2 turn "),
         "{got:#?}"
@@ -1562,7 +1572,7 @@ fn a_stopped_rollout_tap_hands_a_measured_runs_turns_back_to_its_claims() {
         read + 1,
         "the gap's rows name the claim's turn, and the claims stand aside again: {got:#?}"
     );
-    let named = having(&got, " vref=next-1 ");
+    let named = having(&got, " amend t3 turn vref=next-1 ");
     assert!(
         named.len() == 1
             && named[0].contains(" amend t3 turn ")

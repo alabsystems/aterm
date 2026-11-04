@@ -770,6 +770,7 @@ mod tests {
                 launched: Cell::new(0),
             };
             let context = Context {
+                admission: None,
                 env: &env,
                 store: &store,
                 host: &host,

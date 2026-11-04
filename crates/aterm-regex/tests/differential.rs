@@ -954,7 +954,7 @@ fn escape_round_trips() {
 const BUILTIN_DIGEST: &str = "736c9a64662e49c0";
 const SYNTAX_DIGEST: &str = "d9526bd496b9392f";
 const PERL_DIGEST: &str = "6212cb3a3e2938ec";
-const FOLD_DIGEST: &str = "b91b2d673464fac8";
+const FOLD_DIGEST: &str = "47803473ede5742a";
 const EXOTIC_DIGEST: &str = "033f0d201ef6505a";
 const ZERO_WIDTH_DIGEST: &str = "c6278ff2ce852f5c";
 const NULLABLE_DIGEST: &str = "75190a174fd22dac";

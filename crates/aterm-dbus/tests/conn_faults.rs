@@ -65,7 +65,7 @@ fn a_bad_message_is_reported_and_the_next_one_still_arrives() {
     let mut after = bad;
     after.extend_from_slice(&recorded("name_acquired"));
     let (ours, served) = bus(after);
-    let mut conn = Connection::handshake(ours, 1000, None).unwrap();
+    let mut conn = Connection::handshake_within(ours, 1000, None, HANG).unwrap();
     assert!(matches!(
         conn.recv(Some(HANG)),
         Err(Error::Malformed { .. })
@@ -87,7 +87,7 @@ fn a_framing_fault_ends_the_connection() {
     let mut after = recorded("name_acquired");
     after.extend_from_slice(&garbage);
     let (ours, served) = bus(after);
-    let mut conn = Connection::handshake(ours, 1000, None).unwrap();
+    let mut conn = Connection::handshake_within(ours, 1000, None, HANG).unwrap();
     let first = conn.recv(Some(HANG)).unwrap().expect("the intact signal");
     assert_eq!(first.member.as_deref(), Some("NameAcquired"));
     assert!(conn.has_buffered(), "the fault is buffered");
@@ -118,7 +118,7 @@ fn a_message_past_the_limit_is_read_past() {
     let mut after = big.encode().unwrap();
     after.extend_from_slice(&recorded("name_acquired"));
     let (ours, served) = bus(after);
-    let mut conn = Connection::handshake(ours, 1000, None).unwrap();
+    let mut conn = Connection::handshake_within(ours, 1000, None, HANG).unwrap();
     conn.set_max_incoming(1024);
     assert!(matches!(
         conn.recv(Some(HANG)),
@@ -134,7 +134,7 @@ fn a_message_past_the_limit_is_read_past() {
         both.extend_from_slice(&recorded("name_acquired"));
         both
     });
-    let mut wide = Connection::handshake(ours, 1000, None).unwrap();
+    let mut wide = Connection::handshake_within(ours, 1000, None, HANG).unwrap();
     wide.set_max_incoming(64 * 1024);
     let first = wide.recv(Some(HANG)).unwrap().expect("the big signal");
     assert_eq!(first.member.as_deref(), Some("Big"));
@@ -146,7 +146,7 @@ fn a_message_past_the_limit_is_read_past() {
 #[test]
 fn a_hangup_is_closed_and_a_refusal_fails_the_handshake() {
     let (ours, served) = bus(Vec::new());
-    let mut conn = Connection::handshake(ours, 1000, None).unwrap();
+    let mut conn = Connection::handshake_within(ours, 1000, None, HANG).unwrap();
     assert!(conn.recv(Some(Duration::ZERO)).unwrap().is_none());
     drop(conn);
     served.join().unwrap();
@@ -157,7 +157,7 @@ fn a_hangup_is_closed_and_a_refusal_fails_the_handshake() {
         line(&mut theirs);
         theirs.write_all(b"REJECTED DBUS_COOKIE_SHA1\r\n").unwrap();
     });
-    match Connection::handshake(ours, 1000, None) {
+    match Connection::handshake_within(ours, 1000, None, HANG) {
         Err(Error::Auth(why)) => assert!(why.contains("DBUS_COOKIE_SHA1"), "{why}"),
         other => panic!("handshake against a refusal: {:?}", other.err()),
     }
@@ -171,12 +171,13 @@ fn a_hangup_is_closed_and_a_refusal_fails_the_handshake() {
             .write_all(b"OK 8e4f0c2a1b7d6e5f8e4f0c2a1b7d6e5f\r\n")
             .unwrap();
     });
-    let refused = Connection::handshake(ours, 1000, Some("00000000000000000000000000000000"));
+    let refused =
+        Connection::handshake_within(ours, 1000, Some("00000000000000000000000000000000"), HANG);
     assert!(matches!(refused, Err(Error::Auth(_))));
     wrong_guid.join().unwrap();
 
     let (ours, served) = bus_then(recorded("name_acquired"), true);
-    let mut conn = Connection::handshake(ours, 1000, None).unwrap();
+    let mut conn = Connection::handshake_within(ours, 1000, None, HANG).unwrap();
     served.join().unwrap();
     let last = conn
         .recv(Some(HANG))
@@ -228,7 +229,7 @@ fn sending(
 #[test]
 fn a_send_timeout_gives_up_on_a_bus_that_stopped_reading() {
     let (ours, served) = silent_bus();
-    let mut conn = Connection::handshake(ours, 1000, None).unwrap();
+    let mut conn = Connection::handshake_within(ours, 1000, None, HANG).unwrap();
     let bus = served.join().unwrap();
     conn.set_send_timeout(Some(Duration::from_millis(100)));
     let (sent, worker) = sending(conn, too_big_to_buffer());
@@ -243,7 +244,7 @@ fn a_send_timeout_gives_up_on_a_bus_that_stopped_reading() {
 #[test]
 fn without_a_send_timeout_a_send_waits_for_the_bus_to_read() {
     let (ours, served) = silent_bus();
-    let conn = Connection::handshake(ours, 1000, None).unwrap();
+    let conn = Connection::handshake_within(ours, 1000, None, HANG).unwrap();
     let bus = served.join().unwrap();
     let (sent, worker) = sending(conn, too_big_to_buffer());
     let early = sent.recv_timeout(Duration::from_secs(1));

@@ -8,7 +8,7 @@ use crate::harness::accounts::rename_tests::{NOW, seed_reference};
 use crate::harness::alab_roster::{self, Lab, LabAccount};
 
 fn email(local: &str) -> String {
-    format!("{local}@example.test")
+    format!("{local}@example.com")
 }
 
 fn lab_account(local: &str, label: &str, preferred: &[(&str, Option<u64>)]) -> LabAccount {
@@ -785,7 +785,7 @@ fn a_mac_the_lab_names_reads_no_sheet_in_its_upkeep() {
             cli_sync_inputs(Cli::Kimi, &home, &toml),
         )
     };
-    edit("email,computer,claude,kimi\none@example.test,m22,1,global\n");
+    edit("email,computer,claude,kimi\none@example.com,m22,1,global\n");
     let (claude, kimi) = alab_roster::with_lab(lab.clone(), || {
         assert!(!has_fleet_source(&home.join(".secrets")), "no fleet source");
         assert!(!sheet_names_this_machine(Some(&toml), &sheet));
@@ -796,7 +796,7 @@ fn a_mac_the_lab_names_reads_no_sheet_in_its_upkeep() {
         digests()
     });
     let (bare_claude, bare_kimi) = digests();
-    edit("email,computer,claude,kimi\ntwo@example.test,m22,1,global\n");
+    edit("email,computer,claude,kimi\ntwo@example.com,m22,1,global\n");
     alab_roster::with_lab(lab, || {
         assert_eq!(digests().0, claude, "reads no sheet");
         assert_eq!(digests().1, kimi, "a CLI's upkeep reads no sheet");
@@ -819,4 +819,185 @@ fn a_mac_the_lab_names_reads_no_sheet_in_its_upkeep() {
         pending_kimi,
         "a CLI's upkeep reads no sheet while the lab is not read yet"
     );
+}
+
+/// A FIRST LAB SYNC LISTS ONE ACCOUNT ONCE: where Codex's default login names an account the lab
+/// prefers here, that row is the default login's (its lab label, its address, no login directory),
+/// so no `main` stands beside it; where the lab knows the account and prefers it elsewhere, it joins
+/// as the default login's row beside what the lab prefers here. CONTROL: where the lab does not know
+/// the account, and where the login names none, the default login is `main`, and every row the lab
+/// prefers keeps a directory of its own. The report's words say which row is on this machine's own
+/// login, and never list it as not signed in yet.
+#[test]
+fn a_first_lab_sync_lists_the_default_login_under_its_lab_label() {
+    let codex = |local: &str, label: &str, preferred: &[(&str, Option<u64>)]| LabAccount {
+        cli: Cli::Codex,
+        ..lab_account(local, label, preferred)
+    };
+    let run_kept = |default: Option<&str>, keyring: bool| -> (Vec<Row>, String) {
+        let root = aterm_tempfile::TempDir::new().unwrap();
+        let home = root.path().join("home");
+        let state = root.path().join("state");
+        let config = root.path().join("config");
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        fs::create_dir_all(&config).unwrap();
+        fs::create_dir_all(&state).unwrap();
+        let toml = config.join("aterm.toml");
+        fs::write(&toml, "").unwrap();
+        if keyring {
+            fs::write(
+                home.join(".codex/config.toml"),
+                "cli_auth_credentials_store = \"keyring\"\n",
+            )
+            .unwrap();
+        }
+        if let Some(default) = default {
+            let token = crate::harness::codex_app_login::tests::make_chatgpt_jwt(
+                Some(default),
+                "plus",
+                NOW + 3600,
+            );
+            fs::write(
+                home.join(".codex/auth.json"),
+                aterm_json::json!({"tokens": {"access_token": token}}).to_string(),
+            )
+            .unwrap();
+        }
+        let lab = Lab {
+            me: Some("m16".into()),
+            settled: true,
+            accounts: vec![
+                codex("ann", "codex-aaaaaa", &[("m16", Some(1))]),
+                codex("bea", "codex-bbbbbb", &[("m16", Some(2))]),
+                codex("cid", "codex-cccccc", &[("m3", Some(1))]),
+            ],
+            aliases: BTreeMap::new(),
+            mailboxes: BTreeMap::new(),
+            places: Default::default(),
+        };
+        let fetch =
+            |_: &Env, _: &str| -> Result<String, String> { panic!("the lab is the source") };
+        let env = Env {
+            state,
+            aterm_state: None,
+            cwd: home.clone(),
+            home: Some(home.clone()),
+            claude_dir: Some(home.join(".claude")),
+            claude_config_unusable: None,
+            claude_profile: Some(home.join(".claude.json")),
+            claude_custom_oauth: false,
+            claude_session: None,
+            claude_pid: None,
+            codex_thread: None,
+            agy_conversation: None,
+            codex_home: None,
+            codex_login: None,
+            now: NOW,
+            tz_s: 0,
+            sid: String::new(),
+            sock: None,
+            config: Some(toml.clone()),
+            claude_tmp: None,
+            claude_running: None,
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = alab_roster::with_lab(lab, || {
+            run_cli_accounts_sync_with(
+                Cli::Codex,
+                &env,
+                (None, None, false),
+                (&mut out, &mut err),
+                &fetch,
+            )
+        });
+        assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&err));
+        let roster = Roster::load_for(
+            Cli::Codex,
+            &accounts::roster_beside_for(&toml, Cli::Codex).unwrap(),
+        )
+        .unwrap();
+        (roster.rows, String::from_utf8(out).unwrap())
+    };
+    let run = |default: Option<&str>| run_kept(default, false);
+    let shape = |rows: &[Row]| -> Vec<(String, bool)> {
+        rows.iter()
+            .map(|row| (row.label.clone(), row.dir.is_some()))
+            .collect()
+    };
+
+    // Under the keyring store a leftover `auth.json` is no login of this machine's: the row it
+    // names keeps a directory of its own.
+    let (rows, said) = run_kept(Some(&email("ann")), true);
+    assert_eq!(
+        shape(&rows),
+        vec![
+            ("main".to_string(), false),
+            ("codex-aaaaaa".to_string(), true),
+            ("codex-bbbbbb".to_string(), true)
+        ],
+        "{said}"
+    );
+    assert!(!said.contains("on this machine's own login:"), "{said}");
+
+    let (rows, said) = run(Some(&email("ann")));
+    assert_eq!(
+        shape(&rows),
+        vec![
+            ("codex-aaaaaa".to_string(), false),
+            ("codex-bbbbbb".to_string(), true)
+        ],
+        "{said}"
+    );
+    assert_eq!(rows[0].email.as_deref(), Some(email("ann").as_str()));
+    assert!(
+        said.contains("on this machine's own login: codex-aaaaaa"),
+        "{said}"
+    );
+    let unsigned = said
+        .lines()
+        .find(|line| line.starts_with("not signed in yet: "))
+        .expect("the row with no login yet");
+    assert!(unsigned.contains("codex-bbbbbb"), "{said}");
+    assert!(!unsigned.contains("codex-aaaaaa"), "{said}");
+    assert!(said.contains("the lab prefers here"), "{said}");
+    assert!(!said.contains("across the fleet"), "{said}");
+
+    let (rows, said) = run(Some(&email("cid")));
+    assert_eq!(
+        shape(&rows),
+        vec![
+            ("codex-cccccc".to_string(), false),
+            ("codex-aaaaaa".to_string(), true),
+            ("codex-bbbbbb".to_string(), true)
+        ],
+        "{said}"
+    );
+    assert_eq!(rows[0].email.as_deref(), Some(email("cid").as_str()));
+
+    for default in [Some(email("nobody")), None] {
+        let (rows, said) = run(default.as_deref());
+        assert_eq!(
+            shape(&rows),
+            vec![
+                ("main".to_string(), false),
+                ("codex-aaaaaa".to_string(), true),
+                ("codex-bbbbbb".to_string(), true)
+            ],
+            "CONTROL: {default:?}: {said}"
+        );
+        assert!(
+            !said.contains("on this machine's own login:"),
+            "CONTROL: {said}"
+        );
+    }
+}
+
+/// A SHEET NAMED AS A SOURCE ON A MAC THE LAB NAMES IS REFUSED WITH THE VERB THAT SYNCS THAT POOL,
+/// `--cli` INCLUDED WHERE THE POOL TAKES ONE.
+#[test]
+fn a_refused_sheet_names_the_sync_of_its_own_pool() {
+    assert!(
+        sheet_refused("a.csv", Cli::Kimi).contains("`aterm harness accounts sync alab --cli kimi`")
+    );
+    assert!(sheet_refused("a.csv", Cli::Claude).contains("`aterm harness accounts sync alab`"));
 }

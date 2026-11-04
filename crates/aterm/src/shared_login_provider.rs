@@ -5,7 +5,8 @@
 
 use super::*;
 use aterm_agent::harness::cli::shared_provider::{
-    ClaudeOauth, CodexOauth, Context, Execution, KimiOauth, LoginProof, MailboxInputs, Provider,
+    ClaudeOauth, CodexOauth, Context, Execution, KimiOauth, LoginProof, MailboxInputs,
+    ObservationError, Provider,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -170,13 +171,17 @@ impl Provider for Approved {
         context: &Context<'_>,
         row: &accounts::Row,
         staging: &std::path::Path,
-    ) -> Result<Option<Box<dyn LoginProof>>, String> {
-        self.read(row)?;
-        let prepared = self.prepared()?;
+    ) -> Result<Option<Box<dyn LoginProof>>, ObservationError> {
+        self.read(row).map_err(ObservationError::RecoveryRequired)?;
+        let prepared = self
+            .prepared()
+            .map_err(ObservationError::RecoveryRequired)?;
         match Kind::of(
             prepared.configuration().account(),
             prepared.credential().is_some(),
-        )? {
+        )
+        .map_err(ObservationError::RecoveryRequired)?
+        {
             Kind::Claude => claude_observe(context, row, staging),
             Kind::Codex => CodexOauth.observe(context, row, staging),
             Kind::Kimi => KimiOauth.observe(context, row, staging),
@@ -218,7 +223,7 @@ fn claude_observe(
     context: &Context<'_>,
     row: &accounts::Row,
     staging: &std::path::Path,
-) -> Result<Option<Box<dyn LoginProof>>, String> {
+) -> Result<Option<Box<dyn LoginProof>>, ObservationError> {
     #[cfg(target_os = "macos")]
     {
         claude_observe_with_reader(
@@ -244,7 +249,7 @@ fn claude_observe_with_reader(
     row: &accounts::Row,
     staging: &std::path::Path,
     reader: std::sync::Arc<cli::shared_provider::KeychainReader>,
-) -> Result<Option<Box<dyn LoginProof>>, String> {
+) -> Result<Option<Box<dyn LoginProof>>, ObservationError> {
     if !context.host.native_credential_setup() {
         return ClaudeOauth.observe(context, row, staging);
     }

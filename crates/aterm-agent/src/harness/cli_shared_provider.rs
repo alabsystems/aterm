@@ -16,6 +16,17 @@ pub use claude::{ClaudeProfile, read_claude_profile};
 #[path = "cli_shared_kimi.rs"]
 mod kimi;
 pub use kimi::KimiOauth;
+#[cfg(unix)]
+pub(in crate::harness) use kimi::{
+    KimiProof, NativeError as KimiNativeError, credential_path as kimi_credential_path,
+    expire_pending as expire_kimi_pending, observation_error as kimi_observation_error,
+    pending_expiry as kimi_pending_expiry, pending_files as kimi_pending_files,
+    verify_native_classified as verify_native_kimi_classified,
+};
+#[cfg(all(test, unix))]
+pub(in crate::harness) use kimi::{
+    pending_proof_fixture as kimi_pending_proof_fixture, proof_fixture as kimi_proof_fixture,
+};
 
 /// A provider-returned identity with private evidence of the staged files.
 /// `check_current` performs bounded local reads only, never provider I/O.
@@ -29,6 +40,8 @@ pub trait LoginProof {
 /// The composing executable chooses a closed provider adapter after validating
 /// the exact root configuration. Catalog strings never construct effects.
 pub struct Context<'a> {
+    /// Current root authority for the exact retained native attempt.
+    pub admission: Option<&'a super::super::login_drive::RecoveryAdmission>,
     pub env: &'a Env,
     pub store: &'a accounts::Store,
     pub host: &'a dyn AccountsHost,
@@ -47,6 +60,21 @@ impl Execution {
         match self {
             Self::Completed => Ok(()),
             Self::NotStarted(why) | Self::Unknown(why) => Err(why),
+        }
+    }
+}
+
+/// An unavailable identity read is not evidence that another login is needed.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ObservationError {
+    Unavailable(String),
+    RecoveryRequired(String),
+}
+
+impl std::fmt::Display for ObservationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(why) | Self::RecoveryRequired(why) => f.write_str(why),
         }
     }
 }
@@ -76,7 +104,7 @@ pub trait Provider: Send + Sync {
         context: &Context<'_>,
         row: &accounts::Row,
         staging: &Path,
-    ) -> Result<Option<Box<dyn LoginProof>>, String>;
+    ) -> Result<Option<Box<dyn LoginProof>>, ObservationError>;
 }
 
 /// Claude's existing OAuth driver. This does not import shared credentials.
@@ -129,7 +157,7 @@ impl ClaudeOauth {
         row: &accounts::Row,
         staging: &Path,
         reader: std::sync::Arc<KeychainReader>,
-    ) -> Result<Option<Box<dyn LoginProof>>, String> {
+    ) -> Result<Option<Box<dyn LoginProof>>, ObservationError> {
         claude_observe(context, row, staging, Some(reader))
     }
 }
@@ -224,7 +252,7 @@ impl Provider for ClaudeOauth {
         context: &Context<'_>,
         row: &accounts::Row,
         staging: &Path,
-    ) -> Result<Option<Box<dyn LoginProof>>, String> {
+    ) -> Result<Option<Box<dyn LoginProof>>, ObservationError> {
         claude_observe(context, row, staging, None)
     }
 }
@@ -234,30 +262,48 @@ fn claude_observe(
     row: &accounts::Row,
     staging: &Path,
     reader: Option<std::sync::Arc<KeychainReader>>,
-) -> Result<Option<Box<dyn LoginProof>>, String> {
+) -> Result<Option<Box<dyn LoginProof>>, ObservationError> {
     if !accounts::login_made(staging) {
         return Ok(None);
     }
-    let path = staging.to_str().ok_or("staging path is not UTF-8")?;
-    let email = row
-        .expected_identity_email()
-        .ok_or("approved account has no provider identity")?;
-    let mut files = vec![PrivateSnapshot::read(
-        staging.join(".credentials.json"),
-        true,
-    )?];
+    let path = staging
+        .to_str()
+        .ok_or_else(|| ObservationError::RecoveryRequired("staging path is not UTF-8".into()))?;
+    let email = row.expected_identity_email().ok_or_else(|| {
+        ObservationError::RecoveryRequired("approved account has no provider identity".into())
+    })?;
+    let mut files = vec![
+        PrivateSnapshot::read(staging.join(".credentials.json"), true)
+            .map_err(ObservationError::RecoveryRequired)?,
+    ];
     let keychain = reader
         .map(|reader| KeychainSnapshot::read(staging, reader))
-        .transpose()?;
+        .transpose()
+        .map_err(ObservationError::Unavailable)?;
     if keychain.as_ref().is_none_or(|item| item.bytes.is_none()) && files[0].bytes.is_none() {
-        return Err("staged credential backend has no verifiable private bytes".into());
+        return Err(ObservationError::RecoveryRequired(
+            "staged credential backend has no verifiable private bytes".into(),
+        ));
     }
-    let facts = status_facts(&context.host.status_in_home(path)?, email)
-        .filter(StatusFacts::renews)
-        .ok_or("staged provider status does not prove the approved account")?;
+    let facts = status_facts(
+        &context
+            .host
+            .status_in_home(path)
+            .map_err(ObservationError::Unavailable)?,
+        email,
+    )
+    .filter(StatusFacts::renews)
+    .ok_or_else(|| {
+        ObservationError::RecoveryRequired(
+            "staged provider status does not prove the approved account".into(),
+        )
+    })?;
     // The status command may refresh profile metadata. Its selected credential
     // must stay fixed, while the resulting profile is pinned before publication.
-    files.push(PrivateSnapshot::read(staging.join(".claude.json"), false)?);
+    files.push(
+        PrivateSnapshot::read(staging.join(".claude.json"), false)
+            .map_err(ObservationError::RecoveryRequired)?,
+    );
     let credential = keychain
         .as_ref()
         .and_then(|item| item.bytes.as_ref().map(aterm_uds::secret::Secret::expose))
@@ -267,7 +313,9 @@ fn claude_observe(
                 .as_ref()
                 .map(aterm_uds::secret::Secret::expose)
         })
-        .ok_or("staged Claude credential is absent")?;
+        .ok_or_else(|| {
+            ObservationError::RecoveryRequired("staged Claude credential is absent".into())
+        })?;
     let remote = claude::verify_credentials(
         credential,
         email,
@@ -276,7 +324,9 @@ fn claude_observe(
     )?;
     let observed = context.host.claude_identity_in_home(path, email);
     if observed.email_matches != Some(true) || observed.principal != Some(remote.principal) {
-        return Err("staged provider identity contradicts its status".into());
+        return Err(ObservationError::RecoveryRequired(
+            "staged provider identity contradicts its status".into(),
+        ));
     }
     let proof = ClaudeProof {
         staging: staging.to_owned(),
@@ -286,7 +336,9 @@ fn claude_observe(
         files,
         keychain,
     };
-    proof.check_current()?;
+    proof
+        .check_current()
+        .map_err(ObservationError::RecoveryRequired)?;
     Ok(Some(Box::new(proof)))
 }
 
@@ -345,6 +397,7 @@ fn codex_execution(outcome: super::super::login_drive::Outcome) -> Execution {
     match outcome {
         super::super::login_drive::Outcome::SignedIn { .. } => Execution::Completed,
         super::super::login_drive::Outcome::NotRun(why) => Execution::NotStarted(why),
+        super::super::login_drive::Outcome::Unverified(why) => Execution::Unknown(why),
         _ => Execution::Unknown("device-local Codex sign-in did not complete".into()),
     }
 }
@@ -387,6 +440,8 @@ fn codex_request<'a>(
         .of(row.vendor.region)
         .ok_or("shared Codex route is incomplete")?;
     Ok(super::super::login_drive::Request {
+        recovery: None,
+        admission: None,
         cli: Cli::Codex,
         route,
         row,
@@ -423,10 +478,10 @@ impl Provider for CodexOauth {
         context: &Context<'_>,
         row: &accounts::Row,
         staging: &Path,
-    ) -> Result<Option<Box<dyn LoginProof>>, String> {
-        let email = row
-            .expected_identity_email()
-            .ok_or("Codex approval has no identity")?;
+    ) -> Result<Option<Box<dyn LoginProof>>, ObservationError> {
+        let email = row.expected_identity_email().ok_or_else(|| {
+            ObservationError::RecoveryRequired("Codex approval has no identity".into())
+        })?;
         super::super::codex_app_login::shared::verify_in_home(
             staging,
             email,

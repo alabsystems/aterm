@@ -394,10 +394,10 @@ pub struct CliAccounts {
     /// Why the serving account requires shared authority or an execution grant before local sign-in.
     pub sign_in_refused: Option<String>,
     /// The row a sign-in signs in next: the first with an email whose login is not made here,
-    /// else the first due, else the first with an email. A CLI whose renewals cannot approve its
-    /// page (Grok Build's, [`crate::ai::connector::Cli::renews_headlessly`]) signs a row in by
-    /// `accounts login`, which needs no email, so it then takes the first row with none whose
-    /// login is not made here, else the first such row. `None` where none of those is. While the
+    /// else the first due. A CLI whose renewals cannot approve its page (Grok Build's,
+    /// [`crate::ai::connector::Cli::renews_headlessly`]) signs a row in by `accounts login`, which
+    /// needs no email, so it then takes [`Self::unaddressed`]. `None` where none of those is: a
+    /// healthy row is never next, so a pool that needs no sign-in signs nothing in. While the
     /// owner's pin holds every launch to a row not signed in here ([`LaunchEnd::SignIn`]), it
     /// is that row wherever it can be signed in so (an email, or any row for Grok Build). On a
     /// Codex program that keeps no row's login its own ([`Self::unread`]) it is the row on this
@@ -408,6 +408,9 @@ pub struct CliAccounts {
     /// row, and where that program serves that row alone ([`Self::default_only`]) it is `None`:
     /// no other row runs on that build.
     pub next: Option<String>,
+    /// The first row with no email and no current login (its login is not made here, or the pool
+    /// recorded it signed out), which `accounts login` signs in and no renewal does.
+    pub unaddressed: Option<String>,
     /// How many rows the roster lists.
     pub rows: usize,
     /// How many of them carry an email.
@@ -429,7 +432,7 @@ pub struct CliAccounts {
     /// CLI the row a launch aterm makes takes as the records stand
     /// ([`crate::harness::accounts_pool::launch_now`]) wherever it takes one, and under rotation
     /// off with no pin, where a launch takes no row, the row on this machine's own login, which
-    /// a plain launch runs on.
+    /// a plain launch runs on. A known stored identity contradiction withholds this attribution.
     pub serving_label: Option<String>,
     /// The label of the row on this machine's own login (the one with no `dir`), when the roster
     /// lists one.
@@ -685,12 +688,9 @@ fn local_sign_in_refusal(
 fn claude_accounts(m: &Machine<'_>) -> Option<ClaudeAccounts> {
     use crate::harness::accounts;
     let store = accounts::Store::at(m.harness_state.as_ref()?);
-    let loaded = m.roster.as_ref().map(|p| accounts::Roster::load(p));
-    let cache = store
-        .load(m.now)
-        .and_then(|(state, _)| store.load_logins(m.now).map(|(logins, _)| (state, logins)));
-    let refused = match &loaded {
-        Some(Err(why)) => Some(crate::harness::one_line(why, 160)),
+    let cache = store.read_account_records(m.roster.as_deref(), m.now);
+    let refused = match &cache {
+        Err(accounts::RosterReadError::Roster(why)) => Some(crate::harness::one_line(why, 160)),
         _ => None,
     };
     let unread = cache
@@ -698,6 +698,8 @@ fn claude_accounts(m: &Machine<'_>) -> Option<ClaudeAccounts> {
         .err()
         .filter(|_| refused.is_none())
         .map(|why| {
+            let (accounts::RosterReadError::Records(why) | accounts::RosterReadError::Roster(why)) =
+                why;
             let file = store.state_file();
             format!(
                 "{}, in {}",
@@ -730,11 +732,9 @@ fn claude_accounts(m: &Machine<'_>) -> Option<ClaudeAccounts> {
             off: None,
         });
     }
-    let listed_roster = match loaded {
-        Some(Ok(r)) if !r.rows.is_empty() => Some(r),
-        _ => None,
-    };
-    let (state, logins) = cache.ok()?;
+    let records = cache.ok()?;
+    let listed_roster = (!records.roster.rows.is_empty()).then_some(records.roster);
+    let (state, logins) = (records.state, records.logins);
     let Some(roster) = listed_roster else {
         return Some(ClaudeAccounts {
             store: Some(store),
@@ -765,7 +765,7 @@ fn claude_accounts(m: &Machine<'_>) -> Option<ClaudeAccounts> {
             }),
         });
     };
-    let bound = accounts::bound(&roster, &logins);
+    let bound = roster;
     let enrolled = accounts::enrolled(&bound);
     let (row, _) = select_claude_serving_row(&bound, &state, &enrolled, m.now)?;
     let row = row.clone();
@@ -842,7 +842,7 @@ fn claude_accounts(m: &Machine<'_>) -> Option<ClaudeAccounts> {
         signed_out_at: state
             .accounts
             .get(&row.label)
-            .filter(|a| a.auth == accounts::Auth::SignedOut)
+            .filter(|a| a.current_auth(&row) == accounts::Auth::SignedOut)
             .and_then(|a| a.auth_at),
         tried: tried_of(&logins, target),
         unattended: renews_target
@@ -1210,12 +1210,12 @@ fn pool_for_with(
     cli.accounts().signin.as_ref()?;
     let config_dir = m.roster.as_ref()?.parent()?;
     let roster_path = config_dir.join(cli.accounts().roster_file);
-    let roster = match accounts::roster_text(&roster_path).and_then(|text| {
+    match accounts::roster_text(&roster_path).and_then(|text| {
         text.map(|text| accounts::Roster::parse_for(cli, &text))
             .transpose()
     }) {
         Ok(None) => return None,
-        Ok(Some(roster)) => roster,
+        Ok(Some(_)) => {}
         Err(why) => {
             return Some(CliAccounts {
                 roster: roster_path,
@@ -1223,19 +1223,21 @@ fn pool_for_with(
                 ..CliAccounts::default()
             });
         }
-    };
+    }
     let cache = match (m.harness_state.as_deref(), m.home.as_deref()) {
         (Some(state), Some(home)) => {
             let store = accounts::Store::at_for(state, cli, home);
-            store.load(m.now).and_then(|(state, _)| {
-                store
-                    .load_logins(m.now)
-                    .map(|(logins, _)| (home, store, state, logins))
-            })
+            store
+                .read_account_records(Some(&roster_path), m.now)
+                .map(|records| (home, store, records))
+                .map_err(|why| match why {
+                    accounts::RosterReadError::Roster(why)
+                    | accounts::RosterReadError::Records(why) => why,
+                })
         }
         _ => Err("account store is unavailable".to_owned()),
     };
-    let (user_home, store, state, logins) = match cache {
+    let (user_home, store, records) = match cache {
         Ok(loaded) => loaded,
         Err(why) => {
             return Some(CliAccounts {
@@ -1245,10 +1247,13 @@ fn pool_for_with(
             });
         }
     };
+    if !records.roster_present {
+        return None;
+    }
+    let (bound, state, logins) = (records.roster, records.state, records.logins);
     let c = cli.connector();
     let default_dir = user_home.join(cli.accounts().default_home);
     let default_login = store_file_in(&default_dir, c);
-    let bound = accounts::bound(&roster, &logins);
     let enrolled_here = accounts::enrolled_in(cli, &bound, user_home);
     let emails = bound.rows.iter().filter(|r| r.email.is_some()).count();
     let local = |row: &accounts::Row| local_sign_in_refusal(row, &state, &logins).is_none();
@@ -1265,21 +1270,28 @@ fn pool_for_with(
         })
         .map(|row| row.label.clone())
         .collect();
+    // A row with no email that has no current login: `accounts login`, the sign-in that takes no
+    // email, is its step.
+    let unaddressed = bound
+        .rows
+        .iter()
+        .filter(|r| local(r) && r.email.is_none())
+        .find(|r| {
+            !enrolled_here.contains(&r.label)
+                || state
+                    .accounts
+                    .get(&r.label)
+                    .is_some_and(|a| a.current_auth(r) == accounts::Auth::SignedOut)
+        })
+        .map(|r| r.label.clone());
     let next = with_email()
         .find(|r| !enrolled_here.contains(&r.label))
         .map(|r| r.label.clone())
         .or_else(|| due.first().cloned())
-        .or_else(|| with_email().next().map(|r| r.label.clone()))
         .or_else(|| {
-            let no_email = || bound.rows.iter().filter(|r| local(r) && r.email.is_none());
             (!cli.renews_headlessly())
-                .then(|| {
-                    no_email()
-                        .find(|r| !enrolled_here.contains(&r.label))
-                        .or_else(|| no_email().next())
-                })
+                .then(|| unaddressed.clone())
                 .flatten()
-                .map(|r| r.label.clone())
         });
     let enrolled_count = bound
         .rows
@@ -1295,7 +1307,7 @@ fn pool_for_with(
     let mode = m.accounts_mode.unwrap_or_else(|| {
         crate::supervise::config::SupervisorConfig::from_path(Some(&config_dir.join("aterm.toml")))
             .0
-            .accounts
+            .accounts_for(cli.program())
     });
     let row_cond =
         |r: &accounts::Row| accounts::condition(r, &state, enrolled_here.contains(&r.label), m.now);
@@ -1390,14 +1402,28 @@ fn pool_for_with(
     // reviewer to: the serving row is that launch's row wherever it takes one, and where it is
     // refused no reviewer runs ([`CliAccounts::launch_refused`]). A launch from a home of its own
     // takes no row. With no Codex program known, the bare word stands in: it names no build.
+    let default_identity_refused =
+        crate::harness::accounts_pool::check_default_login_identity(cli, &bound, user_home)
+            .err()
+            .map(|why| why.to_string());
     let launch = if default_home {
-        crate::harness::accounts_pool::launch_now(
+        crate::harness::accounts_pool::launch_observed_with(
             (cli, hidden_store, mode),
             &bound,
             &state,
             &enrolled_here,
             program.or(Some(Path::new("codex"))),
             m.now,
+            |picked| {
+                if cli == Cli::Codex && picked.is_none_or(|row| row.dir.is_none()) {
+                    default_identity_refused.clone().map_or(Ok(()), Err)
+                } else {
+                    crate::harness::accounts_pool::check_launch_login_identity(
+                        cli, &bound, picked, user_home,
+                    )
+                    .map_err(|why| why.to_string())
+                }
+            },
         )
     } else {
         Ok(None)
@@ -1406,11 +1432,46 @@ fn pool_for_with(
         Ok(Some(row)) => Some(*row),
         Ok(None) | Err(_) => serving,
     };
+    let identity_refused = serving
+        .filter(|_| !matches!(&launch, Ok(Some(_))))
+        .and_then(|row| {
+            if cli == Cli::Codex && row.dir.is_none() {
+                default_identity_refused.clone()
+            } else {
+                crate::harness::accounts_pool::check_launch_login_identity(
+                    cli,
+                    &bound,
+                    Some(row),
+                    user_home,
+                )
+                .err()
+                .map(|why| why.to_string())
+            }
+        });
+    let serving = serving.filter(|_| identity_refused.is_none());
+    let launch = match (launch, identity_refused) {
+        (Ok(_), Some(why)) => Err(why),
+        (launch, _) => launch,
+    };
     let default_serving = (cli == Cli::Codex && !bound.rows.is_empty()).then(|| {
         match crate::harness::accounts_pool::default_serving(&bound, &state, &enrolled_here, m.now)
         {
-            Ok(row) => crate::harness::codex_alab::DefaultRow::Serves(row.label.clone()),
-            Err(blocked) => blocked,
+            Ok(row) => match &default_identity_refused {
+                None => crate::harness::codex_alab::DefaultRow::Serves(row.label.clone()),
+                Some(why) => crate::harness::codex_alab::DefaultRow::Other {
+                    label: row.label.clone(),
+                    why: why.clone(),
+                },
+            },
+            Err(blocked) => match (&default_identity_refused, blocked) {
+                (Some(why), crate::harness::codex_alab::DefaultRow::Walled { label, .. }) => {
+                    crate::harness::codex_alab::DefaultRow::Other {
+                        label,
+                        why: why.clone(),
+                    }
+                }
+                (_, blocked) => blocked,
+            },
         }
     });
     // On such a program the default row signs in by Codex's own sign-in in its default home while
@@ -1487,6 +1548,7 @@ fn pool_for_with(
                     .and_then(|label| bound.row(label))
                     .is_none_or(local)
         }),
+        unaddressed,
         rows: bound.rows.len(),
         emails,
         enrolled: enrolled_count,
@@ -1520,7 +1582,7 @@ fn pool_for_with(
         out.signed_out_at = state
             .accounts
             .get(&row.label)
-            .filter(|account| account.auth == accounts::Auth::SignedOut)
+            .filter(|account| account.current_auth(row) == accounts::Auth::SignedOut)
             .and_then(|account| account.auth_at);
         let signed_out = matches!(cond, Condition::SignedOut | Condition::NotEnrolled);
         if out.limited_until.is_some() || signed_out {

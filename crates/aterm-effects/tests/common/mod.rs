@@ -366,7 +366,7 @@ pub fn is_key(b: &[u8]) -> bool {
 /// Return whether `b` is a CSI arrow-key sequence (`ESC [ … A|B|C|D`).
 #[allow(dead_code)]
 pub fn is_arrow(b: &[u8]) -> bool {
-    b.starts_with(b"\x1b[") && matches!(b.last(), Some(b'A' | b'B' | b'C' | b'D'))
+    b.starts_with(b"\x1b[") && matches!(b.last(), Some(b'A'..=b'D'))
 }
 
 /// One recorded event from a `lab ptyrec` trace.

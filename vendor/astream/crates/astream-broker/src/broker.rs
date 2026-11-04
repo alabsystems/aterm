@@ -5655,6 +5655,13 @@ impl Broker {
         }
     }
 
+    pub(crate) fn is_diverged(&self) -> bool {
+        match self.shared.log.lock() {
+            Ok(g) => g.is_diverged(),
+            Err(p) => p.into_inner().is_diverged(),
+        }
+    }
+
     /// [`BrokerStats::writer_round_trips`] alone, read WITHOUT the log lock — what
     /// [`visible_head`](Self::visible_head) is to [`head`](Self::head).
     /// [`stats`](Self::stats) snapshots the log under its lock, so it waits out the
@@ -6491,6 +6498,10 @@ fn health_of(shared: &Shared) -> crate::health::BrokerHealth {
         parked_tails: count64(stats.parked_tails),
         flushes,
         process_flushes: Some(astream_sys::flush_tally()),
+        resident: Some(crate::health::Residency {
+            records: count64(stats.log.resident_records),
+            bytes: count64(stats.log.resident_bytes),
+        }),
         poisoned,
     }
 }

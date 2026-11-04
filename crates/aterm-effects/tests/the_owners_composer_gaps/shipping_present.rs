@@ -284,9 +284,9 @@ impl Hosted {
         let after_top = s.comp.rows_for().0[0].0;
         if after_top > before_top {
             let mut erase = String::new();
-            for r in before_top..after_top {
+            for (r, line) in (before_top..).zip(&mut s.comp.screen[before_top..after_top]) {
                 erase.push_str(&format!("\x1b[{};1H\x1b[2K", r + 1));
-                s.comp.screen[r] = vec![' '; COLS];
+                *line = vec![' '; COLS];
             }
             let at = SYNC_BEGIN.len() + "\x1b[?25l".len();
             b.splice(at..at, erase.into_bytes());

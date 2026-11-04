@@ -37,6 +37,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use astream_broker::{identity_path, seal_path};
 use aterm_uds::backup::Backups;
 
 /// The key's file name, beside the log it seals.
@@ -103,10 +104,6 @@ fn beside(log: &Path, suffix: &str) -> PathBuf {
     let mut name = log.as_os_str().to_os_string();
     name.push(suffix);
     PathBuf::from(name)
-}
-
-fn seal_path(log: &Path) -> PathBuf {
-    beside(log, ".seal")
 }
 
 /// The folder `log` sits in: `.` for a bare relative name, whose parent is the empty path.
@@ -549,32 +546,58 @@ fn is_a_log(log: &Path) -> Result<(), String> {
     if !meta.is_file() {
         return Err(format!("{at} is not a file; it is left as it was"));
     }
-    if !present(&beside(log, ".id")) && !present(&seal_path(log)) {
+    if !present(&identity_path(log)) && !present(&seal_path(log)) {
         return Err(format!(
             "{at} is no bus log: every log that has been served has a {} beside it, and a sealed \
              one a {}; it is left as it was",
-            shown(&beside(log, ".id")),
+            shown(&identity_path(log)),
             shown(&seal_path(log))
         ));
     }
     Ok(())
 }
 
-/// The refusal of a log that is not to be given up: it opens as it stands, or a broker holds it.
+/// The refusal of a log that is not to be given up: it opens as it stands, a broker holds it, or
+/// a crash left it a step a start settles before anything can say whether it opens.
+///
+/// Asked by astream's open check, which takes the open's steps and writes none of them
+/// ([`astream_broker::BrokerLog::check_open`], claim `broker.check-open`), so every file of a log
+/// this refuses is as it was, `<log>.id` included, which an open closed at once rewrites. The
+/// check opens the log and its held store read-write, as a start does, so a log no start could
+/// open for writing is answered by that refusal and given up. A sealed log is asked under its key
+/// by the bound open's rules, the key read as a start reads it ([`read_key`]), which removes a
+/// temporary a mint killed part way left beside it (a second link to the key): that file alone
+/// can go with a refusal. One with no usable key never opens, and is not asked.
 fn refuses_retire(log: &Path) -> Result<(), String> {
-    use astream_broker::{BrokerLog, Durability};
+    use astream_broker::{BrokerLog, InterruptedStep, OpenCheck};
     let at = log.display();
-    let sealed = is_sealed(log);
-    let opened = match read_key(log) {
-        KeyFile::Held(key) if sealed => BrokerLog::open_encrypted_bound(log, key.bytes()),
-        _ if sealed => Err(io::Error::new(io::ErrorKind::InvalidData, "no usable key")),
-        _ => BrokerLog::open_with(log, Durability::Strict),
+    let mut key = if is_sealed(log) {
+        match read_key(log) {
+            KeyFile::Held(key) => Some(key.bytes()),
+            KeyFile::Absent | KeyFile::Damaged(_) => return Ok(()),
+        }
+    } else {
+        None
     };
-    match opened {
-        Ok(mut opened) => {
-            let _ = opened.close_clean();
+    let checked = BrokerLog::check_open(log, key);
+    if let Some(bytes) = key.as_mut() {
+        bytes.fill(0);
+        std::hint::black_box(bytes);
+    }
+    match checked {
+        Ok(OpenCheck::Opens { .. }) => Err(format!(
+            "{at} opens as it stands, so there is nothing to give up; it is left as it was"
+        )),
+        Ok(unsettled) => {
+            let step = match unsettled {
+                OpenCheck::Unsettled(InterruptedStep::SealSwitch) => "an offline seal's switch",
+                OpenCheck::Unsettled(InterruptedStep::Compaction { .. }) => "a compaction",
+                _ => "a step",
+            };
             Err(format!(
-                "{at} opens as it stands, so there is nothing to give up; it is left as it was"
+                "{at} has {step} a crash stopped, which a start finishes before it opens the log, \
+                 so whether it opens is not known yet: start the broker, and if it still refuses \
+                 run {RETIRE_VERB} again; it is left as it was"
             ))
         }
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(format!(
@@ -709,7 +732,8 @@ fn retire_names(log: &Path) -> Result<Vec<String>, String> {
 ///
 /// # Errors
 /// It names no file with what a log has beside it; there is no log; it opens (nothing to give up);
-/// a broker holds it; or a move fails, where a later run takes up what is left.
+/// a broker holds it; a crash left it a step a start settles first (`refuses_retire`); or a move
+/// fails, where a later run takes up what is left.
 pub fn retire(log: &Path, backups: Backups) -> Result<Retired, String> {
     let dir = folder_of(log);
     let (to, held) = match retiring_to(log)? {
@@ -741,12 +765,11 @@ pub fn retire(log: &Path, backups: Backups) -> Result<Retired, String> {
         .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
         .collect();
     moved.sort();
-    let name = log
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
     let keyed = moved.iter().any(|entry| *entry == REST_KEY);
-    let sealed = moved.contains(&format!("{name}.seal"));
+    let sealed = seal_path(log)
+        .file_name()
+        .and_then(|seal| seal.to_str())
+        .is_some_and(|seal| moved.iter().any(|entry| entry == seal));
     let minted = (sealed || keyed) && matches!(mint(log, backups), Ok(Some(_)));
     Ok(Retired { to, moved, minted })
 }

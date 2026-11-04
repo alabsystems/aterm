@@ -95,6 +95,7 @@ macro_rules! graph {
 
 #[derive(Debug, PartialEq, Eq)]
 struct Projection {
+    weighing: Weighing,
     membership: Membership,
     records: BTreeMap<RecordId, (bool, bool, bool, Vec<RecordId>)>,
     before: BTreeSet<(RecordId, RecordId)>,
@@ -106,20 +107,21 @@ fn project(records: &[Record], peers: &[Peer], reference: bool) -> Projection {
     let indexed = Indexed::of(records);
     let history = indexed.history(records);
     let graph = graph!(history, reference);
-    let membership = graph.evaluate(&mut Memo::new());
-    let mut scratch = AuthScratch::new(records.len());
-    let plain = graph.authorized(&vec![false; records.len()], &mut Memo::new(), &mut scratch);
+    let mut scratch = graph.scratch();
+    let weighing = graph.weighing(&mut Memo::new(), &mut scratch);
+    let membership = graph.evaluate(&weighing, &mut scratch);
+    let plain = graph.authorized_records(&graph.no_void(), &weighing.apart.plain, &mut scratch);
     let undo = peers
         .iter()
         .map(|peer| {
             let actor = peer.actor();
             let cutoff = graph
-                .undo_cutoff(&actor, &plain, &mut scratch)
+                .undo_cutoff(&actor, &plain, &weighing, &mut scratch)
                 .map(|at| *records[at].id());
             (actor, cutoff)
         })
         .collect();
-    let effective = graph.effective();
+    let effective = graph.effective(&weighing);
     let mut before = BTreeSet::new();
     let flags = records
         .iter()
@@ -160,11 +162,12 @@ fn project(records: &[Record], peers: &[Peer], reference: bool) -> Projection {
             )
         })
         .map(|(i, record)| {
-            let writers = graph!(history, reference).historical_bindings_for_epoch(i);
+            let writers = graph!(history, reference).historical_bindings_for_epoch(&weighing, i);
             (*record.id(), writers)
         })
         .collect();
     Projection {
+        weighing,
         membership,
         records: flags,
         before,

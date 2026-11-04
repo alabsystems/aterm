@@ -56,7 +56,15 @@ fn preparation_case(moving: bool, default: bool, case: i64) -> ([(&'static str, 
             state.pinned = case == 2;
             if case == 11 {
                 for row in world.seat().roster(cli).unwrap().rows {
-                    accounts::note_auth(state, &row.label, accounts::Auth::Ok, NOW);
+                    stage_current_auth(
+                        &world,
+                        cli,
+                        state,
+                        logins,
+                        &row.label,
+                        accounts::Auth::Ok,
+                        NOW,
+                    );
                 }
             }
             if case == 4 {
@@ -153,9 +161,12 @@ fn preparation_case(moving: bool, default: bool, case: i64) -> ([(&'static str, 
         }
         if case == 10 {
             store
-                .transact(NOW, &mut None, |state| {
-                    Ok(accounts::note_auth(
+                .transact_logins(NOW, &mut None, |state, logins| {
+                    Ok(stage_current_auth(
+                        &world,
+                        cli,
                         state,
+                        logins,
                         failed,
                         accounts::Auth::Ok,
                         NOW + 1,
@@ -203,7 +214,7 @@ fn preparation_case(moving: bool, default: bool, case: i64) -> ([(&'static str, 
     let (returned, target, details) = if moving {
         let auth = source.join("auth.json").to_string_lossy().into_owned();
         let env = [("CODEX_AUTH_PATH", auth.as_str())];
-        let mut session = session(cli, Supervisor::Aterm, Mode::Early, Path::new("/opt/codex"));
+        let mut session = session(cli, Supervisor::Aterm, Mode::Early, &world.exe);
         session.env = &env;
         session.point = Point::Wall {
             window: "five_hour".into(),

@@ -292,6 +292,13 @@ pub trait ScreenReader: Sync {
     fn work_left(&self, rows: &[String]) -> Option<&'static str> {
         self.background_wait(rows)
     }
+    /// The agent's own work running under its turn's end that a restart in place would end, as
+    /// this screen names it, in [`Self::background_wait`]'s words. Claude Code's reading keeps
+    /// only what names live work ([`crate::phase::work_running`]): a workflow's progress row,
+    /// which outlives its workflow, is none of it.
+    fn work_running(&self, rows: &[String]) -> Option<&'static str> {
+        self.background_wait(rows)
+    }
     /// Whether the last turn's end is hidden off-screen while the session rests idle.
     fn end_hidden(&self, _rows: &[String]) -> bool {
         false
@@ -575,6 +582,9 @@ impl ScreenReader for ClaudeReader {
     }
     fn work_left(&self, rows: &[String]) -> Option<&'static str> {
         crate::phase::work_left(rows)
+    }
+    fn work_running(&self, rows: &[String]) -> Option<&'static str> {
+        crate::phase::work_running(rows)
     }
     fn context(&self, rows: &[String]) -> Option<u8> {
         context_left(rows)

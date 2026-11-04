@@ -168,7 +168,7 @@ pub(in crate::harness) fn pending_checkpoint(
             && accounts::email_matches(&checkpoint.email, &attempt.intent.identity)
             && accounts::checkpoint_identity_matches(cli, row, &checkpoint)
             && accounts::checkpoint_unreferenced(roster, logins, staging, &actual)
-            && accounts::checkpoint_current(row, state, logins, &checkpoint)
+            && accounts::checkpoint_current(row, state, logins, &checkpoint, None)
             && {
                 let identity = super::super::profile::identity_in_home(staging, &checkpoint.email);
                 identity.email_matches != Some(false)

@@ -34,9 +34,10 @@ aterm ai — this machine's AI CLIs (claude, codex, agy, muse, grok, kimi): heal
   aterm ai doctor [--read-only] [--json] [--on <host>[:/abs/aterm],\u{2026} | --fleet]
                                 the same with fixes tried (not with --read-only or --json):
                                 aterm's own, at a terminal or none and under an agent too
-                                (installs, and sign-ins through accounts v2's or a pool's
-                                renewal), and a CLI's own sign-in only for a person at a
-                                terminal; exit 1
+                                (installs, of a CLI nobody asked for too, and sign-ins through
+                                accounts v2's or a pool's renewal), and a CLI's own sign-in
+                                only for a person at a terminal, of a CLI someone asked for;
+                                exit 1
                                 while one someone asked for is signed out or not installed;
                                 --on / --fleet ([harness]
                                 hosts): those machines too, over ssh, for a person at a terminal
@@ -282,17 +283,26 @@ pub fn look(env: &Env) -> Look {
             .into_iter()
             .any(|cli| config_dir.join(cli.accounts().roster_file).is_file())
         });
-    let accounts_mode = Some(match (has_other_pool, config_text.as_deref()) {
+    // One mode for every pool, read once, unless a switch turns one pool off and not another:
+    // each pool then reads its own ([`crate::supervise::config::SupervisorConfig::accounts_for`]).
+    let accounts_mode = match (has_other_pool, config_text.as_deref()) {
         (true, Some(text)) => {
-            crate::supervise::config::SupervisorConfig::from_parsed_aterm_toml(
+            let policy = crate::supervise::config::SupervisorConfig::from_parsed_aterm_toml(
                 parsed_doc.as_ref(),
                 text,
             )
-            .0
-            .accounts
+            .0;
+            [
+                crate::harness::accounts::Cli::Codex,
+                crate::harness::accounts::Cli::Grok,
+                crate::harness::accounts::Cli::Kimi,
+            ]
+            .into_iter()
+            .all(|cli| policy.on_for(cli.program()))
+            .then_some(policy.accounts)
         }
-        _ => crate::supervise::config::SupervisorConfig::default().accounts,
-    });
+        _ => Some(crate::supervise::config::SupervisorConfig::default().accounts),
+    };
     let machine = Machine {
         now: env.now,
         home: env.home.clone(),
@@ -393,6 +403,15 @@ pub fn render_text(out: &mut dyn Write, look: &Look, fixes: bool, next: &str) {
     render_look(out, look, fixes, next, true);
 }
 
+/// The fix the doctor prints under `row`, where it has one to print: for what warns or needs an act,
+/// and for a refused roster whether anyone asked for that CLI or not, which stays at a note and
+/// alerts nobody; the doctor is where a person asks.
+pub(crate) fn doctor_fix(row: &state::Row) -> Option<&String> {
+    (row.mark >= Mark::Warn || row.state.needs_act(row.wanted) || row.state == State::Refused)
+        .then(|| row.fix.as_ref().or(row.mend.as_ref()))
+        .flatten()
+}
+
 /// [`render_text`], the `NEEDS YOU:` line only where `needs_you` asks for it (not before the
 /// doctor's own fixes, which may make it moot).
 fn render_look(out: &mut dyn Write, look: &Look, fixes: bool, next: &str, needs_you: bool) {
@@ -416,10 +435,7 @@ fn render_look(out: &mut dyn Write, look: &Look, fixes: bool, next: &str, needs_
             pad(&format!("{}:", row.connector.id), LABEL_W),
             pad(row.state.word(), STATE_W)
         );
-        if fixes
-            && (row.mark >= Mark::Warn || row.state.needs_act(row.wanted))
-            && let Some(fix) = row.fix.as_ref().or(row.mend.as_ref())
-        {
+        if fixes && let Some(fix) = doctor_fix(row) {
             let _ = writeln!(out, "{}fix: {fix}", " ".repeat(LABEL_W));
         }
     }
@@ -980,6 +996,7 @@ fn remote_states(json: &str) -> Option<Vec<(String, String)>> {
                 "due",
                 "unproven",
                 "signed-out",
+                "refused",
                 "not-installed",
                 "off",
             ]

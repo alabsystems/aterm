@@ -8,6 +8,30 @@ use super::*;
 use aterm_capacity::reading::{Proc, Procs};
 use aterm_capacity::{Fixed, Reading};
 
+#[cfg(unix)]
+#[path = "build_admit_native_tests.rs"]
+mod native;
+
+#[cfg(target_os = "macos")]
+#[path = "build_admit_cohort_tests.rs"]
+mod cohort;
+
+#[cfg(target_os = "macos")]
+#[path = "build_admit_headless_tests.rs"]
+mod headless;
+
+#[cfg(target_os = "macos")]
+#[path = "build_admit_host_tests.rs"]
+mod host_table;
+
+#[cfg(target_os = "macos")]
+#[path = "build_admit_service_tests.rs"]
+mod host_service;
+
+#[cfg(target_os = "macos")]
+#[path = "build_admit_terminal_tests.rs"]
+mod terminal;
+
 const GIB: u64 = 1 << 30;
 
 fn words(args: &[&str]) -> Vec<String> {
@@ -843,6 +867,8 @@ fn an_ended_builds_claim_goes_before_its_peak_is_kept() {
         claim,
         key,
         own: Some(file.join("targo-memory.json")),
+        #[cfg(unix)]
+        cohort: false,
     };
     let mut said = Vec::new();
     assert_eq!(
@@ -896,7 +922,7 @@ fn a_supervised_build_keeps_its_peak_only_when_it_succeeds() {
         let Admission::Claimed(held) = admit(&b, dir.path(), &s, &mut |_| {}) else {
             panic!("expected a claim");
         };
-        let mut cmd = aterm_uds::spawnfd::transparent("/bin/sh");
+        let mut cmd = aterm_uds::spawnfd::transparent("/bin/sh").into_command();
         cmd.args(["-c", script]);
         supervise(Some(*held), &mut cmd, &|| 3 * GIB, &mut |_| {}).expect("ran")
     };
@@ -960,7 +986,7 @@ fn a_supervised_builds_child_does_not_hold_the_claim() {
             // SAFETY: `fcntl` on a descriptor this process holds open, with plain integers.
             assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) }, 0);
         }
-        let mut cmd = aterm_uds::spawnfd::transparent("/bin/sh");
+        let mut cmd = aterm_uds::spawnfd::transparent("/bin/sh").into_command();
         cmd.args(["-c", &aterm_uds::host::held_probe(fd)]);
         let status = supervise(Some(*held), &mut cmd, &|| 0, &mut |_| {}).expect("ran");
         status.code()
@@ -997,7 +1023,7 @@ fn standin_front_supervises_a_cat() {
         panic!("expected a claim");
     };
     let build = std::env::var(FORWARD_BUILD).unwrap_or_else(|_| A_CAT.to_owned());
-    let mut cmd = aterm_uds::spawnfd::transparent("/bin/sh");
+    let mut cmd = aterm_uds::spawnfd::transparent("/bin/sh").into_command();
     cmd.args(["-c", &build]);
     let status = supervise(Some(*held), &mut cmd, &|| 0, &mut |_| {}).expect("ran");
     let _ = end_like(status);
@@ -1038,6 +1064,131 @@ fn a_front_ends_what_its_signalled_build_left_running() {
         libc::SIGTERM,
         "exec 3<&0; cat <&3 & echo \"ATPKG_CHILD $!\"; wait",
     );
+}
+
+/// A build a signal ended that left a process deaf to that signal keeps its claim until the
+/// tree is actually drained: with the escalation grace far away the front, its claim still
+/// in the ledger, waits while the deaf `cat` lives and ends once the cat is killed; with a
+/// short grace the front kills the cat itself before the claim ends, though the cat's stdin
+/// (this test's pipe) is still open, so nothing else could have ended it. NEGATIVE CONTROL
+/// (the source this test was written against first, where the claim ended once
+/// [`super::TREE_ENDS_WITHIN`] passed, whatever still ran): the short-grace front never
+/// killed the cat, and this test failed with the front not yet ended at its hang detector.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_front_holds_its_claim_until_a_deaf_leftover_is_drained() {
+    use std::os::unix::process::ExitStatusExt as _;
+    const DEAF: &str = "exec 3<&0; (trap '' TERM; exec cat <&3) & \
+                        echo \"ATPKG_CHILD $!\"; echo \"ATPKG_ROOT $$\"; wait";
+    let alive = |pid: i32| {
+        // SAFETY: `kill` with signal 0 sends nothing: it asks whether `pid` still exists.
+        let sent = unsafe { libc::kill(pid, 0) };
+        sent == 0
+    };
+    let spawn_front = |grace_ms: &str| {
+        use std::io::BufRead as _;
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let turn = crate::platform::FORWARDING_TURN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut front = aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "build_admit::tests::standin_front_supervises_a_cat",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(FORWARD_STANDIN, dir.path())
+            .env(FORWARD_BUILD, DEAF)
+            .env(TREE_END_GRACE_ENV, grace_ms)
+            .setsid(true)
+            .stdin(aterm_uds::spawnfd::Stdio::piped())
+            .stdout(aterm_uds::spawnfd::Stdio::piped())
+            .stderr(aterm_uds::spawnfd::Stdio::null())
+            .spawn()
+            .expect("the stand-in front");
+        drop(turn);
+        let out = front.stdout.take().expect("its stdout");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut lines = std::io::BufReader::new(out).lines();
+            let (mut child, mut root) = (None, None);
+            for line in lines.by_ref() {
+                let Ok(line) = line else { break };
+                for (mark, slot) in [("ATPKG_CHILD ", &mut child), ("ATPKG_ROOT ", &mut root)] {
+                    if let Some(at) = line.find(mark) {
+                        *slot = line[at + mark.len()..].trim().parse::<i32>().ok();
+                    }
+                }
+                if let (Some(child), Some(root)) = (child, root) {
+                    let _ = tx.send(Some((child, root)));
+                    lines.for_each(drop);
+                    return;
+                }
+            }
+            let _ = tx.send(None);
+        });
+        let (child, root) = rx
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("hang detector: the build never started")
+            .expect("the build said its pids");
+        (dir, front, child, root)
+    };
+    let claims = |dir: &Path| {
+        Ledger::at(dir.join("ledger"))
+            .list()
+            .expect("the ledger listed")
+            .len()
+    };
+    // Grace far away: custody is held on the live leftover, and release follows its drain.
+    {
+        let (dir, mut front, child, root) = spawn_front("600000");
+        let front_pid = i32::try_from(front.id()).expect("a pid");
+        // SAFETY: `kill` with two integers; the pid is this test's own unreaped child.
+        assert_eq!(unsafe { libc::kill(front_pid, libc::SIGTERM) }, 0);
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the build root reaped",
+            || (!alive(root)).then_some(()),
+        );
+        assert!(alive(child), "the deaf cat outlived its root");
+        assert!(
+            matches!(front.try_wait(), Ok(None)),
+            "the front ended while its tree still ran"
+        );
+        assert_eq!(claims(dir.path()), 1, "the claim is still held");
+        // SAFETY: `kill` with two integers; `child` is this fixture's own process.
+        assert_eq!(unsafe { libc::kill(child, libc::SIGKILL) }, 0);
+        let status = aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the front's end",
+            || front.try_wait().ok().flatten(),
+        );
+        assert_eq!(status.signal(), Some(libc::SIGTERM), "{status:?}");
+        assert_eq!(claims(dir.path()), 0, "the claim went with the drain");
+        drop(front.stdin.take());
+    }
+    // Short grace: the front itself ends the deaf leftover before its claim ends.
+    {
+        let (dir, mut front, child, _root) = spawn_front("200");
+        let front_pid = i32::try_from(front.id()).expect("a pid");
+        // SAFETY: `kill` with two integers; the pid is this test's own unreaped child.
+        assert_eq!(unsafe { libc::kill(front_pid, libc::SIGTERM) }, 0);
+        let status = aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the front's end",
+            || front.try_wait().ok().flatten(),
+        );
+        let cat_alive = alive(child);
+        if cat_alive {
+            // SAFETY: `kill` with two integers; `child` is this fixture's own process.
+            unsafe { libc::kill(child, libc::SIGKILL) };
+        }
+        drop(front.stdin.take());
+        assert_eq!(status.signal(), Some(libc::SIGTERM), "{status:?}");
+        assert!(!cat_alive, "the deaf cat outlived the front and its claim");
+        assert_eq!(claims(dir.path()), 0, "the claim went with the drain");
+    }
 }
 
 /// [`a_front_passes_every_signal_on_and_ends_by_it`] for `sig`, sent to a stand-in front in a
@@ -1190,7 +1341,7 @@ fn a_supervised_build_is_handed_its_claims_cover_marker() {
     };
     let marker = held.claim().record().cover_marker();
     let out = dir.path().join("cover");
-    let mut cmd = aterm_uds::spawnfd::transparent("/bin/sh");
+    let mut cmd = aterm_uds::spawnfd::transparent("/bin/sh").into_command();
     cmd.args([
         "-c",
         &format!("printf %s \"$ATERM_CAPACITY_COVER\" > '{}'", out.display()),
@@ -1338,7 +1489,7 @@ fn standin_front_ends_as_its_build() {
     let Admission::Claimed(held) = admit(&test_build(), &dir, &s, &mut |_| {}) else {
         panic!("expected a claim");
     };
-    let mut cmd = aterm_uds::spawnfd::transparent("/bin/sh");
+    let mut cmd = aterm_uds::spawnfd::transparent("/bin/sh").into_command();
     cmd.args(["-c", &format!("kill -{sig} $$")]);
     let status = supervise(Some(*held), &mut cmd, &|| 0, &mut |_| {}).expect("ran");
     raise_like(&status);
@@ -1781,6 +1932,62 @@ fn an_unproven_nested_lock_never_forces_admission_or_waits_in_a_cycle() {
         matches!(room, Admission::Claimed(_)),
         "configured Wait admits normally when it fits: {room:?}"
     );
+}
+
+/// A NESTED BUILD UNDER AN UNPROVEN LOCK TAKES ITS TURN AT THE LEDGER'S LOCK: its one look
+/// decides, and a look that met another admission holding the ledger's lock (one deciding at that
+/// moment) decided nothing and is no wait that could close a cycle, so it looks again, saying who
+/// holds the lock, and claims once the lock is let go. Its line naming the lock's holder proves
+/// it met the lock before the test let it go. NEGATIVE CONTROL: the single look this replaced
+/// refuses the build as a wait that could cycle.
+#[test]
+fn an_unproven_nested_lock_takes_its_turn_at_the_ledgers_lock() {
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let turn = Ledger::at(dir.path().join("ledger"))
+        .hold_turn()
+        .expect("the ledger's lock")
+        .expect("free");
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let path = dir.path().to_owned();
+    let nested = std::thread::spawn(move || {
+        let m = machine();
+        let mut s = seat(&path, &m, std::process::id().wrapping_add(41));
+        s.pace = Pace {
+            poll: std::time::Duration::from_millis(5),
+            line_every: std::time::Duration::ZERO,
+        };
+        let admitted = admit_bounded(
+            &test_build(),
+            &path,
+            &s,
+            &|| Some(PathBuf::from("/foreign/.cargo-lock")),
+            &mut |line| {
+                let _ = tx.send(line.to_owned());
+            },
+        );
+        (
+            matches!(admitted, Admission::Claimed(_)),
+            format!("{admitted:?}"),
+        )
+    });
+    let lock = aterm_capacity::Short::Turn {
+        holder: Some(std::process::id()),
+    }
+    .to_string();
+    let met = loop {
+        let line = rx
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("a line naming the lock's holder");
+        if line.contains(&lock) {
+            break line;
+        }
+    };
+    drop(turn);
+    aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "its admission", || {
+        nested.is_finished().then_some(())
+    });
+    let (claimed, admitted) = nested.join().expect("the nested admission");
+    assert!(claimed, "{admitted} after {met:?}");
 }
 
 /// A WAITING FRONT'S LEDGER SAYS WHAT IT WAITS FOR ([`front_claim`]), read off a real ledger: its

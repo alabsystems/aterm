@@ -62,9 +62,8 @@ pub enum Unfinished {
     Stopped,
     /// Apple's own installer window has not installed them: it was open when the run began,
     /// with the placeholder beside it or not, which defers to it
-    /// ([`crate::items::developer::Holder::AppleWindow`]), or the root half's wait on it (the one
-    /// it opened where the catalog lists none, or the one already open) ran out with it still
-    /// open.
+    /// ([`crate::items::developer::Holder::AppleWindow`]), or the root half's wait on that
+    /// existing window ran out with it still open. aterm opens no Apple installer window.
     AppleWindow,
     /// Apple's own installer window, which the root half waited on, closed without installing
     /// them, with no installer running: a person pressed Not Now or Cancel there or dismissed

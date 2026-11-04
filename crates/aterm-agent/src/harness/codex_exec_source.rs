@@ -113,9 +113,8 @@ impl ExecSource {
         if !self.current() {
             return Err("exec-source-changed");
         }
-        let config = self.config_home.to_str().ok_or("exec-config-path")?;
-        let auth = self.auth_path.to_str().ok_or("exec-auth-path")?;
-        let env = [("CODEX_HOME", config), ("CODEX_AUTH_PATH", auth)];
+        let env = self.account_env().ok_or("exec-auth-path")?;
+        let program = std::str::from_utf8(&self.process.image.path).map_err(|_| "exec-program")?;
         let session = accounts_pool::Session {
             cli: accounts::Cli::Codex,
             sid,
@@ -129,17 +128,32 @@ impl ExecSource {
             mode: seat.mode_for(accounts::Cli::Codex),
             relaunch: (),
         };
-        let result =
-            codex_rotation::prepare_exec(seat, &session, expected_source, reader, wait, |row| {
+        let result = codex_rotation::prepare_exec(
+            seat,
+            &session,
+            Path::new(program),
+            expected_source,
+            reader,
+            wait,
+            |row| {
                 let home = row.dir.as_ref().map(PathBuf::from).unwrap_or_else(|| {
                     seat.home.join(accounts::Cli::Codex.accounts().default_home)
                 });
                 self.command_for(&home.join("auth.json"))
-            });
+            },
+        );
         if !self.current() {
             return Err("exec-source-changed");
         }
         result
+    }
+
+    fn account_env(&self) -> Option<[(&str, &str); 1]> {
+        // Attribute the login through its proven credential pointer, as TUI
+        // rotation does. CODEX_HOME belongs to config/history; presenting it as
+        // a second login override makes the shared pool refuse a managed row.
+        // The provider reader separately retains the kernel-bound config home.
+        Some([("CODEX_AUTH_PATH", self.auth_path.to_str()?)])
     }
 
     /// Recheck after provider I/O and before native admission. A changed image,
@@ -223,6 +237,23 @@ mod tests {
         let debug = format!("{source:?}");
         assert!(!debug.contains("line one"));
         assert!(!debug.contains("UNRELATED_SECRET"));
+    }
+
+    #[test]
+    fn native_exec_source_keeps_managed_login_attribution_with_a_shared_config_home() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let (process, mut args) = facts(root.path());
+        let config = root.path().join("shared-config");
+        args.env.push(format!("CODEX_HOME={}", config.display()));
+        let source = ExecSource::from_observations(process, args, root.path().into()).unwrap();
+        let login = crate::harness::accounts::ProcessLogin::of_env_for(
+            crate::harness::accounts::Cli::Codex,
+            source.account_env().unwrap(),
+        );
+        assert!(login.default_home && login.stored_login);
+        assert_eq!(login.login.as_deref(), root.path().join("source").to_str());
+        assert_eq!(source.config_home, config);
+        assert_eq!(source.auth_path, root.path().join("source/auth.json"));
     }
 
     #[test]

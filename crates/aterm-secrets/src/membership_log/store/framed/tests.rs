@@ -4,6 +4,7 @@
 use super::*;
 use crate::age::Identity;
 use crate::commons::binding::Request;
+use crate::membership_log::MAX_HELD_RECORDS;
 use crate::membership_log::{Body, Entrant, Inserted, Log, encode_records};
 
 // The old byte-slice recovery algorithm, independent of recover_decoded.
@@ -177,7 +178,7 @@ fn rooted_file_application_rolls_back_only_new_unrooted_records() {
         let bytes = encode_records(records.iter().enumerate().filter_map(|(i, record)| {
             (i != 1 && (include_rejected_genesis || i != 0)).then_some(record)
         }));
-        let batch = Store::read_records(bytes.as_slice()).unwrap();
+        let batch = Store::read_records(bytes.as_slice(), original.budgets().held).unwrap();
         assert_eq!(batch.bytes_read(), bytes.len());
         let recovered = batch.apply_rooted(original.clone());
         assert!(recovered.log().is_none());
@@ -194,7 +195,7 @@ fn rooted_file_application_rolls_back_only_new_unrooted_records() {
             .enumerate()
             .filter_map(|(i, record)| (i != 1).then_some(record)),
     );
-    let recovered = Store::read_records(bytes.as_slice())
+    let recovered = Store::read_records(bytes.as_slice(), original.budgets().held)
         .unwrap()
         .apply_rooted(original.under(&[*signer]));
     assert!(recovered.log().is_some());
@@ -310,6 +311,62 @@ fn recovery_bound_counts_verified_frames_including_duplicates() {
     assert!(actual.complete_bytes(records[1].id()).is_some());
     assert!(actual.complete_bytes(records[2].id()).is_none());
     assert_eq!(input.at, bytes.len());
+}
+
+/// A local file uses its store's capacity. Cutting this history at the network decoder's
+/// legacy limit loses the final wraps and falsely excludes an active recipient.
+#[test]
+fn local_recovery_keeps_the_complete_history_within_its_store_budget() {
+    use crate::crossing::fixture::{Batch, RAISED};
+
+    let batch = Batch::get();
+    let records = batch.whole();
+    let wire = encode_records(&records);
+    assert!(super::super::decode_records(&wire).is_err());
+    // Only construction uses the raised ambient budget; recovery must use what the store kept.
+    let empty = || RAISED.within(|| Store::with_compiled(None));
+    let recovered = [
+        empty().recovering(&wire),
+        empty()
+            .recovering_read(Chunks::new(&wire, 257))
+            .expect("streaming local recovery"),
+    ];
+    for store in recovered {
+        let log = store.log().expect("rooted history");
+        assert_eq!(log.held_count(), records.len());
+        assert!(store.encode() == wire, "every signed record survives");
+        assert!(!log.audience_left_out_recipient(
+            &crate::membership_log::EpochAudience::Everyone,
+            &batch.a.recipient,
+        ));
+        assert!(log.recipient_is_removed(&batch.c.recipient));
+    }
+}
+
+#[test]
+fn local_recovery_counts_duplicate_frames_against_its_store_budget() {
+    use crate::membership_log::RecordBudgets;
+
+    let records = fixture();
+    let wire = encode_records([&records[0], &records[0], &records[1]]);
+    assert_eq!(super::super::decode_records(&wire).unwrap().len(), 3);
+    let empty = || {
+        RecordBudgets {
+            held: 2,
+            ..RecordBudgets::PRODUCTION
+        }
+        .within(|| Store::with_compiled(None))
+    };
+    let mut input = Chunks::new(&wire, 17);
+    let recovered = [
+        empty().recovering(&wire),
+        empty().recovering_read(&mut input).unwrap(),
+    ];
+    for store in recovered {
+        assert_eq!(store.log().unwrap().held_count(), 1);
+        assert!(store.complete_bytes(records[1].id()).is_none());
+    }
+    assert_eq!(input.at, wire.len(), "the rest is consumed for its digest");
 }
 
 #[test]

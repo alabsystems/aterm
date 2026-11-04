@@ -9771,8 +9771,14 @@ pub enum HostTurn {
 pub enum Restart {
     Memory,
     /// The worker read the line the loop wrote to it and drew none of it a minute on, at rest
-    /// ([`RULE_INPUT_LOST`]).
-    InputLost,
+    /// ([`RULE_INPUT_LOST`]): a restart of `of`, the agent's process the line was written to as
+    /// the host named it, and of no other process; `(None, None)` where it named none, a restart
+    /// of the tab's agent then. `line`: the line it is made for, the same at every ask of that
+    /// line's restart (`custody::LineAsk`), whose ask ([`RestartAsk::of`]) is the line's.
+    InputLost {
+        of: crate::supervise::custody::Process,
+        line: crate::supervise::custody::LineAsk,
+    },
     Model {
         to: String,
     },
@@ -9820,7 +9826,7 @@ impl Restart {
     pub const fn word(&self) -> &'static str {
         match self {
             Restart::Memory => "memory",
-            Restart::InputLost => "input-lost",
+            Restart::InputLost { .. } => "input-lost",
             Restart::Model { .. } => "model",
             Restart::ModelBack { .. } => "model-back",
             Restart::Account {
@@ -9832,6 +9838,39 @@ impl Restart {
                 ..
             } => "account-ahead",
         }
+    }
+}
+
+/// WHICH ASK OF A RESTART IN PLACE THE HOST IS ASKED (`IdleHost::restart`'s `ask`): the same at
+/// every ask of one restart, its first and each asked again after a deferral, and another at any
+/// other restart's. A lost line's is its line's ([`Restart::InputLost`]'s `line`), the same while
+/// the line is held, whatever other restart is asked meanwhile; any other restart's is its run's
+/// (`Session::restart_run`): its kind and the Unix second the loop first asked it, kept while the
+/// loop asks that kind again on its back-off and restored by a later loop for a model's move its
+/// ledger shows still waiting, so a re-ask there is the same. The relaunch's record keeps the ask
+/// that claimed it (`St::ask`), and a restart asked again meets its own record by it alone, never
+/// by its cause, so a restart asked of the process an earlier restart of its cause started is
+/// made of it (`relaunch::its_own`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestartAsk(String);
+
+impl RestartAsk {
+    /// The ask of `why` in the loop's restart run first asked at Unix second `run_at`.
+    #[must_use]
+    pub fn of(why: &Restart, run_at: i64) -> Self {
+        match why {
+            Restart::InputLost { line, .. } => Self(format!("line:{}", line.word())),
+            Restart::Memory
+            | Restart::Model { .. }
+            | Restart::ModelBack { .. }
+            | Restart::Account { .. } => Self(format!("{}@{run_at}", why.word())),
+        }
+    }
+
+    /// The word the relaunch's record keeps (`St::ask`).
+    #[must_use]
+    pub fn word(&self) -> &str {
+        &self.0
     }
 }
 
@@ -11274,6 +11313,15 @@ impl RecordTurn {
 /// How much earlier than the act's own stamp the record may date the prompt that act typed ([`TurnEndState::observe`]'s fast answer).
 pub const RECORD_SLACK: Duration = Duration::from_secs(5);
 
+/// WHETHER `phase` IS A TURN'S END: no turn running and no box (idle, a question, a limit's
+/// notice), the phases a point is decided at ([`TurnEndReading`]'s point) and so the phases the
+/// policy writes a line at, and on which a line held is judged at rest
+/// (`custody::Rest::turn_ended`, `Session::custody_at_rest`).
+#[must_use]
+pub(crate) const fn turn_ended(phase: &Phase) -> bool {
+    matches!(phase, Phase::Idle | Phase::Question | Phase::Limited { .. })
+}
+
 impl TurnEndReading {
     /// The advice the decider acts on ([`AccountAdvice::past_probe`] of [`Self::account`]), read the same at every deciding site.
     #[must_use]
@@ -11618,10 +11666,8 @@ impl TurnEndReading {
     }
 
     const fn at_point(&self, stale_input: bool) -> bool {
-        matches!(
-            self.phase,
-            Phase::Idle | Phase::Question | Phase::Limited { .. }
-        ) && self.authoritative
+        turn_ended(&self.phase)
+            && self.authoritative
             && !self.survey
             && !matches!(self.composer, Composer::Absent | Composer::Unknown)
             && (!self.pending_input || stale_input)
@@ -19127,7 +19173,7 @@ impl TurnEndState {
             self.account_startup = self.account.is_some();
         }
         match why {
-            Restart::Memory | Restart::InputLost => {}
+            Restart::Memory | Restart::InputLost { .. } => {}
             Restart::Model { to } if made => {
                 let track = self.wall.as_ref().filter(|t| t.class == WallClass::Model);
                 let credits = self

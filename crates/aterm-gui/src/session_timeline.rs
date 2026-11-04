@@ -458,6 +458,32 @@ impl SessionMeta {
         }
     }
 
+    /// Transfer only the connection of this exact live v2 claim while its
+    /// native exec operation still owns input custody. No scope or identity is
+    /// reconstructed from the wire, and a changed owner/revision refuses.
+    #[cfg(any(unix, test))]
+    pub(crate) fn transfer_native_exec_claim(
+        &mut self,
+        expected: &SupervisorAuthority,
+        connection: u64,
+        now_us: u64,
+    ) -> Option<SupervisorAuthority> {
+        if expected.contract() != Some(2)
+            || expected.identity().is_none()
+            || self.supervisor_authority(now_us) != *expected
+        {
+            return None;
+        }
+        let mut claim = self.supervisor.clone()?;
+        let previous = claim.conn;
+        claim.conn = Some(connection);
+        self.set_supervisor(Some(claim), now_us);
+        if let Some(previous) = previous.filter(|old| *old != connection) {
+            self.close_connection(previous, now_us);
+        }
+        Some(self.supervisor_authority(now_us))
+    }
+
     /// A scoped claimant or the private built-in harness must name its input duty. Ordinary
     /// operator/drive credentials retain their independent authority; attribution text is no
     /// substitute for this connection history or the direct socket's kernel peer.
@@ -5977,6 +6003,41 @@ mod tests {
             timeline.agent.screen_word_unix_ms > 17,
             "a later limit episode has its own start"
         );
+    }
+
+    #[test]
+    fn native_exec_claim_transfer_keeps_identity_and_rejects_stale_authority() {
+        let proof = crate::self_claim::Proven {
+            pid: 4242,
+            start: "birth".into(),
+        };
+        let mut meta = SessionMeta::default();
+        meta.set_supervisor(
+            Some(SupervisorClaim {
+                holder: "codex-alab@4242".into(),
+                conn: Some(11),
+                expires_us: None,
+                proven: Some(proof.clone()),
+                scoped: None,
+            }),
+            100,
+        );
+        let old = meta.supervisor_authority(100);
+        let moved = meta
+            .transfer_native_exec_claim(&old, 12, 100)
+            .expect("same native claim");
+        assert_eq!(moved.identity(), Some(&proof));
+        assert_eq!(moved.connection(), Some(12));
+        assert_eq!(moved.scopes(), old.scopes());
+        assert!(
+            !meta
+                .claimant_conn
+                .iter()
+                .any(|(connection, _)| *connection == 11)
+        );
+        assert!(meta.transfer_native_exec_claim(&old, 13, 100).is_none());
+        meta.set_supervisor(None, 100);
+        assert!(meta.transfer_native_exec_claim(&moved, 13, 100).is_none());
     }
 
     /// One capture preserves a claim's identity, binding and revision, and assigns every duty

@@ -4,23 +4,319 @@
 //! Explicit Google federation from a native vendor login, without changing its default policy.
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use aterm_json::{Value, json};
 
-use super::google_browser::{MemoryBrowser, Page as BrowserPage};
+use super::cli::shared_provider::{
+    KimiNativeError, KimiProof, LoginProof, verify_native_kimi_classified,
+};
+use super::google_browser::{MemoryBrowser, Page as BrowserPage, PendingSession};
 use super::google_credentials::Credentials;
 use super::google_identity::{Identity, Registry};
 use super::headless_oauth::{self as oauth, FlowBound, Gate, Step, VendorApprover};
 use super::login_drive::{self, Approval, Handoff};
+use crate::ai::connector::{Cli, Region};
+
+#[path = "google_federation_recovery.rs"]
+pub(super) mod recovery;
 
 const REGISTRY_FILE: &str = "google-identities.toml";
 
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct NativeAttempt {
+    recovery: Option<login_drive::RecoveryKey>,
+    admission: Option<login_drive::RecoveryAdmission>,
+    cli: Cli,
+    store_cli: Cli,
+    device: bool,
+    row: super::accounts::Row,
+    staging: PathBuf,
+    state: PathBuf,
+    hosts: Vec<String>,
+}
+
+impl NativeAttempt {
+    pub(super) fn state(&self) -> &Path {
+        &self.state
+    }
+
+    pub(super) fn capture(request: &login_drive::Request<'_>) -> Self {
+        Self {
+            recovery: request.recovery,
+            admission: request.admission.cloned(),
+            cli: request.cli,
+            store_cli: request.store.cli(),
+            device: matches!(
+                request.route.drive,
+                crate::ai::connector::Drive::Lines {
+                    completion: crate::ai::connector::Completion::Device,
+                    ..
+                }
+            ),
+            row: request.row.clone(),
+            staging: request.staging.into(),
+            state: request
+                .store
+                .dir
+                .parent()
+                .unwrap_or(&request.store.dir)
+                .into(),
+            hosts: request
+                .hosts
+                .iter()
+                .map(|host| (*host).to_owned())
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct FederationScope {
+    attempt: NativeAttempt,
+    provider: String,
+    identity: Identity,
+    expected: String,
+    revision: [u8; 32],
+    region: Region,
+}
+
+impl FederationScope {
+    fn current(&self) -> Result<(), String> {
+        if let Some(admission) = &self.attempt.admission {
+            if self.attempt.recovery != Some(admission.key()) {
+                return Err("Google recovery admission differs from its key".into());
+            }
+            admission.current(None)?;
+        }
+        let registry = read_registry(&self.attempt.state)
+            .ok()
+            .flatten()
+            .and_then(|bytes| parse_registry(&bytes))
+            .ok_or("Google federation binding is unavailable")?;
+        let (identity, _) = registry
+            .resolve(&self.provider, &self.attempt.row.label)
+            .ok_or("Google federation binding changed")?;
+        if identity != &self.identity
+            || registry.binding_revision(&self.provider, &self.attempt.row.label)
+                != Some(self.revision)
+        {
+            return Err("Google federation binding changed".into());
+        }
+        Ok(())
+    }
+
+    fn check_attempt(&self) -> Result<(), String> {
+        let hosts = Cli::Kimi
+            .accounts()
+            .signin
+            .as_ref()
+            .and_then(|signin| signin.route(Some(crate::ai::connector::Flow::Device)))
+            .and_then(|route| route.hosts.of(Some(self.region)))
+            .ok_or("Kimi federation route is unavailable")?;
+        if self.attempt.cli != Cli::Kimi
+            || self.attempt.store_cli != Cli::Kimi
+            || !self.attempt.device
+            || !self.attempt.staging.is_absolute()
+            || !self.attempt.state.is_absolute()
+            || !self
+                .attempt
+                .hosts
+                .iter()
+                .map(String::as_str)
+                .eq(hosts.iter().copied())
+            || self.attempt.row.vendor.flow.is_some()
+            || self.attempt.row.vendor.region != Some(self.region)
+            || self.attempt.row.held_by.is_some()
+            || !self
+                .attempt
+                .row
+                .expected_identity_email()
+                .is_some_and(|email| email.eq_ignore_ascii_case(&self.expected))
+        {
+            return Err("Google federation native attempt is not admitted".into());
+        }
+        Ok(())
+    }
+
+    fn check_request(&self, request: &login_drive::Request<'_>) -> Result<(), String> {
+        if NativeAttempt::capture(request) != self.attempt {
+            return Err("Google federation native attempt changed".into());
+        }
+        self.check_attempt()?;
+        self.current()
+    }
+}
+
+pub(super) struct PendingFederation {
+    scope: FederationScope,
+    session: Option<PendingSession>,
+    native: Option<KimiProof>,
+}
+
+/// Native Kimi's canonical account proof and the Google binding that authorized its flow.
+pub(super) struct VerifiedKimiGoogle<'a> {
+    scope: FederationScope,
+    native: KimiProof,
+    journal: Option<&'a recovery::Journal>,
+}
+
+impl VerifiedKimiGoogle<'_> {
+    pub(super) fn check_browser_identity(&self, identity: &Identity) -> Result<(), String> {
+        self.scope.current()?;
+        if let Some(admission) = &self.scope.attempt.admission {
+            admission.current(Some(self.native.principal()))?;
+        }
+        if let Some(journal) = self.journal {
+            journal.check_attempt(&self.scope.attempt)?;
+        }
+        if identity != &self.scope.identity
+            || !self
+                .native
+                .identity()
+                .eq_ignore_ascii_case(&self.scope.expected)
+        {
+            return Err("Google cookie identity does not match the verified Kimi account".into());
+        }
+        self.native.check_native(
+            &self.scope.attempt.staging,
+            self.scope.region,
+            &self.scope.expected,
+        )
+    }
+}
+
+impl PendingFederation {
+    pub(super) fn verified_email(&self) -> Option<&str> {
+        self.native.as_ref().map(LoginProof::identity)
+    }
+
+    pub(super) fn complete(
+        mut self,
+        request: &login_drive::Request<'_>,
+        outcome: &login_drive::Outcome,
+        deadline: Instant,
+        journal: Option<&recovery::Journal>,
+    ) -> Result<(), String> {
+        let cached = self.native.take();
+        self.complete_checked(request, outcome, deadline, journal, |scope| {
+            if let Some(journal) = journal {
+                journal.check(request)?;
+            }
+            if let Some(native) = cached {
+                native.check_native(request.staging, scope.region, &scope.expected)?;
+                return Ok(native);
+            }
+            let now = aterm_time::unix_secs()
+                .and_then(|now| i64::try_from(now).ok())
+                .ok_or("Kimi account clock is unavailable")?;
+            let result = verify_native_kimi_classified(
+                request.staging,
+                scope.region,
+                &scope.expected,
+                now,
+                deadline,
+            );
+            if let Some(journal) = journal {
+                journal.check(request)?;
+            }
+            match result {
+                Ok(Some(native)) => Ok(native),
+                Ok(None) => Err("Kimi did not retain a native credential".into()),
+                Err(KimiNativeError::Refused(why)) => {
+                    if let Some(journal) = journal {
+                        journal.reject(request)?;
+                    }
+                    Err(why)
+                }
+                Err(error) => Err(error.to_string()),
+            }
+        })
+        .map(|_| ())
+    }
+
+    pub(super) fn commit_recovered(
+        mut self,
+        request: &login_drive::Request<'_>,
+        journal: &recovery::Journal,
+        deadline: Instant,
+    ) -> Result<KimiProof, String> {
+        let native = self
+            .native
+            .take()
+            .ok_or("Kimi recovered proof is unavailable")?;
+        self.complete_checked(
+            request,
+            &login_drive::Outcome::SignedIn {
+                email: None,
+                page: false,
+            },
+            deadline,
+            Some(journal),
+            |scope| {
+                native.check_native(request.staging, scope.region, &scope.expected)?;
+                Ok(native)
+            },
+        )?
+        .ok_or_else(|| "Kimi recovered proof is unavailable".into())
+    }
+
+    #[cfg(test)]
+    fn complete_using(
+        self,
+        request: &login_drive::Request<'_>,
+        outcome: &login_drive::Outcome,
+        deadline: Instant,
+        verify: impl FnOnce(&FederationScope) -> Result<KimiProof, String>,
+    ) -> Result<(), String> {
+        self.complete_checked(request, outcome, deadline, None, verify)
+            .map(|_| ())
+    }
+
+    fn complete_checked(
+        self,
+        request: &login_drive::Request<'_>,
+        outcome: &login_drive::Outcome,
+        deadline: Instant,
+        journal: Option<&recovery::Journal>,
+        verify: impl FnOnce(&FederationScope) -> Result<KimiProof, String>,
+    ) -> Result<Option<KimiProof>, String> {
+        if !matches!(outcome, login_drive::Outcome::SignedIn { .. }) {
+            return Ok(None);
+        }
+        self.scope.check_request(request)?;
+        if Instant::now() >= deadline {
+            return Err("Kimi federation verification deadline expired".into());
+        }
+        let native = verify(&self.scope)?;
+        self.scope.check_request(request)?;
+        if Instant::now() >= deadline {
+            return Err("Kimi federation verification deadline expired".into());
+        }
+        let proof = VerifiedKimiGoogle {
+            scope: self.scope,
+            native,
+            journal,
+        };
+        proof.check_browser_identity(&proof.scope.identity)?;
+        if let Some(session) = self.session {
+            session
+                .commit_kimi(&proof)
+                .map_err(|_| "Verified Kimi Google session could not be persisted")?;
+        }
+        if Instant::now() >= deadline {
+            return Err("Kimi federation verification deadline expired".into());
+        }
+        proof.check_browser_identity(&proof.scope.identity)?;
+        Ok(Some(proof.native))
+    }
+}
+
 /// Missing configuration keeps the ordinary vendor route. An explicit but unusable binding
 /// fails quietly; it never switches to another identity or asks the person to sign in.
-pub(super) fn configured(approver: &VendorApprover, handoff: &Handoff<'_>) -> Option<Approval> {
-    let bytes = match read_registry(&approver.shared_dir) {
+pub(super) fn configured(approver: &mut VendorApprover, handoff: &Handoff<'_>) -> Option<Approval> {
+    let bytes = match read_registry(&approver.google_state) {
         Ok(Some(bytes)) => bytes,
         Ok(None) => return None,
         Err(why) => return Some(Approval::NotRun(why.into())),
@@ -61,14 +357,54 @@ pub(super) fn configured(approver: &VendorApprover, handoff: &Handoff<'_>) -> Op
             "Google credential home is unavailable".into(),
         ));
     };
-    let revision = registry.binding_revision(provider, account);
-    let result = run(identity, approver, handoff, home, || {
-        read_registry(&approver.shared_dir)
-            .ok()
-            .flatten()
-            .and_then(|bytes| parse_registry(&bytes))
-            .is_some_and(|now| now.binding_revision(provider, account) == revision)
+    let Some(attempt) = approver
+        .native_attempt
+        .as_ref()
+        .filter(|attempt| attempt.cli == *cli && attempt.row.label == *account)
+        .cloned()
+    else {
+        return Some(quiet("Google federation has no bound native attempt"));
+    };
+    let Some(revision) = registry.binding_revision(provider, account) else {
+        return Some(quiet("Google federation binding is unavailable"));
+    };
+    let scope = FederationScope {
+        attempt,
+        provider: provider.into(),
+        identity: identity.clone(),
+        expected: binding.expected_email().into(),
+        revision,
+        region: if provider == "kimi-global" {
+            Region::Global
+        } else {
+            Region::MainlandCn
+        },
+    };
+    if let Err(why) = scope.check_attempt().and_then(|()| scope.current()) {
+        return Some(quiet(why));
+    }
+    if !handoff
+        .hosts
+        .iter()
+        .copied()
+        .eq(scope.attempt.hosts.iter().map(String::as_str))
+        || handoff.completion != crate::ai::connector::Completion::Device
+    {
+        return Some(quiet(
+            "Google federation handoff differs from the native attempt",
+        ));
+    }
+    let mut session = None;
+    let result = run(identity, approver, handoff, home, &mut session, || {
+        scope.current().is_ok()
     });
+    if matches!(result, Approval::Approved { .. }) {
+        approver.google_pending = Some(PendingFederation {
+            scope,
+            session,
+            native: None,
+        });
+    }
     Some(result)
 }
 
@@ -182,6 +518,10 @@ impl InnerFlow {
     fn is_callback(&self, url: &str) -> bool {
         let location = |value: &str| value.split(['?', '#']).next().unwrap_or("").to_owned();
         location(url) == location(&self.callback)
+            && {
+                let codes = oauth::query_values(url, "code");
+                codes.len() == 1 && !codes[0].is_empty()
+            }
             && oauth::query_values(url, "error").is_empty()
             && self.bound.state.as_ref().is_none_or(|state| {
                 let got = oauth::query_values(url, "state");
@@ -210,6 +550,7 @@ fn run(
     approver: &VendorApprover,
     handoff: &Handoff<'_>,
     home: &Path,
+    pending_session: &mut Option<PendingSession>,
     configuration_current: impl Fn() -> bool,
 ) -> Approval {
     if Instant::now() >= handoff.deadline {
@@ -226,11 +567,15 @@ fn run(
     if !login_drive::pinned(handoff.url, handoff.hosts) {
         return Approval::Refused("Native sign-in URL is outside its provider realm".into());
     }
-    let mut browser =
-        match MemoryBrowser::start(identity, &approver.shared_dir, Some(home), handoff.deadline) {
-            Ok(browser) => browser,
-            Err(error) => return quiet(error),
-        };
+    let mut browser = match MemoryBrowser::start(
+        identity,
+        &approver.google_state,
+        Some(home),
+        handoff.deadline,
+    ) {
+        Ok(browser) => browser,
+        Err(error) => return quiet(error),
+    };
     // An absent, expired or damaged snapshot can always fall back to the explicitly bound
     // credential. Validation completes before any cookie is imported.
     match browser.restore_session(home) {
@@ -246,6 +591,7 @@ fn run(
     let mut google: Option<(BrowserPage, InnerFlow)> = None;
     let mut pending_inner: Option<InnerFlow> = None;
     let mut selected_google = false;
+    let mut callback_seen = false;
     let mut last_selection: Option<Instant> = None;
     let mut selections = 0;
     let mut password_sent = false;
@@ -286,9 +632,25 @@ fn run(
             return quiet(error);
         }
         if (handoff.finished)() {
+            // Read one response before draining final callback events, even when the popup closed.
+            if let Err(error) = browser.pages() {
+                return quiet(error);
+            }
+            if let Some((page, inner)) = &google {
+                match browser.navigation_commits(page) {
+                    Ok(urls) => callback_seen |= urls.iter().any(|url| inner.is_callback(url)),
+                    Err(error) => return quiet(error),
+                }
+            }
+            if callback_seen {
+                match browser.into_pending_session(home) {
+                    Ok(session) => *pending_session = Some(session),
+                    Err(error) => return quiet(error),
+                }
+            }
             return Approval::Approved { page: page_proved };
         }
-        if selected_google && google.is_none() {
+        if selected_google && google.is_none() && !callback_seen {
             let mut requests = match browser.window_opens(&root) {
                 Ok(requests) => requests,
                 Err(error) => return quiet(error),
@@ -332,11 +694,29 @@ fn run(
             }
         }
         if let Some((page, inner)) = &google {
+            match browser.navigation_commits(page) {
+                Ok(urls) => callback_seen |= urls.iter().any(|url| inner.is_callback(url)),
+                Err(error) => return quiet(error),
+            }
+            if callback_seen {
+                google = None;
+                continue;
+            }
             let view = match read_page(&mut browser, page) {
                 Ok(view) => view,
                 Err(_) => {
-                    // A popup can disappear after its own callback; root/native completion still decides success.
-                    google = None;
+                    // Keep the owned flow after a popup closes. A response drains its last
+                    // committed callback event before native completion decides success.
+                    if let Err(error) = browser.pages() {
+                        return quiet(error);
+                    }
+                    match browser.navigation_commits(page) {
+                        Ok(urls) => callback_seen |= urls.iter().any(|url| inner.is_callback(url)),
+                        Err(error) => return quiet(error),
+                    }
+                    if callback_seen {
+                        google = None;
+                    }
                     std::thread::sleep(Duration::from_millis(200));
                     continue;
                 }
@@ -395,13 +775,8 @@ fn run(
                             Err(error) => return quiet(error),
                         };
                     }
-                    Some("consent") => {
-                        // The consent action proves the exact account on Google's origin.
-                        // A chooser or password-entry page can still require reauthentication.
-                        if let Err(error) = browser.save_session(home) {
-                            return quiet(error);
-                        }
-                    }
+                    // Final callback cookies are committed only after native Kimi verification.
+                    Some("consent") => {}
                     Some("identifier") => identifier_sent = true,
                     Some("password") => password_sent = true,
                     Some("totp") => totp_sent = true,
@@ -446,7 +821,12 @@ fn run(
                 std::thread::sleep(Duration::from_millis(200));
                 continue;
             }
-            if !inner.is_callback(&view.url) && !view.url.starts_with("about:blank") {
+            if inner.is_callback(&view.url) {
+                callback_seen = true;
+                google = None;
+                continue;
+            }
+            if !view.url.starts_with("about:blank") {
                 return Approval::Refused("Google popup left its admitted callback".into());
             }
         }
@@ -511,6 +891,7 @@ fn run(
             }
             Step::SignIn(_) | Step::Wait
                 if google.is_none()
+                    && !callback_seen
                     && last_selection.is_none_or(|at| at.elapsed() >= Duration::from_secs(1)) =>
             {
                 if selections >= 3 {
@@ -766,6 +1147,222 @@ mod tests {
     const HOSTS: &[&str] = &["auth.kimi.ai", "www.kimi.ai"];
 
     #[test]
+    fn google_federation_uses_one_harness_identity_root() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let store = super::super::accounts::Store::at_for(root.path(), Cli::Kimi, &home);
+        let mut approver = VendorApprover::with_mailbox(
+            Cli::Kimi,
+            "one",
+            &store.shared_dir(),
+            &home,
+            oauth::MailboxConfig::default(),
+        );
+        assert_eq!(approver.shared_dir, root.path().join("accounts"));
+        assert_eq!(approver.google_state, root.path());
+        let row = super::super::accounts::Row {
+            label: "one".into(),
+            ..Default::default()
+        };
+        let route = Cli::Kimi
+            .accounts()
+            .signin
+            .as_ref()
+            .unwrap()
+            .route(None)
+            .unwrap();
+        let request = login_drive::Request {
+            recovery: None,
+            admission: None,
+            cli: Cli::Kimi,
+            row: &row,
+            staging: &home,
+            store: &store,
+            route,
+            hosts: HOSTS,
+        };
+        login_drive::Approver::begin(&mut approver, &request).unwrap();
+        assert_eq!(approver.google_state, root.path());
+        assert_eq!(
+            approver.native_attempt.as_ref().unwrap().state(),
+            root.path()
+        );
+    }
+
+    #[test]
+    fn kimi_cookie_completion_requires_current_native_attempt_and_provider_proof() {
+        use super::super::cli::shared_provider::kimi_proof_fixture;
+        use super::super::{accounts, google_browser, google_browser_store};
+        const EMAIL: &str = "person@example.com";
+        const OLD: &[u8] = br#"[{"name":"fixture","value":"old-cookie","domain":".google.com","path":"/","secure":true}]"#;
+        const NEW: &[u8] = br#"[{"name":"fixture","value":"new-cookie","domain":".google.com","path":"/","secure":true}]"#;
+        for scenario in 0..12 {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let state = root.path().join("state");
+            let home = root.path().join("home");
+            let staging = root.path().join("staging");
+            for path in [&state, &home, &staging] {
+                aterm_secrets::fsx::ensure_private_dir(path).unwrap();
+            }
+            let text = "[[identities]]\nid='one'\nemail='person@example.com'\n[[bindings]]\nprovider='kimi-global'\naccount='one'\nidentity='one'\nexpected_email='person@example.com'\n";
+            aterm_secrets::fsx::write_atomic(&state.join(REGISTRY_FILE), text.as_bytes(), 0o600)
+                .unwrap();
+            let registry = Registry::parse(text).unwrap();
+            let identity = registry.resolve("kimi-global", "one").unwrap().0.clone();
+            let store = accounts::Store::at_for(&state, Cli::Kimi, &home);
+            let row = accounts::Row {
+                label: "one".into(),
+                email: Some(EMAIL.into()),
+                vendor: accounts::Vendor {
+                    region: Some(Region::Global),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let route = Cli::Kimi
+                .accounts()
+                .signin
+                .as_ref()
+                .unwrap()
+                .route(Some(crate::ai::connector::Flow::Device))
+                .unwrap();
+            let request = login_drive::Request {
+                recovery: Some(login_drive::RecoveryKey([1; 32])),
+                admission: None,
+                cli: Cli::Kimi,
+                row: &row,
+                staging: &staging,
+                store: &store,
+                route,
+                hosts: HOSTS,
+            };
+            let scope = FederationScope {
+                attempt: NativeAttempt::capture(&request),
+                provider: "kimi-global".into(),
+                identity: identity.clone(),
+                expected: EMAIL.into(),
+                revision: registry.binding_revision("kimi-global", "one").unwrap(),
+                region: Region::Global,
+            };
+            let claim = identity.claim(&state).unwrap();
+            let snapshot = claim.profile().join("session.age");
+            google_browser_store::save(&home, &identity, &claim, OLD).unwrap();
+            let previous = std::fs::read(&snapshot).unwrap();
+            drop(claim);
+            let candidate_identity = if scenario == 8 {
+                Registry::parse("[[identities]]\nid='other'\nemail='person@example.com'\n[[bindings]]\nprovider='kimi-global'\naccount='one'\nidentity='other'\nexpected_email='person@example.com'\n").unwrap().resolve("kimi-global", "one").unwrap().0.clone()
+            } else {
+                identity.clone()
+            };
+            let pending = PendingFederation {
+                scope,
+                native: None,
+                session: Some(google_browser::pending_fixture(
+                    &candidate_identity,
+                    &state,
+                    &home,
+                    NEW,
+                )),
+            };
+            let proof_staging = if scenario == 10 {
+                root.path().join("another-native-home")
+            } else {
+                staging.clone()
+            };
+            let proof = kimi_proof_fixture(
+                &proof_staging,
+                if scenario == 9 {
+                    Region::MainlandCn
+                } else {
+                    Region::Global
+                },
+                if scenario == 7 {
+                    "another@example.com"
+                } else {
+                    EMAIL
+                },
+            );
+            let changed = accounts::Row {
+                label: "another".into(),
+                ..row.clone()
+            };
+            let request = login_drive::Request {
+                recovery: if scenario == 11 {
+                    Some(login_drive::RecoveryKey([11; 32]))
+                } else {
+                    request.recovery
+                },
+                row: if scenario == 2 { &changed } else { &row },
+                ..request
+            };
+            let outcome = if scenario == 1 {
+                login_drive::Outcome::Failed
+            } else {
+                login_drive::Outcome::SignedIn {
+                    email: Some(EMAIL.into()),
+                    page: false,
+                }
+            };
+            let deadline = if scenario == 3 {
+                Instant::now()
+            } else {
+                Instant::now() + Duration::from_secs(60)
+            };
+            let result = pending.complete_using(&request, &outcome, deadline, |_| {
+                assert!(
+                    !matches!(scenario, 1..=3 | 11),
+                    "failed, changed or expired attempt contacted Kimi"
+                );
+                assert_eq!(std::fs::read(&snapshot).unwrap(), previous);
+                assert!(
+                    candidate_identity.claim(&state).is_err(),
+                    "pending identity was released before provider proof"
+                );
+                if scenario == 4 {
+                    return Err("provider unavailable".into());
+                }
+                if scenario == 5 {
+                    aterm_secrets::fsx::write_atomic(&state.join(REGISTRY_FILE), b"changed", 0o600)
+                        .unwrap();
+                }
+                if scenario == 6 {
+                    aterm_secrets::fsx::write_atomic(
+                        &staging.join("config.toml"),
+                        b"changed",
+                        0o600,
+                    )
+                    .unwrap();
+                }
+                Ok(proof)
+            });
+            if scenario == 0 {
+                result.unwrap();
+                assert_ne!(std::fs::read(&snapshot).unwrap(), previous);
+                let claim = identity.claim(&state).unwrap();
+                assert_eq!(
+                    google_browser_store::load(&home, &identity, &claim)
+                        .unwrap()
+                        .unwrap()
+                        .as_slice(),
+                    NEW
+                );
+            } else {
+                if scenario == 1 {
+                    result.unwrap();
+                } else {
+                    assert!(result.is_err());
+                }
+                assert_eq!(std::fs::read(&snapshot).unwrap(), previous);
+                assert!(candidate_identity.claim(&state).is_ok());
+                if scenario == 8 {
+                    let claim = candidate_identity.claim(&state).unwrap();
+                    assert!(!claim.profile().join("session.age").exists());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn exact_saved_gmail_grant_supplies_verification_mail_without_a_config_file() {
         let home = aterm_tempfile::tempdir().unwrap();
         let identity = |target: &str| {
@@ -830,7 +1427,14 @@ mod tests {
         ] {
             assert!(!flow.admits_google(&url, HOSTS));
         }
+        // Kimi's observed Google request omits state. Retain it when supplied;
+        // an absent state still requires this owned flow and the native account proof.
+        let stateless = InnerFlow::admit(&GOOGLE.replace("&state=inner-state", ""), HOSTS).unwrap();
+        assert!(stateless.is_callback("https://www.kimi.ai/google-callback?code=value"));
         for url in [
+            "https://www.kimi.ai/google-callback?state=inner-state",
+            "https://www.kimi.ai/google-callback?code=&state=inner-state",
+            "https://www.kimi.ai/google-callback?code=a&code=b&state=inner-state",
             "https://www.kimi.ai/google-callback?code=value&state=outer-state",
             "https://www.kimi.ai/google-callback?code=value",
             "https://www.kimi.ai/google-callback?error=denied&state=inner-state",
@@ -897,7 +1501,7 @@ mod tests {
             finished: &|| false,
             deadline: Instant::now(),
         };
-        assert!(configured(&approver, &handoff).is_none());
+        assert!(configured(&mut approver, &handoff).is_none());
         let text = "[[identities]]\nid='one'\nemail='person@example.com'\ncredential_ref='missing-google-entry'\n[[bindings]]\nprovider='kimi-global'\naccount='work'\nidentity='one'\nexpected_email='person@example.com'\n";
         aterm_uds::private_file::write_private(root.path(), REGISTRY_FILE, text.as_bytes())
             .unwrap();
@@ -914,11 +1518,11 @@ mod tests {
             ..handoff
         };
         assert!(matches!(
-            configured(&approver, &wrong),
+            configured(&mut approver, &wrong),
             Some(Approval::Refused(_))
         ));
         approver.google_account.1 = "other".into();
-        assert!(configured(&approver, &handoff).is_none());
+        assert!(configured(&mut approver, &handoff).is_none());
         assert_eq!(
             provider_key("kimi", &["www.kimi.com"]),
             Some("kimi-mainland-cn")
@@ -1281,6 +1885,13 @@ mod tests {
                 "anonymous Google transition did not complete after {clicks} pointer clicks; pages={observed:?}"
             );
             for url in browser.window_opens(&page).unwrap() {
+                if login_drive::https_host(&url).as_deref() == Some("accounts.google.com") {
+                    println!(
+                        "anonymous Kimi Google request: state_present={} callback_present={}",
+                        !oauth::query_values(&url, "state").is_empty(),
+                        oauth::query_values(&url, "redirect_uri").len() == 1
+                    );
+                }
                 if let Some(flow) = InnerFlow::admit(&url, HOSTS) {
                     pending = Some(flow);
                 }
@@ -1307,6 +1918,178 @@ mod tests {
                     "anonymous vendor page requires a security check"
                 );
                 if login_drive::pinned(&view.url, HOSTS)
+                    && choose_google(&mut browser, &page, &view.url).unwrap()
+                {
+                    clicks += 1;
+                }
+                last_select = Instant::now();
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    struct NativeClaudeProbe(aterm_uds::spawnfd::Child);
+
+    #[cfg(target_os = "macos")]
+    impl Drop for NativeClaudeProbe {
+        fn drop(&mut self) {
+            if let Ok(pid) = i32::try_from(self.0.id()) {
+                let _ = aterm_uds::process::kill_group_until_empty(pid);
+            }
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn native_claude_probe(
+        program: &std::path::Path,
+        home: &std::path::Path,
+        deadline: Instant,
+    ) -> (NativeClaudeProbe, aterm_secrets::SecretBytes) {
+        use std::io::Read;
+        use std::os::fd::AsFd;
+        aterm_secrets::fsx::ensure_private_dir(home).unwrap();
+        let (mut reader, writer) = std::io::pipe().unwrap();
+        let mut command = aterm_uds::spawnfd::Command::new(login_drive::SANDBOX_EXEC);
+        command
+            .args(["-p", login_drive::NO_DESK])
+            .arg(program)
+            .args([
+                "auth",
+                "login",
+                "--claudeai",
+                "--email",
+                "probe@example.invalid",
+            ])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", home)
+            .env("CLAUDE_CONFIG_DIR", home.join("config"))
+            .env("CLAUDE_SECURESTORAGE_CONFIG_DIR", home.join("secure"))
+            .env("DISABLE_AUTOUPDATER", "1")
+            .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+            .env("BROWSER", "/usr/bin/false")
+            .env("TERM", "dumb")
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .stdout(writer.try_clone().unwrap())
+            .stderr(writer);
+        let child = NativeClaudeProbe(command.spawn_in_dedicated_process_group().unwrap());
+        drop(command);
+        let mut output = aterm_secrets::SecretBytes::from(Vec::new());
+        loop {
+            aterm_uds::ready::until(reader.as_fd(), aterm_uds::ready::Interest::Read, deadline)
+                .expect("native Claude printed no authorization request");
+            let mut chunk = [0; 4096];
+            // A ready pipe read has one reader; the child cannot consume its bytes.
+            let count = reader.read(&mut chunk).unwrap();
+            assert!(
+                count != 0,
+                "native Claude closed before an authorization request"
+            );
+            let mut bytes = output.as_slice().to_vec();
+            bytes.extend_from_slice(&chunk[..count]);
+            assert!(
+                bytes.len() <= 64 * 1024,
+                "native Claude exceeded the probe output bound"
+            );
+            output = aterm_secrets::SecretBytes::from(bytes);
+            let text = String::from_utf8_lossy(output.as_slice());
+            let super::super::open_url::Pin::Endpoints(endpoints) =
+                super::super::open_url::CLAUDE_PIN
+            else {
+                unreachable!()
+            };
+            for (endpoint, _) in endpoints {
+                if let Some(start) = text.find(&format!("{endpoint}?")) {
+                    let tail = &text[start..];
+                    if let Some(end) = tail.find(|c: char| c.is_whitespace() || c.is_control()) {
+                        let url = &tail[..end];
+                        assert!(
+                            FlowBound::of(url).is_ok(),
+                            "native Claude request has no admitted outer binding"
+                        );
+                        println!(
+                            "native Claude request captured on host={:?}",
+                            login_drive::https_host(url)
+                        );
+                        return (child, aterm_secrets::SecretBytes::from(url.to_owned()));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "contacts Claude anonymously through the pinned headless browser"]
+    fn live_claude_google_transition_observes_vendor_callback() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let registry = Registry::parse("[[identities]]\nid='anonymous-probe'\nemail='probe@example.invalid'\n[[bindings]]\nprovider='claude'\naccount='probe'\nidentity='anonymous-probe'\nexpected_email='probe@example.invalid'\n").unwrap();
+        let identity = registry.resolve("claude", "probe").unwrap().0;
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        #[cfg(target_os = "macos")]
+        let native = std::env::var_os("ATERM_TEST_CLAUDE").map(|program| {
+            native_claude_probe(
+                std::path::Path::new(&program),
+                &root.path().join("native-home"),
+                deadline,
+            )
+        });
+        #[cfg(target_os = "macos")]
+        let start = native
+            .as_ref()
+            .map(|(_, url)| url.as_str().unwrap())
+            .unwrap_or("https://claude.ai/login");
+        #[cfg(not(target_os = "macos"))]
+        let start = "https://claude.ai/login";
+        let mut browser =
+            MemoryBrowser::start(identity, root.path(), home.as_deref(), deadline).unwrap();
+        let page = browser.open(start).unwrap();
+        let mut last_select = Instant::now() - Duration::from_secs(2);
+        let mut clicks = 0;
+        let mut observed = Vec::new();
+        let mut challenge_seen = false;
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "anonymous Claude transition did not complete after {clicks} clicks; challenge_seen={challenge_seen}; hosts={observed:?}"
+            );
+            let mut urls = browser.window_opens(&page).unwrap();
+            observed.clear();
+            for info in browser.pages().unwrap() {
+                observed.push(login_drive::https_host(info.url()));
+                if info.target() == page.target() || info.opener() == Some(page.target()) {
+                    urls.push(info.url().to_owned());
+                }
+            }
+            for url in urls {
+                if login_drive::https_host(&url).as_deref() != Some("accounts.google.com") {
+                    continue;
+                }
+                let callback = oauth::query_values(&url, "redirect_uri");
+                if callback.len() == 1 {
+                    let callback = callback[0].split(['?', '#']).next().unwrap();
+                    println!(
+                        "anonymous Claude Google callback={callback} client_present={} state_present={}",
+                        oauth::query_values(&url, "client_id").len() == 1,
+                        oauth::query_values(&url, "state").len() == 1
+                    );
+                    assert!(callback.starts_with("https://"));
+                    return;
+                }
+            }
+            if last_select.elapsed() >= Duration::from_secs(2) {
+                let view = read_page(&mut browser, &page).unwrap();
+                if oauth::bot_check(&view) {
+                    challenge_seen = true;
+                    // Ordinary page loading may clear a challenge by itself. Touch
+                    // nothing while it is present; never press a verification widget.
+                    std::thread::sleep(Duration::from_millis(200));
+                    continue;
+                }
+                if super::super::open_url::CLAUDE_PIN.admits(&view.url)
                     && choose_google(&mut browser, &page, &view.url).unwrap()
                 {
                     clicks += 1;

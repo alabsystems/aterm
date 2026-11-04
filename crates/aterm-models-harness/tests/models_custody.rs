@@ -13,7 +13,7 @@ use aterm_spec::interp;
 use aterm_spec::walk::walk;
 
 /// Each mutant, its dial and the law it was written to break.
-const MUTANTS: [(&str, i64, &str); 13] = [
+const MUTANTS: [(&str, i64, &str); 15] = [
     ("SettleOnMove", 1, "NoTwoCopies"),
     ("SettleWithoutTurn", 2, "NoTwoCopies"),
     ("TurnSettlesUnread", 3, "NoTwoCopies"),
@@ -31,29 +31,36 @@ const MUTANTS: [(&str, i64, &str); 13] = [
     ),
     ("AnswersComposer", 12, "ADrawnLineGoesBackToItsWriter"),
     ("AnswersWithoutRead", 13, "ABoxAnswerFollowsARead"),
+    ("RestartTakenOnWord", 14, "NoTwoCopies"),
+    ("SettleKeepsAsked", 15, "OneRestartPerLine"),
 ];
 
-/// A bound on the states the model reaches at any dial (the box and its custody-permission marker
-/// each distinguish states under it).
-const STATE_BOUND: usize = 60_000;
+/// A bound on the states the model reaches at any dial (the box over the composer and its
+/// custody-permission marker each distinguish states under it, a restart standing asked adds half
+/// again): the most, at `Buggy = 1`, were 60256 when it was set.
+const STATE_BOUND: usize = 80_000;
 
 /// The steps a host that serves no input word never takes: no read says the line was read.
-const UNSERVED: [&str; 8] = [
+const UNSERVED: [&str; 10] = [
     "AnswersBox",
     "AsksRestart",
     "Minute",
     "RestartDeferred",
     "RestartMade",
+    "RestartMadeDeferred",
+    "RestartStands",
     "RestartUnmade",
     "TurnSettles",
     "WaitsLost",
 ];
 
 /// The steps no restart lane takes.
-const LANELESS: [&str; 4] = [
+const LANELESS: [&str; 6] = [
     "AsksRestart",
     "RestartDeferred",
     "RestartMade",
+    "RestartMadeDeferred",
+    "RestartStands",
     "RestartUnmade",
 ];
 
@@ -206,6 +213,158 @@ fn a_read_line_is_restarted_once_and_a_second_loss_waits() {
         ],
     );
     assert_eq!((submitted["restart"], submitted["asks"]), (0, 0));
+}
+
+/// The host's word that it made the restart, with the process the line was written to named after
+/// it, shows nothing ended: the line stays held, every write held behind it, its copy may still be
+/// drawn, and the restart stands asked, asked again; made once another process is named, the line
+/// ended with its program. Settled on the word alone (`RestartTakenOnWord`), a write goes while
+/// the read line may still reach the program.
+#[test]
+fn a_restart_word_with_the_lines_process_standing_holds_the_line() {
+    let m = line_custody_model();
+    let stands = walk(
+        &m,
+        &["WritesRead", "Minute", "AsksRestart", "RestartStands"],
+    );
+    assert_eq!(
+        (
+            stands["cust"],
+            stands["q"],
+            stands["restart"],
+            stands["asks"]
+        ),
+        (1, 2, 3, 0)
+    );
+    for write in ["WritesQueued", "WritesRead", "Types"] {
+        assert!(!m.action_enabled(write, &stands), "{write} while it stands");
+    }
+    assert!(
+        m.action_enabled("AsksRestart", &stands),
+        "asked again on its back-off"
+    );
+    assert!(
+        m.action_enabled("ProgramDraws", &stands),
+        "its copy may still come"
+    );
+    let made = walk(
+        &m,
+        &[
+            "WritesRead",
+            "Minute",
+            "AsksRestart",
+            "RestartStands",
+            "AsksRestart",
+            "RestartMade",
+        ],
+    );
+    assert_eq!(
+        (made["cust"], made["q"], made["restart"], made["asks"]),
+        (0, 0, 1, 1)
+    );
+    let taken = interp::with_buggy(&alone(&m, "RestartTakenOnWord"), 14);
+    let twice = walk(
+        &taken,
+        &[
+            "WritesRead",
+            "Minute",
+            "AsksRestart",
+            "RestartTakenOnWord",
+            "WritesRead",
+        ],
+    );
+    assert_eq!(twice["twice"], 1, "a second copy behind one that may come");
+}
+
+/// A RESTART THE HOST MADE AND ANSWERED AS A DEFERRAL SPENDS THE LINE'S RESTART ONCE THE LINE
+/// SETTLES: its signal went and the process it started is not yet registered, so its word is a
+/// deferral; the program ended with the line, which settles once another process is named, and the
+/// line written to that process, lost the same way, waits rather than restarting it again. A
+/// deferral that made nothing is spent the same way by whatever settles its line (here its draw,
+/// entered by its writer, after which an act submitted makes a restart askable again). Left
+/// unspent by the settle (`SettleKeepsAsked`), the second loss is restarted again: two restarts
+/// for one line short of an act submitted.
+#[test]
+fn a_restart_made_under_a_deferrals_word_is_spent_once_its_line_settles() {
+    let m = line_custody_model();
+    let made = walk(
+        &m,
+        &["WritesRead", "Minute", "AsksRestart", "RestartMadeDeferred"],
+    );
+    assert_eq!(
+        (
+            made["cust"],
+            made["moved"],
+            made["q"],
+            made["restart"],
+            made["asks"]
+        ),
+        (1, 1, 0, 3, 1)
+    );
+    assert!(
+        !m.action_enabled("AsksRestart", &made),
+        "its program ended: the line settles before any ask"
+    );
+    let again = walk(
+        &m,
+        &[
+            "WritesRead",
+            "Minute",
+            "AsksRestart",
+            "RestartMadeDeferred",
+            "SeesEnded",
+            "WritesRead",
+            "Minute",
+        ],
+    );
+    assert_eq!((again["restart"], again["asks"]), (1, 1));
+    assert!(!m.action_enabled("AsksRestart", &again), "spent");
+    assert!(
+        m.action_enabled("WaitsLost", &again),
+        "the second loss waits"
+    );
+    let drawn = walk(
+        &m,
+        &[
+            "WritesRead",
+            "Minute",
+            "AsksRestart",
+            "RestartDeferred",
+            "ProgramDraws",
+            "LookDrawn",
+        ],
+    );
+    assert_eq!((drawn["cust"], drawn["restart"], drawn["st"]), (0, 1, 1));
+    let entered = walk(
+        &m,
+        &[
+            "WritesRead",
+            "Minute",
+            "AsksRestart",
+            "RestartDeferred",
+            "ProgramDraws",
+            "LookDrawn",
+            "Enters",
+        ],
+    );
+    assert_eq!((entered["restart"], entered["asks"]), (0, 0));
+    let kept = interp::with_buggy(&alone(&m, "SettleKeepsAsked"), 15);
+    let twice = walk(
+        &kept,
+        &[
+            "WritesRead",
+            "Minute",
+            "AsksRestart",
+            "RestartMadeDeferred",
+            "SettleKeepsAsked",
+            "WritesRead",
+            "Minute",
+            "AsksRestart",
+            "RestartMade",
+        ],
+    );
+    assert_eq!(twice["asks"], 2, "a second restart for the line");
+    assert!(interp::violated_invariants(&kept).contains("OneRestartPerLine"));
 }
 
 /// A line read whose minute passed is held while input queued behind it is unread: no restart

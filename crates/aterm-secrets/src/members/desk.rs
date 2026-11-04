@@ -26,6 +26,7 @@
 //! marked so, and a plain `ask`, from any network, shows as a row that waits for a person's Allow
 //! (`docs/DESIGN-automatic-lan-admission-2026-11-02.md`).
 
+use super::bundle::Reader;
 use super::wire::{self, Line};
 use super::{Allowed, PhraseState};
 use crate::client::{self, Paths};
@@ -528,7 +529,7 @@ struct Running {
     request: Request,
     node: [u8; 32],
     name: String,
-    reads_log: bool,
+    reader: Reader,
     restore: bool,
     /// The new Mac acknowledges its bundle (`ack=1`): the row closes only on that.
     acks: bool,
@@ -1120,7 +1121,7 @@ impl Desk {
                 request,
                 node,
                 name,
-                reads_log: false,
+                reader: Reader::Files,
                 restore,
                 acks: false,
             },
@@ -1316,8 +1317,7 @@ pub struct Let {
     /// The bundle carried the member's `Admit` and the log ([`super::bundle::Handed::Log`]):
     /// the caller posts this Mac's records to the vault's servers.
     pub logged: bool,
-    /// Why a member that holds a log handed F10's files instead ([`Handout::note`]), for the
-    /// caller's log.
+    /// A diagnostic supplied by the bundle producer ([`Handout::note`]), for the caller's log.
     pub note: Option<String>,
     /// Whether the new Mac acknowledged its bundle. The caller posts the records and the
     /// Allowed however it went (the `Admit` is in this Mac's records already), and logs an
@@ -1335,9 +1335,8 @@ pub struct Handing<'a> {
     pub name: &'a str,
     /// The Allow this member signed for it.
     pub allowed: &'a Allowed,
-    /// It reads `alab-join-bundle/2`, the membership log ([`super::bundle::Handed::Log`]): it
-    /// said so when it started the run. A Mac that did not gets the `[everyone]` files.
-    pub reads_log: bool,
+    /// The payload and capacity capability stated when the device started its run.
+    pub reader: Reader,
     /// A person pressed "Allow again" for it: the log removed it, and a plain removal does not
     /// keep it out of this run (F16).
     pub restore: bool,
@@ -1353,8 +1352,8 @@ pub struct Handout {
     pub bundle: SecretBytes,
     /// It is a [`super::bundle::Handed::Log`] bundle.
     pub logged: bool,
-    /// Why it is F10's files where this member holds a membership log (its log path failed), for
-    /// the caller's log; `None` for a log bundle and where no log applies.
+    /// An optional diagnostic from the bundle producer, for the caller's log. A failed log
+    /// handover returns an error instead of a files payload.
     pub note: Option<String>,
 }
 
@@ -1396,6 +1395,8 @@ pub struct Proving<'a> {
     pub node: [u8; 32],
     /// The machine name it asks under.
     pub name: &'a str,
+    /// The joining device's stated log capacity, or its explicit legacy capability.
+    pub reader: Reader,
     /// The fleet's channel proved the fleet's current key and this node key, and the caller's
     /// drive admission took it ([`Proof::fleet`]).
     pub fleet: bool,
@@ -1576,8 +1577,17 @@ fn run<S: Read + Write + ?Sized>(
             nonce: first.hex::<{ crate::pake::NONCE_LEN }>("nonce")?,
             signature: first.hex::<64>("sig")?,
         };
-        // `reads=2`: the new Mac reads F15's log bundle (`alab-join-bundle/2`).
-        let reads_log = first.get("reads").is_ok_and(|reads| reads == "2");
+        let reader = reader(first)?;
+        if reader.reads_log()
+            && let Some(paths) = &paths
+        {
+            let store = client::load_records(paths)?;
+            if !reader.can_take(client::records_bound(paths, &store)?) {
+                return Err(Error::new(
+                    "the joining device cannot receive this membership history",
+                ));
+            }
+        }
         // `ack=1`: the new Mac acknowledges the bundle it opened ([`Delivered::Acknowledged`]).
         let acks = first.get("ack").is_ok_and(|ack| ack == "1");
         desk.lock_or_recover()
@@ -1585,7 +1595,7 @@ fn run<S: Read + Write + ?Sized>(
             .map(|(running, run, nonce)| {
                 (
                     Running {
-                        reads_log,
+                        reader,
                         acks,
                         ..running
                     },
@@ -1657,7 +1667,7 @@ fn steps<S: Read + Write + ?Sized>(
         node: running.node,
         name: &running.name,
         allowed: &allowed,
-        reads_log: running.reads_log,
+        reader: running.reader,
         restore: running.restore,
         held: held.as_ref(),
     })?;
@@ -1734,11 +1744,16 @@ fn prove<S: Read + Write + ?Sized>(
                 held.local.automatically_admits(from),
             )
         };
+        let reader = reader(first)?;
+        if !reader.reads_log() {
+            return Err(Error::new("a proof join requires a membership log reader"));
+        }
         let fresh = std::cell::Cell::new(false);
         let proving = Proving {
             request: &request,
             node: asked.node,
             name: &name,
+            reader,
             fleet: proof.fleet.is_some_and(|fleet| fleet.current),
             lan,
             fresh: &fresh,
@@ -1772,6 +1787,27 @@ fn prove<S: Read + Write + ?Sized>(
     ended
 }
 
+fn reader(line: &Line<'_>) -> Result<Reader> {
+    if !matches!(line.verb, "run" | "prove") {
+        return Err(Error::new("invalid join capability line"));
+    }
+    let log = line.get("reads").is_ok_and(|reads| reads == "2");
+    if line.get("records-bound").is_ok() {
+        if !log {
+            return Err(Error::new(
+                "a records bound requires a membership log reader",
+            ));
+        }
+        let bound = crate::crossing::RecordsBound::parse(&line.text("records-bound")?)
+            .ok_or_else(|| Error::new("invalid join records bound"))?;
+        Ok(Reader::BoundedLog(bound))
+    } else if log {
+        Ok(Reader::LegacyLog)
+    } else {
+        Ok(Reader::Files)
+    }
+}
+
 fn expect<'a>(line: &'a str, verb: &str) -> Result<Line<'a>> {
     let parsed = Line::parse(line);
     if parsed.verb == verb {
@@ -1787,6 +1823,37 @@ fn expect<'a>(line: &'a str, verb: &str) -> Result<Line<'a>> {
 #[cfg(test)]
 mod lan_tests {
     use super::*;
+
+    #[test]
+    fn reader_capability_distinguishes_files_legacy_and_explicit_bounds() {
+        use crate::crossing::RecordsBound;
+        assert_eq!(reader(&Line::parse("run")).unwrap(), Reader::Files);
+        assert_eq!(
+            reader(&Line::parse("run reads=2")).unwrap(),
+            Reader::LegacyLog
+        );
+        let bound = RecordsBound::of(8192, true);
+        let line = format!(
+            "prove reads=2 records-bound={}",
+            wire::escape(&bound.value())
+        );
+        assert_eq!(
+            reader(&Line::parse(&line)).unwrap(),
+            Reader::BoundedLog(bound)
+        );
+        assert!(!Reader::LegacyLog.can_take(RecordsBound::of(4096, true)));
+        assert!(Reader::LegacyLog.can_take(RecordsBound::of(8192, false)));
+        assert!(!Reader::BoundedLog(RecordsBound::of(4096, false)).can_take(bound));
+        for bad in [
+            "run records-bound=1%204096%20uncrossed",
+            "run reads=2 records-bound=1%200%20uncrossed",
+            "run reads=2 records-bound=1%2004096%20uncrossed",
+            "run reads=2 records-bound=1%204096%20maybe",
+            "run reads=2 records-bound=1%204096%20crossed records-bound=1%204096%20crossed",
+        ] {
+            assert!(reader(&Line::parse(bad)).is_err(), "{bad}");
+        }
+    }
 
     const TRUST: Trust = Trust {
         network: [1; 16],

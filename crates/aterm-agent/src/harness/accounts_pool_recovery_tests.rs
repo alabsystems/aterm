@@ -292,12 +292,7 @@ fn session_move_recovers_a_commit_and_discards_the_stale_prepared_line() {
     let store = world.seat().store(cli);
     let staging = store.claim_staging_dir("work").unwrap();
     std::fs::write(staging.join(cli.connector().stores[0]), "{}").unwrap();
-    let s = session(
-        cli,
-        Supervisor::Aterm,
-        Mode::Early,
-        Path::new("/opt/provider"),
-    );
+    let s = session(cli, Supervisor::Aterm, Mode::Early, &world.exe);
     let mut prepared = false;
     let result = super::session_move_using(&world.seat(), &s, |row| {
         let env = login_env(cli, row, &world.home).unwrap();

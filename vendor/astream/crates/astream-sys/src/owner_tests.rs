@@ -9,7 +9,10 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use crate::{euid, open_nonblocking, owner_private, owner_private_dir, Links, NotPrivate};
+use crate::{
+    euid, open_nonblocking, open_nonblocking_rw, owner_private, owner_private_dir, Links,
+    NotPrivate,
+};
 
 /// A wait for something that must happen: a hang detector, not a latency budget.
 const HANG: Duration = Duration::from_secs(60);
@@ -156,6 +159,62 @@ fn a_fifo_is_refused_without_waiting_for_a_writer() {
     let judged = rx
         .recv_timeout(HANG)
         .expect("a non-blocking open of a FIFO returns");
+    assert_eq!(
+        judged.expect("opened").expect("judged").unwrap_err(),
+        NotPrivate::Kind("a FIFO")
+    );
+}
+
+/// A READ-WRITE open is refused where a writer in place would be, and writes nothing: a file
+/// of ours at 0400 opens read-only (the control) and is refused read-write (`PermissionDenied`)
+/// with its bytes as they were, the same file at 0600 opens read-write with its bytes as they
+/// were, and a FIFO opens read-write AT ONCE, behind the one-minute hang detector. Root
+/// writes past a mode, so as root the 0400 file opens read-write too.
+#[test]
+fn a_read_write_open_is_refused_as_a_writer_is_and_writes_nothing() {
+    let scratch = Scratch::new("rw");
+    let path = scratch.file("k", 0o400);
+    assert!(
+        open_nonblocking(&path, Links::Refuse).is_ok(),
+        "CONTROL: it opens read-only"
+    );
+    let rw = open_nonblocking_rw(&path, Links::Refuse);
+    if euid() == 0 {
+        assert!(rw.is_ok(), "root writes past a mode");
+    } else {
+        let refused = rw.expect_err("a 0400 file is no writer's");
+        assert_eq!(
+            refused.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "{refused}"
+        );
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), b"secret");
+    chmod(&path, 0o600);
+    let opened = open_nonblocking_rw(&path, Links::Refuse).expect("a 0600 file opens read-write");
+    drop(opened);
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"secret",
+        "the open wrote nothing"
+    );
+
+    let fifo = scratch.0.join("f");
+    let made = std::process::Command::new("mkfifo")
+        .arg("-m")
+        .arg("600")
+        .arg(&fifo)
+        .status()
+        .expect("run mkfifo");
+    assert!(made.success(), "mkfifo");
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let opened = open_nonblocking_rw(&fifo, Links::Refuse).map(|f| owner_private(&f));
+        let _ = tx.send(opened);
+    });
+    let judged = rx
+        .recv_timeout(HANG)
+        .expect("a non-blocking read-write open of a FIFO returns");
     assert_eq!(
         judged.expect("opened").expect("judged").unwrap_err(),
         NotPrivate::Kind("a FIFO")

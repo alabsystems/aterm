@@ -366,6 +366,9 @@ pub(crate) struct DeckInput<'a> {
     pub(crate) network_place: Option<&'a crate::network_deck::PlaceCaption>,
     /// Stable machine/service selected in the network close-up.
     pub(crate) network_target: crate::network_deck::Target,
+    /// The lab's account rows ([`crate::lab_deck`]), drawn on the network band's Shared State
+    /// line; absent where the network band is.
+    pub(crate) lab: Option<&'a crate::lab_deck::LabDeck>,
     /// The latest snapshot, `None` before the first.
     pub(crate) snap: Option<&'a Snapshot>,
     /// The snapshot immediately preceding [`Self::snap`], when available, for smooth value
@@ -3176,10 +3179,15 @@ pub(crate) fn deck_paint_kept(
             network_inks.machine = network_inks.machine_ic;
             network_inks.aterm = network_inks.aterm_ic;
         }
+        if input.contrast {
+            network_inks.heat = network_inks.heat_ic;
+        }
+        let empty = crate::lab_deck::LabDeck::default();
         let (prims, network_hits) = crate::network_deck::paint_with_inks(
             g,
             resource_geom.h,
             snapshot,
+            input.lab.unwrap_or(&empty),
             input.network_place,
             &network_inks,
             input.dwc,
@@ -3484,6 +3492,7 @@ impl crate::App {
         self.network_snapshot.network.accounts_exchange.hash(&mut h);
         crate::network_deck::hash_peer_reachability(&self.network_snapshot, &mut h);
         self.network_snapshot.services.hash(&mut h);
+        self.lab_deck_feed.revision().hash(&mut h);
         if f.form == StatsBars::Deck {
             f.network_place.hash(&mut h);
         }
@@ -3516,6 +3525,7 @@ impl crate::App {
             network: (f.form == StatsBars::Deck).then_some(self.network_snapshot.as_ref()),
             network_place: f.network_place.as_ref(),
             network_target: crate::network_deck::Target::Overview,
+            lab: (f.form == StatsBars::Deck).then_some(self.lab_deck.as_ref()),
             snap,
             prev_snap: self.vitals.prev_snapshot.as_deref(),
             tab_panes: f.tab_panes.clone(),
@@ -4039,9 +4049,16 @@ impl crate::App {
                 }),
             });
         let mut group = stats_a11y_group(self.vitals.snapshot.as_deref(), &f.tab_panes, &loc);
-        for target in crate::network_deck::targets(&self.network_snapshot) {
-            let words = crate::network_deck::details(&self.network_snapshot, target);
-            let name = words.get(1).map_or_else(
+        for target in crate::network_deck::targets_with(&self.network_snapshot, &self.lab_deck) {
+            let words =
+                crate::network_deck::details_lab(&self.network_snapshot, &self.lab_deck, target);
+            // A lab account's first row names it; the others' second row says what they are.
+            let named = if matches!(target, crate::network_deck::Target::LabAccount(_)) {
+                0
+            } else {
+                1
+            };
+            let name = words.get(named).map_or_else(
                 || "Network State".to_owned(),
                 |(name, value)| format!("{name}: {value}"),
             );
@@ -4900,6 +4917,7 @@ pub(crate) mod tests {
             network: None,
             network_place: None,
             network_target: crate::network_deck::Target::Overview,
+            lab: None,
             snap: Some(snap),
             prev_snap: None,
             tab_panes: vec![7],

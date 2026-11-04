@@ -70,12 +70,7 @@ impl Parser {
                 self.utf8_expected
             );
 
-            assert!(
-                crate::csi::subparam_mask_fits(self.subparam_mask, self.params.len()),
-                "TLA+ SubparamMaskValid violated: subparam_mask has bits set at or beyond params.len(), past the cap's mark (mask={:#010x}, params.len()={})",
-                self.subparam_mask,
-                self.params.len()
-            );
+            self.assert_param_invariants();
 
             assert!(
                 !(self.dcs_active && self.apc_active),
@@ -123,6 +118,35 @@ impl Parser {
 
             self.assert_string_invariants();
         }
+    }
+
+    /// The conjuncts of [`Self::assert_invariants`] over CSI/DCS parameter and
+    /// subparameter scratch state.
+    #[cfg(test)]
+    fn assert_param_invariants(&self) {
+        assert!(
+            crate::csi::subparam_mask_fits(self.subparam_mask, self.params.len()),
+            "TLA+ SubparamMaskValid violated: subparam_mask has bit 0 set or bits set at or beyond params.len() past the cap's mark (mask={:#010x}, params.len()={})",
+            self.subparam_mask,
+            self.params.len()
+        );
+
+        assert!(
+            !self.last_was_colon || !self.params.is_empty(),
+            "TLA+ LastWasColonValid violated: last_was_colon=true when params is empty"
+        );
+
+        assert!(
+            (self.subparam_mask == 0 && !self.last_was_colon)
+                || !matches!(
+                    self.state,
+                    State::DcsEntry | State::DcsParam | State::DcsIntermediate
+                ),
+            "TLA+ DcsNoColon violated: subparam_mask={:#010x} last_was_colon={} in state={:?}",
+            self.subparam_mask,
+            self.last_was_colon,
+            self.state
+        );
     }
 
     /// The conjuncts of [`Self::assert_invariants`] over what a string

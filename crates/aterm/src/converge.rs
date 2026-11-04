@@ -329,9 +329,54 @@ fn swarm_disabled_at(config_path: &Path) -> Result<bool, String> {
         .map_err(|e| format!("aterm.toml: {e}"))
 }
 
-/// Local hostnames consulted as a last-resort fallback (`LocalHostName`, `ComputerName`, LAN and
-/// kernel host names) when `aterm-swarm-roster` has not yet assigned a row for this Mac.
-fn local_hostnames() -> Vec<String> {
+/// The Mac's own names the root half of the one password sets as two separate `[names]` rows
+/// (`scutil --set ComputerName` and `--set LocalHostName`), as `scutil --get` reads them now:
+/// `None` where a read failed, the name is unset, or the platform has none.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct OwnNames {
+    /// `ComputerName`: what Finder, AirDrop and Sharing show.
+    pub(crate) computer: Option<String>,
+    /// `LocalHostName`: the Bonjour `.local` name.
+    pub(crate) local_host: Option<String>,
+}
+
+impl OwnNames {
+    /// Both names, `LocalHostName` first.
+    fn each(&self) -> [(&'static str, Option<&str>); 2] {
+        [
+            ("Local hostname", self.local_host.as_deref()),
+            ("Computer Name", self.computer.as_deref()),
+        ]
+    }
+}
+
+/// [`OwnNames`] as `scutil` reads them on this Mac (none elsewhere).
+fn own_names() -> OwnNames {
+    #[cfg(target_os = "macos")]
+    {
+        let get = |key: &str| {
+            let mut cmd = aterm_uds::spawnfd::command("/usr/sbin/scutil");
+            cmd.args(["--get", key]);
+            let output =
+                aterm_uds::deadline::output_within(&mut cmd, std::time::Duration::from_secs(2))
+                    .ok()
+                    .filter(|output| output.status.success())?;
+            let text = std::str::from_utf8(&output.stdout).ok()?.trim();
+            (!text.is_empty()).then(|| text.to_owned())
+        };
+        OwnNames {
+            computer: get("ComputerName"),
+            local_host: get("LocalHostName"),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    OwnNames::default()
+}
+
+/// Local hostnames consulted as a last-resort fallback (`LocalHostName`, `ComputerName` from
+/// `own`, then the LAN and kernel host names) when `aterm-swarm-roster` has not yet assigned a row
+/// for this Mac.
+fn local_hostnames(own: &OwnNames) -> Vec<String> {
     let mut out = Vec::new();
     let mut push = |candidate: Option<String>| {
         if let Some(name) = candidate {
@@ -341,18 +386,8 @@ fn local_hostnames() -> Vec<String> {
             }
         }
     };
-    #[cfg(target_os = "macos")]
-    for key in ["LocalHostName", "ComputerName"] {
-        let mut cmd = aterm_uds::spawnfd::command("/usr/sbin/scutil");
-        cmd.args(["--get", key]);
-        if let Ok(output) =
-            aterm_uds::deadline::output_within(&mut cmd, std::time::Duration::from_secs(2))
-            && output.status.success()
-            && let Ok(text) = std::str::from_utf8(&output.stdout)
-        {
-            push(Some(text.trim().to_owned()));
-        }
-    }
+    push(own.local_host.clone());
+    push(own.computer.clone());
     push(aterm_uds::process::lan_host_name());
     push(aterm_uds::process::kernel_host_name());
     out
@@ -755,15 +790,16 @@ pub(crate) fn mac_names() -> Result<MacName, String> {
         return Ok(MacName::Off("[identity] name = false".to_owned()));
     }
     let paths = vault_paths()?;
-    let hostnames = local_hostnames();
+    let own = own_names();
+    let hostnames = local_hostnames(&own);
     let Some((target, label)) = identity_target(&config, &paths, &hostnames)? else {
         return Ok(MacName::Unlabelled);
     };
     let fleet = aterm_agent::fleet_name_for(&target, &|word| {
         roster_gives(&paths, label.as_deref(), word)
     })?;
-    let pending = own_name_pending(&target, label.as_deref(), &hostnames)
-        .filter(|_| cfg!(target_os = "macos"));
+    let pending =
+        own_name_pending(&target, label.as_deref(), &own).filter(|_| cfg!(target_os = "macos"));
     Ok(MacName::Named {
         target,
         fleet,
@@ -771,31 +807,33 @@ pub(crate) fn mac_names() -> Result<MacName, String> {
     })
 }
 
-/// Where the Mac's own names (`hostnames`: LocalHostName, ComputerName, …) are not yet the
+/// Where any of the Mac's own names the root half sets (`own`: `ComputerName` and
+/// `LocalHostName`, each its own row, so one can take while the other fails) is not yet the
 /// roster's `label` and `target` is that label: what names it. macOS lets only root set them, so
 /// the root half of a Command Line Tools install sets them under its one password (its argv
 /// carries the label when the roster gave it by the time the root half ran), and
-/// otherwise the one command a person types the password for. `None` where they are the label,
+/// otherwise the one command a person types the password for. `None` where both are the label,
 /// or the Mac is named by the person's own `[identity] name` (never set as the Mac's own).
 pub(crate) fn own_name_pending(
     target: &str,
     label: Option<&str>,
-    hostnames: &[String],
+    own: &OwnNames,
 ) -> Option<String> {
     let label = label.filter(|label| *label == target)?;
-    if hostnames.iter().any(|host| host == label) {
-        return None;
-    }
-    let now = hostnames.first().map_or("unread", String::as_str);
+    let (which, now) = own
+        .each()
+        .into_iter()
+        .find(|(_, name)| *name != Some(label))?;
+    let now = now.unwrap_or("unread");
     Some(format!(
-        "this Mac's own name is {now}, not {label}: only root sets it, so the root half of the \
-         next Command Line Tools install sets it under its one password, or now `sudo aterm \
-         machines here apply --plain --name {label}`"
+        "this Mac's own name is {now} ({which}), not {label}: only root sets it, so the root half \
+         of the next Command Line Tools install sets it under its one password, or now `sudo \
+         aterm machines here apply --plain --name {label}`"
     ))
 }
 
 /// `read` (`sync.identity`'s `aterm.toml` keys) with the fleet name beside it (`fleet`, against
-/// `target`), and, where the Mac's own names (`hostnames`: LocalHostName, ComputerName, …) are
+/// `target`), and, where the Mac's own names (`own`: LocalHostName and ComputerName) are
 /// not yet the roster's `label`, the record of what names it ([`own_name_pending`]): no pass asks
 /// for a password of its own.
 fn with_fleet_name(
@@ -803,7 +841,7 @@ fn with_fleet_name(
     target: &str,
     label: Option<&str>,
     fleet: &aterm_agent::FleetName,
-    hostnames: &[String],
+    own: &OwnNames,
 ) -> IdentityRead {
     use aterm_agent::FleetName;
     let now = match fleet {
@@ -812,7 +850,7 @@ fn with_fleet_name(
         FleetName::Taken(other) => format!("fleet name left as it is: {target} names {other}"),
         FleetName::NotApplicable(why) => format!("fleet name left as it is: {why}"),
     };
-    let host = own_name_pending(target, label, hostnames)
+    let host = own_name_pending(target, label, own)
         .map(|pending| format!("; {pending}"))
         .unwrap_or_default();
     match (read, fleet) {
@@ -1304,7 +1342,8 @@ impl Ports for Live {
         let config = aterm_types::dirs::aterm_config_path()
             .ok_or("no config path: neither $XDG_CONFIG_HOME nor $HOME is set")?;
         let paths = vault_paths()?;
-        let hostnames = local_hostnames();
+        let names = own_names();
+        let hostnames = local_hostnames(&names);
         let read = identity_at(&config, &identity_record()?, &paths, &hostnames)?;
         let Some((target, label)) = identity_target(&config, &paths, &hostnames)? else {
             return Ok(read);
@@ -1315,7 +1354,7 @@ impl Ports for Live {
         // Only a Mac's own names are aterm's to align (the root half is macOS's): elsewhere
         // the record names none.
         let own = label.as_deref().filter(|_| cfg!(target_os = "macos"));
-        Ok(with_fleet_name(read, &target, own, &fleet, &hostnames))
+        Ok(with_fleet_name(read, &target, own, &fleet, &names))
     }
 
     fn sync_identity(&self) -> Result<String, String> {
@@ -1328,7 +1367,7 @@ impl Ports for Live {
             return Ok("left as it is: [identity] name = false".to_owned());
         }
         let paths = vault_paths()?;
-        let hostnames = local_hostnames();
+        let hostnames = local_hostnames(&own_names());
         let label = aterm_secrets::client::resolve_local_swarm_label(&paths, &hostnames)
             .map_err(|why| why.to_string())?;
         let keys = write_identity_after_read(
@@ -1602,8 +1641,11 @@ impl Ports for Live {
         aterm_machines::init_github::vault_git_credentials(&aterm_machines::port::Live::new())
     }
 
-    fn sync_github(&self) -> Result<String, String> {
-        aterm_machines::init_github::sync_vault_git_credentials(&aterm_machines::port::Live::new())
+    fn sync_github(&self, journaled: &str) -> Result<String, String> {
+        aterm_machines::init_github::sync_vault_git_credentials(
+            &aterm_machines::port::Live::new(),
+            journaled,
+        )
     }
 
     fn owed_clone(&self) -> Result<aterm_machines::init::OwedClone, String> {
@@ -1803,7 +1845,11 @@ mod tests {
     fn the_identity_row_reads_the_fleet_name_and_records_the_macs_own_name() {
         use aterm_agent::FleetName;
         let keys = || IdentityRead::Current("label m42 in [ai] and [fleet] machine".to_owned());
-        let own = ["Andrews-MacBook-Pro".to_owned()];
+        let named_as = |local_host: &str, computer: &str| OwnNames {
+            computer: Some(computer.to_owned()),
+            local_host: Some(local_host.to_owned()),
+        };
+        let own = named_as("Andrews-MacBook-Pro", "Andrews-MacBook-Pro");
         let due = FleetName::Due {
             from: "node-3fa2".to_owned(),
         };
@@ -1819,13 +1865,32 @@ mod tests {
             IdentityRead::Current(now) => {
                 assert!(now.contains("fleet name m42"), "{now}");
                 assert!(
-                    now.contains("this Mac's own name is Andrews-MacBook-Pro, not m42"),
+                    now.contains(
+                        "this Mac's own name is Andrews-MacBook-Pro (Local hostname), not m42"
+                    ),
                     "{now}"
                 );
             }
             other => panic!("{other:?}"),
         }
-        let named = ["m42".to_owned()];
+        // A half-applied rename (one `[names]` row refused) or a Computer Name renamed in System
+        // Settings still names the Mac otherwise, and so does a name scutil could not read.
+        for half in [
+            named_as("m42", "Andrew\u{2019}s MacBook Pro"),
+            named_as("Andrews-MacBook-Pro", "m42"),
+            OwnNames {
+                computer: None,
+                local_host: Some("m42".to_owned()),
+            },
+        ] {
+            match with_fleet_name(keys(), "m42", Some("m42"), &FleetName::Current, &half) {
+                IdentityRead::Current(now) => {
+                    assert!(now.contains("own name is"), "{half:?}: {now}");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        let named = named_as("m42", "m42");
         match with_fleet_name(keys(), "m42", Some("m42"), &FleetName::Current, &named) {
             IdentityRead::Current(now) => assert!(!now.contains("own name"), "{now}"),
             other => panic!("{other:?}"),

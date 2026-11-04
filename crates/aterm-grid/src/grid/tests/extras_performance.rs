@@ -36,13 +36,13 @@ fn erase_to_end_of_screen_extras_clear_is_batch_o_e() {
         take_extras_clear_ops()
     }
 
-    let clear_few_rows = measure_erase_to_end_ops(1_000, 90);
-    let clear_many_rows = measure_erase_to_end_ops(1_000, 10);
-    let ratio = clear_many_rows as f64 / clear_few_rows as f64;
-    assert!(
-        ratio < 3.0,
-        "clearing many more rows should not multiply extras ops: few={clear_few_rows}, many={clear_many_rows}, ratio={ratio:.2}"
-    );
+    // `erase_to_end_of_screen` calls `clear_range` on `cursor_row` (1,000 entries, removing 10)
+    // followed by one `clear_rows(cursor_row + 1 .. 100)` pass (990 remaining entries), so
+    // clearing 9 rows and clearing 89 rows both execute 1,990 ops; on the bottom row (99),
+    // `clear_rows(100..100)` is empty and only `clear_range` runs (1,000 ops).
+    assert_eq!(measure_erase_to_end_ops(1_000, 90), 1_990);
+    assert_eq!(measure_erase_to_end_ops(1_000, 10), 1_990);
+    assert_eq!(measure_erase_to_end_ops(1_000, 99), 1_000);
 }
 
 #[test]
@@ -68,13 +68,9 @@ fn erase_rect_extras_clear_is_batch_o_e() {
         take_extras_clear_ops()
     }
 
-    let short_rect = measure_erase_rect_ops(1_000, 5);
-    let tall_rect = measure_erase_rect_ops(1_000, 80);
-    let ratio = tall_rect as f64 / short_rect as f64;
-    assert!(
-        ratio < 3.0,
-        "taller rectangles should not multiply extras ops: short={short_rect}, tall={tall_rect}, ratio={ratio:.2}"
-    );
+    // `erase_rect` executes one `clear_rect` pass over the 1,000-entry map regardless of height.
+    assert_eq!(measure_erase_rect_ops(1_000, 5), 1_000);
+    assert_eq!(measure_erase_rect_ops(1_000, 80), 1_000);
 }
 
 fn measure_shift(
@@ -102,23 +98,9 @@ fn assert_shift_ops_o_e(
     large_n: u16,
     measure: impl Fn(usize, u16) -> usize,
 ) {
-    let small = measure(500, small_n);
-    let large = measure(500, large_n);
-
-    assert!(small > 0, "should register shift ops");
-    let ratio = large as f64 / small as f64;
-    assert!(
-        ratio > 0.5 && ratio < 2.0,
-        "{grown} should NOT change ops: small={small}, large={large}, ratio={ratio:.2}"
-    );
-
-    let double_entries = measure(1000, small_n);
-    let entry_ratio = double_entries as f64 / small as f64;
-    assert!(
-        entry_ratio > 1.5 && entry_ratio < 3.0,
-        "2x entries should ~double ops: base={small}, double={double_entries}, \
-         ratio={entry_ratio:.2}"
-    );
+    assert_eq!(measure(500, small_n), 500, "{grown}: small_n={small_n}");
+    assert_eq!(measure(500, large_n), 500, "{grown}: large_n={large_n}");
+    assert_eq!(measure(1_000, small_n), 1_000, "{grown}: 2x entries");
 }
 
 #[test]
@@ -196,15 +178,9 @@ fn assert_reflow_row_ops_linear(old_cols: u16, new_cols: u16, ch: char) {
         take_reflow_row_ops()
     };
 
-    let small = measure_reflow_rows(25);
-    let large = measure_reflow_rows(50);
-
-    assert!(small > 0, "should register reflow row ops");
-    let ratio = large as f64 / small as f64;
-    assert!(
-        ratio > 1.5 && ratio < 3.0,
-        "2x rows should ~2x reflow ops: small={small}, large={large}, ratio={ratio:.2}"
-    );
+    // Each source visible row is visited exactly once during width reflow (`reflow-cost`).
+    assert_eq!(measure_reflow_rows(25), 25);
+    assert_eq!(measure_reflow_rows(50), 50);
 }
 
 #[test]

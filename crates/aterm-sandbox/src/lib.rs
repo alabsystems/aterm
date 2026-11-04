@@ -269,20 +269,34 @@ mod tests {
     fn shell_default_omits_unsupported_address_space_on_macos() {
         let d = Limits::shell_default();
         #[cfg(target_os = "macos")]
-        assert_eq!(
-            d.address_space, None,
-            "macOS must not request a finite RLIMIT_AS"
-        );
+        let expected_as = None;
         #[cfg(not(target_os = "macos"))]
+        let expected_as = Some(16 * 1024 * 1024 * 1024);
         assert_eq!(
-            d.address_space,
-            Some(16 * 1024 * 1024 * 1024),
-            "non-macOS should bound the address space to 16 GiB"
+            d,
+            Limits {
+                cpu_seconds: None,
+                address_space: expected_as,
+                file_size: None,
+                open_files: Some(8192),
+                active_processes: Some(512),
+                restrict_ui: true,
+                binding: false,
+            }
         );
+        assert_eq!(Limits::contained(), Limits { binding: true, ..d });
+        assert_eq!(Limits::inherit(), Limits::default());
         assert_eq!(
-            d.open_files,
-            Some(8192),
-            "the working NOFILE limit must remain"
+            Limits::inherit(),
+            Limits {
+                cpu_seconds: None,
+                address_space: None,
+                file_size: None,
+                open_files: None,
+                active_processes: None,
+                restrict_ui: false,
+                binding: false,
+            }
         );
     }
 
@@ -295,10 +309,11 @@ mod tests {
 
         let hard_before = current_hard(libc::RLIMIT_NOFILE);
         let applied = 256u64;
-        assert!(
-            hard_before > applied,
-            "test precondition: inherited hard NOFILE ({hard_before}) must exceed the applied soft default"
-        );
+        if hard_before <= applied {
+            aterm_spec::host::could_not_run(format!(
+                "inherited hard RLIMIT_NOFILE ({hard_before}) does not exceed the applied soft default ({applied})"
+            ));
+        }
 
         Limits {
             open_files: Some(applied),
@@ -344,15 +359,16 @@ mod tests {
         libc::WEXITSTATUS(status)
     }
 
-    /// A child that installed [`Limits::contained`] cannot raise its descriptor
-    /// limit back (`ulimit -n`), while one that installed [`Limits::shell_default`]
-    /// can.
+    /// NEGATIVE CONTROL: a child that installed [`Limits::shell_default`] (`binding: false`) can
+    /// raise its soft `RLIMIT_NOFILE` back above the cap, whereas [`Limits::contained`]
+    /// (`binding: true`) lowers `rlim_max` too and refuses `setrlimit` back above it.
     #[cfg(unix)]
     #[test]
     fn a_contained_limit_cannot_be_raised_back() {
         const RAISED: i32 = 0;
         const REFUSED: i32 = 1;
         const NOT_INSTALLED: i32 = 2;
+        aterm_spec::host::could_not_run_as_root("a binding rlimit");
         let _serialized = nofile_guard();
         let auth = unsafe { Authority::root_authority() };
         let cap: Cap<Sandbox> = auth.grant(Tier::Trusted);
@@ -360,16 +376,33 @@ mod tests {
             .open_files
             .expect("the set caps open files");
         let hard = current_hard(libc::RLIMIT_NOFILE);
-        assert!(
-            hard > open_files,
-            "test precondition: inherited hard NOFILE ({hard}) must exceed the cap"
-        );
+        if hard <= 64 {
+            aterm_spec::host::could_not_run(format!(
+                "inherited hard RLIMIT_NOFILE ({hard}) leaves no room above open descriptors"
+            ));
+        }
+        let (contained, safety, cap_files) = if hard > open_files {
+            (Limits::contained(), Limits::shell_default(), open_files)
+        } else {
+            let cap_files = hard - 1;
+            (
+                Limits {
+                    open_files: Some(cap_files),
+                    ..Limits::contained()
+                },
+                Limits {
+                    open_files: Some(cap_files),
+                    ..Limits::shell_default()
+                },
+                cap_files,
+            )
+        };
+        let above = libc::rlim_t::try_from(cap_files + 1).expect("cap_files + 1 fits rlim_t");
         let raise_after = |limits: Limits| {
             in_forked_child(move || {
                 if limits.apply(&cap).is_err() {
                     return NOT_INSTALLED;
                 }
-                let above = (open_files + 1) as libc::rlim_t;
                 let lim = libc::rlimit {
                     rlim_cur: above,
                     rlim_max: above,
@@ -383,12 +416,12 @@ mod tests {
             })
         };
         assert_eq!(
-            raise_after(Limits::contained()),
+            raise_after(contained),
             REFUSED,
             "a contained program raised its descriptor limit back"
         );
         assert_eq!(
-            raise_after(Limits::shell_default()),
+            raise_after(safety),
             RAISED,
             "Safety's soft limit must stay raisable"
         );

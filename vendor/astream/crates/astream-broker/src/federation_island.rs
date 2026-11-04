@@ -161,4 +161,10 @@ clean {
 
     def federation_hop_allowed_isl (hops : UInt8) (max_hops : UInt8) : Bool :=
       decide (hops < max_hops)
+
+    def federation_route_preferred_isl (cur_rtt_us : UInt64) (switch_threshold_us : UInt64) : Bool :=
+      decide (switch_threshold_us ≤ cur_rtt_us)
+
+    def federation_incarnation_fresh_isl (observed_inc : UInt64) (min_inc : UInt64) : Bool :=
+      decide (min_inc ≤ observed_inc)
 }

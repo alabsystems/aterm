@@ -2,9 +2,18 @@
 // Copyright 2026 Andrew Yates
 
 use super::{
-    DROP_WASH_ALPHA, OverlayGlow, apply_drop_overlay, apply_drop_overlay_at, apply_host_chrome_at,
-    blend_rgb, composite_tray, composite_tray_at, composite_tray_quad_at, tray_quad_below_y,
+    DROP_BORDER_ALPHA, DROP_WASH_ALPHA, OverlayGlow, apply_host_chrome_at, apply_overlay_at,
+    blend_rgb, composite_tray_quad_at, tray_quad_below_y,
 };
+
+fn drop_glow(accent: u32) -> OverlayGlow {
+    OverlayGlow {
+        accent,
+        wash_a: DROP_WASH_ALPHA as u8,
+        border_a: DROP_BORDER_ALPHA as u8,
+        border_scale_q4: 0,
+    }
+}
 
 #[test]
 fn canonical_host_chrome_order_is_base_then_tray_then_bell_then_overlay() {
@@ -130,7 +139,7 @@ fn band_aware_overlay_twins_shift_without_touching_bands() {
     let accent = 0x0050_FA7B;
     let (fw, fh) = (40usize, 24usize);
     let mut a = vec![0x0010_2030u32; fw * fh];
-    apply_drop_overlay_at(&mut a, fw, fh, 0, 0, fw, fh, accent);
+    apply_overlay_at(&mut a, fw, fh, 0, 0, fw, fh, drop_glow(accent));
 
     let band = 0x0001_0203u32;
     let (sw, sh) = (fw + 7, fh + 7);
@@ -140,7 +149,7 @@ fn band_aware_overlay_twins_shift_without_touching_bands() {
             s[(y + 3) * sw + (x + 3)] = 0x0010_2030;
         }
     }
-    apply_drop_overlay_at(&mut s, sw, sh, 3, 3, fw, fh, accent);
+    apply_overlay_at(&mut s, sw, sh, 3, 3, fw, fh, drop_glow(accent));
     for y in 0..sh {
         for x in 0..sw {
             let got = s[y * sw + x];
@@ -168,7 +177,7 @@ fn band_aware_overlay_twins_shift_without_touching_bands() {
         delta: None,
     };
     let mut t2 = vec![0u32; 4 * 3];
-    composite_tray_at(&mut t2, 4, 3, 1, 2, &card);
+    composite_tray_quad_at(&mut t2, 4, 3, 1, 2, tray_quad_below_y(&card, 0).unwrap());
     assert_eq!(
         t2[2 * 4 + 2],
         0x00AA_BBCC,
@@ -176,7 +185,7 @@ fn band_aware_overlay_twins_shift_without_touching_bands() {
     );
     assert_eq!(t2.iter().filter(|&&p| p != 0).count(), 1);
     let mut t3 = vec![0u32; 1];
-    composite_tray_at(&mut t3, 1, 1, -2, -2, &card);
+    composite_tray_quad_at(&mut t3, 1, 1, -2, -2, tray_quad_below_y(&card, 0).unwrap());
     assert_eq!(t3[0], 0);
 }
 
@@ -268,18 +277,23 @@ fn composite_tray_src_over_and_clamps() {
         serial: 0,
         delta: None,
     };
+    let composite = |fb: &mut [u32], w: usize, h: usize, c: &crate::SettingsCard| {
+        if let Some(quad) = tray_quad_below_y(c, 0) {
+            composite_tray_quad_at(fb, w, h, 0, 0, quad);
+        }
+    };
     let mut fb = vec![0x0010_2030u32; 4];
-    composite_tray(&mut fb, 2, 2, &card(vec![0xAA, 0xBB, 0xCC, 0xFF], 0, 0));
+    composite(&mut fb, 2, 2, &card(vec![0xAA, 0xBB, 0xCC, 0xFF], 0, 0));
     assert_eq!(fb[0], 0x00AA_BBCC);
     let mut fb2 = vec![0x0012_3456u32; 1];
-    composite_tray(&mut fb2, 1, 1, &card(vec![0xFF, 0xFF, 0xFF, 0x00], 0, 0));
+    composite(&mut fb2, 1, 1, &card(vec![0xFF, 0xFF, 0xFF, 0x00], 0, 0));
     assert_eq!(fb2[0], 0x0012_3456);
     let mut fb3 = vec![0u32; 1];
-    composite_tray(&mut fb3, 1, 1, &card(vec![0xFF, 0x00, 0x80, 0x80], 0, 0));
+    composite(&mut fb3, 1, 1, &card(vec![0xFF, 0x00, 0x80, 0x80], 0, 0));
     let exp = |s: u32, a: u32| (s * a + 127) / 255;
     assert_eq!(fb3[0], (exp(0xFF, 0x80) << 16) | exp(0x80, 0x80));
     let mut translucent = vec![0x8010_2030u32];
-    composite_tray(
+    composite(
         &mut translucent,
         1,
         1,
@@ -287,7 +301,7 @@ fn composite_tray_src_over_and_clamps() {
     );
     assert_eq!(translucent[0] >> 24, 64);
     let mut fb4 = vec![0x00FF_FFFFu32; 1];
-    composite_tray(&mut fb4, 1, 1, &card(vec![0, 0, 0, 0xFF], 5, 5));
+    composite(&mut fb4, 1, 1, &card(vec![0, 0, 0, 0xFF], 5, 5));
     assert_eq!(fb4[0], 0x00FF_FFFF);
 }
 
@@ -339,7 +353,7 @@ fn border_is_accent_heavy_interior_is_faint() {
     let (w, h) = (400usize, 300usize);
     let accent = 0x0050_FA7B;
     let mut px = vec![0x0000_0000u32; w * h];
-    apply_drop_overlay(&mut px, w, h, accent);
+    apply_overlay_at(&mut px, w, h, 0, 0, w, h, drop_glow(accent));
 
     let corner = px[0];
     let interior = px[(h / 2) * w + w / 2];
@@ -356,13 +370,13 @@ fn border_is_accent_heavy_interior_is_faint() {
 #[test]
 fn zero_dims_is_noop() {
     let mut px = vec![0x0011_2233u32; 4];
-    apply_drop_overlay(&mut px, 0, 0, 0x00ff_ffff);
+    apply_overlay_at(&mut px, 0, 0, 0, 0, 0, 0, drop_glow(0x00ff_ffff));
     assert_eq!(px, vec![0x0011_2233u32; 4]);
 }
 
 #[test]
 fn overlay_preserves_transmittance() {
     let mut px = vec![0x7fab_cdefu32; 10 * 10];
-    apply_drop_overlay(&mut px, 10, 10, 0x00ff_ffff);
+    apply_overlay_at(&mut px, 10, 10, 0, 0, 10, 10, drop_glow(0x00ff_ffff));
     assert!(px.iter().all(|p| p >> 24 == 0x7f));
 }

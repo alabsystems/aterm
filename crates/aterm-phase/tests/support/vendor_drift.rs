@@ -33,6 +33,159 @@ fn find_bytes(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     None
 }
 
+/// Which of `needles` occur in `hay`, scanned in a single pass.
+pub(crate) fn found_in(hay: &[u8], needles: &[&[u8]]) -> Vec<bool> {
+    const HEAD: usize = 3;
+    let mut found: Vec<bool> = needles.iter().map(|n| n.is_empty()).collect();
+    let mut heads = vec![0u16; 1 << (8 * HEAD)];
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut left = 0usize;
+    for (i, needle) in needles.iter().enumerate() {
+        if needle.is_empty() {
+            continue;
+        }
+        if needle.len() < HEAD {
+            found[i] = hay.windows(needle.len()).any(|w| w == *needle);
+            continue;
+        }
+        let h = needle[..HEAD]
+            .iter()
+            .fold(0, |h, &b| (h << 8) | usize::from(b));
+        if heads[h] == 0 {
+            groups.push(Vec::new());
+            heads[h] = u16::try_from(groups.len()).expect("fewer than 65,536 heads");
+        }
+        groups[usize::from(heads[h]) - 1].push(i);
+        left += 1;
+    }
+    let mut window = 0usize;
+    for (end, &b) in hay.iter().enumerate() {
+        if left == 0 {
+            break;
+        }
+        window = ((window << 8) | usize::from(b)) & ((1 << (8 * HEAD)) - 1);
+        let group = heads[window];
+        if group == 0 || end + 1 < HEAD {
+            continue;
+        }
+        let at = &hay[end + 1 - HEAD..];
+        for &i in &groups[usize::from(group) - 1] {
+            if !found[i] && at.starts_with(needles[i]) {
+                found[i] = true;
+                left -= 1;
+            }
+        }
+    }
+    found
+}
+
+/// The literal anchors of `table` missing from `bytes`, each part looked for as the screen spells it
+/// and as a bundle's source does ([`js_escaped`]).
+pub(crate) fn missing(bytes: &[u8], table: &[Anchor]) -> Vec<&'static str> {
+    let literal: Vec<&Anchor> = table
+        .iter()
+        .filter(|a| a.kind == AnchorKind::Literal)
+        .collect();
+    let parts: Vec<&str> = literal.iter().flat_map(|a| a.text.split(" · ")).collect();
+    let escaped: Vec<String> = parts.iter().map(|part| js_escaped(part)).collect();
+    let needles: Vec<&[u8]> = parts
+        .iter()
+        .map(|part| part.as_bytes())
+        .chain(escaped.iter().map(String::as_bytes))
+        .collect();
+    let found = found_in(bytes, &needles);
+    let (plain, spelled) = found.split_at(parts.len());
+    let mut held = plain.iter().zip(spelled).map(|(a, b)| *a || *b);
+    literal
+        .into_iter()
+        .filter(|a| {
+            a.text
+                .split(" · ")
+                .filter(|_| !held.next().expect("an answer per part"))
+                .count()
+                > 0
+        })
+        .map(|a| a.id)
+        .collect()
+}
+
+/// How a bundled program's source spells `text`: a Latin-1 character as JavaScript's `\xHH`, and one
+/// past it as `\uXXXX`, one per UTF-16 unit. Claude Code's `Opened changes in … ⧉` title is held this
+/// way: the glyph's UTF-8 bytes are nowhere in its bundle.
+pub(crate) fn js_escaped(text: &str) -> String {
+    text.chars()
+        .map(|c| match u32::from(c) {
+            0..=0x7f => c.to_string(),
+            latin1 @ 0x80..=0xff => format!("\\x{latin1:02X}"),
+            _ => c
+                .encode_utf16(&mut [0; 2])
+                .iter()
+                .map(|unit| format!("\\u{unit:04X}"))
+                .collect(),
+        })
+        .collect()
+}
+
+/// The file ranges of a thin 64-bit Mach-O's sections of nothing but instructions. `None` for any
+/// other file, and for one whose load commands or code sections do not fit where the file says.
+fn code_ranges(bytes: &[u8]) -> Option<Vec<std::ops::Range<usize>>> {
+    const MH_MAGIC_64: u32 = 0xfeed_facf;
+    const LC_SEGMENT_64: u32 = 0x19;
+    const S_ATTR_PURE_INSTRUCTIONS: u32 = 0x8000_0000;
+    const HEADER: usize = 32;
+    const COMMAND: usize = 8;
+    const SEGMENT: usize = 72;
+    const SECTION: usize = 80;
+    let u32_at = |at: usize| Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?));
+    let u64_at = |at: usize| Some(u64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?));
+    if u32_at(0)? != MH_MAGIC_64 {
+        return None;
+    }
+    let commands_end = HEADER.checked_add(usize::try_from(u32_at(20)?).ok()?)?;
+    if commands_end > bytes.len() {
+        return None;
+    }
+    let mut code = Vec::new();
+    let mut command = HEADER;
+    for _ in 0..u32_at(16)? {
+        let size = usize::try_from(u32_at(command + 4)?).ok()?;
+        let next = command.checked_add(size)?;
+        if size < COMMAND || next > commands_end {
+            return None;
+        }
+        if u32_at(command)? == LC_SEGMENT_64 {
+            let sections = usize::try_from(u32_at(command + 64)?).ok()?;
+            if SEGMENT.checked_add(sections.checked_mul(SECTION)?)? > size {
+                return None;
+            }
+            for index in 0..sections {
+                let section = command + SEGMENT + index * SECTION;
+                if u32_at(section + 64)? & S_ATTR_PURE_INSTRUCTIONS != 0 {
+                    let start = usize::try_from(u32_at(section + 48)?).ok()?;
+                    let length = usize::try_from(u64_at(section + 40)?).ok()?;
+                    let range = start..start.checked_add(length)?;
+                    bytes.get(range.clone())?;
+                    code.push(range);
+                }
+            }
+        }
+        command = next;
+    }
+    Some(code)
+}
+
+/// Zeroes a thin 64-bit Mach-O's instructions, so that a search of `bytes` reads what the program
+/// holds as data. A short anchor's bytes occur by chance in 100 MB of code: `⧉`'s three were inside
+/// ARM64 instructions of Claude Code 2.1.316 and 2.1.317, whose text never held them, so its anchor
+/// passed until 2.1.318's code moved. Any other file is left whole, its code still searched, and so
+/// is one [`code_ranges`] cannot follow: a range it misread would turn a held anchor into a missing
+/// one.
+pub(crate) fn blank_code(bytes: &mut [u8]) {
+    for range in code_ranges(bytes).unwrap_or_default() {
+        bytes[range].fill(0);
+    }
+}
+
 /// Private-use placeholder in a template matching any single JavaScript identifier.
 pub(crate) const JS_NAME: char = '\u{E000}';
 
@@ -321,6 +474,10 @@ pub(crate) fn composed_templates() -> Vec<(&'static str, Vec<String>)> {
     let word = whole
         .strip_prefix(head)
         .expect("the auto notice opens with its head");
+    let (ide_diff, mark) = (
+        anchor("box.ide_diff"),
+        js_escaped(anchor("box.ide_diff.mark")),
+    );
     vec![
         (
             "effort auto notice",
@@ -334,6 +491,12 @@ pub(crate) fn composed_templates() -> Vec<(&'static str, Vec<String>)> {
                     "{{return!1}}function {JS_NAME}(){{return {JS_NAME}()?\"adaptive\":\"{word}\"}}"
                 ),
             ],
+        ),
+        (
+            "IDE diff title",
+            vec![format!(
+                "{ide_diff}${{{JS_NAME}({JS_NAME}.ideName??\"IDE\")}} {mark}"
+            )],
         ),
     ]
 }

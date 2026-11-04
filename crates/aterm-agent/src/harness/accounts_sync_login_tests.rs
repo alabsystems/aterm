@@ -972,6 +972,190 @@ pub(super) fn upkeep_effects<'a>(
     }
 }
 
+/// A ROSTER A PERSON MADE KEEPS ITS LABELS THROUGH THE FIRST DISCOVERY: every row keeps its label,
+/// directory and order, a row with no address stays, and only an account no row holds joins, under
+/// a label no row has. A login that names another address than its row (`old-work`, and an alias
+/// with no `identity_email`) keeps its directory and is recorded as a wrong-account login: no row
+/// is minted for it. CONTROL: with no roster, discovery labels what it finds from the machine.
+#[test]
+fn discovery_keeps_a_persons_rows_and_mints_none_for_their_logins() {
+    let desk = Desk::new("m27");
+    desk.default_login("main@example.test");
+    let dir = |name: &str, names: Option<&str>| {
+        let dir = desk.store().logins_dir().join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(".credentials.json"), "opaque fixture").unwrap();
+        if let Some(names) = names {
+            fs::write(
+                dir.join(".claude.json"),
+                format!("{{\"oauthAccount\":{{\"emailAddress\":\"{names}\"}}}}\n"),
+            )
+            .unwrap();
+        }
+        dir.to_str().unwrap().to_owned()
+    };
+    let rows = vec![
+        Row {
+            label: "main".into(),
+            email: Some("main@example.test".into()),
+            ..Row::default()
+        },
+        Row {
+            label: "old-work".into(),
+            dir: Some(dir("old-work", Some("old-work@example.test"))),
+            email: Some("work@example.test".into()),
+            class: Class::Pool,
+            ..Row::default()
+        },
+        Row {
+            label: "alias".into(),
+            dir: Some(dir("alias", Some("real@example.test"))),
+            email: Some("alias@example.test".into()),
+            ..Row::default()
+        },
+        Row {
+            label: "legacy".into(),
+            dir: Some(dir("legacy", None)),
+            ..Row::default()
+        },
+    ];
+    fs::write(
+        desk.roster(),
+        format_roster_toml(&Roster { rows: rows.clone() }).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        desk.home.join(".claude.json.backup"),
+        "{\"oauthAccount\":{\"emailAddress\":\"new.m27.2@example.test\"}}\n",
+    )
+    .unwrap();
+    sync_accounts_for_init(&desk.home, &desk.state, &desk.roster(), NOW).expect("discovered");
+    assert_eq!(
+        fleet_file_opt_in(&desk.fleet_file()),
+        Some(OptIn::Discovered)
+    );
+    let synced = desk.rows();
+    for row in &rows {
+        let kept = synced
+            .row(&row.label)
+            .unwrap_or_else(|| panic!("`{}` kept: {synced:?}", row.label));
+        assert_eq!(kept.dir, row.dir, "{}", row.label);
+        assert_eq!(kept.email, row.email, "{}", row.label);
+        assert_eq!(kept.class, row.class, "{}", row.label);
+    }
+    let added: Vec<&Row> = synced
+        .rows
+        .iter()
+        .filter(|row| !rows.iter().any(|kept| kept.label == row.label))
+        .collect();
+    assert_eq!(added.len(), 1, "{synced:?}");
+    assert_eq!(added[0].email.as_deref(), Some("new.m27.2@example.test"));
+    let (logins, _) = desk.store().load_logins(NOW).unwrap();
+    for label in ["old-work", "alias"] {
+        assert!(
+            logins
+                .get(label)
+                .is_some_and(|login| login.wrong_at.is_some()),
+            "`{label}`'s login names another account"
+        );
+    }
+    assert!(
+        logins
+            .get("main")
+            .is_none_or(|login| login.wrong_at.is_none()),
+        "`main`'s names its own"
+    );
+
+    let desk = Desk::new("m27");
+    desk.default_login("sol-m27@example.test");
+    fs::write(
+        desk.home.join(".claude.json.backup"),
+        "{\"oauthAccount\":{\"emailAddress\":\"sun.m27.2@example.test\"}}\n",
+    )
+    .unwrap();
+    sync_accounts_for_init(&desk.home, &desk.state, &desk.roster(), NOW).expect("discovered");
+    let rows = desk.rows().rows;
+    assert_eq!(rows.len(), 2, "CONTROL");
+    assert!(
+        rows.iter().all(|row| row.label.starts_with("m27")),
+        "CONTROL: {rows:?}"
+    );
+}
+
+/// A ROSTER A PERSON MADE KEEPS ITS SEQUENCE, AND A ROW THEY RENAMED, THROUGH DISCOVERY: the rows stay
+/// in the file's order, a sync with the old label still in the discovered fleet keeps the new one and
+/// lists the account once. CONTROL: a row the discovery adds later follows them.
+#[test]
+fn discovery_keeps_a_rosters_sequence_and_a_renamed_row() {
+    let desk = Desk::new("m27");
+    desk.default_login("main@example.com");
+    let dir = |name: &str| {
+        let dir = desk.store().logins_dir().join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(".credentials.json"), "opaque fixture").unwrap();
+        dir.to_str().unwrap().to_owned()
+    };
+    let row = |label: &str, email: &str| Row {
+        label: label.into(),
+        dir: Some(dir(label)),
+        email: Some(email.into()),
+        ..Row::default()
+    };
+    let mut rows = vec![
+        Row {
+            label: "main".into(),
+            email: Some("main@example.com".into()),
+            ..Row::default()
+        },
+        row("zeta", "zeta@example.com"),
+        row("alpha", "alpha@example.com"),
+    ];
+    let save = |rows: &[Row]| {
+        fs::write(
+            desk.roster(),
+            format_roster_toml(&Roster {
+                rows: rows.to_vec(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    };
+    save(&rows);
+    let labels = || -> Vec<String> {
+        desk.rows()
+            .rows
+            .iter()
+            .map(|row| row.label.clone())
+            .collect()
+    };
+    sync_accounts_for_init(&desk.home, &desk.state, &desk.roster(), NOW).expect("discovered");
+    assert_eq!(
+        fleet_file_opt_in(&desk.fleet_file()),
+        Some(OptIn::Discovered)
+    );
+    assert_eq!(labels(), ["main", "zeta", "alpha"], "the file's sequence");
+
+    rows[1].label = "renamed".into();
+    save(&rows);
+    sync_accounts_for_init(&desk.home, &desk.state, &desk.roster(), NOW)
+        .expect("the discovered fleet's old label is the renamed row");
+    assert_eq!(
+        labels(),
+        ["main", "renamed", "alpha"],
+        "one account, one row"
+    );
+
+    fs::write(
+        desk.home.join(".claude.json.backup"),
+        "{\"oauthAccount\":{\"emailAddress\":\"new.m27.2@example.com\"}}\n",
+    )
+    .unwrap();
+    sync_accounts_for_init(&desk.home, &desk.state, &desk.roster(), NOW).expect("a new account");
+    let now = labels();
+    assert_eq!(now.len(), 4, "CONTROL: {now:?}");
+    assert_eq!(now[..3], ["main", "renamed", "alpha"], "CONTROL: {now:?}");
+}
+
 /// A window's upkeep over a fleet discovery made: an account first seen in a transcript past
 /// 4 MiB becomes a row of this machine (fleet and roster), and the default login's move to
 /// another row is synced at once, its displaced row on record. CONTROL: a pass with nothing new

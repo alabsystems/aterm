@@ -154,7 +154,7 @@ fn other_provider_stats_recover_before_reading_account_records() {
         f.pending_login();
         let (mut out, mut err) = (Vec::new(), Vec::new());
         assert_eq!(
-            run_accounts_stats_of(cli, &f.env, true, &mut out, &mut err),
+            run_accounts_stats_of((cli, Launch::default()), &f.env, true, &mut out, &mut err),
             ExitCode::SUCCESS,
             "{cli:?}: {}",
             String::from_utf8_lossy(&err)
@@ -317,6 +317,124 @@ fn report_preserves_nonfatal_machine_identity_diagnostics() {
     );
 }
 
+/// Combined reports age a held journal at the command's clock, leaving its sample time and
+/// readings intact. Reusing `seen.at` keeps the passed wall and quota in both report forms.
+#[test]
+fn combined_reports_age_cached_journal_quota_at_the_command_clock() {
+    use crate::harness::alab_seen::{self, AccountSeen, Figure, Seen, WindowSeen};
+    const KEY: &str = "ac-0123456789abcdef";
+    let f = Fixture::new(Cli::Claude, true);
+    let roster = accounts::append_rows_for(
+        Cli::Claude,
+        "",
+        &[accounts::Row {
+            label: "main".into(),
+            dir: Some(f.old.clone()),
+            ..Default::default()
+        }],
+    )
+    .unwrap();
+    std::fs::write(&f.roster, roster).unwrap();
+    f.store
+        .transact(f.env.now, &mut None, |state| {
+            state.accounts.entry("main".into()).or_default().pk = Some(KEY.into());
+            Ok(Vec::new())
+        })
+        .unwrap();
+    let end = f.env.now + 100;
+    let window = |name: &str, reset, wall_until| WindowSeen {
+        window: name.into(),
+        sub: None,
+        figure: Some(Figure::Used {
+            pct_x10: 1000,
+            reset,
+        }),
+        read: Some((f.env.now, "m17".into(), "statusline".into())),
+        wall_until,
+    };
+    let seen = Seen {
+        at: f.env.now,
+        accounts: [(
+            KEY.into(),
+            AccountSeen {
+                windows: vec![
+                    window("5h", Some(end), Some(Some(end))),
+                    window("7d", Some(end + 1_000), Some(Some(end + 1_000))),
+                    window("credits", None, Some(None)),
+                ],
+                ..Default::default()
+            },
+        )]
+        .into(),
+    };
+    let original = seen.clone();
+    alab_seen::with_seen(seen, || {
+        for now in [end - 1, end, end + 1] {
+            let mut env = f.env.clone();
+            env.now = now;
+            for json in [false, true] {
+                let (mut out, mut err) = (Vec::new(), Vec::new());
+                let report = write_accounts_report(
+                    (Cli::Claude, Launch::default()),
+                    &env,
+                    json,
+                    &mut out,
+                    &mut err,
+                );
+                assert!(report.local.is_some(), "{}", String::from_utf8_lossy(&err));
+                let lines = if json {
+                    let doc: Value = aterm_json::from_slice(&out).unwrap();
+                    let windows = &doc["journal"]["main"]["windows"];
+                    let five = &windows[0];
+                    assert_eq!(five["read"]["t"].as_i64(), Some(original.at));
+                    assert_eq!(five["read"]["age_s"].as_i64(), Some(now - original.at));
+                    if now < end {
+                        assert_eq!(five["state"].as_str(), Some("current"));
+                        assert_eq!(five["used_pct_x10"].as_u64(), Some(1000));
+                        assert_eq!(five["wall_until"].as_i64(), Some(end));
+                    } else {
+                        assert_eq!(five["state"].as_str(), Some("reset-unread"));
+                        assert!(five["used_pct_x10"].is_null());
+                        assert!(five["wall_until"].is_null());
+                        assert_eq!(five["reset"].as_i64(), Some(end));
+                    }
+                    assert_eq!(windows[1]["state"].as_str(), Some("current"));
+                    assert_eq!(windows[2]["state"].as_str(), Some("reset-unknown"));
+                    windows
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|w| w["line"].as_str().unwrap().to_owned())
+                        .collect::<Vec<_>>()
+                } else {
+                    let text = String::from_utf8(out).unwrap();
+                    let journal = text.split_once("\nlab journal").unwrap().1;
+                    ["main: 5h", "main: 7d", "main: credits"]
+                        .into_iter()
+                        .map(|name| {
+                            journal
+                                .lines()
+                                .find(|line| line.contains(name))
+                                .unwrap()
+                                .to_owned()
+                        })
+                        .collect()
+                };
+                if now < end {
+                    assert!(lines[0].contains("100% used") && lines[0].contains("at its limit"));
+                } else {
+                    assert!(lines[0].contains("not read since"));
+                    assert!(!lines[0].contains('%') && !lines[0].contains("at its limit"));
+                }
+                assert!(lines[1].contains("100% used") && lines[1].contains("at its limit until"));
+                assert!(lines[2].contains("reset unknown") && lines[2].contains("at its limit"));
+            }
+        }
+        assert_eq!(alab_seen::current(false).unwrap().as_ref(), &original);
+    });
+    f.credentials_unchanged();
+}
+
 #[test]
 fn a_captured_report_does_not_reread_changed_policy_or_discard_its_refusal() {
     let f = Fixture::new(Cli::Codex, true);
@@ -467,7 +585,7 @@ fn missing_report_paths_and_provider_homes_have_json_refusals() {
         out.clear();
         err.clear();
         assert_eq!(
-            run_accounts_stats_of(cli, &env, true, &mut out, &mut err),
+            run_accounts_stats_of((cli, Launch::default()), &env, true, &mut out, &mut err),
             ExitCode::from(1)
         );
         let doc: Value = aterm_json::from_slice(&out).unwrap();
@@ -486,7 +604,7 @@ fn missing_report_paths_and_provider_homes_have_json_refusals() {
         out.clear();
         err.clear();
         assert_eq!(
-            run_accounts_stats_of(cli, &env, true, &mut out, &mut err),
+            run_accounts_stats_of((cli, Launch::default()), &env, true, &mut out, &mut err),
             ExitCode::from(1)
         );
         let doc: Value = aterm_json::from_slice(&out).unwrap();

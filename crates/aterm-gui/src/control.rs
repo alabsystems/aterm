@@ -6161,6 +6161,9 @@ fn release_connection_claims(store: &Store, proxy: Option<&EventLoopProxy<Wake>>
     for handle in handles {
         control_session::release_connection_lease(&handle.ctx, conn);
         crate::native_act::connection_closed(&handle.ctx, conn);
+        if crate::native_act::retain_exec_claim(&handle.ctx, conn) {
+            continue;
+        }
         let by = aterm_slog::Actor::Aterm;
         let released =
             crate::session_timeline::publish_release_supervisor(&handle.ctx, Some(conn), now, by)
@@ -7761,7 +7764,7 @@ impl<'a> DeadlineRead<'a> {
 
 #[cfg(target_os = "macos")]
 fn enter_detached_peer_drain(stream: &CtlStream, refused: std::io::Error) -> std::io::Result<()> {
-    if refused.raw_os_error() != Some(libc::EINVAL) {
+    if !peer_detached(&refused) {
         return Err(refused);
     }
     stream.set_nonblocking(true)
@@ -7770,6 +7773,30 @@ fn enter_detached_peer_drain(stream: &CtlStream, refused: std::io::Error) -> std
 #[cfg(not(target_os = "macos"))]
 fn enter_detached_peer_drain(_stream: &CtlStream, refused: std::io::Error) -> std::io::Result<()> {
     Err(refused)
+}
+
+/// Whether `refused`, a socket option's refusal, is macOS saying the peer closed: XNU refuses
+/// every option on a socket both of whose directions are shut (EINVAL), though what the peer
+/// wrote before it closed is still there to read.
+#[cfg(target_os = "macos")]
+fn peer_detached(refused: &std::io::Error) -> bool {
+    refused.raw_os_error() == Some(libc::EINVAL)
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn peer_detached(_refused: &std::io::Error) -> bool {
+    false
+}
+
+/// Bound `stream`'s next write by `timeout` (`None`: no bound). A socket whose peer closed takes
+/// no option on macOS ([`peer_detached`]), and needs none: a write to it fails at once on its
+/// own, and an answer already written, read and acknowledged before the close is not undone by
+/// the bound that could not be set after it.
+fn arm_write(stream: &CtlStream, timeout: Option<std::time::Duration>) -> std::io::Result<()> {
+    match stream.set_write_timeout(timeout) {
+        Err(refused) if peer_detached(&refused) => Ok(()),
+        set => set,
+    }
 }
 
 fn read_authenticated_request_line(
@@ -9670,6 +9697,7 @@ fn serve_session_verb(
         return crate::native_act::serve_codex_rotation(self_ctx, master, rest);
     }
     if verb == "codex-exec-handoff" {
+        note_connection_claim();
         return crate::native_act::serve_codex_exec_handoff(self_ctx, master, rest);
     }
     if verb == "native-observe" {

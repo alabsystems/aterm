@@ -2258,8 +2258,8 @@ pub(crate) enum UpdateRequest {
 pub(crate) enum HarnessRequest {
     /// Read the harness's ledgers again, off the event loop, and republish (the page's Refresh, and the route's arrival).
     Refresh,
-    /// Refresh the Lab page's local account observation off the event loop.
-    LabRefresh,
+    /// Refresh the Lab page's local Claude account observation off the event loop.
+    LabAccountsRefresh,
     /// Write session `session`'s own Autopilot word (a press on its row's Cruise, Land or Off).
     Autopilot {
         session: u64,

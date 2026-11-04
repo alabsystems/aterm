@@ -477,7 +477,7 @@ fn guarded_file_artifact_echoes_only_the_server_nonce() {
         BufReader::new(&server).read_line(&mut line).unwrap();
         line
     });
-    let mut reader = BufReader::new(&client);
+    let mut reader = reply_on(&client);
     acknowledge_artifact_reply(&client, &mut reader, "image", "image shot.png").unwrap();
     assert_eq!(
         peer.join().unwrap(),
@@ -490,7 +490,7 @@ fn in_memory_image_never_probes_for_an_optional_ack_challenge() {
     let (client, mut server) = CtlStream::pair().unwrap();
     server.write_all(b"not-an-ack-challenge\n").unwrap();
     server.flush().unwrap();
-    let mut reader = BufReader::new(&client);
+    let mut reader = reply_on(&client);
     acknowledge_artifact_reply(&client, &mut reader, "image", "image --bytes").unwrap();
 
     let mut untouched = String::new();
@@ -501,7 +501,7 @@ fn in_memory_image_never_probes_for_an_optional_ack_challenge() {
 #[test]
 fn guarded_artifact_reply_accepts_a_legacy_server_without_hanging() {
     let (client, _legacy_server) = CtlStream::pair().unwrap();
-    let mut reader = BufReader::new(&client);
+    let mut reader = reply_on(&client);
     acknowledge_artifact_reply(&client, &mut reader, "image", "image shot.png")
         .expect("an absent optional challenge is a bounded legacy fallback");
 }
@@ -524,7 +524,7 @@ fn guarded_payload_ack_precedes_the_user_output_handoff() {
         acked_tx.send(()).unwrap();
     });
 
-    let mut reader = BufReader::new(&client);
+    let mut reader = reply_on(&client);
     let mut status = String::new();
     reader.read_line(&mut status).unwrap();
     let status = status.trim_end();
@@ -4325,4 +4325,54 @@ fn read_control_token_file_rejects_internal_whitespace_and_control_chars() {
     }
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir(&dir);
+}
+
+/// A read of a nonblocking stream says `WouldBlock` at once, so a reply that arrives here was
+/// waited for in `poll(2)`, where a shutdown of the connection cannot pass it by.
+#[cfg(unix)]
+#[test]
+fn a_reply_is_waited_for_in_poll() {
+    use std::io::{BufRead as _, Write as _};
+    let (near, far) = aterm_uds::kept_out(aterm_uds::CtlStream::pair).unwrap();
+    near.set_nonblocking(true).unwrap();
+    near.set_read_timeout(Some(std::time::Duration::from_secs(60)))
+        .unwrap();
+    let answering = std::thread::spawn(move || {
+        let mut line = String::new();
+        std::io::BufReader::new(&far).read_line(&mut line).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        (&far).write_all(b"OK\n").unwrap();
+        far
+    });
+    let served = exchange_on(
+        near,
+        "/nonexistent/c.sock",
+        "version\n",
+        "version",
+        None,
+        false,
+        &redial::Redial::none(),
+    );
+    assert_eq!(served.unwrap(), std::process::ExitCode::SUCCESS);
+    drop(answering.join().unwrap());
+}
+
+/// The status probe's read waits the same way, within its own deadline.
+#[cfg(unix)]
+#[test]
+fn a_probe_reply_is_waited_for_in_poll() {
+    use std::io::Write as _;
+    let (near, far) = aterm_uds::kept_out(aterm_uds::CtlStream::pair).unwrap();
+    near.set_nonblocking(true).unwrap();
+    let answering = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        (&far).write_all(b"k").unwrap();
+        far
+    });
+    let mut probe = ProbeIo {
+        stream: &near,
+        deadline: ProbeDeadline::after(std::time::Duration::from_secs(60)),
+    };
+    assert_eq!(probe.read(&mut [0]).unwrap(), 1);
+    drop(answering.join().unwrap());
 }

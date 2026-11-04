@@ -189,12 +189,24 @@ impl KeeperClient {
         read_frame(&self.stream)
     }
 
-    fn answer<T>(&self, read: impl FnOnce(&Self) -> io::Result<T>) -> io::Result<T> {
+    /// Send `frame` and `read` its answer within [`WELCOME_WAIT`], the keeper's peer check
+    /// included, then go back to the frame wait.
+    ///
+    /// The longer wait is set before `frame` goes out, while the keeper cannot yet have answered:
+    /// a keeper may close once it has, and macOS refuses a socket option on a unix socket whose
+    /// peer closed (EINVAL), though what the keeper wrote is still there to read. For the same
+    /// reason a failed reset does not undo an answer already read; it leaves the longer wait,
+    /// still a bound, on the socket.
+    fn exchange<T>(
+        &self,
+        frame: &Frame,
+        read: impl FnOnce(&Self) -> io::Result<T>,
+    ) -> io::Result<T> {
         self.stream
             .set_read_timeout(Some(WELCOME_WAIT.max(self.frame_wait)))?;
-        let answer = read(self);
-        let reset = self.stream.set_read_timeout(Some(self.frame_wait));
-        answer.and_then(|value| reset.map(|()| value))
+        let answer = self.send(frame, None).and_then(|()| read(self));
+        let _reset = self.stream.set_read_timeout(Some(self.frame_wait));
+        answer
     }
 
     /// Send HELLO as a window and collect the WELCOME's offers.
@@ -213,7 +225,7 @@ impl KeeperClient {
         marker: Option<MarkerRef>,
         journal: bool,
     ) -> io::Result<Vec<Offered>> {
-        self.send(
+        self.exchange(
             &Frame::Hello {
                 proto: PROTO,
                 class: PeerClass::App,
@@ -221,9 +233,8 @@ impl KeeperClient {
                 build: build.to_string(),
                 marker,
             },
-            None,
-        )?;
-        self.answer(|c| c.welcome_offers(journal))
+            |c| c.welcome_offers(journal),
+        )
     }
 
     fn welcome_offers(&self, journal: bool) -> io::Result<Vec<Offered>> {
@@ -301,7 +312,7 @@ impl KeeperClient {
         marker: Option<MarkerRef>,
         journal: bool,
     ) -> io::Result<()> {
-        self.send(
+        self.exchange(
             &Frame::Hello {
                 proto: PROTO,
                 class: PeerClass::App,
@@ -309,26 +320,29 @@ impl KeeperClient {
                 build: build.to_string(),
                 marker,
             },
-            None,
-        )?;
-        self.answer(|c| match c.recv()?.map(|i| i.frame) {
+            Self::empty_welcome,
+        )
+    }
+
+    fn empty_welcome(&self) -> io::Result<()> {
+        match self.recv()?.map(|i| i.frame) {
             Some(Frame::Welcome {
                 offers: 0,
                 identity,
                 caps,
                 ..
-            }) => c.welcomed(identity, caps),
+            }) => self.welcomed(identity, caps),
             other => Err(protocol(format!(
                 "expected an empty WELCOME, got {other:?}"
             ))),
-        })
+        }
     }
 
     /// Send HELLO as a status client and ask for the status text.
     /// # Errors
     /// The exchange failing or the keeper answering out of protocol.
     pub fn status(&self, build: &str) -> io::Result<String> {
-        self.send(
+        self.exchange(
             &Frame::Hello {
                 proto: PROTO,
                 class: PeerClass::Status,
@@ -336,29 +350,17 @@ impl KeeperClient {
                 build: build.to_string(),
                 marker: None,
             },
-            None,
+            Self::empty_welcome,
         )?;
-        self.answer(|c| match c.recv()?.map(|i| i.frame) {
-            Some(Frame::Welcome {
-                offers: 0,
-                identity,
-                caps,
-                ..
-            }) => c.welcomed(identity, caps),
-            other => Err(protocol(format!(
-                "expected an empty WELCOME, got {other:?}"
-            ))),
-        })?;
-        self.send(
+        self.exchange(
             &Frame::Status {
                 text: String::new(),
             },
-            None,
-        )?;
-        self.answer(|c| match c.recv()?.map(|i| i.frame) {
-            Some(Frame::Status { text }) => Ok(text),
-            other => Err(protocol(format!("expected STATUS, got {other:?}"))),
-        })
+            |c| match c.recv()?.map(|i| i.frame) {
+                Some(Frame::Status { text }) => Ok(text),
+                other => Err(protocol(format!("expected STATUS, got {other:?}"))),
+            },
+        )
     }
 
     /// Read every frame already waiting, keeping only a SYNC answer; returns `false` once the keeper is gone.

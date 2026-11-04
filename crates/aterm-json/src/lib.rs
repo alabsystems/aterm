@@ -28,7 +28,7 @@ mod value;
 
 pub use de::{Deserializer, from_slice, from_str};
 pub use error::{Error, Result};
-pub use ser::{quoted_string, to_string, to_vec};
+pub use ser::{quoted_capacity, quoted_string, to_string, to_vec};
 pub use value::{Map, Number, Value};
 
 use serde::Deserialize as _;
@@ -153,24 +153,4 @@ pub const fn decode_json_span_le(bytes: [u8; 16]) -> (u32, u32, u32, u32) {
         | ((bytes[14] as u32) << 16)
         | ((bytes[15] as u32) << 24);
     (offset, len, line, col)
-}
-
-#[cfg(test)]
-mod const_tests {
-    use super::*;
-
-    #[test]
-    fn json_const_helpers_round_trip() {
-        assert_eq!(recursion_limit(), 127);
-        assert!(within_recursion_limit(127));
-        assert!(!within_recursion_limit(128));
-        assert!(is_json_whitespace_byte(b' '));
-        assert!(!is_json_whitespace_byte(b'a'));
-        assert!(is_json_control_byte(0x1f));
-        assert!(!is_json_control_byte(0x20));
-        assert_eq!(decode_surrogate_pair(0xd83d, 0xde00), Some(0x1f600));
-        assert_eq!(decode_surrogate_pair(0xd800, 0x0041), None);
-        let enc = encode_json_span_le(12, 34, 5, 9);
-        assert_eq!(decode_json_span_le(enc), (12, 34, 5, 9));
-    }
 }

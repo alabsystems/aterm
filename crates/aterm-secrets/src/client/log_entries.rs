@@ -776,7 +776,7 @@ pub(super) fn overlay_log_commons_onto_document(
     let Some(opened) = log.open_audience_entries(identity)? else {
         return Ok(false);
     };
-    overlay_log_commons_with_opened(log, &opened, doc, readmit)
+    overlay_log_commons_with_opened(log, &opened, &identity.recipient(), doc, readmit)
 }
 
 /// [`overlay_log_commons_onto_document`] with the audiences already opened; a Mac `readmit` names
@@ -784,10 +784,12 @@ pub(super) fn overlay_log_commons_onto_document(
 fn overlay_log_commons_with_opened(
     log: &Log,
     opened: &crate::membership_log::entries::OpenedAudienceEntries,
+    mine: &Recipient,
     doc: &mut Document,
     readmit: Option<&BTreeSet<Recipient>>,
 ) -> crate::Result<bool> {
     let mut changed = false;
+    let flight = &Flight::of_reader(log, mine);
     let roster = roster_from_doc_or_opened(Some(doc), Some(opened), Some(log));
     let initial_doc_recipients: BTreeSet<Recipient> = doc
         .machines()
@@ -799,9 +801,17 @@ fn overlay_log_commons_with_opened(
         if admins.contains(&machine.name) && admins.len() <= 1 {
             continue;
         }
+        // A machine a batch still arriving may yet wrap or leave out stays until it settles.
         if let Ok(recipient) = Recipient::parse(&machine.recipient)
             && (log.recipient_is_removed(&recipient)
-                || kept_out(log, &EpochAudience::Everyone, &recipient, readmit)
+                || (kept_out(log, flight, &EpochAudience::Everyone, &recipient, readmit)
+                    && !undecided_out(
+                        log,
+                        flight,
+                        &[EpochAudience::Everyone],
+                        &recipient,
+                        readmit,
+                    ))
                 || machine_denied_by_roster_or_log(roster.as_ref(), log, &machine.name, &recipient))
             && doc.remove_machine(&machine.name, true) == Ok(true)
         {
@@ -830,7 +840,8 @@ fn overlay_log_commons_with_opened(
                 || code_only.contains(&recipient.to_bech32())
                 || log.recipient_is_removed(&recipient)
                 || membership.member_node_removed(member)
-                || log.left_out(opened, &EpochAudience::Everyone, actor)
+                || (log.left_out(opened, &EpochAudience::Everyone, actor)
+                    && !flight.of(&EpochAudience::Everyone).contains(&recipient))
                 || roster
                     .as_ref()
                     .is_some_and(|r| member_denied_by_roster(r, member))
@@ -878,9 +889,12 @@ fn overlay_log_commons_with_opened(
             .members()
             .iter()
             .filter(|(actor, member)| {
+                let recipient = member.binding.recipient();
                 !membership.member_node_removed(member)
-                    && !log.left_out(opened, &EpochAudience::Commons, actor)
-                    && !log.left_out(opened, &EpochAudience::Everyone, actor)
+                    && !(log.left_out(opened, &EpochAudience::Commons, actor)
+                        && !flight.of(&EpochAudience::Commons).contains(&recipient))
+                    && !(log.left_out(opened, &EpochAudience::Everyone, actor)
+                        && !flight.of(&EpochAudience::Everyone).contains(&recipient))
                     && !roster
                         .as_ref()
                         .is_some_and(|r| member_denied_by_roster(r, member))
@@ -899,9 +913,12 @@ fn overlay_log_commons_with_opened(
                 let Ok(r) = Recipient::parse(&m.recipient) else {
                     return false;
                 };
+                let both = [EpochAudience::Commons, EpochAudience::Everyone];
                 !log.recipient_is_removed(&r)
-                    && !kept_out(log, &EpochAudience::Commons, &r, readmit)
-                    && !kept_out(log, &EpochAudience::Everyone, &r, readmit)
+                    && (both
+                        .iter()
+                        .all(|audience| !kept_out(log, flight, audience, &r, readmit))
+                        || undecided_out(log, flight, &both, &r, readmit))
                     && !machine_denied_by_roster_or_log(roster.as_ref(), log, &m.name, &r)
                     && (cur_host_set.contains(&m.name) || log_commons_recipients.contains(&r))
             })
@@ -935,7 +952,8 @@ pub(super) fn overlay_log_onto_document(
     let Some(opened) = log.open_audience_entries(identity)? else {
         return Ok(false);
     };
-    let mut changed = overlay_log_commons_with_opened(log, &opened, doc, readmit)?;
+    let mut changed =
+        overlay_log_commons_with_opened(log, &opened, &identity.recipient(), doc, readmit)?;
 
     if opened.fully_unwrapped_audiences.is_empty() {
         return Ok(changed);
@@ -1312,9 +1330,10 @@ pub(crate) fn local_swarm_roster_for_log_held(
         ));
     }
     let mut combined = super::roster::base_swarm_roster_held(paths, lock)?;
-    if let Some(identity) = super::read_identity(paths)?
+    let identity = super::read_identity(paths)?;
+    if let Some(identity) = &identity
         && let Some(entries) = log.open_audience_entries_named(
-            &identity,
+            identity,
             &Audience::Everyone,
             &[crate::swarm_roster::ROSTER_ENTRY],
         )?
@@ -1326,7 +1345,8 @@ pub(crate) fn local_swarm_roster_for_log_held(
         }
     }
     let mut roster = combined.unwrap_or_default();
-    super::roster::overlay_log_membership(log, &mut roster);
+    let reader = identity.as_ref().map(Identity::recipient);
+    super::roster::overlay_log_membership(log, reader.as_ref(), &mut roster);
     Ok((!roster.members.is_empty()
         || !roster.deny_labels.is_empty()
         || !roster.deny_nodes.is_empty())
@@ -1602,7 +1622,8 @@ pub(super) fn adopt_held_draft(
 /// the command whose version has landed for that one deadline, not one each.
 ///
 /// # Errors
-/// The complete draft cannot be retained, or the records file cannot be read or written.
+/// The complete draft cannot be retained, the records file cannot be read or written, or the
+/// crossed mark cannot be looked for before the posts ([`super::records_bound`]).
 pub(super) fn keep_drafted_until(
     paths: &Paths,
     drafted: &Drafted,
@@ -1636,15 +1657,17 @@ pub(super) fn keep_drafted_until(
         return Ok(());
     }
     let by = posts_by.unwrap_or_else(super::fan_out::one_exchange);
-    let _ = super::fan_out::post_records_to(urls, &store.encode(), by);
+    let bound = super::records_bound(paths, &store)?;
+    let _ = super::fan_out::post_records_to(urls, &store.encode(), bound, by);
     Ok(())
 }
 
 /// The recipients of each locker `doc` seals, by audience, less any `log` removed or left out of
-/// `[everyone]` (unless `readmit` lets it back in).
+/// `[everyone]` (unless `readmit` lets it back in, or its `Wrap` may still arrive: `flight`).
 fn plan_recipients_of(
     doc: &Document,
     log: &Log,
+    flight: &Flight,
     readmit: Option<&BTreeSet<Recipient>>,
 ) -> crate::Result<BTreeMap<Audience, BTreeSet<Recipient>>> {
     let mut out = BTreeMap::new();
@@ -1653,7 +1676,7 @@ fn plan_recipients_of(
         for text in &plan.recipients {
             let recipient = Recipient::parse(text).map_err(|_| Error::new("bad machine key"))?;
             if !log.recipient_is_removed(&recipient)
-                && !kept_out(log, &EpochAudience::Everyone, &recipient, readmit)
+                && !kept_out(log, flight, &EpochAudience::Everyone, &recipient, readmit)
                 && !recipient_denied_by_roster_or_log(None, log, &recipient)
             {
                 recipients.insert(recipient);
@@ -1813,16 +1836,112 @@ pub(super) struct Base<'a> {
     pub(super) readmit: Option<&'a BTreeSet<Recipient>>,
 }
 
+/// What the causally newest epochs leave out only while another Mac's batch may still be
+/// arriving, for the Mac whose recipient is `mine`, by audience: the recipients in flight
+/// ([`Log::in_flight`]), whose missing `Wrap`s a writer, an overlay or a mint does not read as
+/// left out on purpose, and the undecided ones ([`Log::undecided`]), which a writer neither wraps
+/// nor reads as departed and an overlay keeps in its document. It is read once, from the log as
+/// it stood before anything this Mac signs now: in a batch that mints several audiences, each
+/// new epoch is the newest of its audience in the log the batch mutates and has nothing in
+/// flight, while the batch's `opened` view still reads the epochs before it.
+pub(super) struct Flight {
+    in_flight: BTreeMap<EpochAudience, BTreeSet<Recipient>>,
+    undecided: BTreeMap<EpochAudience, BTreeSet<Recipient>>,
+    none: BTreeSet<Recipient>,
+}
+
+impl Flight {
+    /// For a writer or an overlay: `[everyone]`'s and Commons'.
+    fn of_reader(log: &Log, mine: &Recipient) -> Self {
+        Self::of_audiences(log, mine, [EpochAudience::Everyone, EpochAudience::Commons])
+    }
+
+    /// For a batch of re-keys over `opened`, signed by the Mac whose seat is `me`: `[everyone]`'s,
+    /// Commons' and each host list's `opened` reads. Nothing is in flight for a Mac with no seat.
+    pub(super) fn of_batch(
+        log: &Log,
+        opened: &crate::membership_log::entries::OpenedAudienceEntries,
+        me: &MemberId,
+    ) -> Self {
+        let Some(mine) = log.membership().get(me).map(|m| m.binding.recipient()) else {
+            return Self::empty();
+        };
+        let audiences: BTreeSet<EpochAudience> = [EpochAudience::Everyone, EpochAudience::Commons]
+            .into_iter()
+            .chain(opened.maximal_epochs.keys().cloned())
+            .collect();
+        Self::of_audiences(log, &mine, audiences)
+    }
+
+    const fn empty() -> Self {
+        Self {
+            in_flight: BTreeMap::new(),
+            undecided: BTreeMap::new(),
+            none: BTreeSet::new(),
+        }
+    }
+
+    fn of_audiences(
+        log: &Log,
+        mine: &Recipient,
+        audiences: impl IntoIterator<Item = EpochAudience>,
+    ) -> Self {
+        let mut flight = Self::empty();
+        for audience in audiences {
+            flight
+                .in_flight
+                .insert(audience.clone(), log.in_flight(&audience, mine));
+            flight
+                .undecided
+                .insert(audience.clone(), log.undecided(&audience, mine));
+        }
+        flight
+    }
+
+    /// Those in flight in `audience`; none for one it was not read for.
+    fn of(&self, audience: &EpochAudience) -> &BTreeSet<Recipient> {
+        self.in_flight.get(audience).unwrap_or(&self.none)
+    }
+
+    /// Those undecided in `audience`; none for one it was not read for.
+    fn undecided(&self, audience: &EpochAudience) -> &BTreeSet<Recipient> {
+        self.undecided.get(audience).unwrap_or(&self.none)
+    }
+}
+
 /// Whether `log` leaves `recipient` out of `audience` on purpose, unless `readmit` lets it back
-/// in ([`Base::readmit`]).
+/// in ([`Base::readmit`]) or its missing `Wrap` may still arrive (`flight`).
 fn kept_out(
     log: &Log,
+    flight: &Flight,
     audience: &EpochAudience,
     recipient: &Recipient,
     readmit: Option<&BTreeSet<Recipient>>,
 ) -> bool {
     readmit.is_none_or(|readmit| !readmit.contains(recipient))
         && log.audience_left_out_recipient(audience, recipient)
+        && !flight.of(audience).contains(recipient)
+}
+
+/// Whether `recipient` is [`kept_out`] of some audience of `audiences` only while a batch may
+/// still decide it there ([`Flight::undecided`]): of each it is kept out of, it is undecided. A
+/// writer does not wrap it, nor read an epoch that wraps it as reaching a Mac that left, and an
+/// overlay keeps its machine in the document, until the batch settles.
+fn undecided_out(
+    log: &Log,
+    flight: &Flight,
+    audiences: &[EpochAudience],
+    recipient: &Recipient,
+    readmit: Option<&BTreeSet<Recipient>>,
+) -> bool {
+    let out: Vec<&EpochAudience> = audiences
+        .iter()
+        .filter(|audience| kept_out(log, flight, audience, recipient, readmit))
+        .collect();
+    !out.is_empty()
+        && out
+            .iter()
+            .all(|audience| flight.undecided(audience).contains(recipient))
 }
 
 /// Diff `doc` against `paths`'s seeded [`Log`] and draft the [`Body::Epoch`], [`Body::Wrap`],
@@ -1837,7 +1956,8 @@ fn kept_out(
 ///
 /// A name whose register holds concurrent values is left as it is unless `base.resolve` names it
 /// (a person's save, or a mirror's entry the merge of heads rules on): no other write settles a
-/// conflict.
+/// conflict. A fresh Commons epoch carries the control descriptor this edit is entitled to put;
+/// an unchanged, unopened descriptor leaves the current Commons epochs intact.
 pub(super) fn draft_document_diff(
     paths: &Paths,
     config: &Config,
@@ -1953,13 +2073,17 @@ pub(super) fn draft_document_diff_in_store(
         .filter_map(|m| Recipient::parse(&m.recipient).ok())
         .collect();
     let roster = roster_from_doc_or_opened(Some(doc), Some(&opened), Some(&log));
+    let flight = Flight::of_reader(&log, &identity.recipient());
     let everyone_log_recipients: BTreeSet<Recipient> = membership
         .members()
         .iter()
         .filter(|(m_actor, m)| {
             !log.recipient_is_removed(&m.binding.recipient())
                 && !membership.member_node_removed(m)
-                && !log.left_out(&opened, &EpochAudience::Everyone, m_actor)
+                && !(log.left_out(&opened, &EpochAudience::Everyone, m_actor)
+                    && !flight
+                        .of(&EpochAudience::Everyone)
+                        .contains(&m.binding.recipient()))
                 && !roster
                     .as_ref()
                     .is_some_and(|r| member_denied_by_roster(r, m))
@@ -1990,7 +2114,7 @@ pub(super) fn draft_document_diff_in_store(
         .collect();
     let mut base_recipients = base
         .doc
-        .map(|base_doc| plan_recipients_of(base_doc, &log, base.readmit))
+        .map(|base_doc| plan_recipients_of(base_doc, &log, &flight, base.readmit))
         .transpose()?
         .unwrap_or_default();
     // The same union as each plan's below (F15), so the log's members alone never read as a
@@ -2022,14 +2146,33 @@ pub(super) fn draft_document_diff_in_store(
     device.with_seed(|writer_seed| -> crate::Result<()> {
         for plan in &plans {
             let mut plan_recipients = BTreeSet::new();
+            // The plan's machines only a batch still arriving can decide ([`undecided_out`]):
+            // wrapped by nothing this edit mints, and no departure where an epoch wraps them.
+            let mut undecided = BTreeSet::new();
             for text in &plan.recipients {
                 let recipient =
                     Recipient::parse(text).map_err(|_| Error::new("bad machine key"))?;
-                if !log.recipient_is_removed(&recipient)
-                    && !kept_out(&log, &EpochAudience::Everyone, &recipient, base.readmit)
-                    && !recipient_denied_by_roster_or_log(None, &log, &recipient)
+                if log.recipient_is_removed(&recipient)
+                    || recipient_denied_by_roster_or_log(None, &log, &recipient)
                 {
+                    continue;
+                }
+                if !kept_out(
+                    &log,
+                    &flight,
+                    &EpochAudience::Everyone,
+                    &recipient,
+                    base.readmit,
+                ) {
                     plan_recipients.insert(recipient);
+                } else if undecided_out(
+                    &log,
+                    &flight,
+                    &[EpochAudience::Everyone],
+                    &recipient,
+                    base.readmit,
+                ) {
+                    undecided.insert(recipient);
                 }
             }
             if plan_recipients.is_empty() {
@@ -2111,10 +2254,11 @@ pub(super) fn draft_document_diff_in_store(
             });
             let departed_wrapped = minted_outside
                 || active_epochs.iter().any(|ep_id| {
-                    opened
-                        .wrapped_recipients
-                        .get(ep_id)
-                        .is_some_and(|wrapped| wrapped.iter().any(|r| !plan_recipients.contains(r)))
+                    opened.wrapped_recipients.get(ep_id).is_some_and(|wrapped| {
+                        wrapped
+                            .iter()
+                            .any(|r| !plan_recipients.contains(r) && !undecided.contains(r))
+                    })
                 });
             // An entry that leaves `[everyone]` (a `Delete`, or narrowed to a host list) leaves
             // its old value sealed under the epoch it was put at. Any member wraps `[everyone]`'s
@@ -2130,36 +2274,35 @@ pub(super) fn draft_document_diff_in_store(
                 });
             let reusable_epoch: Option<([u8; 32], [u8; 32])> = if !departed_wrapped
                 && !left_everyone
-                && let Some(ep_id) = sealing_epoch(&log, &opened, max_ids, &actor)
-            {
+                && let Some(ep_id) = sealing_epoch(
+                    &log,
+                    &opened,
+                    max_ids,
+                    identity,
+                    &plan_recipients,
+                    &undecided,
+                ) {
                 opened.unwrapped_keys.get(&ep_id).map(|key| (ep_id, **key))
             } else {
                 None
             };
 
             if let Some((epoch_id, epoch_key)) = reusable_epoch {
-                // Close any Wrap gaps across all active epochs of this audience that we hold,
-                // but those that may be a prefix of another Mac's batch.
-                let active: Vec<RecordId> = active_epochs.iter().copied().collect();
-                let unsettled = unsettled_of_others(&log, &active, &actor);
-                for ep_id in &active_epochs {
-                    let Some(ep_key) = opened.unwrapped_keys.get(ep_id) else {
-                        continue;
-                    };
-                    if unsettled.contains(ep_id) {
-                        continue;
-                    }
-                    let already = opened.wrapped_recipients.get(ep_id);
-                    for &recipient in &plan_recipients {
-                        if already.is_none_or(|set| !set.contains(&recipient)) {
-                            let wrap_rec = log
-                                .draft_wrap(&actor, authored_ms, *ep_id, ep_key, recipient)?
-                                .sign(writer_seed, incarnation)?;
-                            let _ = log.insert(wrap_rec.clone())?;
-                            minted.push(wrap_rec);
-                        }
-                    }
-                }
+                let author = AuthorCtx {
+                    actor: &actor,
+                    writer_seed,
+                    incarnation,
+                    authored_ms,
+                };
+                close_plan_gaps(
+                    &mut log,
+                    &opened,
+                    &author,
+                    &identity.recipient(),
+                    &active_epochs,
+                    &plan_recipients,
+                    &mut minted,
+                )?;
 
                 if let Some(doc_entries) = doc_map {
                     for (name, entry) in doc_entries {
@@ -2266,10 +2409,13 @@ pub(super) fn draft_document_diff_in_store(
                 .members()
                 .iter()
                 .filter(|(m_actor, m)| {
-                    !log.recipient_is_removed(&m.binding.recipient())
+                    let recipient = m.binding.recipient();
+                    !log.recipient_is_removed(&recipient)
                         && !membership.member_node_removed(m)
-                        && !log.left_out(&opened, &EpochAudience::Commons, m_actor)
-                        && !log.left_out(&opened, &EpochAudience::Everyone, m_actor)
+                        && !(log.left_out(&opened, &EpochAudience::Commons, m_actor)
+                            && !flight.of(&EpochAudience::Commons).contains(&recipient))
+                        && !(log.left_out(&opened, &EpochAudience::Everyone, m_actor)
+                            && !flight.of(&EpochAudience::Everyone).contains(&recipient))
                         && !roster
                             .as_ref()
                             .is_some_and(|r| member_denied_by_roster(r, m))
@@ -2281,6 +2427,8 @@ pub(super) fn draft_document_diff_in_store(
                         && !base_machine_recipients.contains(r)
                 })
                 .collect();
+            // As a plan's ([`undecided_out`]).
+            let mut commons_undecided = BTreeSet::new();
             if let Audience::Hosts(hosts) = &ctrl_entry.audience {
                 let by_name: BTreeMap<String, Recipient> = doc
                     .machines()
@@ -2291,14 +2439,23 @@ pub(super) fn draft_document_diff_in_store(
                             .flatten()
                     })
                     .collect();
+                let both = [EpochAudience::Commons, EpochAudience::Everyone];
                 for host in hosts {
-                    if let Some(&r) = by_name.get(host)
-                        && !log.recipient_is_removed(&r)
-                        && !kept_out(&log, &EpochAudience::Commons, &r, base.readmit)
-                        && !kept_out(&log, &EpochAudience::Everyone, &r, base.readmit)
-                        && !machine_denied_by_roster_or_log(roster.as_ref(), &log, host, &r)
+                    let Some(&r) = by_name.get(host) else {
+                        continue;
+                    };
+                    if log.recipient_is_removed(&r)
+                        || machine_denied_by_roster_or_log(roster.as_ref(), &log, host, &r)
+                    {
+                        continue;
+                    }
+                    if both
+                        .iter()
+                        .all(|audience| !kept_out(&log, &flight, audience, &r, base.readmit))
                     {
                         commons_recipients.insert(r);
+                    } else if undecided_out(&log, &flight, &both, &r, base.readmit) {
+                        commons_undecided.insert(r);
                     }
                 }
             }
@@ -2324,43 +2481,40 @@ pub(super) fn draft_document_diff_in_store(
                 let departed_wrapped = minted_outside
                     || active_epochs.iter().any(|ep_id| {
                         opened.wrapped_recipients.get(ep_id).is_some_and(|wrapped| {
-                            wrapped.iter().any(|r| !commons_recipients.contains(r))
+                            wrapped.iter().any(|r| {
+                                !commons_recipients.contains(r) && !commons_undecided.contains(r)
+                            })
                         })
                     });
                 let reusable_commons = if !departed_wrapped
-                    && let Some(ep_id) = sealing_epoch(&log, &opened, max_ids, &actor)
-                {
+                    && let Some(ep_id) = sealing_epoch(
+                        &log,
+                        &opened,
+                        max_ids,
+                        identity,
+                        &commons_recipients,
+                        &commons_undecided,
+                    ) {
                     opened.unwrapped_keys.get(&ep_id).map(|key| (ep_id, **key))
                 } else {
                     None
                 };
                 if let Some((ep_id, ep_key)) = reusable_commons {
-                    let active: Vec<RecordId> = active_epochs.iter().copied().collect();
-                    let unsettled = unsettled_of_others(&log, &active, &actor);
-                    for active_id in &active_epochs {
-                        let Some(active_key) = opened.unwrapped_keys.get(active_id) else {
-                            continue;
-                        };
-                        if unsettled.contains(active_id) {
-                            continue;
-                        }
-                        let already = opened.wrapped_recipients.get(active_id);
-                        for &recipient in &commons_recipients {
-                            if already.is_none_or(|set| !set.contains(&recipient)) {
-                                let wrap_rec = log
-                                    .draft_wrap(
-                                        &actor,
-                                        authored_ms,
-                                        *active_id,
-                                        active_key,
-                                        recipient,
-                                    )?
-                                    .sign(writer_seed, incarnation)?;
-                                let _ = log.insert(wrap_rec.clone())?;
-                                minted.push(wrap_rec);
-                            }
-                        }
-                    }
+                    let author = AuthorCtx {
+                        actor: &actor,
+                        writer_seed,
+                        incarnation,
+                        authored_ms,
+                    };
+                    close_plan_gaps(
+                        &mut log,
+                        &opened,
+                        &author,
+                        &identity.recipient(),
+                        &active_epochs,
+                        &commons_recipients,
+                        &mut minted,
+                    )?;
                     if commons_descriptor_due(
                         opened
                             .fully_unwrapped_audiences
@@ -2384,7 +2538,17 @@ pub(super) fn draft_document_diff_in_store(
                         let _ = log.insert(put_rec.clone())?;
                         minted.push(put_rec);
                     }
-                } else {
+                } else if commons_descriptor_due(
+                    opened
+                        .fully_unwrapped_audiences
+                        .contains(&EpochAudience::Commons),
+                    true,
+                    opened.commons_control.as_ref().map(SecretBytes::as_slice),
+                    ctrl_entry.value.as_slice(),
+                    base_commons_value
+                        .as_ref()
+                        .map(|value| value.as_ref().map(SecretBytes::as_slice)),
+                ) {
                     let next_gen = opened
                         .max_generation
                         .get(&EpochAudience::Commons)
@@ -2405,31 +2569,17 @@ pub(super) fn draft_document_diff_in_store(
                         let _ = log.insert(wrap_rec.clone())?;
                         minted.push(wrap_rec);
                     }
-                    // The descriptor again only where this Mac opens all of Commons, or where
-                    // the person changed it (F21 rule 7, `commons_descriptor_due`).
-                    if commons_descriptor_due(
-                        opened
-                            .fully_unwrapped_audiences
-                            .contains(&EpochAudience::Commons),
-                        true,
-                        opened.commons_control.as_ref().map(SecretBytes::as_slice),
-                        ctrl_entry.value.as_slice(),
-                        base_commons_value
-                            .as_ref()
-                            .map(|value| value.as_ref().map(SecretBytes::as_slice)),
-                    ) {
-                        let put_rec = log
-                            .draft_commons_put(
-                                &actor,
-                                authored_ms,
-                                ep_id,
-                                &ep_key,
-                                ctrl_entry.value.as_slice(),
-                            )?
-                            .sign(writer_seed, incarnation)?;
-                        let _ = log.insert(put_rec.clone())?;
-                        minted.push(put_rec);
-                    }
+                    let put_rec = log
+                        .draft_commons_put(
+                            &actor,
+                            authored_ms,
+                            ep_id,
+                            &ep_key,
+                            ctrl_entry.value.as_slice(),
+                        )?
+                        .sign(writer_seed, incarnation)?;
+                    let _ = log.insert(put_rec.clone())?;
+                    minted.push(put_rec);
                 }
             }
         }
@@ -2466,7 +2616,7 @@ pub(super) fn draft_document_diff_in_store(
             .filter_map(|m| Recipient::parse(&m.recipient).ok())
             .filter(|r| {
                 !log.recipient_is_removed(r)
-                    && !kept_out(&log, &EpochAudience::Everyone, r, base.readmit)
+                    && !kept_out(&log, &flight, &EpochAudience::Everyone, r, base.readmit)
                     && !recipient_denied_by_roster_or_log(None, &log, r)
             })
             .collect();
@@ -2845,21 +2995,44 @@ mod lineage_tests {
 pub(super) fn post_records_best_effort(paths: &Paths, wire: &[u8]) {
     if let Ok(Some(cfg)) = super::config(paths)
         && let Source::Url(url) = &cfg.source
+        && let Ok(bound) =
+            super::load_records(paths).and_then(|store| super::records_bound(paths, &store))
     {
-        let _ = transport::post_records(url, wire);
+        let _ = transport::post_records_answered_until(url, wire, bound, None);
     }
 }
 
-/// The epoch a writer seals an audience's next entries under, of `newest` (its causally newest
-/// epochs): its one newest epoch, or the lowest id among [`secure_twins`]. `None` where they are
-/// concurrent with distinct recipient sets (the tender coalesces them), and where one `me` did
-/// not mint may be a prefix of its minter's batch ([`unsettled_of_others`]): the rest of that
-/// batch may wrap a recipient the writer's plan leaves out, so the writer mints a fresh epoch.
+#[cfg(test)]
+thread_local! {
+    /// The negative control of [`sealing_epoch`]'s reuse of a batch still arriving: while set, a
+    /// writer seals under no epoch another Mac's batch may still be arriving for, and mints a
+    /// fresh one instead.
+    pub(super) static FRESH_OVER_PREFIX: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// The negative control of [`close_plan_gaps`] on a batch still arriving: while set, a writer
+    /// wraps no epoch another Mac's batch may still be arriving for, as it once skipped them
+    /// whole, so a Mac new to the plan cannot open what the edit seals under it.
+    pub(super) static PREFIX_GAPS_SKIPPED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// The epoch a writer, the Mac of `identity`, seals an audience's next entries under, of
+/// `newest` (its causally newest epochs): its one newest epoch, or the lowest id among
+/// [`secure_twins`]. `None` where they are concurrent with distinct recipient sets (the tender
+/// coalesces them), and where the rest of a batch this log may hold only a prefix of could still
+/// wrap a recipient outside `plan`, the writer's recipients, and `undecided`, those of its plan
+/// only that batch can decide ([`Log::batch_may_wrap`]: a Mac a `Remove` the minter did not know
+/// took out, or one the person left out of the plan): the writer then mints a fresh epoch. A
+/// batch still arriving that wraps only Macs the plan keeps or leaves to it is sealed under, as a
+/// settled one is: a fresh epoch would cost an epoch and a `Wrap` per Mac for nothing, and would
+/// decide for good, by leaving them out, the Macs whose `Wrap`s that batch decides.
 fn sealing_epoch(
     log: &Log,
     opened: &crate::membership_log::entries::OpenedAudienceEntries,
     newest: &[RecordId],
-    me: &MemberId,
+    identity: &Identity,
+    plan: &BTreeSet<Recipient>,
+    undecided: &BTreeSet<Recipient>,
 ) -> Option<RecordId> {
     let id = match newest {
         [one] => *one,
@@ -2873,9 +3046,64 @@ fn sealing_epoch(
         }
         _ => return None,
     };
-    unsettled_of_others(log, newest, me)
-        .is_empty()
+    #[cfg(test)]
+    if FRESH_OVER_PREFIX.with(std::cell::Cell::get) && !log.unsettled(newest).is_empty() {
+        return None;
+    }
+    let mine = identity.recipient();
+    newest
+        .iter()
+        .all(|epoch| {
+            log.batch_may_wrap(epoch, &mine)
+                .iter()
+                .all(|r| plan.contains(r) || undecided.contains(r))
+        })
         .then_some(id)
+}
+
+/// Before a writer seals under a reused epoch: wrap each of `active` (the audience's newest and
+/// winning epochs) whose key `opened` holds to each of `recipients` (the plan) that lacks a
+/// counting `Wrap` of it. Of an epoch another Mac's batch may still be arriving for
+/// ([`unsettled_of_others`]), only a recipient the rest of that batch cannot bring
+/// ([`Log::batch_may_wrap`] for `mine`): one it may, it wraps itself, and a Mac new to the plan
+/// (an approval) still opens what the edit seals there.
+fn close_plan_gaps(
+    log: &mut Log,
+    opened: &crate::membership_log::entries::OpenedAudienceEntries,
+    author: &AuthorCtx<'_>,
+    mine: &Recipient,
+    active: &BTreeSet<RecordId>,
+    recipients: &BTreeSet<Recipient>,
+    minted: &mut Vec<Record>,
+) -> crate::Result<()> {
+    let ids: Vec<RecordId> = active.iter().copied().collect();
+    let unsettled = unsettled_of_others(log, &ids, author.actor);
+    for ep_id in active {
+        let Some(ep_key) = opened.unwrapped_keys.get(ep_id) else {
+            continue;
+        };
+        let arriving = if unsettled.contains(ep_id) {
+            #[cfg(test)]
+            if PREFIX_GAPS_SKIPPED.with(std::cell::Cell::get) {
+                continue;
+            }
+            log.batch_may_wrap(ep_id, mine)
+        } else {
+            BTreeSet::new()
+        };
+        let already = opened.wrapped_recipients.get(ep_id);
+        for &recipient in recipients {
+            if already.is_none_or(|set| !set.contains(&recipient)) && !arriving.contains(&recipient)
+            {
+                let wrap_rec = log
+                    .draft_wrap(author.actor, author.authored_ms, *ep_id, ep_key, recipient)?
+                    .sign(author.writer_seed, author.incarnation)?;
+                let _ = log.insert(wrap_rec.clone())?;
+                minted.push(wrap_rec);
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(super) struct AuthorCtx<'a> {
@@ -3370,9 +3598,48 @@ pub(super) fn draft_retire_in_log_with(
     Ok(minted)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The negative control of a host list's in-flight recipients: while set,
+    /// [`carried_audience_recipients`] carries a host list's recipients only from the `Wrap`s its
+    /// newest epochs hold, as it once did, so a removal over a prefix of another Mac's rotation of
+    /// the list leaves out the hosts that rotation still wraps.
+    pub(super) static HOSTS_FLIGHT_BLIND: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// The negative control of a batch's one [`Flight`]: while set, each audience a batch re-keys
+    /// after its first mint reads what is in flight from the log the batch mutates, as it once
+    /// did, where that mint is the newest epoch and has nothing in flight.
+    pub(super) static FLIGHT_AFTER_MINT: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// [`FLIGHT_AFTER_MINT`]'s fresh read of what is in flight, while it is set.
+#[cfg(test)]
+fn flight_after_mint(
+    log: &Log,
+    opened: &crate::membership_log::entries::OpenedAudienceEntries,
+    me: &MemberId,
+) -> Option<Flight> {
+    FLIGHT_AFTER_MINT
+        .with(std::cell::Cell::get)
+        .then(|| Flight::of_batch(log, opened, me))
+}
+
+/// The recipients a new epoch of `audience` carries over: each of `active_members` that the log
+/// has not removed, `exclude_recipients` does not name, no roster denies and neither `audience`
+/// nor `[everyone]` leaves out on purpose, and each recipient every newest epoch of `audience`
+/// wraps (a Mac with no seat) on the same terms. A missing `Wrap` that another Mac's batch may
+/// still deliver (`flight`, read before the batch's first mint) is no leaving out: a removal on a
+/// Mac that holds only a prefix of another's rotation keeps the Macs that rotation still wraps.
+/// A host list, whose recipients come from its epochs alone (a caller names no members for it),
+/// carries those in-flight recipients of its own on the same terms. A Mac with no seat whose
+/// `[everyone]` `Wrap` a batch may still bring ([`Log::undecided`]) reads as left out of
+/// `[everyone]` here, and so of every audience: the tender waits on that batch within its settle
+/// grace before it re-keys one (`remove::everyone_wait`).
 pub(super) fn carried_audience_recipients(
     log: &Log,
     opened: &crate::membership_log::entries::OpenedAudienceEntries,
+    flight: &Flight,
     audience: &EpochAudience,
     active_members: &BTreeSet<Recipient>,
     exclude_recipients: &BTreeSet<Recipient>,
@@ -3380,12 +3647,18 @@ pub(super) fn carried_audience_recipients(
     let removed = log.removed_recipients();
     let roster = roster_from_doc_or_opened(None, Some(opened), Some(log));
     let membership = log.membership();
+    let flight_everyone = flight.of(&EpochAudience::Everyone);
+    let flight = flight.of(audience);
+    let left = |flight: &BTreeSet<Recipient>, aud: &EpochAudience, r: &Recipient| {
+        log.audience_left_out_recipient(aud, r) && !flight.contains(r)
+    };
     let mut has_active_seat: BTreeSet<Recipient> = BTreeSet::new();
     let mut has_left_out_seat: BTreeSet<Recipient> = BTreeSet::new();
     for (actor, m) in membership.members() {
         let rec = m.binding.recipient();
-        if log.left_out(opened, audience, actor)
-            || log.left_out(opened, &EpochAudience::Everyone, actor)
+        if (log.left_out(opened, audience, actor) && !flight.contains(&rec))
+            || (log.left_out(opened, &EpochAudience::Everyone, actor)
+                && !flight_everyone.contains(&rec))
             || roster
                 .as_ref()
                 .is_some_and(|r| member_denied_by_roster(r, m))
@@ -3399,31 +3672,21 @@ pub(super) fn carried_audience_recipients(
         .into_iter()
         .filter(|rec| !has_active_seat.contains(rec))
         .collect();
-    let recipient_denied_by_roster =
-        |r: &Recipient| recipient_denied_by_roster_or_log(roster.as_ref(), log, r);
-    let mut out: BTreeSet<Recipient> = active_members
-        .iter()
-        .copied()
-        .filter(|r| {
-            !removed.contains(r)
-                && !exclude_recipients.contains(r)
-                && !left_out_recipients.contains(r)
-                && !recipient_denied_by_roster(r)
-                && !log.audience_left_out_recipient(audience, r)
-                && !log.audience_left_out_recipient(&EpochAudience::Everyone, r)
-        })
-        .collect();
+    let keeps = |r: &Recipient| {
+        !removed.contains(r)
+            && !exclude_recipients.contains(r)
+            && !left_out_recipients.contains(r)
+            && !recipient_denied_by_roster_or_log(roster.as_ref(), log, r)
+            && !left(flight, audience, r)
+            && !left(flight_everyone, &EpochAudience::Everyone, r)
+    };
+    let mut out: BTreeSet<Recipient> = active_members.iter().copied().filter(keeps).collect();
     if let Some(max_ids) = opened.maximal_epochs.get(audience)
         && let Some((first, rest)) = max_ids.split_first()
         && let Some(first_wrapped) = opened.wrapped_recipients.get(first)
     {
         for &r in first_wrapped {
-            if !removed.contains(&r)
-                && !exclude_recipients.contains(&r)
-                && !left_out_recipients.contains(&r)
-                && !recipient_denied_by_roster(&r)
-                && !log.audience_left_out_recipient(audience, &r)
-                && !log.audience_left_out_recipient(&EpochAudience::Everyone, &r)
+            if keeps(&r)
                 && rest.iter().all(|ep_id| {
                     opened
                         .wrapped_recipients
@@ -3434,6 +3697,13 @@ pub(super) fn carried_audience_recipients(
                 out.insert(r);
             }
         }
+    }
+    #[cfg(test)]
+    let hosts_blind = HOSTS_FLIGHT_BLIND.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    let hosts_blind = false;
+    if matches!(audience, EpochAudience::Hosts(_)) && !hosts_blind {
+        out.extend(flight.iter().copied().filter(keeps));
     }
     out
 }
@@ -3511,9 +3781,12 @@ pub(super) fn rotate_after_removal(
     if remaining_members.is_empty() {
         return Ok(rotated);
     }
+    // Read before the first epoch this batch mints, as `opened` was.
+    let flight = Flight::of_batch(log, opened, author.actor);
     let everyone_recipients = carried_audience_recipients(
         log,
         opened,
+        &flight,
         &EpochAudience::Everyone,
         &remaining_members,
         exclude_recipients,
@@ -3521,6 +3794,7 @@ pub(super) fn rotate_after_removal(
     let commons_recipients = carried_audience_recipients(
         log,
         opened,
+        &flight,
         &EpochAudience::Commons,
         &remaining_members,
         exclude_recipients,
@@ -3579,6 +3853,7 @@ pub(super) fn rotate_after_removal(
         rotated.extend(rotate_host_lists(
             log,
             opened,
+            &flight,
             author,
             exclude_recipients,
             minted,
@@ -3640,13 +3915,15 @@ pub(super) fn rotate_after_removal(
 /// that are not [`secure_twins`] (the coverage rule, §3.3.7), or that this Mac reseals under
 /// F21's rule 5 ([`reseal_ready`]): wrapped to the recipients it carries over and resealing the
 /// list's current entries ([`reseal_audience`]). Returns each rotated list's header. A list this
-/// Mac cannot open is left to its own members ([`super::tend_epochs`]).
+/// Mac cannot open is left to its own members ([`super::tend_epochs`]). `flight` is what was in
+/// flight before the batch's first mint ([`Flight::of_batch`]).
 ///
 /// # Errors
 /// A record fails to draft, sign or insert.
 pub(super) fn rotate_host_lists(
     log: &mut Log,
     opened: &crate::membership_log::entries::OpenedAudienceEntries,
+    flight: &Flight,
     author: &AuthorCtx<'_>,
     exclude_recipients: &BTreeSet<Recipient>,
     minted: &mut Vec<Record>,
@@ -3681,9 +3958,14 @@ pub(super) fn rotate_host_lists(
         {
             continue;
         }
+        #[cfg(test)]
+        let fresh = flight_after_mint(log, opened, author.actor);
+        #[cfg(test)]
+        let flight = fresh.as_ref().unwrap_or(flight);
         let recipients = carried_audience_recipients(
             log,
             opened,
+            flight,
             &audience,
             &BTreeSet::new(),
             exclude_recipients,
@@ -3889,7 +4171,8 @@ pub(super) fn reseal_audience(
 /// where this Mac opens the whole audience, and an audience with an uncovered keyed epoch this
 /// Mac does not open is left to a holder's reseal (F21 rule 7). Where this Mac holds every
 /// uncovered keyed epoch of an audience and every newest epoch there, it reseals the audience
-/// ([`reseal_audience`], F21 rule 5), and one epoch serves both rules.
+/// ([`reseal_audience`], F21 rule 5), and one epoch serves both rules. `flight` is what was in
+/// flight before the batch's first mint ([`Flight::of_batch`]).
 ///
 /// # Errors
 /// A record fails to draft, sign or insert.
@@ -3904,6 +4187,7 @@ pub(super) fn reseal_audience(
 pub(super) fn coalesce_concurrent_commons_epochs(
     log: &mut Log,
     opened: &crate::membership_log::entries::OpenedAudienceEntries,
+    flight: &Flight,
     author: &AuthorCtx<'_>,
     active_recipients: &BTreeSet<Recipient>,
     minted: &mut Vec<Record>,
@@ -3942,8 +4226,18 @@ pub(super) fn coalesce_concurrent_commons_epochs(
         {
             continue;
         }
-        let recipients =
-            carried_audience_recipients(log, opened, &audience, active_recipients, &empty_exclude);
+        #[cfg(test)]
+        let fresh = flight_after_mint(log, opened, author.actor);
+        #[cfg(test)]
+        let flight = fresh.as_ref().unwrap_or(flight);
+        let recipients = carried_audience_recipients(
+            log,
+            opened,
+            flight,
+            &audience,
+            active_recipients,
+            &empty_exclude,
+        );
         reseal_audience(log, opened, author, &audience, &recipients, minted)?;
     }
     Ok(())
@@ -4430,8 +4724,9 @@ pub(super) fn heard_across(urls: &[String], now: u64) -> Option<transport::Heard
     Some(union)
 }
 
-/// Union `<name>.records` across candidate servers and keep the parentless (`F1`) `0.145` envelope
-/// mirror in step with the merged log (`docs/DESIGN-fluid-swarm-2026-10-28.md` §3.5.3, F14).
+/// Union `<name>.records` across candidate servers and keep the envelope mirror
+/// in step with the merged log (`docs/DESIGN-fluid-swarm-2026-10-28.md` §3.5.3, F14).
+/// A parented head preserves the parent guard across the merged mirror.
 ///
 /// Returns `Ok(Some(seq))` when a new mirror envelope was published, or `Ok(None)` when every
 /// reachable server already holds the current mirror.
@@ -4462,10 +4757,12 @@ pub(super) fn mirror_log_to_servers(
         let _ = super::sync_records_with_candidates(paths, None, extra_urls);
         if let Ok(store) = super::load_records(paths)
             && !store.is_empty()
+            && let Ok(bound) = super::records_bound(paths, &store)
         {
             let _ = super::fan_out::post_records_to(
                 &candidate_urls,
                 &store.encode(),
+                bound,
                 super::fan_out::one_exchange(),
             );
         }
@@ -4705,10 +5002,13 @@ fn mirror_heads(
     }
     if let Some(drafted) = &drafted
         && !drafted.records.is_empty()
+        && let Ok(bound) =
+            super::load_records(paths).and_then(|store| super::records_bound(paths, &store))
     {
         let _ = super::fan_out::post_records_to(
             candidate_urls,
             &encode_records(&drafted.records),
+            bound,
             super::fan_out::one_exchange(),
         );
     }
@@ -4765,6 +5065,11 @@ fn mirror_heads(
         &merged.handoff,
         &merged.admissions,
         drafted.as_ref().and_then(Drafted::stamp).as_deref(),
+        if heads.iter().any(|head| !head.envelope.parents.is_empty()) {
+            &merged.parents
+        } else {
+            &[]
+        },
     )?;
 
     tried.put = true;
@@ -4806,54 +5111,57 @@ fn mirror_heads(
 pub(super) const GAP_STEP_MS: u64 = 60_000;
 
 /// How long every member but a remover waits on a re-key a removal made due, from when it first
-/// saw the audience due, before its own rank counts ([`super::remove::tend_epochs_at`]): the
-/// remover's rotation is in its own batch, so it arrives with the `Remove` or soon after.
+/// saw that removal (or the audience due, if later), before its own rank counts
+/// ([`super::remove::tend_epochs_at`]): the remover's rotation is in its own batch, so it arrives
+/// with the `Remove` or soon after.
 pub(super) const REMOVER_GRACE_MS: u64 = 10 * GAP_STEP_MS;
 
 /// How long an epoch another Mac minted holds the re-keys and gap closes over it while this Mac
 /// may hold only a prefix of its minter's batch ([`unsettled_of_others`]), from first sight. Not
 /// every batch ends in a record that settles it (a rotation of an audience its minter does not
-/// open whole ends in `Wrap`s), so a minter that falls silent after its last `Wrap` does not hold
-/// the audience forever.
+/// open whole ends in `Wrap`s), and no record kind could end one without writing a value, a
+/// name or a node key, so a minter that falls silent after its last `Wrap` holds the audience
+/// only this long, a Mac with no seat its batch may still wrap ([`Log::undecided`]) included:
+/// a whole batch that left such a Mac out reads the same until its minter signs again.
 pub(super) const SETTLE_GRACE_MS: u64 = REMOVER_GRACE_MS;
 
-#[cfg(test)]
-thread_local! {
-    /// The negative control of settledness: while set, every epoch reads as settled.
-    pub(super) static UNSETTLED_OK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
 /// The epochs of `epochs` a Mac other than `me` minted whose batch `log` may hold only a prefix
-/// of ([`Log::unsettled`]): nobody mints from them, carries recipients from them or closes their
-/// gaps until they settle, or [`SETTLE_GRACE_MS`] after first sight.
+/// of ([`Log::unsettled`]): while they may be, the tender mints from none of them and the gap
+/// closer closes none of their gaps, both only until [`SETTLE_GRACE_MS`] after first sight. A
+/// mint past that, or one that cannot wait, carries what the batch may still wrap
+/// ([`Log::in_flight`]) and leaves out what it may still decide ([`Log::undecided`]).
 pub(super) fn unsettled_of_others(log: &Log, epochs: &[RecordId], me: &MemberId) -> Vec<RecordId> {
-    #[cfg(test)]
-    if UNSETTLED_OK.with(std::cell::Cell::get) {
-        return Vec::new();
-    }
     log.unsettled(epochs)
         .into_iter()
         .filter(|id| log.get(id).is_some_and(|record| record.actor() != me))
         .collect()
 }
 
-/// The most the `wrap-gaps` mark file holds; a longer one reads as none (every gap seen now).
+/// The most the `wrap-gaps` mark file holds; a longer one reads as none (every gap seen now). The
+/// gaps a log can open are not bounded by its records (each is an epoch and a member it lacks, so
+/// after a heal one side's new members times the other's epochs), so [`write_gap_mark`] keeps the
+/// clocks that fit and leaves the rest to be seen again.
 const MAX_GAP_MARK: usize = 256 * 1024;
 
 /// What [`close_wrap_gaps`] remembers between passes: the records' heads digest it last looked
-/// at, when a gap a lower-ranked holder should close is next due here, and when this Mac first
-/// saw each gap it holds a rank for, by epoch and recipient.
+/// at, when a gap a lower-ranked holder should close is next due here, and for each gap it holds
+/// a rank for, by epoch and recipient, when this Mac first saw it and when its ranks start.
 fn gap_mark_file(paths: &Paths) -> std::path::PathBuf {
     paths.dir.join("wrap-gaps")
 }
 
-/// One read of [`gap_mark_file`]: `<digest> <due>` and then `<epoch> <recipient> <first seen>`
-/// for each gap.
+/// One read of [`gap_mark_file`]: `<digest> <due>` and then
+/// `<epoch> <recipient> <first seen> <ranks start>` for each gap ([`GapSeen`]).
 struct GapMark {
     digest: [u8; 32],
     due: u64,
-    seen: BTreeMap<(RecordId, String), u64>,
+    seen: BTreeMap<(RecordId, String), GapSeen>,
 }
+
+/// When this Mac first saw a gap, and when its holders' ranks start counting: first sight where
+/// the epoch had settled then, else when it settled or [`SETTLE_GRACE_MS`] after first sight;
+/// zero while its epoch may still be a prefix of its minter's batch.
+type GapSeen = (u64, u64);
 
 fn read_gap_mark(paths: &Paths) -> Option<GapMark> {
     let bytes = fsx::read_private(&gap_mark_file(paths), MAX_GAP_MARK).ok()??;
@@ -4864,22 +5172,28 @@ fn read_gap_mark(paths: &Paths) -> Option<GapMark> {
     (digest.len() == 64 && aterm_codec::hex::decode_into(digest.as_bytes(), &mut out))
         .then_some(())?;
     let mut seen = BTreeMap::new();
+    let ms = |word: &str| {
+        (!word.is_empty() && word.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| word.parse::<u64>().ok())
+            .flatten()
+    };
     for line in lines {
         let mut words = line.split_ascii_whitespace();
-        let (Some(epoch), Some(recipient), Some(at), None) =
-            (words.next(), words.next(), words.next(), words.next())
-        else {
+        let (Some(epoch), Some(recipient), Some(first), Some(start), None) = (
+            words.next(),
+            words.next(),
+            words.next(),
+            words.next(),
+            words.next(),
+        ) else {
             continue;
         };
         let mut id = [0u8; 32];
         if epoch.len() != 64 || !aterm_codec::hex::decode_into(epoch.as_bytes(), &mut id) {
             continue;
         }
-        if !at.is_empty()
-            && at.bytes().all(|b| b.is_ascii_digit())
-            && let Ok(at) = at.parse()
-        {
-            seen.insert((id, recipient.to_owned()), at);
+        if let (Some(first), Some(start)) = (ms(first), ms(start)) {
+            seen.insert((id, recipient.to_owned()), (first, start));
         }
     }
     if due.is_empty() || !due.bytes().all(|b| b.is_ascii_digit()) {
@@ -4892,18 +5206,27 @@ fn read_gap_mark(paths: &Paths) -> Option<GapMark> {
     })
 }
 
+/// Write [`gap_mark_file`]: the digest and `due`, then each gap's clock of `seen` in its order
+/// while the file stays within [`MAX_GAP_MARK`], so it always reads back. A gap past that is
+/// seen again at the next pass, as one newly open: its holders' ranks count from there, and the
+/// clocks before it, kept, close and give it room, while a mark too long to read would forget
+/// every clock at every pass and leave no rank past the first ever due.
 fn write_gap_mark(
     paths: &Paths,
     digest: &[u8; 32],
     due: u64,
-    seen: &BTreeMap<(RecordId, String), u64>,
+    seen: &BTreeMap<(RecordId, String), GapSeen>,
 ) -> crate::Result<()> {
     let mut text = format!("{} {due}\n", aterm_codec::hex::encode_lower(digest));
-    for ((epoch, recipient), at) in seen {
-        text.push_str(&format!(
-            "{} {recipient} {at}\n",
+    for ((epoch, recipient), (first, start)) in seen {
+        let line = format!(
+            "{} {recipient} {first} {start}\n",
             aterm_codec::hex::encode_lower(epoch)
-        ));
+        );
+        if text.len() + line.len() > MAX_GAP_MARK {
+            break;
+        }
+        text.push_str(&line);
     }
     fsx::write_atomic(&gap_mark_file(paths), text.as_bytes(), 0o600)
 }
@@ -4914,9 +5237,11 @@ fn write_gap_mark(
 /// ranked `k` ([`Log::gap_rank`]) signs the `Wrap` once `now_ms` is `k` [`GAP_STEP_MS`] past the
 /// time this Mac first saw the gap, so after a heal one member closes each gap instead of all
 /// ~35; on an epoch another Mac minted whose batch this Mac may hold only a prefix of
-/// ([`unsettled_of_others`]), not before [`SETTLE_GRACE_MS`] past that first sight unless the
-/// batch settles. The spread counts from first sight, not from when the gap opened: after a split longer
-/// than a few steps every holder would otherwise be past due at its first look, and all sign.
+/// ([`unsettled_of_others`]), `k` steps past when the batch settled here, or past
+/// [`SETTLE_GRACE_MS`] after first sight if it has not, so a late settle or the grace puts no two
+/// ranks due at once. The spread counts from first sight, not from when the gap opened: after a
+/// split longer than a few steps every holder would otherwise be past due at its first look, and
+/// all sign.
 /// The records' heads digest gates the work: with no new record and nothing due, it reads
 /// nothing more. It looks without the state lock first, which the desk, the subscriber and the
 /// Commons runtime wait on, and takes it only to sign, looking again under it. Returns the
@@ -4961,6 +5286,30 @@ pub(super) fn close_wrap_gaps(paths: &Paths, now_ms: u64) -> crate::Result<Vec<R
 )]
 #[doc(hidden)]
 pub fn keyed_epochs_environment() {}
+
+#[cfg(test)]
+thread_local! {
+    /// The negative control of a late settle: while set, a gap's ranks count from first sight
+    /// even where its epoch settled later, so every rank whose step passed meanwhile is due at
+    /// once.
+    pub(super) static GAPS_FROM_FIRST_SIGHT: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// The gap closer's negative controls: every holder ranked first ([`super::remove::UNRANKED`]),
+/// and ranks counted from first sight ([`GAPS_FROM_FIRST_SIGHT`]).
+#[cfg(test)]
+fn gap_controls() -> (bool, bool) {
+    (
+        super::remove::UNRANKED.with(std::cell::Cell::get),
+        GAPS_FROM_FIRST_SIGHT.with(std::cell::Cell::get),
+    )
+}
+
+#[cfg(not(test))]
+const fn gap_controls() -> (bool, bool) {
+    (false, false)
+}
 
 /// One look at the wrap gaps for [`close_wrap_gaps`]: whether one is due for this member now,
 /// and, where `sign` (the caller holds the state lock), the `Wrap`s it signed and kept. Each look
@@ -5042,20 +5391,38 @@ fn wrap_gaps_pass(
         let Some(rank) = log.gap_rank(&opened, &gap, &actor) else {
             continue;
         };
+        let rank = if gap_controls().0 { 0 } else { rank };
         let key = (gap.epoch, gap.recipient.to_bech32());
         // A clock set back since never puts first sight in the future.
-        let first = earlier.get(&key).copied().unwrap_or(now_ms).min(now_ms);
-        seen.insert(key, first);
+        let (first, start) = earlier.get(&key).copied().unwrap_or((now_ms, 0));
+        let first = first.min(now_ms);
         // The holders a rank counts are the epoch's `Wrap`s, so a prefix of its minter's batch
-        // ranks other Macs than the whole one: the gap waits for the batch to settle.
-        let settle = if unsettled.contains(&gap.epoch) {
-            first.saturating_add(SETTLE_GRACE_MS)
+        // ranks other Macs than the whole one: the gap waits for the batch to settle, or the
+        // grace, and its ranks count from then, a step apart, so no two holders sign at once.
+        let settle_by = first.saturating_add(SETTLE_GRACE_MS);
+        let holding = unsettled.contains(&gap.epoch);
+        let start = if gap_controls().1 {
+            if holding && now_ms < settle_by {
+                0
+            } else {
+                first
+            }
+        } else if start != 0 {
+            start.min(now_ms)
+        } else if !holding {
+            now_ms
+        } else if now_ms >= settle_by {
+            settle_by
         } else {
             0
         };
-        let due = first
-            .saturating_add(GAP_STEP_MS.saturating_mul(u64::try_from(rank).unwrap_or(u64::MAX)))
-            .max(settle);
+        seen.insert(key, (first, start));
+        if start == 0 {
+            next_due = Some(next_due.map_or(settle_by, |at| at.min(settle_by)));
+            continue;
+        }
+        let due = start
+            .saturating_add(GAP_STEP_MS.saturating_mul(u64::try_from(rank).unwrap_or(u64::MAX)));
         if now_ms < due {
             next_due = Some(next_due.map_or(due, |at| at.min(due)));
             continue;
@@ -5094,18 +5461,6 @@ fn wrap_gaps_pass(
     Ok((true, signed))
 }
 
-/// [`close_wrap_gaps`] at the wall clock, and the `Wrap`s it signed posted to every vault server
-/// this Mac reaches by `posts_by` (one exchange from when it posts where none is given,
-/// [`super::admit::post_records_to_servers_by`]): the subscriber's pass after it pulls records.
-/// Best effort: a pass that fails here tries again on the next.
-pub(super) fn tend_wrap_gaps(paths: &Paths, posts_by: Option<std::time::Instant>) {
-    let now_ms = aterm_time::unix_millis().unwrap_or(0);
-    if close_wrap_gaps(paths, now_ms).is_ok_and(|signed| !signed.is_empty()) {
-        let by = posts_by.unwrap_or_else(super::fan_out::one_exchange);
-        let _ = super::admit::post_records_to_servers_by(paths, by);
-    }
-}
-
 #[cfg(test)]
 #[path = "log_entries/author_batch_tests.rs"]
 mod author_batch_tests;
@@ -5116,6 +5471,59 @@ mod tests {
     use crate::commons::binding::Request;
     use crate::membership_log::{Entrant, Log, Record};
     use crate::swarm_roster::{SwarmMember, SwarmRoster};
+
+    /// A gap mark with more clocks than [`MAX_GAP_MARK`] holds (40 epochs times 60 Macs, every
+    /// field at its widest) keeps the first that fit, in order, and reads back with its digest
+    /// and due, so those gaps' ranks keep counting.
+    ///
+    /// NEGATIVE CONTROL: the same mark written whole is past the bound, and the reader takes it
+    /// for none, which forgets every clock.
+    #[test]
+    fn a_gap_mark_past_its_bound_keeps_the_clocks_that_fit() {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let paths = Paths::for_home(home.path());
+        fsx::ensure_private_dir(&paths.dir).unwrap();
+        let mut seen = BTreeMap::new();
+        for e in 0u8..40 {
+            for m in 0u8..60 {
+                let recipient = Identity::from_secret_bytes([m.wrapping_add(1); 32])
+                    .recipient()
+                    .to_bech32();
+                seen.insert(([e; 32], recipient), (u64::MAX, u64::MAX));
+            }
+        }
+        let digest = [7; 32];
+        write_gap_mark(&paths, &digest, u64::MAX, &seen).unwrap();
+        let len = std::fs::metadata(gap_mark_file(&paths)).unwrap().len();
+        assert!(len <= u64::try_from(MAX_GAP_MARK).unwrap(), "{len} bytes");
+        let mark = read_gap_mark(&paths).expect("the mark reads back");
+        assert_eq!(mark.digest, digest);
+        assert_eq!(mark.due, u64::MAX);
+        assert!(!mark.seen.is_empty() && mark.seen.len() < seen.len());
+        let kept: Vec<_> = seen.iter().take(mark.seen.len()).collect();
+        assert_eq!(
+            mark.seen.iter().collect::<Vec<_>>(),
+            kept,
+            "the first in order"
+        );
+
+        let mut whole = format!("{} {}\n", aterm_codec::hex::encode_lower(&digest), u64::MAX);
+        for ((epoch, recipient), (first, start)) in &seen {
+            whole.push_str(&format!(
+                "{} {recipient} {first} {start}\n",
+                aterm_codec::hex::encode_lower(epoch)
+            ));
+        }
+        assert!(
+            whole.len() > MAX_GAP_MARK,
+            "CONTROL: the whole mark is past the bound"
+        );
+        fsx::write_atomic(&gap_mark_file(&paths), whole.as_bytes(), 0o600).unwrap();
+        assert!(
+            read_gap_mark(&paths).is_none(),
+            "CONTROL: the whole mark reads as none"
+        );
+    }
 
     #[test]
     fn public_roster_and_stamp_distinguish_envelopes_readers_and_parse_failures() {

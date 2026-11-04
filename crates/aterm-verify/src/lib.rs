@@ -385,8 +385,9 @@ pub struct Ctx {
     pub fix: bool,
     /// `--cell`: the forge cells `cells` checks.
     pub cells: Vec<String>,
-    /// The selection pulled `cells` ([`checks::pulls_cells`]): one cell per other OS, each
-    /// checked only where its graph holds a selected crate ([`cells::pulled_cells`]).
+    /// The selection pulled `cells` ([`checks::pulls_cells`]): one cell per other OS and one of
+    /// this OS for its lint pass, each checked only where its graph holds a selected crate
+    /// ([`cells::pulled_cells`]).
     pub cells_pulled: bool,
     pub scope: Scope,
     pub tools: Toolchain,
@@ -1611,7 +1612,9 @@ pub fn header(ctx: &Ctx, cone: Option<&str>) -> String {
         names.join(" ")
     };
     if ctx.cells_pulled {
-        what.push_str(" + cells (each other OS's cell that builds a selected crate)");
+        what.push_str(
+            " + cells (each other OS's cell and one of this OS's that builds a selected crate)",
+        );
     }
     format!("verify: {what} — {}", selection(ctx, cone))
 }
@@ -2991,11 +2994,11 @@ mod tests {
         };
         assert_eq!(
             pulled(&["aterm-gui"]),
-            "verify: dev + cells (each other OS's cell that builds a selected crate) — the cone"
+            "verify: dev + cells (each other OS's cell and one of this OS's that builds a selected crate) — the cone"
         );
         assert_eq!(
             pulled(&["aterm-wasm"]),
-            "verify: dev + wasm-smoke (the selection holds aterm-wasm) + cells (each other OS's cell that builds a selected crate) — the cone"
+            "verify: dev + wasm-smoke (the selection holds aterm-wasm) + cells (each other OS's cell and one of this OS's that builds a selected crate) — the cone"
         );
     }
 

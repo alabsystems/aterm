@@ -1000,7 +1000,7 @@ fn codesign_report(root: &Path) -> Option<String> {
             "--verbose=2".as_ref(),
             root.as_os_str(),
         ],
-        CODESIGN_CEILING,
+        codesign_ceiling(),
     )?;
     Some(format!("{out}\n{err}"))
 }
@@ -1117,6 +1117,34 @@ fn codesign_report(_root: &Path) -> Option<String> {
 
 #[cfg(target_os = "macos")]
 const CODESIGN_CEILING: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The bound a test set in place of `CODESIGN_CEILING`, in milliseconds (0: none set).
+#[cfg(any(test, debug_assertions))]
+static CODESIGN_CEILING_FOR_TEST_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Bound each `codesign` read by `ceiling` instead of the product's 10 s, for this process.
+///
+/// A test whose bundles `codesign` must read sets the hang detector here: a loaded machine
+/// that outlasts the product's ceiling would otherwise read a signed bundle as unknown.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub fn set_codesign_ceiling_for_test(ceiling: std::time::Duration) {
+    let ms = u64::try_from(ceiling.as_millis())
+        .unwrap_or(u64::MAX)
+        .max(1);
+    CODESIGN_CEILING_FOR_TEST_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(target_os = "macos")]
+fn codesign_ceiling() -> std::time::Duration {
+    #[cfg(any(test, debug_assertions))]
+    match CODESIGN_CEILING_FOR_TEST_MS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => {}
+        ms => return std::time::Duration::from_millis(ms),
+    }
+    CODESIGN_CEILING
+}
 
 fn designated_requirement(report: &str) -> Option<String> {
     report.lines().find_map(|line| {
@@ -2507,7 +2535,7 @@ pub fn process_meets_team(pid: u32, team: &str) -> bool {
         run_bounded(
             "/usr/bin/codesign",
             &["--verify".as_ref(), requirement.as_ref(), pid.as_ref()],
-            CODESIGN_CEILING,
+            codesign_ceiling(),
         )
         .is_some_and(|(met, _, _)| met)
     }
@@ -6506,8 +6534,14 @@ mod tests {
         let path = scratch.path().join("open-child");
         std::fs::write(&path, b"").unwrap();
         let missing = Path::new("/nonexistent/aterm.app/Contents/MacOS/aterm");
+        // A child that runs to its end must be heard out: past `OPEN_PROBE_CEILING` a loaded
+        // machine would read as a hung child, so these wait on the hang detector instead.
         for exe in [None, Some(missing), Some(Path::new("/usr/bin/false"))] {
-            assert_eq!(open_probe_in_child(exe, &path), ProbeOutcome::Ok, "{exe:?}");
+            assert_eq!(
+                open_probe_in_child_bounded(exe, &path, HANG_DETECTOR),
+                ProbeOutcome::Ok,
+                "{exe:?}"
+            );
         }
         let stand_in = |name: &str, code: u8| {
             use std::os::unix::fs::PermissionsExt as _;
@@ -6518,10 +6552,13 @@ mod tests {
         };
         let (answers, fails) = (stand_in("answers", 0), stand_in("fails", 1));
         assert_eq!(
-            open_probe_in_child(Some(&answers), &path),
+            open_probe_in_child_bounded(Some(&answers), &path, HANG_DETECTOR),
             ProbeOutcome::Errno(13)
         );
-        assert_eq!(open_probe_in_child(Some(&fails), &path), ProbeOutcome::Ok);
+        assert_eq!(
+            open_probe_in_child_bounded(Some(&fails), &path, HANG_DETECTOR),
+            ProbeOutcome::Ok
+        );
         let hangs = {
             use std::os::unix::fs::PermissionsExt as _;
             let exe = scratch.path().join("hangs");
@@ -8104,6 +8141,18 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_change_runner_keeps_the_exit_and_a_head_of_each_stream() {
+        // The child's readers must reach EOF (nothing outlives it to hold a pipe), so the first
+        // grace poll waits for them on the hang detector, not the product's 2 s grace.
+        GRACE_POLL.with(|slot| {
+            let act = |_: &mut u32, readers_done: &dyn Fn() -> bool| {
+                aterm_spec::wait::until_within(
+                    aterm_spec::wait::MUST_HAPPEN,
+                    "the change's readers reached EOF",
+                    || readers_done().then_some(()),
+                );
+            };
+            *slot.borrow_mut() = Some((0, Box::new(act)));
+        });
         let mut seen = None;
         let run = run_to_exit_keeping_heads(
             &[
@@ -10323,7 +10372,7 @@ mod tests {
             run_bounded(
                 "/bin/sh",
                 &["-c".as_ref(), "exit 3".as_ref()],
-                CODESIGN_CEILING
+                HANG_DETECTOR
             ),
             Some((false, String::new(), String::new()))
         );

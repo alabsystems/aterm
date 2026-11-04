@@ -55,6 +55,13 @@ impl Lifeline {
     }
 
     /// Opens the held and child ends of a lifeline FIFO in `dir`.
+    ///
+    /// Both ends are open, and the FIFO unlinked, before this returns, so before the child given
+    /// the far end exists: that open returns at once because `held` already writes, and the child
+    /// is handed the descriptor, never the name. That is why the cut is race-free. On macOS a FIFO
+    /// reader whose open returns just as the only writer closes can miss the end of file and sleep
+    /// in its read for ever (measured 2026-10-29 under load); here no close can come before the far
+    /// end's open has returned.
     /// # Errors
     /// Returns an error if creating, opening, or unlinking the FIFO fails.
     pub fn open(dir: &Path) -> io::Result<(Self, File)> {
@@ -116,6 +123,16 @@ pub fn check(number: RawFd) -> io::Result<()> {
 }
 
 /// Adopts descriptor `number` as a close-on-exec lifeline and retires the original slot.
+///
+/// The end of file is the cut, and on macOS a FIFO reader whose open returns just as the only
+/// writer closes can miss it and never end (measured 2026-10-29 under load), so no close of the
+/// launcher's writer may meet the open of the read end this adopts. The launcher opens that end
+/// before the child starts and hands over the descriptor (a pipe's, or a FIFO's opened as
+/// [`Lifeline::open`] opens one); or, where the child opens the FIFO by its name, either the
+/// launcher's writer closes only once the child has shown its open returned, or the opener starts
+/// the program that adopts it only on a byte the launcher writes after seeing that (aterm-lab's
+/// app band, a launchd job that can inherit nothing, which ends without its program when its
+/// launcher is gone first).
 /// # Errors
 /// Returns an error if `number` fails validation or descriptor duplication fails.
 pub fn adopt(number: RawFd) -> io::Result<OwnedFd> {

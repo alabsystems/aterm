@@ -787,6 +787,8 @@ struct Pager {
     cursor: PathBuf,
     /// Its flush tally (`aterm_link::notify::FLUSH_TALLY_SEAM`).
     tally: PathBuf,
+    /// Its last fresh page's stamps (`aterm_link::notify::EXEC_STAMPS_SEAM`).
+    stamps: PathBuf,
     out: PathBuf,
 }
 
@@ -821,6 +823,7 @@ impl Pager {
             .args(["--since", &since.to_string()])
             .args(["--rate", "1000000/1s"])
             .env(aterm_link::notify::FLUSH_TALLY_SEAM, "1")
+            .env(aterm_link::notify::EXEC_STAMPS_SEAM, "1")
             .stdin(aterm_uds::spawnfd::Stdio::null())
             .stdout(log)
             .stderr(err);
@@ -829,8 +832,25 @@ impl Pager {
             journal: dir.join("notify/journal"),
             cursor: dir.join("notify/cur").join(sel.key()),
             tally: dir.join("notify").join(aterm_link::notify::FLUSH_TALLY),
+            stamps: dir.join("notify").join(aterm_link::notify::EXEC_STAMPS),
             out,
         }
+    }
+
+    /// The page of `off` by the pager's own stamps, in ms: its `firing` line
+    /// written -> its command reaped, and reaped -> its `fired` line written.
+    fn split(&self, clock: Clock, off: u64) -> (f64, f64) {
+        let want = format!(" off={off} ");
+        self.until(clock, &format!("stamp page @{off}"), || {
+            std::fs::read_to_string(&self.stamps).is_ok_and(|s| s.contains(&want))
+        });
+        let text = std::fs::read_to_string(&self.stamps).unwrap_or_default();
+        let us = |key| {
+            harness::kv(&text, key)
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or_else(|| panic!("the pager's stamps name no {key}=: {text:?}"))
+        };
+        (ms(us("armed"), us("exited")), ms(us("exited"), us("fired")))
     }
 
     /// When `ready` first holds of what the pager wrote, read every [`POLL`].
@@ -915,6 +935,9 @@ struct PersonAsk {
     gap: Option<f64>,
     /// `(paged, quiet)` on the bench clock.
     pager: Option<(u64, u64)>,
+    /// By the pager's own stamps ([`Pager::split`]), in ms: `(firing written
+    /// -> command exited, command exited -> fired written)`.
+    split: Option<(f64, f64)>,
 }
 
 /// The person leg's two variants ([`PERSON_ARMS`]).
@@ -977,6 +1000,7 @@ fn person(s: &Stage, spec: &Spec, ctl: &mut Ctl, start: Mark) -> (Person, Mark) 
             let paged = pager
                 .as_ref()
                 .map(|p| (p.paged(s.clock, off), p.quiet(s.clock, off)));
+            let split = pager.as_ref().map(|p| p.split(s.clock, off));
             posts += 1;
             let m = s.mark("a person-lane ask retired", settled(0, base + posts));
             if i + 1 < warm {
@@ -991,6 +1015,7 @@ fn person(s: &Stage, spec: &Spec, ctl: &mut Ctl, start: Mark) -> (Person, Mark) 
                 waited,
                 gap,
                 pager: paged,
+                split,
             });
             if i + 1 == warm + n {
                 let from = from.as_ref().expect("a block warms up first");
@@ -2068,7 +2093,10 @@ fn person_report(ctx: &Reading, p: &Person) -> (Value, Vec<String>) {
              directory in full (`F_FULLFSYNC`, its one full flush a page), runs the command, \
              then replaces the journal (the `<off> fired` line) and its cursor, each ordered \
              with its directory, on the volume the bridge's state dir is on. \"Paged\" is the \
-             `fired` line seen by the bench; the bench waits \
+             `fired` line seen by the bench. The pager's own stamps \
+             (`aterm_link::notify::EXEC_STAMPS`, its monotonic clock) split its page: the \
+             `firing` line written -> its command exited (spawned, run and reaped), and the \
+             command exited -> the `fired` line written. The bench waits \
              for the cursor too before the next ask, so no ask is posted while the pager still \
              writes for the one before. The unpaged variant is the escalation's own cost; what \
              the paged one adds is the pager's.\n"
@@ -2086,6 +2114,8 @@ fn person_report(ctx: &Reading, p: &Person) -> (Value, Vec<String>) {
         let mut paged = Vec::new();
         let mut released_to_paged = Vec::new();
         let mut paged_to_quiet = Vec::new();
+        let mut firing_to_exited = Vec::new();
+        let mut exited_to_fired = Vec::new();
         for a in asks {
             splits.push(ctx.split(&a.waited));
             acked_to_durable.extend(ms_opt(
@@ -2097,6 +2127,10 @@ fn person_report(ctx: &Reading, p: &Person) -> (Value, Vec<String>) {
                 paged.push(ms(a.waited.t_call, t_paged));
                 released_to_paged.push(ms(a.waited.t_ret, t_paged));
                 paged_to_quiet.push(ms(t_paged, t_quiet));
+            }
+            if let Some((to_exited, to_fired)) = a.split {
+                firing_to_exited.push(to_exited);
+                exited_to_fired.push(to_fired);
             }
         }
         md.extend(splits.rows(ctx, word));
@@ -2127,6 +2161,18 @@ fn person_report(ctx: &Reading, p: &Person) -> (Value, Vec<String>) {
                 ctx.unit,
             ));
         }
+        if !firing_to_exited.is_empty() {
+            md.push(row_u(
+                &format!("{word}: the pager's `firing` written -> its command exited"),
+                &firing_to_exited,
+                ctx.unit,
+            ));
+            md.push(row_u(
+                &format!("{word}: the pager's command exited -> its `fired` written"),
+                &exited_to_fired,
+                ctx.unit,
+            ));
+        }
         lates.push(late(&splits.acked_to_released, ctx.threshold));
         let mut fields = splits.json(ctx);
         if let Some(f) = fields.as_object_mut() {
@@ -2148,6 +2194,16 @@ fn person_report(ctx: &Reading, p: &Person) -> (Value, Vec<String>) {
                 f.insert(
                     "paged_to_cursor_ms".to_string(),
                     json_u(&paged_to_quiet, ctx.unit),
+                );
+            }
+            if !firing_to_exited.is_empty() {
+                f.insert(
+                    "firing_to_exited_ms".to_string(),
+                    json_u(&firing_to_exited, ctx.unit),
+                );
+                f.insert(
+                    "exited_to_fired_ms".to_string(),
+                    json_u(&exited_to_fired, ctx.unit),
                 );
             }
             f.insert("steps".to_string(), steps_json(&p.spent[v], asks.len()));

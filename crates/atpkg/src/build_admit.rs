@@ -48,6 +48,7 @@
 //! and its peak kept when it succeeded, or when it failed above what it claimed ([`Held::end`]).
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use aterm_capacity::book::{self, BuildNeed, Key, Records};
 #[cfg(unix)]
@@ -554,6 +555,9 @@ pub struct Held {
     claim: Claim,
     key: Key,
     own: Option<PathBuf>,
+    /// This admission requires native ARM/birth/BIND rather than holder transfer.
+    #[cfg(unix)]
+    cohort: bool,
 }
 
 impl Held {
@@ -575,20 +579,22 @@ impl Held {
         self.let_go().keep(succeeded, peak, say)
     }
 
-    /// The build ended: LET THE CLAIM GO NOW, before its peak is read whole or kept (a meter's last
-    /// read, a write of its book under that book's lock), so no waiter waits on a build that has
-    /// ended; what keeps its peak is left ([`Ended::keep`]).
+    /// Drop local controller custody before reading or recording its final memory sample.
+    /// An ordinary claim ends now; a live or uncertain cohort retains its full durable
+    /// reservation until actual group drain. What keeps the peak is left ([`Ended::keep`]).
     #[must_use]
     pub fn let_go(self) -> Ended {
-        let Held { claim, key, own } = self;
+        let Held {
+            claim, key, own, ..
+        } = self;
         let claimed = claim.record().need.mem;
         drop(claim);
         Ended { claimed, key, own }
     }
 }
 
-/// An ended build whose claim went ([`Held::let_go`]): what it claimed, the key its peak is kept
-/// under, and where.
+/// A build whose local controller ended ([`Held::let_go`]): its requested memory and
+/// sample key/path. This does not certify closure of a retained durable cohort.
 #[derive(Debug)]
 pub struct Ended {
     claimed: u64,
@@ -649,14 +655,77 @@ fn admit_bounded(
     probe_lock: &dyn Fn() -> Option<PathBuf>,
     say: &mut dyn FnMut(&str),
 ) -> Admission {
+    admit_for(build, cwd, seat, probe_lock, say, AdmissionKind::Holder)
+}
+
+/// Admit one explicitly managed cohort build for [`supervise`]. This uses a prepared
+/// private cohort ledger; it neither redirects the account ledger nor transfers the
+/// ordinary shim's terminal/holder responsibilities. Nested coverage and own-claim
+/// fallbacks refuse until their managed handoff is qualified. Callers own terminal
+/// foreground policy for the dedicated process group.
+#[cfg(unix)]
+pub fn admit_cohort(
+    build: &Build,
+    cwd: &Path,
+    seat: &Seat<'_>,
+    say: &mut dyn FnMut(&str),
+) -> Admission {
+    admit_for(build, cwd, seat, &|| None, say, AdmissionKind::Cohort)
+}
+
+/// Reserve one independent job in an explicit cohort host. This always requests
+/// its full budget, even when the host already owns claims. It never borrows an
+/// ancestor's coverage or runs unclaimed. One capacity poll either grants the
+/// reservation or refuses; the host never waits on its own jobs. Seat overrides
+/// refuse: Now means forced admission in ordinary fronts, not a nonblocking
+/// capacity check. Queue/retry policy belongs to the host; this does not enable
+/// the ordinary managed route.
+#[cfg(unix)]
+pub fn admit_cohort_job(
+    build: &Build,
+    cwd: &Path,
+    seat: &Seat<'_>,
+    say: &mut dyn FnMut(&str),
+) -> Admission {
+    if seat.mode != Admit::Wait || seat.pid != std::process::id() {
+        return refuse(
+            say,
+            "host job admission requires resource guards and its actual owner process",
+        );
+    }
+    admit_for(build, cwd, seat, &|| None, say, AdmissionKind::HostJob)
+}
+
+#[derive(Clone, Copy)]
+enum AdmissionKind {
+    Holder,
+    #[cfg(unix)]
+    Cohort,
+    #[cfg(unix)]
+    HostJob,
+}
+
+fn admit_for(
+    build: &Build,
+    cwd: &Path,
+    seat: &Seat<'_>,
+    probe_lock: &dyn Fn() -> Option<PathBuf>,
+    say: &mut dyn FnMut(&str),
+    kind: AdmissionKind,
+) -> Admission {
+    let cohort = !matches!(kind, AdmissionKind::Holder);
+    #[cfg(unix)]
+    let independent = matches!(kind, AdmissionKind::HostJob);
+    #[cfg(not(unix))]
+    let independent = false;
     let Some(ledger) = &seat.ledger else {
         return refuse(say, "no home directory keeps the capacity ledger");
     };
-    // This front transfers holder-based custody and preserves the command's group. It cannot
-    // arm/bind a dedicated cohort or establish drain, including when an existing claim covers
-    // this process. Do not admit work under a lifetime contract it cannot implement.
+    // The ordinary front transfers holder custody; explicit native cohort admission
+    // requires the opposite ledger kind. Neither route silently changes lifetime law.
     match ledger.cohort_aware() {
-        Ok(false) => {}
+        Ok(aware) if aware == cohort => {}
+        Ok(false) => return refuse(say, "native cohort admission requires a cohort ledger"),
         Ok(true) => {
             return refuse(
                 say,
@@ -670,23 +739,37 @@ fn admit_bounded(
             );
         }
     }
-    match aterm_capacity::covering(ledger, seat.machine, seat.pid, seat.marker.as_deref()) {
-        Ok(Some(holder)) => return Admission::Covered(holder),
-        Ok(None) => {}
-        Err(e) => return refuse(say, &format!("the capacity ledger could not be read ({e})")),
-    }
-    match ledger.of_pid(seat.pid) {
-        Ok(mine) => {
-            if let Some(r) = mine.into_iter().find(|r| r.held.is_some()) {
-                say(&format!(
-                    "{SAYS}: this process holds a claim of its own ({:?}), which a second would \
-                     wait on; the build runs unclaimed",
-                    r.need.what
-                ));
-                return Admission::Own(r);
+    if !independent {
+        match aterm_capacity::covering(ledger, seat.machine, seat.pid, seat.marker.as_deref()) {
+            Ok(Some(_)) if cohort => {
+                return refuse(
+                    say,
+                    "native cohort admission cannot use a coverage fallback",
+                );
             }
+            Ok(Some(holder)) => return Admission::Covered(holder),
+            Ok(None) => {}
+            Err(e) => return refuse(say, &format!("the capacity ledger could not be read ({e})")),
         }
-        Err(e) => return refuse(say, &format!("the capacity ledger could not be read ({e})")),
+        match ledger.of_pid(seat.pid) {
+            Ok(mine) => {
+                if let Some(r) = mine.into_iter().find(|r| r.held.is_some()) {
+                    if cohort {
+                        return refuse(
+                            say,
+                            "native cohort admission cannot use an own-claim fallback",
+                        );
+                    }
+                    say(&format!(
+                        "{SAYS}: this process holds a claim of its own ({:?}), which a second would \
+                     wait on; the build runs unclaimed",
+                        r.need.what
+                    ));
+                    return Admission::Own(r);
+                }
+            }
+            Err(e) => return refuse(say, &format!("the capacity ledger could not be read ({e})")),
+        }
     }
     // Hints never precede verified authority, and an explicit mode choice needs no hint.
     let possible_lock = (seat.mode == Admit::Wait).then(probe_lock).flatten();
@@ -717,6 +800,26 @@ fn admit_bounded(
         say(line);
     };
     let attempt = |need: Need, speak: &mut dyn FnMut(&str)| {
+        if independent {
+            if let Some(why) = aterm_capacity::never(&need, &reading) {
+                return Err(Error::Never(why));
+            }
+            return match aterm_capacity::Waiter::enter(ledger, seat.machine, need)
+                .map_err(Error::Ledger)?
+                .poll(seat.machine)
+            {
+                aterm_capacity::Polled::Admitted(claim) => Ok(claim),
+                aterm_capacity::Polled::Waiting(waiter, short) => {
+                    drop(waiter);
+                    Err(Error::Stopped {
+                        signal: None,
+                        short: Some(short),
+                    })
+                }
+                aterm_capacity::Polled::Gone(error) => Err(Error::Ledger(error)),
+                aterm_capacity::Polled::Unqualified(why) => Err(Error::Timing(why)),
+            };
+        }
         if seat.mode != Admit::Wait || possible_lock.is_none() {
             return aterm_capacity::admit_with(
                 ledger,
@@ -737,16 +840,46 @@ fn admit_bounded(
                 short: None,
             });
         }
-        let polled = aterm_capacity::Waiter::enter(ledger, seat.machine, need)
-            .map_err(Error::Ledger)?
-            .poll(seat.machine);
-        if let Some(signal) = watch.take() {
-            drop(polled);
-            return Err(Error::Stopped {
-                signal: Some(signal),
-                short: None,
-            });
-        }
+        // One look decides, but only in its turn: the ledger's lock is held only while another
+        // admission decides, and a look waits on no build, so a wait for it can close no cycle.
+        // A look that met it is tried again every turn gap, saying who holds it by the wait
+        // loop's rule, until a look decides or an interrupt ends the wait.
+        let mut waiter =
+            aterm_capacity::Waiter::enter(ledger, seat.machine, need).map_err(Error::Ledger)?;
+        let mut turn: Option<Instant> = None;
+        let mut said: Option<Instant> = None;
+        let polled = loop {
+            let polled = waiter.poll(seat.machine);
+            if let Some(signal) = watch.take() {
+                drop(polled);
+                return Err(Error::Stopped {
+                    signal: Some(signal),
+                    short: None,
+                });
+            }
+            match polled {
+                aterm_capacity::Polled::Waiting(w, short)
+                    if matches!(short.shorts[..], [aterm_capacity::Short::Turn { .. }]) =>
+                {
+                    let since = *turn.get_or_insert_with(Instant::now);
+                    if let Some(line) = w.turn_line(&short, seat.pace, since, said) {
+                        speak(&line);
+                        said = Some(Instant::now());
+                    }
+                    if watch.nap(seat.pace.turn_gap(), &|| false)
+                        && let Some(signal) = watch.take()
+                    {
+                        drop(w);
+                        return Err(Error::Stopped {
+                            signal: Some(signal),
+                            short: Some(short),
+                        });
+                    }
+                    waiter = w;
+                }
+                decided => break decided,
+            }
+        };
         match polled {
             aterm_capacity::Polled::Admitted(claim) => Ok(claim),
             aterm_capacity::Polled::Waiting(waiter, short) => {
@@ -771,6 +904,8 @@ fn admit_bounded(
             claim,
             key,
             own: seat.own.clone(),
+            #[cfg(unix)]
+            cohort,
         })),
         Err(e @ Error::Stopped { signal: None, .. }) if possible_lock.is_some() => {
             let line = format!(
@@ -865,24 +1000,350 @@ pub fn children_maxrss() -> u64 {
 /// so the builds it starts claim nothing more, its tree metered while a claim is held, and its
 /// peak (never
 /// below `floor`'s read once it is reaped) kept as [`Held::end`] keeps one. Its status.
+/// Build pass-through commands with [`aterm_uds::spawnfd::TransparentCommand::into_command`]
+/// to preserve inherited handles such as compiler jobserver pipes. The native owned-child
+/// boundary uses ordinary spawn for ordinary admission. [`admit_cohort`] instead requires
+/// native ARM/birth/BIND. A live or unread cohort remains fully reserved after root exit;
+/// that incomplete run cannot supply a successful whole-build memory sample. This does
+/// not transfer the ordinary shim's terminal policy or enable account-wide cohort admission.
 ///
 /// # Errors
-/// The spawn's or the wait's.
+/// Admission's native launch, durable binding or wait failed. A child whose BIND failed
+/// remains supervised; the error is returned afterwards with uncertain custody retained.
 #[cfg(unix)]
 pub fn supervise(
     held: Option<Held>,
-    command: &mut aterm_uds::spawnfd::TransparentCommand,
+    command: &mut aterm_uds::spawnfd::Command,
     floor: &dyn Fn() -> u64,
     say: &mut dyn FnMut(&str),
 ) -> std::io::Result<std::process::ExitStatus> {
+    let cohort = held.as_ref().is_some_and(|held| held.cohort);
+    supervise_with(
+        held,
+        command,
+        floor,
+        say,
+        || {
+            if cohort {
+                front::Front::arm_cohort()
+            } else {
+                front::Front::arm()
+            }
+        },
+        |_, _| {},
+    )
+}
+
+/// Run explicit cohort admission on the caller's foreground controlling terminal.
+/// Native stopped-at-exec launch keeps target code behind durable BIND and terminal
+/// handoff; the child's owning wait restores foreground before reaping. Command start
+/// policy is restored on return and unwinding. This does not migrate the ordinary shim.
+/// # Errors
+/// Admission is not cohort-aware, native launch/handoff/resume fails, or wait fails.
+#[cfg(target_os = "macos")]
+pub fn supervise_terminal(
+    held: Held,
+    command: &mut aterm_uds::spawnfd::Command,
+    terminal: std::fs::File,
+    floor: &dyn Fn() -> u64,
+    say: &mut dyn FnMut(&str),
+) -> std::io::Result<std::process::ExitStatus> {
+    supervise_job_using(held, command, Some(terminal), floor, say, None, None)
+        .map(JobOutcome::root_status)
+}
+
+/// Notifications from the actual supervised root, not proof that its whole cohort
+/// is drained or that the CPU is actively executing.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SupervisedEvent {
+    /// Actual exit observed while cancellation still retains the original leader pin.
+    RootExitObserved,
+    /// The kernel reported a stop; the root remains owned and budgeted.
+    Stopped(i32),
+    /// The kernel accepted this controller's explicit resume request.
+    ResumeAccepted { foreground: bool },
+    /// Kernel acceptance of one explicit bound-group request, never proof of drain.
+    GroupRequestAccepted(aterm_capacity::cohort::launch::CohortSignal),
+    /// The actual root was reaped with accounting; cohort settlement is separate.
+    RootExited(aterm_uds::spawnfd::Rusage),
+    /// Kernel group absence settled this claim; root exit alone did not do so.
+    CohortDrained,
+    /// Group settlement remains live or unknown; its full budget stays reserved.
+    CohortRetained,
+}
+
+/// Durable cohort settlement, separate from root exit or signal acceptance.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CohortSettlement {
+    /// Kernel absence settled the original group reservation.
+    Drained,
+    /// Live or unknown work retains the complete reservation.
+    Retained,
+}
+
+/// Operational job result. Root status alone cannot establish successful work
+/// after cancellation or retained custody. This is not a formal proof grade.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+pub struct JobOutcome {
+    root: std::process::ExitStatus,
+    cancelled: bool,
+    settlement: Option<CohortSettlement>,
+}
+
+#[cfg(unix)]
+impl JobOutcome {
+    /// The actual root status, not a whole-job success verdict.
+    #[must_use]
+    pub const fn root_status(self) -> std::process::ExitStatus {
+        self.root
+    }
+    /// Explicit cancellation or a termination-class signal forwarded by this supervisor.
+    #[must_use]
+    pub const fn cancelled(self) -> bool {
+        self.cancelled
+    }
+    /// None for an ordinary holder supervisor without durable cohort custody.
+    #[must_use]
+    pub const fn cohort_settlement(self) -> Option<CohortSettlement> {
+        self.settlement
+    }
+    /// An uncancelled zero root exit with the original cohort conclusively drained.
+    /// Does not establish formal correctness or certificate validation.
+    #[must_use]
+    pub fn succeeded(self) -> bool {
+        !self.cancelled && self.root.success() && self.settlement == Some(CohortSettlement::Drained)
+    }
+}
+
+/// An explicit owner decision after a stop. No action suspends the resource owner.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobControl {
+    /// Keep stopped until an external operator changes it; retain the reservation.
+    Wait,
+    /// Reacquire the caller's foreground terminal, then continue the admitted group.
+    ResumeForeground,
+    /// Resume without claiming terminal foreground (terminal I/O may stop it again).
+    ResumeBackground,
+    /// Request TERM then CONT for the bound group, so stopped members can handle
+    /// termination. Each accepted syscall is reported separately; no release is implied.
+    TerminateGroup,
+    /// Request KILL for the bound group. Acceptance still does not establish drain.
+    KillGroup,
+}
+
+#[cfg(unix)]
+/// A borrowed owner policy; callbacks run on the parent side, never in a signal
+/// handler or child pre-exec callback.
+pub type JobEvents<'a> = &'a mut dyn FnMut(SupervisedEvent) -> std::io::Result<JobControl>;
+
+#[cfg(unix)]
+#[path = "build_admit_live.rs"]
+mod live;
+#[cfg(unix)]
+pub use live::{CancelHandle, CancelRequest, Cancellation};
+
+#[cfg(target_os = "macos")]
+#[path = "build_admit_host.rs"]
+pub mod host;
+
+#[cfg(target_os = "macos")]
+#[path = "build_admit_service.rs"]
+pub mod service;
+
+#[cfg(unix)]
+struct JobRun<'a> {
+    terminal: Option<std::fs::File>,
+    events: Option<JobEvents<'a>>,
+    live: Option<Cancellation>,
+    cancelled: bool,
+}
+
+/// Supervise explicit terminal cohort work with owner-directed stop/resume events.
+/// Stops yield the terminal and keep the same claim. Only an explicit callback
+/// decision resumes work; shell/pipeline policy belongs to the client, never an
+/// automatic suspension of a persistent prefix owner. Non-stop events take Wait.
+/// # Errors
+/// As [`supervise_terminal`], or an event, owner decision or group request fails.
+#[cfg(target_os = "macos")]
+pub fn supervise_terminal_events(
+    held: Held,
+    command: &mut aterm_uds::spawnfd::Command,
+    terminal: std::fs::File,
+    floor: &dyn Fn() -> u64,
+    say: &mut dyn FnMut(&str),
+    events: JobEvents<'_>,
+) -> std::io::Result<std::process::ExitStatus> {
+    supervise_job_using(
+        held,
+        command,
+        Some(terminal),
+        floor,
+        say,
+        Some(events),
+        None,
+    )
+    .map(JobOutcome::root_status)
+}
+
+/// Supervise live job-local cancellation. The receiver's explicit grace retains
+/// the original leader pin through TERM/CONT and KILL escalation before owning reap.
+/// Normal uncancelled jobs keep their ordinary prompt exit behavior. Root exit,
+/// accepted requests and actual group drain are distinct events.
+/// # Errors
+/// Invalid inbox owner, native launch/control/wait failure or rejected owner event.
+#[cfg(target_os = "macos")]
+pub fn supervise_terminal_controlled(
+    held: Held,
+    command: &mut aterm_uds::spawnfd::Command,
+    terminal: std::fs::File,
+    floor: &dyn Fn() -> u64,
+    say: &mut dyn FnMut(&str),
+    cancellation: Cancellation,
+    events: JobEvents<'_>,
+) -> std::io::Result<JobOutcome> {
+    cancellation.check_owner()?;
+    supervise_job_using(
+        held,
+        command,
+        Some(terminal),
+        floor,
+        say,
+        Some(events),
+        Some(cancellation),
+    )
+}
+
+/// Run an independently owned headless cohort job. This blocks its caller but
+/// installs no process signal policy, takes no global forwarding turn and never
+/// opens or acquires a controlling terminal. A host can call it concurrently on
+/// its own bounded execution threads; the host owns process-wide shutdown policy.
+/// Each job retains its actual child, cancellation inbox and complete budget.
+/// Foreground resume refuses; background resume and explicit cancellation remain
+/// available. This is not yet a single event loop or ordinary shim adoption.
+/// # Errors
+/// Non-cohort admission, invalid inbox owner, native launch/control/wait failure,
+/// foreground resume without a lease, or rejected owner event.
+#[cfg(target_os = "macos")]
+pub fn supervise_headless_controlled(
+    held: Held,
+    command: &mut aterm_uds::spawnfd::Command,
+    floor: &dyn Fn() -> u64,
+    say: &mut dyn FnMut(&str),
+    cancellation: Cancellation,
+    events: JobEvents<'_>,
+) -> std::io::Result<JobOutcome> {
+    cancellation.check_owner()?;
+    supervise_job_using(
+        held,
+        command,
+        None,
+        floor,
+        say,
+        Some(events),
+        Some(cancellation),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn supervise_job_using(
+    held: Held,
+    command: &mut aterm_uds::spawnfd::Command,
+    terminal: Option<std::fs::File>,
+    floor: &dyn Fn() -> u64,
+    say: &mut dyn FnMut(&str),
+    events: Option<JobEvents<'_>>,
+    live: Option<Cancellation>,
+) -> std::io::Result<JobOutcome> {
+    struct Restore<'a> {
+        command: &'a mut aterm_uds::spawnfd::Command,
+        configured: bool,
+    }
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            self.command.start_suspended(self.configured);
+        }
+    }
+    let configured = command.starts_suspended();
+    command.start_suspended(true);
+    let restore = Restore {
+        command,
+        configured,
+    };
+    let forwarding = terminal.is_some();
+    supervise_launch(
+        Some(held),
+        &mut *restore.command,
+        floor,
+        say,
+        || {
+            if forwarding {
+                front::Front::arm_cohort()
+            } else {
+                None
+            }
+        },
+        |_, _| {},
+        Some(JobRun {
+            terminal,
+            events,
+            live,
+            cancelled: false,
+        }),
+    )
+}
+
+// Parent-side runtime seams exercise unavailable forwarding with actual child ownership and
+// metering. The production caller supplies the real factory and no observer.
+#[cfg(unix)]
+fn supervise_with(
+    held: Option<Held>,
+    command: &mut aterm_uds::spawnfd::Command,
+    floor: &dyn Fn() -> u64,
+    say: &mut dyn FnMut(&str),
+    arm: impl FnOnce() -> Option<front::Front>,
+    before_wait: impl FnOnce(&mut aterm_uds::spawnfd::Child, Option<&TreeMeter>),
+) -> std::io::Result<std::process::ExitStatus> {
+    supervise_launch(
+        held,
+        command,
+        floor,
+        say,
+        arm,
+        |owned, meter| before_wait(owned.child_mut(), meter),
+        None,
+    )
+    .map(JobOutcome::root_status)
+}
+
+#[cfg(unix)]
+fn supervise_launch(
+    mut held: Option<Held>,
+    command: &mut aterm_uds::spawnfd::Command,
+    floor: &dyn Fn() -> u64,
+    say: &mut dyn FnMut(&str),
+    arm: impl FnOnce() -> Option<front::Front>,
+    before_wait: impl FnOnce(&mut SupervisedChild, Option<&TreeMeter>),
+    mut terminal: Option<JobRun<'_>>,
+) -> std::io::Result<JobOutcome> {
+    if terminal.is_some() && held.as_ref().is_none_or(|held| !held.cohort) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "controlled cohort supervision requires explicit native cohort admission",
+        ));
+    }
     if let Some(held) = &held {
         command.env(
             aterm_capacity::COVER_ENV,
             held.claim().record().cover_marker(),
         );
     }
-    let front = front::Front::arm();
-    let mut child = match command.spawn() {
+    let front = arm();
+    let (mut owned, mut launch_error) = match launch_held(held.as_mut(), command) {
         Ok(child) => child,
         Err(e) => {
             if let Some(front) = &front {
@@ -891,36 +1352,494 @@ pub fn supervise(
             return Err(e);
         }
     };
-    let meter = held.as_ref().map(|_| TreeMeter::start(child.id()));
-    let status = match front {
+    let child = owned.child_mut();
+    if let Some(terminal) = terminal.as_ref() {
+        let handed = if launch_error.is_some() {
+            Err(std::io::Error::other("unbound child remains stopped"))
+        } else {
+            let initial = if terminal.events.is_some() {
+                acknowledge_initial_stop(child)
+            } else {
+                Ok(())
+            };
+            initial
+                .and_then(|()| match &terminal.terminal {
+                    Some(terminal) => child.take_foreground(terminal.try_clone()?),
+                    None => Ok(()),
+                })
+                .and_then(|()| child.resume())
+        };
+        if let Err(error) = handed {
+            // This exact owned unreaped child has not acknowledged a usable terminal
+            // launch. End it and retain the original failure through ordinary cleanup.
+            if let Err(kill) = child.kill() {
+                say(&format!(
+                    "{SAYS}: ending the owned child after controlled launch failure: {kill}"
+                ));
+            }
+            launch_error.get_or_insert(error);
+        }
+    }
+    let meter = held
+        .as_ref()
+        .filter(|_| !child.is_reaped())
+        .map(|_| TreeMeter::start(child.id()));
+    if !child.is_reaped() {
+        before_wait(&mut owned, meter.as_ref());
+    }
+    let child = owned.child_mut();
+    let (status, passed) = match front {
         Some(front) => {
-            front.aim(child.id(), meter.as_ref().map(TreeMeter::watch));
-            let status = front.reap(&mut child);
+            if child.is_reaped() {
+                front.reaped();
+            } else {
+                front.aim(child.id(), meter.as_ref().map(TreeMeter::watch));
+            }
+            let status = wait_supervised(&mut owned, Some(&front), terminal.as_mut(), say);
             let passed = front.passed();
             front.disarm();
-            if let (Some(meter), Ok(status)) = (&meter, &status) {
-                end_tree(meter, passed, *status, say);
-            }
-            status
+            (status, passed)
         }
-        None => child.wait(),
+        None => (
+            wait_supervised(&mut owned, None, terminal.as_mut(), say),
+            None,
+        ),
     };
+    if let (Some(meter), Ok(status)) = (&meter, &status) {
+        end_tree(meter, passed, *status, say);
+    }
+    // A root's exit is no group-drain receipt. Drop retains a live/unknown cohort's
+    // entire budget; do not record an incomplete sample as a successful whole build.
+    let mut settled = true;
+    if let Some(held) = held.as_mut().filter(|held| held.cohort)
+        && let Err(error) = held.claim.finish_cohort()
+    {
+        settled = false;
+        say(&format!(
+            "{SAYS}: cohort reservation retained after root wait ({error})"
+        ));
+    }
+    let settlement = held.as_ref().filter(|held| held.cohort).map(|_| {
+        if settled {
+            CohortSettlement::Drained
+        } else {
+            CohortSettlement::Retained
+        }
+    });
+    let mut status = launch_error.map_or(status, Err);
+    if let Some(events) = terminal
+        .as_mut()
+        .and_then(|terminal| terminal.events.as_mut())
+    {
+        let notified = events(if settled {
+            SupervisedEvent::CohortDrained
+        } else {
+            SupervisedEvent::CohortRetained
+        })
+        .and_then(|decision| {
+            if decision == JobControl::Wait {
+                Ok(())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "settlement events carry no live group authority",
+                ))
+            }
+        });
+        if let Err(error) = notified
+            && status.is_ok()
+        {
+            status = Err(error);
+        }
+    }
+    let cancelled = passed.is_some()
+        || terminal.as_ref().is_some_and(|terminal| {
+            terminal.cancelled || terminal.live.as_ref().is_some_and(Cancellation::requested)
+        });
     if let (Some(held), Some(meter)) = (held, meter) {
         let ended = held.let_go();
         let peak = meter.stop(floor());
         ended.keep(
-            status.as_ref().is_ok_and(std::process::ExitStatus::success),
+            !cancelled && settled && status.as_ref().is_ok_and(std::process::ExitStatus::success),
             peak,
             say,
         );
     }
-    status
+    status.map(|root| JobOutcome {
+        root,
+        cancelled,
+        settlement,
+    })
 }
 
-/// The longest a claim waits for what a build ended by a signal left running ([`end_tree`]): a
-/// one-minute hang detector, past which the claim ends anyway, said.
+#[cfg(unix)]
+fn acknowledge_initial_stop(child: &mut aterm_uds::spawnfd::Child) -> std::io::Result<()> {
+    match child.wait_job_event()?.acknowledge()? {
+        Some(aterm_uds::spawnfd::ChildEvent::Stopped(
+            aterm_uds::spawnfd::ChildStop::SuspendedStart,
+        )) => Ok(()),
+        event => Err(std::io::Error::other(format!(
+            "native controlled job did not acknowledge its suspended start: {event:?}",
+        ))),
+    }
+}
+
+#[cfg(unix)]
+fn wait_supervised(
+    owned: &mut SupervisedChild,
+    front: Option<&front::Front>,
+    terminal: Option<&mut JobRun<'_>>,
+    say: &mut dyn FnMut(&str),
+) -> std::io::Result<std::process::ExitStatus> {
+    let result = wait_supervised_events(owned, front, terminal);
+    if result.is_err() && !owned.child_mut().is_reaped() && request_owned_cleanup(owned, say) {
+        let child = owned.child_mut();
+        let cleanup = match front {
+            Some(front) => front.reap(child),
+            None => child.wait(),
+        };
+        if let Err(error) = cleanup {
+            say(&format!(
+                "{SAYS}: failed supervision could not reap its owned root ({error})"
+            ));
+        }
+    }
+    result
+}
+
+#[cfg(unix)]
+fn request_owned_cleanup(owned: &mut SupervisedChild, say: &mut dyn FnMut(&str)) -> bool {
+    // Control/observer failure must not abandon a live, still-authorized
+    // native launch. No fallback may bypass a refused scope/handle check.
+    let authorized = match owned {
+        SupervisedChild::Bound(bound) => {
+            match bound.request_group(aterm_capacity::cohort::launch::CohortSignal::Kill) {
+                Ok(()) => true,
+                Err(error) if error.raw_os_error() == Some(libc::ESRCH) => true,
+                // Keep the original scope/seal checks and try surviving group
+                // members first. A kernel permission refusal for an actually
+                // terminal root does not prohibit reaping that same owned root.
+                // This never counts as accepted signalling or group drain.
+                Err(error)
+                    if error.raw_os_error() == Some(libc::EPERM)
+                        && matches!(bound.child_mut().exited(), Ok(true)) =>
+                {
+                    true
+                }
+                Err(error) => {
+                    say(&format!(
+                        "{SAYS}: failed supervision retains custody; cleanup group request refused ({error})"
+                    ));
+                    false
+                }
+            }
+        }
+        SupervisedChild::Unbound(spawned) => {
+            spawned.key().is_current() && spawned.is_original_child()
+        }
+        SupervisedChild::Ordinary(_) => false,
+    };
+    if authorized {
+        let child = owned.child_mut();
+        // Positive-child cleanup also covers a root that left its original
+        // group. It never broadcasts to a newly observed group.
+        if child.kill().is_ok() || matches!(child.exited(), Ok(true)) {
+            return true;
+        }
+        say(&format!(
+            "{SAYS}: failed supervision retains work; owned root could not be ended"
+        ));
+    }
+    false
+}
+
+#[cfg(unix)]
+fn wait_supervised_events(
+    owned: &mut SupervisedChild,
+    front: Option<&front::Front>,
+    terminal: Option<&mut JobRun<'_>>,
+) -> std::io::Result<std::process::ExitStatus> {
+    let child = owned.child_mut();
+    let Some(terminal) = terminal.filter(|run| run.events.is_some()) else {
+        return match front {
+            Some(front) => front.reap(child),
+            None => child.wait(),
+        };
+    };
+    if child.is_reaped() {
+        return child.wait();
+    }
+    let events = terminal.events.as_mut().expect("event owner");
+    loop {
+        if let Some(live) = terminal.live.as_mut() {
+            live.service(owned, events)?;
+            if live.exit_observed() && live.holds_root() {
+                live.wait()?;
+                continue;
+            }
+        }
+        let child = owned.child_mut();
+        let observed = if let Some(live) = terminal.live.as_mut() {
+            let Some(observed) = child.try_job_event()? else {
+                live.wait()?;
+                continue;
+            };
+            if observed.notice() == aterm_uds::spawnfd::ChildNotice::Exited && live.holds_root() {
+                child.restore_foreground()?;
+                live.observe_exit(events)?;
+                continue;
+            }
+            observed
+        } else {
+            child.wait_job_event()?
+        };
+        let event = match front {
+            Some(front) => front.acknowledge_job(observed)?,
+            None => observed.acknowledge()?,
+        };
+        match event {
+            Some(aterm_uds::spawnfd::ChildEvent::Stopped(
+                aterm_uds::spawnfd::ChildStop::Signal(signal),
+            )) => {
+                let action = events(SupervisedEvent::Stopped(signal))?;
+                // An exited but unreaped original leader still pins its group.
+                // Terminate surviving members before any owning root reap.
+                match action {
+                    JobControl::TerminateGroup => {
+                        terminal.cancelled = true;
+                        if let Some(live) = terminal.live.as_mut() {
+                            live.terminate(owned, events)?;
+                            continue;
+                        }
+                        request_job_group(
+                            owned,
+                            aterm_capacity::cohort::launch::CohortSignal::Terminate,
+                            events,
+                        )?;
+                        request_job_group(
+                            owned,
+                            aterm_capacity::cohort::launch::CohortSignal::Continue,
+                            events,
+                        )?;
+                        continue;
+                    }
+                    JobControl::KillGroup => {
+                        terminal.cancelled = true;
+                        if let Some(live) = terminal.live.as_mut() {
+                            live.kill(owned, events)?;
+                            continue;
+                        }
+                        request_job_group(
+                            owned,
+                            aterm_capacity::cohort::launch::CohortSignal::Kill,
+                            events,
+                        )?;
+                        continue;
+                    }
+                    _ => {}
+                }
+                // The operator may have ended the paused root while the owner
+                // decided. Observe and reap that exit instead of using its old pid.
+                if child.exited()? {
+                    continue;
+                }
+                let foreground = match action {
+                    JobControl::Wait => continue,
+                    JobControl::ResumeForeground => {
+                        let terminal = terminal.terminal.as_ref().ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::PermissionDenied,
+                                "headless job has no foreground terminal lease",
+                            )
+                        })?;
+                        if let Err(error) = child.take_foreground(terminal.try_clone()?) {
+                            if child.exited()? {
+                                continue;
+                            }
+                            return Err(error);
+                        }
+                        true
+                    }
+                    JobControl::ResumeBackground => false,
+                    JobControl::TerminateGroup | JobControl::KillGroup => {
+                        unreachable!("handled above")
+                    }
+                };
+                if let Err(error) =
+                    owned.request_group(aterm_capacity::cohort::launch::CohortSignal::Continue)
+                {
+                    if owned.child_mut().exited()? {
+                        continue;
+                    }
+                    return Err(error);
+                }
+                if events(SupervisedEvent::ResumeAccepted { foreground })? != JobControl::Wait {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "resume decisions require a stopped event",
+                    ));
+                }
+            }
+            Some(aterm_uds::spawnfd::ChildEvent::Stopped(
+                aterm_uds::spawnfd::ChildStop::SuspendedStart,
+            )) => {
+                return Err(std::io::Error::other(
+                    "unexpected second suspended-start notification",
+                ));
+            }
+            Some(aterm_uds::spawnfd::ChildEvent::Exited(usage)) => {
+                notify_job_exit(usage, events)?;
+                return Ok(usage.status);
+            }
+            None => {}
+        }
+    }
+}
+
+#[cfg(unix)]
+fn notify_job_exit(
+    usage: aterm_uds::spawnfd::Rusage,
+    events: &mut JobEvents<'_>,
+) -> std::io::Result<()> {
+    if events(SupervisedEvent::RootExited(usage))? == JobControl::Wait {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "an exited root cannot be resumed",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn request_job_group(
+    owned: &mut SupervisedChild,
+    signal: aterm_capacity::cohort::launch::CohortSignal,
+    events: &mut JobEvents<'_>,
+) -> std::io::Result<()> {
+    owned.request_group(signal)?;
+    notify_job_group(signal, events)
+}
+
+#[cfg(unix)]
+fn notify_job_group(
+    signal: aterm_capacity::cohort::launch::CohortSignal,
+    events: &mut JobEvents<'_>,
+) -> std::io::Result<()> {
+    if events(SupervisedEvent::GroupRequestAccepted(signal))? != JobControl::Wait {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "group-control decisions require a stopped event",
+        ));
+    }
+    Ok(())
+}
+
+/// Keep the actual launch receipt through supervision. An unbound birth stays
+/// owned for cleanup but cannot acquire the bound cohort's group-control API.
+#[cfg(unix)]
+enum SupervisedChild {
+    Ordinary(aterm_uds::spawnfd::Child),
+    Bound(Box<aterm_capacity::cohort::launch::CohortChild>),
+    Unbound(Box<aterm_uds::spawnfd::Spawned>),
+}
+
+#[cfg(unix)]
+impl SupervisedChild {
+    fn group_drained(&self) -> bool {
+        matches!(self, Self::Bound(bound) if bound.cohort().lifetime() == aterm_capacity::cohort::Lifetime::Drained)
+    }
+    fn child_mut(&mut self) -> &mut aterm_uds::spawnfd::Child {
+        match self {
+            Self::Ordinary(child) => child,
+            Self::Bound(bound) => bound.child_mut(),
+            Self::Unbound(spawned) => spawned.child_mut(),
+        }
+    }
+
+    fn request_group(
+        &mut self,
+        signal: aterm_capacity::cohort::launch::CohortSignal,
+    ) -> std::io::Result<()> {
+        match self {
+            Self::Bound(bound) => bound.request_group(signal),
+            Self::Ordinary(_) | Self::Unbound(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "group control requires an actual bound cohort launch",
+            )),
+        }
+    }
+}
+
+/// Preserve the actual child even when BIND fails: supervise it, return the binding
+/// error afterwards, and leave uncertain durable custody reserved. Only a genuine
+/// no-child receipt can cancel an ARM. Ordinary claims keep their existing spawn.
+#[cfg(unix)]
+fn launch_held(
+    held: Option<&mut Held>,
+    command: &mut aterm_uds::spawnfd::Command,
+) -> std::io::Result<(SupervisedChild, Option<std::io::Error>)> {
+    use aterm_capacity::cohort::launch::LaunchError;
+    let Some(held) = held.filter(|held| held.cohort) else {
+        return command
+            .spawn()
+            .map(|child| (SupervisedChild::Ordinary(child), None));
+    };
+    match held.claim.launch_cohort(command) {
+        Ok(child) => Ok((SupervisedChild::Bound(Box::new(child)), None)),
+        Err(LaunchError::Refused(error)) => Err(error),
+        Err(LaunchError::NotSpawned(proof)) => {
+            let error = std::io::Error::new(proof.error().kind(), proof.error().to_string());
+            held.claim.cancel_cohort(*proof)?;
+            Err(error)
+        }
+        Err(LaunchError::Unbound { spawned, error }) => {
+            Ok((SupervisedChild::Unbound(spawned), Some(error)))
+        }
+    }
+}
+
+/// How long what a build ended by a signal left running is given to end by that signal
+/// before [`end_tree`] kills it outright: the grace each left process gets from the signal
+/// it was sent. Elapsed time alone never ends the claim: it ends on a read that finds
+/// none left ([`aterm_capacity::tree_meter::Left::Read`]), however long what is left
+/// takes to drain once killed.
 #[cfg(unix)]
 pub const TREE_ENDS_WITHIN: std::time::Duration = std::time::Duration::from_mins(1);
+
+/// TEST SEAM: set in a debug build's environment to a count of milliseconds, [`end_tree`]'s
+/// escalation grace is that long instead of [`TREE_ENDS_WITHIN`], so a test of a process deaf
+/// to the ending signal does not wait a minute for its kill.
+#[cfg(all(unix, any(test, debug_assertions)))]
+pub const TREE_END_GRACE_ENV: &str = "ATERM_BUILD_TREE_END_GRACE_MS";
+
+/// [`end_tree`]'s escalation grace: [`TREE_ENDS_WITHIN`], or [`TREE_END_GRACE_ENV`]'s
+/// milliseconds in a debug build.
+#[cfg(unix)]
+fn tree_end_grace() -> std::time::Duration {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(ms) = std::env::var(TREE_END_GRACE_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        return std::time::Duration::from_millis(ms);
+    }
+    TREE_ENDS_WITHIN
+}
+
+#[cfg(unix)]
+fn signal_observed((pid, start): (u32, u64), signal: i32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid <= 1 || aterm_uds::process::read_process_start(pid).map(|s| s.boot.0) != Some(start) {
+        return false;
+    }
+    // This fresh birth read rejects stale observations; it does not pin a reaped
+    // descendant's pid across the kernel call. Durable group custody remains separate.
+    // SAFETY: kill takes integer arguments. The caller selected observed work to signal.
+    unsafe { libc::kill(pid, signal) == 0 }
+}
 
 /// How often [`end_tree`] reads what is left.
 #[cfg(unix)]
@@ -929,10 +1848,20 @@ const TREE_END_READ: std::time::Duration = std::time::Duration::from_millis(100)
 /// END WHAT A BUILD ENDED BY A SIGNAL LEFT RUNNING, before its claim ends: a `cargo` killed by a
 /// SIGTERM leaves its compilers and build scripts running, reparented away, holding memory its
 /// claim no longer would. Where the front passed a signal on (`passed`), or the build died of one,
-/// every process its tree leaves ([`TreeMeter::left`]) is sent that signal (a core signal's
-/// death sends SIGTERM, so no crash is reported for them), each once, and the claim waits until
-/// none is left, [`TREE_ENDS_WITHIN`] at most. A build that exited leaves what it started alone
-/// (a daemon it meant to outlive it).
+/// every process its tree leaves ([`TreeMeter::left_observed`]) is sent that signal (a core
+/// signal's death sends SIGTERM, so no crash is reported for them), each once by its identity
+/// (its pid and its start, so a pid taken anew is sent it as its own process, never killed for
+/// its predecessor), and the claim waits until a read finds none left. One still left
+/// [`TREE_ENDS_WITHIN`] after it was sent the signal receives a SIGKILL request, said when
+/// the kernel accepts it; the claim then waits for the read that finds it gone,
+/// with no second bound: elapsed time is no evidence that descendant work stopped. A read
+/// that fails ([`aterm_capacity::tree_meter::Left::Unread`]) is no such evidence either, so
+/// the wait goes on to the next read. Where no read ever found the tree's group
+/// ([`aterm_capacity::tree_meter::Left::Unobserved`]: off macOS, or a root gone before its
+/// first read) there is no observed process to end or to wait for: no sampled drain is
+/// established. The supervisor separately settles durable cohort custody; an ordinary
+/// claim ends unobserved, never as a reading of none left. A build that exited leaves what it
+/// started alone (a daemon it meant to outlive it).
 #[cfg(unix)]
 fn end_tree(
     meter: &TreeMeter,
@@ -940,6 +1869,7 @@ fn end_tree(
     status: std::process::ExitStatus,
     say: &mut dyn FnMut(&str),
 ) {
+    use aterm_capacity::tree_meter::Left;
     use std::os::unix::process::ExitStatusExt as _;
     let Some(sig) = passed.or_else(|| {
         status.signal().map(|n| {
@@ -952,34 +1882,50 @@ fn end_tree(
     }) else {
         return;
     };
-    let now = std::time::Instant::now();
-    let until = now
-        .checked_add(TREE_ENDS_WITHIN)
-        .unwrap_or_else(|| now + std::time::Duration::from_secs(86_400 * 365));
-    let mut sent: Vec<u32> = Vec::new();
+    let grace = tree_end_grace();
+    // Each left identity the ending signal was sent to, when, and whether SIGKILL followed.
+    let mut sent: Vec<((u32, u64), std::time::Instant, bool)> = Vec::new();
     loop {
-        let left = meter.left();
+        let left = match meter.left_observed() {
+            Left::Read(left) => left,
+            Left::Unread => {
+                std::thread::sleep(TREE_END_READ);
+                continue;
+            }
+            Left::Unobserved => {
+                say(&format!(
+                    "{SAYS}: what the build left running could not be read: \
+                     no sampled drain established"
+                ));
+                return;
+            }
+        };
         if left.is_empty() {
             return;
         }
-        for &pid in &left {
-            if sent.contains(&pid) {
-                continue;
-            }
-            sent.push(pid);
-            if let Ok(pid) = libc::pid_t::try_from(pid) {
-                // SAFETY: `kill` with two integers; `pid` is a process this build started, live
-                // at the read just made, by its start.
-                unsafe { libc::kill(pid, sig) };
+        let now = std::time::Instant::now();
+        let mut kill_requests = 0usize;
+        for &identity in &left {
+            match sent.iter_mut().find(|(seen, ..)| *seen == identity) {
+                None => {
+                    if signal_observed(identity, sig) {
+                        sent.push((identity, now, sig == libc::SIGKILL));
+                    }
+                }
+                Some((_, at, done)) if !*done && now.duration_since(*at) >= grace => {
+                    if signal_observed(identity, libc::SIGKILL) {
+                        *done = true;
+                        kill_requests += 1;
+                    }
+                }
+                Some(_) => {}
             }
         }
-        if std::time::Instant::now() >= until {
+        if kill_requests > 0 {
             say(&format!(
-                "{SAYS}: {} of the build's processes outlived it by {}s: its claim ends anyway",
-                left.len(),
-                TREE_ENDS_WITHIN.as_secs()
+                "{SAYS}: kernel accepted SIGKILL for {kill_requests} observed process(es) \
+                 still running {grace:?} after signal {sig}; its claim waits for them to end"
             ));
-            return;
         }
         std::thread::sleep(TREE_END_READ);
     }
@@ -1047,7 +1993,7 @@ pub fn run_if_claimed_at(
     let mut say = |line: &str| eprintln!("{line}");
     match admit(&build, cwd, seat, &mut say) {
         Admission::Claimed(held) => {
-            let mut command = aterm_uds::spawnfd::transparent(target);
+            let mut command = aterm_uds::spawnfd::transparent(target).into_command();
             command.args(args);
             for (k, v) in env {
                 command.env(k, v);
@@ -1256,7 +2202,7 @@ fn front_exec_bounded(
             say(&format!(
                 "{SAYS}: its claim's holder did not arm ({why}); the build runs under this front"
             ));
-            let mut command = aterm_uds::spawnfd::transparent(target);
+            let mut command = aterm_uds::spawnfd::transparent(target).into_command();
             command.args(args);
             match supervise(Some(held), &mut command, &children_maxrss, &mut say) {
                 Ok(status) => end_like(status),
@@ -1286,6 +2232,9 @@ pub const HOLDER_ARMS_WITHIN: std::time::Duration = std::time::Duration::from_se
 /// where it did not.
 #[cfg(target_os = "macos")]
 fn hand_over(held: &Held) -> Result<(), String> {
+    if held.cohort {
+        return Err("native cohort custody cannot transfer to an ordinary holder".into());
+    }
     let exe = aterm_uds::tether::executable().ok_or("no unchanged image of this executable")?;
     let me = std::process::id();
     let serial = i32::try_from(me)

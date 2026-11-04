@@ -6,6 +6,27 @@ use crate::ai::store::{Ended, Outcome};
 
 const NOW: i64 = 1_800_000_000;
 
+pub(super) fn write_codex_login(home: &Path, email: &str) {
+    fs::create_dir_all(home).unwrap();
+    fs::write(
+        home.join("config.toml"),
+        "cli_auth_credentials_store='file'\n",
+    )
+    .unwrap();
+    let token = super::super::codex_app_login::tests::make_jwt(&aterm_json::json!({
+        "email": email,
+        "https://api.openai.com/auth": {"chatgpt_user_id": email, "chatgpt_account_id": "fixture-workspace"}
+    }));
+    fs::write(
+        home.join("auth.json"),
+        aterm_json::json!({
+            "auth_mode": "chatgpt", "tokens": {"id_token": token, "access_token": token}
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
 fn review_case(provider: i64, location: i64, outcome: i64, case: i64) -> [bool; 5] {
     let root = aterm_tempfile::TempDir::new().unwrap();
     let cli = if provider == 0 {
@@ -26,20 +47,30 @@ fn review_case(provider: i64, location: i64, outcome: i64, case: i64) -> [bool; 
         accounts::append_rows_for(cli, "", &[row.clone()]).unwrap(),
     )
     .unwrap();
+    let context = if cli == Cli::Codex {
+        write_codex_login(
+            row.dir.as_deref().map_or(home.as_path(), Path::new),
+            "fixture@example.test",
+        );
+        Some(store.capture_auth_context(&row).unwrap())
+    } else {
+        None
+    };
     store
         .transact_logins(NOW, &mut None, |state, logins| {
             accounts::note_served_login(logins, "account", NOW - 20);
             accounts::note_auth(state, "foreign", accounts::Auth::Ok, NOW - 20);
-            Ok(accounts::note_auth(
-                state,
-                "account",
-                if outcome == 0 {
-                    accounts::Auth::SignedOut
-                } else {
-                    accounts::Auth::Ok
-                },
-                NOW - 10,
-            ))
+            let word = if outcome == 0 {
+                accounts::Auth::SignedOut
+            } else {
+                accounts::Auth::Ok
+            };
+            if let Some(context) = context.clone() {
+                accounts::stage_auth(state, &row, logins, context, word, NOW - 10);
+                Ok(Vec::new())
+            } else {
+                Ok(accounts::note_auth(state, "account", word, NOW - 10))
+            }
         })
         .unwrap();
     if matches!(case, 12 | 13) {
@@ -154,6 +185,18 @@ fn review_case(provider: i64, location: i64, outcome: i64, case: i64) -> [bool; 
             } else {
                 store
                     .transact_logins(NOW, &mut None, |state, logins| {
+                        if let Some(context) = context.clone() {
+                            accounts::stage_auth(
+                                state,
+                                &row,
+                                logins,
+                                context.clone(),
+                                accounts::Auth::SignedOut,
+                                NOW,
+                            );
+                            accounts::stage_signed_back(state, &row, logins, context, NOW);
+                            return Ok(Vec::new());
+                        }
                         let mut events =
                             accounts::note_auth(state, "account", accounts::Auth::SignedOut, NOW);
                         events.extend(accounts::note_signed_back(state, logins, "account", NOW));
@@ -285,5 +328,113 @@ fn review_outcomes_conform_to_the_captured_account_and_login() {
         let mut bad = state.clone();
         bad.insert(field, 1 - state[field]);
         assert!(!model.check_invariant(law, &bad));
+    }
+}
+
+/// A REVIEW THAT ENDS ON A LOGIN ERROR ENDS NOTHING ON A ROW THAT NEVER HELD A LOGIN: no login is
+/// stored, none was ever renewed, served or ended and it was never seen signed out, so the row stays
+/// never signed in (the report's `not-enrolled`, not `signed-out`). CONTROL: with a login stored, the
+/// same outcome records its end.
+#[test]
+fn a_reviews_login_error_ends_nothing_on_a_row_never_signed_in() {
+    for stored in [false, true] {
+        let root = aterm_tempfile::TempDir::new().unwrap();
+        let cli = Cli::Codex;
+        let home = root.path().join(cli.accounts().default_home);
+        fs::create_dir_all(&home).unwrap();
+        if stored {
+            write_codex_login(&home, "fixture@example.test");
+        }
+        let store = accounts::Store::at_for(root.path(), cli, root.path());
+        let path = root.path().join(cli.accounts().roster_file);
+        let row = Row {
+            label: "account".into(),
+            ..Row::default()
+        };
+        fs::write(
+            &path,
+            accounts::append_rows_for(cli, "", std::slice::from_ref(&row)).unwrap(),
+        )
+        .unwrap();
+        let login = accounts::login_env_for(cli, &row);
+        let witness =
+            capture_review_login(&store, cli, &path, "account", &login, NOW).expect("a witness");
+        record_review_login(
+            &store,
+            cli,
+            &path,
+            &witness,
+            &home,
+            Outcome::Ended(Ended::ReviewAuth),
+            NOW,
+        )
+        .expect("the outcome");
+        let state = store.load(NOW).unwrap().0;
+        let signed_out = state
+            .accounts
+            .get("account")
+            .is_some_and(|account| account.auth == accounts::Auth::SignedOut);
+        assert_eq!(signed_out, stored, "a login stored: {stored}");
+    }
+}
+
+/// A CLAUDE CODE LOGIN A MAC KEEPS IN ITS KEYCHAIN IS A LOGIN: no `.credentials.json` is stored, and
+/// the profile of the row's home names an account, so the first review's login error ends it, on
+/// the default login and on a row of its own. CONTROL: with no profile naming an account, the row
+/// never held a login and nothing ends.
+#[test]
+fn a_reviews_login_error_ends_a_claude_login_its_profile_names() {
+    for (own_home, named) in [(false, true), (true, true), (false, false), (true, false)] {
+        let root = aterm_tempfile::TempDir::new().unwrap();
+        let cli = Cli::Claude;
+        let home = root.path().join(cli.accounts().default_home);
+        let own = root.path().join("login");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&own).unwrap();
+        if named {
+            let profile = if own_home {
+                own.join(".claude.json")
+            } else {
+                root.path().join(".claude.json")
+            };
+            fs::write(
+                profile,
+                r#"{"oauthAccount":{"accountUuid":"00000000-0000-4000-8000-000000000001"}}"#,
+            )
+            .unwrap();
+        }
+        let store = accounts::Store::at_for(root.path(), cli, root.path());
+        let path = root.path().join(cli.accounts().roster_file);
+        let row = Row {
+            label: "account".into(),
+            dir: own_home.then(|| own.display().to_string()),
+            ..Row::default()
+        };
+        fs::write(
+            &path,
+            accounts::append_rows_for(cli, "", std::slice::from_ref(&row)).unwrap(),
+        )
+        .unwrap();
+        let login = accounts::login_env_for(cli, &row);
+        let witness =
+            capture_review_login(&store, cli, &path, "account", &login, NOW).expect("a witness");
+        record_review_login(
+            &store,
+            cli,
+            &path,
+            &witness,
+            &home,
+            Outcome::Ended(Ended::ReviewAuth),
+            NOW,
+        )
+        .expect("the outcome");
+        let signed_out = store
+            .load(NOW)
+            .unwrap()
+            .0
+            .accounts
+            .get("account")
+            .is_some_and(|account| account.auth == accounts::Auth::SignedOut);
+        assert_eq!(signed_out, named, "own home {own_home}, named {named}");
     }
 }

@@ -21,6 +21,29 @@ pub(crate) fn macos_kinfo(pid: std::ffi::c_int) -> Option<darwin::Kinfo> {
     macos::kinfo(pid)
 }
 
+/// Whether `pid` has begun to exit: on Apple `PROC_FLAG_INEXIT` (the kernel's `P_LEXIT`), on
+/// Linux `PF_EXITING`. Each is set as the exit starts and never cleared, before the exit closes
+/// the process's descriptors or ends a session leader's hold on its terminal (XNU revokes it),
+/// and before the process is a zombie. `None`: no such process, one the reader cannot see (Apple's
+/// BSD info refuses a zombie), an unread record, or another platform.
+#[must_use]
+pub fn exiting(pid: u32) -> Option<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::exiting(pid)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let stat = crate::read_bounded(&Path::new("/proc").join(pid.to_string()).join("stat"))?;
+        linux::parse_stat(&stat).map(|s| s.exiting())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 /// The device and inode of every vnode `pid` holds open, and whether the list was cut (the build-slot reader's holder proof, `crate::slots`).
 #[cfg(target_os = "macos")]
 pub(crate) fn macos_vnode_ids(pid: u32) -> Option<(Vec<(u32, u64)>, bool)> {

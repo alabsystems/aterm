@@ -178,6 +178,9 @@ pub(crate) use selection_tests::selection_transition;
 #[path = "refresh_tests.rs"]
 mod refresh_tests;
 pub(crate) use refresh_tests::refresh_transition;
+#[path = "publication_tests.rs"]
+mod publication_tests;
+pub(crate) use publication_tests::publication_transition;
 #[path = "google_tests.rs"]
 mod google_tests;
 

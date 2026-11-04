@@ -3925,6 +3925,10 @@ pub(super) struct St {
     pub(super) line_block: Option<u64>,
     pub(super) noted: String,
     pub(super) cause: String,
+    /// Which ask of a restart in place claimed this record ([`super::relaunch::RestartAsk::word`];
+    /// empty for every record no restart in place claimed): an ask of that restart meets its own
+    /// record by it ([`super::relaunch::its_own`]).
+    pub(super) ask: String,
     pub(super) model_before: String,
     pub(super) mark: u64,
     pub(super) launch_model: String,
@@ -4967,6 +4971,7 @@ impl St {
             ),
             ("noted", &self.noted),
             ("cause", &self.cause),
+            ("ask", &self.ask),
             ("model_before", &self.model_before),
             ("launch_model", &self.launch_model),
             ("model_list", &self.model_list),
@@ -5277,6 +5282,7 @@ impl St {
             line_block: v.get("line_block").and_then(Value::as_u64),
             noted: s("noted"),
             cause: s("cause"),
+            ask: s("ask"),
             model_before: s("model_before"),
             mark: n("mark"),
             launch_model: s("launch_model"),

@@ -9,6 +9,10 @@ const MAX_BYTES: usize = 1024 * 1024;
 /// The most quorum candidates a log holds: each is a group of at least two `Remove`s, and a log
 /// holds at most [`MAX_WEIGHED_RECORDS`] weighed records, its genesis one of them.
 pub(super) const MAX_CANDIDATES: usize = (MAX_WEIGHED_RECORDS - 1) / 2;
+// Both relations over that many candidates fit the payload budget, so `Relations::new` never
+// refuses a held log's candidates (the weighing `expect`s it).
+const _: () =
+    assert!(2 * MAX_CANDIDATES * MAX_CANDIDATES.div_ceil(64) * size_of::<u64>() <= MAX_BYTES);
 const ABSENT: usize = usize::MAX;
 type Plane = Vec<Option<Box<[u64]>>>;
 

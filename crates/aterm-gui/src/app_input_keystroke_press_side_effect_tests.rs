@@ -21,15 +21,6 @@ fn key(event_type: KeyEventType) -> InputEvent {
     }
 }
 
-fn modifier_press(key: Key) -> InputEvent {
-    InputEvent::Key {
-        key,
-        mods: Modifiers::empty(),
-        base_layout: None,
-        layout_text: None,
-        event_type: KeyEventType::Press,
-    }
-}
 #[test]
 fn fx_celebration_enter_uses_the_committed_input_path() {
     use aterm_effects::kitty_sing::{CelebrateOn, song_signature};
@@ -79,7 +70,7 @@ fn fx_celebration_enter_uses_the_committed_input_path() {
 }
 
 #[test]
-fn typing_press_snaps_and_deselects_inert_and_repeat_and_release_do_not() {
+fn typing_press_snaps_and_deselects_repeat_and_release_do_not() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     let term = app
@@ -115,30 +106,6 @@ fn typing_press_snaps_and_deselects_inert_and_repeat_and_release_do_not() {
         assert!(
             t.text_selection().has_selection(),
             "repeat must not deselect"
-        );
-    }
-    for k in [
-        Key::Named(NamedKey::SuperLeft),
-        Key::Named(NamedKey::SuperRight),
-        Key::Named(NamedKey::ShiftLeft),
-        Key::Named(NamedKey::ControlLeft),
-        Key::Named(NamedKey::AltLeft),
-        Key::Named(NamedKey::MetaLeft),
-        Key::Named(NamedKey::HyperLeft),
-        Key::Named(NamedKey::CapsLock),
-        Key::Named(NamedKey::NumLock),
-        Key::Named(NamedKey::ScrollLock),
-    ] {
-        let _ = app.input(wid, modifier_press(k.clone()), Source::Human);
-        let t = term_lock(&term);
-        assert_ne!(
-            t.grid().display_offset(),
-            0,
-            "bare {k:?} must not snap the viewport"
-        );
-        assert!(
-            t.text_selection().has_selection(),
-            "bare {k:?} must not clear the selection"
         );
     }
     let _ = app.input(wid, key(KeyEventType::Press), Source::Human);

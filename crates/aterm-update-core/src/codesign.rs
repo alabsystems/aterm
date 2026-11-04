@@ -159,10 +159,16 @@ pub fn developer_id_requirement(team: &str) -> Result<String, CodesignError> {
     ))
 }
 
-/// [`verify_developer_id_until`] within [`VERIFY_TIMEOUT`].
+/// [`verify_developer_id_until`] within [`aterm_uds::deadline::CODESIGN_HANG`]: a test's
+/// codesign run must finish, so its bound is the hang detector, not the product's budget.
 #[cfg(test)]
 fn verify_developer_id(path: &Path, team: &str, deep: bool) -> Result<(), CodesignError> {
-    verify_developer_id_until(path, team, deep, Instant::now() + VERIFY_TIMEOUT)
+    verify_developer_id_until(
+        path,
+        team,
+        deep,
+        Instant::now() + aterm_uds::deadline::CODESIGN_HANG,
+    )
 }
 
 /// Verifies that `path` is signed with a Developer ID of `team` before `deadline`.

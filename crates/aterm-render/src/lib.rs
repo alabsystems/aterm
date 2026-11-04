@@ -22815,9 +22815,9 @@ mod tests {
             })
         };
         let fill = |input: &mut RenderInput, img: &Arc<ImageData>| {
-            for r in 0..2usize {
+            for (r, row) in input.images[..2].iter_mut().enumerate() {
                 for c in 0..4usize {
-                    input.images[r].push((
+                    row.push((
                         c,
                         ImageRef {
                             image: img.clone(),

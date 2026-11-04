@@ -3,8 +3,10 @@
 
 use super::{member_key, two_macs};
 use crate::client::log_entries::{self, AuthorCtx};
-use crate::client::{Paths, ServersAnswering, load_records, read_identity};
-use crate::membership_log::{Body, EpochAudience, Log, MemberId, Record};
+use crate::client::{
+    Paths, ServersAnswering, admin_cached, admin_publish, load_records, read_identity, save_records,
+};
+use crate::membership_log::{Body, EpochAudience, Log, MemberId, Record, encode_records};
 use crate::{age::Recipient, text::Audience};
 use std::collections::BTreeSet;
 
@@ -73,6 +75,7 @@ fn coalesce(mut log: Log, paths: &Paths, active: &BTreeSet<Recipient>) -> (Log, 
     let identity = read_identity(paths).unwrap().unwrap();
     let opened = log.open_audience_entries(&identity).unwrap().unwrap();
     let (bootstrap, actor, incarnation) = member_key(paths);
+    let flight = log_entries::Flight::of_batch(&log, &opened, &actor);
     let mut minted = Vec::new();
     bootstrap
         .device()
@@ -80,6 +83,7 @@ fn coalesce(mut log: Log, paths: &Paths, active: &BTreeSet<Recipient>) -> (Log, 
             log_entries::coalesce_concurrent_commons_epochs(
                 &mut log,
                 &opened,
+                &flight,
                 &AuthorCtx {
                     actor: &actor,
                     writer_seed: seed,
@@ -182,6 +186,69 @@ fn a_partial_everyone_holder_cannot_dominate_an_epoch_an_active_member_still_ope
     partial_holder(EpochAudience::Everyone);
 }
 
+#[test]
+fn an_unrelated_publication_cannot_replace_commons_the_publisher_cannot_open() {
+    let _answering = ServersAnswering::set();
+    for with_control_put in [false, true] {
+        let macs = two_macs(&[(Audience::Everyone, "shared", b"before")]);
+        let base = load_records(&macs.m22).unwrap().log().unwrap().clone();
+        let publisher = read_identity(&macs.m22).unwrap().unwrap();
+        let holder = read_identity(&macs.m7).unwrap().unwrap();
+        let mut records = epoch_fork(
+            &base,
+            &macs.m22,
+            &EpochAudience::Commons,
+            &[holder.recipient()],
+        );
+        if !with_control_put {
+            assert!(matches!(records.pop().unwrap().body(), Body::Put { .. }));
+        }
+        save_records(&macs.m22, &encode_records(&records)).unwrap();
+        let input = load_records(&macs.m22).unwrap();
+        let before = input
+            .log()
+            .unwrap()
+            .open_audience_entries(&publisher)
+            .unwrap()
+            .unwrap();
+        assert!(before.commons_control.is_none());
+        assert!(
+            !before
+                .fully_unwrapped_audiences
+                .contains(&EpochAudience::Commons)
+        );
+        let epochs = before.maximal_epochs[&EpochAudience::Commons].clone();
+        let admin = admin_cached(&macs.m22).unwrap();
+        let policy = admin.doc.commons_audience().cloned();
+        let mut edited = admin.doc.clone();
+        edited
+            .set_entry(&Audience::Everyone, "shared", b"after")
+            .unwrap();
+        assert_eq!(edited.commons_audience(), policy.as_ref());
+        admin_publish(&macs.m22, &admin, &edited).unwrap();
+        let after = load_records(&macs.m22)
+            .unwrap()
+            .log()
+            .unwrap()
+            .open_audience_entries(&publisher)
+            .unwrap()
+            .unwrap();
+        macs.server.stop();
+        assert_eq!(
+            after.by_audience[&Audience::Everyone]["shared"]
+                .value
+                .as_slice(),
+            b"after"
+        );
+        assert_eq!(
+            after.maximal_epochs[&EpochAudience::Commons],
+            epochs,
+            "publishing an unrelated value superseded an unopened Commons epoch; control Put present: {with_control_put}"
+        );
+        assert!(after.commons_control.is_none());
+    }
+}
+
 fn delayed_wraps(audience: EpochAudience) {
     let _answering = ServersAnswering::set();
     let macs = two_macs(&[(Audience::Everyone, "shared", b"value")]);
@@ -258,4 +325,94 @@ fn an_unopened_commons_epoch_waits_for_its_later_wraps_even_when_none_are_active
 #[test]
 fn an_unopened_everyone_epoch_waits_for_its_later_wraps_even_when_none_are_active_yet() {
     delayed_wraps(EpochAudience::Everyone);
+}
+
+/// The old Commons coalescer replaced this three-epoch prefix with an epoch and
+/// three wraps, losing 85 recipients without a Remove or a control Put. The author
+/// holds two current keys; the third branch has delivered only its first three wraps.
+#[test]
+fn an_incomplete_commons_batch_cannot_shrink_88_recipients_to_three() {
+    let _answering = ServersAnswering::set();
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"value")]);
+    let base = load_records(&macs.m22).unwrap().log().unwrap().clone();
+    let observer = read_identity(&macs.m22).unwrap().unwrap();
+    let other = read_identity(&macs.m7).unwrap().unwrap();
+    let audience = EpochAudience::Commons;
+    let mut recipients: Vec<Recipient> = (1..=86)
+        .map(|byte| crate::age::Identity::from_secret_bytes([byte; 32]).recipient())
+        .collect();
+    recipients.extend([observer.recipient(), other.recipient()]);
+    let all: BTreeSet<Recipient> = recipients.iter().copied().collect();
+    assert_eq!(all.len(), 88);
+    let active = BTreeSet::from([observer.recipient(), other.recipient()]);
+    let first = epoch_fork(&base, &macs.m7, &audience, &recipients);
+    let second = epoch_fork(&base, &macs.m22, &audience, &recipients);
+    let third = epoch_fork(&base, &macs.m7, &audience, &recipients);
+    let before = merged(&base, &[&first[..4], &second, &third]);
+    let opened = before.open_audience_entries(&observer).unwrap().unwrap();
+    let current = &opened.maximal_epochs[&audience];
+    assert_eq!(current.len(), 3);
+    assert_eq!(
+        current
+            .iter()
+            .filter(|id| opened.unwrapped_keys.contains_key(*id))
+            .count(),
+        2
+    );
+    assert_eq!(
+        current
+            .iter()
+            .flat_map(|id| opened.wrapped_recipients[id].iter().copied())
+            .collect::<BTreeSet<_>>(),
+        all
+    );
+    assert!(opened.commons_control.is_none());
+    assert!(
+        before
+            .records()
+            .all(|r| !matches!(r.body(), Body::Remove { .. }))
+    );
+
+    let (after, minted) = coalesce(before.clone(), &macs.m22, &active);
+    let epochs = minted
+        .iter()
+        .filter(|r| matches!(r.body(), Body::Epoch { .. }))
+        .count();
+    let wraps = minted
+        .iter()
+        .filter(|r| matches!(r.body(), Body::Wrap { .. }))
+        .count();
+    let puts = minted
+        .iter()
+        .filter(|r| matches!(r.body(), Body::Put { .. }))
+        .count();
+    let removes = minted
+        .iter()
+        .filter(|r| matches!(r.body(), Body::Remove { .. }))
+        .count();
+    eprintln!(
+        "Commons prefix: prior_recipients=88 current_epochs=3 openable_keys=2 \
+         minted_epochs={epochs} minted_wraps={wraps} minted_puts={puts} minted_removes={removes}"
+    );
+
+    // Deliver the original tail, with no new authorization, rotation or regrant.
+    let delivered = merged(&before, &[&first[4..]]);
+    let ready = delivered.open_audience_entries(&observer).unwrap().unwrap();
+    let control = base.open_commons_control(&observer).unwrap().unwrap();
+    assert_eq!(ready.maximal_epochs[&audience].len(), 3);
+    assert!(ready.fully_unwrapped_audiences.contains(&audience));
+    assert_eq!(
+        ready.commons_control.unwrap().as_slice(),
+        control.as_slice()
+    );
+    for id in &ready.maximal_epochs[&audience] {
+        assert_eq!(ready.wrapped_recipients[id], all);
+    }
+    macs.server.stop();
+
+    assert!(
+        minted.is_empty(),
+        "an incomplete batch dominated the current epochs"
+    );
+    assert_eq!(after.heads(), before.heads());
 }

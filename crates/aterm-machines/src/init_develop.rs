@@ -890,8 +890,7 @@ impl Item for Submodules {
         if needs.update {
             let ran = sys
                 .run_complete_stdout(
-                    &self
-                        .git(sys)
+                    &checkout::network(sys, &self.user, Some(&self.path))
                         .budget(LONG_BUDGET)
                         .args(checkout::NO_SIDE_RUNS)
                         .args([

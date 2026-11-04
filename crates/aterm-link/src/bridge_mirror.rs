@@ -53,6 +53,32 @@ impl Outcome {
     }
 }
 
+/// How long the first pass of an open after an attach is held at most while the open has yet to
+/// make the pin's fence ([`Bridge::mirror_yields`], critic item D06). What an attach or a
+/// handoff owes a delivery is on its way by then: a post the loop's first drain published comes
+/// back on the inbox face once the broker has taken it, an ordering barrier later (a pong's
+/// acked -> visible read 0.04 / 0.12 ms at p50 / p99 in ping-pong, `2026-11-04-fabric-504`).
+/// The mirror has no deadline, so this is at most how much later it starts.
+pub(super) const FIRST_PASS_HOLD: Duration = Duration::from_millis(5);
+
+/// THE FIRST PASS OF AN OPEN AFTER AN ATTACH (critic item D06): whether the loop holds it back
+/// for the deliveries the attach owes while this open has yet to make the pin's fence durable
+/// ([`StateDir::ensure_logpin_durable`], two full flushes), so the first delivery after an
+/// attach or a handoff does not wait behind the fence ([`Bridge::mirror_yields`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FirstPass {
+    /// Nothing holds a pass back.
+    Free,
+    /// An attach came up ([`Bridge::mirror_attached`]) and its first pass has yet to come due;
+    /// `drained`: how many posts the loop's drains listed since ([`Bridge::mirror_drained_posts`]),
+    /// each a record that comes back on the inbox face when its session is here.
+    Attached { drained: u64 },
+    /// The pass is held until `until`, while `awaits` records are still to come back (each
+    /// inbox record the loop takes counts one off, [`Bridge::mirror_took_inbox`]) or an item is
+    /// queued; the first round that finds neither ends it.
+    Held { until: Instant, awaits: u64 },
+}
+
 /// The mirror's state in a bridge whose `[fabric] log` is `"turns"` or `"auto"`.
 pub(super) struct MirrorRun {
     /// `Turns`, or `Auto` (on while the broker retains).
@@ -124,6 +150,11 @@ pub(super) struct MirrorRun {
     /// The window budget, in body bytes: [`mirror::NODE_WINDOW_BYTES`] (a simulation's
     /// scaled one, `Bridge::simulate_window`).
     window: u64,
+    /// Whether the first pass after an attach is held back ([`FirstPass`]).
+    first_pass: FirstPass,
+    /// How long a first pass is held at most: [`FIRST_PASS_HOLD`] (a test's own,
+    /// [`MirrorRun::hold_first_pass_for_tests`]).
+    hold: Duration,
 }
 
 impl MirrorRun {
@@ -173,6 +204,8 @@ impl MirrorRun {
                 oldest: 0,
                 waiting: false,
                 window: mirror::NODE_WINDOW_BYTES,
+                first_pass: FirstPass::Free,
+                hold: FIRST_PASS_HOLD,
             })
         })
     }
@@ -193,6 +226,11 @@ impl MirrorRun {
         m
     }
 
+    /// Hold the first pass after an attach for at most `hold` ([`FIRST_PASS_HOLD`] in a bridge).
+    #[cfg(test)]
+    pub(super) fn hold_first_pass_for_tests(&mut self, hold: Duration) {
+        self.hold = hold;
+    }
     /// The batch in flight and what came of each slot.
     #[cfg(test)]
     pub(super) fn batch(&self) -> (&[PinSlot], &[Outcome]) {
@@ -341,11 +379,19 @@ impl Bridge {
         self.broker_retains == Some(true)
     }
 
-    /// AFTER EVERY ATTACH, an `auto` mirror follows the broker's retention.
+    /// AFTER EVERY ATTACH, the first pass is held for the deliveries the attach owes while this
+    /// open has yet to make the pin's fence ([`Bridge::mirror_yields`]), and an `auto` mirror
+    /// follows the broker's retention. The pass is marked once the attach is up, so the posts a
+    /// drain inside the attach listed (one that replayed posts runs it,
+    /// [`Bridge::attach_broker_inner`]) count for nothing: they are published ahead of the
+    /// attach's refill, which reads their records on a session's lane, or meets a replayed one
+    /// whose post is still listed and takes the link down, and the inbox commit lands ahead of
+    /// the live subscription, so none comes back on it for the pass to wait on.
     pub(super) fn mirror_attached(&mut self) {
-        let Some(m) = self.mirror.as_deref() else {
+        let Some(m) = self.mirror.as_deref_mut() else {
             return;
         };
+        m.first_pass = FirstPass::Attached { drained: 0 };
         if m.mode != LogMode::Auto {
             return;
         }
@@ -703,19 +749,108 @@ impl Bridge {
         }
     }
 
-    /// When the loop owes the mirror a pass: `Some(now)` for work it can do now (the loop's wait is then zero), the retry's instant while a busy answer waits, a held-back snapshot's when only it is owed, `None` for nothing.
+    /// When the loop owes the mirror a pass: `Some(now)` for work it can do now (the loop's wait is then zero), the retry's instant while a busy answer waits, a held-back snapshot's when only it is owed, `None` for nothing; no earlier than a held first pass's instant ([`FirstPass::Held`]).
     pub(super) fn mirror_due(&self, now: Instant) -> Option<Instant> {
         if !self.mirror_engaged() || self.conn.is_none() {
             return None;
         }
         let m = self.mirror.as_deref()?;
-        if !m.owed {
-            return m.held_back.map(|at| at.max(now));
+        let due = if !m.owed {
+            m.held_back.map(|at| at.max(now))
+        } else if m.outcome.contains(&Outcome::Sending) && m.sent_inc == self.inc {
+            None
+        } else {
+            Some(m.retry_at.map_or(now, |t| t.max(now)))
+        };
+        match m.first_pass {
+            FirstPass::Held { until, .. } => due.map(|at| at.max(until)),
+            FirstPass::Free | FirstPass::Attached { .. } => due,
         }
-        if m.outcome.contains(&Outcome::Sending) && m.sent_inc == self.inc {
-            return None;
+    }
+
+    /// WHETHER THE LOOP HOLDS THE MIRROR'S PASS BACK FOR A ROUND (critic item D06): the first
+    /// pass due after an attach, in an open that has yet to make the pin's fence
+    /// ([`StateDir::logpin_fence_held`]), is held while the loop owes a delivery the attach
+    /// brought: an item queued, or the record of a post its drains listed still on its way
+    /// back ([`FirstPass::Attached`]; each inbox record taken counts one off). The hold lasts
+    /// at most the mirror's `hold` ([`FIRST_PASS_HOLD`]) from when the pass came due, and ends
+    /// at the first round that finds the loop owing neither ([`FirstPass::Held`]). Each round
+    /// under it parks until an item comes or the hold is out ([`Bridge::mirror_due`]) and takes
+    /// what comes, so the deliveries an attach or a handoff owes go ahead of the fence's two
+    /// full flushes and the pass, and a steady stream of items cannot starve the pass past the
+    /// hold. A post whose record never comes back here (one to another node's session) holds
+    /// the pass the whole hold. What the fence orders is unchanged: the pass that follows makes
+    /// it durable before any take or send ([`Bridge::mirror_key_on_the_media`]), and sends the
+    /// inbox commit its deliveries owe ahead of it ([`Bridge::commit_ahead_of_the_fence`]).
+    pub(super) fn mirror_yields(&mut self) -> bool {
+        #[cfg(test)]
+        if self
+            .fx
+            .mutant(crate::sim::world::Mutant::MirrorAheadOfTheFirstDelivery)
+        {
+            return false;
         }
-        Some(m.retry_at.map_or(now, |t| t.max(now)))
+        let now = self.fx.now();
+        let idle = self.mailbox.is_idle();
+        let Some((first_pass, hold)) = self.mirror.as_deref().map(|m| (m.first_pass, m.hold))
+        else {
+            return false;
+        };
+        let next = match first_pass {
+            FirstPass::Free => return false,
+            FirstPass::Held { until, awaits } if now < until && (awaits > 0 || !idle) => {
+                return true;
+            }
+            FirstPass::Held { .. } => FirstPass::Free,
+            FirstPass::Attached { .. } if self.mirror_due(now).is_none_or(|at| at > now) => {
+                return false;
+            }
+            FirstPass::Attached { .. } if self.state.logpin_fence_held() => FirstPass::Free,
+            FirstPass::Attached { drained: 0 } if idle => FirstPass::Free,
+            FirstPass::Attached { drained } => FirstPass::Held {
+                until: now + hold,
+                awaits: drained,
+            },
+        };
+        if let Some(m) = self.mirror.as_deref_mut() {
+            m.first_pass = next;
+        }
+        next != FirstPass::Free
+    }
+
+    /// A drain listed `posts` to publish: an attach's first pass not yet due waits for their
+    /// records to come back, or for its hold to run out, as it does for a post to another
+    /// node's session ([`Bridge::mirror_yields`]).
+    pub(super) fn mirror_drained_posts(&mut self, posts: u64) {
+        #[cfg(test)]
+        if self
+            .fx
+            .mutant(crate::sim::world::Mutant::FirstPassForgetsTheDrainedPosts)
+        {
+            return;
+        }
+        if let Some(m) = self.mirror.as_deref_mut() {
+            if let FirstPass::Attached { drained } = &mut m.first_pass {
+                *drained = drained.saturating_add(posts);
+            }
+        }
+    }
+
+    /// The loop took an inbox record: one fewer a held first pass waits on
+    /// ([`Bridge::mirror_yields`]).
+    pub(super) fn mirror_took_inbox(&mut self) {
+        #[cfg(test)]
+        if self
+            .fx
+            .mutant(crate::sim::world::Mutant::FirstPassAwaitsPastItsRecords)
+        {
+            return;
+        }
+        if let Some(m) = self.mirror.as_deref_mut() {
+            if let FirstPass::Held { awaits, .. } = &mut m.first_pass {
+                *awaits = awaits.saturating_sub(1);
+            }
+        }
     }
 
     /// Stop the mirror for this bridge's life: said on stderr and to the
@@ -976,12 +1111,27 @@ impl Bridge {
         }
     }
 
-    /// whether `logkey` holds the key this mirror names, written durably now if it does not yet — before the first take that names the key, and before any slot of a recovered batch an older build's pin aliased with it is sent, so a power cut that tears or rolls back the pin can never leave the bus holding aliases of a key the next bridge does not know.
+    /// whether `logkey` holds the key this mirror names, written durably now if it does not yet — before the first take that names the key, and before any slot of a recovered batch an older build's pin aliased with it is sent, so a power cut that tears or rolls back the pin can never leave the bus holding aliases of a key the next bridge does not know. The pin's fence goes first, the inbox commit a delivery owes ahead of it ([`Bridge::commit_ahead_of_the_fence`]).
     pub(super) fn mirror_key_on_the_media(&mut self) -> bool {
+        if self.mirror.is_none() {
+            return false;
+        }
+        self.commit_ahead_of_the_fence();
         let Some(m) = self.mirror.as_deref() else {
             return false;
         };
-        if let Err(e) = self.state.ensure_logpin_durable(|| m.pin.render()) {
+        #[cfg(test)]
+        let fenced = if self
+            .fx
+            .mutant(crate::sim::world::Mutant::TakeAheadOfTheFence)
+        {
+            Ok(())
+        } else {
+            self.state.ensure_logpin_durable(|| m.pin.render())
+        };
+        #[cfg(not(test))]
+        let fenced = self.state.ensure_logpin_durable(|| m.pin.render());
+        if let Err(e) = fenced {
             stderr_line!(
                 "aterm-link: mirror: the pin's version fence could not be made durable \
                  ({e}); nothing taken or sent, tried again"

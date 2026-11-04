@@ -64,14 +64,14 @@ pub enum Reading {
         /// The Trust toolchain aterm is using is still where Spotlight indexes it.
         toolchain: bool,
     },
-    /// `present` of the `count` repositories are cloned; `signed_in` is whether the
-    /// native GitHub credentials verified.
+    /// `present` of the `count` repositories are cloned; `signed_in` is whether aterm's
+    /// GitHub route hands back the synced token.
     Repositories {
         /// Repositories cloned.
         present: usize,
         /// Repositories the plan names.
         count: usize,
-        /// The native GitHub credentials verified.
+        /// aterm's GitHub route hands back the synced token.
         signed_in: bool,
     },
     /// The probe could not go on (its row is blocked), for this reason.

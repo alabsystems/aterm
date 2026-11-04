@@ -16,7 +16,7 @@
 use super::pk_grammar;
 use crate::{Error, Result};
 use aterm_codec::hex;
-use aterm_digest::Sha256;
+use aterm_digest::{Sha256, hmac_sha256_parts};
 
 /// Anthropic's provider word.
 pub const ANTHROPIC: &str = "anthropic";
@@ -139,10 +139,14 @@ pub fn planned_machine_pk(label: &str, held: impl Fn(&str) -> bool) -> Option<St
 pub fn hw_hint(network: &[u8; 16], platform_uuid: &str) -> String {
     let mut seed = b"aterm/alab/hw-hint-key/1\0".to_vec();
     seed.extend_from_slice(network);
-    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &Sha256::digest(&seed));
-    let mut message = b"aterm/alab/hw-hint/1".to_vec();
-    message.extend_from_slice(platform_uuid.trim().to_ascii_uppercase().as_bytes());
-    hex::encode_lower(&ring::hmac::sign(&key, &message).as_ref()[..8])
+    let tag = hmac_sha256_parts(
+        &Sha256::digest(&seed),
+        &[
+            b"aterm/alab/hw-hint/1",
+            platform_uuid.trim().to_ascii_uppercase().as_bytes(),
+        ],
+    );
+    hex::encode_lower(&tag[..8])
 }
 
 /// An address's key: its digest, so the address itself is never a key.

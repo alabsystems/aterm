@@ -26,19 +26,31 @@ pub(crate) const NO_SIDE_RUNS: [&str; 4] = [
 ];
 
 /// The installed git ([`crate::items::github::git_program`]: the Command Line Tools', or a
-/// selected Xcode's) as `user`, in `path` when given, with no prompt (`GIT_TERMINAL_PROMPT=0`)
-/// and no optional index lock (`GIT_OPTIONAL_LOCKS=0`, so a read never races the person's own
-/// git).
+/// selected Xcode's) as `user`, in `path` when given, with no prompt (`GIT_TERMINAL_PROMPT=0`,
+/// and an empty `GIT_ASKPASS`, which keeps a person's `core.askPass` from running) and no
+/// optional index lock (`GIT_OPTIONAL_LOCKS=0`, so a read never races the person's own git).
 pub(crate) fn git(sys: &dyn System, user: &User, path: Option<&Path>) -> Cmd {
     let mut command = Cmd::new(crate::items::github::git_program(sys))
         .as_user(user)
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .budget(READ_BUDGET);
     if let Some(path) = path {
         command = command.arg("-C").arg(path);
     }
     command
+}
+
+/// [`git`] for a run that reaches a remote, or may (a partial clone's merge fetches what it
+/// lacks): aterm's own credential route rides on it ([`crate::git_credential::pinned`]), so no
+/// helper a file names runs for any host, the login keychain's least of all, whatever the
+/// person's git settings say.
+pub(crate) fn network(sys: &dyn System, user: &User, path: Option<&Path>) -> Cmd {
+    crate::git_credential::pinned(
+        git(sys, user, path),
+        crate::init_github::helper(sys, user).as_ref(),
+    )
 }
 
 /// Whether git's standard error says its transport could not reach the remote's host (no name
@@ -401,7 +413,7 @@ fn local(sys: &dyn System, user: &User, path: &Path, origin: &Origin) -> Result<
 fn remote_head(sys: &dyn System, user: &User, path: &Path) -> Result<(String, String), Stop> {
     let ran = run(
         sys,
-        &git(sys, user, Some(path)).args(["ls-remote", "--symref", "origin", "HEAD"]),
+        &network(sys, user, Some(path)).args(["ls-remote", "--symref", "origin", "HEAD"]),
         "ls-remote",
     )?;
     if !ran.success() {
@@ -729,7 +741,7 @@ pub(crate) fn align(
     };
     let fetch = run(
         sys,
-        &git(sys, user, Some(path))
+        &network(sys, user, Some(path))
             .budget(FETCH_BUDGET)
             .args(NO_SIDE_RUNS)
             .args(["fetch", "--quiet", "--no-recurse-submodules", "origin"]),
@@ -775,15 +787,18 @@ pub(crate) fn align(
     };
     let merge = run(
         sys,
-        &git(sys, user, Some(path)).args(NO_SIDE_RUNS).args([
-            "-c",
-            "submodule.recurse=false",
-            "merge",
-            "--ff-only",
-            "--no-autostash",
-            "--quiet",
-            &tip,
-        ]),
+        &network(sys, user, Some(path))
+            .budget(FETCH_BUDGET)
+            .args(NO_SIDE_RUNS)
+            .args([
+                "-c",
+                "submodule.recurse=false",
+                "merge",
+                "--ff-only",
+                "--no-autostash",
+                "--quiet",
+                &tip,
+            ]),
         "merge",
     )?;
     if !merge.success() {

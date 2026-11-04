@@ -179,13 +179,7 @@ pub fn process_args(pid: u32) -> Option<ProcArgs> {
             .to_string_lossy()
             .into_owned();
         let argv = split_nul_list(&aterm_uds::process::read_cmdline(pid)?);
-        let mut env = split_nul_list(
-            &crate::metadata_io::read_bounded_regular(
-                std::path::Path::new(&format!("/proc/{pid}/environ")),
-                1024 * 1024,
-            )
-            .ok()?,
-        );
+        let mut env = split_nul_list(&aterm_uds::process::read_environ(pid)?);
         env.retain(|kv| !kv.is_empty());
         Some(ProcArgs {
             exec_path,
@@ -568,7 +562,9 @@ mod tests {
     }
 
     /// A live process started with an empty argument reads it back in place (`/proc` on
-    /// Linux, `KERN_PROCARGS2` on macOS).
+    /// Linux, `KERN_PROCARGS2` on macOS), and on Linux its environment with it, though procfs
+    /// `stat`s `environ` as empty. (`KERN_PROCARGS2` gave no environment for this `/bin/sh`
+    /// on macOS 27.0.1.)
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn process_args_keeps_an_empty_argument_of_a_live_process() {
@@ -580,28 +576,30 @@ mod tests {
         let mut child = aterm_uds::spawnfd::command("/bin/sh")
             .args(["-c", "read -r _", "sh"])
             .args(tail)
+            .env("ATPKG_PROBE_VAR", "a=b c")
             .stdin(aterm_uds::spawnfd::Stdio::piped())
             .stdout(aterm_uds::spawnfd::Stdio::null())
             .stderr(aterm_uds::spawnfd::Stdio::null())
             .spawn()
             .expect("/bin/sh");
         let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
-        let argv = loop {
-            let argv = process_args(child.id()).map(|a| a.argv);
-            if argv
+        let read = loop {
+            let read = process_args(child.id());
+            if read
                 .as_ref()
-                .and_then(|a| a.last())
+                .and_then(|a| a.argv.last())
                 .is_some_and(|w| w == tail[2])
                 || std::time::Instant::now() >= deadline
             {
-                break argv;
+                break read;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         };
         drop(child.stdin.take());
         let _ = child.kill();
         let _ = child.wait();
-        let argv = argv.unwrap_or_default();
+        let read = read.unwrap_or_default();
+        let argv = &read.argv;
         assert!(
             argv.last().is_some_and(|w| w == tail[2]),
             "the shell never read back as exec'd within a minute ({argv:?}) — the spawn failed, \
@@ -610,6 +608,12 @@ mod tests {
         assert!(
             argv.ends_with(&tail.map(String::from)),
             "the empty argument must read back in place: {argv:?}"
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            read.env_var("ATPKG_PROBE_VAR"),
+            Some("a=b c"),
+            "its environment reads back with it"
         );
     }
 

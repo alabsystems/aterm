@@ -252,12 +252,19 @@ fn quiet_place(dir: &Path, wanted: bool) -> Option<PathBuf> {
 }
 
 /// `dir` cut at its first [`QUIET`] folder: `T/.ubd/x` is `T`; a `dir` with none is itself.
-/// What is made there reaches fseventsd's clients and its history again.
+/// What is made there reaches fseventsd's clients and its history again. A relative path that
+/// starts with [`QUIET`] cuts to `.`.
 #[must_use]
 pub fn outside_quiet(dir: &Path) -> PathBuf {
-    dir.components()
+    let cut: PathBuf = dir
+        .components()
         .take_while(|c| c.as_os_str() != QUIET)
-        .collect()
+        .collect();
+    if cut.as_os_str().is_empty() && !dir.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        cut
+    }
 }
 
 /// Where [`TempDir`] makes a directory asked for in `dir`: on macOS, in `dir`'s [`QUIET`]
@@ -372,7 +379,9 @@ impl TempDir {
         for _ in 0..5 {
             let name = next_name();
             let mut components = Path::new(&name).components();
-            if !matches!(components.next(), Some(std::path::Component::Normal(part)) if part == name.as_str())
+            if name.contains('\0')
+                || (cfg!(windows) && (name.ends_with('.') || name.ends_with(' ')))
+                || !matches!(components.next(), Some(std::path::Component::Normal(part)) if part == name.as_str())
                 || components.next().is_some()
             {
                 return Err(io::Error::new(
@@ -735,6 +744,47 @@ const fn fnv1a(bytes: &[u8]) -> u64 {
 mod tests {
     use super::*;
 
+    /// NEGATIVE CONTROL: `hex_digit` clamps nibbles `>= 16` to `'f'` while mapping `0..=15`
+    /// bijectively, `unique_name` produces distinct `<prefix><pid>_<16 lowercase hex>_<counter>`
+    /// strings on consecutive calls, and `encode_temp_seed_le` / `decode_temp_seed_le` roundtrip
+    /// boundary values without field aliasing.
+    #[test]
+    fn unique_name_hex_digit_and_seed_codec_roundtrip() {
+        let digits: String = (0..16).map(hex_digit).collect();
+        assert_eq!(digits, "0123456789abcdef");
+        assert_eq!(hex_digit(16), 'f');
+        assert_eq!(hex_digit(u64::MAX), 'f');
+
+        let first = unique_name("pfx_");
+        let second = unique_name("pfx_");
+        assert_ne!(first, second);
+        let pid_prefix = format!("pfx_{}_", std::process::id());
+        for candidate in [&first, &second] {
+            let rest = candidate
+                .strip_prefix(&pid_prefix)
+                .expect("unique_name must start with <prefix><pid>_");
+            let (hex_part, counter_part) = rest
+                .split_once('_')
+                .expect("unique_name must have <hex16>_<counter>");
+            assert_eq!(hex_part.len(), 16);
+            assert!(
+                hex_part
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            );
+            assert!(counter_part.parse::<u64>().is_ok());
+        }
+
+        for seed in [
+            (0u64, 0u32, 0u32),
+            (0x0123_4567_89ab_cdef, 0x89ab_cdef, 0xfedc_ba98),
+            (u64::MAX, u32::MAX, u32::MAX),
+        ] {
+            let wire = encode_temp_seed_le(seed.0, seed.1, seed.2);
+            assert_eq!(decode_temp_seed_le(wire), seed);
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_cache_slots_hash_is_aterm_hashs_fold() {
@@ -806,7 +856,7 @@ mod tests {
             fs::write(path.join("artifact"), b"owned").expect("artifact");
         }
         assert!(!path.exists());
-        for suffix in ["/../outside", "/nested/child", "/"] {
+        for suffix in ["/../outside", "/nested/child", "/", ".bad\0"] {
             let error = Builder::new()
                 .suffix(suffix)
                 .tempdir_in(&parent)
@@ -814,7 +864,7 @@ mod tests {
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{suffix:?}");
         }
         #[cfg(windows)]
-        for suffix in [r"\..\outside", r"\nested\child", r"\"] {
+        for suffix in [r"\..\outside", r"\nested\child", r"\", ".", " "] {
             let error = Builder::new()
                 .suffix(suffix)
                 .tempdir_in(&parent)
@@ -831,7 +881,12 @@ mod tests {
         let parent = root.path().join("inside");
         fs::create_dir(&parent).expect("parent");
         let absolute = root.path().join("outside_");
-        for prefix in ["../outside_", "nested/child_", absolute.to_str().unwrap()] {
+        for prefix in [
+            "../outside_",
+            "nested/child_",
+            "nul\0_",
+            absolute.to_str().unwrap(),
+        ] {
             let error = Builder::new()
                 .prefix(prefix)
                 .tempdir_in(&parent)
@@ -1244,6 +1299,9 @@ mod tests {
     fn a_heard_directory_is_made_outside_every_quiet_folder() {
         assert_eq!(outside_quiet(Path::new("/v/T/.ubd/x/y")), Path::new("/v/T"));
         assert_eq!(outside_quiet(Path::new("/v/T/.ubd/")), Path::new("/v/T"));
+        assert_eq!(outside_quiet(Path::new(".ubd/x")), Path::new("."));
+        assert_eq!(outside_quiet(Path::new(".ubd")), Path::new("."));
+        assert_eq!(outside_quiet(Path::new("")), Path::new(""));
         assert_eq!(
             outside_quiet(Path::new("/v/T/x.ubd/y")),
             Path::new("/v/T/x.ubd/y")

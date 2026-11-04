@@ -387,9 +387,26 @@ mod tests {
         );
     }
 
+    /// NEGATIVE CONTROL: `Limits::apply_to_job` rejects an `Untrusted` capability with
+    /// `PermissionDenied` before touching the invalid handle, and fails closed with
+    /// `ERROR_INVALID_HANDLE` (`Some(6)`) once authorized.
     #[test]
     fn apply_to_job_fails_closed_on_invalid_handle() {
-        let err = apply_to_job(&Limits::shell_default(), std::ptr::null_mut()).unwrap_err();
+        let auth = unsafe { aterm_cap::Authority::root_authority() };
+        let weak: aterm_cap::Cap<crate::Sandbox> = auth.grant(aterm_cap::Tier::Untrusted);
+        let denied = Limits::shell_default()
+            .apply_to_job(&weak, std::ptr::null_mut())
+            .unwrap_err();
+        assert_eq!(
+            denied.kind(),
+            io::ErrorKind::PermissionDenied,
+            "cap gate must reject Untrusted before querying the null job handle"
+        );
+
+        let trusted: aterm_cap::Cap<crate::Sandbox> = auth.grant(aterm_cap::Tier::Trusted);
+        let err = Limits::shell_default()
+            .apply_to_job(&trusted, std::ptr::null_mut())
+            .unwrap_err();
         assert_eq!(
             err.raw_os_error(),
             Some(6),

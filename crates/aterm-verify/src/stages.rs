@@ -938,6 +938,10 @@ type Compiled = (
 
 fn compile_tests(ctx: &Ctx, r: &mut Report, label: &str, compile: &Cmd) -> Compiled {
     let mut out = exec::run(compile, ctx.exec_env());
+    for event in crate::report::compile_unit_events(label, &out.output) {
+        eprintln!("{event}");
+        r.raw(event);
+    }
     let artifacts = crate::shape::artifacts(&out.output);
     let exes = crate::testrun::take_test_executables(&mut out.output);
     r.raw(out.output.as_str());
@@ -3454,6 +3458,19 @@ mod tests {
                 };
                 let mut r = Report::new(spec.title.clone());
                 test_compile(&c, &spec, &mut r);
+                let rendered = r.render();
+                let units: Vec<aterm_json::Value> = rendered
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("verify-event: "))
+                    .map(|line| aterm_json::from_str::<aterm_json::Value>(line).unwrap())
+                    .filter(|event| event["event"].as_str() == Some("compile-unit-finished"))
+                    .collect();
+                assert_eq!(units.len(), 1, "{rendered}");
+                assert_eq!(
+                    units[0]["fresh"].as_bool(),
+                    Some(piece != &lib && fresh == "true")
+                );
+                assert_eq!(units[0]["rebuild_reason"], aterm_json::Value::Null);
                 assert!(
                     r.outcomes().all(|(o, _)| o == crate::Outcome::Ok),
                     "{}",

@@ -2050,6 +2050,40 @@ fn agent_resumed_door_round_trips_and_answers_none_on_older_tapes() {
     assert!(core.diverged().is_some());
 }
 
+/// `restart_left`'s answer, the process a restart's own report names, reads back as written; a
+/// tape whose header lacks `host.restart_left` reads none there without diverging, so its loop
+/// goes by the process the host named, as the recording build's did; a header that names it over
+/// a tape that never asked diverges.
+#[test]
+fn restart_left_door_round_trips_and_answers_none_on_older_tapes() {
+    use crate::supervise::IdleHost;
+    use crate::supervise::tape::header::VERBATIM;
+    use crate::supervise::tape::replay::ReplayCore;
+    use crate::supervise::tape::testing::TAPE_ID;
+
+    for value in [
+        None,
+        Some((Some(4242), None)),
+        Some((Some(7), Some(1_793_000_010))),
+        Some((None, None)),
+    ] {
+        same::<Option<crate::supervise::custody::Process>>(value);
+    }
+    for doors in [vec!["host.restart".to_string()], Vec::new()] {
+        let core = ReplayCore::start(Vec::new(), VERBATIM, VERBATIM, TAPE_ID, None);
+        core.recorded_doors(doors);
+        let replay = ReplayHost::new(Fx::replay(Arc::clone(&core)));
+        assert_eq!(replay.restart_left(), None);
+        assert!(core.diverged().is_none());
+    }
+    let core = ReplayCore::start(Vec::new(), VERBATIM, VERBATIM, TAPE_ID, None);
+    core.recorded_doors(vec!["host.restart_left".to_string()]);
+    let replay = ReplayHost::new(Fx::replay(Arc::clone(&core)));
+    let asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| replay.restart_left()));
+    assert!(asked.is_err(), "the replay halts: the tape never asked");
+    assert!(core.diverged().is_some());
+}
+
 /// A window's host that hears the hold's own words
 /// ([`crate::supervise::IdleHost::land_said`]) and keeps each tell.
 #[derive(Debug, Default)]

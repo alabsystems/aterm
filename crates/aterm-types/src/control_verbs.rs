@@ -2991,8 +2991,8 @@ pub const VERBS: &[VerbSpec] = &[
         Signal,
         Status,
         Session,
-        "prepare a native Codex exec account move",
-        "A proven live exec peer may prepare a shared-pool quota selection. Selection grants no launcher or execution capability; commit, attach and execute are not yet supported.",
+        "native Codex exec account handoff",
+        "A proven live exec peer may prepare a shared-pool quota selection, arm its original checkpoint, execute a same-PID replacement, then load and consume that exact native grant. Selection alone grants no execution; policy, owner and process identity fence every admission.",
     ).input(Input::NONE),
     v(
         "native-act",

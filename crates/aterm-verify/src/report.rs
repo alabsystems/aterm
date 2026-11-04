@@ -12,6 +12,338 @@ use crate::ladder::{Finding, Outcome, Report, Severity};
 /// How many findings a failed check lists before pointing at the log.
 pub const FINDINGS_SHOWN: usize = 10;
 
+/// Inspect top-level wire fields before Value's general-purpose map can replace duplicates.
+/// Ambiguous records grant no authority; retain every valid identity they actually named so
+/// only those units lose their join, including both sides of a duplicated identity field.
+enum UnitMessage {
+    Other,
+    Unit(aterm_json::Value),
+    Ambiguous(Vec<String>),
+}
+
+impl<'de> serde::Deserialize<'de> for UnitMessage {
+    fn deserialize<D: serde::Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
+        struct Wire;
+        impl<'de> serde::de::Visitor<'de> for Wire {
+            type Value = UnitMessage;
+            fn expecting(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                out.write_str("a compiler message object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut input: A,
+            ) -> Result<Self::Value, A::Error> {
+                use aterm_json::Value;
+                let mut fields = aterm_json::Map::new();
+                let mut identities = std::collections::BTreeSet::new();
+                let mut unit = false;
+                let mut duplicate = false;
+                while let Some((key, value)) = input.next_entry::<String, Value>()? {
+                    if key == "reason"
+                        && matches!(
+                            value.as_str(),
+                            Some("compiler-artifact" | "compilation-unit-dispatched")
+                        )
+                    {
+                        unit = true;
+                    }
+                    if key == "trust_unit_identity_sha256"
+                        && let Some(identity) = value
+                            .as_str()
+                            .filter(|id| aterm_codec::hex::is_lower(id, 64))
+                    {
+                        identities.insert(identity.to_owned());
+                    }
+                    match fields.entry(key) {
+                        std::collections::btree_map::Entry::Occupied(_) => duplicate = true,
+                        std::collections::btree_map::Entry::Vacant(slot) => {
+                            slot.insert(value);
+                        }
+                    }
+                }
+                Ok(if !unit {
+                    UnitMessage::Other
+                } else if duplicate {
+                    UnitMessage::Ambiguous(identities.into_iter().collect())
+                } else {
+                    UnitMessage::Unit(Value::Object(fields))
+                })
+            }
+        }
+        decoder.deserialize_map(Wire)
+    }
+}
+
+/// The bounded v1 dispatch evidence emitted by Targo, not a process-start or success receipt.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct UnitDispatch<'a> {
+    mode: &'a str,
+    kind: &'a str,
+    fresh: bool,
+    cause: Option<&'a str>,
+}
+
+fn unit_identity(value: &aterm_json::Value) -> Option<&str> {
+    value
+        .get("trust_unit_identity_sha256")?
+        .as_str()
+        .filter(|hash| aterm_codec::hex::is_lower(hash, 64))
+}
+
+fn unit_dispatch(value: &aterm_json::Value) -> Option<UnitDispatch<'_>> {
+    use aterm_json::Value;
+    if value.as_object()?.len() != 7
+        || value.get("schema")?.as_str()? != "targo.compilation-unit-dispatched.v1"
+        || value.get("reason")?.as_str()? != "compilation-unit-dispatched"
+    {
+        return None;
+    }
+    let mode = value.get("trust_compile_mode")?.as_str()?;
+    let kind = value.get("trust_compile_kind")?.as_str()?;
+    if !matches!(
+        mode,
+        "test"
+            | "build"
+            | "check-test"
+            | "check"
+            | "doc"
+            | "doctest"
+            | "docscrape"
+            | "run-custom-build"
+    ) || !matches!(kind, "host" | "target")
+    {
+        return None;
+    }
+    let fresh = value.get("fresh")?.as_bool()?;
+    let cause = match value.get("dirty_reason")? {
+        Value::Null if fresh => None,
+        Value::String(cause)
+            if !fresh
+                && matches!(
+                    cause.as_str(),
+                    "rustc-changed"
+                        | "features-changed"
+                        | "declared-features-changed"
+                        | "target-configuration-changed"
+                        | "path-to-source-changed"
+                        | "profile-configuration-changed"
+                        | "rustflags-changed"
+                        | "config-settings-changed"
+                        | "compile-kind-changed"
+                        | "local-lengths-changed"
+                        | "precalculated-components-changed"
+                        | "fingerprint-method-changed"
+                        | "dep-info-output-changed"
+                        | "rerun-if-changed-output-file-changed"
+                        | "rerun-if-changed-output-paths-changed"
+                        | "env-vars-changed"
+                        | "env-var-changed"
+                        | "local-fingerprint-type-changed"
+                        | "number-of-dependencies-changed"
+                        | "unit-dependency-name-changed"
+                        | "unit-dependency-info-changed"
+                        | "missing-file"
+                        | "unable-to-read-file"
+                        | "failed-to-read-metadata"
+                        | "file-size-changed"
+                        | "changed-file"
+                        | "changed-checksum"
+                        | "missing-checksum"
+                        | "changed-env"
+                        | "stale-dependency"
+                        | "stale-dep-fingerprint"
+                        | "output-integrity"
+                        | "forced"
+                        | "fresh-build"
+                        | "unknown"
+                ) =>
+        {
+            Some(cause.as_str())
+        }
+        _ => return None,
+    };
+    unit_identity(value)?;
+    Some(UnitDispatch {
+        mode,
+        kind,
+        fresh,
+        cause,
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct UnitContext<'a> {
+    mode: Option<&'a str>,
+    kind: Option<&'a str>,
+    fresh: Option<bool>,
+}
+
+#[derive(Default)]
+struct UnitEvidence<'a> {
+    dispatch: Option<Option<UnitDispatch<'a>>>,
+    artifact: Option<UnitContext<'a>>,
+    conflicting: bool,
+    ambiguous: bool,
+}
+
+impl<'a> UnitEvidence<'a> {
+    fn observe_dispatch(&mut self, dispatch: Option<UnitDispatch<'a>>) {
+        if let Some(prior) = self.dispatch {
+            self.conflicting |= prior != dispatch;
+        } else {
+            self.dispatch = Some(dispatch);
+        }
+    }
+
+    fn observe_artifact(&mut self, value: &'a aterm_json::Value) {
+        use aterm_json::Value;
+        let context = UnitContext {
+            mode: value.get("trust_compile_mode").and_then(Value::as_str),
+            kind: value.get("trust_compile_kind").and_then(Value::as_str),
+            fresh: value.get("fresh").and_then(Value::as_bool),
+        };
+        if let Some(prior) = self.artifact {
+            self.conflicting |= prior != context;
+        } else {
+            self.artifact = Some(context);
+        }
+    }
+
+    fn joined(&self) -> Option<UnitDispatch<'a>> {
+        let dispatch = self.dispatch??;
+        (!self.conflicting
+            && !self.ambiguous
+            && self.artifact
+                == Some(UnitContext {
+                    mode: Some(dispatch.mode),
+                    kind: Some(dispatch.kind),
+                    fresh: Some(dispatch.fresh),
+                }))
+        .then_some(dispatch)
+    }
+
+    fn cause(&self, fresh: Option<bool>) -> (Option<&'a str>, &'static str) {
+        if self.ambiguous {
+            return (None, "ambiguous-message");
+        }
+        if self.dispatch.is_none() {
+            return (
+                None,
+                match fresh {
+                    Some(true) => "not-applicable",
+                    Some(false) => "not-reported-by-producer",
+                    None => "freshness-unknown",
+                },
+            );
+        }
+        if self.dispatch == Some(None) {
+            return (None, "dispatch-unavailable");
+        }
+        let Some(dispatch) = self.joined() else {
+            return (None, "conflicting-dispatch");
+        };
+        match dispatch.cause {
+            None => (None, "not-applicable"),
+            Some("unknown") => (None, "producer-unknown"),
+            cause => (cause, "producer-dispatch"),
+        }
+    }
+}
+
+/// Retain the producer's artifact context before test discovery consumes its JSON messages.
+/// Cargo's artifact schema alone reports freshness, not why a unit was rebuilt. Only a
+/// recognized producer dispatch with the same unit identity, mode, kind and freshness can
+/// supply a cause. `fresh=false` alone proves neither a cache miss nor a source change. Optional
+/// Trust fields identify the exact producer unit when that producer supplies them; ordinary
+/// Cargo target metadata alone does not identify the compilation triple or host/target role.
+#[must_use]
+pub fn compile_unit_events(stage: &str, output: &str) -> Vec<String> {
+    use aterm_json::Value;
+    let messages: Vec<UnitMessage> = output
+        .lines()
+        .filter_map(|line| aterm_json::from_str::<UnitMessage>(line).ok())
+        .filter(|message| !matches!(message, UnitMessage::Other))
+        .collect();
+    // This index exists only for this one compiler output, never across calls or invocations.
+    let mut units = std::collections::BTreeMap::<&str, UnitEvidence<'_>>::new();
+    let mut dispatches = Vec::with_capacity(messages.len());
+    for message in &messages {
+        let UnitMessage::Unit(value) = message else {
+            dispatches.push(None);
+            if let UnitMessage::Ambiguous(identities) = message {
+                for identity in identities {
+                    units.entry(identity).or_default().ambiguous = true;
+                }
+            }
+            continue;
+        };
+        let dispatched =
+            value.get("reason").and_then(Value::as_str) == Some("compilation-unit-dispatched");
+        let dispatch = dispatched.then(|| unit_dispatch(value)).flatten();
+        dispatches.push(dispatch);
+        if let Some(identity) = unit_identity(value) {
+            let unit = units.entry(identity).or_default();
+            if dispatched {
+                unit.observe_dispatch(dispatch);
+            } else {
+                unit.observe_artifact(value);
+            }
+        }
+    }
+    fn fields(value: Option<&Value>, keys: &[&str]) -> Option<Value> {
+        let object = value?.as_object()?;
+        Some(Value::Object(
+            keys.iter()
+                .filter_map(|key| {
+                    object
+                        .get(*key)
+                        .map(|value| ((*key).to_owned(), value.clone()))
+                })
+                .collect(),
+        ))
+    }
+    let unavailable = UnitEvidence::default();
+    messages.iter().zip(dispatches).map(|(message, dispatch)| {
+        let UnitMessage::Unit(value) = message else {
+            return format!("verify-event: {}", aterm_json::json!({
+                "schema": 1, "event": "compile-unit-message-unavailable", "stage": stage,
+                "detail": "duplicate top-level fields in a unit message",
+            }));
+        };
+        let identity = unit_identity(value);
+        let unit = identity.and_then(|identity| units.get(identity)).unwrap_or(&unavailable);
+        if value.get("reason").and_then(Value::as_str) == Some("compilation-unit-dispatched") {
+            let reported = unit.joined().map(|_| true);
+            return format!("verify-event: {}", aterm_json::json!({
+                "schema": 1, "event": "compile-unit-dispatched", "stage": stage,
+                "producer_unit_sha256": identity,
+                "compile_kind": dispatch.map(|d| d.kind), "compile_mode": dispatch.map(|d| d.mode),
+                "fresh": dispatch.map(|d| d.fresh), "dirty_reason": dispatch.and_then(|d| d.cause),
+                "evidence_status": if dispatch.is_some() { "producer-dispatch" } else { "dispatch-unavailable" },
+                "artifact_reported": reported,
+            }));
+        }
+        let string = |key| value.get(key).and_then(Value::as_str);
+        let fresh = value.get("fresh").and_then(Value::as_bool);
+        let (cause, cause_status) = unit.cause(fresh);
+        format!("verify-event: {}", aterm_json::json!({
+            "schema": 1, "event": "compile-unit-finished", "stage": stage,
+            "package_id": string("package_id"),
+            "manifest_path": string("manifest_path"),
+            "target": fields(value.get("target"), &["name", "kind", "crate_types", "src_path", "edition"]),
+            "profile": fields(value.get("profile"), &["opt_level", "debuginfo", "debug_assertions", "overflow_checks", "test"]),
+            "features": value.get("features").filter(|v| v.as_array().is_some_and(|a| a.iter().all(|v| v.as_str().is_some()))),
+            "compile_target": string("trust_compile_target"),
+            "compile_kind": string("trust_compile_kind"),
+            "compile_mode": string("trust_compile_mode"),
+            "producer_unit_sha256": identity,
+            "fresh": fresh,
+            "rebuild_reason": cause,
+            "rebuild_reason_status": cause_status,
+        }))
+    }).collect()
+}
+
 /// A stage admitted to execute, paired with its completion by the run-local index.
 #[must_use]
 pub fn stage_started(index: usize, title: &str) -> String {
@@ -309,6 +641,433 @@ pub fn moved_checkout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duplicate_wire_fields_cannot_establish_a_unit_cause_or_artifact_match() {
+        let capture = include_str!("../tests/fixtures/targo-unit-dispatch-v1.jsonl");
+        let dispatch = capture.lines().next().unwrap();
+        let artifact = capture.lines().nth(1).unwrap();
+        for (name, first, second) in [
+            (
+                "dispatch cause",
+                dispatch.replace(
+                    "\"dirty_reason\":\"changed-env\"",
+                    "\"dirty_reason\":\"forced\",\"dirty_reason\":\"changed-env\"",
+                ),
+                artifact.to_owned(),
+            ),
+            (
+                "artifact freshness",
+                dispatch.to_owned(),
+                artifact.replace("\"fresh\":false", "\"fresh\":true,\"fresh\":false"),
+            ),
+            (
+                "artifact reason",
+                dispatch.to_owned(),
+                artifact.replacen(
+                    "\"reason\":\"compiler-artifact\"",
+                    "\"reason\":\"build-finished\",\"reason\":\"compiler-artifact\"",
+                    1,
+                ),
+            ),
+            (
+                "hidden artifact reason",
+                dispatch.to_owned(),
+                artifact.replacen(
+                    "\"reason\":\"compiler-artifact\"",
+                    "\"reason\":\"compiler-artifact\",\"reason\":\"build-finished\"",
+                    1,
+                ),
+            ),
+        ] {
+            let events = compile_unit_events("ambiguous wire", &format!("{first}\n{second}\n"));
+            let values: Vec<aterm_json::Value> = events
+                .iter()
+                .map(|line| {
+                    aterm_json::from_str::<aterm_json::Value>(
+                        line.strip_prefix("verify-event: ").unwrap(),
+                    )
+                    .unwrap()
+                })
+                .collect();
+            assert_eq!(values.len(), 2, "{name}: {events:?}");
+            assert!(
+                values.iter().all(|event| event
+                    .get("rebuild_reason")
+                    .is_none_or(|reason| *reason == aterm_json::Value::Null)),
+                "{name}: {events:?}"
+            );
+            assert!(
+                values.iter().all(|event| event
+                    .get("artifact_reported")
+                    .is_none_or(|reported| *reported == aterm_json::Value::Null)),
+                "{name}: {events:?}"
+            );
+        }
+
+        // An ambiguous identity field can name two units. Invalidate both exact observed
+        // identities without erasing an independent third unit's valid evidence.
+        let x = aterm_json::from_str::<aterm_json::Value>(dispatch).unwrap();
+        let x = x["trust_unit_identity_sha256"].as_str().unwrap();
+        let y = "b".repeat(64);
+        let z = "c".repeat(64);
+        let ambiguous = dispatch.replacen(
+            &format!("\"trust_unit_identity_sha256\":\"{x}\""),
+            &format!(
+                "\"trust_unit_identity_sha256\":\"{x}\",\"trust_unit_identity_sha256\":\"{y}\""
+            ),
+            1,
+        );
+        assert_ne!(ambiguous, dispatch);
+        let output = [
+            dispatch.to_owned(),
+            artifact.to_owned(),
+            producer_dispatch(&y).to_string(),
+            producer_artifact(&y).to_string(),
+            producer_dispatch(&z).to_string(),
+            producer_artifact(&z).to_string(),
+            ambiguous.clone(),
+        ]
+        .join("\n");
+        let events: Vec<aterm_json::Value> = compile_unit_events("scoped ambiguity", &output)
+            .iter()
+            .map(|line| {
+                aterm_json::from_str::<aterm_json::Value>(
+                    line.strip_prefix("verify-event: ").unwrap(),
+                )
+                .unwrap()
+            })
+            .collect();
+        for identity in [x, y.as_str()] {
+            let affected: Vec<_> = events
+                .iter()
+                .filter(|event| event["producer_unit_sha256"].as_str() == Some(identity))
+                .collect();
+            assert_eq!(affected.len(), 2);
+            assert!(affected.iter().all(|event| {
+                event
+                    .get("rebuild_reason")
+                    .is_none_or(|v| *v == aterm_json::Value::Null)
+                    && event
+                        .get("artifact_reported")
+                        .is_none_or(|v| *v == aterm_json::Value::Null)
+            }));
+        }
+        let independent = events
+            .iter()
+            .find(|event| {
+                event["producer_unit_sha256"].as_str() == Some(z.as_str())
+                    && event["event"].as_str() == Some("compile-unit-finished")
+            })
+            .unwrap();
+        assert_eq!(independent["rebuild_reason"].as_str(), Some("changed-file"));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["event"].as_str() == Some("compile-unit-message-unavailable"))
+                .count(),
+            1
+        );
+
+        let no_identity = ambiguous.replace(x, "invalid").replace(&y, "invalid-too");
+        let output = [
+            producer_dispatch(&z).to_string(),
+            producer_artifact(&z).to_string(),
+            no_identity,
+        ]
+        .join("\n");
+        let events = compile_unit_events("unidentified ambiguity", &output);
+        assert!(
+            events
+                .iter()
+                .any(|event| event.contains("\"rebuild_reason\":\"changed-file\""))
+        );
+        // No taint survives this invocation.
+        let healthy = compile_unit_events("healthy", capture);
+        assert!(
+            healthy
+                .iter()
+                .any(|event| event.contains("\"rebuild_reason\":\"changed-env\""))
+        );
+    }
+
+    fn producer_artifact(identity: &str) -> aterm_json::Value {
+        aterm_json::json!({
+            "reason": "compiler-artifact", "trust_unit_identity_sha256": identity,
+            "trust_compile_mode": "test", "trust_compile_kind": "host", "fresh": false,
+        })
+    }
+
+    // The producer's bounded targo.compilation-unit-dispatched.v1 wire envelope.
+    fn producer_dispatch(identity: &str) -> aterm_json::Value {
+        aterm_json::json!({
+            "reason": "compilation-unit-dispatched", "schema": "targo.compilation-unit-dispatched.v1",
+            "trust_unit_identity_sha256": identity, "trust_compile_mode": "test",
+            "trust_compile_kind": "host", "fresh": false, "dirty_reason": "changed-file",
+        })
+    }
+
+    fn retained_units(messages: &[aterm_json::Value]) -> Vec<aterm_json::Value> {
+        let output = messages
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        compile_unit_events("compile", &output)
+            .iter()
+            .map(|line| {
+                aterm_json::from_str::<aterm_json::Value>(
+                    line.strip_prefix("verify-event: ").unwrap(),
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn compile_units_replay_a_real_producer_pair_but_do_not_invent_its_missing_dispatch() {
+        // Exact records 1 and 3 from the controlled producer capture documented in
+        // docs/measured/compiler-unit-evidence-2026-11-04.md, without path redaction.
+        let capture = include_str!("../tests/fixtures/targo-unit-dispatch-v1.jsonl");
+        let events: Vec<aterm_json::Value> = compile_unit_events("captured producer", capture)
+            .iter()
+            .map(|line| {
+                aterm_json::from_str::<aterm_json::Value>(
+                    line.strip_prefix("verify-event: ").unwrap(),
+                )
+                .unwrap()
+            })
+            .collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["artifact_reported"].as_bool(), Some(true));
+        assert_eq!(events[1]["rebuild_reason"].as_str(), Some("changed-env"));
+        assert_eq!(
+            events[0]["producer_unit_sha256"],
+            events[1]["producer_unit_sha256"]
+        );
+        assert_eq!(events[1]["fresh"].as_bool(), Some(false));
+        let artifact = capture.lines().nth(1).unwrap();
+        let without = compile_unit_events("captured artifact only", artifact);
+        let without: aterm_json::Value =
+            aterm_json::from_str(without[0].strip_prefix("verify-event: ").unwrap()).unwrap();
+        assert_eq!(without["rebuild_reason"], aterm_json::Value::Null);
+        assert_eq!(
+            without["rebuild_reason_status"].as_str(),
+            Some("not-reported-by-producer")
+        );
+    }
+
+    #[test]
+    fn compile_units_join_only_matching_producer_dispatches_in_this_call() {
+        let first = "a".repeat(64);
+        let second = "b".repeat(64);
+        let a = producer_dispatch(&first);
+        let mut b = producer_dispatch(&second);
+        b.as_object_mut()
+            .unwrap()
+            .insert("dirty_reason".into(), aterm_json::json!("features-changed"));
+        let events = retained_units(&[
+            a.clone(),
+            b,
+            producer_artifact(&second),
+            producer_artifact(&first),
+            a,
+        ]);
+        assert_eq!(
+            events[2]["rebuild_reason"].as_str(),
+            Some("features-changed")
+        );
+        assert_eq!(events[3]["rebuild_reason"].as_str(), Some("changed-file"));
+        assert_eq!(events[0]["artifact_reported"].as_bool(), Some(true));
+
+        // A dispatched build script need not emit any compiler artifact. Neither a dispatch
+        // nor a later invocation's artifact establishes completion in this invocation.
+        let mut script = producer_dispatch(&first);
+        script.as_object_mut().unwrap().insert(
+            "trust_compile_mode".into(),
+            aterm_json::json!("run-custom-build"),
+        );
+        assert_eq!(
+            retained_units(&[script])[0]["artifact_reported"],
+            aterm_json::Value::Null
+        );
+        assert_eq!(
+            retained_units(&[producer_artifact(&first)])[0]["rebuild_reason"],
+            aterm_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn compile_units_refuse_mismatched_or_conflicting_dispatch_evidence() {
+        use aterm_json::{Value, json};
+        let identity = "a".repeat(64);
+        for (field, invalid) in [
+            ("schema", json!("targo.compilation-unit-dispatched.v2")),
+            ("trust_unit_identity_sha256", json!("b".repeat(64))),
+            ("trust_unit_identity_sha256", json!("invalid")),
+            ("trust_compile_mode", json!("build")),
+            ("trust_compile_kind", json!("target")),
+            ("fresh", json!(true)),
+            ("dirty_reason", json!("unsupported-sensitive-prose")),
+            ("extra", json!("unsupported-sensitive-prose")),
+        ] {
+            let mut dispatch = producer_dispatch(&identity);
+            dispatch
+                .as_object_mut()
+                .unwrap()
+                .insert(field.into(), invalid);
+            let events = retained_units(&[dispatch, producer_artifact(&identity)]);
+            assert_eq!(
+                events[1]["rebuild_reason"],
+                Value::Null,
+                "{field}: {events:?}"
+            );
+            assert_eq!(
+                events[0]["artifact_reported"],
+                Value::Null,
+                "{field}: {events:?}"
+            );
+            assert!(
+                !events[0]
+                    .to_string()
+                    .contains("unsupported-sensitive-prose")
+            );
+        }
+        let mut conflicting = producer_dispatch(&identity);
+        conflicting
+            .as_object_mut()
+            .unwrap()
+            .insert("dirty_reason".into(), json!("forced"));
+        let events = retained_units(&[
+            producer_dispatch(&identity),
+            conflicting,
+            producer_artifact(&identity),
+        ]);
+        assert_eq!(events[2]["rebuild_reason"], Value::Null);
+        assert_eq!(
+            events[2]["rebuild_reason_status"].as_str(),
+            Some("conflicting-dispatch")
+        );
+        assert_eq!(events[0]["artifact_reported"], Value::Null);
+
+        let mut conflicting = producer_artifact(&identity);
+        conflicting
+            .as_object_mut()
+            .unwrap()
+            .insert("trust_compile_kind".into(), json!("target"));
+        let events = retained_units(&[
+            producer_dispatch(&identity),
+            producer_artifact(&identity),
+            conflicting,
+        ]);
+        assert_eq!(events[1]["rebuild_reason"], Value::Null);
+        assert_eq!(events[0]["artifact_reported"], Value::Null);
+    }
+
+    #[test]
+    fn compile_units_distinguish_fresh_work_unknown_causes_and_fresh_build_classification() {
+        use aterm_json::{Value, json};
+        let identity = "a".repeat(64);
+        let mut dispatch = producer_dispatch(&identity);
+        dispatch
+            .as_object_mut()
+            .unwrap()
+            .insert("dirty_reason".into(), json!("unknown"));
+        let events = retained_units(&[dispatch.clone(), producer_artifact(&identity)]);
+        assert_eq!(events[1]["rebuild_reason"], Value::Null);
+        assert_eq!(
+            events[1]["rebuild_reason_status"].as_str(),
+            Some("producer-unknown")
+        );
+        for cause in ["fresh-build", "output-integrity"] {
+            dispatch
+                .as_object_mut()
+                .unwrap()
+                .insert("dirty_reason".into(), json!(cause));
+            assert_eq!(retained_units(&[dispatch.clone(), producer_artifact(&identity)])[1]["rebuild_reason"].as_str(), Some(cause));
+        }
+        dispatch
+            .as_object_mut()
+            .unwrap()
+            .insert("fresh".into(), json!(true));
+        dispatch
+            .as_object_mut()
+            .unwrap()
+            .insert("dirty_reason".into(), Value::Null);
+        let mut artifact = producer_artifact(&identity);
+        artifact
+            .as_object_mut()
+            .unwrap()
+            .insert("fresh".into(), json!(true));
+        let events = retained_units(&[dispatch, artifact]);
+        assert_eq!(events[1]["rebuild_reason"], Value::Null);
+        assert_eq!(
+            events[1]["rebuild_reason_status"].as_str(),
+            Some("not-applicable")
+        );
+        assert_eq!(events[0]["artifact_reported"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn compile_units_retain_producer_context_without_inventing_a_rebuild_cause() {
+        let unit = aterm_json::json!({
+            "reason": "compiler-artifact", "package_id": "path+file:///r/lib#1",
+            "manifest_path": "/r/lib/Cargo.toml",
+            "target": {"name": "lib", "kind": ["lib"], "src_path": "/r/lib/src/lib.rs", "extra": "unreported"},
+            "profile": {"opt_level": "0", "test": true}, "features": ["a"],
+            "trust_compile_target": "aarch64-apple-darwin", "trust_compile_kind": "host",
+            "trust_compile_mode": "test", "trust_unit_identity_sha256": "a".repeat(64),
+            "fresh": false, "dirty_reason": "source-changed", "extra": "unreported",
+        });
+        let events = compile_unit_events("test compile", &unit.to_string());
+        assert_eq!(events.len(), 1);
+        let event: aterm_json::Value =
+            aterm_json::from_str(events[0].strip_prefix("verify-event: ").unwrap()).unwrap();
+        assert_eq!(event["package_id"], unit["package_id"]);
+        assert_eq!(event["target"]["name"], unit["target"]["name"]);
+        assert_eq!(event["profile"], unit["profile"]);
+        assert_eq!(event["features"], unit["features"]);
+        assert_eq!(
+            event["producer_unit_sha256"],
+            unit["trust_unit_identity_sha256"]
+        );
+        assert_eq!(event["compile_target"], unit["trust_compile_target"]);
+        assert_eq!(event["fresh"].as_bool(), Some(false));
+        assert_eq!(event["rebuild_reason"], aterm_json::Value::Null);
+        assert_eq!(
+            event["rebuild_reason_status"].as_str(),
+            Some("not-reported-by-producer")
+        );
+        assert!(!events[0].contains("unreported"));
+        assert!(!events[0].contains("source-changed"));
+    }
+
+    #[test]
+    fn compile_units_keep_unknown_freshness_distinct_from_a_rebuild() {
+        let output = concat!(
+            "not JSON\n{broken\n",
+            "{\"reason\":\"build-finished\",\"fresh\":false}\n",
+            "{\"reason\":\"compiler-artifact\",\"fresh\":\"false\",\"trust_unit_identity_sha256\":\"invalid\"}\n",
+            "{\"reason\":\"compiler-artifact\",\"fresh\":true}\n",
+        );
+        let events = compile_unit_events("compile", output);
+        assert_eq!(events.len(), 2);
+        let read = |line: &str| {
+            aterm_json::from_str::<aterm_json::Value>(line.strip_prefix("verify-event: ").unwrap())
+                .unwrap()
+        };
+        let unknown = read(&events[0]);
+        assert_eq!(unknown["fresh"], aterm_json::Value::Null);
+        assert_eq!(unknown["producer_unit_sha256"], aterm_json::Value::Null);
+        assert_eq!(
+            unknown["rebuild_reason_status"].as_str(),
+            Some("freshness-unknown")
+        );
+        assert_eq!(
+            read(&events[1])["rebuild_reason_status"].as_str(),
+            Some("not-applicable")
+        );
+    }
 
     #[test]
     fn a_started_stage_carries_its_index_without_claiming_a_result() {

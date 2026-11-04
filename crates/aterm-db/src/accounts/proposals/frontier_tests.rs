@@ -34,8 +34,8 @@ fn wide_frontier(covered_predecessor: bool) {
     let db = Proposals::at(lab.paths[0].clone());
     let scope = db.initialize().unwrap();
     let mut original = BTreeSet::new();
-    for writer in 0..writers {
-        let peer = Proposals::at(lab.paths[writer].clone());
+    for (writer, paths) in lab.paths[..writers].iter().enumerate() {
+        let peer = Proposals::at(paths.clone());
         assert_eq!(peer.initialize().unwrap(), scope);
         let receipt = peer
             .write([1; 16], vec![change("one", &format!("offline-{writer}"))])

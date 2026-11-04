@@ -171,10 +171,11 @@ enum NotStarted {
 }
 
 /// THE ATTEMPT RULE: an attempt the person's desk refused is a wait, never a spent attempt.
-const fn not_started(activity_deferred: bool, desk_refused: bool) -> NotStarted {
+/// `sessionless_refusal` is the cause the admission left in `App::sessionless_handoff_refused`.
+fn not_started(activity_deferred: bool, sessionless_refusal: Option<&str>) -> NotStarted {
     if activity_deferred {
         NotStarted::Deferred
-    } else if desk_refused {
+    } else if sessionless_refusal.is_some_and(crate::app_update_handoff::held_by_the_desk) {
         NotStarted::PersonState
     } else {
         NotStarted::Counted
@@ -430,30 +431,41 @@ impl crate::App {
                     ending: None,
                 };
             }
-            Err(error) => match not_started(
-                error.is_activity_deferred(),
-                self.sessionless_handoff_refused
-                    .is_some_and(crate::app_update_handoff::held_by_the_desk),
-            ) {
-                NotStarted::Deferred => {
-                    aterm_log::debug!("launch record: the renewal was deferred: {error}");
-                    self.record_update_switch_stopped(true, &error.to_string());
-                    self.launch_record_renewal.state =
-                        wait_until(crate::automatic_update_activity_retry_at(now));
-                }
-                NotStarted::PersonState => {
-                    aterm_log::debug!("launch record: the renewal waits for the desk: {error}");
-                    self.launch_record_renewal.state = wait_until(now + PERSON_STATE_REPOLL);
-                }
-                NotStarted::Counted => {
-                    aterm_log::warn!(
-                        "launch record: attempt {k} of {ATTEMPTS} did not start: {error}"
-                    );
-                    self.record_update_switch_stopped(k < ATTEMPTS, &error.to_string());
-                    self.launch_record_renewal.attempts = k;
-                    self.launch_record_renewal.rearm_after_attempt(now);
-                }
-            },
+            Err(error) => self.book_renewal_not_started(armed_at, k, now, &error),
+        }
+    }
+
+    /// Books attempt `k`, which did not start, by what held it ([`not_started`]): the
+    /// sessionless cause the admission left beside `error` (`App::sessionless_handoff_refused`)
+    /// says whether the person's desk held it.
+    fn book_renewal_not_started(
+        &mut self,
+        armed_at: Instant,
+        k: u8,
+        now: Instant,
+        error: &crate::UpdateHandoffStartError,
+    ) {
+        let wait_until = |retry_at| RenewalState::Armed { armed_at, retry_at };
+        match not_started(
+            error.is_activity_deferred(),
+            self.sessionless_handoff_refused,
+        ) {
+            NotStarted::Deferred => {
+                aterm_log::debug!("launch record: the renewal was deferred: {error}");
+                self.record_update_switch_stopped(true, &error.to_string());
+                self.launch_record_renewal.state =
+                    wait_until(crate::automatic_update_activity_retry_at(now));
+            }
+            NotStarted::PersonState => {
+                aterm_log::debug!("launch record: the renewal waits for the desk: {error}");
+                self.launch_record_renewal.state = wait_until(now + PERSON_STATE_REPOLL);
+            }
+            NotStarted::Counted => {
+                aterm_log::warn!("launch record: attempt {k} of {ATTEMPTS} did not start: {error}");
+                self.record_update_switch_stopped(k < ATTEMPTS, &error.to_string());
+                self.launch_record_renewal.attempts = k;
+                self.launch_record_renewal.rearm_after_attempt(now);
+            }
         }
     }
 
@@ -604,12 +616,20 @@ mod tests {
     /// and settles after its attempts as the same cause with a terminal tab open does.
     #[test]
     fn a_desk_the_handoff_cannot_carry_never_spends_an_attempt() {
-        use crate::app_update_handoff::held_by_the_desk;
         for desk in [
             "no window is open to hand over",
             "no open tab is one the new build can restore",
         ] {
-            assert!(held_by_the_desk(desk), "{desk}");
+            assert_eq!(
+                not_started(false, Some(desk)),
+                NotStarted::PersonState,
+                "{desk}"
+            );
+            assert_eq!(
+                not_started(true, Some(desk)),
+                NotStarted::Deferred,
+                "{desk}"
+            );
         }
         for lane in [
             "this platform has no LaunchServices launcher",
@@ -619,15 +639,41 @@ mod tests {
             "the launch environment needs a removal a merge cannot express",
             "the new build failed its pre-park verification",
         ] {
-            assert!(!held_by_the_desk(lane), "a cause no desk clears: {lane}");
+            assert_eq!(
+                not_started(false, Some(lane)),
+                NotStarted::Counted,
+                "a cause no desk clears: {lane}"
+            );
         }
-        assert_eq!(not_started(true, false), NotStarted::Deferred);
-        assert_eq!(not_started(true, true), NotStarted::Deferred);
-        assert_eq!(not_started(false, true), NotStarted::PersonState);
+        assert_eq!(not_started(true, None), NotStarted::Deferred);
         assert_eq!(
-            not_started(false, false),
+            not_started(false, None),
             NotStarted::Counted,
             "CONTROL: any other refusal spends one"
+        );
+
+        // The booking reads the cause the admission left beside the error.
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+        let mut app = crate::App::headless_for_test();
+        let now = Instant::now();
+        let refused = crate::UpdateHandoffStartError::refused(
+            "The update waits for the next launch: no window is open to hand over",
+        );
+        app.sessionless_handoff_refused = Some("no window is open to hand over");
+        app.book_renewal_not_started(now, 1, now, &refused);
+        assert_eq!(app.launch_record_renewal.attempts, 0, "the desk spent none");
+        assert!(
+            matches!(
+                app.launch_record_renewal.state,
+                RenewalState::Armed { retry_at, .. } if retry_at == now + PERSON_STATE_REPOLL
+            ),
+            "it looks again when the desk may have changed"
+        );
+        app.sessionless_handoff_refused = Some("this process does not run from a .app bundle");
+        app.book_renewal_not_started(now, 1, now, &refused);
+        assert_eq!(
+            app.launch_record_renewal.attempts, 1,
+            "CONTROL: a cause no desk clears spends one"
         );
     }
 

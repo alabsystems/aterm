@@ -118,9 +118,10 @@ pub fn plan(root: &Path, now: SystemTime) -> Vec<Planned> {
 }
 
 /// Remove what nobody uses from the tooling cache `root` at `now` ([`why`]), `record` asked first
-/// for each (`false` keeps it); each removed whole ([`super::remove::tree`]) is returned with why,
-/// a stage some entry of which stayed with what stayed ([`Unused::Stayed`]), for the next pass,
-/// and an entry whose intent is on record and nothing of which went (its rename aside refused
+/// for each (`false` keeps it); each removed whole ([`super::remove::tree_while`]) is returned with
+/// why, a stage some entry of which stayed with what stayed ([`Unused::Stayed`]), for the next
+/// pass, a stage whose walk a custody marker stopped with what went ([`Unused::Revoked`]), for the
+/// next pass too, and an entry whose intent is on record and nothing of which went (its rename aside refused
 /// after the check, or a process came to use it since; one in a stage by then is returned as the
 /// stage, [`super::Refusal::Staged`]) with [`Unused::Refused`], so every intent on record closes
 /// with an outcome. Each stage is visited once a pass, as the one listing of
@@ -201,7 +202,22 @@ pub(super) fn reclaim_on(
             intents.stop();
             continue;
         }
-        let left = super::remove::tree(&stage);
+        let told = || {
+            fence.working();
+            true
+        };
+        let left = match super::remove::tree_while(&stage, &told) {
+            Ok(left) => left,
+            Err(revoked) => {
+                intents.outcome(
+                    stage,
+                    Unused::Revoked {
+                        freed: revoked.freed,
+                    },
+                );
+                continue;
+            }
+        };
         if left.whole() {
             intents.outcome(entry, why);
         } else {

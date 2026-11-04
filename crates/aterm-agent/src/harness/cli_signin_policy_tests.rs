@@ -11,6 +11,99 @@ const OWNER: &str = "owner@example.test";
 
 #[cfg(unix)]
 #[test]
+fn native_google_retry_recovers_its_encrypted_completion_before_starting_another_login() {
+    struct Host {
+        calls: Cell<usize>,
+        fresh: Cell<usize>,
+        keys: RefCell<Vec<[u8; 32]>>,
+    }
+    impl AccountsHost for Host {
+        fn stdin_is_terminal(&self) -> bool {
+            false
+        }
+        fn auth_status(&self, _: &str) -> Result<Captured, String> {
+            unreachable!()
+        }
+        fn unaskable(&self) -> Option<String> {
+            None
+        }
+        fn login(&self, _: Option<&str>) -> Result<i32, String> {
+            unreachable!()
+        }
+        fn now(&self) -> i64 {
+            NOW
+        }
+        fn vendor_sign_in(&self, _: &Request<'_>) -> Drove {
+            panic!("generic sign-in ran")
+        }
+        fn native_google_sign_in(
+            &self,
+            req: &Request<'_>,
+            recovery: crate::harness::agy_signin::RecoveryKey,
+        ) -> Result<crate::harness::agy_signin::VerifiedGoogleGrant, String> {
+            self.keys.borrow_mut().push(recovery.0);
+            let first = self.calls.get() == 0;
+            self.calls.set(self.calls.get() + 1);
+            let (result, fresh) =
+                crate::harness::agy_signin::recovery_publication_fixture(req, recovery, first);
+            self.fresh.set(self.fresh.get() + usize::from(fresh));
+            result
+        }
+    }
+    let world = World::new(Cli::Agy);
+    let state = world.store.dir.parent().unwrap();
+    aterm_secrets::fsx::write_atomic(&state.join("google-identities.toml"),
+        b"[[identities]]\nid='one'\nemail='owner@example.test'\n[[bindings]]\nprovider='agy'\naccount='main'\nidentity='one'\nexpected_email='owner@example.test'\n", 0o600).unwrap();
+    let host = Host {
+        calls: Cell::new(0),
+        fresh: Cell::new(0),
+        keys: RefCell::new(Vec::new()),
+    };
+    let original = world.store.load_logins(NOW).unwrap().0.labels["main"]
+        .dir
+        .clone();
+    for attempt in 0..3 {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let result =
+            run_accounts_login_for(Cli::Agy, &world.env, &host, "main", &mut out, &mut err);
+        assert_eq!(
+            result == ExitCode::SUCCESS,
+            attempt != 0,
+            "{}{}",
+            String::from_utf8_lossy(&out),
+            String::from_utf8_lossy(&err)
+        );
+        assert_eq!(host.fresh.get(), if attempt < 2 { 1 } else { 2 });
+        let logins = world.store.load_logins(NOW).unwrap().0;
+        if attempt == 0 {
+            assert_eq!(logins.labels["main"].dir, original);
+        } else {
+            assert_eq!(logins.labels["main"].google_principal, Some([1; 32]));
+        }
+        let candidates = std::fs::read_dir(state.join("pending-native-google"))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].path().join("candidate.age").is_file(),
+            attempt == 0
+        );
+    }
+    let keys = host.keys.borrow();
+    assert_eq!(
+        keys[0], keys[1],
+        "a transient failure changed the admitted attempt scope"
+    );
+    assert_ne!(
+        keys[1], keys[2],
+        "publication did not fence the consumed completion"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn native_google_publication_retains_and_rechecks_its_typed_proof() {
     struct NativeHost<'a> {
         world: &'a World,
@@ -39,11 +132,26 @@ fn native_google_publication_retains_and_rechecks_its_typed_proof() {
         fn native_google_sign_in(
             &self,
             req: &Request<'_>,
+            _recovery: crate::harness::agy_signin::RecoveryKey,
         ) -> Result<crate::harness::agy_signin::VerifiedGoogleGrant, String> {
             self.called.set(true);
             let state = self.world.store.dir.parent().unwrap();
-            let proof =
-                crate::harness::agy_signin::publication_fixture(state, req.staging, "main", OWNER);
+            let another = self.world.root.path().join("other-google-state");
+            if self.mutation == 6 {
+                aterm_secrets::fsx::ensure_private_dir(&another).unwrap();
+                aterm_secrets::fsx::write_atomic(
+                    &another.join("google-identities.toml"),
+                    &std::fs::read(state.join("google-identities.toml")).unwrap(),
+                    0o600,
+                )
+                .unwrap();
+            }
+            let proof = crate::harness::agy_signin::publication_fixture(
+                if self.mutation == 6 { &another } else { state },
+                req.staging,
+                "main",
+                OWNER,
+            );
             match self.mutation {
                 1 => std::fs::write(proof.path().unwrap(), b"changed-after-verification").unwrap(),
                 2 => std::fs::write(state.join("google-identities.toml"), "").unwrap(),
@@ -59,7 +167,7 @@ fn native_google_publication_retains_and_rechecks_its_typed_proof() {
             Ok(proof)
         }
     }
-    for mutation in 0..=5 {
+    for mutation in 0..=6 {
         let world = World::new(Cli::Agy);
         let state = world.store.dir.parent().unwrap();
         aterm_secrets::fsx::write_atomic(

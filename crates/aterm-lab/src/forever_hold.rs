@@ -582,7 +582,8 @@ fn spoken_open() -> String {
 /// ([`super::super::REWORDED_LIST`]) after it: a hold whose word family and legs stayed the same,
 /// so only its own words moved. A read of the Open leg in any other words (the reader's family
 /// words a build without 4b says) fails; a surface never read while the Open leg stood goes
-/// unobserved.
+/// unobserved, and a state line whose row the page drew in no read then is a named skip (the page
+/// draws its first sessions' rows, as the hold's legs read them).
 pub fn reworded(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     let Some((t1, _)) = began(seen) else {
         return Verdict::Unobserved("no land act (its records)".into());
@@ -618,7 +619,15 @@ pub fn reworded(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
         format!("{OPEN_IN_REPORT}: {}", quoted(super::super::CHECK_LIST)),
         format!("{OPEN_IN_REPORT}: {}", quoted(super::super::REWORDED_LIST)),
     );
-    let lines: Vec<(i64, String)> = observed(&w.page, &w.page_reads, t1, until)
+    let rows = observed(&w.page, &w.page_reads, t1, until);
+    let open_reads = rows.iter().filter(|(t, _)| open_at(*t)).count();
+    let undrawn = (open_reads > 0
+        && rows
+            .iter()
+            .filter(|(t, _)| open_at(*t))
+            .all(|(_, p)| *p == "-"))
+    .then_some(open_reads);
+    let lines: Vec<(i64, String)> = rows
         .into_iter()
         .filter_map(|(t, p)| {
             Some((
@@ -634,7 +643,7 @@ pub fn reworded(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
     let mut bad = Vec::new();
     let mut unread = Vec::new();
     let mut said = Vec::new();
-    for (surface, reads) in [("state line", &lines), ("hover", &hovers)] {
+    for (surface, reads, undrawn) in [("state line", &lines, undrawn), ("hover", &hovers, None)] {
         let shown: Vec<&(i64, String)> = reads
             .iter()
             .filter(|(t, l)| l.contains(NOT_LANDED_YET) && open_at(*t))
@@ -679,9 +688,15 @@ pub fn reworded(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
                     "no second check was typed"
                 }
             )),
-            (None, None) => unread.push(format!(
-                "the {surface} never said the Open leg while `status` held it"
-            )),
+            (None, None) => match undrawn {
+                Some(n) => said.push(format!(
+                    "the {surface}: SKIPPED (its row was not drawn on the Harness page in {n} \
+                     read(s) while `status` held the Open leg)"
+                )),
+                None => unread.push(format!(
+                    "the {surface} never said the Open leg while `status` held it"
+                )),
+            },
         }
     }
     told(said.join("; "), &bad, &unread)

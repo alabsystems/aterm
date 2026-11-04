@@ -1272,6 +1272,8 @@ fn record_alone_fetches_wasm_bindgen() {
     assert!(!picked(&Options::default()).contains(&"openssl-signing"));
     let release = parse(&["--release".into()]).unwrap();
     assert!(picked(&release).contains(&"openssl-signing"));
+    assert!(!picked(&Options::default()).contains(&"cpython"));
+    assert!(picked(&release).contains(&"cpython"));
     assert!(!picked(&linux).contains(&"wasm-bindgen") && picked(&linux).contains(&"lima"));
 
     let record = Options {

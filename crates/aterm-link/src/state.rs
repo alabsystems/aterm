@@ -377,7 +377,11 @@ pub(crate) struct IncLease {
     pub used: u64,
     /// The lease's top, flushed into `inc` before `used` was presented.
     pub top: u64,
-    /// The boot that wrote it, the one boot whose page cache vouches for it.
+    /// The boot that wrote it, as the kernel names it on every volume (`None` only where the
+    /// kernel names none, or in a lease an older build wrote off the boot volume). It is trusted
+    /// only in that boot and on the boot volume, whose page cache vouches for it
+    /// ([`StateDir::trusted_boot`]); the attach's earlier-boot rules read it on any volume
+    /// ([`StateDir::last_ran_in_an_earlier_boot`]).
     pub boot: Option<[u8; 16]>,
     /// The `inc` the top was flushed into, `None` where the platform names no inode.
     pub file: Option<IncFile>,
@@ -662,6 +666,11 @@ pub struct StateDir {
     posts: std::sync::Mutex<Posts>,
     /// The asks journal ([`asks`]).
     asks: std::sync::Mutex<Asks>,
+    /// The `acked` log, held open for appends from the first ([`StateDir::append_self_acked`])
+    /// until a replace renames another file over its name ([`StateDir::set_self_acked`]) or an
+    /// append's write fails (refused, made and failed, or cut short): the next append opens the
+    /// file the name holds then.
+    acked: std::sync::Mutex<Option<std::fs::File>>,
     /// Whether a read of the journal takes an older build's files into it: an open that may
     /// write, not a peek.
     adopts_legacy: bool,
@@ -701,6 +710,10 @@ pub struct StateDir {
     #[cfg(test)]
     keep_earlier_boot_reservations: std::sync::atomic::AtomicBool,
     #[cfg(test)]
+    lease_names_no_boot_off_the_boot_volume: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    keep_acked_across_its_replace: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
     proof_rule: std::sync::Mutex<ProofRule>,
 }
 
@@ -724,6 +737,9 @@ pub(crate) struct FileOps {
     /// Appends to an append-only file, by write: the one that carries an attach's name into the
     /// post journal with its record counts once.
     pub appends: u64,
+    /// Opens of a file the dir holds open for its appends (the post journal, the asks journal,
+    /// `acked`): one a descriptor taken, none for an append to a descriptor held.
+    pub opens: u64,
 }
 
 #[cfg(test)]
@@ -739,6 +755,7 @@ impl std::ops::Sub for FileOps {
             barriers: self.barriers - before.barriers,
             unlinks: self.unlinks - before.unlinks,
             appends: self.appends - before.appends,
+            opens: self.opens - before.opens,
         }
     }
 }
@@ -1494,6 +1511,7 @@ impl StateDir {
             disk,
             posts: std::sync::Mutex::default(),
             asks: std::sync::Mutex::default(),
+            acked: std::sync::Mutex::default(),
             adopts_legacy,
             unflushed: std::sync::Mutex::default(),
             logpin_fence: std::sync::Mutex::default(),
@@ -1525,6 +1543,10 @@ impl StateDir {
             adopt_without_the_attach: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             keep_earlier_boot_reservations: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            lease_names_no_boot_off_the_boot_volume: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            keep_acked_across_its_replace: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             proof_rule: std::sync::Mutex::default(),
         }
@@ -1573,6 +1595,35 @@ impl StateDir {
     #[cfg(test)]
     pub(crate) fn keep_earlier_boot_reservations(&self, on: bool) {
         self.keep_earlier_boot_reservations
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The negative control of a lease that names its boot on every volume, and the stand-in for
+    /// an older build's attach: the lease names [`StateDir::trusted_boot`], so off the boot
+    /// volume no boot, as before item RZ2
+    /// ([`crate::sim::world::Mutant::LeaseNamesNoBootOffTheBootVolume`]).
+    #[cfg(test)]
+    pub(crate) fn lease_names_no_boot_off_the_boot_volume(&self, on: bool) {
+        self.lease_names_no_boot_off_the_boot_volume
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The dir stands off the boot volume from now on, in whichever boot the seam stands in
+    /// ([`IncSeam::off_volume`]).
+    #[cfg(test)]
+    pub(crate) fn stand_off_the_boot_volume(&self) {
+        let seam = self.inc_seam();
+        self.set_inc_seam(IncSeam {
+            off_volume: true,
+            ..seam
+        });
+    }
+
+    /// The negative control of a replace of `acked` that keeps the descriptor its appends held
+    /// ([`StateDir::set_self_acked`]): the next append writes into the file the rename unlinked.
+    #[cfg(test)]
+    pub(crate) fn keep_acked_across_its_replace(&self, on: bool) {
+        self.keep_acked_across_its_replace
             .store(on, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -1687,9 +1738,14 @@ impl StateDir {
         *self.inc_seam.lock().unwrap_or_else(|e| e.into_inner()) = seam;
     }
 
+    /// Refuse every write of `name` (none, at `None`) from now on, in place of the refusal set
+    /// before, which it returns.
     #[cfg(test)]
-    pub(crate) fn refuse_writes_of(&self, name: Option<&str>) {
-        *self.refused.lock().unwrap_or_else(|e| e.into_inner()) = name.map(str::to_string);
+    pub(crate) fn refuse_writes_of(&self, name: Option<&str>) -> Option<String> {
+        std::mem::replace(
+            &mut *self.refused.lock().unwrap_or_else(|e| e.into_inner()),
+            name.map(str::to_string),
+        )
     }
 
     #[cfg(test)]
@@ -1828,6 +1884,16 @@ impl StateDir {
         self.replace_logpin(&text(), &mut known, true)
     }
 
+    /// Whether this open holds the current pin's v=2 fence, so the next
+    /// [`StateDir::ensure_logpin_durable`] writes nothing (critic item D06: while it does not,
+    /// the bus mirror's first pass after an attach is held, for at most `FIRST_PASS_HOLD`, for
+    /// what the loop holds queued and for the records of the posts the attach's drains listed,
+    /// and the pass sends the inbox commit its deliveries owe ahead of the fence).
+    pub(crate) fn logpin_fence_held(&self) -> bool {
+        let mut known = self.logpin_fence.lock().unwrap_or_else(|e| e.into_inner());
+        self.logpin_fence_known(&mut known)
+    }
+
     fn logpin_fence_known(&self, known: &mut Option<std::fs::File>) -> bool {
         use std::os::unix::fs::{FileExt as _, MetadataExt as _};
         let matches = known.as_ref().is_some_and(|held| {
@@ -1872,6 +1938,7 @@ impl StateDir {
         durable: bool,
     ) -> io::Result<()> {
         let previous = known.take();
+        let _fence = durable.then(|| self.timed(crate::wait_tally::Row::LogpinFence));
         self.replace_bytes(LOGPIN, text.as_bytes(), durable, 0o600)?;
         if crate::mirror::Pin::by_this_build(text.as_bytes()) {
             *known = self.retained_logpin();
@@ -2346,15 +2413,15 @@ impl StateDir {
         written
     }
 
-    /// Open the journal at `path` to append to it, created where it is not there: an owned
-    /// regular single-link file of `len` bytes, the bytes this open holds it to.
+    /// Open `path` to append to it, created where it is not there and never through a link at
+    /// the name: an owned regular single-link file, so no append lands in a file another name
+    /// holds. Answers the file and its length.
     ///
     /// # Errors
-    /// Its directory or its open, or a file that is none of those (`InvalidData`, naming the
-    /// journal as `what`): it is rewritten from what the open holds before its next record.
-    fn open_journal(&self, path: &Path, what: &str, len: u64) -> io::Result<std::fs::File> {
+    /// The open, or a file that is none of those (`InvalidData`, naming it as `what`).
+    fn open_for_appends(&self, path: &Path, what: &str) -> io::Result<(std::fs::File, u64)> {
         use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
-        std::fs::create_dir_all(self.path(journal::DIR))?;
+        self.count(|ops| ops.opens += 1);
         let file = std::fs::OpenOptions::new()
             .append(true)
             .create(true)
@@ -2368,13 +2435,24 @@ impl StateDir {
                 format!("the {what} is not an owned regular single-link file"),
             ));
         }
-        if meta.len() != len {
+        Ok((file, meta.len()))
+    }
+
+    /// Open the journal at `path` to append to it, created where it is not there: an owned
+    /// regular single-link file of `len` bytes, the bytes this open holds it to.
+    ///
+    /// # Errors
+    /// Its directory or its open, or a file that is none of those (`InvalidData`, naming the
+    /// journal as `what`): it is rewritten from what the open holds before its next record.
+    fn open_journal(&self, path: &Path, what: &str, len: u64) -> io::Result<std::fs::File> {
+        std::fs::create_dir_all(self.path(journal::DIR))?;
+        let (file, holds) = self.open_for_appends(path, what)?;
+        if holds != len {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "the {what} holds {} bytes where this open wrote {len}; it is rewritten from \
-                     what this open holds before the next record",
-                    meta.len(),
+                    "the {what} holds {holds} bytes where this open wrote {len}; it is rewritten \
+                     from what this open holds before the next record",
                 ),
             ));
         }
@@ -3430,7 +3508,12 @@ impl StateDir {
         None
     }
 
-    /// This boot, when the page cache can vouch for this state dir.
+    /// This boot, when the page cache can vouch for this state dir: the kernel names it and the
+    /// dir is on the boot volume ([`on_boot_volume`]). Off it a removable or network disk can
+    /// vanish while the kernel runs and take an unflushed `inc-lease` with it, so no lease is
+    /// trusted there (e4e7f00368). That line is the reader's, never the writer's: a lease names
+    /// the boot it was written in on every volume ([`IncLease::boot`]), and one written off the
+    /// boot volume is never trusted on it either, as the `inc` it names is on another device.
     pub(crate) fn trusted_boot(&self) -> Option<[u8; 16]> {
         #[cfg(test)]
         {
@@ -3442,6 +3525,8 @@ impl StateDir {
         crate::durability::this_boot().filter(|_| on_boot_volume(&self.root))
     }
 
+    /// This boot, as the kernel names it (`astream_sys::boot_session`: macOS's
+    /// `kern.bootsessionuuid`, Linux's `boot_id`), on any volume.
     fn kernel_boot(&self) -> Option<[u8; 16]> {
         #[cfg(test)]
         if let Some(boot) = self.inc_seam().boot {
@@ -3453,10 +3538,23 @@ impl StateDir {
     /// Take the incarnation an attach runs under, before its will is registered: named in the post
     /// journal before the lease says it ([`StateDir::name_attach_in_posts`]). Where it writes `inc`
     /// in full (the boot's first incarnation, or a lease spent), that flush covers the OPEN this
-    /// open admitted, and a proof is made of it ([`StateDir::begin_run`], [`RUN_PROOF`]).
+    /// open admitted, and a proof is made of it ([`StateDir::begin_run`], [`RUN_PROOF`]). The
+    /// lease trusts and spans by [`StateDir::trusted_boot`] and names the kernel's boot on every
+    /// volume, so a dir off the boot volume can tell an earlier boot's attach from this boot's
+    /// ([`StateDir::last_ran_in_an_earlier_boot`]).
     pub fn take_incarnation(&self, bus: u64) -> io::Result<u64> {
         let (top, file) = (self.incarnation_top(), self.inc_file());
         let boot = self.trusted_boot();
+        let named = self.kernel_boot();
+        #[cfg(test)]
+        let named = if self
+            .lease_names_no_boot_off_the_boot_volume
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            boot
+        } else {
+            named
+        };
         let (lease, seq_inc, span) = (self.lease(), incarnation_of_seq(self.sequence()), INC_LEASE);
         #[cfg(test)]
         let (lease, span) = {
@@ -3479,7 +3577,7 @@ impl StateDir {
         let leased = |file| IncLease {
             used: plan.next,
             top: plan.top,
-            boot,
+            boot: named,
             file,
         };
         #[cfg(test)]
@@ -3570,12 +3668,24 @@ impl StateDir {
         }
     }
 
-    /// Replace the acked self-lane set with the newest `keep` of `set`.
+    /// Replace the acked self-lane set with the newest `keep` of `set`. The descriptor the appends
+    /// held goes first, under its lock, so no append lands in the file the rename unlinks: the
+    /// next one opens the file this puts at the name.
     pub fn set_self_acked(
         &self,
         set: &std::collections::BTreeSet<u64>,
         keep: usize,
     ) -> io::Result<()> {
+        let mut held = self.acked.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(test)]
+        let keeps = self
+            .keep_acked_across_its_replace
+            .load(std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(test))]
+        let keeps = false;
+        if !keeps {
+            *held = None;
+        }
         let over = set.len().saturating_sub(keep);
         self.replace_bytes(
             "acked",
@@ -3585,9 +3695,12 @@ impl StateDir {
         )
     }
 
-    /// Append `off` to the acked self-lane log, ended by its comma, in one `write` to a file opened `O_APPEND`.
+    /// Append `off` to the acked self-lane log, ended by its comma, in one `write` to the file
+    /// held open `O_APPEND` ([`StateDir::acked`]). It is opened at the first append, after a
+    /// replace ([`StateDir::set_self_acked`]) and after an append whose write failed (refused
+    /// before it was made, made and failed, or cut short), and refused there unless it is an
+    /// owned regular single-link file ([`StateDir::open_for_appends`]).
     pub(crate) fn append_self_acked(&self, off: u64) -> io::Result<()> {
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
         let _call = self.timed(crate::wait_tally::Row::AppendSelfAcked);
         self.count(|ops| ops.appends += 1);
         let path = self.path("acked");
@@ -3597,25 +3710,20 @@ impl StateDir {
             bytes: line.as_bytes(),
         };
         let _timed = self.timed(crate::wait_tally::Row::DirAppend);
+        let mut held = self.acked.lock().unwrap_or_else(|e| e.into_inner());
+        // Out of the lock's slot until the append is made, taken before the seams that refuse
+        // the write: an append that fails, a refused one too, leaves none held.
+        let kept = held.take();
+        #[cfg(test)]
+        self.refused_by_a_test("acked")?;
         self.disk.before(w)?;
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .mode(STATE_FILE_MODE)
-            .custom_flags(crate::enable::LOCK_OPEN_FLAGS)
-            .open(&path)?;
-        let metadata = file.metadata()?;
-        if !metadata.is_file()
-            || metadata.uid() != aterm_uds::peer::our_uid()
-            || metadata.nlink() != 1
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "the acked log is not an owned regular single-link file",
-            ));
-        }
+        let mut file = match kept {
+            Some(file) => file,
+            None => self.open_for_appends(&path, "acked log")?.0,
+        };
         file.write_all(line.as_bytes())?;
         self.disk.after(w)?;
+        *held = Some(file);
         Ok(())
     }
 
@@ -3664,8 +3772,9 @@ impl StateDir {
     /// an earlier one ([`StateDir::sweep_sessions_of_an_earlier_boot`]): the next boot's, but
     /// a reservation whose sequence a record in flight still holds there waits for a later
     /// boot's sweep, and a start whose first roster does not read, or that comes after an
-    /// attach of its own boot, leaves it to a later boot's too. A dir off the boot volume never
-    /// finds an earlier boot, and there it stays.
+    /// attach of its own boot, leaves it to a later boot's too. So does a start over a lease an
+    /// older build wrote off the boot volume, which names no boot: the sweep waits for a boot
+    /// after one in which this build attached and its lease named that boot.
     ///
     /// # Errors
     /// A directory or an entry that cannot be read, the journal damaged, or an older build's
@@ -3883,9 +3992,12 @@ impl StateDir {
     /// WINS OVER THE RECORD: a build older than the record attaches without writing it, so where
     /// a lease reads it must name an earlier boot too. One that names this boot is that attach's
     /// (its sessions may still run, as [`StateDir::retire_in_flight_of_an_earlier_boot`] holds),
-    /// and one that names no boot, as every lease of a dir off the boot volume does, cannot rule
-    /// it out. Read before the start's [`StateDir::begin_run`] names this boot and before its
-    /// own attach writes the lease ([`StateDir::sweep_sessions_of_an_earlier_boot`]).
+    /// and one that names no boot cannot rule it out: an older build's off the boot volume,
+    /// where it named only a boot whose page cache vouched for the dir. This build's lease names
+    /// the kernel's boot on every volume ([`IncLease::boot`]), so a dir on an external disk, or
+    /// off Apple a `/home` on its own filesystem, finds an earlier boot as the boot volume does.
+    /// Read before the start's [`StateDir::begin_run`] names this boot and before its own attach
+    /// writes the lease ([`StateDir::sweep_sessions_of_an_earlier_boot`]).
     pub(crate) fn last_ran_in_an_earlier_boot(&self) -> bool {
         let Some(now) = self.kernel_boot() else {
             return false;
@@ -3927,9 +4039,13 @@ impl StateDir {
     /// without it before its next record ([`StateDir::append_post_frame`]). The bridge sweeps
     /// once, at its start's first roster where that reads, and where
     /// [`StateDir::last_ran_in_an_earlier_boot`] said so before the run record named this boot;
-    /// no later roster sweeps. So a dir off the boot volume, whose every lease names no boot,
-    /// is never swept: there an earlier boot's sessions' files and reservations stay, and the
-    /// subjects those reservations name stay charged to the node.
+    /// no later roster sweeps. A dir off the boot volume is swept as one on it is, its lease
+    /// naming its boot there too; only after an older build's attach there, whose lease names
+    /// none, does the sweep wait for a later boot. NOT COVERED: off the boot volume the
+    /// never-flushed lease and a barrier-ordered run record can both be lost with the disk
+    /// within one boot, so a start then finds an earlier boot that this boot's attach already
+    /// followed and sweeps a session this boot ended; `live` still keeps every session that
+    /// runs.
     ///
     /// # Errors
     /// A directory that does not list, a file that does not read, an unlink, the post journal
@@ -4060,8 +4176,12 @@ impl StateDir {
         retired
     }
 
+    /// Whether an incarnation lease names this boot: an attach of this boot took an incarnation,
+    /// on whichever volume ([`IncLease::boot`]). Only an attach of this boot writes one that
+    /// names it, so it needs no trust in the page cache. An older build's lease off the boot
+    /// volume names no boot, and is not one.
     fn attached_in_this_boot(&self) -> bool {
-        self.trusted_boot()
+        self.kernel_boot()
             .is_some_and(|now| self.lease().and_then(|lease| lease.boot) == Some(now))
     }
 
@@ -6586,12 +6706,17 @@ mod tests {
     /// that does not read whole, and a reservation whose sequence a record in flight still
     /// holds (after a clean stop; an unclean one retired that record first), and it touches no
     /// record in flight. A start in the same boot finds no earlier boot and keeps all three. A
-    /// dir with no run record is judged by its lease's boot. AN ATTACH OF THIS BOOT WINS OVER THE
-    /// RECORD: an older build attaches without writing `run`, so a lease that names this boot
-    /// says its sessions may still run, and a dir off the boot volume, whose leases name no
-    /// boot, cannot rule one out; neither is an earlier boot, and the older build's session keeps
-    /// its file. CONTROL (`keep_earlier_boot_reservations`): a sweep that retires no reservation
-    /// leaves the ended session owed, its files gone.
+    /// dir with no run record is judged by its lease's boot. OFF THE BOOT VOLUME (item RZ2) the
+    /// same holds, the lease naming the kernel's boot there too, with a run record and without.
+    /// AN ATTACH OF THIS BOOT WINS OVER THE RECORD: an older build attaches without writing
+    /// `run`, so a lease that names this boot says its sessions may still run, and one an older
+    /// build wrote off the boot volume, which names no boot, cannot rule one out; neither is an
+    /// earlier boot, and the older build's session keeps its file. CONTROL (RZ2,
+    /// `lease_names_no_boot_off_the_boot_volume`): boot 1's lease written as before RZ2 names no
+    /// boot off the boot volume, and the next boot finds no earlier boot there and sweeps
+    /// nothing, while on the boot volume the same write names its boot and is swept. CONTROL
+    /// (`keep_earlier_boot_reservations`): a sweep that retires no reservation leaves the ended
+    /// session owed, its files gone.
     #[test]
     fn an_earlier_boots_sessions_files_are_swept_and_this_boots_kept() {
         let session_files = |sid: &str| {
@@ -6616,13 +6741,15 @@ mod tests {
         // Whether the record in flight still held the third reservation, at each sweep that
         // retires.
         let mut met: BTreeSet<bool> = BTreeSet::new();
-        // (case, a clean stop, then, off the boot volume, the next start's boot, an earlier
-        // boot, the sweep keeps every reservation: the control)
-        for (case, clean, then, off_volume, next_boot, want, keep) in [
+        // (case, a clean stop, then, off the boot volume, boot 1's lease an older build's (it
+        // names only a boot whose page cache vouches for the dir: the RZ2 control), the next
+        // start's boot, an earlier boot, the sweep keeps every reservation: the C14 control)
+        for (case, clean, then, off_volume, legacy, next_boot, want, keep) in [
             (
                 "a clean stop, then a reboot",
                 true,
                 Then::Nothing,
+                false,
                 false,
                 2,
                 true,
@@ -6633,6 +6760,7 @@ mod tests {
                 false,
                 Then::Nothing,
                 false,
+                false,
                 2,
                 true,
                 false,
@@ -6641,6 +6769,7 @@ mod tests {
                 "no run record, then a reboot",
                 false,
                 Then::NoRecord,
+                false,
                 false,
                 2,
                 true,
@@ -6651,6 +6780,7 @@ mod tests {
                 true,
                 Then::Nothing,
                 false,
+                false,
                 1,
                 false,
                 false,
@@ -6659,6 +6789,7 @@ mod tests {
                 "an open run, then a start in the same boot",
                 false,
                 Then::Nothing,
+                false,
                 false,
                 1,
                 false,
@@ -6669,6 +6800,7 @@ mod tests {
                 true,
                 Then::OlderAttach,
                 false,
+                false,
                 2,
                 false,
                 false,
@@ -6678,14 +6810,68 @@ mod tests {
                 true,
                 Then::Nothing,
                 true,
+                false,
+                2,
+                true,
+                false,
+            ),
+            (
+                "no run record off the boot volume, then a reboot",
+                false,
+                Then::NoRecord,
+                true,
+                false,
+                2,
+                true,
+                false,
+            ),
+            (
+                "a clean stop off the boot volume, then a start in the same boot",
+                true,
+                Then::Nothing,
+                true,
+                false,
+                1,
+                false,
+                false,
+            ),
+            (
+                "a clean stop off the boot volume, then a reboot and an older build's attach, \
+                 whose lease names no boot, before the start",
+                true,
+                Then::OlderAttach,
+                true,
+                false,
                 2,
                 false,
+                false,
+            ),
+            (
+                "CONTROL (RZ2): a clean stop off the boot volume under an older build's lease, \
+                 which names no boot, then a reboot",
+                true,
+                Then::Nothing,
+                true,
+                true,
+                2,
+                false,
+                false,
+            ),
+            (
+                "the same lease on the boot volume, where it names its boot",
+                true,
+                Then::Nothing,
+                false,
+                true,
+                2,
+                true,
                 false,
             ),
             (
                 "CONTROL: an unclean stop, then a reboot, and a sweep that keeps every reservation",
                 false,
                 Then::Nothing,
+                false,
                 false,
                 2,
                 true,
@@ -6703,8 +6889,14 @@ mod tests {
             let root = dir.path();
             let st = StateDir::open(root).expect("open");
             st.set_inc_seam(seam(1));
+            st.lease_names_no_boot_off_the_boot_volume(legacy);
             st.begin_run().expect("boot 1's run");
             st.take_incarnation(0).expect("boot 1's lease");
+            assert_eq!(
+                st.lease().and_then(|lease| lease.boot),
+                (!(legacy && off_volume)).then(|| boot_id(1)),
+                "{case}: the boot boot 1's lease names"
+            );
             for sid in ["s-gone", "s-live"] {
                 st.set_key_seq(sid, "k", 9).expect("a key");
                 st.set_receipt_seq(sid, 3, 10).expect("a receipt's");
@@ -6739,6 +6931,7 @@ mod tests {
                 Then::OlderAttach => {
                     let older = StateDir::open(root).expect("an older build's open");
                     older.set_inc_seam(seam(next_boot));
+                    older.lease_names_no_boot_off_the_boot_volume(true);
                     older
                         .take_incarnation(0)
                         .expect("its attach, which writes no run record");
@@ -7255,6 +7448,123 @@ mod tests {
         assert!(
             result.is_err() && other_bytes == SENTINEL && state_bytes == SENTINEL,
             "ACKED_APPEND_REQUIRES_OWNED_SINGLE_LINK_FILE: result={result:?}, other={other_bytes:?}, state={state_bytes:?}"
+        );
+    }
+
+    /// **AN ACK APPENDED AFTER A REPLACE LANDS IN THE FILE `acked` NAMES** (D05): the log is held
+    /// open from its first append, so appends after it open nothing, and a replace
+    /// (`set_self_acked`'s rename) lets the descriptor go, so the next append opens the file the
+    /// replace put at the name, refused there as at the first open: a hard link planted after a
+    /// replace takes no ack. NEGATIVE CONTROL (`keep_acked_across_its_replace`): a descriptor
+    /// kept across the replace writes the ack into the file the rename unlinked, and a read of
+    /// `acked` misses it.
+    #[test]
+    fn an_ack_appended_after_a_replace_lands_in_the_file_acked_names() {
+        let set = |offs: &[u64]| {
+            offs.iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let scratch = aterm_tempfile::TempDir::new().expect("exclusive state scratch");
+        let root = std::fs::canonicalize(scratch.path()).expect("canonical state scratch");
+        for keeps in [false, true] {
+            let st = StateDir::open(root.join(format!("keeps-{keeps}"))).expect("state");
+            let before = st.ops();
+            for off in [1, 2, 3] {
+                st.append_self_acked(off).expect("append");
+            }
+            assert_eq!(
+                (st.ops() - before).opens,
+                1,
+                "keeps={keeps}: three appends, one open"
+            );
+            st.keep_acked_across_its_replace(keeps);
+            st.set_self_acked(&set(&[2, 3]), 8).expect("replace");
+            let before = st.ops();
+            st.append_self_acked(4)
+                .expect("the append after the replace");
+            let (opens, read) = ((st.ops() - before).opens, st.self_acked_log().offsets);
+            if keeps {
+                assert_eq!(
+                    (opens, read),
+                    (0, set(&[2, 3])),
+                    "NEGATIVE CONTROL: the kept descriptor took 4 into the unlinked file"
+                );
+                continue;
+            }
+            assert_eq!(
+                (opens, read),
+                (1, set(&[2, 3, 4])),
+                "4 is in the file at the name"
+            );
+            assert_eq!(
+                std::fs::read_to_string(st.path("acked")).expect("acked"),
+                "2,3,4,"
+            );
+
+            st.set_self_acked(&set(&[4]), 8).expect("a second replace");
+            let other = root.join("other-owned-file");
+            const SENTINEL: &[u8] = b"the other file owns these bytes\n";
+            std::fs::write(&other, SENTINEL).expect("owned sentinel");
+            std::fs::remove_file(st.path("acked")).expect("unlink the replaced log");
+            std::fs::hard_link(&other, st.path("acked")).expect("owned hardlink");
+            let result = st.append_self_acked(5);
+            assert!(
+                result.is_err() && std::fs::read(&other).expect("other") == SENTINEL,
+                "the open after a replace refuses a hard link: {result:?}"
+            );
+        }
+    }
+
+    /// **A FAILED APPEND LETS THE HELD `acked` DESCRIPTOR GO** (D05): after an append whose
+    /// write failed, a write made and failed (a read-only descriptor in the slot: `EBADF`) or
+    /// one refused before it was made (the test's refusal, as the sim's write errors are), no
+    /// descriptor is held, so the next append opens and checks the file the name holds then: a
+    /// file put at the name after the failure takes the next ack. A descriptor kept across the
+    /// failure fails again (the read-only one) or writes the ack into the file the name no
+    /// longer holds (the refused one), and opens nothing.
+    #[test]
+    fn a_failed_append_lets_the_held_acked_descriptor_go() {
+        let scratch = aterm_tempfile::TempDir::new().expect("exclusive state scratch");
+        let root = std::fs::canonicalize(scratch.path()).expect("canonical state scratch");
+        let mut seen = Vec::new();
+        for (fails, dir) in [
+            ("its write fails", "fails"),
+            ("its write is refused", "refused"),
+        ] {
+            let st = StateDir::open(root.join(dir)).expect("state");
+            st.append_self_acked(1)
+                .expect("the first append, which opens the log");
+            let failed = if dir == "fails" {
+                let read_only = std::fs::File::open(st.path("acked")).expect("acked, read-only");
+                *st.acked.lock().unwrap_or_else(|e| e.into_inner()) = Some(read_only);
+                st.append_self_acked(2)
+            } else {
+                st.refuse_writes_of(Some("acked"));
+                let failed = st.append_self_acked(2);
+                st.refuse_writes_of(None);
+                failed
+            };
+            let swap = root.join(format!("{dir}.swap"));
+            std::fs::write(&swap, "7,").expect("a file for the name");
+            std::fs::rename(&swap, st.path("acked")).expect("put it at the name");
+            let before = st.ops();
+            let next = st.append_self_acked(3);
+            seen.push((
+                fails,
+                failed.is_err(),
+                next.is_ok(),
+                (st.ops() - before).opens,
+                std::fs::read_to_string(st.path("acked")).expect("acked"),
+            ));
+        }
+        assert_eq!(
+            seen,
+            [
+                ("its write fails", true, true, 1, "7,3,".to_string()),
+                ("its write is refused", true, true, 1, "7,3,".to_string()),
+            ],
+            "(the failure, the append failed, the next landed, the next's opens, acked)"
         );
     }
 
@@ -9891,13 +10201,22 @@ mod tests {
             );
             std::fs::remove_file(dir.path().join("run")).expect("no record");
             st.set_inc_seam(seam(1));
+            st.lease_names_no_boot_off_the_boot_volume(true);
             st.take_incarnation(0)
                 .expect("an older build's attach, boot 1");
             st.set_inc_seam(seam(2));
             assert_eq!(
                 st.torn_files_possible().expect("legacy missing run"),
                 !off_volume,
-                "the lease's boot, where it names one"
+                "the lease's boot, where an older build's names one"
+            );
+            st.set_inc_seam(seam(1));
+            st.lease_names_no_boot_off_the_boot_volume(false);
+            st.take_incarnation(0).expect("this build's attach, boot 1");
+            st.set_inc_seam(seam(2));
+            assert!(
+                st.torn_files_possible().expect("missing run"),
+                "this build's lease names its boot on every volume (RZ2)"
             );
         }
     }
@@ -10689,12 +11008,46 @@ mod tests {
         }
     }
 
+    /// **AN ATTACH OF THIS BOOT ON RECORD STOPS THE RETIREMENT** (finding F2): `run` still names
+    /// boot 1's unclean stop, as a start of boot 2 whose `run` the disk refused leaves it, and an
+    /// attach of boot 2 took an incarnation: its entries may be live sessions', and nothing is
+    /// retired. On the boot volume and off it (item RZ2), the lease naming the kernel's boot on
+    /// either. NEGATIVE CONTROLS: a lease of boot 1 retires the entry, and so does boot 2's
+    /// attach off the boot volume by an older build, whose lease names no boot there
+    /// (`lease_names_no_boot_off_the_boot_volume`).
     #[test]
     fn an_attach_of_this_boot_on_record_stops_the_retirement() {
-        for (case, off_volume, attached_in_boot_2) in [
-            ("a lease of boot 2", false, true),
-            ("a lease of boot 1", false, false),
-            ("off the boot volume", true, true),
+        for (case, off_volume, attached_in_boot_2, legacy, kept) in [
+            ("a lease of boot 2", false, true, false, true),
+            ("a lease of boot 1", false, false, false, false),
+            (
+                "off the boot volume, a lease of boot 2",
+                true,
+                true,
+                false,
+                true,
+            ),
+            (
+                "off the boot volume, a lease of boot 1",
+                true,
+                false,
+                false,
+                false,
+            ),
+            (
+                "off the boot volume, an older build's lease of boot 2, which names no boot",
+                true,
+                true,
+                true,
+                false,
+            ),
+            (
+                "on it, an older build's lease of boot 2, which names it",
+                false,
+                true,
+                true,
+                true,
+            ),
         ] {
             let dir = aterm_tempfile::Builder::new()
                 .prefix("retire-lease")
@@ -10727,12 +11080,13 @@ mod tests {
                 "{case}: `run` still names boot 1"
             );
             if attached_in_boot_2 {
+                st.lease_names_no_boot_off_the_boot_volume(legacy);
                 st.take_incarnation(0).expect("boot 2's attach");
             }
             let retired = st
                 .retire_in_flight_of_an_earlier_boot()
                 .expect("the retirement");
-            if attached_in_boot_2 && !off_volume {
+            if kept {
                 assert!(retired.is_empty(), "{case}: nothing is retired");
                 assert_eq!(
                     st.in_flight().expect("reads").len(),

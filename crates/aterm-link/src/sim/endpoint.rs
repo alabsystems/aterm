@@ -215,6 +215,12 @@ pub(crate) struct EpState {
     pub(crate) byes_acked: u64,
     /// Every alias key a take named.
     pub(crate) take_keys: std::collections::BTreeSet<String>,
+    /// The world whose device every take is held to ([`Endpoint::fence_takes`]).
+    fenced_by: Option<Arc<super::Core>>,
+    /// THE PIN FENCE'S EVIDENCE (critic item D06): the takes answered while the media held no
+    /// pin of this build ([`super::device::Device::pin_fenced`]), each a take that ran ahead of
+    /// its open's fence ([`super::world::World::check_always`]).
+    pub(crate) takes_unfenced: u64,
     /// Every `link gap from=<a> to=<b> [records=<n>] [sid=<sid> [topic=<t>]]` a bridge told:
     /// what retention gave up of this node's unread mail (sim item B05), or of one session's
     /// lane or topic under the bridge's own read of it (B12).
@@ -582,6 +588,12 @@ impl Endpoint {
     /// The world whose broker a fetch answer is held to ([`EpState::world`]).
     pub(crate) fn watch(&self, world: Arc<super::Core>) {
         lock(&self.state).world = Some(world);
+    }
+
+    /// The world whose device holds the pin's fence each take is judged by
+    /// ([`EpState::takes_unfenced`]).
+    pub(crate) fn fence_takes(&self, world: Arc<super::Core>) {
+        lock(&self.state).fenced_by = Some(world);
     }
 
     /// Session `local` marks every row seen.
@@ -980,6 +992,13 @@ impl EpState {
             .find_map(|t| t.strip_prefix("key="))
             .unwrap_or_default();
         self.take_keys.insert(key.to_string());
+        if self
+            .fenced_by
+            .as_ref()
+            .is_some_and(|world| !world.device.pin_fenced())
+        {
+            self.takes_unfenced += 1;
+        }
         let at = self.stamp;
         let mut logs: Vec<(&String, &mut aterm_slog::Log)> = self
             .sessions

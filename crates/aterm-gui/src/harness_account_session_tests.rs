@@ -285,7 +285,8 @@ fn a_rotation_does_not_commit_from_a_replaced_source_process() {
     let kept = Arc::clone(&idle.kept);
     a.at_seat_read(2, move |a| replace_session(a, &kept, sid));
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("wait:account-changed")
     );
     assert_eq!(a.asked("restart:"), 0);

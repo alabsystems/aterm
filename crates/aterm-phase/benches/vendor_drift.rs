@@ -101,83 +101,13 @@ pub(crate) fn canary_binary(program: &str, env: &str) -> Option<std::path::PathB
 
 fn store_binary(program: &str, env: &str) -> Option<(String, Vec<u8>)> {
     let path = canary_binary(program, env)?.to_string_lossy().into_owned();
-    let bytes = std::fs::read(&path).ok()?;
+    let mut bytes = std::fs::read(&path).ok()?;
     if !looks_like_a_build(&bytes) {
         eprintln!("{path} is a stub rather than a vendor build");
         return None;
     }
+    blank_code(&mut bytes);
     Some((path, bytes))
-}
-
-/// Which of `needles` occur in `hay`, scanned in a single pass.
-pub(crate) fn found_in(hay: &[u8], needles: &[&[u8]]) -> Vec<bool> {
-    const HEAD: usize = 3;
-    let mut found: Vec<bool> = needles.iter().map(|n| n.is_empty()).collect();
-    let mut heads = vec![0u16; 1 << (8 * HEAD)];
-    let mut groups: Vec<Vec<usize>> = Vec::new();
-    let mut left = 0usize;
-    for (i, needle) in needles.iter().enumerate() {
-        if needle.is_empty() {
-            continue;
-        }
-        if needle.len() < HEAD {
-            found[i] = hay.windows(needle.len()).any(|w| w == *needle);
-            continue;
-        }
-        let h = needle[..HEAD]
-            .iter()
-            .fold(0, |h, &b| (h << 8) | usize::from(b));
-        if heads[h] == 0 {
-            groups.push(Vec::new());
-            heads[h] = u16::try_from(groups.len()).expect("fewer than 65,536 heads");
-        }
-        groups[usize::from(heads[h]) - 1].push(i);
-        left += 1;
-    }
-    let mut window = 0usize;
-    for (end, &b) in hay.iter().enumerate() {
-        if left == 0 {
-            break;
-        }
-        window = ((window << 8) | usize::from(b)) & ((1 << (8 * HEAD)) - 1);
-        let group = heads[window];
-        if group == 0 || end + 1 < HEAD {
-            continue;
-        }
-        let at = &hay[end + 1 - HEAD..];
-        for &i in &groups[usize::from(group) - 1] {
-            if !found[i] && at.starts_with(needles[i]) {
-                found[i] = true;
-                left -= 1;
-            }
-        }
-    }
-    found
-}
-
-/// The literal anchors of `table` missing from `bytes`.
-pub(crate) fn missing(bytes: &[u8], table: &[Anchor]) -> Vec<&'static str> {
-    let literal: Vec<&Anchor> = table
-        .iter()
-        .filter(|a| a.kind == AnchorKind::Literal)
-        .collect();
-    let parts: Vec<&[u8]> = literal
-        .iter()
-        .flat_map(|a| a.text.split(" · "))
-        .map(str::as_bytes)
-        .collect();
-    let mut found = found_in(bytes, &parts).into_iter();
-    literal
-        .into_iter()
-        .filter(|a| {
-            a.text
-                .split(" · ")
-                .filter(|_| !found.next().expect("an answer per part"))
-                .count()
-                > 0
-        })
-        .map(|a| a.id)
-        .collect()
 }
 
 fn literal_anchors_are_in_the_store(program: &str, env: &str, table: &[Anchor]) -> Outcome {

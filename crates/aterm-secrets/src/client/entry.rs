@@ -637,7 +637,7 @@ fn read_entry_with_version(
     {
         r.canonicalize();
         if let Some(log) = &trusted_log {
-            super::roster::overlay_log_membership(log, &mut r);
+            super::roster::overlay_log_membership(log, None, &mut r);
             if super::log_entries::recipient_denied_by_roster_or_log(
                 Some(&r),
                 log,

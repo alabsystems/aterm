@@ -218,7 +218,8 @@ pub struct Options {
     pub linux: bool,
     /// `--record`: add the rows that re-record goldens.
     pub record: bool,
-    /// `--release`: add native source-signing tools.
+    /// `--release`: add a release host's tools (source signing, the publication engine's
+    /// Python).
     pub release: bool,
     /// `--check`: read only.
     pub check: bool,
@@ -245,7 +246,8 @@ off first in a home it never ran in). It reads the network.
   --linux     and the Linux lane's VM: lima, Ubuntu's pinned image for its own VM, and
               stable's aarch64-unknown-linux-musl std, which its guest agent is built against
   --record    and wasm-bindgen, to re-record the wasm-glue goldens
-  --release   and native source-signing tools for a release host
+  --release   and a release host's tools: OpenSSL 3 for source signing, and the
+              standalone CPython the publication engine runs on
   --check     say what is missing; fetch and change nothing
   ROW...      just these: {}
 

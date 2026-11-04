@@ -372,34 +372,78 @@ mod tests {
         }
     }
 
+    /// NEGATIVE CONTROL: wrong-length frames, corrupted `"OBSB"`/`"OBSV"` magic bytes, zero or
+    /// over-cap budget limits, and out-of-range verdict tags (`3`, `0xFF`) must all decode to
+    /// `None`.
     #[test]
     fn watcher_budget_and_row_verdict_wire_roundtrip() {
+        for (mp, sz, st) in [(1, 1, 1), (1024, 128 * 1024, 1 << 22)] {
+            let bw = encode_watcher_budget_wire(mp, sz, st);
+            assert_eq!(decode_watcher_budget_wire(&bw), Some((mp, sz, st)));
+        }
         let bw = encode_watcher_budget_wire(1024, 128 * 1024, 1 << 22);
-        assert_eq!(
-            decode_watcher_budget_wire(&bw),
-            Some((1024, 128 * 1024, 1 << 22))
-        );
+        assert!(decode_watcher_budget_wire(&[]).is_none());
+        assert!(decode_watcher_budget_wire(&bw[..19]).is_none());
         let mut bw_trailing = bw.to_vec();
         bw_trailing.push(0);
         assert!(
             decode_watcher_budget_wire(&bw_trailing).is_none(),
             "fixed 20-byte budget frames reject trailing bytes"
         );
-        let over_bw = encode_watcher_budget_wire(2048, 128 * 1024, 1 << 22);
-        assert!(decode_watcher_budget_wire(&over_bw).is_none());
+        for idx in 0..4 {
+            let mut bad_magic = bw;
+            bad_magic[idx] ^= 0xFF;
+            assert!(decode_watcher_budget_wire(&bad_magic).is_none());
+        }
+        for (mp, sz, st) in [
+            (0, 128 * 1024, 1 << 22),
+            (1024, 0, 1 << 22),
+            (1024, 128 * 1024, 0),
+            (1025, 128 * 1024, 1 << 22),
+            (1024, 128 * 1024 + 1, 1 << 22),
+            (1024, 128 * 1024, (1 << 22) + 1),
+        ] {
+            let bad = encode_watcher_budget_wire(mp, sz, st);
+            assert!(
+                decode_watcher_budget_wire(&bad).is_none(),
+                "out-of-range budget ({mp}, {sz}, {st}) must be rejected"
+            );
+        }
 
         for verdict in [
             RowVerdict::NoMatch,
             RowVerdict::Match,
             RowVerdict::Undecided,
         ] {
+            for (row_idx, plen, seq) in [(0, 0, 0), (12, 16, 99), (u16::MAX, u8::MAX, u64::MAX)] {
+                let vw = encode_row_verdict_wire(verdict, row_idx, plen, seq);
+                assert_eq!(
+                    decode_row_verdict_wire(&vw),
+                    Some((verdict, row_idx, plen, seq))
+                );
+            }
             let vw = encode_row_verdict_wire(verdict, 12, 16, 99);
-            assert_eq!(decode_row_verdict_wire(&vw), Some((verdict, 12, 16, 99)));
+            assert!(decode_row_verdict_wire(&[]).is_none());
+            assert!(decode_row_verdict_wire(&vw[..15]).is_none());
             let mut vw_trailing = vw.to_vec();
             vw_trailing.push(0);
             assert!(
                 decode_row_verdict_wire(&vw_trailing).is_none(),
                 "fixed 16-byte verdict frames reject trailing bytes"
+            );
+            for idx in 0..4 {
+                let mut bad_magic = vw;
+                bad_magic[idx] ^= 0xFF;
+                assert!(decode_row_verdict_wire(&bad_magic).is_none());
+            }
+        }
+        let base_vw = encode_row_verdict_wire(RowVerdict::Match, 12, 16, 99);
+        for bad_tag in [3u8, 0xFF] {
+            let mut bad = base_vw;
+            bad[4] = bad_tag;
+            assert!(
+                decode_row_verdict_wire(&bad).is_none(),
+                "verdict tag {bad_tag} must be rejected"
             );
         }
     }

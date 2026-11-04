@@ -67,13 +67,6 @@ pub const fn clamp_add(x: f32, headroom: f32) -> f32 {
     x.min(headroom.max(0.0)).max(0.0)
 }
 
-/// One channel of the EDR glow pass's fragment output: decode the premultiplied sRGB-space aurora colour to linear, boost it, and clamp to the headroom.
-#[must_use]
-#[cfg(test)]
-pub fn hdr_additive_encode(chan: f32, boost: f32, headroom: f32) -> f32 {
-    clamp_add(srgb_channel_to_linear(chan) * boost, headroom)
-}
-
 /// Ceiling of the SDR glow-boost budget (raw swapchain code-value units, `0..=1`): the most the additive crown on an SDR (non-f16) present adds per channel, at full strength on black. 0.35 ≈ +89/255 peak: reads as light, far below washout.
 pub const SDR_GLOW_BUDGET_BASE: f32 = 0.35;
 
@@ -140,7 +133,8 @@ mod tests {
             "SDR white anchors EXACTLY at 1.0"
         );
         assert!(
-            hdr_grid_encode(255) + hdr_additive_encode(1.0, HDR_GLOW_BOOST, 1.0) > 1.0,
+            hdr_grid_encode(255) + clamp_add(srgb_channel_to_linear(1.0) * HDR_GLOW_BOOST, 1.0)
+                > 1.0,
             "an EDR emission over white must exceed 1.0 (else the feature is vacuous)"
         );
     }
@@ -213,7 +207,7 @@ mod tests {
                         (0.0..=EDR_MAX_CAP - 1.0).contains(&h),
                         "headroom for edr={edr} escaped: {h}"
                     );
-                    let v = hdr_additive_encode(chan, boost, h);
+                    let v = clamp_add(srgb_channel_to_linear(chan) * boost, h);
                     assert!(
                         v >= 0.0 && v <= h,
                         "encode(chan={chan}, boost={boost}, edr={edr}) = {v} > headroom {h}"
@@ -268,15 +262,21 @@ mod tests {
     /// headroom: the bound is load-bearing, not slack.
     #[test]
     fn additive_clamp_is_load_bearing() {
-        let lit = hdr_additive_encode(1.0, HDR_GLOW_BOOST, additive_headroom(2.0));
+        let lit = clamp_add(
+            srgb_channel_to_linear(1.0) * HDR_GLOW_BOOST,
+            additive_headroom(2.0),
+        );
         assert!(
             lit > 0.9,
             "full-coverage glow must emit near its boost ({lit})"
         );
-        let clamped = hdr_additive_encode(1.0, 50.0, additive_headroom(1.6));
         let h = additive_headroom(1.6);
+        let clamped = clamp_add(srgb_channel_to_linear(1.0) * 50.0, h);
         assert_eq!(clamped, h, "over-boost must clamp AT the headroom");
-        assert_eq!(hdr_additive_encode(1.0, 50.0, additive_headroom(1.0)), 0.0);
+        assert_eq!(
+            clamp_add(srgb_channel_to_linear(1.0) * 50.0, additive_headroom(1.0)),
+            0.0
+        );
     }
 
     /// `sanitize_edr_max` on the values that decide its `is_finite`/`>=`/`min`: unset or

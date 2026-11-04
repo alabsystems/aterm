@@ -11,7 +11,12 @@ use super::serve::PROPERTIES;
 use super::wire::{self, ObjectId, ROOT_PATH};
 
 /// How long a call waits for its answer.
+#[cfg(not(test))]
 pub(crate) const CALL: Duration = Duration::from_secs(25);
+/// A unit test's peer answers every call it is sent (an unanswered one is a hang), so the
+/// bound outlasts the tests' one-minute hang detector, which then names what never came.
+#[cfg(test)]
+pub(crate) const CALL: Duration = Duration::from_secs(120);
 
 const A11Y_BUS: &str = "org.a11y.Bus";
 const A11Y_BUS_PATH: &str = "/org/a11y/bus";

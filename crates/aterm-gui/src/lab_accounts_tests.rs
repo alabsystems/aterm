@@ -182,6 +182,150 @@ fn auth_without_a_recorded_human_task_only_points_to_recovery_inspection() {
 }
 
 #[test]
+fn a_replaced_logins_auth_is_history_without_current_recovery_guidance() {
+    for auth in [Auth::Ok, Auth::SignedOut] {
+        for retired in [false, true] {
+            let mut records = records();
+            records.state = accounts::State::from_json(
+                &aterm_json::json!({
+                    "schema": accounts::SCHEMA,
+                    "accounts": {
+                        "one": {
+                            "auth": auth.as_str(),
+                            "auth_at": 100,
+                            "auth_retired": retired
+                        }
+                    }
+                })
+                .to_string(),
+                200,
+            )
+            .unwrap();
+            let before = records.clone();
+            let view = project(&records, 200_000);
+            assert_eq!(
+                fact(&view, "Last observed sign-in"),
+                if auth == Auth::Ok {
+                    "Signed in on record; not checked now"
+                } else {
+                    "Signed out on record"
+                }
+            );
+            assert_eq!(fact(&view, "Sign-in observed"), recorded_time(Some(100)));
+            assert_eq!(
+                fact(&view, "Sign-in record applicability").starts_with("Historical only"),
+                retired
+            );
+            if auth == Auth::SignedOut && !retired {
+                assert_recovery_inspection(&view);
+            } else {
+                assert!(view.rows[0].facts.iter().all(|(key, _)| key != "Next step"));
+            }
+            assert_eq!(records, before);
+        }
+    }
+}
+
+fn lifetime_records(
+    renewal_retired: bool,
+    notice_retired: bool,
+    notice_end: i64,
+) -> AccountRecords {
+    let mut records = records();
+    records.logins.labels.insert(
+        "one".into(),
+        accounts::Binding {
+            renewed_at: Some(100),
+            notice_end: Some(notice_end),
+            served_at: Some(150),
+            lifetime_s: accounts::LIFETIME_MIN_S,
+            ..Default::default()
+        },
+    );
+    let mut encoded: aterm_json::Value = aterm_json::from_str(&records.logins.to_json()).unwrap();
+    let binding = encoded
+        .as_object_mut()
+        .unwrap()
+        .get_mut("labels")
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .get_mut("one")
+        .unwrap()
+        .as_object_mut()
+        .unwrap();
+    for (name, retired) in [
+        ("renewal_retired", renewal_retired),
+        ("notice_retired", notice_retired),
+        ("served_retired", true),
+        ("ended_retired", true),
+    ] {
+        binding.insert(name.into(), retired.into());
+    }
+    records.logins = accounts::Logins::from_json(&encoded.to_string(), 200).unwrap();
+    records
+}
+
+#[test]
+fn historical_expiry_dates_do_not_become_a_current_estimate_with_auth_only() {
+    for retained_auth in [false, true] {
+        for retired in [false, true] {
+            let mut records = lifetime_records(retired, retired, 150);
+            if retained_auth {
+                records.state.accounts.insert(
+                    "one".into(),
+                    accounts::Account {
+                        auth: Auth::Ok,
+                        auth_at: Some(200),
+                        ..Default::default()
+                    },
+                );
+            }
+            let before = records.clone();
+            let view = project(&records, 200_000);
+            assert_eq!(
+                fact(&view, "Last recorded renewal"),
+                recorded_time(Some(100))
+            );
+            assert_eq!(
+                fact(&view, "Expiry notice on record"),
+                recorded_time(Some(150))
+            );
+            assert_eq!(
+                fact(&view, "Last recorded served turn"),
+                recorded_time(Some(150))
+            );
+            if retired {
+                assert!(fact(&view, "Current expiry estimate").starts_with("Unknown"));
+            } else {
+                assert!(
+                    fact(&view, "Current expiry estimate").starts_with(&recorded_time(Some(150)))
+                );
+            }
+            assert_eq!(records, before);
+        }
+    }
+}
+
+#[test]
+fn a_current_expiry_notice_does_not_revive_an_older_renewal_estimate() {
+    let notice_end = 100 + accounts::LIFETIME_MIN_S + 7200;
+    let records = lifetime_records(true, false, notice_end);
+    let before = records.clone();
+    let view = project(&records, 200_000);
+    assert!(fact(&view, "Current expiry estimate").starts_with(&recorded_time(Some(notice_end))));
+    assert_eq!(
+        fact(&view, "Last recorded renewal"),
+        recorded_time(Some(100))
+    );
+    assert_eq!(
+        fact(&view, "Expiry notice on record"),
+        recorded_time(Some(notice_end))
+    );
+    assert_eq!(records, before);
+}
+
+#[test]
 fn automatic_failure_guidance_does_not_invent_a_human_step_or_expose_routes() {
     for auth in [Auth::Unseen, Auth::Ok, Auth::SignedOut] {
         for outcome in [AttemptOutcome::NoRoute, AttemptOutcome::Failed] {
@@ -555,4 +699,82 @@ fn a_row_shows_what_the_lab_journal_says_of_its_account() {
             .iter()
             .any(|(key, _)| key.contains("lab journal"))
     );
+}
+
+/// A fresh Lab metadata projection must not repeat a cached journal wall or positive quota
+/// after its known end. Future bounds and observations with unknown bounds stay on record.
+/// NEGATIVE CONTROL: rendering the raw cached window keeps `100% used` and `at its limit`
+/// beside the local quota's already withdrawn reading.
+#[test]
+fn lab_account_refresh_ages_cached_journal_windows_without_reading_again() {
+    const KEY: &str = "ac-0123456789abcdef";
+    let mut records = records();
+    records.state.accounts.insert(
+        "one".into(),
+        accounts::Account {
+            pk: Some(KEY.into()),
+            windows: [(
+                accounts::SESSION_LIMIT.into(),
+                accounts::WindowFig {
+                    pct_x10: 1000,
+                    reset: 300,
+                    at: 200,
+                    by: "m17".into(),
+                    source: accounts::SOURCE_TAP.into(),
+                    epoch_at: None,
+                },
+            )]
+            .into(),
+            ..Default::default()
+        },
+    );
+    let window = |name: &str, reset, wall_until| alab_seen::WindowSeen {
+        window: name.into(),
+        sub: None,
+        figure: Some(alab_seen::Figure::Used {
+            pct_x10: 1000,
+            reset,
+        }),
+        read: Some((200, "m17".into(), "statusline".into())),
+        wall_until,
+    };
+    let seen = alab_seen::Seen {
+        at: 200,
+        accounts: [(
+            KEY.into(),
+            alab_seen::AccountSeen {
+                windows: vec![
+                    window("5h", Some(300), Some(Some(300))),
+                    window("7d", Some(400), Some(Some(400))),
+                    window("credits", None, Some(None)),
+                    window("day", None, None),
+                ],
+                ..Default::default()
+            },
+        )]
+        .into(),
+    };
+    let original = seen.clone();
+    let before = project_with(&records, Some(&seen), 299_000);
+    assert!(fact(&before, "5-hour quota").contains("100%"));
+    assert!(fact(&before, "Lab 5h quota").contains("100% used"));
+    assert!(fact(&before, "Lab 5h quota").contains("at its limit"));
+    for now_ms in [300_000, 301_000] {
+        let view = project_with(&records, Some(&seen), now_ms);
+        assert_eq!(view.observed_at_ms, Some(now_ms));
+        assert!(fact(&view, "5-hour quota").starts_with("Unknown"));
+        let expired = fact(&view, "Lab 5h quota");
+        assert!(expired.contains("not read since"), "{expired}");
+        assert!(!expired.contains('%') && !expired.contains("at its limit"));
+        assert!(expired.contains("m17 (statusline)"));
+        let future = fact(&view, "Lab 7d quota");
+        assert!(future.contains("100% used") && future.contains("at its limit until"));
+        let unknown_wall = fact(&view, "Lab credits quota");
+        assert!(unknown_wall.contains("100% used, reset unknown"));
+        assert!(unknown_wall.contains("at its limit"));
+        let unknown_reset = fact(&view, "Lab day quota");
+        assert!(unknown_reset.contains("100% used, reset unknown"));
+        assert!(!unknown_reset.contains("at its limit"));
+    }
+    assert_eq!(seen, original);
 }

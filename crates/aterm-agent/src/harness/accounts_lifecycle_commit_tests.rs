@@ -30,12 +30,14 @@ fn apply(operation: i64, state: &mut State, logins: &mut Logins) -> Vec<Event> {
         }
         5 => {
             let mut events = note_signed_back(state, logins, "main", NOW);
-            events.extend(prove(state, "main", NOW));
+            events.extend(prove_in_context(state, logins, "main", NOW));
             events.extend(note_session(state, "session-one", "main", None, NOW));
             events
         }
         6 | 7 => {
-            let mut events: Vec<_> = prove(state, "main", NOW).into_iter().collect();
+            let mut events: Vec<_> = prove_in_context(state, logins, "main", NOW)
+                .into_iter()
+                .collect();
             events.extend(note_session(state, "session-one", "main", None, NOW));
             events
         }

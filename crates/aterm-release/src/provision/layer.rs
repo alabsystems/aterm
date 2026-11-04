@@ -11,6 +11,7 @@ use aterm_converge::{Class, Explain, Item, ItemReport, Layer, Mode, Outcome, Pro
 use aterm_verify::provision::State;
 
 use super::Check;
+use crate::release_steps::Bootstrap;
 
 /// What the layer's items read: this machine ([`System`]), or a test's.
 pub(crate) trait ReleaseHost: Send + Sync {
@@ -33,10 +34,13 @@ pub(crate) trait ReleaseHost: Send + Sync {
     /// Whether the engine's launcher starts successfully on the publication PATH.
     /// # Errors
     /// The launcher or its runtime is unavailable.
-    fn publication_bootstrap(&self) -> Result<(), String>;
+    fn publication_bootstrap(&self) -> Result<(), Bootstrap>;
 
     /// Exercise source signing separately from the Apple certificate and notary tools.
-    fn source_signing(&self) -> Result<(), String>;
+    /// # Errors
+    /// The canonical ring the release reads is incomplete or unauthorized
+    /// ([`SigningGap::Ring`]), or the signing tools are unusable.
+    fn source_signing(&self) -> Result<(), SigningGap>;
 
     /// The site checkout `ship site` syncs, where one is named.
     /// # Errors
@@ -67,6 +71,18 @@ pub(crate) trait ReleaseHost: Send + Sync {
     /// # Errors
     /// The listing failed or did not finish: git's last line.
     fn reach(&self, url: &str) -> Result<(), String>;
+}
+
+/// Why source signing is not ready.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SigningGap {
+    /// The canonical ring under `~/.aterm/release-ring/` (key, record, roster pair), the one
+    /// the release's step 1 and the engine read, does not authorize a cut: a vault that
+    /// delivers its roster only at the legacy `~/.aterm/roster/` leaves this, which
+    /// `ship provision --id` restores from `dist/` or the release channel.
+    Ring(String),
+    /// The ring is whole, but the signing tools or a signature failed.
+    Unusable(String),
 }
 
 /// What a provision does to the deployer key's need.
@@ -245,7 +261,13 @@ impl LayerItem {
                 Ok(()) => Probe::Ok {
                     now: format!("{shown}/bin/pub, gitleaks {}", gitleaks.display()),
                 },
-                Err(why) => Probe::Unusable { why },
+                // The interpreter is a pinned `verify provision --release` row, so its absence
+                // is a gap with a fix, never a check that could not run.
+                Err(Bootstrap::NoPython(why)) => Probe::Change {
+                    from: why,
+                    to: "the pinned cpython first on the publication PATH".into(),
+                },
+                Err(Bootstrap::Failed(why)) => Probe::Unusable { why },
             },
             None => Probe::Person {
                 step: self.id.into(),
@@ -380,7 +402,10 @@ impl LayerItem {
                     .into(),
             ),
             Kind::SourceSigning => Remedy::Command(
-                "restore the complete registered release ring, build atpkg-keys with `targo --unverified build --profile gate -p atpkg-keys`, and provide OpenSSL 3 or newer through PUBLISH_OPENSSL".into(),
+                "build atpkg-keys with `targo --unverified build --profile gate -p atpkg-keys`, and \
+                 provide OpenSSL 3 with `targo --unverified verify provision --release` (or name \
+                 one: PUBLISH_OPENSSL)"
+                    .into(),
             ),
             Kind::EngineReach => Remedy::Command(
                 "give this machine what the registry's address needs (its SSH key and host \
@@ -432,7 +457,7 @@ impl Item for LayerItem {
     fn title(&self) -> String {
         match self.kind {
             Kind::Base => "every machine's base layer".into(),
-            Kind::Develop => "the pinned build and source-signing tools".into(),
+            Kind::Develop => "the pinned build, source-signing and publication-engine tools".into(),
             Kind::Openssl => "macOS's LibreSSL, which release signing uses".into(),
             Kind::Publication => "the publication engine".into(),
             Kind::SourceSigning => "source-attestation signing and independent verification".into(),
@@ -453,7 +478,12 @@ impl Item for LayerItem {
                     now: "registered ring, source signer and OpenSSL Ed25519 verification passed"
                         .into(),
                 },
-                Err(why) => Probe::Unusable { why },
+                // The step-1 refusal's own cause: a gap with its fix, as the release says it.
+                Err(SigningGap::Ring(why)) => Probe::Change {
+                    from: format!("source signing ring: {why}"),
+                    to: "the complete canonical ring".into(),
+                },
+                Err(SigningGap::Unusable(why)) => Probe::Unusable { why },
             },
             Kind::EngineReach => self.probe_engine_reach(),
             Kind::Site => self.probe_site(),
@@ -480,6 +510,13 @@ impl Item for LayerItem {
             (Kind::Base, Probe::Blocked { .. }) => Remedy::Command(
                 "install aterm (tools/install.sh), then `aterm init --only base`".into(),
             ),
+            (Kind::Publication, Probe::Change { .. }) => Remedy::Provision {
+                args: "--release".into(),
+            },
+            (Kind::SourceSigning, Probe::Change { .. }) => Remedy::Command(format!(
+                "{} provision --id <this machine's roster id>",
+                crate::publish::SHIP_COMMAND
+            )),
             _ => self.remedy(),
         };
         Explain { why, remedy }
@@ -806,23 +843,25 @@ impl ReleaseHost for System {
             .map_or_else(|| self.home.join("publication"), PathBuf::from)
     }
 
-    fn publication_bootstrap(&self) -> Result<(), String> {
+    fn publication_bootstrap(&self) -> Result<(), Bootstrap> {
         crate::release_steps::engine_bootstrap(&self.repo, &self.publication())
     }
 
-    fn source_signing(&self) -> Result<(), String> {
+    fn source_signing(&self) -> Result<(), SigningGap> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| format!("source signing clock: {e}"))?
+            .map_err(|e| SigningGap::Unusable(format!("source signing clock: {e}")))?
             .as_secs();
-        let helper = self.source_helper.as_ref().map_err(Clone::clone)?;
-        crate::source_signing::Tools::probe(
-            &self.repo,
-            &self.home,
-            i64::try_from(now).unwrap_or(i64::MAX),
-            helper.as_deref(),
-        )
-        .map(|_| ())
+        let now = i64::try_from(now).unwrap_or(i64::MAX);
+        // The release's step 1 refuses on exactly this read, so the audit reads it first.
+        crate::source_signing::Tools::authority(&self.home, now).map_err(SigningGap::Ring)?;
+        let helper = self
+            .source_helper
+            .as_ref()
+            .map_err(|why| SigningGap::Unusable(why.clone()))?;
+        crate::source_signing::Tools::probe(&self.repo, &self.home, now, helper.as_deref())
+            .map(|_| ())
+            .map_err(SigningGap::Unusable)
     }
 
     fn site(&self) -> Result<Option<PathBuf>, String> {
@@ -900,8 +939,8 @@ mod tests {
         site: Option<PathBuf>,
         site_key: Option<PathBuf>,
         tools: Vec<&'static str>,
-        bootstrap_error: Option<&'static str>,
-        source_signing_error: Option<&'static str>,
+        bootstrap_error: Option<Bootstrap>,
+        source_signing_error: Option<SigningGap>,
         source_signing_calls: std::sync::atomic::AtomicUsize,
         unreached: Vec<&'static str>,
         needs: std::sync::Mutex<Vec<NeedStep>>,
@@ -922,14 +961,13 @@ mod tests {
         fn publication(&self) -> PathBuf {
             self.home.join("publication")
         }
-        fn publication_bootstrap(&self) -> Result<(), String> {
-            self.bootstrap_error.map_or(Ok(()), |why| Err(why.into()))
+        fn publication_bootstrap(&self) -> Result<(), Bootstrap> {
+            self.bootstrap_error.clone().map_or(Ok(()), Err)
         }
-        fn source_signing(&self) -> Result<(), String> {
+        fn source_signing(&self) -> Result<(), SigningGap> {
             self.source_signing_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.source_signing_error
-                .map_or(Ok(()), |why| Err(why.into()))
+            self.source_signing_error.clone().map_or(Ok(()), Err)
         }
         fn site(&self) -> Result<Option<PathBuf>, String> {
             Ok(self.site.clone())
@@ -1043,11 +1081,23 @@ mod tests {
     fn a_present_engine_without_its_runtime_is_not_ready_and_recovers() {
         let dir = aterm_tempfile::tempdir().unwrap();
         let mut fake = whole(dir.path());
-        fake.bootstrap_error = Some("launcher runtime unavailable");
+        fake.bootstrap_error = Some(Bootstrap::Failed("launcher runtime unavailable".into()));
         assert!(matches!(
             line_of(fake, "release.publication"),
             Check::CouldNotRun(why) if why.contains("launcher runtime unavailable")
         ));
+        // m58: pub-python found no 3.11+, which the pinned cpython row provides.
+        let mut fake = whole(dir.path());
+        fake.bootstrap_error = Some(Bootstrap::NoPython(
+            "pub: no Python 3.11 or newer (with tomllib) on PATH".into(),
+        ));
+        match line_of(fake, "release.publication") {
+            Check::Fail { what, fix } => {
+                assert!(what.contains("no Python 3.11"), "{what}");
+                assert_eq!(fix, "targo --unverified verify provision --release");
+            }
+            other => panic!("{other:?}"),
+        }
         assert!(matches!(
             line_of(whole_keeping(dir.path()), "release.publication"),
             Check::Pass(_)
@@ -1125,11 +1175,29 @@ mod tests {
     fn apple_tools_do_not_hide_an_unavailable_source_signer() {
         let dir = aterm_tempfile::tempdir().unwrap();
         let mut fake = whole(dir.path());
-        fake.source_signing_error = Some("source signing needs OpenSSL 3");
+        fake.source_signing_error = Some(SigningGap::Unusable(
+            "source signing needs OpenSSL 3".into(),
+        ));
         assert!(matches!(
             line_of(fake, "release.source-signing"),
             Check::CouldNotRun(_)
         ));
+        // m58: the vault's roster only at the legacy path, which step 1 refuses: a gap with
+        // the fix the refusal names, not a check that could not run.
+        let mut fake = whole(dir.path());
+        fake.source_signing_error = Some(SigningGap::Ring(
+            "release roster ~/.aterm/release-ring/roster/aterm-machines.toml: missing".into(),
+        ));
+        match line_of(fake, "release.source-signing") {
+            Check::Fail { what, fix } => {
+                assert!(what.starts_with("source signing ring: "), "{what}");
+                assert_eq!(
+                    fix,
+                    "targo --unverified ship provision --id <this machine's roster id>"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
         assert!(matches!(
             line_of(whole_keeping(dir.path()), "release.source-signing"),
             Check::Pass(_)
@@ -1141,7 +1209,7 @@ mod tests {
         use std::sync::atomic::Ordering::SeqCst;
         let dir = aterm_tempfile::tempdir().unwrap();
         let mut fake = whole(dir.path());
-        fake.source_signing_error = Some("identity not created yet");
+        fake.source_signing_error = Some(SigningGap::Ring("identity not created yet".into()));
         let mut fake = Arc::new(fake);
         let host: Arc<dyn ReleaseHost> = fake.clone();
         assert!(

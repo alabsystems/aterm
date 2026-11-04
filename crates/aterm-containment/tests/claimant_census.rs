@@ -15,7 +15,14 @@ use aterm_containment::consent::{
 
 const ID: &str = "com.test.aterm-census";
 
+/// Each bundle these tests lay is one `codesign` must read: a loaded machine past the
+/// product's ceiling would read it as unknown, so its reads wait on the hang detector.
+fn codesign_reads_must_happen() {
+    aterm_containment::consent::set_codesign_ceiling_for_test(aterm_spec::wait::MUST_HAPPEN);
+}
+
 fn lay_signed(root: &Path, name: &str, marker: &str) {
+    codesign_reads_must_happen();
     let contents = root.join(name).join("Contents");
     std::fs::create_dir_all(contents.join("MacOS")).expect("layout");
     std::fs::write(
@@ -108,6 +115,7 @@ fn still_claims_follows_the_bundle_on_disk() {
 
 #[test]
 fn still_claims_tells_an_unsigned_copy_from_a_failed_read() {
+    codesign_reads_must_happen();
     let tmp = aterm_tempfile::tempdir().expect("tempdir");
     let root = std::fs::canonicalize(tmp.path()).expect("resolve tempdir");
     let path = root.join("aterm-unsigned.app");

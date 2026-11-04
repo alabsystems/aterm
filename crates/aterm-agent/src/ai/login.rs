@@ -439,10 +439,17 @@ pub fn pool_target(
              refused: {why}"
         ));
     }
+    if let Some(label) = &pool.unaddressed {
+        return Err(format!(
+            "`{label}` is the row with no current login, and it has no email, so `aterm ai login \
+             {id}` does not sign it in: `aterm harness accounts login {label} --cli {id}` does, at \
+             a terminal; no other row of this pool needs a sign-in"
+        ));
+    }
     Err(if pool.emails > 0 {
         format!(
-            "{roster} names no row `aterm ai login {id}` signs in now: `aterm harness accounts \
-             --cli {id}` says each row's state"
+            "this pool needs no sign-in: every row of {roster} that this Mac signs in has a \
+             current login (`aterm harness accounts --cli {id}` says each row's state)"
         )
     } else if cli.renews_headlessly() {
         format!(
@@ -729,17 +736,36 @@ pub fn sign_in(h: &Host<'_>, f: &Facts, row: &Row, out: &mut dyn Write) -> Done 
     if let Err(why) = &exited {
         return Done::Failed(format!("{} could not be started: {why}", c.id));
     }
+    // A sign-in that exits nonzero signed nothing in, whatever a status read after it finds (a
+    // login it left, or one it never touched): that exit is the result, and only a login the
+    // status shows gone is recorded.
+    let failed = match &exited {
+        Ok(0) | Err(_) => None,
+        Ok(code) => Some(format!("{} exited {code}", c.id)),
+    };
+    let unchecked = || failed.clone().map_or(Done::NotChecked, Done::Failed);
     let Some(status) = after else {
-        return Done::NotChecked;
+        // A sign-in that is the CLI itself ends when the person quits it, and a quit's exit says
+        // nothing of the sign-in made before it.
+        return if args.is_empty() {
+            Done::NotChecked
+        } else {
+            unchecked()
+        };
     };
     if !storage_current() {
-        return Done::NotChecked;
+        return unchecked();
     }
     let health_observation = h
         .store
         .load()
         .ok()
         .map(|records| records.of_scope(c.id, f.record_scope));
+    let status_witness = default_row.and_then(|(_, store, _, _)| {
+        default_witness
+            .as_ref()
+            .map(|witness| crate::harness::accounts_sync::capture_status_context(store, witness))
+    });
     let ran = h.runner.run(&Job {
         program: &managed.path,
         args: &as_args(status.args),
@@ -750,7 +776,7 @@ pub fn sign_in(h: &Host<'_>, f: &Facts, row: &Row, out: &mut dyn Write) -> Done 
     });
     let now = (h.now)();
     if !storage_current() {
-        return Done::NotChecked;
+        return unchecked();
     }
     let note = |outcome| {
         if default_home
@@ -768,10 +794,11 @@ pub fn sign_in(h: &Host<'_>, f: &Facts, row: &Row, out: &mut dyn Write) -> Done 
         }
     };
     match read_status(status, &ran) {
+        Said::In(_) if failed.is_some() => unchecked(),
         Said::In(method) => {
             if managed_default {
                 let (Some((_label, pool_store, cli, roster_path)), Some(witness), Ok(home)) =
-                    (default_row, default_witness.as_ref(), &f.home)
+                    (default_row, status_witness.as_ref(), &f.home)
                 else {
                     return Done::Failed("the default account context is unavailable".into());
                 };
@@ -798,26 +825,21 @@ pub fn sign_in(h: &Host<'_>, f: &Facts, row: &Row, out: &mut dyn Write) -> Done 
             if default_home
                 && !f.hidden_store
                 && let Some((_label, pool_store, cli, roster_path)) = default_row
-                && let Some(witness) = default_witness.as_ref()
+                && let Some(witness) = status_witness.as_ref()
                 && let Ok(home) = &f.home
             {
-                let _ = crate::harness::accounts_sync::record_review_login(
+                let _ = crate::harness::accounts_sync::record_default_sign_out(
                     pool_store,
                     cli,
                     roster_path,
                     witness,
                     home,
-                    Outcome::Ended(Ended::StatusSignedOut),
                     now,
                 );
             }
-            Done::SignedOut
+            failed.map_or(Done::SignedOut, Done::Failed)
         }
-        Said::Unread(_) => match exited {
-            Ok(0) => Done::NotChecked,
-            Ok(code) => Done::Failed(format!("{} exited {code}", c.id)),
-            Err(why) => Done::Failed(why),
-        },
+        Said::Unread(_) => unchecked(),
     }
 }
 

@@ -2825,8 +2825,8 @@ mod constructor_tests {
                 default_bg: glow.theme_bg,
                 ..RenderInput::default()
             };
-            for row in 1..4 {
-                for (col, cell) in frame.cells[row].iter_mut().enumerate().take(20) {
+            for cells in &mut frame.cells[1..4] {
+                for (col, cell) in cells.iter_mut().enumerate().take(20) {
                     cell.ch = if col % 5 == 4 { ' ' } else { 'w' };
                     cell.fg = ink;
                 }
@@ -2927,8 +2927,8 @@ mod constructor_tests {
             default_bg: glow.theme_bg,
             ..RenderInput::default()
         };
-        for row in 1..4 {
-            for (col, cell) in words.cells[row].iter_mut().enumerate().take(20) {
+        for cells in &mut words.cells[1..4] {
+            for (col, cell) in cells.iter_mut().enumerate().take(20) {
                 cell.ch = if col % 5 == 4 { ' ' } else { 'w' };
                 cell.fg = [0xC4, 0x26, 0x2E];
             }

@@ -1774,30 +1774,38 @@ mod tests {
 
     #[test]
     fn combo_ladder_climbs_to_guaranteed_nuke() {
-        let n = 1_000u64;
-        let mut flash_pct = Vec::new();
-        let mut nuke_pct = Vec::new();
+        let mut counts = Vec::new();
         for level in 1..=COMBO_EXTREME_LEVEL {
-            let (mut flash, mut nuke) = (0u32, 0u32);
-            for bucket in 0..n {
+            let (flash_end, nova_end) = COMBO_TIER_WINDOWS[level as usize - 1];
+            let (mut flash, mut nova, mut nuke) = (0u64, 0u64, 0u64);
+            for bucket in 0..1_000u64 {
                 match tier_for(bucket << 32, level) {
                     SuperTier::Flash => flash += 1,
-                    SuperTier::Nova => {}
+                    SuperTier::Nova => nova += 1,
                     SuperTier::Nuke => nuke += 1,
                 }
             }
-            flash_pct.push(f64::from(flash) * 100.0 / n as f64);
-            nuke_pct.push(f64::from(nuke) * 100.0 / n as f64);
+            assert_eq!(
+                (flash, nova, nuke),
+                (flash_end, nova_end - flash_end, 1_000 - nova_end),
+                "level {level} residue counts must match COMBO_TIER_WINDOWS"
+            );
+            counts.push((flash, nuke));
         }
-        for w in nuke_pct.windows(2) {
-            assert!(w[1] > w[0], "P(Nuke) must climb each level: {nuke_pct:?}");
+        for w in counts.windows(2) {
+            assert!(
+                w[1].1 > w[0].1,
+                "Nuke buckets must climb each level: {counts:?}"
+            );
+            assert!(
+                w[1].0 <= w[0].0,
+                "Flash buckets must never climb: {counts:?}"
+            );
         }
-        for w in flash_pct.windows(2) {
-            assert!(w[1] <= w[0], "P(Flash) must never climb: {flash_pct:?}");
-        }
-        assert!(
-            nuke_pct[COMBO_EXTREME_LEVEL as usize - 1] == 100.0,
-            "EXTREME level is Nuke on every draw"
+        assert_eq!(
+            counts[COMBO_EXTREME_LEVEL as usize - 1],
+            (0, 1_000),
+            "EXTREME level is Nuke on every residue class"
         );
         assert_eq!(tier_for(7, COMBO_EXTREME_LEVEL + 3), SuperTier::Nuke);
 

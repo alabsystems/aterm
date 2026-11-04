@@ -7,10 +7,31 @@
 //! receipt for the controller; an I/O error never supplies evidence that capacity is free.
 //! The existing private namespace and kernel group-drain contracts remain authoritative.
 
-use super::Cohort;
+use super::{Cohort, Scope};
 use crate::Claim;
 use aterm_uds::spawnfd::{Child, Command, NotSpawned, SpawnFailure, Spawned};
 use std::{fmt, io};
+
+/// An explicit controller request, never evidence of group drain or capacity release.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CohortSignal {
+    /// Ask every current member to terminate (SIGTERM).
+    Terminate,
+    /// Explicitly continue stopped members (SIGCONT).
+    Continue,
+    /// Request uncatchable termination of current members (SIGKILL).
+    Kill,
+}
+
+impl CohortSignal {
+    const fn raw(self) -> i32 {
+        match self {
+            Self::Terminate => libc::SIGTERM,
+            Self::Continue => libc::SIGCONT,
+            Self::Kill => libc::SIGKILL,
+        }
+    }
+}
 
 /// An actual owned child whose exact birth was durably bound to its claim.
 /// This proves neither descendant containment nor permission to release capacity on exit.
@@ -30,6 +51,42 @@ impl CohortChild {
     #[must_use]
     pub const fn cohort(&self) -> &Cohort {
         &self.cohort
+    }
+
+    /// Request a signal for this actual launch's original dedicated group. The
+    /// exclusive unreaped-child borrow pins its original group number through
+    /// the syscall, even if its leader has exited. A decoded observation, reaped
+    /// leader or copied foreign-owner receipt supplies no authority.
+    ///
+    /// Success means only kernel acceptance, never termination, execution or
+    /// drain. No reservation is changed. Members that escape remain outside this
+    /// original group's contract; no signal is sent to a newly observed group.
+    /// # Errors
+    /// The original owner/scope changed or is unreadable, the leader was reaped,
+    /// the original dedicated birth does not match, or the kernel refused the signal.
+    pub fn request_group(&mut self, signal: CohortSignal) -> io::Result<()> {
+        let group = self.cohort.group();
+        if !self.spawned.key().is_current()
+            || !self.spawned.is_original_child()
+            || Scope::of_key(self.spawned.key()) != self.cohort.scope
+            || self.spawned.child_mut().is_reaped()
+            || group <= 1
+            || i32::try_from(self.spawned.child_mut().id()).ok() != Some(group)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "group control requires its original current owner and unreaped dedicated birth",
+            ));
+        }
+        // SAFETY: only the original dedicated-group birth can construct this
+        // receipt. Its actual unreaped leader pins group > 1 against reuse, and
+        // the captured owner/host/boot/namespace are current. No arbitrary pid,
+        // decoded record, live-group guess or post-reap identity is accepted.
+        if unsafe { libc::kill(-group, signal.raw()) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
     }
 
     /// Transfer the actual child receipt and bound cohort to the native controller.
@@ -116,7 +173,10 @@ pub(crate) fn launch_member(
             "cohort member needs its original live owned leader and current durable binding",
         )
     };
-    if !claim.cohort_bound(&leader.cohort) || !leader.spawned.key().is_current() {
+    if !claim.cohort_bound(&leader.cohort)
+        || !leader.spawned.key().is_current()
+        || !leader.spawned.is_original_child()
+    {
         return Err(refused());
     }
     // Require a live self-led child, rather than the fast-exit observation accepted by BIND.

@@ -58,7 +58,12 @@ const RETRY_EVERY: Duration = Duration::from_secs(1);
 
 const TEXT_MAX: usize = 256;
 
-const EXEC_POLL: Duration = Duration::from_millis(10);
+/// The longest [`Notifier::exec`] sleeps between reaps of a page's command when the kernel
+/// gives no word of its exit: no exit descriptor could be made (a `pidfd_open` refused, any
+/// other unix, a kqueue Darwin would not make). It is the 10 ms poll the kernel's word
+/// replaced, so on such a host a page's reap still comes at most 10 ms after its command's exit.
+const EXEC_FALLBACK_TICK: Duration = Duration::from_millis(10);
+
 const DEFAULT_EXEC_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_LIMIT: u32 = 10;
 const DEFAULT_WINDOW_MS: u64 = 60_000;
@@ -77,6 +82,18 @@ pub const FLUSH_TALLY_SEAM: &str = "ATERM_LINK_NOTIFY_FLUSH_TALLY";
 /// after each notice that flushed: `notify-flushes v=1 pid=<pid> durable=<n> ordered=<n>`, the
 /// file and directory flushes its stores asked for since it started, by kind.
 pub const FLUSH_TALLY: &str = "flush-tally";
+
+/// The development seam that has a following notifier tell the fabric bench, after each fresh
+/// page, when its `firing` line was written, its command was reaped and its `fired` line was
+/// written ([`EXEC_STAMPS`]).
+pub const EXEC_STAMPS_SEAM: &str = "ATERM_LINK_NOTIFY_EXEC_STAMPS";
+
+/// The file under `<state>/notify/` a notifier on [`EXEC_STAMPS_SEAM`] rewrites, unflushed,
+/// after each notice that ran a fresh page: `notify-exec v=1 pid=<pid> off=<off> armed=<us>
+/// exited=<us> fired=<us>`, each the microseconds from the notifier's start on its monotonic
+/// clock to the `firing` line written, the command's wait ended (its exit reaped, or its kill at
+/// the timeout) and the `fired` line written. Only their differences mean anything.
+pub const EXEC_STAMPS: &str = "exec-stamps";
 
 /// The flushes this process's notify stores asked for ([`FLUSH_TALLY`]): full, then ordered.
 /// These count what each store ASKED for (aterm-durable's [`Flush`]), where
@@ -1103,6 +1120,17 @@ struct Notifier {
     clock: Option<Instant>,
     /// Where [`FLUSH_TALLY_SEAM`] has the flushes told, and the counts last told there.
     flush_tally: Option<(PathBuf, (u64, u64))>,
+    /// Where [`EXEC_STAMPS_SEAM`] has each fresh page's stamps told.
+    exec_stamps: Option<ExecStamps>,
+}
+
+/// [`EXEC_STAMPS_SEAM`]'s file, the instant its stamps count from, and the last fresh page's
+/// offset and stamps (`firing` written, the command's wait ended, `fired` written) not yet told
+/// there.
+struct ExecStamps {
+    path: PathBuf,
+    origin: Instant,
+    untold: Option<(u64, [Instant; 3])>,
 }
 
 impl Notifier {
@@ -1111,6 +1139,11 @@ impl Notifier {
         let fault = Fault::from_env(&store);
         let flush_tally = aterm_types::dev_seam!(FLUSH_TALLY_SEAM)
             .map(|_| (store.root.join(FLUSH_TALLY), (u64::MAX, u64::MAX)));
+        let exec_stamps = aterm_types::dev_seam!(EXEC_STAMPS_SEAM).map(|_| ExecStamps {
+            path: store.root.join(EXEC_STAMPS),
+            origin: Instant::now(),
+            untold: None,
+        });
         let n = cfg.on.len();
         let need = NeedWatch::new(&cfg.fleet);
         let (suppressed, suppressed_mark) = store.suppressed();
@@ -1150,6 +1183,7 @@ impl Notifier {
             #[cfg(test)]
             clock: None,
             flush_tally,
+            exec_stamps,
         })
     }
 
@@ -1160,6 +1194,38 @@ impl Notifier {
             return now;
         }
         Instant::now()
+    }
+
+    /// Tell the development seams on what the last notice or tick did: the flushes
+    /// ([`Self::tell_flushes`]) and the last fresh page's stamps ([`Self::tell_exec`]). Off the
+    /// page's path: its `fired` line and its cursor are written by then.
+    fn tell(&mut self) {
+        self.tell_flushes();
+        self.tell_exec();
+    }
+
+    /// Rewrite the [`EXEC_STAMPS`] where its seam asked for it and a fresh page ran since.
+    fn tell_exec(&mut self) {
+        let Some(stamps) = self.exec_stamps.as_mut() else {
+            return;
+        };
+        let Some((off, at)) = stamps.untold.take() else {
+            return;
+        };
+        let us = |t: Instant| {
+            u64::try_from(t.saturating_duration_since(stamps.origin).as_micros())
+                .unwrap_or(u64::MAX)
+        };
+        let line = format!(
+            "notify-exec v=1 pid={} off={off} armed={} exited={} fired={}\n",
+            std::process::id(),
+            us(at[0]),
+            us(at[1]),
+            us(at[2])
+        );
+        if let Err(e) = write_unflushed_private(&stamps.path, line.as_bytes()) {
+            warn(&format!("{EXEC_STAMPS_SEAM}: {e}"));
+        }
     }
 
     /// Rewrite the [`FLUSH_TALLY`] where its seam asked for it and the counts moved.
@@ -1971,8 +2037,10 @@ impl Notifier {
             ..
         } = page;
         let (key, dup) = (sel.key(), firing.is_none());
+        let armed = Instant::now();
         let carried = self.suppressed;
         let verdict = self.exec(&hit, dup, carried);
+        let exited = Instant::now();
         if self.fault == Fault::KillAfterExec {
             self.fault.fire(&self.store);
         }
@@ -1980,6 +2048,9 @@ impl Notifier {
             off,
             format!("{off} fired on={} {verdict} dup={}", hit.on, u8::from(dup)),
         );
+        if let Some(stamps) = self.exec_stamps.as_mut().filter(|_| !dup) {
+            stamps.untold = Some((off, [armed, exited, Instant::now()]));
+        }
         if carried > 0 && verdict == "rc=0" {
             self.suppressed -= carried;
             self.save(Part::Suppressed);
@@ -2054,6 +2125,19 @@ impl Notifier {
                 return "rc=spawn-failed".to_string();
             }
         };
+        #[cfg(test)]
+        BEFORE_EXIT_WAIT.with(|seam| {
+            if let Some(before) = seam.borrow_mut().as_mut() {
+                before(&mut child);
+            }
+        });
+        // The kernel's word of the exit (a kqueue on Darwin, a pidfd on Linux), registered while
+        // the child is unreaped, and each turn reaps first. Darwin's kqueue will not watch a
+        // zombie, so a command that exited before the registration leaves the wait nothing to
+        // report: the leading reap ends it at once rather than after a fallback tick. A Linux
+        // pidfd of a zombie reads ready at once, and there the leading reap saves one poll.
+        let mut exit =
+            aterm_uds::deadline::ExitWait::new(&child).ticking_at_most(EXEC_FALLBACK_TICK);
         let deadline = Instant::now().checked_add(self.cfg.exec_timeout);
         loop {
             match child.try_wait() {
@@ -2082,7 +2166,10 @@ impl Notifier {
                     return "rc=wait-failed".to_string();
                 }
             }
-            if deadline.is_some_and(|d| Instant::now() >= d) {
+            let left = deadline.map_or(Duration::MAX, |d| {
+                d.saturating_duration_since(Instant::now())
+            });
+            if left.is_zero() {
                 if let Ok(pgid) = i32::try_from(child.id()) {
                     let _ = aterm_uds::process::kill_group_until_empty(pgid);
                 }
@@ -2093,7 +2180,9 @@ impl Notifier {
                 );
                 return "rc=timeout".to_string();
             }
-            std::thread::sleep(EXEC_POLL);
+            #[cfg(test)]
+            EXIT_WAITS.with(|turns| turns.set(turns.get() + 1));
+            exit.wait(left);
         }
     }
 
@@ -2216,7 +2305,7 @@ impl Notifier {
                 });
                 std::thread::sleep(wait);
                 let _ = self.tick(self.now());
-                self.tell_flushes();
+                self.tell();
                 continue;
             }
             let notice = match self.next_due() {
@@ -2225,7 +2314,7 @@ impl Notifier {
                     Ok(notice) => Some(notice),
                     Err(mpsc::RecvTimeoutError::Timeout) => {
                         let _ = self.tick(self.now());
-                        self.tell_flushes();
+                        self.tell();
                         continue;
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => None,
@@ -2235,7 +2324,7 @@ impl Notifier {
                 break;
             };
             let _ = self.take(notice);
-            self.tell_flushes();
+            self.tell();
         }
         let _ = self.persist();
         Err(io::Error::new(
@@ -2688,6 +2777,12 @@ thread_local! {
     /// Called as [`Notifier::exec`] starts a command, so a test can ask what was flushed
     /// before it.
     static AT_EXEC: std::cell::RefCell<Option<ExecSeam>> = const { std::cell::RefCell::new(None) };
+    /// Called with the command [`Notifier::exec`] spawned, before it registers the command's
+    /// exit wait, so a test can have the command exit first.
+    static BEFORE_EXIT_WAIT: std::cell::RefCell<Option<ChildSeam>> =
+        const { std::cell::RefCell::new(None) };
+    /// The turns [`Notifier::exec`] waited on its commands' exits on this thread.
+    static EXIT_WAITS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// The [`Store::put`]s left before a test's kill: at `Some(0)` every put fails before it
     /// writes, as if the process had died there.
     static PUT_FAULT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
@@ -2738,6 +2833,10 @@ fn refused(name: &str) -> Option<i32> {
 /// What [`AT_EXEC`] calls with the hit whose command starts.
 #[cfg(test)]
 type ExecSeam = Box<dyn FnMut(&Hit)>;
+
+/// What [`BEFORE_EXIT_WAIT`] calls with the command just spawned.
+#[cfg(test)]
+type ChildSeam = Box<dyn FnMut(&mut aterm_uds::spawnfd::Child)>;
 
 const USAGE: &str = "\
 aterm link notify — run a command when the fabric needs a human
@@ -5012,6 +5111,185 @@ mod tests {
             "the tally tells each flush the carry asked of aterm_durable"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE EXEC STAMPS TELL EACH FRESH PAGE ONCE ([`EXEC_STAMPS_SEAM`], the fabric bench's
+    /// split of a page): after the notice, under the page's offset, in the order the page ran
+    /// (`firing` written, the command exited, `fired` written); a tell with no page run since
+    /// writes nothing.
+    #[test]
+    fn the_exec_stamps_tell_each_fresh_page_once_in_the_order_it_ran() {
+        let dir = scratch("exec-stamps");
+        let (mut n, fired) = appending(&dir, 100, "");
+        let path = n.store.root.join(EXEC_STAMPS);
+        n.exec_stamps = Some(ExecStamps {
+            path: path.clone(),
+            origin: Instant::now(),
+            untold: None,
+        });
+        for off in [1, 2] {
+            feed(&mut n, off, &format!("s-{off}"), "v=1 t=1 attention=help");
+            n.tell();
+            assert_eq!(
+                fired_offsets(&fired).last(),
+                Some(&off),
+                "PRECONDITION: paged"
+            );
+            let told = std::fs::read_to_string(&path).expect("the stamps are told");
+            let us = |key| {
+                crate::fabric::kv(&told, key)
+                    .and_then(crate::parse_uint::<u64>)
+                    .unwrap_or_else(|| panic!("no {key}= in {told:?}"))
+            };
+            assert!(told.starts_with("notify-exec v=1 "), "{told:?}");
+            assert_eq!(us("off"), off, "{told:?}");
+            assert!(
+                us("armed") <= us("exited") && us("exited") <= us("fired"),
+                "in the order the page ran: {told:?}"
+            );
+            std::fs::remove_file(&path).expect("take the told stamps");
+            n.tell();
+            assert!(!path.exists(), "told once");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// [`Notifier::exec`] of `command` for an ask, its timeout `timeout`.
+    #[cfg(unix)]
+    fn exec_of(dir: &str, command: &str, timeout: Duration) -> String {
+        let hit = Sel::Ask("h-andrew".into())
+            .hit(
+                "f1",
+                7,
+                "/f/f1/in/p/h-andrew/n-a/ask",
+                b"v=1 t=1 from=s-b text=x",
+            )
+            .expect("an ask to h-andrew");
+        let mut c = cfg(dir);
+        c.exec = command.into();
+        c.exec_timeout = timeout;
+        Notifier::new(c).expect("open").exec(&hit, false, 0)
+    }
+
+    /// A COMMAND'S END IS ITS VERDICT (D07: the wait on the kernel's word of the exit): an
+    /// exit, a non-zero exit and a signal each told as it ended; a command past its timeout
+    /// killed with its whole group, so a member it left running is gone too, `rc=timeout`.
+    #[cfg(unix)]
+    #[test]
+    fn exec_tells_how_its_command_ended_and_kills_one_past_its_timeout_with_its_group() {
+        let dir = scratch("exec-ends");
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let must = aterm_spec::wait::MUST_HAPPEN;
+        for (command, verdict) in [
+            ("true", "rc=0"),
+            ("exit 3", "rc=3"),
+            ("kill -9 $$", "rc=signalled"),
+        ] {
+            assert_eq!(exec_of(&dir, command, must), verdict, "{command}");
+        }
+        let group = std::rc::Rc::new(std::cell::Cell::new(0));
+        BEFORE_EXIT_WAIT.with(|seam| {
+            let group = group.clone();
+            *seam.borrow_mut() = Some(Box::new(move |child| group.set(child.id())));
+        });
+        let verdict = exec_of(&dir, "sleep 600 & wait", Duration::from_millis(100));
+        BEFORE_EXIT_WAIT.with(|seam| seam.borrow_mut().take());
+        assert_eq!(verdict, "rc=timeout");
+        aterm_spec::wait::until_within(must, "the timed-out command's group is gone", || {
+            (aterm_uds::process::group_presence(group.get())
+                == aterm_uds::process::ProcessPresence::Absent)
+                .then_some(())
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// AN EXIT AHEAD OF ITS WAIT IS REAPED AT ONCE (D07): the command has exited, unreaped,
+    /// before [`Notifier::exec`] registers its exit wait (the seam waits on the exit without
+    /// reaping it), and Darwin's kqueue will not watch a zombie, so that wait has no word to
+    /// give and could only sleep its fallback ticks. Each turn reaps first, so the page ends
+    /// `rc=0` without a single wait turn, under a one-minute hang detector (its timeout is ten
+    /// minutes). NEGATIVE CONTROL (scratch): a loop that waits before it reaps ends `rc=0`
+    /// too, after one fallback tick (`exitwatch::exit_fd` of the zombie read none), so the
+    /// count of wait turns is what tells it apart; the hang detector holds a wait that would
+    /// sleep to the timeout.
+    #[cfg(unix)]
+    #[test]
+    fn a_command_that_exits_before_its_exit_wait_registers_is_reaped_at_once() {
+        let dir = scratch("exit-first");
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn({
+            let dir = dir.clone();
+            move || {
+                BEFORE_EXIT_WAIT.with(|seam| {
+                    *seam.borrow_mut() = Some(Box::new(|child| {
+                        child.wait_exited().expect("the command exits, unreaped");
+                    }));
+                });
+                let verdict = exec_of(&dir, "true", Duration::from_secs(600));
+                let _ = tx.send((verdict, EXIT_WAITS.with(std::cell::Cell::get)));
+            }
+        });
+        let (verdict, turns) = rx
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("HANG: an exit ahead of the exit wait was not reaped");
+        assert_eq!(verdict, "rc=0");
+        assert_eq!(turns, 0, "reaped before any wait on its exit");
+        worker.join().expect("the exec thread");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A RUNNING COMMAND IS REAPED ON THE KERNEL'S WORD OF ITS EXIT (D07), by a count of wait
+    /// turns, not a clock: a command alive about 300 ms ends in at most three. One is the turn the
+    /// kernel's word ends. Any others are fallback ticks of 1 and 2 ms, for an exit reported
+    /// just before the command can be reaped. The count does not grow with the command's life,
+    /// where ticks with no descriptor (1 ms doubling to [`EXEC_FALLBACK_TICK`]) take about 33.
+    /// The seam first makes an exit descriptor of its own for the live command: under a Linux
+    /// translator `pidfd_open` returns ENOSYS (NOT RUN), and on any other Darwin or Linux host
+    /// a missing descriptor fails the test. NEGATIVE CONTROL (scratch): a loop that sleeps
+    /// `left.min(10 ms)` in place of `exit.wait(left)` fails it, `25 wait turns for one exit`.
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    #[test]
+    fn a_running_command_is_reaped_on_the_kernels_word_of_its_exit() {
+        let dir = scratch("exit-word");
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn({
+            let dir = dir.clone();
+            move || {
+                let watched = std::rc::Rc::new(std::cell::Cell::new(None));
+                BEFORE_EXIT_WAIT.with(|seam| {
+                    let watched = watched.clone();
+                    *seam.borrow_mut() = Some(Box::new(move |child| {
+                        let fd = aterm_uds::exitwatch::exit_fd(child.id());
+                        let errno = std::io::Error::last_os_error().raw_os_error();
+                        watched.set(Some(fd.map(drop).ok_or(errno)));
+                    }));
+                });
+                let verdict = exec_of(&dir, "sleep 0.3", Duration::from_secs(600));
+                let turns = EXIT_WAITS.with(std::cell::Cell::get);
+                let _ = tx.send((watched.get(), verdict, turns));
+            }
+        });
+        let (watched, verdict, turns) = rx
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("HANG: a running command's exit was not reaped");
+        worker.join().expect("the exec thread");
+        let _ = std::fs::remove_dir_all(&dir);
+        if let Err(errno) = watched.expect("the seam ran") {
+            #[cfg(target_os = "linux")]
+            if errno == Some(38) {
+                if let Some(translator) = aterm_uds::process::translator() {
+                    println!(
+                        "NOT RUN under {translator}: notify::tests::a_running_command_is_reaped_on_the_kernels_word_of_its_exit: pidfd_open returned ENOSYS"
+                    );
+                    return;
+                }
+            }
+            panic!("no exit descriptor for a live command: errno {errno:?}");
+        }
+        assert_eq!(verdict, "rc=0");
+        assert!(turns <= 3, "{turns} wait turns for one exit");
     }
 
     fn ordered_broker(log: &Path) -> Option<astream_broker::Broker> {

@@ -608,10 +608,13 @@ fn a_session_waits_for_its_guests_own_power_off_and_hears_how_the_vm_stopped() {
 fn a_command_lost_while_the_vm_stops_hears_why_it_stopped_never_only_stopping() {
     // A guest that ignores the power-off: a `Stop` holds the VM in `Stopping` for its grace,
     // then stops it hard, as the heartbeat detector does to a guest that stopped answering.
+    // The hard stop finishes only once the poll below has seen `Stopping`, so a starved poll
+    // still sees it, never a helper the grace's hard stop already ended.
     let mut rig = Rig::new();
     rig.lab.start = Threaded::new(
         Script {
             guest_obeys: false,
+            hard_stop_completes: false,
             ..obeying(AGENT)
         },
         &helper_a(),
@@ -620,10 +623,23 @@ fn a_command_lost_while_the_vm_stops_hears_why_it_stopped_never_only_stopping() 
     let paths = rig.paths();
     let stopper = std::thread::spawn(move || stop(&paths, 3_000, SPAN));
     rig.state_until(|st| st.phase == Phase::Stopping);
+    // The grace's hard stop finishes now, as the framework's completion handler would; its
+    // call is waited for with a one-minute hang detector.
+    let vm = rig.lab.start.last();
+    let completer = std::thread::spawn(move || {
+        let begun = Instant::now();
+        while !vm.calls().contains(&Call::HardStop) {
+            assert!(begun.elapsed() < SPAN, "no hard stop within a minute");
+            std::thread::sleep(POLL);
+        }
+        vm.send(crate::machine::Event::HardStopped(Ok(())));
+    });
     // A command connection ended now: its words wait for the stop's own.
     let why = s.why_lost();
     assert!(why.contains("stopped by a Stop"), "{why}");
+    assert!(why.contains("stopped hard"), "{why}");
     assert!(!why.contains("the VM is stopping"), "{why}");
+    completer.join().unwrap();
     stopper.join().unwrap().unwrap();
     s.detach();
     let _ = rig.ended();

@@ -1736,7 +1736,7 @@ pub fn spawn_past_text_busy<T>(spawn: impl FnMut() -> io::Result<T>) -> io::Resu
 
 #[cfg(not(target_vendor = "apple"))]
 fn text_busy_pause() {
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     if let Some(hook) = TEXT_BUSY_HOOK.with(|hook| hook.borrow_mut().take()) {
         hook();
         return;
@@ -1744,15 +1744,25 @@ fn text_busy_pause() {
     std::thread::sleep(TEXT_BUSY_PAUSE);
 }
 
-#[cfg(all(test, not(target_vendor = "apple")))]
+#[cfg(all(any(test, debug_assertions), not(target_vendor = "apple")))]
 thread_local! {
     static TEXT_BUSY_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
 }
 
+/// Test seam: `hook` runs in place of this thread's next pause between `ETXTBSY` tries (of
+/// [`spawn_past_text_busy`] and of the spawns this module makes), so a test can let a writer go
+/// exactly once a spawn has been refused.
+#[cfg(all(any(test, debug_assertions), not(target_vendor = "apple")))]
+pub fn on_next_text_busy_pause(hook: impl FnOnce() + 'static) {
+    TEXT_BUSY_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
 #[path = "spawnfd_command.rs"]
 mod no_fork;
-pub use no_fork::{Child, Command, Rusage, Stdio};
+pub use no_fork::{
+    Child, ChildEvent, ChildNotice, ChildObservation, ChildStop, Command, Rusage, Stdio,
+};
 
 #[path = "spawnfd_birth.rs"]
 mod birth;

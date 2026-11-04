@@ -11,8 +11,9 @@
 > proved through Trust/Clean about the compiled Rust functions, and then the tests it
 > subsumes are deleted. No test has been deleted yet.
 
-Source: `crates/aterm-spec-macros` (read only). All 9 `#[test]` fns are in
-`crates/aterm-spec-macros/tests/derive_and_attrs.rs`; `src/lib.rs` has none. The macro side is
+Source: `crates/aterm-spec-macros` (read only). All 10 `#[test]` fns live in
+`tests/anchors/suite.rs` (9, mounted by `tests/derive_and_attrs.rs`) and
+`tests/anchors/repeated.rs` (1, mounted by `tests/repeated_action.rs`); `src/lib.rs` has none. The macro side is
 `crates/aterm-spec-macros/src/lib.rs` (`refines`, `spec_unmodeled`,
 `entry_probe`, `anchored`, `entry_id_for`, `refusal`), with the fn reader
 `FnItem` (`with_prelude`) in `src/item.rs`; since SP.8 (docs/AUDIT-third-party-2026-10-15.md §7) both read std
@@ -20,7 +21,7 @@ Source: `crates/aterm-spec-macros` (read only). All 9 `#[test]` fns are in
 `crates/aterm-spec-anchor/src/xref.rs` and `crates/aterm-spec-anchor/src/registry.rs`. Nothing was compiled or
 run. The claims below come from reading the code.
 
-Result: **7 specs**, covering **all 9 tests**. **0 tests are not spec samples** (§4).
+Result: **7 specs**, covering **all 10 tests**. **0 tests are not spec samples** (§4).
 
 Gap numbers in this file are the rows of the gap table in
 `AUDIT-trust-for-test-migration-2026-10-15.md` (historical internal audit) §7.

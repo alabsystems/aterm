@@ -103,7 +103,7 @@ pub fn shared_adoption_recovery_model() -> Model {
             action MissingProof when (case == 0) { case = 9; calls = 1; requests = 1; accepted = 1; }
             action Unavailable when (case == 0) { case = 10; calls = 1; requests = 1; accepted = if Buggy == 7 {1} else {0}; }
             action RetryUnavailable when (case == 10) { case = 11; requests = if Buggy == 8 {1} else {2}; accepted = 1; }
-            action ObservationError when (case == 0) { case = 12; calls = 1; requests = 1; accepted = 1; }
+            action ObservationError when (case == 0) { case = 12; calls = 1; requests = if Buggy == 19 {1} else {0}; accepted = if Buggy == 19 {1} else {0}; }
             action Healthy when (case == 0) { case = 13; calls = 1; published = 1; }
             action UnknownReply when (case == 0) { case = 14; calls = 1; requests = if Buggy == 9 {0} else {1}; accepted = if Buggy == 9 {0} else {1}; }
             action UnknownCompleted when (case == 0) { case = 15; calls = 1; published = if Buggy == 10 {0} else {1}; }
@@ -120,8 +120,8 @@ pub fn shared_adoption_recovery_model() -> Model {
             action PrincipalAlias when (case == 0) { case = 26; published = if Buggy == 17 {1} else {0}; retained = if Buggy == 17 {0} else {1}; }
             action SupersededCheckpoint when (case == 0) { case = 27; calls = 2; requests = 1; accepted = 1; published = if Buggy == 18 {0} else {1}; }
             invariant NoReplay: calls == if case == 0 || case == 19 || case == 20 || case == 21 || case == 25 || case == 26 {0} else if case == 3 || case == 27 {2} else {1};
-            invariant RequestProgress: requests == if case == 2 || case == 3 || case == 11 {2} else if case == 1 || case == 4 || case == 9 || case == 10 || case == 12 || case == 14 || case == 16 || case == 17 || (case > 21 && 25 > case) || case == 27 {1} else {0};
-            invariant AcceptedRequests: accepted == if case == 2 || case == 3 {2} else if case == 1 || case == 4 || case == 9 || case == 11 || case == 12 || case == 14 || case == 16 || case == 17 || (case > 21 && 25 > case) || case == 27 {1} else {0};
+            invariant RequestProgress: requests == if case == 2 || case == 3 || case == 11 {2} else if case == 1 || case == 4 || case == 9 || case == 10 || case == 14 || case == 16 || case == 17 || (case > 21 && 25 > case) || case == 27 {1} else {0};
+            invariant AcceptedRequests: accepted == if case == 2 || case == 3 {2} else if case == 1 || case == 4 || case == 9 || case == 11 || case == 14 || case == 16 || case == 17 || (case > 21 && 25 > case) || case == 27 {1} else {0};
             invariant Publication: published == if case == 3 || case == 13 || case == 15 || case == 16 || case == 27 {1} else {0};
             invariant PreserveAttempt: retained == 1;
         }

@@ -1242,10 +1242,14 @@ pub const DIALOG_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 /// How long macOS's Local Network question counts as up once aterm raised it. macOS reports
 /// neither the alert nor its answer, so this is a bound, not a reading: the Commons runtime that
 /// asks by itself holds the dialog slot this long from its first LAN use. System State's Local
-/// Network step holds its own alert until the answer is heard, or until the person has been at
+/// Network step holds its own alert until the answer is heard, until the window list, after
+/// showing a new window of the alert's owner, shows no window of that owner left, on screen or
+/// off, at a read with the person at the Mac (macOS 26 and 27), or until the person has been at
 /// the Mac this long, counted from their first input after the ask and paused while they are
 /// away (`aterm-gui`'s `system_state_access`), so no page of the window's comes up beside an
-/// alert nobody has seen (`docs/DESIGN-system-state-2026-10-21.md` §6).
+/// alert nobody has seen (`docs/DESIGN-system-state-2026-10-21.md` §6). No window-list watch
+/// follows a question asked through the first LAN use's door: its hold runs this long of the
+/// person's time.
 pub const LOCAL_NETWORK_QUESTION_HOLD: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Whether this process's LAN was handed to the Commons runtime. System State's Local Network

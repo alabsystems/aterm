@@ -31,7 +31,24 @@ fn fixture_pause_reply(root: &std::path::Path, kind: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn fixture_native_action(head: &control_request::Head<'_>) -> Option<(&'static str, String)> {
+fn fixture_native_action(
+    head: &control_request::Head<'_>,
+) -> Option<(&'static str, Option<String>)> {
+    if head.verb == "codex-exec-handoff" {
+        let mut words = head.rest.split_ascii_whitespace();
+        let action = match words.next()? {
+            "arm" => return Some(("exec-arm", None)),
+            "reserve" => "exec-reserve",
+            "execute" => "exec-execute",
+            "load" => "exec-load",
+            "consume" => "exec-consume",
+            "cancel" => "exec-cancel",
+            "complete" => "exec-complete",
+            _ => return None,
+        };
+        let id = words.find_map(|word| word.strip_prefix("id="))?;
+        return aterm_codec::hex::is_lower(id, 32).then(|| (action, Some(id.into())));
+    }
     if head.verb != "native-act" {
         return None;
     }
@@ -43,13 +60,13 @@ fn fixture_native_action(head: &control_request::Head<'_>) -> Option<(&'static s
         NativeRequest::Execute(binding, ..) => ("execute", binding),
         _ => return None,
     };
-    Some((action, binding.id))
+    Some((action, Some(binding.id)))
 }
 
 fn fixture_record_native_action(
     root: &std::path::Path,
     action: &str,
-    operation: &str,
+    operation: Option<&str>,
     reply_ok: Option<bool>,
     native_hold: bool,
 ) -> io::Result<()> {
@@ -86,7 +103,7 @@ fn codex_renewal_fixture_trace_records_decision_without_capability() {
     fixture_record_native_action(
         root.path(),
         action,
-        &operation,
+        operation.as_deref(),
         out.fixture_reply_ok(),
         true,
     )
@@ -164,7 +181,10 @@ fn serve_connection_mode(
                 .collect::<Vec<_>>()
                 .windows(2)
                 .any(|words| {
-                    matches!(words[0], "codex-renewal" | "codex-rotation") && words[1] == "prepare"
+                    matches!(
+                        words[0],
+                        "codex-renewal" | "codex-rotation" | "codex-exec-handoff"
+                    ) && words[1] == "prepare"
                 });
         let drop_consume_ack = real_child
             && line
@@ -172,7 +192,10 @@ fn serve_connection_mode(
                 .collect::<Vec<_>>()
                 .windows(2)
                 .any(|words| {
-                    matches!(words[0], "codex-renewal" | "codex-rotation") && words[1] == "consume"
+                    matches!(
+                        words[0],
+                        "codex-renewal" | "codex-rotation" | "codex-exec-handoff"
+                    ) && words[1] == "consume"
                 });
         let drop_signal_ack = real_child
             && line
@@ -200,13 +223,13 @@ fn serve_connection_mode(
             fixture_record_native_action(
                 &context.sock_dir,
                 action,
-                &operation,
+                operation.as_deref(),
                 out.fixture_reply_ok(),
                 native_hold,
             )?;
         }
         if prepare_ack
-            && out.fixture_renewal_ready()
+            && out.fixture_account_prepared()
             && context.sock_dir.join("pause-prepare-ack").exists()
             && !context.sock_dir.join("prepare-ack-paused").exists()
         {

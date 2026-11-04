@@ -71,23 +71,21 @@ src/words.rs	panic_words_name_the_kind_and_never_the_text	log-words
 tests/log_gate.rs	log_gate_and_record_accessors_hold_across_filters_and_logger_decisions	log-gate	record-accessors
 ```
 
-The first 5 rows are `mod tests`; the last 4 are `mod env_tests`.
+In `src/lib.rs`, the first 9 rows are `mod tests` and the next 4 are `mod env_tests`.
 
 ## 3. Coverage
 
-> Status 2026-10-28 (unit E7): `log-words` (the `words` module) joins with its one test,
-> `panic_words_name_the_kind_and_never_the_text`; the counts below are the 2026-10-15 reading.
-
-- 23 tests read. 21 map to one of the 10 specs. 2 are not spec samples (§4).
-- The biggest collapse is `sanitize-record` (7 primary). Then come `level-filter-parse` and
-  `env-scoped-restore` (3 each).
-- `record-cap-by-level` has no primary test. It is a lemma of `sanitize-record`, and two tests sample it
-  through `sanitize_record_for`. `log-gate` has no test at all (§4).
+- All 15 live `#[test]` functions across `src/lib.rs` (13), `src/words.rs` (1) and
+  `tests/log_gate.rs` (1) map to the 11 specs in §1; none is outside a spec (§4).
+- `should-rotate-threshold` is already proved on `should_rotate`, so its unit test is retired.
+- The biggest collapse is `sanitize-record` (4 primary), followed by `env-scoped-restore` (3
+  primary) and `log-gate` (2 primary).
+- `record-accessors` has no separate primary test; it is sampled alongside `log-gate` by
+  `tests/log_gate.rs::log_gate_and_record_accessors_hold_across_filters_and_logger_decisions`.
 
 ## 4. Tests that are not spec samples
 
-None. No test samples `log-gate`. `env::read` is `#[cfg(test)]`-only; the env specs are stated
-against `std::env::var_os`, and the helper goes with the last env test.
+None.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 

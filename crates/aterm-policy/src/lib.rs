@@ -170,6 +170,27 @@ impl Response {
     pub const fn is_drop(self) -> bool {
         matches!(self, Self::Drop | Self::Warn)
     }
+
+    /// Map a response to its strictness rank, from [`Response::Drop`] (`4`, strictest) down to
+    /// [`Response::Execute`] (`0`, loosest).
+    #[must_use]
+    #[inline]
+    pub const fn strictness_rank(self) -> u8 {
+        match self {
+            Self::Drop => 4,
+            Self::Warn => 3,
+            Self::Rewrite => 2,
+            Self::Ask => 1,
+            Self::Execute => 0,
+        }
+    }
+
+    /// Return `true` when `self` is at least as strict as `other`.
+    #[must_use]
+    #[inline]
+    pub const fn is_at_least_as_strict_as(self, other: Self) -> bool {
+        self.strictness_rank() >= other.strictness_rank()
+    }
 }
 
 /// Policy defaults: fallthrough behavior when no rule matches.

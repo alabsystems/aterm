@@ -421,7 +421,10 @@ fn represented_sync(
         ("added", added),
         ("kept", kept),
         ("extra", extra),
-        ("reports", i64::from(report.is_some_and(valid_report))),
+        (
+            "reports",
+            i64::from(report.is_some_and(|report| valid_report(report))),
+        ),
         ("preserved", i64::from(preserved)),
         ("repeat", i64::from(stable)),
     ]

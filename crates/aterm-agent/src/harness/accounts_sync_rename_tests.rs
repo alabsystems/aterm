@@ -27,7 +27,13 @@ impl Bed {
         store
             .transact_logins(NOW, &mut None, |state, logins| {
                 seed_reference(state, logins, "m1", 0);
-                Ok(Vec::new())
+                Ok(accounts::note_auth_in_context(
+                    state,
+                    logins,
+                    "m1",
+                    accounts::Auth::Ok,
+                    NOW - 1,
+                ))
             })
             .unwrap();
         let fleet = parse_accounting_csv(
@@ -456,6 +462,9 @@ fn rename_sync_refuses_fleet_output_aliased_to_account_authority() {
 #[test]
 fn rename_sync_resumes_after_wake_failure_without_repeating_the_move() {
     let bed = Bed::new();
+    if bed.store.wake_path().exists() {
+        fs::rename(bed.store.wake_path(), bed.root.path().join("setup-wake")).unwrap();
+    }
     fs::create_dir(bed.store.wake_path()).unwrap();
     let why = bed
         .sync()

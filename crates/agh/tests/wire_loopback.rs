@@ -501,7 +501,11 @@ fn through_the_environment(env: agh::identity::MapEnv, url: &str) -> WireError {
         url.to_string(),
         Vec::new(),
         LIMIT,
-        Deadlines::JSON,
+        // The proxy's 407 answers inside the connect phase, and that answer must come.
+        Deadlines {
+            connect: common::HANG,
+            ..Deadlines::JSON
+        },
     );
     transport
         .round_trip(request)

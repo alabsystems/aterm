@@ -42,9 +42,9 @@ fn a_fresh_gpu_renderers_first_snapshot_paints_every_fallback_glyph() {
     }
     term.process(bytes.as_bytes());
     let mut input = term.cell_frame(rows, cols);
-    for row in 0..rows {
+    for (row, cells) in input.cells[..rows].iter_mut().enumerate() {
         for (i, &ch) in probed.iter().enumerate() {
-            let cell = &mut input.cells[row][1 + 2 * i];
+            let cell = &mut cells[1 + 2 * i];
             assert_eq!(cell.ch, ch, "row {row}: the glyph sits at its column");
             cell.text_presentation = true; // the band's presentation
         }

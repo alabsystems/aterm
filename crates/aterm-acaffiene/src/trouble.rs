@@ -182,6 +182,7 @@ mod tests {
             state_dir: dir.join("state"),
             home: dir.join("home"),
             logs_dir: dir.join("logs"),
+            local_volume: |_| true,
         }
     }
 

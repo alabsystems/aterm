@@ -884,6 +884,357 @@ fn a_delayed_program_tick_keeps_the_observed_claims_rollout_span() {
     );
 }
 
+/// An interruption read for the next vendor turn must not change the previous claim's end.
+/// Direct tracker facts seed the partial rollout; the terminal and real sweep supply both edges.
+#[test]
+fn a_partial_rollout_interrupt_keeps_the_next_claims_outcome() {
+    use aterm_slog::{ShortId, TxEvent, TxPos, TxState};
+
+    for interrupted in [false, true] {
+        let mut tab = CodexTab::new();
+        tab.says_at(DONE, 900);
+        tab.sweep_at(1_000);
+        tab.says_at(WORKING, 1_010);
+        tab.sweep_at(1_015);
+        assert_eq!(tab.turns(), (1, true), "the first claim is running");
+        tab.says_at(DONE, 1_020);
+        tab.says_at(WORKING, 1_030);
+        tab.says_at(DONE, 1_040);
+        tab.hand.set(1_045);
+        {
+            let mut g = tab.ctx.timeline.lock().unwrap();
+            let now = g.slog().now();
+            let slog = g.slog_mut();
+            let tracker = &mut slog.agent.as_mut().expect("codex run").tracker;
+            let pos = |off, ms| TxPos {
+                fp: 1,
+                id: None,
+                off,
+                wall_ms: tab.wall(ms),
+            };
+            tracker.transcript(
+                &mut slog.log,
+                TxEvent::Bind {
+                    len: 0,
+                    floor_ms: tab.wall(1_000),
+                },
+                pos(0, 1_000),
+                TxState::Partial,
+                now,
+            );
+            tracker.transcript(
+                &mut slog.log,
+                TxEvent::Prompt {
+                    vref: ShortId::new("next").unwrap(),
+                },
+                pos(1, 1_030),
+                TxState::Partial,
+                now,
+            );
+            if interrupted {
+                tracker.transcript(
+                    &mut slog.log,
+                    TxEvent::Interrupt,
+                    pos(2, 1_040),
+                    TxState::Partial,
+                    now,
+                );
+            }
+        }
+        assert_eq!(tab.turns(), (1, true), "no engine edge was swept yet");
+        tab.sweep_at(1_050);
+        let lines = tab.turn_lines();
+        assert_eq!(tab.turns(), (2, false), "two completed claims: {lines:#?}");
+        let opens: Vec<_> = lines
+            .iter()
+            .filter(|line| line.contains(" open t"))
+            .collect();
+        let closes: Vec<_> = lines
+            .iter()
+            .filter(|line| line.contains(" close t"))
+            .collect();
+        assert_eq!((opens.len(), closes.len()), (2, 2), "{lines:#?}");
+        for ((open, close), (began, ended)) in opens
+            .iter()
+            .zip(&closes)
+            .zip([(1_015, 1_020), (1_030, 1_040)])
+        {
+            assert_eq!(node_of(open), node_of(close), "matching claim: {lines:#?}");
+            assert!(
+                open.ends_with(&format!(" t={}", tab.wall(began))),
+                "{lines:#?}"
+            );
+            assert!(
+                close.ends_with(&format!(" t={}", tab.wall(ended))),
+                "{lines:#?}"
+            );
+            assert!(close.contains(" src=engine conf=claim "), "{lines:#?}");
+        }
+        assert!(
+            closes[0].contains(" turn out=done "),
+            "the earlier turn was not interrupted ({interrupted}): {lines:#?}"
+        );
+        let expected = if interrupted { "interrupted" } else { "done" };
+        assert!(
+            closes[1].contains(&format!(" turn out={expected} ")),
+            "the next turn keeps its own outcome ({interrupted}): {lines:#?}"
+        );
+    }
+}
+
+/// Distinct vendor turns must remain distinguishable when their engine reports one working span.
+/// A single vendor turn is the control; partial input carries no extra outcome authority here.
+#[test]
+fn partial_vendor_turns_keep_distinct_identities_inside_one_claimed_span() {
+    use aterm_slog::{Key, Kind, ShortId, TxEvent, TxPos, TxState, Val};
+
+    for vendor_turns in [1, 2] {
+        let mut tab = CodexTab::new();
+        tab.says_at(DONE, 900);
+        tab.sweep_at(1_000);
+        tab.says_at(WORKING, 1_010);
+        tab.sweep_at(1_015);
+        assert_eq!(tab.turns(), (1, true));
+        tab.hand.set(1_055);
+        {
+            let mut g = tab.ctx.timeline.lock().unwrap();
+            let now = g.slog().now();
+            let slog = g.slog_mut();
+            let tracker = &mut slog.agent.as_mut().expect("codex run").tracker;
+            tracker.transcript(
+                &mut slog.log,
+                TxEvent::Bind {
+                    len: 0,
+                    floor_ms: tab.wall(1_000),
+                },
+                TxPos {
+                    fp: 1,
+                    id: None,
+                    off: 0,
+                    wall_ms: tab.wall(1_000),
+                },
+                TxState::Partial,
+                now,
+            );
+            for (index, (id, began, ended)) in [("first", 1_020, 1_030), ("second", 1_040, 1_052)]
+                .into_iter()
+                .take(vendor_turns)
+                .enumerate()
+            {
+                for (offset, ms, event) in [
+                    (
+                        1,
+                        began,
+                        TxEvent::Prompt {
+                            vref: ShortId::new(id).unwrap(),
+                        },
+                    ),
+                    (
+                        2,
+                        ended,
+                        TxEvent::TurnEnd {
+                            vdur_ms: ended - began,
+                            tok_in: 11 + 6 * index as u64,
+                            tok_out: 13 + 6 * index as u64,
+                        },
+                    ),
+                ] {
+                    let pos = TxPos {
+                        fp: 1,
+                        id: None,
+                        off: 2 * index as u64 + offset,
+                        wall_ms: tab.wall(ms),
+                    };
+                    tracker.transcript(&mut slog.log, event, pos, TxState::Partial, now);
+                    // Re-reading the same accepted row cannot duplicate its evidence.
+                    tracker.transcript(&mut slog.log, event, pos, TxState::Partial, now);
+                }
+            }
+        }
+        tab.says_at(DONE, 1_060);
+        tab.sweep_at(1_065);
+        assert_eq!(
+            tab.turns(),
+            (1, false),
+            "the engine's one working span ended"
+        );
+        let lines = lines_of(&tab.ctx.timeline);
+        let g = tab.ctx.timeline.lock().unwrap();
+        let evidence = g
+            .slog()
+            .log()
+            .window()
+            .filter(|record| {
+                record.k == Kind::Meta
+                    && record.f.get(Key::Field).is_some_and(
+                        |value| matches!(value, Val::Tok(field) if field.as_str() == "vendor-turn"),
+                    )
+            })
+            .collect::<Vec<_>>();
+        let first = ShortId::new("first").unwrap();
+        assert!(
+            evidence
+                .iter()
+                .any(|record| record.f.get(Key::Vref) == Some(&Val::Id(first))),
+            "the first prompt has a recorded identity"
+        );
+        if vendor_turns == 2 {
+            let second = ShortId::new("second").unwrap();
+            assert!(
+                evidence
+                    .iter()
+                    .any(|record| record.f.get(Key::Vref) == Some(&Val::Id(second))),
+                "the second vendor identity must remain available without guessing a span split: {lines:#?}"
+            );
+        }
+        assert_eq!(
+            evidence.len(),
+            2 * vendor_turns,
+            "duplicate rows add no observations"
+        );
+        for record in &evidence {
+            assert!(
+                crate::session_timeline_view::rows_of(record).is_empty(),
+                "raw vendor facts must not become generic metadata changes"
+            );
+            assert_eq!(crate::session_timeline_view::row_span(record), 0);
+        }
+        let mut other_source = (*evidence[0]).clone();
+        other_source.src = aterm_slog::Src::Meta;
+        let mut other_actor = (*evidence[0]).clone();
+        other_actor.by = aterm_slog::Actor::Ctl;
+        for ordinary in [other_source, other_actor] {
+            let rows = crate::session_timeline_view::rows_of(&ordinary);
+            assert_eq!(
+                rows.len(),
+                1,
+                "the same field from another source still projects"
+            );
+            assert_eq!(rows[0].0, crate::session_timeline::META_CHANGE);
+        }
+        for (index, id) in ["first", "second"]
+            .into_iter()
+            .take(vendor_turns)
+            .enumerate()
+        {
+            let id = ShortId::new(id).unwrap();
+            let records = evidence
+                .iter()
+                .filter(|record| record.f.get(Key::Vref) == Some(&Val::Id(id)))
+                .collect::<Vec<_>>();
+            assert_eq!(records.len(), 2);
+            assert_eq!(records[0].f.get(Key::State), Some(&Val::Word("working")));
+            assert_eq!(records[1].f.get(Key::State), Some(&Val::Word("done")));
+            assert_eq!(
+                records[0].t,
+                tab.wall(if index == 0 { 1_020 } else { 1_040 })
+            );
+            assert_eq!(
+                records[1].t,
+                tab.wall(if index == 0 { 1_030 } else { 1_052 })
+            );
+            assert_eq!(
+                records[1].f.get(Key::VdurMs),
+                Some(&Val::U(if index == 0 { 10 } else { 12 }))
+            );
+            assert_eq!(
+                records[1].f.get(Key::TokIn),
+                Some(&Val::U(11 + 6 * index as u64))
+            );
+            assert_eq!(
+                records[1].f.get(Key::TokOut),
+                Some(&Val::U(13 + 6 * index as u64))
+            );
+            assert_eq!(
+                records[0].f.get(Key::Why),
+                (index == 1).then_some(&Val::Word("ambiguous"))
+            );
+            assert!(!records[0].is_bus_class());
+        }
+        let turn = g.slog().log().state().last[1].as_ref().unwrap();
+        assert_eq!(turn.f.get(Key::Vref), Some(&Val::Id(first)));
+        assert_eq!(turn.f.get(Key::VdurMs), Some(&Val::U(10)));
+        assert_eq!(turn.f.get(Key::TokIn), Some(&Val::U(11)));
+        assert_eq!(turn.f.get(Key::TokOut), Some(&Val::U(13)));
+    }
+}
+
+#[test]
+fn a_second_partial_vendor_interrupt_does_not_own_the_first_named_claim() {
+    use aterm_slog::{ShortId, TxEvent, TxPos, TxState};
+    let mut tab = CodexTab::new();
+    tab.says_at(DONE, 900);
+    tab.sweep_at(1_000);
+    tab.says_at(WORKING, 1_010);
+    tab.sweep_at(1_015);
+    tab.hand.set(1_055);
+    {
+        let mut g = tab.ctx.timeline.lock().unwrap();
+        let now = g.slog().now();
+        let slog = g.slog_mut();
+        let tracker = &mut slog.agent.as_mut().unwrap().tracker;
+        for (off, ms, event) in [
+            (
+                0,
+                1_000,
+                TxEvent::Bind {
+                    len: 0,
+                    floor_ms: tab.wall(1_000),
+                },
+            ),
+            (
+                1,
+                1_020,
+                TxEvent::Prompt {
+                    vref: ShortId::new("first").unwrap(),
+                },
+            ),
+            (
+                2,
+                1_030,
+                TxEvent::TurnEnd {
+                    vdur_ms: 10,
+                    tok_in: 11,
+                    tok_out: 13,
+                },
+            ),
+            (
+                3,
+                1_040,
+                TxEvent::Prompt {
+                    vref: ShortId::new("second").unwrap(),
+                },
+            ),
+            (4, 1_050, TxEvent::Interrupt),
+        ] {
+            tracker.transcript(
+                &mut slog.log,
+                event,
+                TxPos {
+                    fp: 1,
+                    id: None,
+                    off,
+                    wall_ms: tab.wall(ms),
+                },
+                TxState::Partial,
+                now,
+            );
+        }
+    }
+    tab.says_at(DONE, 1_060);
+    tab.sweep_at(1_065);
+    let lines = tab.turn_lines();
+    assert_eq!(tab.turns(), (1, false), "one engine span: {lines:#?}");
+    assert_eq!(lines.len(), 2);
+    assert_eq!(node_of(&lines[0]), node_of(&lines[1]));
+    assert!(lines[0].ends_with(&format!(" t={}", tab.wall(1_015))));
+    assert!(lines[1].ends_with(&format!(" t={}", tab.wall(1_060))));
+    assert!(
+        lines[1].contains(" turn out=done "),
+        "a contained interruption from another vendor identity is not this claim's outcome: {lines:#?}"
+    );
+}
+
 /// THE EDGES' TURNS SPEND THE RUN'S PROGRAM BUCKET: 2,000 sweeps 50 ms apart on the log's clock,
 /// a whole codex turn between each two that no sweep shows, open no more turns than the bucket
 /// pays for (its burst, then one a second: 100 s), and still about one a second.

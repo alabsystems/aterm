@@ -369,6 +369,15 @@ fn state_and_roster_writers_can_follow_pending_local_login_publication() {
         let obstruction = Obstruction::new(f.store.logins_witness_file());
         assert!(f.write(1).is_err());
         obstruction.repair();
+        let admitted_ledger = f
+            .store
+            .receipt()
+            .unwrap()
+            .unwrap()
+            .plan
+            .unwrap()
+            .ledger
+            .after;
         if following == 0 {
             f.store
                 .transact(NOW, &mut None, |state| {
@@ -398,7 +407,24 @@ fn state_and_roster_writers_can_follow_pending_local_login_publication() {
                 .unwrap();
         }
         assert_eq!(f.store.load_logins(NOW).unwrap().0.generation_clock, 2);
-        assert_eq!(f.store.tail(10).unwrap().len(), 3);
+        assert_eq!(
+            read(&f.store.ledger_path(), MAX_LEDGER).unwrap(),
+            admitted_ledger
+        );
+        assert_eq!(
+            f.store
+                .tail(10)
+                .unwrap()
+                .iter()
+                .filter(|event| event.kind == Kind::Renewed)
+                .count(),
+            2
+        );
+        assert!(f.write(1).unwrap().is_empty());
+        assert_eq!(
+            read(&f.store.ledger_path(), MAX_LEDGER).unwrap(),
+            admitted_ledger
+        );
         assert!(f.preserved());
     }
 }

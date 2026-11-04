@@ -175,9 +175,15 @@ impl RecordBudgets {
     /// whatever loads or builds a log (a records file, a removal plan, a proof's admission). The
     /// budgets before come back when `run` returns or unwinds.
     ///
+    /// The held total may be raised past [`MAX_HELD_RECORDS`], up to the two budgets together
+    /// (where the activation slice puts it), so a test can hold a log past [`LEGACY_RECORDS`]
+    /// (`crate::crossing`). Network streams stay bounded by [`MAX_HELD_RECORDS`]. Local-file
+    /// recovery uses the receiving store's held budget, so such a log can be written and
+    /// reopened without losing its tail.
+    ///
     /// # Panics
-    /// A budget is larger than [`RecordBudgets::PRODUCTION`]'s: the weighing and the streams are
-    /// sized for those.
+    /// The weighed or keyed budget is larger than [`RecordBudgets::PRODUCTION`]'s (the weighing
+    /// is sized for those), or the held total is larger than the two together.
     #[cfg(any(test, debug_assertions))]
     #[doc(hidden)]
     pub fn within<T>(self, run: impl FnOnce() -> T) -> T {
@@ -190,8 +196,8 @@ impl RecordBudgets {
         assert!(
             self.weighed <= MAX_WEIGHED_RECORDS
                 && self.keyed <= MAX_KEYED_RECORDS
-                && self.held <= MAX_HELD_RECORDS,
-            "a test's record budgets stay within the production ones"
+                && self.held <= MAX_WEIGHED_RECORDS + MAX_KEYED_RECORDS,
+            "a test's record budgets stay within the production weighed and keyed ones"
         );
         let _restore = Restore(WITHIN.with(|within| within.replace(Some(self))));
         run()

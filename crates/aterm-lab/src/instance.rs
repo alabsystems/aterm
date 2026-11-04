@@ -56,7 +56,7 @@ pub(crate) fn write_aterm_toml(path: &Path, text: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// How long an instance may take to listen.
+/// One-minute hang detector for startup: a version probe or an instance listening.
 pub const BOOT: Duration = Duration::from_secs(60);
 
 /// The scratch world an instance runs in.
@@ -1212,26 +1212,9 @@ fn cold_copy(world: &mut World, aterm: &Path) -> Result<ColdCopy, Fail> {
         Some(bundle) => root.join(aterm.strip_prefix(bundle).unwrap_or(aterm)),
         None => root.clone(),
     };
-    let ran = aterm_uds::spawnfd::command(&exe)
-        .arg("--version")
-        .env_clear()
-        .envs(world.env())
-        .stdin(Stdio::null())
-        .output();
-    if !ran
-        .as_ref()
-        .is_ok_and(|out| out.stdout.starts_with(b"aterm "))
-    {
-        world.keep();
-        return Err(Fail::die(format!(
-            "instance: the copy {} never printed its version ({}); the world is kept",
-            exe.display(),
-            ran.map_or_else(
-                |e| e.to_string(),
-                |out| String::from_utf8_lossy(&out.stderr).trim().to_string()
-            )
-        )));
-    }
+    prove_cold_version(world, &exe, |cmd| {
+        aterm_uds::deadline::output_within(cmd, BOOT)
+    })?;
     crate::sys::evict_pages(&root)
         .map_err(|e| format!("instance: cannot evict {}: {e}", root.display()))?;
     match crate::sys::resident_pages(&root) {
@@ -1249,6 +1232,44 @@ fn cold_copy(world: &mut World, aterm: &Path) -> Result<ColdCopy, Fail> {
             root.display()
         ))),
     }
+}
+
+/// Require a completed version probe before allowing this world's copy to be removed.
+fn prove_cold_version(
+    world: &mut World,
+    exe: &Path,
+    run: impl FnOnce(
+        &mut aterm_uds::spawnfd::Command,
+    ) -> Result<std::process::Output, aterm_uds::deadline::RunError>,
+) -> Result<(), Fail> {
+    let requested_keep = world.keep;
+    world.keep();
+    let mut cmd = aterm_uds::spawnfd::command(exe);
+    cmd.arg("--version")
+        .current_dir(&world.dir)
+        .env_clear()
+        .envs(world.env())
+        .stdin(Stdio::null());
+    let ran = run(&mut cmd);
+    if !ran
+        .as_ref()
+        .is_ok_and(|out| out.status.success() && out.stdout.starts_with(b"aterm "))
+    {
+        return Err(Fail::die(format!(
+            "instance: the copy {} did not complete its version probe ({}); the world is kept",
+            exe.display(),
+            ran.map_or_else(
+                |e| e.to_string(),
+                |out| format!(
+                    "{}: {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )
+            )
+        )));
+    }
+    world.keep = requested_keep;
+    Ok(())
 }
 
 /// Copy `from` to the new path `to`: a directory's tree, its symbolic links as links.
@@ -1583,6 +1604,60 @@ mod owned_world_store_tests {
 mod cold_copy_tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::process::ExitStatusExt as _;
+
+    fn version_output(code: i32, stdout: &[u8]) -> std::process::Output {
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.to_vec(),
+            stderr: Vec::new(),
+        }
+    }
+
+    /// A timed-out probe, a failed process that printed a banner, and a wrong banner all
+    /// leave the world in place. No executable is started by these injected failure effects.
+    #[test]
+    fn an_unproven_cold_version_keeps_its_world() {
+        for result in [
+            Err(aterm_uds::deadline::RunError::TimedOut),
+            Ok(version_output(1, b"aterm 0.0.0\n")),
+            Ok(version_output(0, b"another program\n")),
+        ] {
+            let mut world = World::new(CONFIG_OFF).unwrap();
+            let dir = world.dir.clone();
+            let exe = dir.join("unstarted");
+            std::fs::write(&exe, b"not an executable").unwrap();
+            let failed = prove_cold_version(&mut world, &exe, |cmd| {
+                assert_eq!(cmd.get_current_dir(), Some(dir.as_path()));
+                assert_eq!(cmd.get_args().collect::<Vec<_>>(), ["--version"]);
+                result
+            });
+            assert!(failed.is_err());
+            drop(world);
+            assert!(exe.is_file(), "an unproven image's directory was removed");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    /// Successful proof restores the caller's keep choice, rather than clearing an explicit
+    /// request to retain the world. The ordinary cleanup arm is the negative control.
+    #[test]
+    fn a_proven_cold_version_preserves_the_callers_keep_choice() {
+        for keep in [false, true] {
+            let mut world = World::new(CONFIG_OFF).unwrap();
+            let dir = world.dir.clone();
+            world.keep = keep;
+            prove_cold_version(&mut world, &dir.join("unstarted"), |_| {
+                Ok(version_output(0, b"aterm 0.0.0\n"))
+            })
+            .unwrap();
+            drop(world);
+            assert_eq!(dir.exists(), keep);
+            if keep {
+                std::fs::remove_dir_all(dir).unwrap();
+            }
+        }
+    }
 
     #[test]
     fn a_cold_copy_of_a_link_is_the_file_it_names_with_no_page_resident() {

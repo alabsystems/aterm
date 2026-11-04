@@ -29,6 +29,7 @@ use std::{
 };
 
 pub(crate) mod enrollment;
+mod frontier;
 mod peers;
 
 /// At most 4.5 MiB of sealed nodes are buffered per direction. The durable
@@ -124,14 +125,14 @@ pub struct Report {
 }
 
 /// How long a peer is offered no membership records once it has refused every record this Mac
-/// could offer it under one pair of complete inventories ([`MembershipHint`]). Under that
+/// could offer it under one pair of complete-history views ([`MembershipHint`]). Under that
 /// evidence only a busy or failing disk makes the next offer fare differently; the hold bounds
 /// how late such a refusal is retried, as `network::Repair`'s deferral lapses after the same 60 s.
 const REFUSAL_HOLD: Duration = Duration::from_secs(60);
 
 /// Per-peer membership-record scheduling, never a claim of delivery: where the next round's
 /// selection resumes, and the run of rounds the peer took none of under one pair of complete
-/// inventories.
+/// history views.
 #[derive(Clone, Default, Debug)]
 struct MembershipHint {
     cursor: Option<Digest>,
@@ -139,10 +140,10 @@ struct MembershipHint {
 }
 
 /// Consecutive rounds a peer durably took none of, all offered under one pair of complete
-/// inventories.
+/// history views.
 #[derive(Clone, Copy, Debug)]
 struct Refusal {
-    /// [`hold_key`] of both inventories, so a change on either side ends the run.
+    /// Digest of both history views and protocol bounds, so a change ends the run.
     key: Digest,
     /// The run's first offered record. A refused round that offers it again has offered every
     /// record the peer lacks at least once since the run began.
@@ -153,10 +154,10 @@ struct Refusal {
 }
 
 impl MembershipHint {
-    /// Whether a round at `now`, under the inventories whose [`hold_key`] is `key`, offers the
+    /// Whether a round at `now`, under the history views whose digest is `key`, offers the
     /// peer anything: not for [`REFUSAL_HOLD`] after a run under that key proved it refuses
     /// everything. Two full stores on different branches otherwise re-offered 16 refused records
-    /// a round, three rounds a pass, every pass. A change of either inventory ends the run.
+    /// a round, three rounds a pass, every pass. A change of either history view ends the run.
     fn offers(&mut self, key: &Digest, now: Instant) -> bool {
         match self.refused {
             Some(run) if run.key != *key => {
@@ -170,12 +171,11 @@ impl MembershipHint {
         }
     }
 
-    /// Note a round that offered `offered`, in selection order, under the inventories whose
-    /// [`hold_key`] is `key`, of which the peer durably took `taken`. The peer refuses whatever
+    /// Note a round that offered `offered`, in selection order, under the history views whose
+    /// digest is `key`, of which the peer durably took `taken`. The peer refuses whatever
     /// this Mac can offer once a run of refused rounds offered every record it lacks (the run's
     /// first record comes round again), or at once when `full`: a peer whose complete records
-    /// reach `LEGACY_RECORDS` (the most this wire's inventory names, and a 0.146-0.151 build's
-    /// held total) takes no complete record (`Log::insert`). A run short of that proves
+    /// reach its held total takes no new complete record (`Log::insert`). A run short of that proves
     /// nothing, as a busy disk refuses a round and a peer parks a record whose parent it lacks
     /// without taking it. Once proved, the walk restarts at the earliest record the peer lacks,
     /// so the round after the hold offers parents before their children, and a refused round
@@ -189,14 +189,7 @@ impl MembershipHint {
             return;
         }
         let proved = match &mut self.refused {
-            Some(run) if run.key == key => {
-                if run.held.is_some() {
-                    run.held = Some(now);
-                    false
-                } else {
-                    offered.contains(&run.first)
-                }
-            }
+            Some(run) if run.key == key => run.held.is_some() || offered.contains(&run.first),
             _ => {
                 self.refused = Some(Refusal {
                     key,
@@ -276,8 +269,8 @@ impl Repair {
         self.unanswered = false;
         self.clear_application();
     }
-    /// This round's initiator sent its hello over an established channel and the peer closed or
-    /// went quiet before sending its own. A responder answers only once it has admitted the
+    /// This round's initiator requested authority evidence and the peer closed or
+    /// went quiet before sending it. A responder answers only once it has admitted the
     /// round, so this is how contention looks from the dialing side (a crossed dial whose other
     /// channel holds the pair, a peer cache at capacity, a preferred round that waited out its
     /// deadline), and equally a peer that refuses this Mac or has not yet approved its enrollment:
@@ -287,8 +280,16 @@ impl Repair {
     }
     /// Receive the peer's hello; an initiator that gets none of it marks [`Self::unanswered`].
     fn receive_answer(&mut self, stream: &mut impl Read, side: Side) -> Result<Vec<u8>> {
+        self.receive_bounded_answer(stream, side, MAX_ACX2_HELLO)
+    }
+    fn receive_bounded_answer(
+        &mut self,
+        stream: &mut impl Read,
+        side: Side,
+        max: usize,
+    ) -> Result<Vec<u8>> {
         let n = read_u32(stream).inspect_err(|_| self.unanswered = side == Side::Initiator)?;
-        frame_body(stream, n, MAX_ACX2_HELLO)
+        frame_body(stream, n, max)
     }
     /// An older application probe failed before any application data was sent.
     pub(crate) fn retry_application_probe(&self) -> bool {
@@ -423,6 +424,10 @@ pub struct Endpoint {
     actor: Actor,
     identity: NodeIdentity,
     hello: Vec<u8>,
+    /// Verified construction history remains a trust anchor when current custody is unreadable.
+    snapshot_log: Option<Arc<aterm_secrets::membership_log::Log>>,
+    /// The history this endpoint was built from must not become legacy-compatible by shrinking.
+    records_bound: aterm_secrets::crossing::RecordsBound,
     /// This device's signed version, traded after a completed round; empty while pending.
     report: Vec<u8>,
     application: Option<crate::replica::Replica>,
@@ -439,6 +444,9 @@ pub struct Endpoint {
     /// Use the released 0.146 projection and `atdb/2` TLS offer in wire tests.
     #[cfg(test)]
     pub(crate) legacy_projection: bool,
+    /// Use the released `atdb/3` offer when a test specifically exercises that boundary.
+    #[cfg(test)]
+    pub(crate) legacy_credentials: bool,
 }
 
 /// One exchange's absolute deadline: the product's [`crate::network::WITHIN`]. A test needs each
@@ -454,11 +462,13 @@ enum Protocol {
     Legacy,
     Repair,
     Credentials,
+    Frontier,
 }
 
 impl Protocol {
     fn from_alpn(alpn: Option<&[u8]>) -> Self {
         match alpn {
+            Some(frontier::ALPN) => Self::Frontier,
             Some(fleet::ALPN_DATABASE_CREDENTIALS) => Self::Credentials,
             Some(fleet::ALPN_DATABASE_REPAIR) => Self::Repair,
             _ => Self::Legacy,
@@ -466,7 +476,28 @@ impl Protocol {
     }
 }
 
+fn require_legacy_bound(bound: aterm_secrets::crossing::RecordsBound) -> Result<()> {
+    if bound.crossed {
+        return Err(Error::new(
+            "crossed membership history requires a database protocol newer than atdb/3",
+        ));
+    }
+    Ok(())
+}
+
 impl Endpoint {
+    /// Legacy protocols carry no crossed-state metadata. Read the durable mark even when
+    /// the endpoint's cached witness or the current records file is short.
+    fn require_legacy_records(&self) -> Result<()> {
+        require_legacy_bound(self.records_bound)?;
+        if let Some(paths) = &self.paths {
+            let crossed = aterm_secrets::client::records_marked_crossed(paths)
+                .map_err(|error| local_failure("records protocol", error))?;
+            require_legacy_bound(aterm_secrets::crossing::RecordsBound::here(crossed))?;
+        }
+        Ok(())
+    }
+
     /// Reuse only volatile repair hints for this same pinned trust and local
     /// writer. Every new connection still authenticates before leasing them.
     pub(crate) fn with_repair_cache(mut self, cache: &PeerCache) -> Self {
@@ -517,7 +548,7 @@ impl Endpoint {
                     bootstrap.journal_dir(),
                     bootstrap.trust(),
                     &request,
-                    &log_witness,
+                    log_witness,
                     seed,
                 )?;
                 endpoint.paths = Some(bootstrap.paths().clone());
@@ -698,7 +729,7 @@ impl Endpoint {
                         bootstrap.journal_dir(),
                         bootstrap.trust(),
                         &request,
-                        &log_witness,
+                        log_witness,
                         seed,
                     )?;
                     endpoint.paths = Some(bootstrap.paths().clone());
@@ -806,6 +837,8 @@ impl Endpoint {
                 actor: request.binding().actor(),
                 identity,
                 hello,
+                snapshot_log: None,
+                records_bound: aterm_secrets::crossing::RecordsBound::uncrossed(),
                 report: Vec::new(),
                 application: None,
                 peers: Arc::default(),
@@ -818,6 +851,8 @@ impl Endpoint {
                 legacy_repair: false,
                 #[cfg(test)]
                 legacy_projection: false,
+                #[cfg(test)]
+                legacy_credentials: false,
             })
         })
     }
@@ -846,10 +881,29 @@ impl Endpoint {
         dir: &Path,
         trust: Trust,
         request: &Request,
-        log_witness: &[u8],
+        log: Arc<aterm_secrets::membership_log::Log>,
         seed: &[u8; 32],
     ) -> Result<Self> {
-        let _ = check_log_witness(trust, request, log_witness)?;
+        let binding = request.binding();
+        if trust.genesis == [0; 32]
+            || *binding.network() != trust.network
+            || *binding.authority() != trust.authority
+            || !matches!(
+                log.genesis().body(),
+                aterm_secrets::membership_log::Body::Genesis { root, .. }
+                    if root.network == trust.network && root.authority == trust.authority
+            )
+        {
+            return Err(Error::new(
+                "Commons local witness belongs to another network",
+            ));
+        }
+        if log.held_count() > aterm_secrets::membership_log::RecordBudgets::current().held {
+            return Err(Error::new(
+                "Commons local witness exceeds its record capacity",
+            ));
+        }
+        admit_by_log_witness(&log, binding)?;
         let identity = NodeIdentity::from_seed(
             &aterm_codec::hex::encode_lower(request.binding().incarnation()),
             seed,
@@ -865,7 +919,9 @@ impl Endpoint {
         hello.extend_from_slice(&trust.authority);
         hello.extend_from_slice(&trust.genesis);
         hello.extend_from_slice(request.bytes());
-        hello.extend_from_slice(log_witness);
+        hello.extend_from_slice(&aterm_secrets::membership_log::encode_records(
+            log.records(),
+        ));
         let actor = request.binding().actor();
         let report = hearing::report(seed, trust.network, &actor, Version::own())
             .map_err(|error| local_failure("version report", error))?;
@@ -875,6 +931,10 @@ impl Endpoint {
             actor,
             identity,
             hello,
+            records_bound: aterm_secrets::crossing::RecordsBound::here(
+                aterm_secrets::crossing::past_legacy(log.held_count()),
+            ),
+            snapshot_log: Some(log),
             report,
             application: None,
             credentials: None,
@@ -887,6 +947,8 @@ impl Endpoint {
             legacy_repair: false,
             #[cfg(test)]
             legacy_projection: false,
+            #[cfg(test)]
+            legacy_credentials: false,
         })
     }
 
@@ -923,6 +985,8 @@ impl Endpoint {
             actor,
             identity,
             hello,
+            snapshot_log: None,
+            records_bound: aterm_secrets::crossing::RecordsBound::uncrossed(),
             report,
             application: None,
             credentials: None,
@@ -935,6 +999,8 @@ impl Endpoint {
             legacy_repair: false,
             #[cfg(test)]
             legacy_projection: false,
+            #[cfg(test)]
+            legacy_credentials: false,
         })
     }
 
@@ -976,6 +1042,8 @@ impl Endpoint {
                     #[cfg(test)]
                     let handshake = if self.legacy_projection {
                         fleet::test_client_handshake_database_v2_as
+                    } else if self.legacy_credentials {
+                        fleet::test_client_handshake_database_v3_as
                     } else {
                         handshake
                     };
@@ -1018,6 +1086,8 @@ impl Endpoint {
                     #[cfg(test)]
                     let handshake = if self.legacy_projection {
                         fleet::test_server_handshake_database_v2_as
+                    } else if self.legacy_credentials {
+                        fleet::test_server_handshake_database_v3_as
                     } else {
                         handshake
                     };
@@ -1085,9 +1155,13 @@ impl Endpoint {
         until: Instant,
         protocol: Protocol,
     ) -> Result<Report> {
+        if protocol == Protocol::Frontier {
+            return frontier::connected(self, stream, proof, side, repair, until);
+        }
         let recovery_first = protocol != Protocol::Legacy;
         repair.begin_round();
         repair.phase = Phase::Membership;
+        self.require_legacy_records()?;
         if self.pending {
             if side != Side::Initiator {
                 return Err(Error::new("pending enrollment cannot accept connections"));
@@ -1129,6 +1203,7 @@ impl Endpoint {
         lease.clear_application();
         lease.phase = Phase::Membership;
         if side == Side::Responder {
+            self.require_legacy_records()?;
             send_frame(stream, &self.hello)?;
         }
         #[cfg(test)]
@@ -1161,6 +1236,7 @@ impl Endpoint {
                     lease.phase = Phase::VersionReport;
                     lease.said = self.trade_reports(stream, actor, side);
                     if common & 4 != 0 {
+                        self.require_legacy_records()?;
                         lease.phase = Phase::Credentials;
                         if let (Some(paths), Some((owner, config))) =
                             (&self.paths, &self.credentials)
@@ -1211,7 +1287,7 @@ impl Endpoint {
 
     /// Synchronize verified membership records (`ACX2`) across bounded passes before control/table
     /// repair. It signs no record: the vault pass's ranked closer and tender close `Wrap` gaps and
-    /// coalesce concurrent epochs ([`aterm_secrets::client::tend_epochs`], `F18`).
+    /// coalesce concurrent epochs ([`aterm_secrets::client::vault_pass_at`], `F18`).
     fn sync_acx2_membership(
         &self,
         stream: &mut (impl Read + Write),
@@ -1240,6 +1316,7 @@ impl Endpoint {
         both_acx2: bool,
         protocol: Protocol,
     ) -> Result<u8> {
+        self.require_legacy_records()?;
         const RECORDS: u8 = 1;
         const APPLICATION: u8 = 2;
         let credentials = if protocol == Protocol::Credentials {
@@ -1312,6 +1389,7 @@ impl Endpoint {
         side: Side,
         repair: &mut Repair,
     ) -> Option<Report> {
+        self.require_legacy_records().ok()?;
         const READY: &[u8; 4] = b"ALMR";
         const NONE: &[u8; 4] = b"ALMN";
         let own_tag: &[u8; 4] = if self.paths.is_some() { READY } else { NONE };
@@ -1346,6 +1424,7 @@ impl Endpoint {
         side: Side,
         repair: &mut Repair,
     ) -> Result<Report> {
+        self.require_legacy_records()?;
         exchange(
             stream,
             &Disk {
@@ -1365,6 +1444,12 @@ impl Endpoint {
         repair: &mut Repair,
         protocol: Protocol,
     ) {
+        if protocol != Protocol::Frontier
+            && let Err(error) = self.require_legacy_records()
+        {
+            repair.application_error = Some(error.to_string());
+            return;
+        }
         if let Some(application) = &self.application {
             repair.phase = Phase::Application;
             #[cfg(test)]
@@ -1375,7 +1460,7 @@ impl Endpoint {
                 repair.application = result.ok();
                 return;
             }
-            let result = if protocol == Protocol::Credentials {
+            let result = if matches!(protocol, Protocol::Credentials | Protocol::Frontier) {
                 application.exchange(stream, actor, side, &mut repair.data)
             } else {
                 application.exchange_with_compatibility(stream, actor, side, &mut repair.data)
@@ -1387,8 +1472,9 @@ impl Endpoint {
 }
 
 /// The decoded membership-log witnesses this process holds: room for one per peer a full roster
-/// has ([`WITNESS_ENTRIES`]), within the byte bound 16 maximal witnesses had before
-/// ([`WITNESS_BYTES`]).
+/// has ([`WITNESS_ENTRIES`]), within the bytes 16 maximal witnesses took on the wire
+/// ([`WITNESS_BYTES`]). Each decoded log counts its record bytes and reachability index
+/// ([`aterm_secrets::membership_log::Log::footprint`]).
 const WITNESS_ENTRIES: usize = aterm_secrets::commons::roster::MAX_MEMBERS + 1;
 const WITNESS_BYTES: usize = 16 * (MAX_ACX2_HELLO - HELLO_FIXED);
 
@@ -1447,13 +1533,12 @@ impl WitnessLogs {
         Some(held)
     }
 
-    /// Keep `log`, decoded from `digest` (`bytes` long) under `trust`, as having admitted
+    /// Keep `log`, decoded from `digest` under `trust`, as having admitted
     /// `request`, evicting the least recently used entries beyond either bound.
     fn keep(
         &self,
         trust: Trust,
         digest: [u8; 32],
-        bytes: usize,
         log: &Arc<aterm_secrets::membership_log::Log>,
         request: &[u8],
     ) {
@@ -1468,7 +1553,7 @@ impl WitnessLogs {
             None => WitnessEntry {
                 trust,
                 digest,
-                bytes,
+                bytes: log.footprint(),
                 log: log.clone(),
                 admitted: Vec::new(),
             },
@@ -1515,7 +1600,7 @@ impl WitnessLogs {
             }
         };
         admit_by_log_witness(&log, binding)?;
-        self.keep(trust, wire_digest, wire.len(), &log, request_bytes);
+        self.keep(trust, wire_digest, &log, request_bytes);
         Ok(log)
     }
 }
@@ -1523,6 +1608,13 @@ impl WitnessLogs {
 /// Decode a peer's membership-log witness under `trust`, verifying each record into its log.
 fn decode_log_witness(trust: Trust, wire: &[u8]) -> Result<aterm_secrets::membership_log::Log> {
     let records = aterm_secrets::membership_log::decode_records(wire).map_err(failure)?;
+    log_witness_from_records(trust, records)
+}
+
+fn log_witness_from_records(
+    trust: Trust,
+    records: Vec<aterm_secrets::membership_log::Record>,
+) -> Result<aterm_secrets::membership_log::Log> {
     let mut iter = records.into_iter();
     let genesis = iter
         .next()
@@ -2192,7 +2284,11 @@ impl<'a> MembershipDisk<'a> {
                 .map_err(|error| local_failure(op, error))?;
             *guard = Some(store);
         }
-        f(guard.as_ref().expect("populated above"))
+        let store = guard.as_ref().expect("populated above");
+        let bound = aterm_secrets::client::records_bound(self.paths, store)
+            .map_err(|error| local_failure(op, error))?;
+        require_legacy_bound(bound)?;
+        f(store)
     }
 }
 
@@ -2270,6 +2366,7 @@ impl Store for MembershipDisk<'_> {
         if wires.is_empty() {
             return Ok(Vec::new());
         }
+        self.with_store("membership retain protocol", |_| Ok(()))?;
         #[cfg(test)]
         if self.busy.load(std::sync::atomic::Ordering::Relaxed) > 0 {
             self.busy.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);

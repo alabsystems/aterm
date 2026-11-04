@@ -186,6 +186,27 @@ fn observe_store_if_declared_until<T>(
     action(&session, &store, descriptor.scope).map(Some)
 }
 
+/// [`observe_store_if_declared`] on a Mac that may hold no Commons: `None` there too, as
+/// [`peek_catalog`] reads one, since nothing was declared. `deadline` bounds the pass, else
+/// [`admission_deadline`]. This creates nothing, and invalid custody, catalog or declared table
+/// storage remains an error.
+pub(crate) fn observe_store_if_here<T>(
+    paths: &Paths,
+    descriptor: impl FnOnce(&Bootstrap) -> Result<Descriptor>,
+    deadline: Option<std::time::Instant>,
+    action: impl FnOnce(&Session<'_>, &Store, Scope) -> Result<T>,
+) -> Result<Option<T>> {
+    let deadline = deadline.unwrap_or_else(admission_deadline);
+    let observed = crate::generation::observed_paths_until(paths, deadline)?;
+    if Bootstrap::cached(&observed)
+        .map_err(crate::table::failure)?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    observe_store_if_declared_until(paths, descriptor, deadline, action)
+}
+
 /// This Mac's lab and the catalog it holds, read as an observer that creates nothing: `None`
 /// where there is no Commons here, and an empty catalog where none is held yet.
 ///

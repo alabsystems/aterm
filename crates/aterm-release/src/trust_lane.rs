@@ -946,7 +946,8 @@ pub trait Checks {
     /// The host's one-minute load average now; `None` when it cannot be read.
     fn load(&self) -> Option<f64>;
     /// Admits `job`'s memory claim ([`Job::need`]) at the launch gate: the claim, held until
-    /// the check ends, or `None` while it waits for room ([`Admission::admit`]).
+    /// the check ends, or `None` while it waits for room or for its turn at the ledger's lock
+    /// ([`Admission::admit`]).
     fn admit(&mut self, job: &Job) -> Option<Admitted>;
     /// What the check at the launch gate waits for, when one waits ([`Admission::waiting`]);
     /// [`run_slots`] asks only when its last pass found the gate's head waiting.
@@ -998,6 +999,10 @@ impl Admitted {
 /// bound either ([`Admission::held_to`]), which the plan refuses up front unless
 /// `--try-refused`, waits for nothing: it is taken at once, saying so. One below the bound
 /// was admitted by the plan while less was wired, and waits for that to fall like any other.
+/// A claim taken at once is still taken only in its turn ([`aterm_capacity::Waiter::force`]):
+/// a look another admission's hold on the ledger's lock kept from deciding is tried again at
+/// the next pass, as a waiting head's is, so the gate never holds the slots still and an
+/// interrupt ends the run there ([`Checks::interrupted`]).
 /// With no ledger (no home) or one that cannot be written, a check starts unclaimed and says
 /// so.
 pub struct Admission<'m> {
@@ -1015,6 +1020,8 @@ pub struct Admission<'m> {
 struct Head {
     name: String,
     waiter: aterm_capacity::Waiter,
+    /// How it is taken, decided as it entered.
+    taken: Taken,
     /// When it entered, on the slots' clock ([`Checks::now`]).
     entered: Duration,
     /// When it was last looked at; `None` before the first look.
@@ -1023,6 +1030,20 @@ struct Head {
     said: Option<Duration>,
     /// What it waited for at its last look, its holders named.
     short: Option<String>,
+}
+
+/// How the check at the head of the queue is taken.
+#[derive(Debug, PartialEq, Eq)]
+enum Taken {
+    /// Once its need fits beside every claim ahead of it.
+    Fits,
+    /// Room or not (`--admit now`), at its first look that gets the ledger's lock, saying what it
+    /// would have waited for, or that it can never fit (why: a need below the plan's bound, said
+    /// as it entered).
+    Now(Option<String>),
+    /// Room or not, at its first look that gets the ledger's lock: it can never be admitted
+    /// here, as it said when it entered.
+    Never,
 }
 
 impl<'m> Admission<'m> {
@@ -1087,7 +1108,8 @@ impl<'m> Admission<'m> {
             .is_none()
             .then(|| aterm_capacity::never(&need, &self.machine.read(None)))
             .flatten();
-        if let Some(why) = never.take_if(|_| job.need < self.bound) {
+        let below = never.take_if(|_| job.need < self.bound);
+        if let Some(why) = &below {
             say(&format!(
                 "capacity: {why}; {} could be available when this run was planned, so it waits for what is wired to fall",
                 aterm_capacity::gib(self.bound)
@@ -1098,36 +1120,20 @@ impl<'m> Admission<'m> {
                 "capacity: {why}: it can never be admitted here, so it starts at once and holds its claim"
             ));
         }
-        if self.mode == Admit::Now || never.is_some() {
-            let mut quiet = |_: &str| {};
-            let told: &mut dyn FnMut(&str) = if never.is_some() {
-                &mut quiet
-            } else {
-                &mut *say
-            };
-            return Some(
-                match aterm_capacity::admit_with(
-                    ledger,
-                    self.machine,
-                    need,
-                    Admit::Now,
-                    self.pace,
-                    told,
-                ) {
-                    Ok(claim) => Admitted::holding(claim),
-                    Err(e) => {
-                        say(&format!("capacity: {what} starts unclaimed: {e}"));
-                        Admitted::unclaimed()
-                    }
-                },
-            );
-        }
+        let taken = if never.is_some() {
+            Taken::Never
+        } else if self.mode == Admit::Now {
+            Taken::Now(below)
+        } else {
+            Taken::Fits
+        };
         let mut head = match self.head.take() {
             Some(head) => head,
             None => match aterm_capacity::Waiter::enter(ledger, self.machine, need) {
                 Ok(waiter) => Head {
                     name: job.name.clone(),
                     waiter,
+                    taken,
                     entered: now,
                     looked: None,
                     said: None,
@@ -1149,6 +1155,48 @@ impl<'m> Admission<'m> {
             return None;
         }
         let waited = now.saturating_sub(head.entered);
+        if head.taken != Taken::Fits {
+            return match head.waiter.force(self.machine) {
+                Ok(aterm_capacity::Forced::Admitted(claim, would)) => {
+                    if head.said.is_some() {
+                        say(&format!("capacity: {what} admitted after {}", span(waited)));
+                    }
+                    match (&head.taken, would) {
+                        (Taken::Now(Some(why)), _) => say(&format!(
+                            "capacity: {what} admitted by --admit now, though it can never fit: {why}"
+                        )),
+                        (Taken::Now(None), Some(short)) => say(&format!(
+                            "capacity: {what} admitted by --admit now; it would wait: {short}"
+                        )),
+                        _ => {}
+                    }
+                    Some(Admitted::holding(claim))
+                }
+                // Another admission held the ledger's lock while it decided, so it decided
+                // nothing: look again at the next pass, as a waiting head does, and say so
+                // only once it has lasted a minute.
+                Ok(aterm_capacity::Forced::Turn(waiter, short)) => {
+                    head.waiter = waiter;
+                    if waited >= self.pace.line_every
+                        && head
+                            .said
+                            .is_none_or(|t| now.saturating_sub(t) >= self.pace.line_every)
+                    {
+                        say(&format!(
+                            "capacity: {what} waits ({}): {short}",
+                            span(waited)
+                        ));
+                        head.said = Some(now);
+                    }
+                    self.head = Some(head);
+                    None
+                }
+                Err(e) => {
+                    say(&format!("capacity: {what} starts unclaimed: {e}"));
+                    Some(Admitted::unclaimed())
+                }
+            };
+        }
         match head.waiter.poll(self.machine) {
             // Its claim file was removed (the ledger's directory cleaned): no look could ever
             // admit it, so it starts unclaimed, saying why, as a check whose ledger cannot be
@@ -6364,6 +6412,9 @@ mod tests {
         gate: Option<Admission<'m>>,
         /// A claim another holder keeps in the gate's ledger, let go at that moment.
         holder: Option<(Duration, aterm_capacity::Claim)>,
+        /// The gate ledger's lock, held as another admission deciding holds it, let go at that
+        /// moment.
+        turn: Option<(Duration, aterm_capacity::Turn)>,
     }
 
     struct FakeCheck {
@@ -6471,6 +6522,9 @@ mod tests {
             };
             if self.holder.as_ref().is_some_and(|(at, _)| now >= *at) {
                 self.holder = None;
+            }
+            if self.turn.as_ref().is_some_and(|(at, _)| now >= *at) {
+                self.turn = None;
             }
         }
         fn held(&self, slot: usize) -> bool {
@@ -6595,6 +6649,7 @@ mod tests {
             load: None,
             gate: None,
             holder: None,
+            turn: None,
         }
     }
 
@@ -7102,6 +7157,100 @@ mod tests {
             "{:?}",
             w.said
         );
+    }
+
+    /// `--admit now` takes a check room or not, but only in its turn: a look that meets another
+    /// admission holding the ledger's lock decides nothing, and the gate looks again at the next
+    /// pass instead of holding the slots still, so the check beside it runs on and ends while it
+    /// waits. It starts holding its claim at the first pass after the lock is let go, having said
+    /// once it waited a minute who held the lock. An interrupt while it waits for the lock ends
+    /// the run there with nothing started, and its place leaves the queue with the gate.
+    /// NEGATIVE CONTROL: the refusal at a held lock this replaced starts the check unclaimed at
+    /// once, and a gate that waits for the lock inside its look never reaches the fake clock's
+    /// next pass, which would let the lock go, and fails the one-minute hang detector.
+    #[test]
+    fn admit_now_takes_its_turn_at_the_gate_without_holding_the_slots() {
+        /// What a gated run did: its end, each check's start, the gate's lines, the checks
+        /// that ended and when, each check's cover, and the claims left once the gate is gone.
+        type Ran = (
+            Result<(), Stopped>,
+            Vec<(String, Duration)>,
+            Vec<(Duration, String)>,
+            Vec<(String, Duration)>,
+            Vec<Option<String>>,
+            usize,
+        );
+        // The run on a thread of its own, within the one-minute hang detector.
+        let within_a_minute = |release: Duration, interrupt: Option<Duration>| -> Ran {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let (_d, l) = ledger();
+                let m = aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(48, 40, 14));
+                let mut f = fake(&[("beside", 5), ("forced", 3)]);
+                f.gate = Some(gate(&l, &m, aterm_capacity::Admit::Now));
+                f.turn = Some((
+                    release,
+                    l.hold_turn().expect("the ledger's lock").expect("free"),
+                ));
+                f.interrupt_at = interrupt;
+                let (r, done) = slots(&mut f, vec![job("beside"), needing("forced", 4)], 2, 100);
+                f.gate = None;
+                let w = f.w.borrow();
+                let ran: Ran = (
+                    r,
+                    w.starts.iter().cloned().zip(w.started_at.clone()).collect(),
+                    w.said.clone(),
+                    done.iter().map(|d| (d.job.name.clone(), d.wall)).collect(),
+                    w.covers.iter().map(|(_, c, _)| c.clone()).collect(),
+                    l.list().expect("the ledger").len(),
+                );
+                let _ = tx.send(ran);
+            });
+            rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                .expect("the gated run ended within the hang detector")
+        };
+        let lock = aterm_capacity::Short::Turn {
+            holder: Some(std::process::id()),
+        }
+        .to_string();
+
+        let (r, starts, said, done, covers, left) = within_a_minute(Duration::from_secs(90), None);
+        assert_eq!(r, Ok(()));
+        assert_eq!(
+            starts,
+            [
+                ("beside".to_owned(), Duration::ZERO),
+                ("forced".to_owned(), Duration::from_secs(90))
+            ],
+            "{said:?}"
+        );
+        assert!(
+            done.contains(&("beside".to_owned(), Duration::from_secs(5))),
+            "the check beside it ran on and ended while it waited: {done:?}"
+        );
+        assert!(covers[1].is_some(), "it holds its claim: {covers:?}");
+        let waits: Vec<&String> = said
+            .iter()
+            .filter(|(_, l)| l.contains("trust check forced waits"))
+            .map(|(_, l)| l)
+            .collect();
+        assert_eq!(
+            waits.len(),
+            1,
+            "one line, once it waited a minute: {said:?}"
+        );
+        assert!(waits[0].contains(&lock), "{waits:?}");
+        assert!(
+            !said.iter().any(|(_, l)| l.contains("unclaimed")),
+            "{said:?}"
+        );
+        assert_eq!(left, 0);
+
+        let (r, starts, _, _, _, left) =
+            within_a_minute(Duration::MAX, Some(Duration::from_secs(30)));
+        assert_eq!(r, Err(Stopped::Interrupted(None)));
+        assert_eq!(starts, [("beside".to_owned(), Duration::ZERO)]);
+        assert_eq!(left, 0, "its place left the queue with the gate");
     }
 
     /// A check claims its recorded peak and a fifth more, at least 1 GiB more; with no peak

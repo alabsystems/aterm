@@ -326,7 +326,8 @@ impl NoKeeper {
 
 #[cfg(unix)]
 fn ask(socket: &std::path::Path, identity: &Identity, version: &str) -> Result<String, NoKeeper> {
-    crate::client::KeeperClient::connect(socket, identity, Duration::from_secs(2))
+    let within = crate::identity::peer_wait(Duration::from_secs(2));
+    crate::client::KeeperClient::connect(socket, identity, within)
         .and_then(|c| c.status(version))
         .map_err(|e| NoKeeper::of(&e))
 }

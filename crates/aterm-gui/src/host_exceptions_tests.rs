@@ -4518,16 +4518,13 @@ fn a_pool_the_host_found_asked_for_speaks_with_no_look() {
 }
 
 #[test]
-fn a_background_sign_in_task_has_a_durable_action_and_clears_when_resolved() {
+fn a_background_sign_in_task_steps_to_its_pool_and_clears_when_resolved() {
     use crate::harness_host::PoolSaid;
     use aterm_agent::harness::accounts::{Cli, SignInAction};
     let mut app = App::headless_for_test();
     looked_asked_for(&mut app, &["kimi"]);
     let key = mr::pool_notice_key(Cli::Kimi, "sign-in");
-    for (action, word) in [
-        (SignInAction::Browser, "accounts browser"),
-        (SignInAction::Login, "accounts login"),
-    ] {
+    for action in [SignInAction::Browser, SignInAction::Login] {
         app.note_harness_host(HostNote::Pools(vec![PoolSaid {
             cli: Cli::Kimi,
             due: Vec::new(),
@@ -4540,11 +4537,12 @@ fn a_background_sign_in_task_has_a_durable_action_and_clears_when_resolved() {
             .entries
             .iter()
             .find(|entry| entry.key == key)
-            .expect("human step shown");
+            .expect("the stopped sign-in on record");
+        assert!(entry.then.contains("--cli kimi"), "{}", entry.then);
         assert!(
-            entry.then.contains(word) && entry.then.contains("--cli kimi"),
-            "{}",
-            entry.then
+            entry.detail.iter().any(|line| line.contains("kimi-one")),
+            "{:?}",
+            entry.detail
         );
     }
     app.note_harness_host(HostNote::Pools(Vec::new()));
@@ -4557,12 +4555,12 @@ fn a_background_sign_in_task_has_a_durable_action_and_clears_when_resolved() {
     );
 }
 
-/// A Grok login due whose background renewal already stopped at the block page is asked for
-/// once: its sign-in task's entry names `accounts login`, and the due entry leaves it out (and
-/// is cleared where it was the only one), keeping a due login with no task. CONTROL: Kimi's due
-/// entry, a fact for later of its background renewals, still lists a login its task names.
+/// A Grok login due whose background renewal already stopped at the block page is said once: its
+/// sign-in task's entry names the row, and the due entry leaves it out (and is cleared where it was
+/// the only one), keeping a due login with no task. CONTROL: Kimi's due entry, a fact for later of
+/// its background renewals, still lists a login its task names.
 #[test]
-fn a_grok_login_due_with_a_sign_in_task_is_asked_for_once() {
+fn a_grok_login_due_with_a_sign_in_task_is_said_once() {
     use crate::harness_host::PoolSaid;
     use aterm_agent::harness::accounts::{Cli, SignInAction};
     let mut app = App::headless_for_test();
@@ -4594,14 +4592,14 @@ fn a_grok_login_due_with_a_sign_in_task_is_asked_for_once() {
     );
     let asked = entries(&app, &sign_in);
     assert!(
-        asked.len() == 1 && asked[0].0.contains("accounts login grok-1 --cli grok"),
+        asked.len() == 1 && asked[0].1.iter().any(|line| line.contains("grok-1")),
         "{asked:?}"
     );
     app.note_harness_host(HostNote::Pools(vec![said(&["grok-1", "grok-2"])]));
     let left = entries(&app, &due);
     assert!(
         left.len() == 1
-            && left[0].0.contains("accounts login grok-2 --cli grok")
+            && left[0].1.iter().any(|line| line.contains("grok-2"))
             && !left[0].1.iter().any(|line| line.contains("grok-1")),
         "{left:?}"
     );

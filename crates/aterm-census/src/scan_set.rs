@@ -893,6 +893,9 @@ pub(crate) struct ManifestTargets {
     /// Each target table (`[lib]`, `[[bin]]`, `[[test]]`, `[[bench]]`, `[[example]]`) as its
     /// kind, its `name` and its `path`.
     pub(crate) declared: Vec<(&'static str, Option<String>, Option<String>)>,
+    /// Parallel to [`Self::declared`]: whether Cargo's `--tests` harness runs `#[test]` functions
+    /// in that target (`test` enabled and `harness` not `false`).
+    pub(crate) runs_libtest: Vec<bool>,
 }
 
 /// The target tables of the manifest `text` (at `file`, for errors).
@@ -909,11 +912,18 @@ pub(crate) fn manifest_targets(text: &str, file: &str) -> Result<ManifestTargets
         name: None,
         undiscovered: Vec::new(),
         declared: Vec::new(),
+        runs_libtest: Vec::new(),
     };
     for (header, entries) in parse_doc(text, file)?.sections {
         let string = |key: &str| {
             entries.iter().find_map(|(k, v)| match v {
                 Value::Str(s) if k == key => Some(s.clone()),
+                _ => None,
+            })
+        };
+        let flag = |key: &str| {
+            entries.iter().find_map(|(k, v)| match v {
+                Value::Bool(b) if k == key => Some(*b),
                 _ => None,
             })
         };
@@ -929,7 +939,10 @@ pub(crate) fn manifest_targets(text: &str, file: &str) -> Result<ManifestTargets
                 }
             }
         } else if let Some(&(kind, _)) = KINDS.iter().find(|(kind, _)| header == *kind) {
+            let default_test = matches!(kind, "lib" | "bin" | "test");
+            let libtest = flag("harness").unwrap_or(true) && flag("test").unwrap_or(default_test);
             out.declared.push((kind, string("name"), string("path")));
+            out.runs_libtest.push(libtest);
         }
     }
     Ok(out)

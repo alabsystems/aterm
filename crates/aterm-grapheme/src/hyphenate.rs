@@ -87,7 +87,9 @@ fn patterns() -> &'static Patterns {
 /// [`LEFT_MIN`] letters from its start and `right_min` from its end.
 fn letter_run_points(letters: &str, right_min: usize) -> Vec<usize> {
     let count = letters.len();
-    if count < LEFT_MIN + right_min || !letters.bytes().all(|b| b.is_ascii_alphabetic()) {
+    if count < LEFT_MIN.saturating_add(right_min)
+        || !letters.bytes().all(|b| b.is_ascii_alphabetic())
+    {
         return Vec::new();
     }
     let lower = letters.to_ascii_lowercase();
@@ -181,6 +183,8 @@ mod tests {
         out
     }
 
+    /// Syllable breaks follow Liang's English patterns and saturate `LEFT_MIN + right_min`.
+    /// NEGATIVE CONTROL: unchecked `LEFT_MIN + right_min` panics on `right_min == usize::MAX`.
     #[test]
     fn words_break_at_their_syllables() {
         for (word, broken) in [
@@ -200,6 +204,7 @@ mod tests {
         ] {
             assert_eq!(hyphenated(word), broken, "{word:?}");
         }
+        assert!(letter_run_points("hyphenation", usize::MAX).is_empty());
     }
 
     #[test]

@@ -153,6 +153,130 @@ fn second_device_enrolls_over_tls_and_retries_without_a_vault_server_or_new_epoc
     client.unwrap();
 }
 
+#[test]
+fn frontier_log_enrollment_carries_the_source_mark_and_retries_without_new_records() {
+    let lab = Lab::new(true);
+    client::test_sign_genesis(
+        &lab.paths[0],
+        &lab.root.path().join("membership.genesis"),
+        &lab.signer,
+    )
+    .unwrap();
+    let seed = client::load_records(&lab.paths[0]).unwrap().encode();
+    client::save_records(&lab.paths[1], &seed).unwrap();
+    std::fs::write(
+        lab.paths[0].records_file().with_extension("crossed"),
+        b"crossed\n",
+    )
+    .unwrap();
+    let pending = lab.pending();
+    assert!(!client::records_marked_crossed(&lab.paths[1]).unwrap());
+    let (server, peer) = lab.exchange(&pending);
+    assert!(server.is_ok() && peer.is_ok(), "{server:?} {peer:?}");
+    assert!(server.unwrap().sent > 0);
+    assert!(peer.unwrap().received > 0);
+    assert!(client::records_marked_crossed(&lab.paths[1]).unwrap());
+    let bootstrap = lab.bootstrap(1);
+    assert!(bootstrap.is_log_backed().unwrap());
+    assert!(bootstrap.log_witness().unwrap().is_some());
+    let first = client::load_records(&lab.paths[0]).unwrap().inventory();
+    let (server, peer) = lab.exchange(&pending);
+    assert!(server.is_ok() && peer.is_ok(), "{server:?} {peer:?}");
+    assert_eq!(
+        client::load_records(&lab.paths[0]).unwrap().inventory(),
+        first
+    );
+    let (server, peer) = lab.exchange(&lab.endpoint(1));
+    assert!(server.is_ok() && peer.is_ok(), "{server:?} {peer:?}");
+}
+
+#[test]
+fn frontier_large_log_enrollment_reopens_selected_witness() {
+    use aterm_secrets::membership_log::{Body, LEGACY_RECORDS, RecordBudgets, encode_records};
+    const LARGER: RecordBudgets = RecordBudgets {
+        held: 8192,
+        ..RecordBudgets::PRODUCTION
+    };
+    LARGER.within(|| {
+        let lab = Lab::new(true);
+        client::test_sign_genesis(
+            &lab.paths[0],
+            &lab.root.path().join("membership.genesis"),
+            &lab.signer,
+        )
+        .unwrap();
+        let initial = client::load_records(&lab.paths[0]).unwrap();
+        client::save_records(&lab.paths[1], &initial.encode()).unwrap();
+        let mut log = initial.log().unwrap().clone();
+        let bootstrap = lab.bootstrap(0);
+        let request = bootstrap.request().unwrap();
+        bootstrap
+            .device()
+            .with_seed(|seed| {
+                while log.held_count() <= LEGACY_RECORDS {
+                    let count = log.held_count();
+                    let record = log
+                        .draft(
+                            &request.binding().actor(),
+                            count as u64 + 1,
+                            Body::Name {
+                                name: format!("before-new-member-{count}"),
+                            },
+                        )
+                        .sign(seed, *request.binding().incarnation())?;
+                    log.insert(record)?;
+                }
+                Ok::<(), aterm_secrets::Error>(())
+            })
+            .unwrap();
+        aterm_secrets::fsx::write_atomic(
+            &lab.paths[0].records_file().with_extension("crossed"),
+            b"crossed\n",
+            0o600,
+        )
+        .unwrap();
+        aterm_secrets::fsx::write_atomic(
+            &lab.paths[0].records_file(),
+            &encode_records(log.records()),
+            0o600,
+        )
+        .unwrap();
+        let pending = lab.pending();
+        let owner = Endpoint::from_bootstrap(&lab.bootstrap(0))
+            .unwrap()
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        thread::scope(|scope| {
+            let server = scope.spawn(|| {
+                LARGER.within(|| {
+                    owner.exchange(
+                        Connection::admit(listener.accept().unwrap().0, Scope::Loopback).unwrap(),
+                        Side::Responder,
+                        &mut Repair::default(),
+                    )
+                })
+            });
+            let peer = pending.exchange(
+                Connection::connect(address, Scope::Loopback, Duration::from_secs(60)).unwrap(),
+                Side::Initiator,
+                &mut Repair::default(),
+            );
+            let server = server.join().unwrap();
+            assert!(server.is_ok() && peer.is_ok(), "{server:?} {peer:?}");
+        });
+        let bootstrap = lab.bootstrap(1);
+        let witness = bootstrap.log_witness().unwrap().unwrap();
+        assert!(witness.held_count() > LEGACY_RECORDS);
+        assert!(
+            aterm_secrets::membership_log::decode_records(&encode_records(witness.records()))
+                .is_err()
+        );
+        assert!(Endpoint::from_bootstrap(&bootstrap).unwrap().is_some());
+        assert!(client::records_marked_crossed(&lab.paths[1]).unwrap());
+    });
+}
+
 /// A member refuses a device it has not approved before it sends its hello, so the pending device
 /// dials it again at the ordinary interval (`Busy`), not the backoff of a peer that does not
 /// answer: it enrolls within seconds of its approval. NEGATIVE CONTROL: with `Outcome::of`

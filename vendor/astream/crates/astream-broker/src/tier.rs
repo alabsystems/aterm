@@ -10,10 +10,11 @@
 //! fleet left running for days paid for its whole history in RAM, though readers
 //! almost always want the newest records (a live tail, a resume a little behind it).
 //!
-//! The tier keeps, for every retained record, only what is cheap — the byte at which
-//! its frame starts in the log file and its broker time (`bt=`) — and keeps the
-//! DECODED record only for a hot window at the head, bounded by a byte budget
-//! ([`Tier::with_budget`]). A record that falls out of the window is read back from
+//! The tier keeps each retained record's frame position, broker time (`bt=`) and
+//! [`Summary`], plus interned subjects. With a finite byte budget ([`Tier::with_budget`]),
+//! it keeps DECODED records only for a hot window at the head; the newest always stays,
+//! even when it exceeds the budget. The budget does not bound retained metadata or
+//! other broker memory, which can grow with history. A record outside the window is read from
 //! its frame on demand ([`BrokerLog::record_arc`](crate::BrokerLog)), through the same
 //! frame decode, at-rest open and record parse the open's recovery scan applies, so a
 //! cold read returns exactly the record the open would have recovered.
@@ -171,7 +172,8 @@ impl Tier {
     /// before the tier existed).
     pub(crate) const RESIDENT_ALL: usize = usize::MAX;
 
-    /// An empty tier keeping at most `budget` bytes of decoded records resident.
+    /// An empty tier charging decoded records against `budget` bytes. The newest
+    /// record always stays resident, even when its charge exceeds the budget.
     pub(crate) fn with_budget(budget: usize) -> Tier {
         Tier {
             at: Vec::new(),

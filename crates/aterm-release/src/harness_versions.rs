@@ -8,7 +8,8 @@
 //! ([`aterm_phase::CliHarness::sources`]) changed. The gate refuses a candidate whose harness
 //! sources moved since the previous public release while that harness's `HARNESS_VER` text did
 //! not; `ship harness-bump` writes exactly the bumps the gate would ask for, and a line for each
-//! under the CHANGELOG's `[Unreleased]`.
+//! under the CHANGELOG's `[Unreleased]`. `ship release --bump` opens a release window, so its
+//! version commit carries the same bumps ([`apply`]) and its candidate meets this gate.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -292,8 +293,9 @@ pub fn bump(root: &Path, git: &dyn GitRunner, released: (&str, &str)) -> Result<
             }
         }
         let entry = format!(
-            "- **Harness versions since v{release}: {}.** Each harness's minor moves once per \
-             release in which it changed.",
+            "{}{release}: {}.** Each harness's minor moves once per release in which it \
+             changed.",
+            crate::changelog::HARNESS_ENTRY_HEAD,
             names.join(", ")
         );
         let new = upsert_unreleased_harness_entry(&text, release, &entry).ok_or_else(|| {
@@ -310,16 +312,17 @@ pub fn bump(root: &Path, git: &dyn GitRunner, released: (&str, &str)) -> Result<
 fn upsert_unreleased_harness_entry(text: &str, release: &str, entry: &str) -> Option<String> {
     let head = "## [Unreleased]";
     let mut offset = 0;
-    let (at, head_len) = text.split_inclusive('\n').find_map(|line| {
+    // The heading as the changelog gate reads it, as [`with_unreleased_entry`] finds it.
+    let body_start = text.split_inclusive('\n').find_map(|line| {
         let start = offset;
         offset += line.len();
-        (line.trim_end() == head).then_some((start, line.trim_end_matches(['\r', '\n']).len()))
+        line.starts_with(head)
+            .then(|| start + line.trim_end().len())
     })?;
-    let body_start = at + head_len;
     let body_end = text[body_start..]
         .find("\n## ")
         .map_or(text.len(), |p| body_start + p + 1);
-    let prefix = format!("- **Harness versions since v{release}: ");
+    let prefix = format!("{}{release}: ", crate::changelog::HARNESS_ENTRY_HEAD);
     let mut body_offset = body_start;
     for line in text[body_start..body_end].split_inclusive('\n') {
         let start = body_offset;
@@ -339,17 +342,18 @@ fn upsert_unreleased_harness_entry(text: &str, release: &str, entry: &str) -> Op
 }
 
 /// `text` with `entry` added first under `[Unreleased]`'s `### Changed` (made where missing);
-/// `None` where `text` has no `## [Unreleased]`.
+/// `None` where `text` has no `## [Unreleased]` (a line starting so, as the changelog gate
+/// reads it).
 #[must_use]
 pub fn with_unreleased_entry(text: &str, entry: &str) -> Option<String> {
     let head = "## [Unreleased]";
     let mut offset = 0;
-    let (at, head_len) = text.split_inclusive('\n').find_map(|line| {
+    let (line_end, body_start) = text.split_inclusive('\n').find_map(|line| {
         let start = offset;
         offset += line.len();
-        (line.trim_end() == head).then_some((start, line.trim_end_matches(['\r', '\n']).len()))
+        line.starts_with(head)
+            .then(|| (offset, start + line.trim_end().len()))
     })?;
-    let body_start = at + head_len;
     let body_end = text[body_start..]
         .find("\n## ")
         .map_or(text.len(), |p| body_start + p + 1);
@@ -378,7 +382,8 @@ pub fn with_unreleased_entry(text: &str, entry: &str) -> Option<String> {
             out.push_str("\n\n### Changed\n\n");
             out.push_str(entry);
             out.push('\n');
-            out.push_str(&text[body_start..]);
+            // The heading line's own end (its newline, a CR or blanks before it) is replaced.
+            out.push_str(&text[line_end..]);
         }
     }
     Some(out)
@@ -424,11 +429,33 @@ fn bump_base_release(
     )
 }
 
-/// `ship harness-bump` at checkout `root`.
+/// The files [`bump`] wrote for `owed`: each harness's version file, and the CHANGELOG when
+/// any harness was owed.
+#[must_use]
+pub fn written(owed: &[Owed]) -> Vec<String> {
+    let mut paths: Vec<String> = owed
+        .iter()
+        .map(|o| o.harness.version_file().to_string())
+        .collect();
+    if !owed.is_empty() {
+        paths.push(crate::changelog::CHANGELOG_FILE.to_string());
+    }
+    paths
+}
+
+/// Write the bumps checkout `root`'s release window owes ([`bump`]) against the public release
+/// that opened it (the checkout's version if it shipped, else the newest earlier one that did),
+/// and name that release with what was written: `None` where the ledger names no earlier
+/// release, so nothing is owed. `ship harness-bump` and `ship release --bump`'s version commit
+/// both write through here.
 ///
 /// # Errors
-/// The checkout's ledger, tags or files cannot be read, or no public release precedes it.
-pub fn run(root: &Path) -> Result<()> {
+/// The ledger or manifest cannot be read, the ledger cannot be parsed or names earlier releases
+/// none of which shipped, or the manifest's version is no release version whose minor can be
+/// raised; origin's tags cannot be listed, or the release's tag fetched; git cannot diff the
+/// window; or a written file cannot be read or written, a version file has no `HARNESS_VER`
+/// line, or the CHANGELOG has no `## [Unreleased]`.
+pub fn apply(root: &Path) -> Result<Option<(String, Vec<Owed>)>> {
     let git = crate::ledger::GitCli::new(root);
     let ledger_text = crate::durable::read_text(&root.join(crate::ledger::LEDGER_FILE))
         .map_err(|e| Error::new(format!("cannot read {}: {e}", crate::ledger::LEDGER_FILE)))?;
@@ -439,8 +466,7 @@ pub fn run(root: &Path) -> Result<()> {
     )?;
     let tags = git_ok(&git, &["ls-remote", "--tags", "origin"])?.stdout_utf8();
     let Some((release, commit)) = bump_base_release(&ledger_text, &version, &tags)? else {
-        println!("harness-bump: no public release precedes v{version}; nothing is owed");
-        return Ok(());
+        return Ok(None);
     };
     if !git
         .git(&["cat-file", "-e", &format!("{commit}^{{commit}}")])?
@@ -452,6 +478,18 @@ pub fn run(root: &Path) -> Result<()> {
         )?;
     }
     let owed = bump(root, &git, (&release, &commit))?;
+    Ok(Some((release, owed)))
+}
+
+/// `ship harness-bump` at checkout `root`.
+///
+/// # Errors
+/// As [`apply`].
+pub fn run(root: &Path) -> Result<()> {
+    let Some((release, owed)) = apply(root)? else {
+        println!("harness-bump: the ledger names no earlier release; nothing is owed");
+        return Ok(());
+    };
     if owed.is_empty() {
         println!(
             "harness-bump: every harness's version already covers its changes since v{release}"
@@ -629,11 +667,32 @@ fn read() {}
         );
         let bare = "# Changelog\n\n## [Unreleased]\n\n## [0.1.0] - x\n";
         let new = with_unreleased_entry(bare, "- **New.**").unwrap();
-        assert!(
-            new.contains("## [Unreleased]\n\n### Changed\n\n- **New.**\n"),
-            "{new}"
+        assert_eq!(
+            new,
+            "# Changelog\n\n## [Unreleased]\n\n### Changed\n\n- **New.**\n\n## [0.1.0] - x\n"
         );
         assert!(crate::changelog::gate_unreleased(&new).is_ok(), "{new}");
+        // One blank line before the section that follows, as before any other section.
+        let added = "# Changelog\n\n## [Unreleased]\n\n### Added\n\n- **Old.**\n";
+        assert_eq!(
+            with_unreleased_entry(added, "- **New.**").unwrap(),
+            "# Changelog\n\n## [Unreleased]\n\n### Changed\n\n- **New.**\n\n### Added\n\n- **Old.**\n"
+        );
+        assert_eq!(
+            with_unreleased_entry("# Changelog\n\n## [Unreleased]", "- **New.**").unwrap(),
+            "# Changelog\n\n## [Unreleased]\n\n### Changed\n\n- **New.**\n"
+        );
+        // The heading as the changelog gate reads it: a suffix stays, and a CR or blanks
+        // ending its line leave no blank-looking line behind the entry.
+        assert_eq!(
+            with_unreleased_entry("## [Unreleased] - next\n\n## [0.1.0] - x\n", "- **New.**")
+                .unwrap(),
+            "## [Unreleased] - next\n\n### Changed\n\n- **New.**\n\n## [0.1.0] - x\n"
+        );
+        assert_eq!(
+            with_unreleased_entry("## [Unreleased] \r\n\n## [0.1.0] - x\n", "- **New.**").unwrap(),
+            "## [Unreleased]\n\n### Changed\n\n- **New.**\n\n## [0.1.0] - x\n"
+        );
         assert_eq!(with_unreleased_entry("# Changelog\n", "- x"), None);
     }
 
@@ -761,8 +820,18 @@ fn read() {}
             !log.contains("codex harness"),
             "Codex versions its own binary: {log}"
         );
+        assert_eq!(
+            written(&owed),
+            vec![
+                CliHarness::ClaudeCode.version_file().to_string(),
+                CliHarness::Muse.version_file().to_string(),
+                crate::changelog::CHANGELOG_FILE.to_string(),
+            ],
+            "the files a bump commit carries"
+        );
         let again = bump(tmp.path(), &git, ("0.1.0", &released)).unwrap();
         assert!(again.is_empty(), "a second run owes nothing");
+        assert!(written(&again).is_empty(), "and writes nothing");
         let run = |args: &[&str]| {
             let out = git_cmd(tmp.path(), args);
             assert!(out.status.success(), "{args:?}");

@@ -131,8 +131,10 @@ None: `src/block/mod.rs::lz4_block_const_helpers_invariants` is mapped in §2 (`
 5. *(Resolved)* **Both paths now reject offset `0`.** `decompress_internal` returns
    `Err(DecompressError::OffsetOutOfBounds)` when `offset == 0` on both the fast path and the slow
    path, matching the LZ4 block format (`1..=65535`) and `valid_match_distance`.
-6. **The manifest count is off by one.** It says 27 tests. There are 26 `#[test]` fns. The extra hit
-   is the doc-comment text in `tests/lz4_suite.rs`.
+6. *(Resolved)* **Manifest test count reconciled.** `tests/lz4_suite.rs` is gone, and the 17 live
+   `#[test]` functions (`src/block/compress.rs` 3, `src/block/decompress_safe.rs` 2,
+   `src/block/mod.rs` 1, `src/fastcpy.rs` 1, `tests/fuzz_decode_never_panics.rs` 3,
+   `tests/round_trip.rs` 7) match §2 and §3 exactly.
 
 ## 6. Proof order
 

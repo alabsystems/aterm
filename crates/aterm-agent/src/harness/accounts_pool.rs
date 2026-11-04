@@ -38,11 +38,51 @@ pub trait UsageReader: Sync {
     /// snapshot it actually uses.
     fn read(&self, cli: Cli, home: &Path, expected_email: Option<&str>, now: i64) -> Reading;
 
+    /// Read with the credential context actually used. Readers without such evidence
+    /// can supply quota observations, but cannot establish current authentication.
+    fn read_observed(
+        &self,
+        cli: Cli,
+        home: &Path,
+        expected_email: Option<&str>,
+        now: i64,
+    ) -> UsageObservation {
+        UsageObservation {
+            reading: self.read(cli, home, expected_email, now),
+            context: None,
+        }
+    }
+
     /// Whether [`Self::read`] for `cli` asks a provider, and so is reported
     /// ([`provider_read::note`]). A reader with nothing to ask for `cli` makes no read.
     fn reads_provider(&self, cli: Cli) -> bool {
         let _ = cli;
         true
+    }
+}
+
+/// A usage result and, when available, the exact credentials used by its request.
+pub struct UsageObservation {
+    reading: Reading,
+    context: Option<super::codex_app_login::CredentialContext>,
+}
+
+impl UsageObservation {
+    /// Attach a synthetic provider answer to its fixture's actual read-only credential
+    /// snapshot. Unreadable or non-file credentials supply no fixture authority.
+    #[doc(hidden)]
+    #[cfg(any(test, debug_assertions))]
+    pub fn from_fixture(reading: Reading, home: &Path, user_home: &Path) -> Option<Self> {
+        if reading == Reading::Unread {
+            return Some(Self {
+                reading,
+                context: None,
+            });
+        }
+        Some(Self {
+            reading,
+            context: Some(super::codex_app_login::current_context(home, user_home)?),
+        })
     }
 }
 
@@ -81,6 +121,36 @@ impl UsageReader for LiveUsage {
 
     fn reads_provider(&self, cli: Cli) -> bool {
         cli == Cli::Codex
+    }
+
+    fn read_observed(
+        &self,
+        cli: Cli,
+        home: &Path,
+        expected_email: Option<&str>,
+        now: i64,
+    ) -> UsageObservation {
+        let unread = || UsageObservation {
+            reading: Reading::Unread,
+            context: None,
+        };
+        if cli != Cli::Codex {
+            return unread();
+        }
+        let Some(user_home) = aterm_types::dirs::home_dir() else {
+            return unread();
+        };
+        let observed = super::codex_app_login::observed_in_home(
+            home,
+            &user_home,
+            USAGE_READ_WAIT,
+            now,
+            expected_email,
+        );
+        UsageObservation {
+            reading: observed.reading,
+            context: observed.context,
+        }
     }
 }
 
@@ -588,6 +658,34 @@ pub fn check_login_identity(cli: Cli, row: &Row, home: &Path) -> io::Result<()> 
     Ok(())
 }
 
+/// Check the Codex login a launch selects, or its known default row when it selects none.
+/// Non-file backends and missing claims supply no file-backed identity contradiction.
+///
+/// # Errors
+/// Stored tokens name different known users, or a known email contradicts the row's expected identity.
+pub fn check_launch_login_identity(
+    cli: Cli,
+    roster: &Roster,
+    picked: Option<&Row>,
+    home: &Path,
+) -> io::Result<()> {
+    if cli == Cli::Codex
+        && !keyring_held_in(cli, home)
+        && let Some(row) = picked.or_else(|| roster.row_for_login(None))
+    {
+        check_login_identity(cli, row, home)?;
+    }
+    Ok(())
+}
+
+/// Check a known Codex default row before a launch passes its login through unchanged.
+///
+/// # Errors
+/// As [`check_launch_login_identity`] for the default row.
+pub fn check_default_login_identity(cli: Cli, roster: &Roster, home: &Path) -> io::Result<()> {
+    check_launch_login_identity(cli, roster, None, home)
+}
+
 /// [`accounts::login_env_for`] for `row`, once `cli`'s overlay home for it links the shared
 /// entries to the CLI's default home under `home` ([`super::accounts_overlay::ensure`]), where
 /// its seam is an overlay.
@@ -781,7 +879,8 @@ fn snapshot_held(
     held: &accounts::Lock,
 ) -> Result<PoolSnapshot, String> {
     let (roster, logins) = policy_held(seat, cli, store, held)?;
-    let (state, _) = store.load(seat.now)?;
+    let (mut state, _) = store.load(seat.now)?;
+    store.hydrate_auth_contexts(&mut state, &roster);
     Ok(PoolSnapshot {
         roster,
         logins,
@@ -894,7 +993,9 @@ fn read_launch_rows(
                         .state
                         .accounts
                         .get(&row.label)
-                        .is_some_and(|account| account.auth == accounts::Auth::SignedOut)
+                        .is_some_and(|account| {
+                            account.current_auth(row) == accounts::Auth::SignedOut
+                        })
             })
         });
         let Some(row) = next else {
@@ -965,11 +1066,15 @@ fn poll_usage(
             why: provider_read::InUse::Launching,
         });
     }
-    let mut readings: Vec<(String, Reading)> = vec![(
+    let mut readings = vec![(
         row.label.clone(),
-        read.read(cli, &home, row.expected_identity_email(), seat.now),
+        read.read_observed(cli, &home, row.expected_identity_email(), seat.now),
     )];
-    readings.retain(|(_, reading)| *reading != Reading::Unread);
+    readings.retain(|(_, observed)| match observed.reading {
+        Reading::Unread => false,
+        Reading::SignedOut => observed.context.is_some(),
+        Reading::Usage(_) => true,
+    });
     let held = store
         .acquire_within(&accounts::LOCK_LADDER)
         .map_err(|why| why.to_string())?
@@ -978,7 +1083,7 @@ fn poll_usage(
     if current.roster != before.roster || current.logins != before.logins {
         return Err("account policy or login changed during usage read; nothing recorded".into());
     }
-    readings.retain(|(label, reading)| match reading {
+    readings.retain(|(label, observed)| match &observed.reading {
         Reading::Usage(usage) => {
             usage.sample.at <= seat.now
                 && before
@@ -988,46 +1093,45 @@ fn poll_usage(
                     .and_then(|binding| binding.renewed_at)
                     .is_none_or(|renewed| usage.sample.at >= renewed)
         }
-        // Read under the bindings checked unchanged above: no renewal came between.
+        // Exact credential admission follows under the writer as well as policy admission.
         Reading::SignedOut => true,
         Reading::Unread => false,
     });
     if readings.is_empty() {
         return Ok((current.state, false));
     }
-    let mut state_after = None;
     let path = seat.config_dir.join(cli.accounts().roster_file);
     let recorded =
         store.transact_pool_logins_held(&held, &path, seat.now, &mut None, |raw, state, logins| {
             current.require_policy(raw, logins)?;
             let mut events = Vec::new();
-            for (label, reading) in &readings {
-                let usage = match reading {
+            for (label, observed) in &readings {
+                let row = current.roster.row(label).ok_or("usage account disappeared")?;
+                let context = store.capture_auth_context(row);
+                if let Some(used) = &observed.context
+                    && context.as_ref().is_none_or(|current| !current.uses(used))
+                {
+                    return Err("credentials changed or became unavailable during usage read; nothing recorded".into());
+                }
+                let raw_row = raw.row(label).ok_or("usage account disappeared")?;
+                let usage = match &observed.reading {
                     Reading::Usage(usage) => usage,
                     Reading::SignedOut => {
-                        events.extend(accounts::note_auth(
-                            state,
-                            label,
-                            accounts::Auth::SignedOut,
-                            seat.now,
-                        ));
+                        if observed.context.is_some()
+                            && let Some(context) = context
+                        {
+                            accounts::stage_auth(state, raw_row, logins, context,
+                                accounts::Auth::SignedOut, seat.now);
+                        }
                         continue;
                     }
                     Reading::Unread => continue,
                 };
-                // A login read as signed out that reads its usage again is signed in again
-                // (a sign-in by hand in its home), so launches choose it once more.
-                if state
-                    .accounts
-                    .get(label)
-                    .is_some_and(|account| account.auth == accounts::Auth::SignedOut)
+                if observed.context.is_some()
+                    && let Some(context) = context
                 {
-                    events.extend(accounts::note_auth(
-                        state,
-                        label,
-                        accounts::Auth::Ok,
-                        seat.now,
-                    ));
+                    accounts::stage_auth(state, raw_row, logins, context,
+                        accounts::Auth::Ok, seat.now);
                 }
                 let sample_events =
                     accounts::note_sample(state, label, usage.sample.clone(), seat.now);
@@ -1044,7 +1148,6 @@ fn poll_usage(
                     ));
                 }
             }
-            state_after = Some(state.clone());
             Ok(events)
         });
     recorded.map_err(|why| {
@@ -1053,10 +1156,7 @@ fn poll_usage(
             store.state_file().display()
         )
     })?;
-    Ok((
-        state_after.ok_or("usage transaction supplied no state")?,
-        true,
-    ))
+    Ok((snapshot_held(seat, cli, &store, &held)?.state, true))
 }
 
 /// Test seam: a row at a time, as many launches would, each of `roster`'s rows of `cli` whose login
@@ -1104,8 +1204,9 @@ pub(crate) fn record_usage(
 /// is honoured.
 /// # Errors
 /// The pool's records cannot be read, its effective roster changes during polling, no managed
-/// row is usable, the chosen login's overlay cannot be prepared, or its binding, routing or
-/// selection changes during preparation. A caller must hold the launch on these failures.
+/// row is usable, a known stored login identity contradicts its row, the chosen login's overlay
+/// cannot be prepared, or its binding, routing or selection changes during preparation. A caller
+/// must hold the launch on these failures.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -1247,9 +1348,11 @@ pub fn default_serving<'a>(
 ///
 /// # Errors
 ///
-/// Why the roster or the store's state cannot be read.
+/// Why the roster or the store's state cannot be read, or the file-backed default login
+/// contradicts its row's expected identity.
 pub fn default_row_now(seat: &Seat<'_>, cli: Cli) -> Result<super::codex_alab::DefaultRow, String> {
     let roster = seat.bound_roster(cli)?;
+    check_default_login_identity(cli, &roster, seat.home).map_err(|why| why.to_string())?;
     let (state, _) = seat
         .store(cli)
         .load(seat.now)
@@ -1397,6 +1500,78 @@ pub fn launch_now<'a>(
         return Ok(None);
     }
     pick_row(cli, roster, state, enrolled, unread, now).map(Some)
+}
+
+/// Observe the login a launch would take after rejecting known stored identity contradictions.
+/// Unpinned failed rows are excluded from temporary selection state, as failed preparations are
+/// at launch. This reads no usage, prepares no overlay and changes no account records.
+///
+/// # Errors
+/// As [`launch_now`], or the last known identity contradiction when no alternative can serve.
+pub fn launch_observed<'a>(
+    policy: (Cli, bool, Mode),
+    roster: &'a Roster,
+    state: &accounts::State,
+    enrolled: &std::collections::BTreeSet<String>,
+    program: Option<&Path>,
+    now: i64,
+    home: &Path,
+) -> Result<Option<&'a Row>, String> {
+    launch_observed_with(policy, roster, state, enrolled, program, now, |picked| {
+        check_launch_login_identity(policy.0, roster, picked, home).map_err(|why| why.to_string())
+    })
+}
+
+pub(crate) fn launch_observed_with<'a>(
+    policy: (Cli, bool, Mode),
+    roster: &'a Roster,
+    state: &accounts::State,
+    enrolled: &std::collections::BTreeSet<String>,
+    program: Option<&Path>,
+    now: i64,
+    mut check_identity: impl FnMut(Option<&Row>) -> Result<(), String>,
+) -> Result<Option<&'a Row>, String> {
+    if policy.0 != Cli::Codex || takes_no_row(policy.0, policy.1) {
+        return launch_now(policy, roster, state, enrolled, program, now);
+    }
+    let mut excluded = std::collections::BTreeSet::new();
+    let mut last_identity_error = None;
+    loop {
+        let candidates = without_failed_preparations(state, &excluded);
+        let picked = match launch_now(policy, roster, &candidates, enrolled, program, now) {
+            Ok(picked) => picked,
+            Err(why) => {
+                if let Some(identity) = last_identity_error.take() {
+                    return Err(identity);
+                }
+                if default_only_now(policy.0, roster, &candidates, enrolled, program, now)
+                    .is_some_and(|rule| {
+                        matches!(
+                            rule.default,
+                            Err(super::codex_alab::DefaultRow::Walled { .. })
+                        )
+                    })
+                {
+                    // A wall's end can restore quota, not a contradictory default identity.
+                    check_identity(roster.row_for_login(None))?;
+                }
+                return Err(why);
+            }
+        };
+        let why = match check_identity(picked) {
+            Ok(()) => return Ok(picked),
+            Err(why) => why,
+        };
+        let Some(row) = picked else {
+            return Err(why);
+        };
+        if (state.pinned && state.active.as_deref() == Some(row.label.as_str()))
+            || !excluded.insert(row.label.clone())
+        {
+            return Err(why);
+        }
+        last_identity_error = Some(why);
+    }
 }
 
 /// The row of its own (one with a `dir`) the owner's pin in `state` holds, where it holds one. On
@@ -1612,6 +1787,7 @@ fn launch_env_using(
     if configured_mode == Mode::Off {
         let Some(pinned) = off_pick(cli, roster, &snapshot.state, &enrolled, unread, seat.now)?
         else {
+            check_default_login_identity(cli, roster, seat.home).map_err(|why| why.to_string())?;
             return Ok(None);
         };
         // Rotation off moves nothing, and still never starts on another Mac's account: the pin's
@@ -1659,6 +1835,7 @@ fn launch_env_using(
     };
     if lone_default(roster, pinned) {
         default_execution(cli, roster, &snapshot.state)?;
+        check_default_login_identity(cli, roster, seat.home).map_err(|why| why.to_string())?;
         return Ok(None);
     }
     read_launch_rows(seat, cli, &mut snapshot, &enrolled, unread, read)?;
@@ -1897,9 +2074,10 @@ fn cold_resume_pick(
         return None;
     }
     let (logins, _) = store.load_logins(seat.now).ok()?;
-    let (state, _) = store.load(seat.now).ok()?;
+    let (mut state, _) = store.load(seat.now).ok()?;
     store.check_sync_read_receipt(&receipt).ok()?;
     let roster = accounts::bound(&raw, &logins);
+    store.hydrate_auth_contexts(&mut state, &roster);
     let who = accounts::ProcessLogin::of_env_for(cli, env.iter().copied());
     let ran = roster.row(accounts::judged_label(&roster, &who)?)?;
     let enrolled = accounts::enrolled_in(cli, &roster, seat.home);
@@ -1962,9 +2140,9 @@ fn without_failed_preparations(
     excluded: &std::collections::BTreeSet<String>,
 ) -> accounts::State {
     let mut candidates = state.clone();
-    for label in excluded {
-        candidates.accounts.entry(label.clone()).or_default().auth = accounts::Auth::SignedOut;
-    }
+    candidates
+        .excluded_accounts
+        .extend(excluded.iter().cloned());
     candidates
 }
 
@@ -1977,24 +2155,39 @@ fn check_failed_preparations(
         if before.roster.row(label) != current.roster.row(label)
             || !accounts::RenewalParent::capture(&before.logins, label)
                 .matches(&current.logins, label)
-            || before
-                .state
-                .accounts
-                .get(label)
-                .map_or((accounts::Auth::Unseen, None), |a| (a.auth, a.auth_at))
-                != current
-                    .state
-                    .accounts
-                    .get(label)
-                    .map_or((accounts::Auth::Unseen, None), |a| (a.auth, a.auth_at))
+            || before.state.accounts.get(label).map_or(
+                (accounts::Auth::Unseen, None, accounts::Auth::Unseen),
+                |a| {
+                    (
+                        a.auth,
+                        a.auth_at,
+                        before
+                            .roster
+                            .row(label)
+                            .map_or(accounts::Auth::Unseen, |row| a.current_auth(row)),
+                    )
+                },
+            ) != current.state.accounts.get(label).map_or(
+                (accounts::Auth::Unseen, None, accounts::Auth::Unseen),
+                |a| {
+                    (
+                        a.auth,
+                        a.auth_at,
+                        current
+                            .roster
+                            .row(label)
+                            .map_or(accounts::Auth::Unseen, |row| a.current_auth(row)),
+                    )
+                },
+            )
             || before
                 .logins
                 .get(label)
-                .map(|b| (b.renewed_at, b.served_at))
+                .map(|b| (b.renewed_at, b.served_at, b.lifetime_scope.clone()))
                 != current
                     .logins
                     .get(label)
-                    .map(|b| (b.renewed_at, b.served_at))
+                    .map(|b| (b.renewed_at, b.served_at, b.lifetime_scope.clone()))
         {
             return Err("failed account policy or login changed while preparing a fallback".into());
         }
@@ -2101,7 +2294,6 @@ fn finish_launch(
     if seat.keyring_held(cli) || seat.mode_for(cli) != configured_mode {
         return Err("account routing changed while preparing a launch".into());
     }
-    check_failed_preparations(before, &current, excluded)?;
     if current
         .state
         .active
@@ -2116,6 +2308,7 @@ fn finish_launch(
     {
         return Err("active account changed to a failed preparation".into());
     }
+    check_failed_preparations(before, &current, excluded)?;
     let candidates = without_failed_preparations(&current.state, excluded);
     let enrolled = accounts::enrolled_in(cli, &current.roster, seat.home);
     let pinned = checked_launch_pin(seat, cli, &current.roster, &candidates, &enrolled)?;
@@ -2482,7 +2675,8 @@ impl<T> SessionPlan<T> {
 /// and login generations are checked and advice is recomputed under the
 /// account lock. A move that rotates then commits its rotation ([`accounts::begin_rotation`]), so the breaker counts it in that
 /// CLI's store alone. A CLI that keeps its login in the OS keyring stays
-/// ([`StayWhy::KeyringStore`]).
+/// ([`StayWhy::KeyringStore`]), and a Codex build that keeps no row's login its own has no line
+/// ([`StayWhy::NoLine`]).
 /// Taking an expired canary records its new holder before returning the line,
 /// without charging another rotation. A replaced canary invalidates the plan.
 /// The `note` callback receives the session attribution after the transaction's
@@ -2549,7 +2743,8 @@ pub(super) fn native_quota_plan_admitting(
     note: impl FnOnce(SessionNote<'_>),
     mut admit: impl FnMut(&Row) -> bool,
 ) -> SessionPlan {
-    native_quota_plan_preparing(seat, session, note, |seat, row| {
+    let program = Some(session.relaunch.exe);
+    native_quota_plan_preparing(seat, session, program, note, |seat, row| {
         admit(row)
             .then(|| prepare_session_line(seat, session, row))
             .flatten()
@@ -2559,16 +2754,18 @@ pub(super) fn native_quota_plan_admitting(
 /// Prepare a native exec command with the same roster, quota, identity and
 /// commit-time checks as interactive account rotation. The host supplies the
 /// exact typed command after its authenticated candidate read. This does not
-/// grant execution or change the caller's account.
+/// grant execution or change the caller's account. `program` is the image that command runs: one
+/// that keeps no row's login its own has no line to a move ([`session_plan_with`]).
 #[cfg(unix)]
 #[must_use]
 pub fn native_exec_quota_plan<R>(
     seat: &Seat<'_>,
     session: &Session<'_, R>,
+    program: &Path,
     note: impl FnOnce(SessionNote<'_>),
     mut prepare: impl FnMut(&Row) -> Option<super::codex_exec_handoff::ExecCommand>,
 ) -> SessionPlan<super::codex_exec_handoff::ExecCommand> {
-    native_quota_plan_preparing(seat, session, note, |seat, row| {
+    native_quota_plan_preparing(seat, session, Some(program), note, |seat, row| {
         let command = prepare(row)?;
         let expected = row_home(Cli::Codex, row, seat.home)?.join("auth.json");
         (Path::new(&command.auth_path) == expected && command.encode().is_some()).then_some(command)
@@ -2578,6 +2775,7 @@ pub fn native_exec_quota_plan<R>(
 fn native_quota_plan_preparing<T, R>(
     seat: &Seat<'_>,
     session: &Session<'_, R>,
+    program: Option<&Path>,
     note: impl FnOnce(SessionNote<'_>),
     mut prepare: impl FnMut(&Seat<'_>, &Row) -> Option<T>,
 ) -> SessionPlan<T> {
@@ -2597,6 +2795,7 @@ fn native_quota_plan_preparing<T, R>(
     session_plan_with(
         seat,
         session,
+        program,
         |row| prepare(seat, row),
         note,
         MoveAuthority::NativeCodexQuota,
@@ -2672,12 +2871,108 @@ fn session_plan_using(
     prepare: impl FnMut(&Row) -> Option<String>,
     note: impl FnOnce(SessionNote<'_>),
 ) -> SessionPlan {
-    session_plan_with(seat, s, prepare, note, MoveAuthority::Window)
+    let program = Some(s.relaunch.exe);
+    session_plan_with(seat, s, program, prepare, note, MoveAuthority::Window)
+}
+
+/// Whether the handoff takes `row` as a target on the records as they stand: only a row with room
+/// left. [`accounts::advise_for`] offers a low row as a last resort to a session that would stop
+/// otherwise; the handoff's writer ([`super::codex_rotation::with_prepared_writer`]) and its plan
+/// both refuse it.
+pub(super) fn native_target_admitted(row: &Row, state: &accounts::State, now: i64) -> bool {
+    accounts::condition(row, state, true, now).fresh()
+}
+
+/// The row a Codex session on `from` moves to at its weekly limit as the records stand, or `None`
+/// where nothing moves it: what [`native_quota_plan`] selects where each provider read admits its
+/// candidate. `default_login` is the address the default login names
+/// ([`accounts::default_login_address`]): a candidate of the session's own account is passed over,
+/// as the handoff's own read of it is. A default row that login moved off neither takes a session,
+/// whose preparation refuses it, nor hands one off, whose usage [`record_session`] will not
+/// attribute to it. A session stays on a held row ([`held_source`]) and under another row's pin;
+/// its wall ends a pin on its own row.
+#[must_use]
+pub fn native_quota_target(
+    (cli, mode): (Cli, Mode),
+    (roster, state, enrolled): (
+        &Roster,
+        &accounts::State,
+        &std::collections::BTreeSet<String>,
+    ),
+    from: &Row,
+    default_login: Option<&str>,
+    now: i64,
+) -> Option<String> {
+    let moved = accounts::default_login_moved_off(roster, default_login);
+    if held_source(from)
+        || (state.pinned && state.active.as_deref() != Some(from.label.as_str()))
+        || moved.is_some_and(|moved| moved.label == from.label)
+    {
+        return None;
+    }
+    let mut state = state.clone();
+    let window = "seven_day";
+    accounts::note_wall(&mut state, &from.label, window, None, now, now);
+    state.pinned = false;
+    let me = accounts::Me {
+        account: Some(&from.label),
+        left: None,
+        default_home: true,
+        stored_login: true,
+    };
+    let point = Point::Wall {
+        window: window.to_owned(),
+        at: Some(now),
+    };
+    let identity = |row: &Row| {
+        row.expected_identity_email()
+            .map(str::to_owned)
+            .or_else(|| {
+                row.dir
+                    .is_none()
+                    .then(|| default_login.map(str::to_owned))?
+            })
+    };
+    let source = identity(from);
+    let one_account = |row: &Row| {
+        source
+            .as_deref()
+            .zip(identity(row))
+            .is_some_and(|(a, b)| accounts::email_matches(a, &b))
+    };
+    let mut excluded = std::collections::BTreeSet::new();
+    loop {
+        let candidates = without_failed_preparations(&state, &excluded);
+        let Advice::Move { to, .. } =
+            accounts::advise_for(cli, roster, &candidates, enrolled, &me, &point, mode, now)
+        else {
+            return None;
+        };
+        let row = roster.row(&to)?;
+        if to != from.label
+            && native_target_admitted(row, &state, now)
+            && !one_account(row)
+            && moved.is_none_or(|moved| moved.label != to)
+        {
+            return Some(to);
+        }
+        if state.active.as_deref() == Some(to.as_str()) || !excluded.insert(to) {
+            return None;
+        }
+    }
+}
+
+/// Whether `row` is held for another Mac, so no session of this Mac's hands off from it (the
+/// handoff's writer refuses it as a changed selection).
+#[must_use]
+pub(super) fn held_source(row: &Row) -> bool {
+    row.held_by.is_some()
 }
 
 fn session_plan_with<T, R>(
     seat: &Seat<'_>,
     s: &Session<'_, R>,
+    program: Option<&Path>,
     mut prepare: impl FnMut(&Row) -> Option<T>,
     note: impl FnOnce(SessionNote<'_>),
     authority: MoveAuthority,
@@ -2721,6 +3016,7 @@ fn session_plan_with<T, R>(
     if s.mode != configured_mode {
         return SessionPlan::stay(StayWhy::NothingDue);
     }
+    let native = matches!(authority, MoveAuthority::NativeCodexQuota);
     let enrolled = accounts::enrolled_in(s.cli, roster, seat.home);
     // record_session timestamps an unstamped wall at this seat's observation
     // time. Keep that receipt when admission happens later.
@@ -2758,7 +3054,7 @@ fn session_plan_with<T, R>(
     };
     let (advice, line) = loop {
         let candidates = without_failed_preparations(state, &excluded);
-        let advice = if matches!(authority, MoveAuthority::NativeCodexQuota) {
+        let advice = if native {
             accounts::advise_for(
                 s.cli,
                 roster,
@@ -2792,6 +3088,12 @@ fn session_plan_with<T, R>(
                 }
             };
         };
+        // A Codex build that keeps no row's login its own has no line to a move: under a row's
+        // login it would read this machine's own while the pool counted the row, as a launch of
+        // it refuses to.
+        if default_only(s.cli, roster, program).is_some() {
+            return no_line(&advice);
+        }
         let Some(row) = roster.row(to) else {
             return SessionPlan::stay(if saw_line_failure {
                 StayWhy::NoLine
@@ -2799,7 +3101,9 @@ fn session_plan_with<T, R>(
                 StayWhy::NoCandidate
             });
         };
-        if let Some(line) = prepare(row) {
+        if (!native || native_target_admitted(row, state, seat.now))
+            && let Some(line) = prepare(row)
+        {
             break (advice, line);
         }
         saw_line_failure = true;
@@ -2929,10 +3233,7 @@ fn finish_move<T>(
     let excluded = &prepared.excluded;
     let configured_mode = prepared.configured_mode;
     let Advice::Move {
-        to,
-        rotates,
-        takes_canary,
-        ..
+        to, takes_canary, ..
     } = advice
     else {
         return Err("no prepared account move".into());
@@ -2977,7 +3278,8 @@ fn finish_move<T>(
         check_login_identity(session.cli, target, seat.home).map_err(|why| why.to_string())?;
         return Ok(());
     }
-    if *takes_canary
+    if native.is_none()
+        && *takes_canary
         && (before.state.active != current.state.active
             || before.state.canary != current.state.canary)
     {
@@ -3026,9 +3328,29 @@ fn finish_move<T>(
             seat.now,
         )
     };
-    if fresh != *advice {
-        return Err("account advice changed while preparing a move".into());
-    }
+    // A native receipt binds its destination, not ownership of the pool's
+    // canary. Another session may have proved that same destination since
+    // preparation. Recheck current advice and use its rotation/canary flags;
+    // stale flags must neither reject a valid follower nor charge twice.
+    let admitted = if native.is_some() {
+        match &fresh {
+            Advice::Move { to: current, .. } if current == to => &fresh,
+            _ => return Err("account advice changed while preparing a move".into()),
+        }
+    } else {
+        if fresh != *advice {
+            return Err("account advice changed while preparing a move".into());
+        }
+        advice
+    };
+    let Advice::Move {
+        rotates,
+        takes_canary,
+        ..
+    } = admitted
+    else {
+        unreachable!("admitted account advice is a move")
+    };
     check_login_identity(
         session.cli,
         current.roster.row(to).ok_or("target account disappeared")?,
@@ -3243,7 +3565,9 @@ fn record_session<R>(
             let mut events = Vec::new();
             if session.point == Point::TurnEnd {
                 if observation.matches_current(&current) {
-                    events.extend(accounts::prove(state, &row.label, seat.now));
+                    events.extend(accounts::prove_in_context(
+                        state, logins, &row.label, seat.now,
+                    ));
                 }
                 note(SessionNote {
                     state,

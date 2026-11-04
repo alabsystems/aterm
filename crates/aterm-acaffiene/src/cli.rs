@@ -482,7 +482,8 @@ pub fn installed_startup_turned_off() -> bool {
 /// Labels of the old `aterm caffeine` name's login jobs no aterm will run again
 /// ([`crate::legacy::retired_jobs`]), writing nothing and taking no lock: the converge pass reads
 /// them so an old job whose `aterm` is gone or answers no to `aterm help caffeine` (0.145.0) is
-/// retired even when the mug already runs.
+/// retired even when the mug already runs. On a home that is not on a disk of this Mac only a job
+/// whose `aterm` lies inside the home is among them: one outside it may be another Mac's mug.
 #[must_use]
 pub fn retired_old_jobs() -> Vec<String> {
     #[cfg(target_os = "macos")]
@@ -957,7 +958,7 @@ mod mac {
         paths: &Paths,
         exe: &Path,
         has_verb: impl Fn(&Path) -> Option<bool>,
-        unload: impl Fn(&str),
+        unload: impl Fn(&str) -> launchd::Unload,
     ) -> Result<String, String> {
         let jobs = crate::legacy::retired_jobs_with(paths, exe, has_verb);
         if jobs.is_empty() {
@@ -1669,6 +1670,7 @@ mod tests {
             state_dir: dir.path().join("state"),
             home: dir.path().join("home"),
             logs_dir: dir.path().join("logs"),
+            local_volume: |_| true,
         };
         std::fs::create_dir_all(&paths.state_dir).expect("state dir");
         std::fs::write(paths.bridge_file(), "4242\n").expect("bridge file");
@@ -1687,6 +1689,7 @@ mod tests {
             state_dir: dir.join("state"),
             home: dir.join("home"),
             logs_dir: dir.join("logs"),
+            local_volume: |_| true,
         }
     }
 
@@ -1905,8 +1908,9 @@ mod tests {
                     paths,
                     std::path::Path::new("/nonexistent/this-aterm"),
                     |_| Some(false),
-                    |_| {},
+                    |_| crate::launchd::Unload::Unloaded,
                 )
+                .failed
             },
             installed: |paths| {
                 crate::launchd::Installed::At(
@@ -2020,6 +2024,7 @@ mod tests {
         let unloaded = RefCell::new(Vec::new());
         let said = mac::retire_old_jobs_only_with(&paths, this_exe, has_verb, |label| {
             unloaded.borrow_mut().push(label.to_owned());
+            crate::launchd::Unload::Unloaded
         })
         .expect("retires dead and 0.145.0 jobs");
         assert_eq!(

@@ -988,6 +988,98 @@ fn a_log_admitted_mac_reads_an_older_log_epochs_row_through_a_history_handoff() 
     );
 }
 
+/// A Mac that holds another Mac's `Remove` but not yet the removal's rotation seals no table row:
+/// the Commons epoch it would seal under is still wrapped to the removed Mac, whose key would open
+/// the row. Once the rotation lands, its session is a writer's again, under the rotation's epoch.
+///
+/// NEGATIVE CONTROL: the oracle reads the log itself: before the rotation the session's basis
+/// carries a `Wrap` to the removed Mac, and after it none.
+#[test]
+fn a_mac_holding_a_removal_without_its_rotation_seals_no_row() {
+    use aterm_secrets::{
+        client::{Paths, admit_member_in_log, load_records, remove_member_in_log, save_records},
+        commons::bootstrap::Device,
+        membership_log::{Body, Entrant, Evidence, encode_records},
+    };
+    let lab = Lab::with_foundation(&[Role::Writer, Role::Writer]);
+    client::seed_vault_genesis(&lab.paths[0], &lab._home.path().join("genesis.v2")).unwrap();
+    let trust = lab.bootstrap(0).trust();
+    let pinned = format!(
+        "{}#{}",
+        lab._home.path().join("test.vault").display(),
+        lab.signer
+    );
+    let m4 = Paths::for_home(&lab._home.path().join("m4"));
+    client::configure_log_member(&m4, &pinned, "m4").unwrap();
+    let _ = client::machine_identity(&m4).unwrap();
+    let request = Device::open(&m4)
+        .unwrap()
+        .unwrap()
+        .request(trust.network, trust.authority)
+        .unwrap();
+    let (actor4, recipient4) = (request.binding().actor(), request.binding().recipient());
+    let entrant = Entrant {
+        request,
+        node_key: [0x44; 32],
+        name: "m4".to_owned(),
+        label: "m4".to_owned(),
+    };
+    admit_member_in_log(&lab.paths[0], entrant, Evidence::Phrase).unwrap();
+    save_records(
+        &lab.paths[1],
+        &load_records(&lab.paths[0]).unwrap().encode(),
+    )
+    .unwrap();
+    let b1 = lab.bootstrap(1);
+    let dir = lab._home.path().join("table-m1");
+    // Each session reopens the replica: a session's custody is its own.
+    let write = |session: &Session<'_>, payload: &[u8]| {
+        store::Store::create(session, &dir)?.commit_catalog(session, payload)
+    };
+    let session = Session::open(&b1).unwrap();
+    write(&session, b"before").expect("m1 writes before the removal");
+    drop(session);
+
+    let removal = remove_member_in_log(&lab.paths[0], actor4).unwrap();
+    assert!(
+        matches!(removal[0].body(), Body::Remove { .. }),
+        "CONTROL: the batch opens with the Remove"
+    );
+    save_records(&lab.paths[1], &encode_records(&removal[..1])).unwrap();
+    let wraps_removed = |session: &Session<'_>| {
+        load_records(&lab.paths[1])
+            .unwrap()
+            .log()
+            .unwrap()
+            .records()
+            .any(|record| {
+                matches!(record.body(), Body::Wrap { epoch, recipient, .. }
+                    if epoch == session.access.basis() && *recipient == recipient4)
+            })
+    };
+    let session = Session::open(&b1).unwrap();
+    assert!(
+        wraps_removed(&session),
+        "CONTROL: the basis is still wrapped to the removed m4"
+    );
+    let refused = write(&session, b"during").unwrap_err();
+    assert!(
+        refused.to_string().contains("removed Mac"),
+        "the write waits for the rotation: {refused}"
+    );
+    drop(session);
+
+    save_records(&lab.paths[1], &encode_records(&removal)).unwrap();
+    let session = Session::open(&b1).unwrap();
+    assert!(
+        !wraps_removed(&session),
+        "CONTROL: the rotation's epoch reaches m4 no more"
+    );
+    session
+        .writer()
+        .expect("a writer's session opens once the rotation lands");
+}
+
 /// Table repair refuses a peer while this device has never read its roster (it could name that
 /// peer), admits it once a read succeeds, and keeps that answer through a read that fails after
 /// it. The read is made to fail by leaving the scratch vault's `source.toml` readable by other

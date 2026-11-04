@@ -360,7 +360,8 @@ fn a_completed_move_cannot_be_consumed_by_an_old_session_generation() {
     });
     let before = images(&a);
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("wait:account-changed")
     );
     assert!(

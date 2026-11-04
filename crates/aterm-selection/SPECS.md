@@ -79,13 +79,16 @@ contains-cell-glyph-whole	contract	text_selection::TextSelection::contains_cell,
 include-all	contract	text_selection::TextSelection::include_all	state = None: identity. Otherwise, if start ≤lex end, start.side := Left and end.side := Right, else start.side := Right and end.side := Left; rows, cols, type, state and truncated unchanged. Corollary (Simple, Semantic): SAB' = Some((first.row, first.col, last.row, last.col)) with first/last the lex-min/lex-max of the old (row, col) pairs, so both original cells are contained.	src/text_selection/tests.rs::test_include_all_expands_sides, src/text_selection/tests.rs::include_all_covers_both_endpoints_for_either_drag_direction	&mut self two-state, anchor Ord	0, 1, 2
 clamp-head	contract	text_selection::TextSelection::clamp_head_to_min_row (private; Clamp)	∀ sel, m: state = None ⇒ returns true, unchanged. Let lo = min(start.row, end.row), hi = max. lo ≥ m ⇒ true, unchanged. Else if m ≥ 0 ∨ hi < m ⇒ cleared (state None, ¬truncated), returns false. Otherwise let A be the lower anchor (start if start.row ≤ end.row, else end): A.row := m; if type ≠ Block also A.col := 0, A.side := Left; truncated := true. Then SAB = None ⇒ cleared, returns false; else returns true with state, type and the other anchor unchanged.	src/text_selection/tests.rs::test_adjust_for_scroll_deep_scrollback_survives_then_evicts, src/text_selection/tests.rs::test_adjust_for_scroll_clamps_the_evicted_end_anchor_on_an_upward_drag, src/text_selection/tests.rs::test_adjust_for_scroll_clears_when_the_clamp_collapses_the_span	&mut self, a &mut to one of two fields chosen at runtime, calls to SAB and clear (callee ensures)	0, 1, 2, 3, 4
 adjust-for-scroll	contract	text_selection::TextSelection::adjust_for_scroll	∀ sel, d, M, f: state = None ⇒ true, unchanged. M ≤ 0 ⇒ clear, false. Let s' = start.row ⊖ d, e' = end.row ⊖ d; max(s',e') ≥ M ⇒ clear, false. Otherwise start.row := s', end.row := e' (cols, sides, type, state unchanged) and the result is Clamp(·, f.saturating_neg()). Corollaries: no overflow for any d (including i32::MAX); the kept window is [−f, M), because M is the live row count; InProgress stays InProgress.	src/text_selection/tests.rs::adjust_for_scroll_shifts_or_clears_at_the_bounds, src/text_selection/tests.rs::test_adjust_for_scroll_in_progress_selection	&mut self, i32 saturating_sub/neg, callee composition (clamp-head)	0, 1, 2, 3, 4
-truncate-to-floor	contract	text_selection::TextSelection::truncate_to_floor	∀ sel, o, L: truncate_to_floor(sel,o,L) = Clamp(sel, min(m, 0)) where m = i32::try_from(sat_i64(o) ⊖64 sat_i64(L)).unwrap_or(i32::MIN) and sat_i64(x) = i64::try_from(x).unwrap_or(i64::MAX).	src/text_selection/tests.rs::truncate_to_floor_over_every_small_span	u64→i64→i32 try_from with unwrap_or, i64 saturating_sub, &mut self	0, 1, 2, 3, 4
+intersects-absolute-band	contract	text_selection::TextSelection::intersects_absolute_band	∀ sel, L, lo, hi: intersects_absolute_band(sel,L,lo,hi) ⇔ state ≠ None ∧ lo ≤ hi ∧ lo ≤ L + max(start.row, end.row) ∧ L + min(start.row, end.row) ≤ hi (exact integer comparisons in ℤ, with no i64::MAX clamping).	src/text_selection/tests.rs::intersects_absolute_band_matches_exact_integer_hull_across_u64_domain	&self view, u64 checked_add/checked_sub/saturating_sub, i32 min/max/unsigned_abs	0, 1, 2, 3
+truncate-to-floor	contract	text_selection::TextSelection::truncate_to_floor	∀ sel, o, L: truncate_to_floor(sel,o,L) = Clamp(sel, m) where m = 0 if o ≥ L else max(−(L − o), i32::MIN) in ℤ (exact u64 difference L.checked_sub(o) narrowed via i32::try_from and saturating_neg, with no i64::MAX clamping).	src/text_selection/tests.rs::truncate_to_floor_over_every_small_span, src/text_selection/tests.rs::truncate_to_floor_preserves_scrollback_depth_above_i64_max	u64 checked_sub, u64→i32 try_from, i32 saturating_neg, &mut self, callee composition (clamp-head)	0, 1, 2, 3, 4
 row-splice	contract	text_selection::TextSelection::adjust_for_row_splice	∀ sel, b, n, M, f: state = None ⇒ true, unchanged. M ≤ 0 ∨ n < 0 ⇒ clear, false. remap(x) = x ⊖ n if x < b, else x; s' = remap(start.row), e' = remap(end.row). max(s',e') ≥ M ⇒ clear, false. Otherwise the rows become s', e' (everything else unchanged, including InProgress and the raw anchor order) and the result is Clamp(·, f.saturating_neg()).	src/text_selection/tests.rs::test_adjust_for_row_splice_moves_history_endpoint_but_keeps_footer_endpoint, src/text_selection/tests.rs::test_adjust_for_row_splice_handles_reverse_and_in_progress_anchors, src/text_selection/tests.rs::test_adjust_for_row_splice_clears_only_after_real_history_eviction	&mut self, a local closure, saturating ops, callee composition	0, 1, 2, 3, 4, 13
 rows-shrink	contract	text_selection::TextSelection::adjust_for_rows_shrink	∀ sel, k, r, f: state = None ⇒ true, unchanged. k ≤ 0 ∨ r ≤ 0 ⇒ = adjust_for_scroll(sel, 0, k, f); else = adjust_for_scroll(sel, r, k, f). Corollary: a rows-only shrink is the uniform monotone relabel x ↦ x ⊖ r, so start.row ≤ end.row is preserved whenever the call returns true; k ≤ 0 always clears.	src/text_selection/tests.rs::test_adjust_for_rows_shrink_relabels_every_row_by_the_same_amount, src/text_selection/tests.rs::a_shrink_spares_a_span_that_crosses_the_cut	&mut self, callee composition	0, 2, 4
 translate-rows	contract	text_selection::TextSelection::translate_rows_for_presentation	∀ sel, d: start.row' = start.row ⊕ d, end.row' = end.row ⊕ d (saturating at i32::MIN/MAX); every other field (cols, sides, type, state, truncated) unchanged, in every state.	src/text_selection/tests.rs::test_translate_rows_for_presentation_preserves_selection_semantics, src/text_selection/tests.rs::test_translate_rows_for_presentation_saturates_at_i32_boundaries	&mut self two-state on struct fields, i32 saturating_add	0, 2, 3
+relocate	contract	text_selection::TextSelection::relocate	∀ sel, sr, sc, er, ec: start' = (sr, sc, start.side) and end' = (er, ec, end.side); state, type and truncated are unchanged in every state.	src/text_selection/tests.rs::relocate_updates_anchor_coordinates_preserving_sides_type_state_and_truncated	const &mut self two-state on struct fields	0, 1, 2
 expand-gated	contract	text_selection::TextSelection::{expand_semantic,expand_lines}	expand_semantic(a,b): if state = InProgress ∧ type = Semantic, start := (start.row, a, Left), end := (end.row, b, Right), else identity. expand_lines(w): if state = InProgress ∧ type = Lines, start := (start.row, 0, Left), end := (end.row, w, Right), else identity. Rows, state, type and truncated are always unchanged.	src/text_selection/tests.rs::expansion_acts_only_on_an_in_progress_selection_of_its_type	&mut self two-state with an enum guard	0, 1, 2
 truncated-per-span	invariant	text_selection::TextSelection (every &mut method)	Inv(sel) := state = None ⇒ ¬truncated. Inv(new()) holds and every &mut method preserves it. start_selection and clear set truncated := false; only Clamp sets truncated := true, and only on a path that returns true with state ≠ None. So a cleared selection never reports a partial loss, and a fresh span starts unreported.	src/text_selection/tests.rs::test_truncated_resets_on_new_selection_and_on_clear	type invariant over a struct, preserved by every &mut self method	0, 1, 2
-selection-no-panic	no-panic	text_selection::TextSelection::*, rules::SmartSelection::{word_boundaries_at,word_boundaries_at_column_with}	No TextSelection method panics in any state of Reach for any arguments (every i32/u16/i64 step is saturating or checked). word_boundaries_at and word_boundaries_at_column_with never panic for any t: &str and any usize position (every slice goes through get; positions are floored to char boundaries).	(none; no test samples it)	panic-freedom over saturating/checked arithmetic, &str::get, iterator code	0, 1, 2, 3, 7, 12
+selection-bounds-codec	round-trip	is_ordered_cell_pair, cell_span_width, encode_selection_bounds_le, decode_selection_bounds_le	∀ sr, sc, er, ec: is_ordered_cell_pair(sr,sc,er,ec) ⇔ (sr, sc) ≤lex (er, ec); cell_span_width(sc,ec) = ec.saturating_sub(sc); decode_selection_bounds_le(encode_selection_bounds_le(sr,sc,er,ec)) = (sr,sc,er,ec) with each 32-bit field stored in 4-byte little-endian two's-complement order.	src/tests.rs::selection_bounds_helpers_order_span_and_roundtrip_le_bytes	const fn scalar comparisons, usize saturating_sub, fixed [u8; 16] array indexing, shifts and casts	0, 1, 3
+selection-no-panic	no-panic	text_selection::TextSelection::*, rules::SmartSelection::{word_boundaries_at,word_boundaries_at_column_with}	No TextSelection method panics in any state of Reach for any arguments (every i32/u16/u64 step is saturating or checked). word_boundaries_at and word_boundaries_at_column_with never panic for any t: &str and any usize position (every slice goes through get; positions are floored to char boundaries).	(none; no test samples it)	panic-freedom over saturating/checked arithmetic, &str::get, iterator code	0, 1, 2, 3, 7, 12
 ```
 
 ## 2. Test → spec map (TSV)
@@ -113,6 +116,7 @@ src/tests.rs	builtin_rules_select_the_token_under_the_cursor	rule-precedence	bui
 src/tests.rs	test_no_match_at_position	rule-precedence	
 src/tests.rs	test_word_boundaries_with_match	rule-precedence	
 src/tests.rs	test_word_boundaries_fallback	rule-precedence	basic-word-is-containing-word
+src/tests.rs	selection_bounds_helpers_order_span_and_roundtrip_le_bytes	selection-bounds-codec	
 src/text_selection/tests.rs	test_contains_simple	contains-region	
 src/text_selection/tests.rs	test_contains_multiline	contains-region	
 src/text_selection/tests.rs	test_contains_block	contains-region	
@@ -149,6 +153,9 @@ src/text_selection/tests.rs	test_adjust_for_rows_shrink_relabels_every_row_by_th
 src/text_selection/tests.rs	a_shrink_spares_a_span_that_crosses_the_cut	rows-shrink	adjust-for-scroll
 src/text_selection/tests.rs	expansion_acts_only_on_an_in_progress_selection_of_its_type	expand-gated	
 src/text_selection/tests.rs	truncate_to_floor_over_every_small_span	truncate-to-floor	clamp-head
+src/text_selection/tests.rs	truncate_to_floor_preserves_scrollback_depth_above_i64_max	truncate-to-floor	clamp-head
+src/text_selection/tests.rs	intersects_absolute_band_matches_exact_integer_hull_across_u64_domain	intersects-absolute-band	
+src/text_selection/tests.rs	relocate_updates_anchor_coordinates_preserving_sides_type_state_and_truncated	relocate	
 src/text_selection/tests.rs	is_empty_iff_none_or_the_anchors_coincide	is-empty	
 tests/conformance_text_selection.rs	real_calls_conform_to_the_lifecycle_model	lifecycle-refines-model	
 tests/conformance_text_selection.rs	a_dropped_phase_check_is_rejected	lifecycle-refines-model	
@@ -156,7 +163,7 @@ tests/conformance_text_selection.rs	a_dropped_phase_check_is_rejected	lifecycle-
 
 ## 3. Coverage
 
-- 58 live tests mapped in §2 across the 34 specs (0 non-spec tests remain; 146 original tests read in the initial 2026-10-15 audit).
+- 62 live tests mapped in §2 across the 37 specs (0 non-spec tests remain; 146 original tests read in the initial 2026-10-15 audit).
 - One spec, `selection-no-panic`, has no test of its own. Every test above samples it in passing,
   and it is what makes the arithmetic in the other specs total.
 - The biggest collapses are `basic-word-is-containing-word` (15 primary), `project-range` (12),
@@ -164,7 +171,7 @@ tests/conformance_text_selection.rs	a_dropped_phase_check_is_rejected	lifecycle-
   (9), `clamp-head` (6), `lifecycle-refines-model` (6) and `word-at-column` (6).
 - The seven `pat-*` specs retire 23 tests. All of them hinge on the aterm-regex crate's spec
   being citable across crates (gap 12).
-- Gap histogram (specs blocked by each gap): 0 → 34, 1 → 32, 2 → 20, 3 → 15, 4 → 11, 5 → 10,
+- Gap histogram (specs blocked by each gap): 0 → 37, 1 → 35, 2 → 22, 3 → 17, 4 → 11, 5 → 10,
   7 → 15, 10 → 1, 11 → 2, 12 → 17, 13 → 5. Gaps 6, 8, 9 and 14–17 block no spec here directly.
   6, 14, 16 and 17 still apply to every proof, as the audit says.
 
@@ -210,6 +217,12 @@ cross-anchor extension, the wide-glyph halves) is an instance of a general spec 
    a `debug_assert!(min_row <= 0)` that no caller contract stated, while release builds clamped via
    `min_row.min(0)`. The assert is removed so debug and release share the total `min_row.min(0)`
    contract (`truncate-to-floor`, `selection-no-panic`).
+7. **(Fixed 2026-11-04.) `truncate_to_floor` and `intersects_absolute_band` clamped `u64` absolute
+   row counters to `i64::MAX`.** Above `i64::MAX as u64`, `truncate_to_floor` collapsed
+   `oldest_abs - live_top_abs` to `0` and cleared every scrollback selection, while
+   `intersects_absolute_band` miscomputed scrollback row offsets and returned `true` on inverted
+   `lo_abs > hi_abs` ranges. Both now compute exact `u64` differences and bounds
+   (`truncate-to-floor`, `intersects-absolute-band`).
 
 ## 6. Proof order (easiest high-value first)
 
@@ -218,12 +231,11 @@ only gaps 1–4 (in-crate structs and enums, `&self`/`&mut self` views, straight
 arithmetic, callee composition). The smart-selection specs also need loops (7), cross-crate citation
 (12) and, for the patterns, a regex-crate spec. So prove them later.
 
-1. **`translate-rows`** (gaps 0, 2, 3). These are two saturating `i32` field updates with a frame
-   condition, the simplest `&mut self` two-state contract in the crate. It retires 2 tests and is
-   the probe for gap 2's primed state.
-2. **`is-empty`, `expand-gated`, `include-all`** (gaps 0, 1, 2). These are straight-line `&self`/`&mut self`
-   contracts over the struct and one enum guard. They retire 5 tests and establish the
-   anchor-struct carrier (gap 1) that every later text-selection spec reuses.
+1. **`translate-rows`, `relocate`, `selection-bounds-codec`** (gaps 0, 1, 2, 3). Straight-line scalar
+   and two-state struct field contracts with frame conditions, the simplest entry points in the crate.
+2. **`is-empty`, `expand-gated`, `include-all`, `intersects-absolute-band`** (gaps 0, 1, 2, 3).
+   Straight-line `&self`/`&mut self` contracts over the struct, enum guards and `u64` bounds. They
+   establish the anchor-struct carrier (gap 1) that every later text-selection spec reuses.
 3. **`normalize` → `side-adjusted-bounds` → `contains-region` → `project-range` →
    `contains-cell-glyph-whole`** (gaps 0–4, 12 for the aterm-types callees). This is one chain:
    each spec is the lemma for the next. Together they retire 35 tests, the largest block in the

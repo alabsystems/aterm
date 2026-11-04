@@ -118,21 +118,6 @@ pub enum MarkdownInlineKind {
     Image { index: usize },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg(any(test, debug_assertions))]
-pub struct MarkdownSourceSegment {
-    pub display: Range<usize>,
-    pub source: Range<usize>,
-    pub inline: Option<MarkdownInlineKind>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-#[cfg(any(test, debug_assertions))]
-pub struct MarkdownSemanticProjection {
-    pub text: String,
-    pub source_map: Vec<MarkdownSourceSegment>,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LinkPolicy {
     LocalAnchor,
@@ -599,74 +584,6 @@ pub fn parse(source: &str) -> MarkdownDocument {
     }
 }
 
-/// Canonical semantic reading order used by app introspection and clipboard selection.
-#[cfg(any(test, debug_assertions))]
-pub fn semantic_text(document: &MarkdownDocument) -> String {
-    semantic_projection(document).text
-}
-
-/// Build the bounded semantic reading projection and its stable source map.
-#[cfg(any(test, debug_assertions))]
-pub fn semantic_projection(document: &MarkdownDocument) -> MarkdownSemanticProjection {
-    let mut out = String::new();
-    let mut source_map = Vec::new();
-    for block in &document.blocks {
-        let display_start = out.len();
-        let text = match block {
-            MarkdownBlock::Heading { text, .. }
-            | MarkdownBlock::Paragraph { text, .. }
-            | MarkdownBlock::ListItem { text, .. }
-            | MarkdownBlock::Quote { text, .. } => text.clone(),
-            MarkdownBlock::CodeBlock { code, .. } => code.clone(),
-            MarkdownBlock::Table { header, rows, .. } => {
-                let mut table = header.join("\t");
-                for row in rows {
-                    table.push('\n');
-                    table.push_str(&row.join("\t"));
-                }
-                table
-            }
-            MarkdownBlock::ThematicBreak { .. } => continue,
-        };
-        out.push_str(&text);
-        let display_end = out.len();
-        source_map.push(MarkdownSourceSegment {
-            display: display_start..display_end,
-            source: block.source().clone(),
-            inline: None,
-        });
-
-        let mut search_from = display_start;
-        for run in inline_runs_in_range(document, block.source().clone()) {
-            if run.text.is_empty() {
-                continue;
-            }
-            let Some(relative) = out[search_from..display_end].find(&run.text) else {
-                continue;
-            };
-            let start = search_from + relative;
-            let end = start + run.text.len();
-            source_map.push(MarkdownSourceSegment {
-                display: start..end,
-                source: run.content_source.clone(),
-                inline: Some(run.kind.clone()),
-            });
-            search_from = end;
-        }
-        out.push('\n');
-    }
-    let trimmed = out.trim_end().len();
-    out.truncate(trimmed);
-    source_map.retain(|segment| segment.display.start < trimmed);
-    for segment in &mut source_map {
-        segment.display.end = segment.display.end.min(trimmed);
-    }
-    MarkdownSemanticProjection {
-        text: out,
-        source_map,
-    }
-}
-
 /// How one span of a block's display text is styled.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct InlineStyle {
@@ -709,19 +626,6 @@ impl MarkdownDocument {
             })
             .unwrap_or_default()
     }
-}
-
-#[cfg(any(test, debug_assertions))]
-pub fn inline_runs_in_range(
-    document: &MarkdownDocument,
-    source: Range<usize>,
-) -> impl Iterator<Item = &MarkdownInlineRun> {
-    let start = document
-        .inline_runs
-        .partition_point(|run| run.source.end <= source.start);
-    document.inline_runs[start..]
-        .iter()
-        .take_while(move |run| run.source.start < source.end)
 }
 
 #[inline]
@@ -1451,18 +1355,6 @@ fn source_anchor_for_visual_row(document: &MarkdownDocument, block: usize, row: 
         .saturating_sub(1)
         .max(first_line);
     document.source_line_starts[first_line.saturating_add(row).min(last_line)]
-}
-
-/// Move a reading anchor by block count without converting through fragile pixels.
-#[cfg(any(test, debug_assertions))]
-pub fn move_block_anchor(document: &MarkdownDocument, source_anchor: usize, delta: isize) -> usize {
-    let Some(current) = block_at_source(document, source_anchor) else {
-        return 0;
-    };
-    let target = current
-        .saturating_add_signed(delta)
-        .min(document.blocks.len().saturating_sub(1));
-    document.blocks[target].source().start
 }
 
 /// Columns a character takes in the reader's wrap and block-row estimate.
@@ -2616,15 +2508,21 @@ mod tests {
     fn reader_hides_comments_but_preserves_code_and_canonical_ranges() {
         let source = "<!-- hidden [bad](https://bad.example) -->\n# **Visible**\n\nBefore <!-- private --> after.\n\n`<!-- inline code -->`\n\n```md\n<!-- fenced code -->\n```\n\n<!-- unclosed";
         let document = parse(source);
-        let text = semantic_text(&document);
+        let painted = document
+            .blocks
+            .iter()
+            .map(block_paint_text)
+            .collect::<Vec<_>>();
 
-        assert!(text.contains("Visible"));
-        assert!(text.contains("Before after."));
-        assert!(text.contains("<!-- inline code -->"));
-        assert!(text.contains("<!-- fenced code -->"));
-        assert!(!text.contains("hidden"));
-        assert!(!text.contains("private"));
-        assert!(!text.contains("unclosed"));
+        assert_eq!(
+            painted,
+            vec![
+                "Visible",
+                "Before after.",
+                "<!-- inline code -->",
+                "<!-- fenced code -->\n",
+            ]
+        );
         assert!(
             document.links.is_empty(),
             "comment links never become actions"
@@ -2644,7 +2542,8 @@ mod tests {
         );
 
         let document = parse("[**site**](https://example.com) ![*alt*](pic.png)");
-        assert_eq!(semantic_text(&document), "site alt");
+        assert_eq!(document.blocks.len(), 1);
+        assert_eq!(block_paint_text(&document.blocks[0]), "site alt");
         assert_eq!(document.links[0].label, "site");
         assert_eq!(document.links[0].destination, "https://example.com");
         assert_eq!(document.images[0].alt.as_deref(), Some("alt"));
@@ -2739,39 +2638,59 @@ mod tests {
     fn inline_semantics_and_reading_source_map_retain_exact_authored_ranges() {
         let source = "Before **strong _em_** and `code` [site](https://example.com).";
         let document = parse(source);
+        assert_eq!(document.blocks.len(), 1);
+        assert_eq!(
+            block_paint_text(&document.blocks[0]),
+            "Before strong em and code site."
+        );
+        for run in &document.inline_runs {
+            assert!(run.source.start <= run.content_source.start);
+            assert!(run.content_source.start <= run.content_source.end);
+            assert!(run.content_source.end <= run.source.end);
+            assert!(run.source.end <= document.source_len);
+        }
         let authored = document
             .inline_runs
             .iter()
-            .map(|run| (&run.kind, &source[run.source.clone()]))
-            .collect::<Vec<_>>();
-        assert!(authored.iter().any(|(kind, text)| {
-            matches!(kind, MarkdownInlineKind::Strong) && *text == "**strong _em_**"
-        }));
-        assert!(authored.iter().any(|(kind, text)| {
-            matches!(kind, MarkdownInlineKind::Emphasis) && *text == "_em_"
-        }));
-        assert!(
-            authored.iter().any(|(kind, text)| {
-                matches!(kind, MarkdownInlineKind::Code) && *text == "`code`"
+            .map(|run| {
+                (
+                    &run.kind,
+                    &source[run.source.clone()],
+                    &source[run.content_source.clone()],
+                )
             })
-        );
-        assert!(authored.iter().any(|(kind, text)| {
+            .collect::<Vec<_>>();
+        assert!(authored.iter().any(|(kind, raw, inner)| {
+            matches!(kind, MarkdownInlineKind::Strong)
+                && *raw == "**strong _em_**"
+                && *inner == "strong _em_"
+        }));
+        assert!(authored.iter().any(|(kind, raw, inner)| {
+            matches!(kind, MarkdownInlineKind::Emphasis) && *raw == "_em_" && *inner == "em"
+        }));
+        assert!(authored.iter().any(|(kind, raw, inner)| {
+            matches!(kind, MarkdownInlineKind::Code) && *raw == "`code`" && *inner == "code"
+        }));
+        assert!(authored.iter().any(|(kind, raw, inner)| {
             matches!(kind, MarkdownInlineKind::Link { .. })
-                && *text == "[site](https://example.com)"
+                && *raw == "[site](https://example.com)"
+                && *inner == "site"
         }));
-
-        let projection = semantic_projection(&document);
-        assert_eq!(projection.text, "Before strong em and code site.");
-        let link = projection
-            .source_map
+        let strong = document
+            .inline_runs
             .iter()
-            .find(|segment| matches!(segment.inline, Some(MarkdownInlineKind::Link { .. })))
-            .expect("link has a fine-grained source mapping");
-        assert_eq!(&projection.text[link.display.clone()], "site");
-        assert_eq!(&source[link.source.clone()], "site");
-        assert!(projection.source_map.iter().any(|segment| {
-            segment.inline.is_none() && &source[segment.source.clone()] == source
-        }));
+            .find(|run| matches!(run.kind, MarkdownInlineKind::Strong))
+            .expect("strong run");
+        let emphasis = document
+            .inline_runs
+            .iter()
+            .find(|run| matches!(run.kind, MarkdownInlineKind::Emphasis))
+            .expect("nested emphasis run");
+        assert!(
+            strong.content_source.start <= emphasis.source.start
+                && emphasis.source.end <= strong.content_source.end,
+            "nested emphasis run lies inside enclosing strong content range"
+        );
     }
 
     #[test]
@@ -2815,6 +2734,7 @@ mod tests {
         let source = "> **A terminal you can read,\n> reason about, and trust.**\n\nAfter.";
         let document = parse(source);
 
+        assert_eq!(document.blocks.len(), 2);
         assert!(matches!(
             &document.blocks[0],
             MarkdownBlock::Quote { text, source: range }
@@ -2823,9 +2743,14 @@ mod tests {
                         == "> **A terminal you can read,\n> reason about, and trust.**\n"
         ));
         assert_eq!(
-            semantic_text(&document),
-            "A terminal you can read, reason about, and trust.\nAfter."
+            block_paint_text(&document.blocks[0]),
+            "A terminal you can read, reason about, and trust."
         );
+        assert!(matches!(
+            &document.blocks[1],
+            MarkdownBlock::Paragraph { text, .. } if text == "After."
+        ));
+        assert_eq!(block_paint_text(&document.blocks[1]), "After.");
     }
 
     #[test]
@@ -3048,8 +2973,15 @@ mod tests {
     #[test]
     fn tables_and_semantic_text_are_structured() {
         let document = parse("| A | B |\n|---|:---:|\n| 1 | 2 |\n");
-        assert!(matches!(document.blocks[0], MarkdownBlock::Table { .. }));
-        assert_eq!(semantic_text(&document), "A\tB\n1\t2");
+        assert_eq!(document.blocks.len(), 1);
+        match &document.blocks[0] {
+            MarkdownBlock::Table { header, rows, .. } => {
+                assert_eq!(header, &["A".to_string(), "B".to_string()]);
+                assert_eq!(rows, &[vec!["1".to_string(), "2".to_string()]]);
+            }
+            other => panic!("expected Table block, got {other:?}"),
+        }
+        assert_eq!(block_paint_text(&document.blocks[0]), "A  │  B\n1  │  2\n");
     }
 
     #[test]
@@ -3076,12 +3008,12 @@ mod tests {
         assert!(layout.blocks.iter().any(|block| block.index == 2_500));
         assert!(layout.total_height > 100_000.0);
         assert_eq!(
-            move_block_anchor(&document, middle, 3),
-            document.blocks[2_503].source().start
+            block_at_source(&document, document.blocks[2_503].source().start),
+            Some(2_503)
         );
         assert_eq!(
-            move_block_anchor(&document, middle, -3),
-            document.blocks[2_497].source().start
+            block_at_source(&document, document.blocks[2_497].source().start),
+            Some(2_497)
         );
         assert!(
             layout_visible_blocks(&document, middle, 0, f32::NAN, 720.0, TYPE)

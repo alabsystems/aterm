@@ -2490,7 +2490,8 @@ impl Run<'_> {
                 Some(_) => format!(
                     "would commit `release: {} — the version and the lockfile move together` on \
                      {} (pub-bump-edit, then targo update --workspace --offline, each nested \
-                     lockfile's path crates following) and push it to main",
+                     lockfile's path crates following; with the harness versions its window \
+                     owes, `ship harness-bump`'s writes) and push it to main",
                     cand.version,
                     short(&self.tip)
                 ),

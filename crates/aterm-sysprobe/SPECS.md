@@ -118,12 +118,12 @@
 > driver check. Its live test is `tests::the_gpu_driver_names_itself_on_this_host` (macOS on Apple
 > silicon). Its spec is not recovered here yet.
 
-Source: `crates/aterm-sysprobe`. The recovered spec table below maps 48 `#[test]` functions across
-`src/tests.rs` (18), `src/jobs/tests.rs` (17), `src/procargs_tests.rs` (8) and `src/linux_tests.rs` (5),
-recounted from §2's rows on 2026-11-01. Nothing was compiled or run for this file; the claims come
+Source: `crates/aterm-sysprobe`. The recovered spec table below maps 49 `#[test]` functions across
+`src/tests.rs` (19), `src/jobs/tests.rs` (17), `src/procargs_tests.rs` (8) and `src/linux_tests.rs` (5),
+recounted from §2's rows on 2026-11-04. Nothing was compiled or run for this file; the claims come
 from reading the code.
 
-Result: **28 specs**, covering **48 tests**. Every mapped test is a spec sample (§4).
+Result: **29 specs**, covering **49 tests**. Every mapped test is a spec sample (§4).
 
 > 2026-10-20: `procargs-parse` (the workspace's one `KERN_PROCARGS2` reader and parser,
 > `procargs`, which `kproc`, atpkg, aterm-gui and aterm-uds' `process` read through; aterm-uds
@@ -196,9 +196,10 @@ meminfo-facts	contract	linux::meminfo, linux::keyed	∀ text: meminfo(text) = So
 swap-pages-sum	contract	linux::swap_pages	∀ vmstat: swap_pages(vmstat) = Some(a sat+ b) when Key(vmstat,"pswpin") = Some(a) and Key(vmstat,"pswpout") = Some(b), otherwise None.	T::vmstat_sums_swap_in_and_out	&str, Option `?`, composition with keyed (the meminfo-facts Key lemma)	0,1,3,4,5,7,13
 auxv-lookup	contract	linux::auxv_value	∀ bytes: &[u8], key: u64, with W = size_of::<usize>(): split bytes into the full 2W-byte chunks P_0..P_{m−1}, with m = len div 2W; a trailing partial chunk is ignored. Let k_j = usize::from_ne_bytes(P_j[..W]) and v_j = usize::from_ne_bytes(P_j[W..]), and let n ≤ m be the least index with k_n = 0 (AT_NULL), or m if none is 0. auxv_value(bytes,key) = Some(v_j) for the least j < n with k_j = key, and None if no j < n matches (in particular key = 0 always gives None, and a cut pair len < 2W gives None).	T::the_auxiliary_vector_gives_the_page_size	&[u8] as_chunks (const generic), copy_from_slice, from_ne_bytes, take_while/find_map closures	0,1,3,5,7,11,13
 read-bounded-cap	contract	read_bounded, read_bounded_bytes	Effects(fs). ∀ path p: read_bounded_bytes(p) = Err(kind) when open fails, or when a read fails with any kind other than Interrupted (which is retried). Otherwise it is Ok(the first min(N, READ_CAP) bytes the file yields), where N is the bytes yielded before EOF. |result| ≤ READ_CAP for every file, including a device that never ends (exactly READ_CAP bytes). read_bounded(p) = read_bounded_bytes(p).ok().map(from_utf8_lossy). Pure core (provable modulo gaps 2 and 7): the loop invariant 0 ≤ n ≤ READ_CAP with buf[..n] equal to the concatenation of the reads.	T::every_proc_read_is_bounded_to_4_kib	fs::File, io::Read loop over &mut [u8; 4096], ErrorKind, Vec<u8>, String::from_utf8_lossy	0,1,2,7,8
-pressure-level-table	table-property	pressure_of	∀ level: i64: pressure_of(level) = {1 ↦ Normal, 2 ↦ Warn, 4 ↦ Critical, otherwise None}.	T::kernel_pressure_levels_map_to_memory_levels	literal match into an Option of a local enum	0,1,3
-used-mib-of	contract	used_mib_of	∀ internal, purgeable, wired, compressor, page: used_mib_of(...) = None if page = 0. Otherwise, with pages = ((internal sat- purgeable) sat+ wired) sat+ compressor, it is u32::try_from((pages sat* page) >> 20).ok(). Total on all u64 inputs. The result is not capped at physical memory.	T::memory_in_use_is_counted_from_the_vm_pages	u64 scalar arithmetic, saturating ops, u32::try_from; seal 150efe4a: E6 refuses (Option<u32> return, saturating calls, Assert)	0,1,3
-available-mib-of	contract	available_mib_of	∀ free, inactive, purgeable, page, physical: available_mib_of(...) = None if page = 0. Otherwise it is Some(min(((free sat+ inactive sat+ purgeable) sat* page) >> 20, physical)), where the min applies only when physical is Some. Corollary: the result never exceeds physical when physical is known.	T::memory_available_is_free_inactive_and_purgeable_pages	u64 scalar arithmetic, Option<u64> map_or with a closure	0,1,3,13
+pressure-level-table	table-property	pressure_of, MemoryLevel::{as_str,is_elevated,is_critical}	∀ level: i64: pressure_of(level) = {1 ↦ Normal, 2 ↦ Warn, 4 ↦ Critical, otherwise None}. as_str maps Normal/Warn/Critical to "normal"/"warn"/"critical"; is_elevated(l) ⇔ l ≠ Normal; is_critical(l) ⇔ l = Critical.	T::kernel_pressure_levels_map_to_memory_levels	literal match into an Option of a local enum and const fn enum predicates	0,1,3
+used-mib-of	contract	used_mib_of	∀ internal, purgeable, wired, compressor, page: used_mib_of(...) = None if page = 0. Otherwise, with pages = ((internal sat- purgeable) sat+ wired) sat+ compressor and mib = (pages sat* page) >> 20, it is Some(mib as u32) if mib ≤ u32::MAX as u64, else None. Total on all u64 inputs. The result is not capped at physical memory.	T::memory_in_use_is_counted_from_the_vm_pages	u64 scalar arithmetic, saturating ops, u64 compare and as u32 cast; seal 150efe4a: E6 refuses (Option<u32> return, saturating calls, Assert)	0,1,3
+available-mib-of	contract	available_mib_of	∀ free, inactive, purgeable, page, physical: available_mib_of(...) = None if page = 0. Otherwise it is Some(min(((free sat+ inactive sat+ purgeable) sat* page) >> 20, physical)), where the min applies only when physical is Some. Corollary: the result never exceeds physical when physical is known.	T::memory_available_is_free_inactive_and_purgeable_pages	u64 scalar arithmetic, Option<u64> match clamp	0,1,3
+memory-wire-codecs	round-trip	GroupMemory::{encode_le,decode_le}, MachineMemory::{encode_le,decode_le,total_estimated_mib}	∀ g: GroupMemory: GroupMemory::decode_le(g.encode_le()) = g (little-endian pgid, measured, footprint_mib in 16 bytes). ∀ m: MachineMemory: MachineMemory::decode_le(m.encode_le()) = m (little-endian available_mib, used_mib in 16 bytes), and m.total_estimated_mib() = m.available_mib sat+ m.used_mib.	T::group_and_machine_memory_wire_roundtrip_and_saturating_total	const fn fixed [u8; 16] shift/or LE codecs, saturating_add	0,1,3
 swap-meter-rate	refinement	SwapMeter::new, SwapMeter::observe	State (base: Option<(Instant,u64)>, rate: Option<u32>), with new() = (None, None). observe(at, kib): kib = None resets to (None, None) and returns None. With no base, it sets base = (at, kib) and returns None. Otherwise let span = at sat- base_at. If span > SWAP_SPAN_MAX, the state becomes (Some((at,kib)), None) and observe returns None. If span < SWAP_SPAN_MIN, the state is unchanged and observe returns rate. Otherwise r = min(u32::MAX, ((kib sat- base_kib) sat* 1000) div max(1, span_ms)), the state becomes (Some((at,kib)), Some(r)), and observe returns Some(r). Corollaries: a counter that went backwards gives rate 0; a second reader within SWAP_SPAN_MIN repeats the last rate; a rate is never taken over a span longer than SWAP_SPAN_MAX.	T::the_swap_meter_reads_a_rate_over_a_span_of_its_readings	&mut self two-state, Option<(Instant,u64)>, Duration comparison/as_millis (u128), try_from	0,1,2,3
 process-cwd-path-own	other	process_cwd, process_path, macos::process_cwd, macos::process_path, win_paths::process_path	Effects(proc_pidinfo/proc_pidpath, /proc/<pid>/{cwd,exe}, or QueryFullProcessImageNameW). ∀ pid: process_cwd(pid) = Some(p) ⇒ p is absolute and equals the OS's current-directory path for pid. process_path(pid) = Some(p) ⇒ p is absolute and equals the OS's executable path for pid (truncated to PATH_CAP bytes on macOS). process_cwd(0) = process_path(0) = None, and on macOS both are None for pid > i32::MAX (pid is filtered to 0 < pid ≤ i32::MAX). On Windows process_cwd reads the process environment block's CurrentDirectory (peb::cwd: Effects(OpenProcess, NtQueryInformationProcess, ReadProcessMemory)), spelled as the process's own GetCurrentDirectoryW answers it (no trailing separator but at a root), None for a process that refuses PROCESS_VM_READ or has exited (peb::tests::a_processs_working_directory_is_read_from_its_environment_block); process_path reads QueryFullProcessImageNameW through an OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) handle (with SYNCHRONIZE when granted, refusing an exited process), None when refused or exited. Every other platform answers None.	T::a_processs_working_directory_and_executable_are_its_own	FFI, unsafe zeroed structs, OsStr from bytes, PathBuf, fs::read_link	0,1,8
 group-memory-members	other	group_memory, macos::group_memory, macos::footprint_kib	Effects(libproc). ∀ pid: group_memory(pid) = None if pid = 0, if pid > i32::MAX, if the short info is unreadable, if pgid = 0, or if no member was measured. Otherwise it is Some{pgid = pbsi_pgid(pid), measured = the number of the first min(n, MAX_GROUP_PIDS) listed group members > 0 whose footprint_kib is Some, footprint_mib = (sat-sum of those footprint_kib)/1024}, where footprint_kib(m) = proc_pid_rusage(m, RUSAGE_INFO_V4).ri_phys_footprint / 1024 when the call succeeds. So a child that took its own process group is never counted in its parent's group. On every platform but macOS it is always None.	T::a_groups_memory_is_its_own_members_footprint	FFI proc_listpids into a fixed array, unsafe, loop with a saturating sum	0,7,8
@@ -221,7 +222,7 @@ socket-settled	contract	jobs::macos::settled	∀ flags, e, a: settled(flags, e, 
 socket-read-gate	other	jobs::macos::{fds,spawning,spawning_with,sockets_readable,read}, machine::owned_count, jobs::sockets_readable, JobsReader::read_all_at	Effects(libproc, sysctl). spawning(p, now) = true when p's PROC_PIDTBSDINFO is refused or its pbi_flags has PROC_FLAG_INEXIT; otherwise spawning_with(now, the MAX_CHILDREN (256) slots, n = proc_listchildpids(p), the errno it left, kinfo's start). spawning_with is true when the list is incomplete (machine::owned_count is None: n < 0, n ≥ the slots, or n = 0 with errno set) or a listed pid > 0 has a start that is unread (a child gone since the listing too), 0, or less than SETTLE_US before now (saturating, so a start after now counts); otherwise false. fds(p, …, now, s) reads PROC_PIDFDSOCKETINFO of none of p's descriptors unless s ∧ some socket lies within the detail budget (the first MAX_FD_DETAILS (128) vnode, pipe, socket and kqueue descriptors of the list, in order) ∧ ¬spawning(p, now), checked after the list and before any detail read; then it reads every socket within the budget before any other detail. Every other socket reads FdKind::Other. read(pid, fds = true, …, now, execd_then) passes s = settled(pbi_flags, execd_then(start, name), now − start) (socket-settled), false when the BSD record is unread. On macOS sockets_readable(pid) = settled(pbi_flags, true, now − start) at now_us() (a timed reader's gate: no spawning check, which cannot see a spawn that starts after it), false for pid 0, pid > i32::MAX or a refused BSD record; it is true on every other platform. Each is a snapshot: a process can start a spawn, exit or close a socket right after it.	src/jobs/tests.rs::a_programs_socket_reads_from_the_second_pass_that_finds_it_running, src/jobs/tests.rs::a_spawners_socket_reads_other_while_its_child_is_young, src/jobs/tests.rs::a_forks_socket_reads_once_it_kept_its_parents_program_long_enough, src/jobs/tests.rs::a_timed_readers_gate_passes_a_program_at_once_and_a_fork_once_it_is_settled, src/jobs/tests.rs::only_complete_child_observations_clear_the_spawn_guard	FFI proc_pidinfo, proc_listchildpids and proc_pidfdinfo into fixed buffers, sysctl(KERN_PROC_PID), composition with socket-settled	0,7,8
 ```
 
-### Kinds (28)
+### Kinds (29)
 
 | kind | count | ids |
 |---|---|---|
@@ -229,24 +230,25 @@ socket-read-gate	other	jobs::macos::{fds,spawning,spawning_with,sockets_readable
 | table-property | 1 | pressure-level-table |
 | invariant | 1 | whole-lines-torn-tail-ignored |
 | refinement | 1 | swap-meter-rate |
+| round-trip | 1 | memory-wire-codecs |
 | other (effectful host facts) | 10 | process-cwd-path-own, group-memory-members, machine-memory-within-physical, swapped-kib-counter, lone-group-leader, stdin-sharers, group-usage-members, hid-idle-clock, program-check-read, socket-read-gate |
 
-Total: 15 + 1 + 1 + 1 + 10 = 28.
+Total: 15 + 1 + 1 + 1 + 1 + 10 = 29.
 
-### Gap histogram (number of the 28 specs each gap blocks)
+### Gap histogram (number of the 29 specs each gap blocks)
 
 | gap | specs blocked |
 |---|---|
-| 0 | 28 |
-| 1 | 20 |
+| 0 | 29 |
+| 1 | 21 |
 | 2 | 2 |
-| 3 | 18 |
+| 3 | 19 |
 | 4 | 3 |
 | 5 | 7 |
 | 7 | 13 |
 | 8 | 11 |
 | 11 | 1 |
-| 13 | 7 |
+| 13 | 6 |
 
 Gaps 6, 9, 10, 12, 14, 15, 16 and 17 are not listed per spec. Gap 6 (plain-Rust clause publication) and
 gap 14 (Clean elaborator coverage) apply to every spec, depending on which lane discharges it, and gap 16
@@ -266,6 +268,7 @@ src/tests.rs	every_proc_read_is_bounded_to_4_kib	read-bounded-cap	whole-lines-to
 src/tests.rs	kernel_pressure_levels_map_to_memory_levels	pressure-level-table	
 src/tests.rs	memory_in_use_is_counted_from_the_vm_pages	used-mib-of	
 src/tests.rs	memory_available_is_free_inactive_and_purgeable_pages	available-mib-of	
+src/tests.rs	group_and_machine_memory_wire_roundtrip_and_saturating_total	memory-wire-codecs	
 src/tests.rs	a_processs_working_directory_and_executable_are_its_own	process-cwd-path-own	
 src/tests.rs	a_groups_memory_is_its_own_members_footprint	group-memory-members	
 src/tests.rs	the_machines_memory_and_pressure_are_read_on_this_host	machine-memory-within-physical	available-mib-of, used-mib-of, pressure-level-table
@@ -311,8 +314,8 @@ src/procargs_tests.rs	a_reused_buffer_reads_a_record_whole_or_not_at_all	procarg
 
 ## 3. Coverage
 
-- 48 tests mapped across `src/tests.rs` (18), `src/jobs/tests.rs` (17), `src/procargs_tests.rs` (8) and
-  `src/linux_tests.rs` (5). All 48 map to one of the 28 specs in §1.
+- 49 tests mapped across `src/tests.rs` (19), `src/jobs/tests.rs` (17), `src/procargs_tests.rs` (8) and
+  `src/linux_tests.rs` (5). All 49 map to one of the 29 specs in §1.
 - One spec has no primary test of its own (`whole-lines-torn-tail-ignored`). It is sampled as a secondary
   part of `every_proc_read_is_bounded_to_4_kib`, whose primary spec is `read-bounded-cap`. That test is
   deleted only when both of its specs are proved.
@@ -357,14 +360,10 @@ and the latency ceiling `a_reading_and_a_sweep_cost_milliseconds_not_more`) were
 6. **Resolved — swap counter test checks monotonicity only.** `the_swap_counter_reads_on_this_host_and_never_runs_backwards`
    now asserts only `second >= first`, dropping the `< 1 GiB` host-load heuristic.
 
-Rows that lag the code: `used_mib_of` saturates its additions and bounds its result by a compare
-and an `as` cast, so `used-mib-of`'s `requires` clause and `try_from` no longer apply; and
-`available_mib_of` clamps by a `match`, with no `map_or` closure (so no gap 13).
-
 ## 6. Proof order
 
 1. The rows that need only gaps 0, 1 and 3: `used-mib-of`, `available-mib-of`,
-   `pressure-level-table`, `program-check-judge`, `fresh-dylib`, `vnode-terminal`,
+   `pressure-level-table`, `memory-wire-codecs`, `program-check-judge`, `fresh-dylib`, `vnode-terminal`,
    `unix-listener-decode` and `unix-diag-listeners`. `used-mib-of` and `available-mib-of` are the
    macOS pure cores of `machine-memory-within-physical`.
 2. `swap-meter-rate`, once gap 2 (two-state `&mut self`) lands.

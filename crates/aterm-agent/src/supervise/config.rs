@@ -1067,17 +1067,18 @@ impl SupervisorConfig {
         (cfg, notes)
     }
 
-    /// What in aterm.toml's `text` turns account rotation off (leaves [`Self::accounts`] at
-    /// [`crate::harness::accounts::Mode::Off`]), in the order [`Self::from_aterm_toml`] reads
-    /// it: `[harness] accounts`, an `accounts` in a `harness` table filed below another table's
-    /// header, and the `[swarm]` switch. Empty where none does.
+    /// What in aterm.toml's `text` turns account rotation off for `agent` (leaves
+    /// [`Self::accounts_for`] at [`crate::harness::accounts::Mode::Off`]): the harness's master
+    /// switch, `agent`'s own, then in the order [`Self::from_aterm_toml`] reads them `[harness]
+    /// accounts`, an `accounts` in a `harness` table filed below another table's header, and the
+    /// `[swarm]` switch. Empty where none does.
     ///
     /// # Errors
     ///
     /// Where `text` is not valid TOML, whose lines [`Self::from_aterm_toml`] reads one by one (its
     /// notes say what each did): where the parser stopped and why, on one line (`TOML error at
     /// line 3, column 8: …`).
-    pub fn accounts_off_by(text: &str) -> Result<Vec<AccountsOff>, String> {
+    pub fn accounts_off_by(text: &str, agent: Program) -> Result<Vec<AccountsOff>, String> {
         let doc = aterm_toml::from_str::<aterm_toml::Value>(text).map_err(|why| {
             let at = why.log_words().to_string();
             match crate::supervise::limit::one_line(why.message_text()) {
@@ -1092,6 +1093,18 @@ impl SupervisorConfig {
             cfg.accounts == crate::harness::accounts::Mode::Off
         };
         let mut off = Vec::new();
+        let (read, _) = Self::from_doc_and_text(&doc, text);
+        if !read.enabled {
+            off.push(
+                match doc.get("harness").filter(|h| h.as_table().is_none()) {
+                    Some(value) => AccountsOff::HarnessWrittenOff(written(value)),
+                    None => AccountsOff::HarnessSwitch,
+                },
+            );
+        }
+        if read.off.contains(&agent) {
+            off.push(AccountsOff::AgentSwitch(agent));
+        }
         if let Some(value) = doc
             .get("harness")
             .and_then(aterm_toml::Value::as_table)
@@ -1828,6 +1841,14 @@ pub enum AccountsOff {
     },
     /// The swarm switch, its value as TOML reads it (`[swarm] enabled = false`).
     Swarm(String),
+    /// The harness's master switch ([`SupervisorConfig::on_for`]): `enabled = false` under
+    /// `[harness]`.
+    HarnessSwitch,
+    /// The same switch written as the harness itself (`harness = false`), its value as TOML reads
+    /// it.
+    HarnessWrittenOff(String),
+    /// This agent's own switch ([`SupervisorConfig::on_for`]): `[harness.<agent>] enabled = false`.
+    AgentSwitch(Program),
 }
 
 impl AccountsOff {
@@ -1841,6 +1862,11 @@ impl AccountsOff {
                  header)"
             ),
             Self::Swarm(written) => format!("`{written}`"),
+            Self::HarnessSwitch => "`[harness] enabled = false`".to_string(),
+            Self::HarnessWrittenOff(value) => format!("`harness = {value}`"),
+            Self::AgentSwitch(agent) => {
+                format!("`[harness.{}] enabled = false`", agent.name())
+            }
         }
     }
 }
@@ -4351,12 +4377,14 @@ trust_dialog = false
         }
     }
 
-    /// `accounts_off_by` NAMES EXACTLY THE SETTINGS THAT TURN ROTATION OFF: `[harness] accounts`,
-    /// a `harness.accounts` filed below another table's header, and the swarm switch, each where
-    /// it turns rotation off and none where it does not, a `[swarm] enabled = true` or a misplaced
-    /// `harness.accounts = "early"` beside a setting that does included; it names one exactly
-    /// where the reader leaves rotation off; and where the file is not valid TOML it gives where
-    /// the parser stopped and the parser's own reason, on one line.
+    /// `accounts_off_by` NAMES EXACTLY THE SETTINGS THAT TURN ROTATION OFF FOR THE AGENT:
+    /// `[harness] accounts`, a `harness.accounts` filed below another table's header, the swarm
+    /// switch, the harness's master switch and that agent's own (CONTROL: another agent's own
+    /// switch is not named), each where it turns rotation off and none where it does not, a
+    /// `[swarm] enabled = true` or a misplaced `harness.accounts = "early"` beside a setting that
+    /// does included; it names one exactly where `accounts_for` leaves rotation off; and where the
+    /// file is not valid TOML it gives where the parser stopped and the parser's own reason, on
+    /// one line.
     #[test]
     fn accounts_off_by_names_only_what_turns_rotation_off() {
         use crate::harness::accounts::Mode;
@@ -4392,17 +4420,33 @@ trust_dialog = false
             ),
             ("[theme]\nharness.accounts = \"early\"\n", Vec::new()),
             ("[theme]\nswarm = false\n", Vec::new()),
+            (
+                "[harness]\nenabled = false\n",
+                vec![AccountsOff::HarnessSwitch],
+            ),
+            (
+                "harness = false\n",
+                vec![AccountsOff::HarnessWrittenOff("false".to_string())],
+            ),
+            ("[harness]\nenabled = true\n", Vec::new()),
+            (
+                "[harness.codex]\nenabled = false\n",
+                vec![AccountsOff::AgentSwitch(Program::Codex)],
+            ),
+            ("[harness.claude]\nenabled = false\n", Vec::new()),
         ] {
-            let off_by = SupervisorConfig::accounts_off_by(text).expect("valid TOML");
+            let off_by =
+                SupervisorConfig::accounts_off_by(text, Program::Codex).expect("valid TOML");
             assert_eq!(off_by, want, "{text}");
             assert_eq!(
                 off_by.is_empty(),
-                read(text).accounts != Mode::Off,
+                read(text).accounts_for(Program::Codex) != Mode::Off,
                 "{text}: the reader agrees"
             );
         }
         let broken = "[harness]\naccounts = \"off\"\n[broken\n";
-        let why = SupervisorConfig::accounts_off_by(broken).expect_err("not valid TOML");
+        let why =
+            SupervisorConfig::accounts_off_by(broken, Program::Codex).expect_err("not valid TOML");
         assert!(!why.is_empty() && !why.contains('\n'), "{why:?}");
         // Where the parser stopped, and the parser's own reason, not the position alone.
         let parsed = aterm_toml::from_str::<aterm_toml::Value>(broken).expect_err("not valid TOML");

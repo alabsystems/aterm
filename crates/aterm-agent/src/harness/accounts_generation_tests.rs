@@ -24,6 +24,12 @@ pub(crate) fn generation_transition(
     state: &aterm_spec::interp::State,
     action: &str,
 ) -> aterm_spec::interp::State {
+    if state["recorded"] == 1 || action == "RecordFailure" {
+        return super::auth_scope_tests::generation_scope_transition(state, action);
+    }
+    if state["case"] == 16 && action == "Commit" {
+        return super::auth_scope_publication_tests::publication_transition(state, action);
+    }
     let mut next = state.clone();
     match action {
         "AnotherCase" => {

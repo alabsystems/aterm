@@ -53,6 +53,12 @@ fn bsd_info(pid: c_int) -> Option<libc::proc_bsdinfo> {
     (usize::try_from(n).ok() == Some(BSD_SIZE)).then_some(info)
 }
 
+/// [`super::exiting`] on Apple: `pid`'s BSD info says `PROC_FLAG_INEXIT`.
+pub(super) fn exiting(pid: u32) -> Option<bool> {
+    let pid = c_int::try_from(pid).ok()?;
+    bsd_info(pid).map(|b| b.pbi_flags & darwin::PROC_FLAG_INEXIT != 0)
+}
+
 fn comm(bytes: &[libc::c_char]) -> String {
     let raw: Vec<u8> = bytes
         .iter()

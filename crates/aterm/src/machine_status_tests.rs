@@ -176,7 +176,13 @@ fn a_step_is_there_exactly_when_one_is_due() {
     ] {
         areas.push(fleet_area(&check, &Ok(2)));
     }
-    for clt in [Clt::NotHere, Clt::Present, Clt::Installing, Clt::Missing] {
+    for clt in [
+        Clt::NotHere,
+        Clt::Present,
+        Clt::Installing,
+        Clt::Missing { may_install: true },
+        Clt::Missing { may_install: false },
+    ] {
         for toolset in [
             Ok(None),
             Ok(Some(row(Outcome::Ok, None))),
@@ -291,17 +297,33 @@ fn vault_steps_follow_who_can_take_them() {
     );
 }
 
-/// Tools: missing Command Line Tools are aterm's to install before anything else is said; the
-/// toolset's remedy names its command for an agent, and a System Settings switch a person.
+/// Tools: the Command Line Tools come before anything else is said. aterm's own tab installing
+/// them is aterm's; missing with nothing installing them (never opened, stopped, or an account
+/// that may not) is a person's, who types the password or is an administrator. The toolset's
+/// remedy names its command for an agent, and a System Settings switch a person.
+/// NEGATIVE CONTROL: an install under way names aterm, and no agent step is offered for a
+/// password only a person types.
 #[test]
 fn tools_put_the_command_line_tools_first() {
     let healthy = Ok(Some(row(Outcome::Ok, None)));
-    let missing = tools_area(Clt::Missing, &healthy);
+    let installing = tools_area(Clt::Installing, &healthy);
+    assert_eq!(
+        (installing.level, who(&installing)),
+        (Level::Working, Some(Who::Aterm))
+    );
+    let missing = tools_area(Clt::Missing { may_install: true }, &healthy);
     assert_eq!(
         (missing.level, who(&missing)),
-        (Level::Due, Some(Who::Aterm))
+        (Level::Due, Some(Who::Person))
     );
     assert!(missing.says.contains("Command Line Tools"));
+    assert!(missing.says.contains("nothing is installing them"));
+    let act = missing.next.as_ref().unwrap().act.clone();
+    assert!(act.contains("aterm init --only base.clt"), "{act}");
+    let standard = tools_area(Clt::Missing { may_install: false }, &healthy);
+    assert_eq!(who(&standard), Some(Who::Person));
+    let act = standard.next.as_ref().unwrap().act.clone();
+    assert!(act.contains("only an administrator"), "{act}");
     assert_eq!(tools_area(Clt::Present, &healthy).level, Level::Ok);
     let install = tools_area(
         Clt::NotHere,

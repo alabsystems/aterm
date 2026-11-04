@@ -219,6 +219,7 @@ fn account_admission_refuses_before_any_filesystem_work() {
         let report = restart_as(
             &opts,
             &why(),
+            &crate::supervise::policy::turn_end::RestartAsk::of(&why(), 0),
             &current_rows,
             Ok(fresh),
             (case != 0).then_some(&selected),

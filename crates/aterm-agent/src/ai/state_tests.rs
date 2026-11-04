@@ -1073,3 +1073,203 @@ fn the_doctor_never_promises_a_fix_and_owns_one_it_did_not_finish() {
     let all = h.next_after(&["agy", "muse"]).expect("acts");
     assert!(!all.contains("`aterm ai doctor`"), "{all}");
 }
+
+/// A PERSON'S STEP THAT ENDS A REFUSED LAUNCH STANDS WHATEVER ELSE THE ROW IS: on a row whose login
+/// is due or at a limit, as on one that is well, the owner's pin or roster is the step (a mend, no
+/// sign-in fix), so `aterm ai login` says it. The pool's own sign-in of the row the pin holds stays
+/// the fix where it signs that row in. CONTROL: a refusal the pool's records end by themselves asks
+/// nobody, and leaves a due row's fix.
+#[test]
+fn a_launch_refused_for_a_persons_step_says_it_whatever_the_row_is() {
+    use crate::ai::facts::{CliAccounts, LaunchEnd};
+    let row_under = |renew_by: Option<i64>,
+                     limited: Option<i64>,
+                     end: LaunchEnd,
+                     step: Option<&str>,
+                     next: Option<&str>| {
+        let mut f = facts(&CODEX);
+        f.login_file = Some((PathBuf::from("/login/auth.json"), None));
+        f.profile_signed_in = true;
+        f.limited_until = limited;
+        f.pool = Some(CliAccounts {
+            state: Some("ok"),
+            renew_by,
+            launch_refused: Some("every launch is refused".into()),
+            launch_end: Some(end),
+            launch_step: step.map(str::to_string),
+            next: next.map(str::to_string),
+            serving_label: Some("main".into()),
+            ..CliAccounts::default()
+        });
+        assess(&f, true, NOW)
+    };
+    let due = Some(NOW + 3600);
+    for (case, renew_by, limited) in [
+        ("well", None, None),
+        ("due", due, None),
+        ("limited", None, Some(NOW + 3600)),
+    ] {
+        let owner = row_under(renew_by, limited, LaunchEnd::Owner, None, None);
+        assert!(owner.mend.is_some(), "{case}: {}", owner.fact);
+        assert_eq!(owner.fix, None, "{case}");
+        assert_eq!(owner.actor, Some(Actor::Person), "{case}");
+        assert!(owner.mark >= Mark::Warn, "{case}: {:?}", owner.mark);
+        let step = row_under(renew_by, limited, LaunchEnd::Owner, Some("repin it"), None);
+        assert!(
+            step.mend
+                .as_deref()
+                .is_some_and(|mend| mend.contains("repin it")),
+            "{case}: {:?}",
+            step.mend
+        );
+        let elsewhere = row_under(renew_by, limited, LaunchEnd::Pool, None, None);
+        assert_eq!(elsewhere.mend, None, "{case}: CONTROL");
+    }
+    let signs_it = row_under(
+        due,
+        None,
+        LaunchEnd::SignIn("work".into()),
+        None,
+        Some("work"),
+    );
+    assert_eq!(signs_it.mend, None, "the fix signs in the pinned row");
+    assert!(signs_it.fix.is_some(), "{}", signs_it.fact);
+    let another = row_under(
+        due,
+        None,
+        LaunchEnd::SignIn("work".into()),
+        None,
+        Some("main"),
+    );
+    assert!(another.mend.is_some(), "the fix signs in another row");
+    assert_eq!(another.fix, None);
+}
+
+/// A ROSTER THE POOL REFUSES WHOLE IS RATED AS WHAT IT IS, WHATEVER THE LOGIN THIS MACHINE HOLDS
+/// SAYS: no launch, sync or sign-in of it runs, so the row is `refused`, a warning a person's edit
+/// mends, naming that file. CONTROL: the same login under an admitted roster is well.
+#[test]
+fn a_refused_roster_is_rated_as_what_it_is() {
+    use crate::ai::facts::CliAccounts;
+    let row_under = |refused: Option<&str>| {
+        let mut f = facts(&CODEX);
+        f.login_file = Some((PathBuf::from("/login/auth.json"), None));
+        f.profile_signed_in = true;
+        f.pool = Some(CliAccounts {
+            roster: PathBuf::from("/config/accounts-codex.toml"),
+            state: Some("ok"),
+            refused: refused.map(str::to_string),
+            ..CliAccounts::default()
+        });
+        assess(&f, true, NOW)
+    };
+    let refused = row_under(Some("two rows name one email"));
+    assert_eq!(refused.state, State::Refused, "{}", refused.fact);
+    assert_eq!(refused.mark, Mark::Warn);
+    assert_eq!(refused.fix, None);
+    assert_eq!(refused.actor, Some(Actor::Person));
+    let mend = refused.mend.as_deref().expect("a person's step");
+    assert!(mend.contains("/config/accounts-codex.toml"), "{mend}");
+    assert!(
+        health(std::slice::from_ref(&refused))
+            .mends
+            .iter()
+            .any(|step| step == mend),
+        "the verdict carries the step"
+    );
+    let admitted = row_under(None);
+    assert_eq!(admitted.state, State::Ok, "CONTROL: {}", admitted.fact);
+    assert_eq!(admitted.mend, None, "CONTROL");
+}
+
+/// A REFUSED ROSTER'S REASON IS SAID WHOLE, AND THE DOCTOR PRINTS ITS STEP WHETHER ANYONE ASKED FOR
+/// THAT CLI OR NOT: at a note, which alerts nobody, the row still has `fix:` under it. CONTROL: an
+/// admitted row at a note with a fix has none.
+#[test]
+fn a_refused_roster_says_its_whole_reason_and_the_doctor_prints_its_step_unasked() {
+    use crate::ai::facts::CliAccounts;
+    let why = "word ".repeat(60);
+    let why = why.trim();
+    let mut f = facts(&CODEX);
+    f.login_file = Some((PathBuf::from("/login/auth.json"), None));
+    f.profile_signed_in = true;
+    f.pool = Some(CliAccounts {
+        roster: PathBuf::from("/config/accounts-codex.toml"),
+        state: Some("ok"),
+        refused: Some(why.to_string()),
+        ..CliAccounts::default()
+    });
+    assert!(
+        pool_words(&f).expect("its pool's words").ends_with(why),
+        "{:?}",
+        pool_words(&f)
+    );
+    let mut unasked = assess(&f, true, NOW);
+    unasked.asked = false;
+    unasked.mark = Mark::Note;
+    assert_eq!(unasked.state, State::Refused);
+    assert_eq!(
+        crate::ai::cli::doctor_fix(&unasked),
+        unasked.mend.as_ref(),
+        "the step"
+    );
+    assert!(unasked.mend.is_some());
+    let mut control = assess(&f, true, NOW);
+    control.state = State::Ok;
+    control.wanted = false;
+    control.mark = Mark::Note;
+    assert_eq!(crate::ai::cli::doctor_fix(&control), None, "CONTROL");
+}
+
+/// A REFUSED ROSTER IS RATED AS WHAT IT IS WHATEVER THE LOGIN IS, THERE OR NOT: recorded signed out,
+/// with no login stored, or in a home that is not there, the row is `refused`, its step the person's
+/// edit of that file and never `aterm ai login`, which refuses such a roster.
+/// CONTROL: under an admitted roster, a row with no login is signed out, with that sign-in.
+#[test]
+fn a_refused_roster_with_no_login_is_rated_as_what_it_is() {
+    use crate::ai::facts::CliAccounts;
+    let row_under = |refused: Option<&str>, change: &dyn Fn(&mut crate::ai::facts::Facts)| {
+        let mut f = facts(&CODEX);
+        f.login_file = None;
+        f.pool = Some(CliAccounts {
+            roster: PathBuf::from("/config/accounts-codex.toml"),
+            refused: refused.map(str::to_string),
+            ..CliAccounts::default()
+        });
+        change(&mut f);
+        assess(&f, true, NOW)
+    };
+    type Change<'a> = &'a dyn Fn(&mut crate::ai::facts::Facts);
+    let worlds: [(&str, Change<'_>); 3] = [
+        ("no login stored", &|_| {}),
+        ("no home", &|f| f.home_exists = false),
+        ("recorded signed out", &|f| {
+            if let Some(pool) = &mut f.pool {
+                pool.state = Some("expired");
+            }
+        }),
+    ];
+    for (world, change) in worlds {
+        let refused = row_under(Some("two rows name one email"), change);
+        assert_eq!(refused.state, State::Refused, "{world}: {}", refused.fact);
+        assert_eq!(refused.fix, None, "{world}");
+        assert_eq!(refused.actor, Some(Actor::Person), "{world}");
+        let mend = refused.mend.as_deref().expect("a person's step");
+        assert!(
+            mend.contains("/config/accounts-codex.toml"),
+            "{world}: {mend}"
+        );
+    }
+    let admitted = row_under(None, &|_| {});
+    assert_eq!(
+        admitted.state,
+        State::SignedOut,
+        "CONTROL: {}",
+        admitted.fact
+    );
+    assert_eq!(
+        admitted.fix.as_deref(),
+        Some("aterm ai login codex"),
+        "CONTROL"
+    );
+}

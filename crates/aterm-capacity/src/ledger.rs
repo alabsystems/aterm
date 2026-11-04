@@ -728,7 +728,7 @@ impl Drop for Laid {
 
 /// The admissions' lock, held while one waiter reads the ledger and decides; its holder's pid lies before the locked range, for a waiter kept out to name.
 #[derive(Debug)]
-pub(crate) struct Turn {
+pub struct Turn {
     _lock: RecordLock,
 }
 
@@ -942,6 +942,16 @@ impl Ledger {
         }
         live.sort_by_key(Record::order);
         Ok(live)
+    }
+
+    /// TEST SEAM: [`Self::try_turn`] for another crate's test, which holds the admissions' lock
+    /// as an admission deciding holds it, so its looks meet that lock until the [`Turn`] drops.
+    ///
+    /// # Errors
+    /// As [`Self::try_turn`].
+    #[cfg(any(test, debug_assertions))]
+    pub fn hold_turn(&self) -> io::Result<Result<Turn, Option<u32>>> {
+        self.try_turn()
     }
 
     /// Take the admissions' lock if nobody holds it, writing this process's pid into it; `Err(holder)` while another waiter holds it (its pid, where it wrote one).

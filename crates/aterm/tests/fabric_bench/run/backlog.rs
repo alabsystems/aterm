@@ -183,6 +183,41 @@ pub fn split(beats: &[Beat], windows: &[(u64, u64)]) -> (Vec<f64>, Vec<f64>) {
     )
 }
 
+/// What the world's broker holds in memory at one moment (D10): the retained records it keeps
+/// decoded (`Broker::residency`), and the physical footprint of this process, which serves it
+/// in-process beside the bench's own clients.
+#[derive(Debug, Clone, Copy)]
+pub struct Held {
+    /// Retained records the broker keeps decoded.
+    pub resident_records: usize,
+    /// The bytes its residency budget charges them.
+    pub resident_bytes: usize,
+    /// Every record it retains.
+    pub retained: usize,
+    /// This process's physical footprint now, bytes (macOS `ri_phys_footprint`); `None` where
+    /// the process table does not say.
+    pub footprint: Option<u64>,
+    /// The largest footprint this process has had since it started (macOS
+    /// `ri_lifetime_max_phys_footprint`); `None` where unread.
+    pub peak_footprint: Option<u64>,
+}
+
+/// [`Held`] of `broker` now.
+#[must_use]
+pub fn held(broker: &astream_broker::Broker) -> Held {
+    let (resident_records, resident_bytes, retained) = broker.residency();
+    let me = std::process::id();
+    let mine = aterm_sysprobe::procs::processes()
+        .and_then(|sweep| sweep.procs.into_iter().find(|p| p.pid == me));
+    Held {
+        resident_records,
+        resident_bytes,
+        retained,
+        footprint: mine.as_ref().and_then(|p| p.footprint),
+        peak_footprint: mine.as_ref().and_then(|p| p.peak_footprint),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// The spec's bound on the backlog is astream's and aterm's own arithmetic: a filler

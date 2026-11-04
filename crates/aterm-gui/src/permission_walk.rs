@@ -18,7 +18,10 @@
 //!   it: [`App::person_present_within`]) and not typing ([`START_KEYS_QUIET`]), System Settings
 //!   asking nothing (`App::system_settings_may_ask`), and System State's Local Network step run
 //!   and its alert's hold over ([`App::local_network_step_to_come`]): macOS's answer heard by the
-//!   LAN re-probe, or the person at the Mac for
+//!   LAN re-probe, the alert seen answered by the window-list watch, a new window of its owner
+//!   come and then, with the person at the Mac, none of that owner left
+//!   ([`App::on_local_network_alert_answered`]), or the
+//!   person at the Mac for
 //!   [`crate::system_state_access::LOCAL_NETWORK_ALERT_HOLD`] counted from their first touch
 //!   after the ask, their time away not counted ([`App::look_at_local_network_alert`]), so
 //!   System Settings does not come up beside that

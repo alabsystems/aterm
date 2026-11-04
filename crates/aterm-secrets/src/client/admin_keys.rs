@@ -291,7 +291,7 @@ pub(super) mod legacy {
             admin.commons_bound,
             &admin.doc,
             &admin.handoff,
-            &admin.opened_heads,
+            &[],
             &crate::client::admission::Ledger::default()
                 .retained(&admin.doc)
                 .unwrap(),

@@ -3,7 +3,8 @@
 
 //! An interrupt ends a wait for capacity (`docs/DESIGN-adaptive-build-2026-10-24.md`,
 //! WAIT-INTERRUPT): a stand-in in a process of its own waits in a scratch ledger behind this
-//! test's claim, on an injected machine, and is sent SIGTERM or SIGINT.
+//! test's claim, or under `--admit now` for the ledger's lock this test holds, on an injected
+//! machine, and is sent SIGTERM or SIGINT.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -16,7 +17,7 @@ use crate::{Admit, Error, Fixed, Ledger, Need, Pace, Reading, Volume, admit_with
 
 /// Set, the test binary is [`standin_waits_for_capacity`], its ledger under this directory.
 const STANDIN: &str = "ATERM_CAPACITY_INTERRUPT_STANDIN";
-/// What the stand-in waits for: `mem`, `disk` or `quiet` ([`Kind`]).
+/// What the stand-in waits for: `mem`, `disk`, `quiet` or `turn` ([`Kind`]).
 const STANDIN_KIND: &str = "ATERM_CAPACITY_INTERRUPT_KIND";
 /// Set, the stand-in puts SIGINT back to its default action first, as a foreground process
 /// has it.
@@ -26,11 +27,14 @@ const STANDIN_SIGINT: &str = "ATERM_CAPACITY_INTERRUPT_SIGINT";
 const STANDIN_TOOL: &str = "ATERM_CAPACITY_INTERRUPT_TOOL";
 
 /// What a wait is short of.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
     Mem,
     Disk,
     Quiet,
+    /// `--admit now`'s turn at the ledger's lock, which the test holds: its memory short of
+    /// room, as [`Kind::Mem`]'s, which `now` overrides.
+    Turn,
 }
 
 impl Kind {
@@ -39,6 +43,7 @@ impl Kind {
             Kind::Mem => "mem",
             Kind::Disk => "disk",
             Kind::Quiet => "quiet",
+            Kind::Turn => "turn",
         }
     }
 
@@ -46,7 +51,17 @@ impl Kind {
         match word {
             "disk" => Kind::Disk,
             "quiet" => Kind::Quiet,
+            "turn" => Kind::Turn,
             _ => Kind::Mem,
+        }
+    }
+
+    /// How the stand-in asks: `--admit now` for [`Kind::Turn`], else it waits for room.
+    fn mode(self) -> Admit {
+        if self == Kind::Turn {
+            Admit::Now
+        } else {
+            Admit::Wait
         }
     }
 
@@ -68,7 +83,7 @@ impl Kind {
     /// the quiet machine).
     fn held(self) -> Need {
         match self {
-            Kind::Mem => Need::new("holder").mem_gib(30),
+            Kind::Mem | Kind::Turn => Need::new("holder").mem_gib(30),
             Kind::Disk => Need::new("holder").disk(80 * GIB, "/vol"),
             Kind::Quiet => Need::new("holder").quiet(28.0),
         }
@@ -77,7 +92,7 @@ impl Kind {
     /// The stand-in's need.
     fn wants(self) -> Need {
         match self {
-            Kind::Mem => Need::new("stand-in").mem_gib(20),
+            Kind::Mem | Kind::Turn => Need::new("stand-in").mem_gib(20),
             Kind::Disk => Need::new("stand-in").disk(20 * GIB, "/vol"),
             Kind::Quiet => Need::new("stand-in").quiet(28.0),
         }
@@ -89,6 +104,7 @@ impl Kind {
             Kind::Mem => "memory short by 10 GiB",
             Kind::Disk => "disk short by 10 GiB",
             Kind::Quiet => "the quiet machine",
+            Kind::Turn => "holds the ledger's lock",
         }
     }
 }
@@ -102,8 +118,9 @@ extern "C" fn tool_handler(sig: libc::c_int) {
 
 /// Run by [`an_interrupt_ends_each_kind_of_wait`] in a process of its own: waits for its
 /// [`Kind`] behind the test's claim, looking every two minutes (twice the test's hang detector,
-/// so only a nap the interrupt ends ends in time), writing `waiting` at its first wait line,
-/// and exits 3, a tool's NOT RUN, naming the signal and the shortfall.
+/// so only a nap the interrupt ends ends in time), or under `--admit now` for the test's lock,
+/// which it never lets go, writing `waiting` at its first wait line, and exits 3, a tool's NOT
+/// RUN, naming the signal and the shortfall.
 /// With [`STANDIN_TOOL`], its own handler is back once the wait has ended and never saw the
 /// signal the wait took.
 #[test]
@@ -129,10 +146,15 @@ fn standin_waits_for_capacity() {
         &Ledger::at(dir.join("ledger")),
         &Kind::machine(),
         kind.wants(),
-        Admit::Wait,
+        kind.mode(),
         Pace {
             poll: MUST_HAPPEN * 2,
-            ..Pace::default()
+            // A wait for the lock alone says its line once the lock has kept it this long.
+            line_every: if kind == Kind::Turn {
+                Duration::ZERO
+            } else {
+                Pace::default().line_every
+            },
         },
         &mut |line| {
             if !waiting.exists() {
@@ -196,8 +218,8 @@ impl Drop for Standin {
     }
 }
 
-/// Hold `kind`'s claim, start [`standin_waits_for_capacity`] behind it with `env` set, and once
-/// it waits send it `sig`.
+/// Hold `kind`'s claim (and, for [`Kind::Turn`], the ledger's lock), start
+/// [`standin_waits_for_capacity`] behind it with `env` set, and once it waits send it `sig`.
 fn interrupt(kind: Kind, env: &[&str], sig: libc::c_int) -> Ended {
     let dir = aterm_tempfile::Builder::new()
         .prefix(&format!("cap-int-{}-", kind.word()))
@@ -213,6 +235,12 @@ fn interrupt(kind: Kind, env: &[&str], sig: libc::c_int) -> Ended {
         &mut |_| {},
     )
     .expect("the holder's claim");
+    let turn = (kind == Kind::Turn).then(|| {
+        ledger
+            .try_turn()
+            .expect("the ledger's lock")
+            .expect("nobody holds it")
+    });
     let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"));
     for key in env {
         cmd.env(key, "1");
@@ -256,6 +284,7 @@ fn interrupt(kind: Kind, env: &[&str], sig: libc::c_int) -> Ended {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| n.ends_with(".claim") || n.ends_with(".wait"))
         .collect();
+    drop(turn);
     drop(held);
     Ended {
         status,
@@ -265,12 +294,14 @@ fn interrupt(kind: Kind, env: &[&str], sig: libc::c_int) -> Ended {
     }
 }
 
-/// Each kind of wait (memory, disk, the quiet machine), its next look two minutes off, ends on
-/// SIGTERM as NOT RUN well inside the one-minute hang detector (the time is reported), naming
-/// the signal and what it was short of, and leaves only the holder's claim in the ledger.
-/// SIGINT does the same where it is not ignored, and a tool's own handler is set aside for the
-/// wait and put back after. Without the wait's watch the stand-in dies of the signal (no exit 3)
-/// and leaves its `.wait` file, or, with its own handler, waits on past the hang detector.
+/// Each kind of wait (memory, disk, the quiet machine), its next look two minutes off, and
+/// `--admit now`'s wait for the ledger's lock, which is never let go, ends on SIGTERM as NOT RUN
+/// well inside the one-minute hang detector (the time is reported), naming the signal and what
+/// it was short of, and leaves only the holder's claim in the ledger. SIGINT does the same where
+/// it is not ignored, and a tool's own handler (one that only notes the signal, as the release
+/// steps' does) is set aside for the wait and put back after. Without the wait's watch the
+/// stand-in dies of the signal (no exit 3) and leaves its `.wait` file, or, with its own
+/// handler, waits on past the hang detector.
 #[test]
 fn an_interrupt_ends_each_kind_of_wait() {
     for (kind, env, sig, word) in [
@@ -280,6 +311,8 @@ fn an_interrupt_ends_each_kind_of_wait() {
         (Kind::Mem, &[STANDIN_SIGINT][..], libc::SIGINT, "SIGINT"),
         (Kind::Disk, &[STANDIN_TOOL][..], libc::SIGTERM, "SIGTERM"),
         (Kind::Quiet, &[STANDIN_TOOL][..], libc::SIGINT, "SIGINT"),
+        (Kind::Turn, &[STANDIN_TOOL][..], libc::SIGTERM, "SIGTERM"),
+        (Kind::Turn, &[STANDIN_SIGINT][..], libc::SIGINT, "SIGINT"),
     ] {
         let ended = interrupt(kind, env, sig);
         let what = format!("{} {env:?} {word}", kind.word());

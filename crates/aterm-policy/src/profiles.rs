@@ -207,22 +207,3 @@ pub fn hardened() -> Policy {
         ],
     }
 }
-
-/// Refinement helpers for the `Hardened ⊆ Standard ⊆ Permissive` invariant.
-#[cfg(test)]
-pub(crate) mod refinement {
-    use crate::Response;
-
-    /// Map a response to a numeric "strictness" rank, from `Drop` (4, strictest) down to
-    /// `Execute` (0, loosest).
-    #[must_use]
-    pub const fn response_rank(r: Response) -> u8 {
-        match r {
-            Response::Drop => 4,
-            Response::Warn => 3,
-            Response::Rewrite => 2,
-            Response::Ask => 1,
-            Response::Execute => 0,
-        }
-    }
-}

@@ -1,22 +1,21 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-sandbox: spec recovery from its 17 unit tests
+# aterm-sandbox: spec recovery from its 18 unit tests
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the row naming the 1 test it
-> deleted (`apply_actually_sets_the_limit`) is gone, and the spec rows no longer cite that test.
-> Counts below are reconciled with current `main` (2026-10-28).
+> Status 2026-11-03: reconciled with current `main` across all 18 live `#[test]` functions
+> (`src/lib.rs` 9, `src/job_fold.rs` 1, `src/windows.rs` 8).
 
 > Status 2026-10-16: this file is the crate's migration worklist. Each of the 8 specs below is
 > proved through Trust/Clean about the compiled Rust function. Then the tests it subsumes are
 > deleted.
 
 Source: `crates/aterm-sandbox` (read only). Every `#[test]` is mapped
-(`src/lib.rs` 9, one of them `cfg(windows)`; `src/windows.rs` 8, all `cfg(windows)`, for 17) along with the code
-they reach: `src/unix.rs` (`apply_limits`, `set_limit`), `src/windows.rs` (`apply_limits`, `apply_to_job`,
+(`src/lib.rs` 9, one of them `cfg(windows)`; `src/job_fold.rs` 1; `src/windows.rs` 8, all `cfg(windows)`, for 18) along with the code
+they reach: `src/unix.rs` (`apply_limits`, `set_limit`), `src/job_fold.rs` (`fold_job_limits`), `src/windows.rs` (`apply_limits`, `apply_to_job`,
 `apply_ui_restrictions`), `Sandbox::project_apply` (`aterm_models_core::sandbox_model`), and `aterm_cap::require` / `Cap::satisfies`.
 
-Result: **8 specs**, covering **17 tests**. **0 tests are non-spec** (§4).
+Result: **8 specs**, covering **18 tests**. **0 tests are non-spec** (§4).
 Gap numbers are the rows of `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7.
 
 ## 0. Notation used in the statements
@@ -106,6 +105,7 @@ src/lib.rs	apply_preserves_the_hard_ceiling_so_a_shell_can_raise_its_soft_limit	
 src/lib.rs	a_contained_limit_cannot_be_raised_back	sandbox-set-limit	sandbox-presets (contained), sandbox-apply-limits-best-effort
 src/lib.rs	each_limit_lands_on_its_resource_clamped_under_the_hard_ceiling	sandbox-set-limit	sandbox-apply-limits-best-effort
 src/lib.rs	apply_conforms_to_the_sandbox_model_and_rejects_mutants	sandbox-apply-model-refinement	sandbox-apply-cap-gate, sandbox-set-limit, sandbox-apply-limits-best-effort
+src/job_fold.rs	fold_job_limits_preserves_flags_is_identity_on_inherit_and_saturates_time	sandbox-job-fold	
 src/windows.rs	apply_to_job_installs_memory_and_cpu_limits	sandbox-job-fold	sandbox-job-write-protocol
 src/windows.rs	apply_to_job_preserves_preexisting_limit_flags	sandbox-job-fold	sandbox-job-write-protocol
 src/windows.rs	apply_to_job_installs_active_process_cap	sandbox-job-fold	sandbox-job-write-protocol
@@ -118,10 +118,10 @@ src/windows.rs	apply_to_job_fails_closed_on_invalid_handle	sandbox-job-write-pro
 
 ## 3. Coverage
 
-- 17 live tests mapped across the 8 specs. None is a non-spec test (§4).
-- 9 of the 17 tests are `cfg(windows)` (8 in `windows.rs`, plus `lib.rs::windows_apply_is_a_capgated_noop`),
+- 18 live tests mapped across the 8 specs. None is a non-spec test (§4).
+- 9 of the 18 tests are `cfg(windows)` (8 in `windows.rs`, plus `lib.rs::windows_apply_is_a_capgated_noop`),
   so a macOS dev run never executes them. Their specs need a Windows-target Trust build to be proved.
-- The biggest collapses are `sandbox-job-fold` (4 primary), `sandbox-job-write-protocol` (4) and
+- The biggest collapses are `sandbox-job-fold` (5 primary), `sandbox-job-write-protocol` (4) and
   `sandbox-set-limit` (3).
 
 ## 4. Tests that are not spec samples
@@ -134,9 +134,7 @@ is proved, not kept as they are.
 
 1. **Weak or mislabelled tests**
    - *(Resolved: `apply_to_job_fails_closed_on_invalid_handle` now asserts `ERROR_INVALID_HANDLE` (`Some(6)`), `shell_default_hardens_the_job` checks `ProcessMemoryLimit` (`16 GiB`) and `ActiveProcessLimit` (`512`) alongside `HARDENED_UI_RESTRICTIONS`, `apply_to_job_installs_ui_restrictions_when_requested` pins `0xFE`, `apply_preserves_the_hard_ceiling_so_a_shell_can_raise_its_soft_limit` asserts `current(RLIMIT_NOFILE) == raise`, `unsupported_limit_does_not_block_the_working_ones` asserts the inherited hard-limit precondition, `shell_default_omits_unsupported_address_space_on_macos` pins `Some(16 GiB)` and `Some(8192)`, and `none_limits_are_a_no_op` snapshots `(rlim_cur, rlim_max)` across all four POSIX resources `RLIMIT_CPU`, `RLIMIT_AS`, `RLIMIT_FSIZE`, and `RLIMIT_NOFILE`.)*
-   - `lib.rs::a_contained_limit_cannot_be_raised_back`: off macOS, `contained()` also requests a binding
-     16 GiB `RLIMIT_AS`. If the host's AS hard limit is lower, `set_limit` clamps to `min(v, hard)`
-     (checked by `each_limit_lands_on_its_resource_clamped_under_the_hard_ceiling`).
+   - *(Resolved: `lib.rs::a_contained_limit_cannot_be_raised_back` refuses root via `could_not_run_as_root`, ends `COULD NOT RUN` when `hard <= 64`, and scales `cap_files = min(open_files, hard - 1)` when `hard <= 8192`; off macOS, `contained()` also requests a binding 16 GiB `RLIMIT_AS`, which `set_limit` clamps to `min(v, hard)`, checked by `each_limit_lands_on_its_resource_clamped_under_the_hard_ceiling`.)*
 2. **The model is stronger than the code.** `Sandbox`'s `AllSupportedApplied` models per-slot
    applicability (`Req` and `Sup`); `set_limit` clamps to the inherited hard ceiling, installing
    `min(v, H)`, as `sandbox-set-limit` states.

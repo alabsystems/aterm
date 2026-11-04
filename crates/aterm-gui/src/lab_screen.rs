@@ -14,6 +14,10 @@ use crate::lab_accounts::LabAccounts;
 const REREAD: Duration = Duration::from_secs(10);
 const READER_WATCH: Duration = Duration::from_secs(60);
 
+#[cfg(test)]
+#[path = "lab_reader_activation_tests.rs"]
+mod activation_tests;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LabSession {
     pub(crate) local_id: u64,
@@ -388,15 +392,20 @@ impl crate::App {
     }
 
     pub(crate) fn lab_state_deadline(&self) -> Option<Instant> {
-        if !self.lab_page_shown() {
+        self.lab_state_deadline_at(Instant::now())
+    }
+
+    // The first read is due on this tick; a second clock sample would keep moving it ahead
+    // of service_lab_state's caller. A candidate must not start a reader whose wake it drops.
+    fn lab_state_deadline_at(&self, now: Instant) -> Option<Instant> {
+        if self.incoming_handoff_pending || !self.lab_page_shown() {
             return None;
         }
         if self.lab_screen.pending.is_some() {
-            return (!self.lab_screen.overdue).then(|| {
-                self.lab_screen.pending_started.unwrap_or_else(Instant::now) + READER_WATCH
-            });
+            return (!self.lab_screen.overdue)
+                .then(|| self.lab_screen.pending_started.unwrap_or(now) + READER_WATCH);
         }
-        Some(self.lab_screen.next_read.unwrap_or_else(Instant::now))
+        Some(self.lab_screen.next_read.unwrap_or(now))
     }
 
     /// Periodic observations use published names and nonblocking timeline reads,
@@ -416,7 +425,10 @@ impl crate::App {
     }
 
     pub(crate) fn service_lab_state(&mut self, now: Instant) {
-        if self.lab_state_deadline().is_some_and(|due| due <= now) {
+        if self
+            .lab_state_deadline_at(now)
+            .is_some_and(|due| due <= now)
+        {
             if self.lab_screen.pending.is_some() {
                 self.lab_screen.overdue = true;
                 self.publish_native_lab_state();
@@ -427,7 +439,7 @@ impl crate::App {
     }
 
     pub(crate) fn start_lab_accounts_refresh(&mut self) {
-        if self.lab_screen.pending.is_some() {
+        if self.incoming_handoff_pending || self.lab_screen.pending.is_some() {
             return;
         }
         let now = Instant::now();

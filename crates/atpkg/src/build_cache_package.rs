@@ -1307,7 +1307,7 @@ fn compact(
     let removed = super::reclaim_selected_on(
         home,
         std::time::SystemTime::now(),
-        super::super::RECLAIM_GONE,
+        super::super::ReclaimAfter::CALM,
         None,
         &mut |_, _| true,
         fence,

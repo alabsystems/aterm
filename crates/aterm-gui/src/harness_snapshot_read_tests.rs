@@ -27,7 +27,8 @@ fn a_restart_read_cannot_replace_a_newer_account_generation() {
         old
     });
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("wait:account-changed")
     );
     let k = idle.kept.lock().unwrap();

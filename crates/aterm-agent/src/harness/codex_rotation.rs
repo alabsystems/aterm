@@ -23,6 +23,25 @@ pub trait UsageReader {
     ) -> Option<IdentifiedUsage>;
 }
 
+/// Whether this build's host can run a weekly-limit handoff at all: the sealed renewal service's
+/// native host and provider pair is qualified on Apple Silicon macOS only.
+pub const QUOTA_ROTATION_QUALIFIED: bool = cfg!(all(target_os = "macos", target_arch = "aarch64"));
+
+/// Whether aterm.toml (`policy`, as it read with `warnings`) lets a weekly-limit handoff run: a
+/// handoff needs rotation on, relaunch and limit resumption on, and a file with nothing to warn
+/// of. What [`with_prepared_writer`] refuses and the accounts report's `at a weekly limit:` line
+/// leaves out, read from the one place.
+#[must_use]
+pub fn policy_allows_handoff(
+    policy: &crate::supervise::SupervisorConfig,
+    warnings: &[String],
+) -> bool {
+    warnings.is_empty()
+        && policy.accounts != accounts::Mode::Off
+        && policy.relaunch
+        && policy.resume_limits
+}
+
 pub struct LiveUsage<'a> {
     pub user_home: &'a Path,
     pub config_home: &'a Path,
@@ -143,6 +162,40 @@ pub fn with_prepared_writer<T>(
     with_selection_writer(env, receipt, SelectionPhase::Prepared, use_prepared)
 }
 
+/// Validate a consumed receipt after its pool deduplication record was retired.
+/// This validates metadata only. The native caller must separately prove that
+/// the same admitted process completed its original turn successfully.
+pub fn with_completed_writer<T>(
+    env: &Env,
+    receipt: &Receipt,
+    use_completed: impl FnOnce(&Successor, &ReceiptWriter<'_>) -> Result<T, &'static str>,
+) -> Result<Option<T>, &'static str> {
+    if receipt.phase != renewal::Phase::Consumed
+        || receipt.accepted_turn.as_deref() != Some(receipt.intent.wall.as_str())
+        || renewal::read_receipt(env, &receipt.id).as_ref() != Some(receipt)
+    {
+        return Err("not-consumed");
+    }
+    with_selection_writer(env, receipt, SelectionPhase::Completed, use_completed)
+}
+
+/// Revalidate a consumed tree's own account for another authenticated member.
+/// The pool's next-launch selection may have changed while this tree remained
+/// alive. Native code must separately bind the member to the admitted image.
+pub fn with_consumed_member_writer<T>(
+    env: &Env,
+    receipt: &Receipt,
+    use_member: impl FnOnce(&Successor, &ReceiptWriter<'_>) -> Result<T, &'static str>,
+) -> Result<Option<T>, &'static str> {
+    if receipt.phase != renewal::Phase::Consumed
+        || receipt.accepted_turn.as_deref() != Some(receipt.intent.wall.as_str())
+        || renewal::read_receipt(env, &receipt.id).as_ref() != Some(receipt)
+    {
+        return Err("not-consumed");
+    }
+    with_selection_writer(env, receipt, SelectionPhase::Member, use_member)
+}
+
 /// Validate compensation to the original login, without requiring the failed
 /// destination's credentials or remaining quota. The native host must still
 /// authorize the sealed Rollback command and prove the forward child has ended.
@@ -168,6 +221,8 @@ enum SelectionPhase {
     Prepared,
     Forward,
     Rollback,
+    Completed,
+    Member,
 }
 
 fn with_selection_writer<T>(
@@ -194,11 +249,7 @@ fn with_selection_writer<T>(
             return Err("receipt-changed");
         }
         let (policy, warnings) = crate::supervise::SupervisorConfig::from_path(Some(config));
-        if !warnings.is_empty()
-            || policy.accounts == accounts::Mode::Off
-            || !policy.relaunch
-            || !policy.resume_limits
-        {
+        if !policy_allows_handoff(&policy, &warnings) {
             return Err("rotation-policy");
         }
         let raw = accounts::Roster::load_for(
@@ -212,7 +263,13 @@ fn with_selection_writer<T>(
             .map_err(|_| "bindings-unreadable")?;
         match logins.native_rotations.get(&receipt.id) {
             Some(recorded) if recorded != &binding => return Err("pool-commit-changed"),
-            None if phase != SelectionPhase::Prepared => return Err("pool-commit-missing"),
+            None if !matches!(
+                phase,
+                SelectionPhase::Prepared | SelectionPhase::Completed | SelectionPhase::Member
+            ) =>
+            {
+                return Err("pool-commit-missing");
+            }
             _ => {}
         }
         let roster = accounts::bound(&raw, &logins);
@@ -226,11 +283,7 @@ fn with_selection_writer<T>(
         };
         let old_dir = directory(&receipt.old_auth)?;
         let new_dir = directory(&receipt.new_auth)?;
-        let sources: Vec<_> = roster
-            .rows
-            .iter()
-            .filter(|row| row.dir == old_dir || row.was.contains(&old_dir))
-            .collect();
+        let sources = roster.rows_of_login(old_dir.as_deref());
         let targets: Vec<_> = roster
             .rows
             .iter()
@@ -240,7 +293,7 @@ fn with_selection_writer<T>(
             return Err("account-lineage");
         };
         if source.label == target.label
-            || source.held_by.is_some()
+            || super::accounts_pool::held_source(source)
             || target.held_by.is_some()
             || renewal::row_stamp(target) != receipt.row_stamp
             || (phase != SelectionPhase::Rollback
@@ -251,12 +304,13 @@ fn with_selection_writer<T>(
         {
             return Err("selection-changed");
         }
-        let state = store.load(env.now).map_err(|_| "state-unreadable")?.0;
-        if (phase != SelectionPhase::Prepared
+        let mut state = store.load(env.now).map_err(|_| "state-unreadable")?.0;
+        store.hydrate_auth_contexts(&mut state, &roster);
+        if (!matches!(phase, SelectionPhase::Prepared | SelectionPhase::Member)
             && state.active.as_deref() != Some(target.label.as_str()))
             || state.pinned
             || (phase != SelectionPhase::Rollback
-                && !accounts::condition(target, &state, true, env.now).fresh())
+                && !super::accounts_pool::native_target_admitted(target, &state, env.now))
         {
             return Err("target-unavailable");
         }
@@ -386,6 +440,7 @@ pub fn prepare(
 pub fn prepare_exec<R: Clone>(
     seat: &Seat<'_>,
     session: &Session<'_, R>,
+    program: &std::path::Path,
     expected_source: &Identity,
     reader: &dyn UsageReader,
     wait: Duration,
@@ -401,6 +456,7 @@ pub fn prepare_exec<R: Clone>(
             accounts_pool::native_exec_quota_plan(
                 seat,
                 session,
+                program,
                 |note| note.record(),
                 |row| admit(row).then(|| command(row)).flatten(),
             )
@@ -439,6 +495,16 @@ fn prepare_with<T, R: Clone>(
         .clone();
     if !me.default_home || !me.stored_login {
         return Err("source-unmanaged");
+    }
+    // Another row's pin keeps every session where it is, and the writer takes no target under one:
+    // nothing is read of the provider while it stands. The session's own row's wall ends its pin.
+    let state = seat
+        .store(Cli::Codex)
+        .load(seat.now)
+        .map_err(|_| "state")?
+        .0;
+    if state.pinned && state.active.as_deref() != Some(source.label.as_str()) {
+        return Ok(None);
     }
     let old_auth = who
         .login

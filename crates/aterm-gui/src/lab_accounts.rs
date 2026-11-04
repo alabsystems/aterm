@@ -125,7 +125,7 @@ fn project_with(
         let next_step = binding.and_then(|binding| binding.sign_in_task)
             .map(|task| task.action.next_step(Cli::Claude, &row.label))
             .or_else(|| {
-                (account.auth == Auth::SignedOut
+                (account.current_auth(row) == Auth::SignedOut
                     || binding.and_then(|binding| binding.sign_in_attempt.as_ref())
                         .is_some_and(|attempt| attempt.outcome.failing()))
                     .then(|| "Run aterm harness accounts to inspect recovery details".into())
@@ -147,6 +147,13 @@ fn project_with(
             ("Selection".into(), selection.into()),
             ("Last observed sign-in".into(), auth.into()),
             ("Sign-in observed".into(), observation_time(account.auth_at, now)),
+            ("Sign-in record applicability".into(), if account.auth == Auth::Unseen {
+                "No sign-in observation to apply"
+            } else if account.current_auth(row) != Auth::Unseen {
+                "Applies to the configured login; provider not checked now"
+            } else {
+                "Historical only; sign-in on the current login is unconfirmed"
+            }.into()),
             ("Login routing".into(), if row.dir.is_some() {
                 "Named local login configured; contents not checked"
             } else {
@@ -158,9 +165,17 @@ fn project_with(
             facts.push(("Pool assignment".into(), "Assignment on record; owner not checked here".into()));
         }
         if let Some(binding) = binding {
-            facts.push(("Login renewed".into(), observation_time(binding.renewed_at, now)));
-            if let Some(by) = accounts::forecast(binding) {
-                facts.push(("Renewal forecast".into(), recorded_time(Some(by))));
+            facts.push(("Last recorded renewal".into(), observation_time(binding.renewed_at, now)));
+            if binding.notice_end.is_some() {
+                facts.push(("Expiry notice on record".into(), recorded_time(binding.notice_end)));
+            }
+            facts.push(("Current expiry estimate".into(), match accounts::login_forecast(row, &records.logins, &records.state) {
+                Some(by) if valid_time(by) => format!("{} (estimate)", recorded_time(Some(by))),
+                Some(_) => "Unknown; the recorded expiry timestamp is invalid".into(),
+                None => "Unknown; expiry has not been observed on this login".into(),
+            }));
+            if binding.served_at.is_some() {
+                facts.push(("Last recorded served turn".into(), observation_time(binding.served_at, now)));
             }
             if let Some(task) = binding.sign_in_task {
                 facts.push(("Recorded sign-in task".into(), match task.action {

@@ -43,7 +43,7 @@ pub(super) struct Cost {
     pub(super) copied_words: usize,
 }
 
-/// A broken way of building rows, for the tests' negative controls.
+/// A broken way of building or reading rows, for the tests' negative controls.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Mutant {
@@ -51,12 +51,16 @@ pub(super) enum Mutant {
     OmitParentRow,
     /// Each record's first parent's own bit is left unset.
     OmitParentBit,
+    /// A closure unions every root's row, even one already in the set.
+    UnionEveryRoot,
 }
 
 #[cfg(test)]
 thread_local! {
-    /// The mutant [`Reach::push`] builds this thread's rows with, if any.
+    /// The mutant this thread's rows are built and read with, if any.
     pub(super) static MUTANT: std::cell::Cell<Option<Mutant>> = const { std::cell::Cell::new(None) };
+    /// The row words [`Reach::closure`] ORed on this thread, counted (never timed).
+    pub(super) static CLOSURE_ORS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Rows `64 * index ..` packed in order: the first holds `index` words, each later one
@@ -167,7 +171,7 @@ impl Reach {
             let (past, own) = match first.take() {
                 Some(Mutant::OmitParentRow) => (&[][..], true),
                 Some(Mutant::OmitParentBit) => (past, false),
-                None => (past, true),
+                Some(Mutant::UnionEveryRoot) | None => (past, true),
             };
             #[cfg(not(test))]
             let own = true;
@@ -206,29 +210,33 @@ impl Reach {
     }
 
     /// OR record `b`'s strict past into `into`, a set over the indexed records.
-    pub(super) fn union_past_into(&self, b: usize, into: &mut [u64]) {
+    fn union_past_into(&self, b: usize, into: &mut [u64]) {
         for (word, more) in into.iter_mut().zip(self.row(b)) {
             *word |= more;
         }
     }
 
-    /// Make `into`, a set over the indexed records, record `b`'s strict past.
-    pub(super) fn copy_past_into(&self, b: usize, into: &mut [u64]) {
-        let row = self.row(b);
-        into[..row.len()].copy_from_slice(row);
-        into[row.len()..].fill(0);
-    }
-
-    /// Whether record `b`'s strict past meets `set`, a set over the indexed records.
-    pub(super) fn past_intersects(&self, b: usize, set: &[u64]) -> bool {
-        self.row(b).iter().zip(set).any(|(a, b)| a & b != 0)
-    }
-
     /// The indexed records at `roots` and every record in their pasts, as a set over the indexed
     /// records.
+    ///
+    /// Roots are taken highest first, and one already in the set (a repeat, or a record in a
+    /// higher root's past) adds nothing, so its row is never read: a closure ORs one row for each
+    /// distinct root that lies in no other root's past, however many roots repeat or precede
+    /// another.
     pub(super) fn closure(&self, roots: impl IntoIterator<Item = usize>) -> Vec<u64> {
+        let mut roots: Vec<usize> = roots.into_iter().collect();
+        roots.sort_unstable_by(|a, b| b.cmp(a));
         let mut set = vec![0; self.len.div_ceil(64)];
+        #[cfg(test)]
+        let every = MUTANT.get() == Some(Mutant::UnionEveryRoot);
+        #[cfg(not(test))]
+        let every = false;
         for root in roots {
+            if !every && (set[root / 64] >> (root % 64)) & 1 == 1 {
+                continue;
+            }
+            #[cfg(test)]
+            CLOSURE_ORS.set(CLOSURE_ORS.get() + self.row(root).len());
             self.union_past_into(root, &mut set);
             set[root / 64] |= 1 << (root % 64);
         }

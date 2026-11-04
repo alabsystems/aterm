@@ -10,21 +10,33 @@ repository.workspace = true
 description = "aterm's name for astream-digest's SHA-256, HMAC-SHA256, HKDF-SHA256 and constant-time compare, re-exported (replaces sha2 and hmac)"
 
 [dependencies]
-# ONE HASH, ONE MAC. astream-digest is the SHA-256, the HMAC-SHA256, the
-# HKDF-SHA256 and the constant-time compare under astream-cap's capability tags
-# and producer ids, astream-aead's handshake and astream-evidence's output pins:
-# zero dependencies, forbid(unsafe), its streaming buffer's L0 obligations
-# discharged as a Clean island. It began as this crate's own sha256.rs and
-# hmac_sha256.rs (the same author, ported with their tests), and aterm kept
-# second copies of both, which nothing held to the first; and aterm-net kept a
-# third HKDF over them. Re-exporting makes `aterm_digest::Sha256` and
-# `aterm_digest::HmacSha256` the very types aterm-link's grants are already
-# tagged and hashed with, so a fix or a proof lands once.
+# ASTREAM'S HASH AND MAC, NOT A SECOND COPY. astream-digest is this crate's
+# SHA-256, HMAC-SHA256, HKDF-SHA256 and constant-time compare (`ct_eq`), the
+# ones under astream-cap's capability tags and producer ids, astream-aead's
+# handshake and astream-evidence's output pins: zero dependencies,
+# forbid(unsafe), its streaming buffer's L0 obligations discharged as a Clean
+# island. It began as this crate's own sha256.rs and hmac_sha256.rs (the same
+# author, ported with their tests), and aterm kept second copies of both, which
+# nothing held to the first; and aterm-net kept a third HKDF over them.
+# Re-exporting makes `aterm_digest::Sha256` and `aterm_digest::HmacSha256` the
+# very types aterm-link's grants are already tagged and hashed with, so a fix
+# or a proof lands once for every crate that hashes or tags through this one.
 #
-# Still no third-party code: `sha2` + `hmac` pulled in 8 packages (49,474 lines)
-# for four methods; `cargo forge survey --cell mac-arm` measured 161 -> 153
-# third-party packages. `subtle` stays in the graph through rustls; `ct_eq`
-# replaces only our use of it.
+# It is not all of aterm's SHA-256, HMAC or HKDF, and it replaces no use of
+# ring. ring's stay in the vault (aterm-secrets: age's and the PAKE's HMAC and
+# HKDF, join's HMAC tag and proof digest, the membership log's HKDF), in
+# aterm-mail (PGP, SRP, the OAuth PKCE challenge), aterm-release (snapshot and
+# certificate digests), atpkg-keys (the master key's fingerprint) and
+# aterm-agent (a disk version's hash), and in the CPU's SHA-256 instructions in
+# bulk file hashes (atpkg, aterm-update-core's `hash::sha256_file` on macOS);
+# ring is also aterm's AEAD and its Ed25519 signatures (releases, updates, the
+# fleet document, the vault's envelopes). A fix or a proof here reaches none of
+# them.
+#
+# This crate adds no third-party code: `sha2` + `hmac` pulled in 8 packages
+# (49,474 lines) for four methods; `cargo forge survey --cell mac-arm` measured
+# 161 -> 153 third-party packages. `subtle` stays in the graph through rustls;
+# `ct_eq` replaces only our use of it.
 astream-digest = { path = "../../vendor/astream/crates/astream-digest" }
 
 [lints]

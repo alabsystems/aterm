@@ -499,6 +499,20 @@ impl Device {
         *lock(&self.pin_total)
     }
 
+    /// WHETHER THE MEDIA HOLDS THE PIN'S FENCE: what it holds of `logpin` for sure, whatever
+    /// a power cut does to the writes since, is a pin of this build
+    /// ([`crate::mirror::Pin::by_this_build`]), as a durable write of it leaves it
+    /// (`StateDir::ensure_logpin_durable`; critic item D06's law, `World::check_always`).
+    pub(crate) fn pin_fenced(&self) -> bool {
+        lock(&self.journal)
+            .files
+            .get(&self.root.join(crate::state::LOGPIN))
+            .is_some_and(|f| {
+                matches!(&f.durable, Version::Bytes(bytes, _)
+                    if crate::mirror::Pin::by_this_build(bytes))
+            })
+    }
+
     /// A file the world wrote before the bridge ever ran (the provisioned node id), on the media.
     pub(crate) fn seed(&self, path: &Path, bytes: &[u8]) {
         std::fs::write(path, bytes).expect("seed a state file");

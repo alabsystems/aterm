@@ -212,15 +212,29 @@ fn valid_authorization_states_keep_one_payload_per_result() {
         checksum >= STATES,
         "each valid state authorizes its genesis"
     );
-    // One result payload and key per state, plus one transient payload during conversion.
-    // The per-state slack covers tree nodes, shared-owner metadata and result handles;
-    // the fixed slack covers container growth. Even without metadata, retaining a second
-    // full payload for every state exceeds this budget.
-    let key_bytes = RECORDS.div_ceil(64) * size_of::<u64>();
-    let bound = (STATES + 1) * RECORDS + STATES * (key_bytes + 512) + 2048;
+    // One result payload and key per state, each over the weighed records alone (the genesis,
+    // the `Admit`s and the `Remove`s), plus one transient payload during conversion. The
+    // per-state slack covers tree nodes, shared-owner metadata and result handles; the fixed
+    // slack covers container growth. Payloads over every held record, as the full pass kept
+    // (STATES * RECORDS bytes), exceed this budget even without metadata.
+    let weighed = log
+        .records()
+        .filter(|record| {
+            matches!(
+                record.kind(),
+                log::Kind::Genesis | log::Kind::Admit | log::Kind::Remove
+            )
+        })
+        .count();
+    assert_eq!(weighed, 1 + STATES - 1 + 2 * STATES);
+    let key_bytes = weighed.div_ceil(64) * size_of::<u64>();
+    let bound = (STATES + 1) * weighed + STATES * (key_bytes + 512) + 2048;
+    assert!(STATES * RECORDS > bound);
     assert!(
         peak <= bound,
         "authorization peak {peak} exceeds {bound} bytes"
     );
-    println!("authorization states={STATES} records={RECORDS} peak={peak} bound={bound}");
+    println!(
+        "authorization states={STATES} records={RECORDS} weighed={weighed} peak={peak} bound={bound}"
+    );
 }

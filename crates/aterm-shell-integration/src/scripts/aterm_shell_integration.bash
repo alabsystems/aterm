@@ -1046,7 +1046,9 @@ __aterm_start_mark() {
 # Unsets `HISTFILE` while held so a discarded spare writes no history, and
 # reloads history on release unless the startup files populated their own list.
 __aterm_spare_hold() {
-    if [[ ! -p /dev/fd/10 ]]; then
+    # macOS answers bash's path test of /dev/fd/10 now and then as no FIFO while one is there, and
+    # the next test sees it: only three answers in a row mean the startup files took the hold.
+    if [[ ! -p /dev/fd/10 && ! -p /dev/fd/10 && ! -p /dev/fd/10 ]]; then
         unset __aterm_spare_mode __aterm_spare_fifo __aterm_spare_rc_list
         __aterm_start_mark cold
         return 0

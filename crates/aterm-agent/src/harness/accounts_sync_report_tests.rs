@@ -77,6 +77,9 @@ impl Bed {
             fleet_accounts: 3,
             changed,
             conflicts: Vec::new(),
+            lab: false,
+            rows_changed: RowChanges::default(),
+            clashes: Vec::new(),
         }
     }
 

@@ -63,6 +63,9 @@ use std::time::Duration;
 pub mod admit;
 pub mod book;
 pub mod cpu_observation;
+pub mod host_protocol;
+#[cfg(unix)]
+pub mod leadership;
 pub use cpu_observation::{CpuHolder, CpuObservation};
 mod timing;
 pub use timing::{CpuPoint, CpuWindow, QuietPolicy, TimingCause, TimingEvidence, TimingIssue};
@@ -93,13 +96,15 @@ pub mod tree_meter;
 pub use trust_build_cpu as build_cpu;
 
 pub use admit::{
-    Alone, CREDIT_MAX, Claim, Error, Holder, Pace, Polled, QuietStart, Relief, Reserve, Short,
-    Shortfall, Waiter, admit, admit_relieved, admit_until, admit_with, covered_memory, covering,
-    gib, never, reserved, span,
+    Alone, CREDIT_MAX, Claim, Error, Forced, Holder, Pace, Polled, QuietStart, Relief, Reserve,
+    Short, Shortfall, Waiter, admit, admit_relieved, admit_until, admit_with, covered_memory,
+    covering, gib, never, reserved, span,
 };
 #[cfg(unix)]
 pub use cohort_environment::capacity_cohort_environment;
 pub use footprint::{Estimate, Footprint, Footprints, Meter, allocated, allocated_until, size};
+#[cfg(any(test, debug_assertions))]
+pub use ledger::Turn;
 pub use ledger::{Accounting, ClaimGuardIdentity, CohortClaimState, Held, Ledger, Record};
 #[cfg(any(test, debug_assertions))]
 pub use reading::Fixed;
@@ -476,7 +481,8 @@ pub enum Admit {
     /// Wait for room ([`admit`]).
     #[default]
     Wait,
-    /// Override resource-only admission at once and say what it would have waited for.
+    /// Override resource-only admission and say what it would have waited for: at once, but
+    /// only in its turn, so it waits while another admission holds the ledger's lock.
     /// Requested Timing refuses this mode: an override cannot qualify measurements.
     Now,
 }

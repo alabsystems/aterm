@@ -455,8 +455,10 @@ pub(crate) fn watch_at_once() -> Watch {
 }
 
 /// The window heard macOS's Local Network answer for aterm move (`App::tick_local_network_step`):
-/// its question went up, which the access record keeps as asked from then on, or the re-probe
-/// after it ended, whatever it heard. Each watch of this process wakes with
+/// its question went up, which the access record keeps as asked from then on, the alert watch
+/// saw no window of the alert's owner left with the person at the Mac
+/// (`App::on_local_network_alert_answered`), or the
+/// re-probe after it ended, whatever it heard. Each watch of this process wakes with
 /// [`Woke::LocalNetwork`], so what reads the LAN (the converge pass's `sync.peers`, which reads
 /// "macOS has not asked" until the record says asked) reads it again now, not at its own time.
 pub(crate) fn local_network_moved() {

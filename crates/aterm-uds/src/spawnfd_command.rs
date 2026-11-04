@@ -12,6 +12,7 @@ use std::io::{self, Read as _};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::{ChildStderr, ChildStdin, ChildStdout, ExitStatus, Output};
+use std::sync::Arc;
 
 /// What a child's stdin, stdout or stderr is: `std::process::Stdio`'s modes.
 pub struct Stdio(Kind);
@@ -383,6 +384,13 @@ impl Command {
         self
     }
 
+    /// Whether the command requests a stopped-at-exec start; observing policy is
+    /// not evidence that a child exists or has acquired foreground custody.
+    #[must_use]
+    pub const fn starts_suspended(&self) -> bool {
+        self.suspended
+    }
+
     /// TEST SEAM: disclaim through the SPI named `spi` instead of [`DISCLAIM_SPI`] — one no image exports, to drive the fail-closed path.
     #[cfg(test)]
     pub(super) fn disclaim_through(&mut self, spi: &'static CStr) -> &mut Self {
@@ -711,8 +719,10 @@ pub struct Child {
     pub stdout: Option<ChildStdout>,
     /// The parent's end of a piped stderr.
     pub stderr: Option<ChildStderr>,
+    foreground: Option<foreground::Lease>,
     handle: Handle,
     usage: Option<Rusage>,
+    custody: Arc<()>,
 }
 
 /// A child's exit status and the resources it and the descendants it reaped used.
@@ -728,6 +738,13 @@ pub struct Rusage {
 #[path = "spawnfd_rusage.rs"]
 mod rusage;
 
+#[path = "spawnfd_foreground.rs"]
+mod foreground;
+
+#[path = "spawnfd_job.rs"]
+mod job;
+pub use job::{ChildEvent, ChildNotice, ChildObservation, ChildStop};
+
 impl fmt::Debug for Child {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Child")
@@ -740,6 +757,97 @@ impl fmt::Debug for Child {
 }
 
 impl Child {
+    /// Parent-private handle identity, stable across moves. A retained receipt
+    /// prevents allocation reuse; replacing a Child cannot replace this binding.
+    pub(super) fn custody_key(&self) -> Arc<()> {
+        Arc::clone(&self.custody)
+    }
+
+    pub(super) fn owns_custody(&self, key: &Arc<()>) -> bool {
+        Arc::ptr_eq(&self.custody, key)
+    }
+
+    /// Wait for this actual child's terminal exit without reaping it. Stop,
+    /// trace and continue events do not establish completion. The cached result
+    /// of a prior reap is returned without supplying a new identity pin.
+    /// # Errors
+    /// Exit observation or the kernel exit watch fails; the child remains owned.
+    pub fn wait_exited(&mut self) -> io::Result<()> {
+        if self.usage.is_some() || self.handle.status.is_some() {
+            return Ok(());
+        }
+        if rusage::observe_exit(self.id(), true)? {
+            Ok(())
+        } else {
+            Err(io::Error::other(
+                "no terminal exit observed for owned child",
+            ))
+        }
+    }
+
+    /// Give this actual live self-led child's group the caller's controlling terminal.
+    /// The caller must currently own its foreground. Start suspended, hand over, then
+    /// [`Self::resume`] to avoid a background terminal-read race. Every owning wait
+    /// restores foreground before reaping; Drop attempts restoration without reaping.
+    /// An intervening foreground handoff is respected. This is cooperative job control,
+    /// not an atomic exclusion of other terminal controllers.
+    ///
+    /// # Errors
+    /// Reaped/exited child, non-self-led or foreign-session group, another active lease,
+    /// unavailable terminal, background caller, or terminal/signal-mask operation failure.
+    /// A transfer failure retains its lease here until restoration can be retried.
+    pub fn take_foreground(&mut self, terminal: std::fs::File) -> io::Result<()> {
+        if self.foreground.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "child already holds terminal foreground custody",
+            ));
+        }
+        if self.exited()? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "terminal handoff requires a live unreaped child",
+            ));
+        }
+        self.foreground = Some(foreground::Lease::prepare(self.id(), terminal)?);
+        self.foreground.as_mut().expect("prepared lease").take()
+    }
+
+    /// Return terminal foreground while this child is still owned and unreaped.
+    /// A terminal another job already owns is left alone. Retain failed restoration
+    /// for retry; no wait may reap this child until restoration succeeds.
+    /// # Errors
+    /// Its controlling process/session changed, or a terminal/mask operation failed.
+    pub fn restore_foreground(&mut self) -> io::Result<()> {
+        if self.foreground.is_some() && (self.usage.is_some() || self.handle.status.is_some()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "terminal custody must be restored before reaping",
+            ));
+        }
+        if let Some(lease) = self.foreground.as_mut() {
+            lease.restore()?;
+            self.foreground = None;
+        }
+        Ok(())
+    }
+
+    fn before_reap(&mut self, block: bool) -> io::Result<bool> {
+        if self.foreground.is_none() {
+            return Ok(true);
+        }
+        if !rusage::observe_exit(self.id(), block)? {
+            if block {
+                return Err(io::Error::other(
+                    "blocking wait observed no owned-child exit",
+                ));
+            }
+            return Ok(false);
+        }
+        self.restore_foreground()?;
+        Ok(true)
+    }
+
     /// Wait for the child and collect its resource accounting.
     /// # Errors
     /// `wait4`'s, or `Unsupported` off 64-bit Darwin/Linux.
@@ -765,6 +873,9 @@ impl Child {
                 "child already reaped without resource accounting",
             ));
         }
+        if !self.before_reap(block)? {
+            return Ok(None);
+        }
         let usage = rusage::wait(self.id(), block)?;
         if let Some(usage) = usage {
             self.handle.status = Some(usage.status);
@@ -788,6 +899,13 @@ impl Child {
     #[must_use]
     pub fn id(&self) -> u32 {
         self.handle.id()
+    }
+
+    /// Whether this handle already consumed its child's exit. Its old pid then
+    /// supplies no live identity or signalling authority.
+    #[must_use]
+    pub const fn is_reaped(&self) -> bool {
+        self.usage.is_some() || self.handle.status.is_some()
     }
 
     /// `SIGKILL` the child; once it is reaped, signal nothing and answer `Ok` (the pid may
@@ -817,6 +935,7 @@ impl Child {
     /// `waitpid`'s, other than `EINTR` (retried).
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
         drop(self.stdin.take());
+        self.before_reap(true)?;
         self.handle.wait()
     }
 
@@ -824,6 +943,9 @@ impl Child {
     /// # Errors
     /// `waitpid`'s, other than `EINTR` (retried).
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        if !self.before_reap(false)? {
+            return Ok(None);
+        }
         self.handle.try_wait()
     }
 
@@ -961,8 +1083,10 @@ impl Command {
             stdin: stdin.map(ChildStdin::from),
             stdout: stdout.map(ChildStdout::from),
             stderr: stderr.map(ChildStderr::from),
+            foreground: None,
             handle: super::LaneChild { pid, status: None },
             usage: None,
+            custody: Arc::new(()),
         })
     }
 
@@ -1285,11 +1409,13 @@ impl Command {
             stdin: child.stdin.take(),
             stdout: child.stdout.take(),
             stderr: child.stderr.take(),
+            foreground: None,
             handle: Handle {
                 child,
                 status: None,
             },
             usage: None,
+            custody: Arc::new(()),
         })
     }
 

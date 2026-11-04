@@ -126,7 +126,7 @@ impl Watch {
             || {
                 let pass = cli::disk_sweep_journalled(&env.state, now, |record| {
                     atpkg::build_cache::reclaim_home_watched(
-                        atpkg::build_cache::RECLAIM_GONE,
+                        atpkg::build_cache::ReclaimAfter::CALM,
                         placing.as_ref(),
                         &mut |path, why| held.validate_for(&pass_path).is_ok() && record(path, why),
                     )
@@ -177,14 +177,10 @@ impl Watch {
             |p| config.projected_target(p),
         );
         if config.dead_build_dirs {
-            let gone_after = if config.below_auto_floor(before) {
-                atpkg::build_cache::RECLAIM_GONE_UNDER_PRESSURE
-            } else {
-                atpkg::build_cache::RECLAIM_GONE
-            };
+            let after = atpkg::build_cache::ReclaimAfter::by_floor(config.below_auto_floor(before));
             let pass = cli::disk_sweep_journalled(&env.state, now, |record| {
                 atpkg::build_cache::reclaim_home_watched(
-                    gone_after,
+                    after,
                     placing.as_ref(),
                     &mut |path, why| {
                         held.validate_for(&pass_path).is_ok()

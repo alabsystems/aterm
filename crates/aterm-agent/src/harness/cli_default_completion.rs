@@ -92,7 +92,8 @@ pub(in crate::harness) fn complete(
     if accounts::roster_text(&path)?.as_deref() != Some(&text) {
         return Err("the roster changed during identity discovery; metadata is unchanged".into());
     }
-    let state = store.load(env.now)?.0;
+    let mut state = store.load(env.now)?.0;
+    store.hydrate_auth_contexts(&mut state, &roster);
     if accounts::condition(row, &state, true, env.now) == accounts::Condition::SignedOut {
         return if asked.is_some() {
             Err("the account is signed out; metadata is unchanged".into())

@@ -162,7 +162,7 @@ fn items(
 mod tests {
     use super::*;
     use aterm_machines::model::{HostFacts, User};
-    use aterm_machines::port::{Fake, GithubResponse, Stat};
+    use aterm_machines::port::{Fake, GithubResponse, Ran, Stat};
     use aterm_secrets::client::{self, JoinOptions, Paths};
     use aterm_types::macos_setup::{Selection, Setting};
     use std::os::unix::fs::PermissionsExt as _;
@@ -219,6 +219,13 @@ mod tests {
         };
         sys.stat_of(home.to_str().unwrap(), stat(true, 0));
         sys.stat_of(aterm_machines::items::github::CLT_GIT, stat(false, 1));
+        // git's credential settings hold nothing of an earlier init's.
+        sys.simulate(|_, command| {
+            command
+                .display()
+                .contains(" config --null --show-origin --get-regexp ")
+                .then(|| Ran::ok(""))
+        });
         let token = home.join(".secrets/gh_access_token");
         let bytes = std::fs::read(&token).unwrap();
         sys.file(token.to_str().unwrap(), &bytes)
@@ -343,7 +350,7 @@ mod tests {
             assert!(
                 !sys.calls()
                     .iter()
-                    .any(|call| call.contains(" agh GET ") || call.contains("credential")),
+                    .any(|call| call.contains(" agh GET ") || call.contains("credential fill")),
                 "{wait:?}: {:?}",
                 sys.calls()
             );
@@ -383,9 +390,11 @@ mod tests {
                 Some(Wait::TokenRefused.note())
             )
         );
+        // The settings row before it has nothing to do, so the stage's own row decides the park.
         let rows = run(&sys, &ctx, None, Mode::Plan).unwrap();
-        assert!(
-            !rows.is_empty() && rows.iter().all(|row| row.status == super::super::WAITING),
+        assert_eq!(
+            rows.last().map(|row| row.status.as_str()),
+            Some(super::super::WAITING),
             "{rows:?}"
         );
         assert_eq!(

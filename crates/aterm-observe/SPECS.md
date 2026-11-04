@@ -119,9 +119,7 @@ crates/aterm-observe/src/lib.rs	watcher_budget_and_row_verdict_wire_roundtrip	ob
 
 ## 4. Tests that are not spec samples
 
-`watcher_budget_and_row_verdict_wire_roundtrip` has no row: it checks the watcher-budget and
-row-verdict wire codecs (`encode_watcher_budget_wire`, `decode_watcher_budget_wire`,
-`encode_row_verdict_wire`, `decode_row_verdict_wire`), which no spec in §1 states.
+None.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 

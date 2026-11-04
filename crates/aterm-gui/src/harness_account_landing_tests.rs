@@ -31,14 +31,15 @@ fn a_profile_changed_during_restart_cannot_publish_a_completed_move() {
     let original = Arc::clone(&idle.hooks.acts.restart);
     let changed = profile.clone();
     let wrong = br#"{"oauthAccount":{"emailAddress":"another@example.test"}}"#;
-    idle.hooks.acts.restart = Arc::new(move |sid, grace, why, selected| {
-        let step = original(sid, grace, why, selected);
+    idle.hooks.acts.restart = Arc::new(move |sid, grace, why, ask, selected| {
+        let step = original(sid, grace, why, ask, selected);
         std::fs::write(&changed, wrong).unwrap();
         step
     });
     assert_eq!(moves(&idle.account(usage_wall())), Some("work-2"));
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("wait:account-unverified")
     );
     let kept = idle.kept.lock().unwrap();
@@ -59,7 +60,8 @@ pub(super) fn pending(same_login: bool) -> (Arc<Accts>, WorkerIdle) {
     a.same_login.store(same_login, Ordering::SeqCst);
     assert_eq!(moves(&idle.account(usage_wall())), Some("work-2"));
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("wait:account-unverified")
     );
     a.readable();

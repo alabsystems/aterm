@@ -2,7 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! What `aterm-lab-guest` (`src/guest/main.rs`) writes in a `lab mac nux` guest, read here: the
-//! dialog census ([`read_census`], [`dialogs`]), the person at the console ([`read_person`],
+//! dialog census ([`read_census`], [`dialogs`]), the reader's words of each dialog
+//! ([`read_reader`]), the person at the console ([`read_person`],
 //! [`hid_proof`], [`click_latencies`], [`sheet_presses`], [`quit_confirms`],
 //! [`reopen_presses`]), the setup record's watch
 //! ([`read_watch`], [`stage_starts`]) and the app's processes ([`read_procs`], [`runs`]); and the
@@ -349,6 +350,42 @@ pub fn read_person(text: &str) -> Person {
         }
     }
     p
+}
+
+/// The reader's record (`aterm-lab-guest reader`): whether it had Accessibility, and the words
+/// of each dialog it read, never answered.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Reader {
+    pub trusted: Option<bool>,
+    /// Each reading: when, the dialog's owner, its controls on one line.
+    pub words: Vec<(u64, String, String)>,
+}
+
+/// Read the reader's record: a `reader trusted=…` line, then `words <pid> <owner>: <controls>`
+/// lines (an owner is one word: the window list's owner names the lane reads have none with a
+/// space but System Settings, which the reader never reads).
+#[must_use]
+pub fn read_reader(text: &str) -> Reader {
+    let mut r = Reader::default();
+    for (kind, at, rest) in text.lines().filter_map(split_line) {
+        match kind {
+            "reader" => {
+                r.trusted = rest
+                    .split_whitespace()
+                    .find_map(|kv| kv.strip_prefix("trusted="))
+                    .map(|v| v == "yes");
+            }
+            "words" => {
+                if let Some((_pid, rest)) = rest.split_once(' ')
+                    && let Some((owner, words)) = rest.split_once(": ")
+                {
+                    r.words.push((at, owner.to_owned(), words.to_owned()));
+                }
+            }
+            _ => {}
+        }
+    }
+    r
 }
 
 /// Whether the person's inputs reset `HIDIdleTime`, as each input's readings show.
@@ -1048,6 +1085,39 @@ mod tests {
         ] {
             assert_eq!(dialog_kind(owner), kind, "{owner}");
         }
+    }
+
+    #[test]
+    fn the_readers_record_names_each_dialogs_owner_and_words() {
+        let r = read_reader(
+            "reader 100 trusted=yes\n\
+             words 200 77 UserNotificationCenter: AXWindow; AXStaticText \"Background Items Added\"\n\
+             words 300 80 CoreServicesUIAgent: AXStaticText \"\\\"kimi\\\" is an app downloaded: x\"\n\
+             words garbled\n",
+        );
+        assert_eq!(r.trusted, Some(true));
+        assert_eq!(
+            r.words,
+            vec![
+                (
+                    200,
+                    "UserNotificationCenter".to_owned(),
+                    "AXWindow; AXStaticText \"Background Items Added\"".to_owned()
+                ),
+                (
+                    300,
+                    "CoreServicesUIAgent".to_owned(),
+                    "AXStaticText \"\\\"kimi\\\" is an app downloaded: x\"".to_owned()
+                ),
+            ],
+            "the words after the owner's first ': ', a garbled line dropped"
+        );
+        assert_eq!(read_reader("reader 1 trusted=no\n").trusted, Some(false));
+        assert_eq!(
+            read_reader("").trusted,
+            None,
+            "no record: unknown, never a no"
+        );
     }
 
     #[test]

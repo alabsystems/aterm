@@ -500,29 +500,59 @@ pub(crate) fn recover(
             );
             Ok(())
         }
-        Verdict::Neither => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "{}: {} names a compaction from base {} to base {}, but the log's first frame \
-                 is neither the one it began with nor the one it kept; refusing to open, \
-                 nothing touched",
-                log.display(),
-                intent_path(log).display(),
-                intent.old_base,
-                intent.new_base
-            ),
-        )),
+        Verdict::Neither => Err(neither(log, &intent)),
     }
 }
 
-/// Steps 5 to 8 for a compaction whose rename landed: each is idempotent, so a crash here
-/// is recovered the same way by the next open.
-fn finish(
+/// WHAT [`recover`] WOULD DO, judged without doing it, for a check that writes nothing
+/// (`BrokerLog::check_open`): `Some(new_base)` when it would finish a compaction whose rename
+/// landed, `None` when there is none to finish (no intent, one it ignores as unreadable, or
+/// one it discards, none of which changes the log, its base or its carried state), and the
+/// refusal it would make: of a log that starts with neither frame its intent names, and the
+/// finish's own ([`ready_to_finish`]), so the open's finish can fail only by a write.
+pub(crate) fn pending(
     log: &Path,
+    existing: &[u8],
     key: Option<AtRestRef<'_>>,
-    intent: &Intent,
-    anti_rollback: bool,
-) -> io::Result<()> {
+) -> io::Result<Option<u64>> {
+    let Found::Intent(intent) = read_intent(log, key)? else {
+        return Ok(None);
+    };
+    let first = match logid::first_frame(existing) {
+        Some(frame) => Some(FrameId::of(frame)),
+        None => None,
+    };
+    match judge(&intent, first) {
+        Verdict::Finish => {
+            ready_to_finish(log, key, &intent)?;
+            Ok(Some(intent.new_base))
+        }
+        Verdict::Discard => Ok(None),
+        Verdict::Neither => Err(neither(log, &intent)),
+    }
+}
+
+/// The refusal of a log whose first frame is neither one `intent` names.
+fn neither(log: &Path, intent: &Intent) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "{}: {} names a compaction from base {} to base {}, but the log's first frame is \
+             neither the one it began with nor the one it kept; refusing to open, nothing \
+             touched",
+            log.display(),
+            intent_path(log).display(),
+            intent.old_base,
+            intent.new_base
+        ),
+    )
+}
+
+/// What [`finish`] reads before it writes, and its refusals, which change nothing: the base
+/// sidecar must read the compaction's old base or its new one, and a compaction that carried
+/// state must find its staged state, or a state already at the new base. `Ok(true)` when the
+/// staged state is there to install.
+fn ready_to_finish(log: &Path, key: Option<AtRestRef<'_>>, intent: &Intent) -> io::Result<bool> {
     let base = read_base(log)?.0;
     if base != intent.old_base && base != intent.new_base {
         return Err(io::Error::new(
@@ -537,30 +567,43 @@ fn finish(
             ),
         ));
     }
-    if intent.carries_state {
-        let staged = staged_state_path(log);
-        match std::fs::symlink_metadata(&staged) {
-            Ok(_) => {
-                let state = state_path(log);
-                rename_path(&staged, &state)?;
-                sync_parent_dir(&state)?;
+    if !intent.carries_state {
+        return Ok(false);
+    }
+    let staged = staged_state_path(log);
+    match std::fs::symlink_metadata(&staged) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            if read_state_base(log, key)? != Some(intent.new_base) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{}: the compaction to base {} carried state, and neither {} nor a \
+                         state at that base is here; refusing to open, nothing touched",
+                        log.display(),
+                        intent.new_base,
+                        staged.display()
+                    ),
+                ));
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                if read_state_base(log, key)? != Some(intent.new_base) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "{}: the compaction to base {} carried state, and neither {} nor \
-                             a state at that base is here; refusing to open, nothing touched",
-                            log.display(),
-                            intent.new_base,
-                            staged.display()
-                        ),
-                    ));
-                }
-            }
-            Err(e) => return Err(e),
+            Ok(false)
         }
+        Err(e) => Err(e),
+    }
+}
+
+/// Steps 5 to 8 for a compaction whose rename landed: each is idempotent, so a crash here
+/// is recovered the same way by the next open.
+fn finish(
+    log: &Path,
+    key: Option<AtRestRef<'_>>,
+    intent: &Intent,
+    anti_rollback: bool,
+) -> io::Result<()> {
+    if ready_to_finish(log, key, intent)? {
+        let state = state_path(log);
+        rename_path(&staged_state_path(log), &state)?;
+        sync_parent_dir(&state)?;
     }
     write_base(log, intent.new_base)?;
     reidentify(log, key, intent, anti_rollback)?;

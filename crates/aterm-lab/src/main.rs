@@ -867,7 +867,7 @@ Outside any lab (no jail, no stub):
   link [--rtt MS] [--take FILE] -- <cmd> [args...]
                                  run <cmd> behind a PTY delaying chunks by RTT/2 each way (default 100 ms)
   mac dmg [--image REF] [--fda] [--keep] | mac nux [--app PATH] [--scenario ROW,...] [--standard-user]
-      [--person] [--no-clt | --vanilla] [--repeat N] [--record [FILE]] | mac clean
+      [--person | --reader] [--no-clt | --vanilla] [--repeat N] [--record [FILE]] | mac clean
                                  the macOS tart guest lane, each run in a fresh clone of a kept SIP-on base: `dmg`, the
                                  dmg_acceptance benches; `nux`, what a person meets on a new Mac (init, doctor, first
                                  launch, terminal and app launch, vault, a vault of the guest's own, successor,

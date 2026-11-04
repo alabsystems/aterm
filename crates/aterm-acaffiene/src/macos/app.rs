@@ -1253,6 +1253,7 @@ mod tests {
             state_dir: dir.join("state"),
             home: dir.join("home"),
             logs_dir: dir.join("logs"),
+            local_volume: |_| true,
         };
         std::fs::create_dir_all(&paths.state_dir).expect("state dir");
         paths
@@ -1663,6 +1664,7 @@ mod tests {
                 state_dir: dir.join("state"),
                 home: dir.join("home"),
                 logs_dir: dir.join("logs"),
+                local_volume: |_| true,
             },
             label: "com.aterm.aterm.acaffiene.test".into(),
             origin: dir.join("aterm"),

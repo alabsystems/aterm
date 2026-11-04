@@ -134,8 +134,8 @@ fn read_answer_within(stream: &crate::CtlStream, wait: Duration) -> io::Result<W
                 .checked_duration_since(std::time::Instant::now())
                 .filter(|duration| !duration.is_zero())
                 .ok_or(io::ErrorKind::TimedOut)?;
-            self.stream.set_read_timeout(Some(remaining))?;
-            self.stream.read(bytes)
+            crate::armed(self.stream.set_read_timeout(Some(remaining)))?;
+            aterm_uds::hangup::Awake(self.stream).read(bytes)
         }
     }
     let deadline = std::time::Instant::now()

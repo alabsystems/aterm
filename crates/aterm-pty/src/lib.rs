@@ -505,6 +505,8 @@ pub use unix_shell::{
     shell_env_for_child,
 };
 #[cfg(any(windows, test))]
+mod cmdline_units;
+#[cfg(any(windows, test))]
 mod input_release;
 #[cfg(windows)]
 mod windows;

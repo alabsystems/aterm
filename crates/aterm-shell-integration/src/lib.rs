@@ -974,7 +974,10 @@ macro_rules! spare_parked_hold {
 if [ -n \"${ATERM_REKEY_PATH:-}\" ]; then
   __aterm_spare_fifo=\"${ATERM_REKEY_PATH%/rekey/*}/spare/${ATERM_REKEY_PATH##*/}\"
   if [ -p \"$__aterm_spare_fifo\" ]; then
-    [ -p /dev/fd/10 ] || exit 0
+    # On macOS a path test of /dev/fd/10 (bash's and fish's: zsh tests the descriptor itself) now
+    # and then answers that a FIFO there is none, and the next test sees it: only three answers in
+    # a row mean no end.
+    [ -p /dev/fd/10 ] || [ -p /dev/fd/10 ] || [ -p /dev/fd/10 ] || exit 0
     printf '\\033]633;P;AtermSpare=parked;id=%s\\a' \"${ATERM_SHELL_NONCE:-}\" >/dev/tty 2>/dev/null
     __aterm_spare_n=0 __aterm_spare_cd=
     while :; do

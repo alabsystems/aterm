@@ -972,7 +972,9 @@ end
 # to its prompt, so the shell ends by `exec`. fish cannot close a descriptor, so
 # the tab keeps fd 10: a read end whose writers close at its first prompt.
 function __aterm_spare_hold
-    if not test -p /dev/fd/10
+    # macOS answers a path test of /dev/fd/10 now and then as no FIFO while one is there, and the
+    # next test sees it: only three answers in a row mean no end.
+    if not test -p /dev/fd/10; and not test -p /dev/fd/10; and not test -p /dev/fd/10
         set -e __aterm_spare_fifo
         __aterm_start_mark cold
         return 0

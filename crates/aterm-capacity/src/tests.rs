@@ -924,25 +924,118 @@ fn admit_now_takes_the_claim_and_says_what_it_would_wait_for() {
     assert_eq!(Admit::parse("later"), None);
 }
 
-/// An explicit resource override does not authorize concurrent decisions or unreadable
-/// ledger state. The same request can override a resource shortage once the ledger works.
+/// `--admit now` overrides room, never the ledger's lock: one that meets the lock held while
+/// another admission decides (a verify run admits several stages at once) decides nothing
+/// meanwhile and waits its turn, saying so by the wait loop's rule, naming the lock's holder.
+/// Once the lock is let go it is admitted short of room, and what it says it would have waited
+/// for is that room, not the lock. NEGATIVE CONTROL: the refusal at a held lock this replaced
+/// ends the admission before any wait line.
 #[test]
-fn admit_now_requires_a_real_admission_turn_and_readable_ledger() {
+fn admit_now_waits_its_turn_at_the_ledgers_lock() {
     let s = scratch("now-turn");
     let m = mac48();
-    let turn = s.ledger.try_turn().unwrap().unwrap();
-    let denied = admit_with(
-        &s.ledger,
-        &m,
-        Need::new("busy turn").mem_gib(60),
-        Admit::Now,
-        Pace::default(),
-        &mut |_| {},
+    let _a = admitted(enter(&s, &m, Need::new("A").mem_gib(30)), &m);
+    let turn = s.ledger.try_turn().expect("the lock").expect("free");
+    let held_turn = Short::Turn {
+        holder: Some(std::process::id()),
+    }
+    .to_string();
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let ledger = s.ledger.clone();
+    let forcing = std::thread::spawn(move || {
+        admit_with(
+            &ledger,
+            &mac48(),
+            Need::new("now-c").mem_gib(20),
+            Admit::Now,
+            Pace {
+                poll: Duration::from_millis(5),
+                line_every: Duration::ZERO,
+            },
+            &mut |l| {
+                let _ = tx.send(l.to_owned());
+            },
+        )
+        .map(|c| (c.record().need.what.clone(), c.record().held.is_some()))
+    });
+    let line = rx.recv_timeout(MUST_HAPPEN).expect("its lock line");
+    names(&line, &["now-c", &held_turn]);
+    assert!(!forcing.is_finished(), "it waits while the lock is held");
+    let queued = s.ledger.list().expect("the ledger");
+    assert!(
+        queued
+            .iter()
+            .any(|r| r.need.what == "now-c" && r.held.is_none()),
+        "it decided nothing while the lock was held: {queued:?}"
     );
-    assert!(matches!(denied, Err(Error::Ledger(ref error))
-        if error.kind() == std::io::ErrorKind::WouldBlock));
-    assert!(s.ledger.list().unwrap().is_empty());
     drop(turn);
+    let forced = joined(forcing, "its admission").expect("admitted once the lock is let go");
+    assert_eq!(forced, ("now-c".to_owned(), true));
+    let lines: Vec<String> = rx.try_iter().collect();
+    let (would, locks) = lines.split_last().expect("what it would have waited for");
+    assert!(locks.iter().all(|l| l.contains(&held_turn)), "{lines:?}");
+    names(would, &["now-c", "10 GiB", "20 GiB"]);
+    assert!(!would.contains(&held_turn), "{would:?}");
+}
+
+/// A stop ends `--admit now`'s wait for the ledger's lock as it ends a wait for room: while the
+/// lock is still held, its claim leaves the queue and [`Error::Stopped`] names the lock's holder.
+/// NEGATIVE CONTROL: a wait for the lock that never asks `stopped` goes on until the lock is let
+/// go, and fails the hang detector.
+#[test]
+fn a_stop_ends_admit_now_waiting_its_turn() {
+    let s = scratch("now-turn-stop");
+    let turn = s.ledger.try_turn().expect("the lock").expect("free");
+    let stop = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let (ledger, stopping) = (s.ledger.clone(), Arc::clone(&stop));
+    let forcing = std::thread::spawn(move || {
+        admit_until(
+            &ledger,
+            &mac48(),
+            Need::new("now-d").mem_gib(1),
+            Admit::Now,
+            Pace {
+                poll: Duration::from_millis(5),
+                line_every: Duration::ZERO,
+            },
+            &mut |l| {
+                let _ = tx.send(l.to_owned());
+            },
+            &|| stopping.load(Ordering::SeqCst),
+        )
+        .map(|c| c.record().need.what.clone())
+    });
+    let line = rx.recv_timeout(MUST_HAPPEN).expect("its lock line");
+    names(&line, &["now-d"]);
+    stop.store(true, Ordering::SeqCst);
+    match joined(forcing, "the stopped admission") {
+        Err(Error::Stopped {
+            signal: None,
+            short: Some(short),
+        }) => assert_eq!(
+            short.shorts,
+            vec![Short::Turn {
+                holder: Some(std::process::id())
+            }]
+        ),
+        other => panic!("expected a stop at the ledger's lock, got {other:?}"),
+    }
+    assert!(
+        s.ledger.list().expect("the ledger").is_empty(),
+        "its claim left the queue"
+    );
+    drop(turn);
+}
+
+/// An explicit resource override does not authorize unreadable ledger state. The same request
+/// can override a resource shortage once the ledger works.
+#[test]
+fn admit_now_requires_a_readable_ledger() {
+    let s = scratch("now-unreadable");
+    let m = mac48();
+    // The ledger's directory, made as an admission makes it.
+    drop(s.ledger.try_turn().unwrap().unwrap());
     let path = s.ledger.dir().join("ledger.lock");
     std::fs::remove_file(&path).unwrap();
     std::fs::create_dir(&path).unwrap();

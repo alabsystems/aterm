@@ -122,9 +122,8 @@ impl SessionPolicy {
             return fixture.quota_rotation
                 && fixture.constructors.enabled(Constructor::PrivateRestart);
         }
-        // Qualified with the sealed renewal service's native host/provider pair.
         // Account selection still requires fresh, identity-bound weekly usage.
-        cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        aterm_agent::harness::codex_rotation::QUOTA_ROTATION_QUALIFIED
     }
 
     pub(crate) fn quota_fixture_roots(&self) -> Option<Vec<Vec<u8>>> {

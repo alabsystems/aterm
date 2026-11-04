@@ -4,6 +4,27 @@
 use super::*;
 use std::cell::RefCell;
 
+fn codex_login(home: &Path) {
+    std::fs::create_dir_all(home).unwrap();
+    std::fs::write(
+        home.join("config.toml"),
+        "cli_auth_credentials_store='file'\n",
+    )
+    .unwrap();
+    let token = crate::harness::codex_app_login::tests::make_jwt(&aterm_json::json!({
+        "email": "main@example.test",
+        "https://api.openai.com/auth": {"chatgpt_user_id": "main", "chatgpt_account_id": "fixture-workspace"}
+    }));
+    std::fs::write(
+        home.join("auth.json"),
+        aterm_json::json!({
+            "auth_mode": "chatgpt", "tokens": {"id_token": token, "access_token": token}
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
 struct Host {
     emails: RefCell<Vec<String>>,
 }
@@ -62,6 +83,9 @@ impl Bed {
             let credential = dir.join(cli.connector().stores[0]);
             std::fs::create_dir_all(credential.parent().unwrap()).unwrap();
             std::fs::write(credential, b"opaque fixture").unwrap();
+            if cli == Cli::Codex {
+                codex_login(dir);
+            }
         }
         let raw = Roster {
             rows: vec![accounts::Row {
@@ -93,6 +117,7 @@ impl Bed {
     }
 
     fn renew_ended(&self, index: usize) -> Result<Vec<accounts::Event>, String> {
+        let raw = Roster::load_for(self.cli, &self.path)?;
         self.store
             .transact_logins(self.env.now, &mut None, |state, logins| {
                 let mut events = accounts::note_renewed(
@@ -104,12 +129,27 @@ impl Bed {
                     None,
                     self.env.now,
                 );
-                events.extend(accounts::note_login_end(
-                    state,
-                    logins,
-                    "main",
-                    self.env.now,
-                ));
+                if self.cli == Cli::Codex {
+                    let effective = accounts::bound(&raw, logins);
+                    let context = self
+                        .store
+                        .capture_auth_context(effective.row("main").unwrap())
+                        .unwrap();
+                    accounts::stage_login_end(
+                        state,
+                        raw.row("main").unwrap(),
+                        logins,
+                        context,
+                        self.env.now,
+                    );
+                } else {
+                    events.extend(accounts::note_login_end(
+                        state,
+                        logins,
+                        "main",
+                        self.env.now,
+                    ));
+                }
                 Ok(events)
             })
     }
@@ -155,6 +195,10 @@ fn manual_renewals_recover_or_refuse_before_dispatching_any_provider() {
         for due in [false, true] {
             for fault in 0..7 {
                 let bed = Bed::new(cli);
+                let credentials_before = bed
+                    .dirs
+                    .each_ref()
+                    .map(|dir| std::fs::read(dir.join(cli.connector().stores[0])).unwrap());
                 match fault {
                     1 | 6 => bed.pending(),
                     2 => std::fs::write(&bed.path, "[[account]").unwrap(),
@@ -217,10 +261,14 @@ fn manual_renewals_recover_or_refuse_before_dispatching_any_provider() {
                         "a refused read changed account records"
                     );
                 }
-                for dir in &bed.dirs {
+                for (index, dir) in bed.dirs.iter().enumerate() {
                     assert_eq!(
                         std::fs::read(dir.join(cli.connector().stores[0])).unwrap(),
-                        b"opaque fixture"
+                        if cli == Cli::Codex {
+                            credentials_before[index].as_slice()
+                        } else {
+                            b"opaque fixture"
+                        }
                     );
                 }
             }

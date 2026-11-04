@@ -230,6 +230,15 @@ struct Mock {
     /// The first this many `text` reads find the cursor off the caret (row 10), later ones on
     /// it; the move bumps no content seq.
     caret_after_reads: Option<usize>,
+    /// From this long after a screen was first read, its cursor stands home, on its caret row at
+    /// column 2, wherever it stood before: a program that places its cursor last, the move
+    /// bumping no content seq.
+    cursor_home_after: Option<Duration>,
+    /// SCREENS ON THE RUN'S CLOCK: from screen `.0`'s first read, screen `.0 + j` stands from
+    /// `.1[j]` after it (`.1[0]` is zero), each held until the next one's time and the last for
+    /// good; an `await seq` on one passes the run's clock to the next one's time, or times out
+    /// on it first.
+    timeline: Option<(usize, Vec<Duration>)>,
     /// A screen that sits ([`Self::held`]) is read, from this many `text` reads on, as the
     /// script's next screen at a new seq while every wait on it still sat.
     redrawn_after_reads: Option<usize>,
@@ -327,11 +336,26 @@ struct Mock {
     /// The first `cell` read once the attention is raised is lost.
     cell_lost_once_told: bool,
     person_skipped: Vec<usize>,
+    /// What a `cell` read answers: a blanket `dim` by default, a grey suggestion, which stands with
+    /// the cursor home. Text the cursor stands past on its caret's row is a person's and reads plain
+    /// ([`Self::typed_past`]), unless the test says it is grey there too ([`Self::dim_past`]).
     cell_attrs: &'static str,
+    /// [`Self::cell_attrs`]'s blanket `dim` holds wherever the cursor stands: grey text read before
+    /// its program placed the cursor.
+    dim_past: bool,
     /// The attributes a `cell` read answers while the script's screen `i` is the one last
     /// served, in place of [`Self::cell_attrs`].
     cell_attrs_on: BTreeMap<usize, &'static str>,
     cell_fg: &'static str,
+    /// The foreground a `cell` read answers while the script's screen `i` is the one last served,
+    /// in place of [`Self::cell_fg`].
+    cell_fg_on: BTreeMap<usize, &'static str>,
+    /// The first this many `cell` reads answer from a frame still open (` frame=open`), which says
+    /// nothing of what the cell is.
+    cell_open_reads: usize,
+    /// The first this many `cell` reads answer `dim` from a frame drawn since the rows were read: the
+    /// content seq has moved.
+    cell_later_frames: usize,
     cell_unreadable: bool,
     /// Every `cell` read fails (`ERR evicted`) while the script's screen `i` is the one last
     /// served: a glyph's cell unread on that screen alone.
@@ -1077,7 +1101,7 @@ impl Mock {
             exit_at_request: None,
             end_when_parked: false,
             waits: None,
-            hang_at: None,
+            hang_at: Some(Instant::now() + aterm_spec::wait::MUST_HAPPEN),
             round_trip: Duration::ZERO,
             after_call: None,
             title: None,
@@ -1108,6 +1132,8 @@ impl Mock {
             screen_cols: BTreeMap::new(),
             cursor_on_caret: false,
             caret_after_reads: None,
+            cursor_home_after: None,
+            timeline: None,
             redrawn_after_reads: None,
             screen_cursors: BTreeMap::new(),
             pane_cols: None,
@@ -1195,7 +1221,11 @@ impl Mock {
             cell_lost_once_told: false,
             person_skipped: Vec::new(),
             cell_attrs: "dim",
+            dim_past: false,
             cell_attrs_on: BTreeMap::new(),
+            cell_fg_on: BTreeMap::new(),
+            cell_open_reads: 0,
+            cell_later_frames: 0,
             cell_fg: "d0d0d0",
             cell_unreadable: false,
             cell_unread_on: std::collections::BTreeSet::new(),
@@ -1714,6 +1744,85 @@ impl Mock {
         };
         format!("OK idle {seq}\n")
     }
+    /// Where a read of screen `i` finds the cursor: its row and its column.
+    fn cursor_of(&self, i: usize) -> (usize, usize) {
+        let caret = || {
+            self.screens[i]
+                .iter()
+                .rposition(|r| r.starts_with(['❯', '›', '»']))
+                .unwrap_or(10)
+        };
+        let home = self.cursor_home_after.is_some_and(|after| {
+            self.read_times
+                .iter()
+                .find(|(j, _)| *j == i)
+                .is_some_and(|(_, first)| run_since(self.waits.as_deref(), *first) >= after)
+        });
+        if home {
+            return (caret(), 2);
+        }
+        let col = self
+            .screen_cols
+            .get(&i)
+            .copied()
+            .or(self.cursor_col)
+            .unwrap_or_else(|| {
+                if self.screens[i].iter().any(|r| r == "❯ 1" || r == "❯ 0") {
+                    3
+                } else {
+                    2
+                }
+            });
+        let row = if let Some(&row) = self.screen_cursors.get(&i) {
+            row
+        } else if let Some(row) = self.cursor_row {
+            row
+        } else if self.cursor_on_caret
+            || self
+                .caret_after_reads
+                .is_some_and(|n| self.reads.len() >= n)
+        {
+            caret()
+        } else {
+            10
+        };
+        (row, col)
+    }
+    /// Whether a read of screen `i` finds the cursor past column 2 on its caret's row, or off its
+    /// rows, which a read takes for its caret's.
+    fn typed_past(&self, i: usize) -> bool {
+        let (row, col) = self.cursor_of(i);
+        let caret = self.screens[i]
+            .iter()
+            .rposition(|r| r.starts_with(['❯', '›', '»']))
+            .unwrap_or(10);
+        col != 2 && (row == caret || row >= self.screens[i].len())
+    }
+    /// When [`Self::timeline`]'s next screen stands, once a screen of it is read.
+    fn timeline_next(&self) -> Option<Instant> {
+        let (k, offsets) = self.timeline.as_ref()?;
+        let i = self.served.checked_sub(1)?;
+        if i < *k {
+            return None;
+        }
+        let next = offsets.get(i - k + 1)?;
+        let t0 = self
+            .read_times
+            .iter()
+            .find(|(j, _)| j == k)
+            .map(|(_, at)| *at)?;
+        Some(t0 + *next)
+    }
+    /// Whether [`Self::timeline`] holds the screen read: its next one's time is still to come, or
+    /// it is the last.
+    fn timeline_holds(&self) -> bool {
+        self.timeline_next()
+            .is_some_and(|at| at > run_now(self.waits.as_deref()))
+            || self
+                .timeline
+                .as_ref()
+                .is_some_and(|(k, offsets)| self.served >= k + offsets.len())
+    }
     /// Whether the screen last served still stands ([`Self::stands`]).
     fn standing(&self) -> bool {
         let Some(i) = self.served.checked_sub(1) else {
@@ -1728,7 +1837,8 @@ impl Mock {
             .is_some_and(|(_, first)| run_since(self.waits.as_deref(), *first) < hold)
     }
     fn held(&self) -> bool {
-        self.moves_held && self.rest_from.is_some()
+        self.timeline_holds()
+            || self.moves_held && self.rest_from.is_some()
             || self.unmoved_for().is_some()
             || self.standing()
             || self
@@ -1809,39 +1919,12 @@ impl Mock {
         } else {
             String::new()
         };
-        let composer_col = self
-            .screen_cols
-            .get(&i)
-            .copied()
-            .or(self.cursor_col)
-            .unwrap_or_else(|| {
-                if self.screens[i].iter().any(|r| r == "❯ 1" || r == "❯ 0") {
-                    3
-                } else {
-                    2
-                }
-            });
+        let (cursor_row, composer_col) = self.cursor_of(i);
         let (epoch, seq) = self.screen_gens.get(&i).copied().unwrap_or((1, self.seq));
         let generation = if self.sends_gen {
             format!(",\"gen\":\"{epoch}.{seq}\"")
         } else {
             String::new()
-        };
-        let cursor_row = if let Some(&row) = self.screen_cursors.get(&i) {
-            row
-        } else if let Some(row) = self.cursor_row {
-            row
-        } else if self.cursor_on_caret
-            || self
-                .caret_after_reads
-                .is_some_and(|n| self.reads.len() >= n)
-        {
-            self.screens[i]
-                .iter()
-                .rposition(|r| r.starts_with(['❯', '›', '»']))
-                .unwrap_or(10)
-        } else {
-            10
         };
         let stamp = match (self.human_on.get(&i), self.human.len()) {
             (Some(&on), _) => on,
@@ -2934,6 +3017,25 @@ impl Mock {
                         return Ok(timeout());
                     }
                 }
+                if let Some(at) = self.timeline_next() {
+                    let asked = tail
+                        .iter()
+                        .position(|a| *a == "timeout")
+                        .and_then(|i| tail.get(i + 1))
+                        .and_then(|ms| ms.parse::<u64>().ok())
+                        .map_or(Duration::ZERO, Duration::from_millis);
+                    let now = run_now(self.waits.as_deref());
+                    if at > now {
+                        let left = at - now;
+                        if let Some(clock) = &self.waits {
+                            clock.skip(left.min(asked));
+                        }
+                        if left > asked {
+                            return Ok(timeout());
+                        }
+                    }
+                    return Ok(ok("OK seq\n"));
+                }
                 if self.held() {
                     let asked = tail
                         .iter()
@@ -3312,12 +3414,28 @@ impl Mock {
             ))),
             "cell" => {
                 let shown = self.served.saturating_sub(1).min(self.screens.len() - 1);
-                let attrs = self
-                    .cell_attrs_on
-                    .get(&shown)
-                    .copied()
-                    .unwrap_or(self.cell_attrs);
-                Ok(ok(&format!("OK %20 {} 111318 {attrs}\n", self.cell_fg)))
+                let later = self.cell_later_frames > 0;
+                if later {
+                    self.cell_later_frames -= 1;
+                    self.seq += 1;
+                }
+                let attrs = self.cell_attrs_on.get(&shown).copied().unwrap_or_else(|| {
+                    if later {
+                        "dim"
+                    } else if self.cell_attrs == "dim" && !self.dim_past && self.typed_past(shown) {
+                        "none"
+                    } else {
+                        self.cell_attrs
+                    }
+                });
+                let fg = self.cell_fg_on.get(&shown).copied().unwrap_or(self.cell_fg);
+                let frame = if self.cell_open_reads > 0 {
+                    self.cell_open_reads -= 1;
+                    " frame=open"
+                } else {
+                    ""
+                };
+                Ok(ok(&format!("OK %20 {fg} 111318 {attrs}{frame}\n")))
             }
             "meta" if tail.get(2) == Some(&"owner=needs") => {
                 self.needs_calls.push(tail.join(" "));
@@ -8868,7 +8986,11 @@ impl IdleHost for ProbeHost {
     fn relaunches_after_stall(&self) -> bool {
         self.relaunches.load(Ordering::SeqCst)
     }
-    fn restart(&self, why: &super::super::policy::turn_end::Restart) -> Option<String> {
+    fn restart(
+        &self,
+        why: &super::super::policy::turn_end::Restart,
+        _: &super::super::policy::turn_end::RestartAsk,
+    ) -> Option<String> {
         use super::super::policy::turn_end::Restart;
         let what = match why {
             Restart::Account { to, .. } => format!("restart:{}:{to}", why.word()),

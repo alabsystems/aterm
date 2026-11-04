@@ -75,9 +75,9 @@ pub struct Job {
 }
 
 impl Job {
-    /// Start `line` (program first: a headless aterm and its flags, `--lifeline-fd 0` among them, or a windowed one's keeper, which takes the lifeline on stdin) as its own launchd job ([`launch`]) with exactly `env`, in `cwd`, its output appended to `log`, and wait for it to report its pid.
+    /// Start `line` (program first: a headless aterm and its flags, `--lifeline-fd 0` among them, or a windowed one's keeper, which takes the lifeline on stdin) as its own launchd job ([`launch`]) with exactly `env`, in `cwd`, its output appended to `log`, wait for it to report its pid, and then give it the go ([`band_main`]).
     /// # Errors
-    /// The world's entries could not be made, `launchctl` refused the job, or the job never reported (its log says why; the job is removed).
+    /// The world's entries could not be made, `launchctl` refused the job, the job never reported (its log says why), or its go could not be written; the job is removed after either of the last two.
     pub fn start(
         dir: &Path,
         line: &[String],
@@ -112,10 +112,15 @@ impl Job {
                 .ok()
                 .and_then(|s| s.trim().parse::<i32>().ok())
             {
+                let mut held = File::from(held);
+                if let Err(e) = held.write_all(&[GO]) {
+                    remove(&label);
+                    return Err(format!("the go to the instance's launchd job {label}: {e}"));
+                }
                 return Ok(Job {
                     label,
                     pid,
-                    held: Some(held),
+                    held: Some(held.into()),
                 });
             }
             if Instant::now() >= end {
@@ -271,7 +276,52 @@ pub fn launch_main(args: &[String]) -> i32 {
     }
 }
 
+/// The byte [`Job::start`] writes into the lifeline once it has read the job's pid: the go.
+const GO: u8 = b'g';
+
+/// What [`band_main`] read from the lifeline while it waited for the go.
+#[derive(Debug)]
+enum Go {
+    /// A byte: the launcher still held its writer after the job's open of the lifeline.
+    Given,
+    /// End of file: every writer is gone, the launcher's among them.
+    Gone,
+    /// Neither, within the wait's bound.
+    Late,
+    /// The read failed.
+    Failed(std::io::Error),
+}
+
+/// Wait at most `within` for the go on `lifeline`, a non-blocking read end, polling every 20 ms
+/// rather than blocking in a read, so the wait ends by `within` whatever the lifeline answers.
+fn await_go(mut lifeline: &File, within: Duration) -> Go {
+    let end = Instant::now() + within;
+    loop {
+        match lifeline.read(&mut [0_u8; 1]) {
+            Ok(0) => return Go::Gone,
+            Ok(_) => return Go::Given,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= end {
+                    return Go::Late;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => return Go::Failed(e),
+        }
+    }
+}
+
 /// `aterm-lab band <dir> <label> --cwd DIR --log FILE -- PROGRAM ARGS…`: the first process of an app-band job ([`Job::start`]).
+///
+/// A launchd job inherits no descriptor, so it opens the lifeline FIFO by its name, and on macOS a
+/// FIFO reader whose open returns just as the only writer closes can miss the end of file and
+/// never end (measured 2026-10-29 under load): a launcher killed at that moment could leave the
+/// job's program running for good. So the job writes its pid only once its open has returned,
+/// and starts its program only on the go, which [`Job::start`] writes once it has read that pid:
+/// the launcher held its writer after the open, so no close of it can meet the open. A launcher
+/// gone before the go leaves the job to end without its program, at the end of file or, should
+/// that be lost, once [`crate::instance::BOOT`] has passed; launchd's restart then removes it.
 #[must_use]
 pub fn band_main(args: &[String]) -> i32 {
     let usage = || {
@@ -330,10 +380,6 @@ pub fn band_main(args: &[String]) -> i32 {
         }
     };
     let _ = std::fs::remove_file(dir.join(LIFELINE));
-    if let Err(e) = crate::sys::set_blocking(lifeline.as_raw_fd()) {
-        eprintln!("aterm-lab band: the lifeline: {e}");
-        return 127;
-    }
     let out = match OpenOptions::new().create(true).append(true).open(log) {
         Ok(f) => f,
         Err(e) => {
@@ -343,6 +389,28 @@ pub fn band_main(args: &[String]) -> i32 {
     };
     if let Err(e) = write_pid(&dir) {
         eprintln!("aterm-lab band: the pid file: {e}");
+        return 127;
+    }
+    match await_go(&lifeline, crate::instance::BOOT) {
+        Go::Given => {}
+        Go::Gone => {
+            eprintln!("aterm-lab band: the launcher was gone before its go; {prog} does not run");
+            return 1;
+        }
+        Go::Late => {
+            eprintln!(
+                "aterm-lab band: no go from the launcher in {} s; {prog} does not run",
+                crate::instance::BOOT.as_secs()
+            );
+            return 1;
+        }
+        Go::Failed(e) => {
+            eprintln!("aterm-lab band: the lifeline: {e}");
+            return 127;
+        }
+    }
+    if let Err(e) = crate::sys::set_blocking(lifeline.as_raw_fd()) {
+        eprintln!("aterm-lab band: the lifeline: {e}");
         return 127;
     }
     let placed = crate::sys::dup_onto(lifeline.as_raw_fd(), 0)
@@ -430,6 +498,50 @@ fn write_pid(dir: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lifeline as [`band_main`] holds it, a non-blocking read end of a FIFO, beside the
+    /// launcher's held read-write end, as [`Job::start`] opens them.
+    fn lifeline() -> (aterm_tempfile::TempDir, File, File) {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let fifo = dir.path().join(LIFELINE);
+        crate::sys::make_fifo(&fifo).expect("mkfifo");
+        let held = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fifo)
+            .expect("the held end");
+        let job = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+            .expect("the job's end");
+        (dir, held, job)
+    }
+
+    /// The go is a byte; a launcher gone without it is the end of file; one that holds its writer
+    /// and writes nothing leaves the job waiting until the bound.
+    #[test]
+    fn the_job_waits_for_its_go_and_sees_a_launcher_gone_without_it() {
+        let (_dir, mut held, job) = lifeline();
+        held.write_all(&[GO]).expect("the go");
+        assert!(
+            matches!(await_go(&job, crate::instance::BOOT), Go::Given),
+            "the go"
+        );
+
+        let (_dir, held, job) = lifeline();
+        drop(held);
+        assert!(
+            matches!(await_go(&job, crate::instance::BOOT), Go::Gone),
+            "a launcher gone"
+        );
+
+        let (_dir, _held, job) = lifeline();
+        assert!(
+            matches!(await_go(&job, Duration::ZERO), Go::Late),
+            "a launcher that holds its writer and writes nothing"
+        );
+    }
 
     #[test]
     fn an_instance_defaults_to_the_app_band_and_takes_either_band_by_name() {

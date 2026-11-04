@@ -21,6 +21,9 @@ mod live_snapshot;
 #[serde(deny_unknown_fields)]
 pub struct NativeRenewalFixture {
     pub root: PathBuf,
+    /// Explicit test-only shared pool, preseeded by the fixture driver. Each
+    /// native host still owns its own root, control socket, PTY and receipts.
+    pub shared_pool_root: Option<PathBuf>,
     pub codex: PathBuf,
     pub cwd: PathBuf,
     pub auth_path: PathBuf,
@@ -35,6 +38,58 @@ pub struct NativeRenewalFixture {
     pub continue_policy: Option<bool>,
     #[serde(default)]
     pub weekly_quota: bool,
+}
+
+fn fixture_pool_root<'a>(
+    root: &'a std::path::Path,
+    shared: Option<&'a std::path::Path>,
+    weekly_quota: bool,
+    adopting: bool,
+) -> Result<&'a std::path::Path, String> {
+    let Some(shared) = shared else {
+        return Ok(root);
+    };
+    let plain_absolute = |path: &std::path::Path| {
+        path.is_absolute()
+            && path.components().all(|part| {
+                matches!(
+                    part,
+                    std::path::Component::RootDir | std::path::Component::Normal(_)
+                )
+            })
+    };
+    if !weekly_quota
+        || adopting
+        || !plain_absolute(shared)
+        || !plain_absolute(root)
+        || root == shared
+        || !root.starts_with(shared)
+    {
+        return Err("shared fixture pool must contain a distinct quota host root".into());
+    }
+    Ok(shared)
+}
+
+#[cfg(test)]
+#[test]
+fn native_renewal_shared_pool_requires_distinct_owned_quota_hosts() {
+    use std::path::Path;
+    let pool = Path::new("/fixture-pool");
+    let host = pool.join("host-one");
+    assert_eq!(fixture_pool_root(&host, None, false, false).unwrap(), host);
+    assert_eq!(
+        fixture_pool_root(&host, Some(pool), true, false).unwrap(),
+        pool
+    );
+    for (root, weekly, adopting) in [
+        (pool, true, false),
+        (Path::new("/elsewhere"), true, false),
+        (Path::new("/fixture-pool/../elsewhere"), true, false),
+        (host.as_path(), false, false),
+        (host.as_path(), true, true),
+    ] {
+        assert!(fixture_pool_root(root, Some(pool), weekly, adopting).is_err());
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -324,24 +379,30 @@ fn codex_renewal_native_status_matches_app_claim_and_counter_fields() {
 pub fn run_native_renewal_host_fixture(config: NativeRenewalFixture) -> Result<(), String> {
     let env = aterm_agent::harness::cli::Env::from_process()?;
     let home = env.home.as_ref().ok_or("fixture HOME missing")?;
+    let pool_root = fixture_pool_root(
+        &config.root,
+        config.shared_pool_root.as_deref(),
+        config.weekly_quota,
+        config.adopt.is_some(),
+    )?;
     if !config.root.is_absolute()
-        || !home.starts_with(&config.root)
-        || !env.state.starts_with(&config.root)
+        || !home.starts_with(pool_root)
+        || !env.state.starts_with(pool_root)
         || env
             .config
             .as_ref()
-            .is_none_or(|path| !path.starts_with(&config.root))
+            .is_none_or(|path| !path.starts_with(pool_root))
         || !config.cwd.starts_with(&config.root)
-        || !config.auth_path.starts_with(&config.root)
+        || !config.auth_path.starts_with(pool_root)
         || !config.codex.is_absolute()
         || config
             .successor_auth_path
             .as_ref()
-            .is_some_and(|path| !path.starts_with(&config.root))
+            .is_some_and(|path| !path.starts_with(pool_root))
         || config
             .additional_auth_paths
             .iter()
-            .any(|path| !path.starts_with(&config.root))
+            .any(|path| !path.starts_with(pool_root))
     {
         return Err("fixture paths must remain in the owned root".into());
     }
@@ -353,12 +414,15 @@ pub fn run_native_renewal_host_fixture(config: NativeRenewalFixture) -> Result<(
     let old_home = config.auth_path.parent().ok_or("fixture auth path")?;
     let email = aterm_agent::harness::codex_app_login::read_account_email(old_home)
         .ok_or("fixture native email")?;
-    if roster.exists() && config.adopt.is_none() {
+    if config.shared_pool_root.is_some() && !roster.is_file() {
+        return Err("shared fixture pool requires a preseeded roster".into());
+    }
+    if roster.exists() && config.adopt.is_none() && config.shared_pool_root.is_none() {
         return Err("fixture requires an unseeded roster".into());
     }
     std::fs::create_dir_all(roster.parent().ok_or("fixture roster parent")?)
         .map_err(|e| e.to_string())?;
-    if config.adopt.is_none() {
+    if config.adopt.is_none() && config.shared_pool_root.is_none() {
         let mut roster_text = format!(
             "[[account]]\nlabel='main'\nclass='dedicated'\ndir={}\nemail={}\n",
             aterm_toml::Value::from(old_home.to_str().ok_or("fixture old home")?),
@@ -650,7 +714,11 @@ pub fn run_native_renewal_host_fixture(config: NativeRenewalFixture) -> Result<(
         .map(|word| quote(&word))
         .collect::<Vec<_>>()
         .join(" ")
-        + "\n";
+        + if config.args.first().is_some_and(|arg| arg == "exec") {
+            "; printf '\\nEXEC_FIXTURE_EXIT=%s\\n' \"$?\"\n"
+        } else {
+            "\n"
+        };
     if config.adopt.is_none() {
         aterm_pty::write_all(master, line.as_bytes());
     }

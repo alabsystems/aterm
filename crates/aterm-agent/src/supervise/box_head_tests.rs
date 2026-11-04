@@ -538,7 +538,7 @@ fn a_chrome_intro_taller_than_its_pane_joins_whole_and_is_held() {
                 panic!("{name} cut at {k}: the cut alone is pressed: {held:?}");
             };
             assert!(
-                reason.contains("taller than the pane"),
+                reason.contains("top border is not on the screen (a box taller than the pane)"),
                 "{name} cut at {k}: {reason}"
             );
             let (joined, reading) = joined_box(&rows[rule..k], screen, p, 2)

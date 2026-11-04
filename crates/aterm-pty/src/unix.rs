@@ -247,9 +247,9 @@ fn open_ptmx(mut open: impl FnMut(libc::c_int) -> libc::c_int) -> io::Result<lib
     }
 }
 
-/// How many ptys whose slave's node is gone as it opens one pty open replaces before it is an
-/// error ([`open_pty_pair_cloexec`]).
-const GONE_SLAVE_REPLACEMENTS: usize = 1;
+/// How many ptys one pty open replaces (one whose slave's node is gone as it opens, or on Apple
+/// one whose `grantpt` was let go) before it is an error ([`open_pty_pair_cloexec`]).
+const GONE_PTY_REPLACEMENTS: usize = 1;
 
 /// Opens a `(master, slave)` pty pair, both ends close-on-exec, `termp` and `winp` applied to
 /// the slave.
@@ -262,18 +262,25 @@ const GONE_SLAVE_REPLACEMENTS: usize = 1;
 /// would go straight to the fresh pair. A second is an error naming both. (Linux opens the slave
 /// through `TIOCGPTPEER`, by name only where a kernel predates it.)
 ///
+/// On Apple a pty whose `grantpt` has not returned after [`GRANT_BOUND`] and goes on burning its
+/// thread's CPU ([`GRANT_SPIN`]) is let go ([`grant_watch`]): XNU's spins forever on a pty whose
+/// node could not be made because its name was still another pty's. It is replaced the same
+/// way, held open meanwhile. A grant that is only late (its thread off its core) is waited for.
+///
 /// # Errors
 /// The failed step's own error (`posix_openpt`, `FD_CLOEXEC`, `grantpt`, `unlockpt`, the slave's
-/// name or its open), with nothing left open; for a second pty whose slave's node was gone, or
-/// the replacement's own failure, that error naming the gone one, the gone ptys closed.
+/// name or its open), with nothing left open; for a second pty whose slave's node was gone or
+/// whose grant was let go (`TimedOut`), or the replacement's own failure, that error naming the
+/// gone one, the gone ptys closed.
 fn open_pty_pair_cloexec(
     termp: Option<&libc::termios>,
     winp: Option<&libc::winsize>,
 ) -> io::Result<(libc::c_int, libc::c_int)> {
-    open_pty_pair_replacing(termp, winp, GONE_SLAVE_REPLACEMENTS)
+    open_pty_pair_replacing(termp, winp, GONE_PTY_REPLACEMENTS)
 }
 
-/// [`open_pty_pair_cloexec`], replacing up to `replacements` ptys whose slave's node is gone.
+/// [`open_pty_pair_cloexec`], replacing up to `replacements` ptys whose slave's node is gone or,
+/// on Apple, whose `grantpt` was let go ([`grant_watch`]), from one budget.
 fn open_pty_pair_replacing(
     termp: Option<&libc::termios>,
     winp: Option<&libc::winsize>,
@@ -290,18 +297,56 @@ fn open_pty_pair_replacing(
         return Err(err);
     }
 
-    // SAFETY: `master` is a live ptmx fd; `grantpt` and `unlockpt` take no pointer arguments.
-    let refused = unsafe {
-        if libc::grantpt(master) != 0 {
-            Some("grantpt")
-        } else if libc::unlockpt(master) != 0 {
-            Some("unlockpt")
-        } else {
-            None
+    // A test's grant that spins as XNU's does (`pty_race::grants_spin`), or `grantpt`.
+    let grant = |m: libc::c_int| {
+        #[cfg(all(test, target_os = "macos"))]
+        if pty_race::grant_spins(m) {
+            return pty_race::spin_grant(m);
+        }
+        #[cfg(all(test, target_os = "macos"))]
+        if let Some(nap) = pty_race::grant_naps(m) {
+            std::thread::sleep(nap);
+        }
+        // SAFETY: `m` is a live ptmx fd; `grantpt` takes no pointer argument.
+        unsafe { libc::grantpt(m) }
+    };
+    #[cfg(target_vendor = "apple")]
+    let granted = match grant_watch::grant(master, grant) {
+        grant_watch::Granted::Returned(granted) => granted,
+        grant_watch::Granted::LetGo { held } => {
+            #[cfg(all(test, target_os = "macos"))]
+            pty_race::let_go_slot(master);
+            // SAFETY: `master` holds the watchdog's pipe now, a descriptor this call owns; the
+            // pty is `held`.
+            unsafe {
+                libc::close(master);
+            }
+            let gone = format!(
+                "{}, whose grantpt ran past {GRANT_BOUND:?} and then burnt {GRANT_SPIN:?} more of \
+                 its thread's CPU, as XNU's spins on a pty left with no node of its own \
+                 (ATERM-KI-1028-4)",
+                held.map_or_else(|| "a pty".to_owned(), pty_label)
+            );
+            let err = io::Error::new(io::ErrorKind::TimedOut, "grantpt did not return");
+            return open_in_place_of(held, &gone, err, termp, winp, replacements);
         }
     };
-    if let Some(step) = refused {
-        let err = pty_step_failed(step, io::Error::last_os_error());
+    #[cfg(not(target_vendor = "apple"))]
+    let granted = if grant(master) == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    };
+    let refused = match granted {
+        Err(err) => Some(("grantpt", err)),
+        // SAFETY: `master` is a live ptmx fd; `unlockpt` takes no pointer argument.
+        Ok(()) if unsafe { libc::unlockpt(master) } != 0 => {
+            Some(("unlockpt", io::Error::last_os_error()))
+        }
+        Ok(()) => None,
+    };
+    if let Some((step, err)) = refused {
+        let err = pty_step_failed(step, err);
         // SAFETY: closing the master we opened above.
         unsafe {
             libc::close(master);
@@ -317,23 +362,7 @@ fn open_pty_pair_replacing(
                  (ATERM-KI-1028-4)",
                 pty_label(master)
             );
-            // Opened while `master` still holds the gone pty's number, so never on it.
-            let fresh = replacements
-                .checked_sub(1)
-                .map(|left| open_pty_pair_replacing(termp, winp, left));
-            // SAFETY: closing the master we opened above, once the fresh pair (if any) is open;
-            // no slave exists for it.
-            unsafe {
-                libc::close(master);
-            }
-            return match fresh {
-                Some(Ok(pair)) => Ok(pair),
-                Some(Err(err)) => Err(io::Error::new(
-                    err.kind(),
-                    format!("{err} (opening a pty in place of {gone})"),
-                )),
-                None => Err(io::Error::new(err.kind(), format!("{err}: {gone}"))),
-            };
+            return open_in_place_of(Some(master), &gone, err, termp, winp, replacements);
         }
         Err(err) => {
             // SAFETY: closing the master we opened above; no slave exists yet.
@@ -366,6 +395,386 @@ fn open_pty_pair_replacing(
         }
     }
     Ok((master, slave))
+}
+
+/// A fresh pair opened in place of `gone`, the pty `what` describes, which is held open until
+/// that pair is (XNU hands out the lowest free number, so closed first, its number would go
+/// straight to the fresh pair) and then closed: up to `replacements` more such replacements
+/// within, and with none left `err` naming `what`.
+fn open_in_place_of(
+    gone: Option<libc::c_int>,
+    what: &str,
+    err: io::Error,
+    termp: Option<&libc::termios>,
+    winp: Option<&libc::winsize>,
+    replacements: usize,
+) -> io::Result<(libc::c_int, libc::c_int)> {
+    let fresh = replacements
+        .checked_sub(1)
+        .map(|left| open_pty_pair_replacing(termp, winp, left));
+    #[cfg(all(test, target_os = "macos"))]
+    pty_race::replaced(gone);
+    if let Some(gone) = gone {
+        // SAFETY: `gone` is a master the caller hands over to close, once the fresh pair (if
+        // any) is open; no slave of it is open here.
+        unsafe {
+            libc::close(gone);
+        }
+    }
+    match fresh {
+        Some(Ok(pair)) => Ok(pair),
+        Some(Err(err)) => Err(io::Error::new(
+            err.kind(),
+            format!("{err} (opening a pty in place of {what})"),
+        )),
+        None => Err(io::Error::new(err.kind(), format!("{err}: {what}"))),
+    }
+}
+
+/// How long a pty's `grantpt` runs on Apple before [`grant_watch`] first looks at it: a grant
+/// returns in microseconds of its thread's time, so one still running past this is either in
+/// ATERM-KI-1028-4's livelock or on a thread the scheduler has kept off its core.
+#[cfg(target_vendor = "apple")]
+pub(crate) const GRANT_BOUND: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How much of its thread's CPU time a grant past [`GRANT_BOUND`] must go on to burn, still not
+/// returned, before [`grant_watch`] lets it go. XNU's spin burns its core for as long as it
+/// runs; a healthy grant uses microseconds, and one that is only late (its thread descheduled
+/// under load, paging in, or its process stopped) burns none while it waits.
+#[cfg(target_vendor = "apple")]
+pub(crate) const GRANT_SPIN: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// A bound on a pty's `grantpt` on Apple. XNU's `TIOCPTYGRANT` on a pty whose `/dev` node could
+/// not be made (`devfs_make_node` found its name still another pty's, ATERM-KI-1028-4) calls
+/// `_devfs_setattr` on a NULL handle, which answers `ERESTART` at once, and the kernel backs the
+/// thread's pc up to the `svc` before it returns to user mode: the thread re-enters that one
+/// call forever, burning its core (published xnu-12377; the same code in macOS 27.0.1's kernel,
+/// read in its binary 2026-11-04). A signal handler returns into the same `svc`, `SA_RESTART`
+/// or not; no timer, thread call or `thread_abort` ends it short of the process's death; a
+/// `close` of the descriptor ends it but frees the number for another open to take.
+///
+/// So one watchdog thread looks at each grant still running past [`GRANT_BOUND`] and lets it go
+/// once it has burnt [`GRANT_SPIN`] more of its thread's CPU time (a grant that is only late
+/// burns none, and is never let go, however long it takes). It keeps the pty open on a
+/// descriptor of its own and puts a pipe in the master's slot (`dup2`, which keeps the slot
+/// reserved throughout): each pass re-enters the call through the slot, so the next finds the
+/// pipe (`ENOTTY`) or the slot mid-swap (`EBADF`), the grant returns, and the number was never
+/// free. Where no descriptor can be had to keep the pty (`EMFILE`), the swap still ends the
+/// spin, closing the pty and so freeing its number.
+///
+/// Every grant's watch lives under the watchdog's one lock, and the watchdog swaps a slot only
+/// while it holds it, so an opener that takes the lock once its grant returned finds its fate
+/// settled. A grant wakes the watchdog only when it sleeps with no deadline (or one past this
+/// grant's bound), and once a grant has begun the watchdog keeps a deadline one bound away, so
+/// a burst of opens wakes it about once a bound, not once an open. A child of `fork`,
+/// which has no watchdog thread (and whose copy of the lock another thread may have held), runs
+/// its grants unbounded, as `grantpt` alone does; so does a process whose watchdog could not
+/// start.
+#[cfg(target_vendor = "apple")]
+mod grant_watch {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
+    use std::time::{Duration, Instant};
+
+    /// How often the watchdog looks again at a grant past [`super::GRANT_BOUND`].
+    const LOOK_EVERY: Duration = Duration::from_millis(100);
+
+    type MachPort = u32;
+
+    unsafe extern "C" {
+        fn pthread_self() -> libc::pthread_t;
+        fn pthread_mach_thread_np(thread: libc::pthread_t) -> MachPort;
+        fn thread_info(
+            thread: MachPort,
+            flavor: u32,
+            info: *mut i32,
+            count: *mut u32,
+        ) -> libc::c_int;
+        fn pthread_atfork(
+            prepare: Option<extern "C" fn()>,
+            parent: Option<extern "C" fn()>,
+            child: Option<extern "C" fn()>,
+        ) -> libc::c_int;
+    }
+
+    const THREAD_BASIC_INFO: u32 = 3;
+    const THREAD_BASIC_INFO_COUNT: u32 = 10;
+
+    /// What became of one grant.
+    pub(super) enum Granted {
+        /// It returned by itself (or the swap failed): `grantpt`'s result, `master` as it was.
+        Returned(std::io::Result<()>),
+        /// The watchdog let it go: `master` now holds a pipe, and the pty is `held`, a
+        /// descriptor of its own, or closed where none could be had.
+        LetGo { held: Option<libc::c_int> },
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Fate {
+        /// Under way; the watchdog may still let it go.
+        Armed,
+        /// The master's slot holds the watchdog's pipe; the pty is `held` (-1: not kept).
+        Swapped { held: libc::c_int },
+        /// The swap failed: the master's slot is as it was.
+        Unswapped,
+    }
+
+    /// One grant under way, read and written only under [`Dog::watched`]'s lock.
+    struct Watch {
+        /// The opener's master: a key no other watch shares, since the opener holds it open
+        /// until it has taken its watch back.
+        master: libc::c_int,
+        /// The opener's thread, whose CPU time tells a spin from a wait.
+        thread: MachPort,
+        /// When the watchdog looks at it next.
+        look: Instant,
+        /// The opener's CPU time at the watchdog's first look, past the bound.
+        cpu_then: Option<Duration>,
+        fate: Fate,
+    }
+
+    struct Watched {
+        watches: Vec<Watch>,
+        /// The deadline the watchdog sleeps toward, or `None` when it sleeps with none (or has
+        /// yet to sleep): a grant whose first look comes before it wakes the watchdog.
+        asleep_until: Option<Instant>,
+        /// Whether a grant has begun since the watchdog's last scan: if so, a scan that finds
+        /// nothing to watch keeps a deadline one bound away, so the opens of a burst find it on a
+        /// timer and wake it not at all, whichever of them its scans happen to see.
+        begun: bool,
+    }
+
+    struct Dog {
+        watched: Mutex<Watched>,
+        wake: Condvar,
+        /// A pipe's read end, close-on-exec, open for the process's life.
+        sentinel: libc::c_int,
+    }
+
+    static DOG: OnceLock<Option<&'static Dog>> = OnceLock::new();
+
+    /// Set in a child of `fork` by the handler the watchdog's start registers.
+    static FORKED: AtomicBool = AtomicBool::new(false);
+
+    /// The `pthread_atfork` child handler: async-signal-safe, one store.
+    extern "C" fn forked() {
+        FORKED.store(true, Ordering::Relaxed);
+    }
+
+    /// The watchdog, started on first use; `None` in a child of `fork`, or where its fork
+    /// handler, pipe or thread could not be had (each grant then runs unbounded, as `grantpt`
+    /// alone does).
+    fn dog() -> Option<&'static Dog> {
+        if FORKED.load(Ordering::Relaxed) {
+            return None;
+        }
+        *DOG.get_or_init(|| {
+            // SAFETY: registers one `extern "C"` function that lives as long as the process and
+            // cannot unwind.
+            if unsafe { pthread_atfork(None, None, Some(forked)) } != 0 {
+                return None;
+            }
+            let mut ends = [0 as libc::c_int; 2];
+            // SAFETY: `ends` is two writable descriptor slots, which `pipe` fills on success.
+            if unsafe { libc::pipe(ends.as_mut_ptr()) } != 0 {
+                return None;
+            }
+            // SAFETY: both ends were just opened by this call; the write end is closed at once,
+            // the read end kept for the process's life and made close-on-exec.
+            unsafe {
+                libc::close(ends[1]);
+                libc::fcntl(ends[0], libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+            let dog: &'static Dog = Box::leak(Box::new(Dog {
+                watched: Mutex::new(Watched {
+                    watches: Vec::new(),
+                    asleep_until: None,
+                    begun: false,
+                }),
+                wake: Condvar::new(),
+                sentinel: ends[0],
+            }));
+            std::thread::Builder::new()
+                .name("aterm-pty-grant-watch".to_owned())
+                .spawn(move || dog.run())
+                .ok()?;
+            Some(dog)
+        })
+    }
+
+    /// The calling thread's port name, which its pthread holds for the thread's life.
+    fn this_thread() -> MachPort {
+        // SAFETY: the calling thread's own pthread handle, and its port name in this task.
+        unsafe { pthread_mach_thread_np(pthread_self()) }
+    }
+
+    /// `thread`'s CPU time, user and system, or `None` where the kernel will not say.
+    fn cpu_time(thread: MachPort) -> Option<Duration> {
+        let mut info = [0i32; THREAD_BASIC_INFO_COUNT as usize];
+        let mut count = THREAD_BASIC_INFO_COUNT;
+        // SAFETY: `info` holds `count` integers, the size the flavor fills.
+        let kr =
+            unsafe { thread_info(thread, THREAD_BASIC_INFO, info.as_mut_ptr(), &raw mut count) };
+        if kr != 0 {
+            return None;
+        }
+        // `thread_basic_info` opens with `user_time` and `system_time`, each a `time_value_t`
+        // of seconds and microseconds.
+        let time = |secs: i32, micros: i32| {
+            Some(
+                Duration::from_secs(u64::try_from(secs).ok()?)
+                    + Duration::from_micros(u64::try_from(micros).ok()?),
+            )
+        };
+        Some(time(info[0], info[1])? + time(info[2], info[3])?)
+    }
+
+    /// Runs `f` while this thread holds the watchdog's lock (tests): a fork in `f`'s time, on
+    /// another thread, gives its child that lock held by a thread the child does not have.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(super) fn holding_lock(f: impl FnOnce()) {
+        let dog = dog().expect("the watchdog");
+        let _held = dog.lock();
+        f();
+    }
+
+    /// `grant(master)` (`grantpt`, or a test's stand-in), let go once it spins past
+    /// [`super::GRANT_BOUND`].
+    pub(super) fn grant(
+        master: libc::c_int,
+        grant: impl FnOnce(libc::c_int) -> libc::c_int,
+    ) -> Granted {
+        let returned = |rc: libc::c_int, err: Option<std::io::Error>| {
+            Granted::Returned(match (rc, err) {
+                (0, _) => Ok(()),
+                (_, Some(err)) => Err(err),
+                (_, None) => Err(std::io::Error::other("grantpt failed")),
+            })
+        };
+        let Some(dog) = dog() else {
+            let rc = grant(master);
+            return returned(rc, (rc != 0).then(std::io::Error::last_os_error));
+        };
+        let thread = this_thread();
+        let wake = {
+            let mut watched = dog.lock();
+            let look = Instant::now() + super::GRANT_BOUND;
+            watched.watches.push(Watch {
+                master,
+                thread,
+                look,
+                cpu_then: None,
+                fate: Fate::Armed,
+            });
+            watched.begun = true;
+            let wake = watched.asleep_until.is_none_or(|until| until > look);
+            if wake {
+                watched.asleep_until = Some(look);
+            }
+            wake
+        };
+        if wake {
+            dog.wake.notify_one();
+        }
+        let rc = grant(master);
+        let err = (rc != 0).then(std::io::Error::last_os_error);
+        // The watchdog swaps a slot only under the lock, so its fate is settled once we hold it.
+        let fate = {
+            let mut watched = dog.lock();
+            watched
+                .watches
+                .iter()
+                .position(|watch| watch.master == master)
+                .map_or(Fate::Armed, |at| watched.watches.swap_remove(at).fate)
+        };
+        match fate {
+            Fate::Swapped { held } => Granted::LetGo {
+                held: (held >= 0).then_some(held),
+            },
+            Fate::Armed | Fate::Unswapped => returned(rc, err),
+        }
+    }
+
+    impl Dog {
+        fn lock(&self) -> MutexGuard<'_, Watched> {
+            self.watched.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+
+        fn run(&self) {
+            let mut watched = self.lock();
+            loop {
+                let now = Instant::now();
+                for watch in &mut watched.watches {
+                    if watch.fate == Fate::Armed && watch.look <= now {
+                        self.look_at(watch, now);
+                    }
+                }
+                let begun = std::mem::take(&mut watched.begun);
+                let next = watched
+                    .watches
+                    .iter()
+                    .filter(|watch| watch.fate == Fate::Armed)
+                    .map(|watch| watch.look)
+                    .min()
+                    .or_else(|| begun.then(|| now + super::GRANT_BOUND));
+                watched.asleep_until = next;
+                watched = match next {
+                    None => self
+                        .wake
+                        .wait(watched)
+                        .unwrap_or_else(PoisonError::into_inner),
+                    Some(until) => {
+                        self.wake
+                            .wait_timeout(watched, until.saturating_duration_since(Instant::now()))
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .0
+                    }
+                };
+            }
+        }
+
+        /// A look at a grant past its bound: its opener's CPU time taken at the first, and the
+        /// grant let go at a later one that finds [`super::GRANT_SPIN`] more of it burnt (or at
+        /// once, where the kernel will not say).
+        fn look_at(&self, watch: &mut Watch, now: Instant) {
+            match (watch.cpu_then, cpu_time(watch.thread)) {
+                (Some(then), Some(cpu)) if cpu.saturating_sub(then) < super::GRANT_SPIN => {
+                    watch.look = now + LOOK_EVERY;
+                }
+                (None, Some(cpu)) => {
+                    watch.cpu_then = Some(cpu);
+                    watch.look = now + LOOK_EVERY;
+                }
+                (Some(_), Some(_)) | (_, None) => watch.fate = self.let_go(watch.master),
+            }
+        }
+
+        /// Takes the pty out of `master`'s slot, which its opener holds open while its grant
+        /// runs.
+        fn let_go(&self, master: libc::c_int) -> Fate {
+            // SAFETY: `master` is the opener's live master: the opener closes it only after it
+            // has taken its watch back, under the lock this thread holds throughout. `F_DUPFD_CLOEXEC`
+            // and `dup2` take descriptors by value; `dup2` closes the slot's old file (the pty,
+            // kept open by `held` where `F_DUPFD_CLOEXEC` gave one) and keeps the slot reserved
+            // until it holds the pipe.
+            unsafe {
+                let held = libc::fcntl(master, libc::F_DUPFD_CLOEXEC, 3);
+                loop {
+                    if libc::dup2(self.sentinel, master) >= 0 {
+                        libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC);
+                        return Fate::Swapped { held };
+                    }
+                    if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                        break;
+                    }
+                }
+                if held >= 0 {
+                    libc::close(held);
+                }
+                Fate::Unswapped
+            }
+        }
+    }
 }
 
 /// Opens a bare `(master, slave)` PTY pair with `FD_CLOEXEC` set on both ends.
@@ -984,15 +1393,32 @@ fn ensure_above_stdio(fd: &mut libc::c_int) -> io::Result<()> {
 /// [`spawn_shell_with_pid_cell_px`] does: checks [`dead_pty`] before each fork, checks
 /// `TIOCSCTTY` (`T`) and post-`TIOCSCTTY` `fstat`/`tcgetattr` on stdin (`D`) in the child, and
 /// replaces at most [`DEAD_PTY_REPLACEMENTS`] dead pty while still holding the dead one open so
-/// the replacement gets a distinct minor. Any non-pty spawn error (such as `setsid` or `exec`
-/// failing) returns `Err` immediately with no replacement.
+/// the replacement gets a distinct minor. An `exec` refused with `ETXTBSY` (a program some
+/// process holds open for writing, such as the child another thread forked while the program
+/// was being written, until that child's own `exec`) is tried again off Apple, each time on a
+/// fresh pty, as [`aterm_uds::spawnfd::spawn_past_text_busy`] tries one. Any other non-pty
+/// spawn error (such as `setsid` or `exec` failing) returns `Err` immediately with no
+/// replacement.
 ///
 /// # Errors
 /// Returns an `io::Error` if opening or replacing a pty fails, if `build` fails on a live pty,
-/// if two consecutive ptys die before `exec`, or if `Command::spawn` fails for a non-pty reason.
+/// if two consecutive ptys die before `exec`, or if `Command::spawn` fails for a non-pty reason
+/// (`ETXTBSY` once `spawn_past_text_busy` has stopped trying).
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn spawn_session_leader_on_pty(
     mut build: impl FnMut(&std::os::fd::OwnedFd) -> io::Result<aterm_uds::spawnfd::StdCommand>,
+) -> io::Result<(
+    std::os::fd::OwnedFd,
+    std::os::fd::OwnedFd,
+    std::process::Child,
+)> {
+    aterm_uds::spawnfd::spawn_past_text_busy(|| spawn_session_leader_on_fresh_pty(&mut build))
+}
+
+/// One try of [`spawn_session_leader_on_pty`], on a pty of its own.
+#[cfg_attr(trust_verify, trust::skip)]
+fn spawn_session_leader_on_fresh_pty(
+    build: &mut impl FnMut(&std::os::fd::OwnedFd) -> io::Result<aterm_uds::spawnfd::StdCommand>,
 ) -> io::Result<(
     std::os::fd::OwnedFd,
     std::os::fd::OwnedFd,
@@ -1126,9 +1552,14 @@ pub fn spawn_session_leader_on_pty(
 /// down by the exit of a process nobody waits on (its session leader, left running when its
 /// master closed) frees its number at a moment no one chooses, and XNU frees a number before it
 /// removes that pty's `/dev` node: a pty given the number in between is left with no node of its
-/// own (`devfs_make_node` finds the name taken), as ATERM-KI-1028-4 records. A leader the caller
-/// has already reaped is not signalled, nor is its terminal's foreground: its pid, and the group
-/// it led, may name other processes now.
+/// own (`devfs_make_node` finds the name taken), as ATERM-KI-1028-4 records. The call looks at
+/// the leader without reaping it ([`child_exit_unreaped`]). A leader the caller has already
+/// reaped is not signalled, nor is its group or its terminal's foreground: its pid, and the
+/// group it led, may name other processes now. One that has exited and is not reaped (a zombie)
+/// still holds its pid, and so its group's id, so its group is signalled as a running leader's
+/// is (a member left holding the slave, as a job that ignored the exit's hangup does, is
+/// ended); its terminal's foreground is not, since that group may have emptied and its id
+/// passed to a process of another session by then.
 ///
 /// # Errors
 /// `fcntl`'s, making the master nonblocking; `Other` for a leader pid `pid_t` cannot hold; the
@@ -1151,9 +1582,14 @@ pub fn end_session_on_pty(
     let fd = master.as_raw_fd();
     set_nonblocking(fd, true)?;
     let pid = libc::pid_t::try_from(leader.id()).map_err(io::Error::other)?;
-    if leader.try_wait()?.is_none() {
+    // `None`: reaped (by the caller), so its pid and group may name others; nothing is signalled.
+    if let Some(exited) = child_exit_unreaped(pid) {
         // SAFETY: `tcgetpgrp` is a read-only ioctl on the master this call owns.
-        let front = unsafe { libc::tcgetpgrp(fd) };
+        let front = if exited {
+            0
+        } else {
+            unsafe { libc::tcgetpgrp(fd) }
+        };
         if front > 1 && front != pid {
             // SAFETY: a plain syscall taking no pointer; `front` > 1 names one group, the one the
             // pty named its foreground just now, while the session's leader is unreaped.
@@ -1289,6 +1725,13 @@ pub(crate) mod pty_race {
         static SLAVE_OPENS_GONE: Cell<u32> = const { Cell::new(0) };
         static STRUCK_FRESH: RefCell<Vec<CString>> = const { RefCell::new(Vec::new()) };
         static STRUCK_OPENS: RefCell<Vec<CString>> = const { RefCell::new(Vec::new()) };
+        static GRANTS_SPIN: Cell<u32> = const { Cell::new(0) };
+        static STRUCK_GRANTS: RefCell<Vec<CString>> = const { RefCell::new(Vec::new()) };
+        static REPLACED: RefCell<Vec<Option<CString>>> = const { RefCell::new(Vec::new()) };
+        static GRANTS_NAP: Cell<(u32, std::time::Duration)> =
+            const { Cell::new((0, std::time::Duration::ZERO)) };
+        static NAPPED_GRANTS: RefCell<Vec<CString>> = const { RefCell::new(Vec::new()) };
+        static LET_GO_SLOTS: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
     }
 
     unsafe extern "C" {
@@ -1347,6 +1790,101 @@ pub(crate) mod pty_race {
         CString::new(gone).unwrap_or_default()
     }
 
+    /// On each of this thread's next `n` pty opens, a grant that never returns by itself, as
+    /// XNU's `grantpt` spins on a pty whose node could not be made (ATERM-KI-1028-4): it asks the
+    /// master's slot for its name again and again, the same call on the same number, until the
+    /// slot holds something else.
+    pub(crate) fn grants_spin(n: u32) {
+        GRANTS_SPIN.with(|c| c.set(n));
+    }
+
+    /// In a replacement, once the fresh pair is open and before the replaced pty closes: that
+    /// pty's name as its master answers it then (`None` where no pty was kept, or it answers
+    /// none), the proof it was held while the fresh pair opened.
+    pub(super) fn replaced(gone: Option<libc::c_int>) {
+        let name = gone.and_then(|fd| super::pts_name(fd).ok());
+        REPLACED.with(|r| r.borrow_mut().push(name));
+    }
+
+    /// What [`replaced`] recorded since the last take, one entry a replacement.
+    pub(crate) fn take_replaced() -> Vec<Option<CString>> {
+        REPLACED.with(|r| std::mem::take(&mut *r.borrow_mut()))
+    }
+
+    /// The names of the ptys whose grant [`grants_spin`] struck since the last take.
+    pub(crate) fn take_struck_grants() -> Vec<CString> {
+        STRUCK_GRANTS.with(|s| std::mem::take(&mut *s.borrow_mut()))
+    }
+
+    /// In a pty's open, before its grant: whether this grant is one that spins (its pty's name
+    /// recorded).
+    pub(super) fn grant_spins(master: libc::c_int) -> bool {
+        if !take_one(&GRANTS_SPIN) {
+            return false;
+        }
+        let name = super::pts_name(master).unwrap_or_default();
+        STRUCK_GRANTS.with(|s| s.borrow_mut().push(name));
+        true
+    }
+
+    /// The spinning grant: `TIOCPTYGNAME` on `master`'s slot until it fails, then -1.
+    pub(super) fn spin_grant(master: libc::c_int) -> libc::c_int {
+        let mut name = [0 as libc::c_char; super::PTS_NAME_LEN];
+        // SAFETY: `name` is `PTS_NAME_LEN` writable bytes, the size `TIOCPTYGNAME` writes; it takes
+        // whatever descriptor the slot holds, and fails once it holds no pty master.
+        while unsafe {
+            libc::ioctl(
+                master,
+                libc::TIOCPTYGNAME as libc::c_ulong,
+                name.as_mut_ptr(),
+            )
+        } == 0
+        {}
+        -1
+    }
+
+    /// On each of this thread's next `n` pty opens, a grant that sleeps `nap` before it runs, as a
+    /// healthy grant on an opener the scheduler leaves off its core (heavy load, a page-in, a
+    /// stop): late, burning no CPU, and then granted.
+    pub(crate) fn grants_nap(n: u32, nap: std::time::Duration) {
+        GRANTS_NAP.with(|c| c.set((n, nap)));
+    }
+
+    /// In a pty's open, before its grant: how long this grant sleeps first, if it is one that
+    /// does (its pty's name recorded).
+    pub(super) fn grant_naps(master: libc::c_int) -> Option<std::time::Duration> {
+        let (left, nap) = GRANTS_NAP.with(Cell::get);
+        if left == 0 {
+            return None;
+        }
+        GRANTS_NAP.with(|c| c.set((left - 1, nap)));
+        let name = super::pts_name(master).unwrap_or_default();
+        NAPPED_GRANTS.with(|s| s.borrow_mut().push(name));
+        Some(nap)
+    }
+
+    /// The names of the ptys whose grant [`grants_nap`] put to sleep since the last take.
+    pub(crate) fn take_napped_grants() -> Vec<CString> {
+        NAPPED_GRANTS.with(|s| std::mem::take(&mut *s.borrow_mut()))
+    }
+
+    /// In a let-go grant's open, before the master's slot closes: whether that slot holds a pipe
+    /// (the watchdog's), so the number stayed reserved through the swap and the close is of a
+    /// descriptor the open owns.
+    pub(super) fn let_go_slot(master: libc::c_int) {
+        // SAFETY: every field of `stat` is an integer, so all-zero is valid.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `st` is a live, writable `stat`; a closed `master` answers EBADF.
+        let pipe = unsafe { libc::fstat(master, &raw mut st) } == 0
+            && st.st_mode & libc::S_IFMT == libc::S_IFIFO;
+        LET_GO_SLOTS.with(|s| s.borrow_mut().push(pipe));
+    }
+
+    /// What [`let_go_slot`] recorded since the last take, one entry a let-go grant.
+    pub(crate) fn take_let_go_slots() -> Vec<bool> {
+        LET_GO_SLOTS.with(|s| std::mem::take(&mut *s.borrow_mut()))
+    }
+
     /// This thread's seam, all of it off, and its record of struck fresh ptys cleared.
     pub(crate) fn reset() {
         in_children(0);
@@ -1357,6 +1895,12 @@ pub(crate) mod pty_race {
         slave_opens_gone(0);
         let _ = take_struck_fresh();
         let _ = take_struck_opens();
+        grants_spin(0);
+        let _ = take_struck_grants();
+        let _ = take_replaced();
+        grants_nap(0, std::time::Duration::ZERO);
+        let _ = take_napped_grants();
+        let _ = take_let_go_slots();
     }
 
     /// The names of the fresh ptys [`in_fresh`] killed since the last take.
@@ -2142,24 +2686,48 @@ fn process_birth_platform(_pid: i32) -> Option<u64> {
 }
 
 fn is_unreaped_child(pid: i32) -> bool {
-    let Ok(id) = libc::id_t::try_from(pid) else {
-        return false;
-    };
+    child_exit_unreaped(pid).is_some()
+}
+
+/// What `pid`, a child of this process, is, read without reaping it (`waitid` with `WNOWAIT`):
+/// `Some(false)` running (or stopped), `Some(true)` exited and not yet reaped (a zombie, which
+/// keeps its pid, and the id of a group it led, from naming any other process), `None` when no
+/// unreaped child of this process has that pid (it was reaped, by std's `Child` or any wait, and
+/// the kernel keeps no record of a status std cached) or the read failed. A reaped child's pid
+/// names one of this process's children again only once the kernel's pid allocator has wrapped
+/// around to it.
+#[must_use]
+pub fn child_exit_unreaped(pid: i32) -> Option<bool> {
+    let id = libc::id_t::try_from(pid).ok()?;
     loop {
-        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
-        // SAFETY: `info` is a valid `siginfo_t` out-param and `WNOWAIT` leaves child state intact.
+        // SAFETY: every field of `siginfo_t` is an integer or a pointer, so all-zero is valid.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is a live, writable `siginfo_t`, and `WNOWAIT` leaves the child's state
+        // intact.
         let rc = unsafe {
             libc::waitid(
                 libc::P_PID,
                 id,
-                info.as_mut_ptr(),
+                &raw mut info,
                 libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
             )
         };
-        if rc < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-            continue;
+        if rc == 0 {
+            // Only an exit's code is an exit: Darwin's `WEXITED` alone also reports a stopped
+            // child (`CLD_STOPPED`, measured on 27.0: `a_stopped_child_is_read_as_running`).
+            // When nothing is reported, Linux zeroes the siginfo and XNU leaves it as it was,
+            // zeroed here, so `si_signo` is 0.
+            return Some(
+                info.si_signo == libc::SIGCHLD
+                    && matches!(
+                        info.si_code,
+                        libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+                    ),
+            );
         }
-        return rc == 0;
+        if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            return None;
+        }
     }
 }
 

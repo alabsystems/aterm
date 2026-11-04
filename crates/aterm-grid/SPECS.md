@@ -926,8 +926,8 @@ crates/aterm-grid/src/grid/tests/stale_extras_overwrite.rs	write_wide_run_autowr
 crates/aterm-grid/src/grid/tests/style_perf.rs	erase_to_end_of_screen_clears_has_extras	has-extras-iff-entry	
 crates/aterm-grid/src/grid/tests/style_perf.rs	mark_cursor_damage_marks_cursor_cell	mark-cursor-damage	
 crates/aterm-grid/src/grid/tests/style_perf.rs	remove_cell_extra_clears_flag_and_entry	has-extras-iff-entry	
-crates/aterm-grid/src/grid/tests/style_perf_complexity.rs	reflow_linear_time	nonspec:becomes-spec-after-fix	
-crates/aterm-grid/src/grid/tests/style_perf_complexity.rs	reflow_linear_time_columns	nonspec:becomes-spec-after-fix	
+crates/aterm-grid/src/grid/tests/style_perf_complexity.rs	reflow_linear_time	reflow-cost	
+crates/aterm-grid/src/grid/tests/style_perf_complexity.rs	reflow_linear_time_columns	reflow-cost	
 crates/aterm-grid/src/grid/tests/style_perf_complexity.rs	row_to_line_extracts_hyperlinks	extract-row-extras-spans	
 crates/aterm-grid/src/grid/tests/style_perf_complexity.rs	scroll_single_line_constant_time	scroll-off-is-lazy	
 crates/aterm-grid/src/grid/tests/style_perf_complexity.rs	scroll_up_linear_time	scroll-off-is-lazy	
@@ -1099,10 +1099,9 @@ below remain in the tree.
 
 | tests | count | why | action |
 |---|---|---|---|
-| `src/grid/tests/style_perf_complexity.rs` (reflow_linear_time, reflow_linear_time_columns) | 2 | Ratio test on deterministic counters (a proxy for linearity); the exact counter law is reflow-cost. Delete once reflow-cost is certified. | **becomes-spec-after-fix** |
 | `src/row/tests/unsafe_boundary/unchecked.rs` (get_unchecked_out_of_bounds_panics_in_debug, get_unchecked_mut_out_of_bounds_panics_in_debug) | 2 | A debug_assert on a violated unsafe precondition; once row-get-unchecked's requires is a proved obligation at every caller it samples nothing. | **delete** |
 
-Totals by action: delete 2, becomes-spec-after-fix 2.
+Totals by action: delete 2.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
@@ -1115,10 +1114,8 @@ Totals by action: delete 2, becomes-spec-after-fix 2.
      "cache coherence" clause one pass gave `hyperlink_perf.rs` was vacuous. Those tests were deleted: the
      map operations they sampled are pinned exactly by `every_clear_removes_exactly_its_cells_from_map_and_rgb_ring`
      and `every_shift_moves_every_store_by_the_model`.
-   - These tests drive `#[cfg(test)]` wrappers of production functions and should be **retargeted**, not
-     deleted, when their spec is proved:
-     - `write_char_wrap` (→ `write_char_wrap_styled`)
-     - **Resolved:** `write_ascii_run_styled`, `scroll_down`, `checkpoint_lines`, `tab_n`, and `back_tab_n` (`#[cfg(test)]`) are removed and their callers retargeted directly to `write_ascii_run_styled_packed`, `scroll_region_down`, `checkpoint_lines_bounded(usize::MAX)`, `tab_n_margin(_, false)`, and `back_tab_n_margin(_, false, false)`.
+   - `write_char_wrap` (`write.rs`) and `write_test_helpers::{write_char_styled, write_char_wrap_styled, write_wide_char_wrap_styled}` are `#[cfg(test)]` single-char reference writers against which the bulk production writers (`write_ascii_blast`, `write_ascii_run_styled_packed`, `write_cell_run`) are checked (`run-writers-refine-write-char-wrap`).
+   - **Resolved:** `write_ascii_run_styled`, `scroll_down`, `checkpoint_lines`, `tab_n`, `back_tab_n`, and `row_to_line_with_hyperlinks` (`#[cfg(test)]`) are removed and their callers retargeted directly to `write_ascii_run_styled_packed`, `scroll_region_down`, `checkpoint_lines_bounded(usize::MAX)`, `tab_n_margin(_, false)`, `back_tab_n_margin(_, false, false)`, and `extract_row_extras` + `row_to_line_with_stored_extras`.
 2. **Code that contradicts its docs or invites a bug**
    - **Resolved:** `DamageTracker::{mark_cell, mark_wide_cell}` ignore out-of-range `col == u16::MAX` (as they do `row >= visible_rows`), keeping every damaged row's `[left, right)` interval strictly non-empty (`damage/tests.rs::row_damage_bounds_clamp_and_saturate`).
    - **Resolved:** `ComplexCharRing`, `RgbColorRing` and `RingSpans` guard `row >= visible_rows` across reads, writes, clears and shifts, and compute `ring_row` in `u32` so out-of-range external rows never alias live ring rows.
@@ -1139,6 +1136,7 @@ Totals by action: delete 2, becomes-spec-after-fix 2.
    - **Resolved:** `grid/checkpoint_lines.rs::visible_checkpoint_excludes_scrollback_and_restores_visible_rows` is renamed to match what it tests.
    - **Resolved:** `erase.rs::margined_dch_and_ech_give_the_wide_orphan_the_bce_background_and_ring` exercises `delete_chars_margin` under `DECSLRM` and `erase_chars` (`ECH`), both of which genuinely orphan the continuation cell one column past the right boundary and update `RgbColorRing` via `fill_bce_rgb_cols`.
    - **Resolved:** `erase.rs::test_el1_el2_and_el0_on_the_continuation_keep_the_link` now asserts the remaining link and cleared continuation after the bottom-row EL 0.
+   - **Resolved:** `deferred_line_equivalence.rs::assert_lines_equivalent` compares attributes by char index `0..text.chars().count()`, with non-default styled cells placed after multi-byte complex glyphs, combining marks, and wide CJK cells so any char-vs-byte or column skew fails immediately.
    - `scroll.rs::a_drained_flood_backlog_gives_its_spine_back` asserts `capacity ≤ 4000`, which relies on
      `VecDeque::shrink_to` behaviour that std leaves unspecified. `lazy-spine-slack-bound` states only the call.
    - `scroll.rs::a_marker_shrinks_as_the_window_slides_past_its_hole` and
@@ -1148,16 +1146,14 @@ Totals by action: delete 2, becomes-spec-after-fix 2.
    - `reflow.rs::last_resize_shape_in_the_trim_demote_and_bottom_push_regimes` samples three specs at once,
      and its retention-0 halves duplicate `resize_undo.rs`.
    - **Resolved:** `src/grid/tests/algorithm_boundary/resize_and_invariants.rs::reflow_grow_cursor_in_trailing_blank_of_continuation_row` now pins the exact merged column `cursor_col() == 9`.
-   - `src/grid/tests/extras_performance.rs` ratio tests check deterministic counters against loose windows
-     (0.5..2.0, 1.5..3.0, < 3.0). `extras-op-cost` and `reflow-cost` state the exact counts.
+   - **Resolved:** `src/grid/tests/extras_performance.rs` and `src/grid/tests/style_perf_complexity.rs` now check exact deterministic op counts (`1_990`/`1_000` clear ops, `500`/`1_000` shift ops, `25`/`50`/`80`/`400` reflow row ops, `8_000`/`32_000`/`4_000`/`16_000` reflow cell ops, and `10`/`50`/`1` drain ops) matching `extras-op-cost`, `reflow-cost`, and `scroll-off-is-lazy`.
    - **Resolved:** `scrollback_offload.rs::stepping_interleaved_with_window_output_keeps_history_and_order` now asserts exact `history_seq` and `screen_rows` equality against a synchronous `plain` `resize` twin.
    - **Resolved:** `scroll_fill.rs` was deleted, removing its 10 duplicate scroll tests.
    - **Resolved:** `scroll_region/unscroll.rs::grid_unscroll_preserves_wrapped_flag` now drives genuine autowrap via `write_char_wrap` onto continuation row 1 instead of hand-setting `set_wrapped(true)` on row 0, and `grid_unscroll_preserves_attributes` asserts both `fg_color() == Some(fg)` and `CellFlags::BOLD` on every cell of `"STYLED"`.
    - **Resolved:** `reflow/cost_bound.rs::offload_window_lazy_buffer_is_bounded` now asserts exact line conservation (`dropped == held_at_detach + window_writes - (DETACHED_LAZY_CAP + ring_cap)`, `after == reflowed_len + DETACHED_LAZY_CAP + ring_cap`) and exact oldest/newest retained `W` lines.
    - Files and headers named for something they do not hold:
-     - `style_perf.rs` holds no performance tests.
-     - `style_perf_complexity.rs::row_to_line_extracts_hyperlinks` is not a complexity test and goes
-       through a `#[cfg(test)]` helper.
+     - `style_perf.rs` holds no performance tests (its module header documents cursor damage and `HAS_EXTRAS`).
+     - **Resolved:** `Grid::row_to_line_with_hyperlinks` (`#[cfg(test)]`) is removed and `style_perf_complexity.rs::row_to_line_extracts_hyperlinks` calls `Grid::extract_row_extras` + `Grid::row_to_line_with_stored_extras` directly.
    - **Resolved:** `state/presentation.rs::union_is_order_independent_within_the_arity_bound` is renamed and documented accurately for the 8-band arity bound (`from_merged` absorbs pairs order-dependently past the bound).
    - **Resolved:** `page_tests/pointer_correctness.rs::alloc_zero_length_slice_aligns_offset_and_consumes_zero_bytes` verifies both alignment advancement from a misaligned cursor (`u8` -> `u64`) and zero payload consumption once aligned.
    - **Resolved:** `tests/history_renumber_epoch.rs::a_width_reflow_with_no_scrollback_still_advances_the_renumber_epoch` now asserts both a same-size resize and a genuine rows-only resize (`16x10`) leave the epoch unchanged.
@@ -1169,44 +1165,3 @@ Totals by action: delete 2, becomes-spec-after-fix 2.
    - The Tier-0 `ty check` tests (`*_spec_model_checked_in_trust`) become verify-model obligations.
    - `tests/conformance_offload.rs` models the detach window synchronously, but production may step the
      job on a worker. That is why `offload-window-refinement` lists gap 13.
-
-Weak, mislabelled or vacuous tests:
-- `src/grid/checkpoint_lines.rs::visible_checkpoint_cost_does_not_scale_with_scrollback` asserts the copy's
-  length, not a cost.
-- `src/grid/erase.rs::erase_line_within_margins_gives_the_wide_orphan_the_bce_background_and_ring` describes a
-  margin-bounded EL 2, but EL 2 erases the whole row, so the orphan rule it names is never sampled.
-- `src/grid/erase.rs::test_el1_el2_and_el0_on_the_continuation_keep_the_link` ends with an EL 0 and no assertion.
-- `src/grid/scroll.rs::a_drained_flood_backlog_gives_its_spine_back` asserts `spine_capacity() ≤ 4000`, a bound
-  std leaves unspecified for `VecDeque::shrink_to`; `lazy-spine-slack-bound` states only the call.
-- `src/grid/scroll.rs::a_marker_shrinks_as_the_window_slides_past_its_hole` and
-  `a_window_that_slides_past_the_whole_hole_takes_the_marker` rig the cut by writing fields. Production reaches
-  that state only through `bound_detached_lazy_buffer`, which the spec's precondition should name.
-- `src/grid/reflow.rs::last_resize_shape_in_the_trim_demote_and_bottom_push_regimes` samples three specs at
-  once, and its retention-0 halves duplicate `src/grid/resize_undo.rs`.
-- `src/grid/tests/deferred_line_equivalence.rs::assert_lines_equivalent` passes a byte offset from
-  `char_indices()` to `Line::get_attr`, which takes a char index, so on non-ASCII rows it compares attrs at the
-  wrong positions. `deferred-line-equals-eager` compares by char index.
-- `src/grid/tests/algorithm_boundary/resize_and_invariants.rs::reflow_grow_cursor_in_trailing_blank_of_continuation_row`
-  checks the cursor column only against the width (CursorInBounds), not its reflowed position.
-- The ratio tests of `src/grid/tests/extras_performance.rs` check deterministic counters against loose windows
-  (0.5..2.0, 1.5..3.0, < 3.0); `extras-op-cost` and `reflow-cost` state the exact counts.
-- `src/grid/scrollback_offload.rs::stepping_interleaved_with_window_output_keeps_history_and_order` checks
-  conservation with `+ 8` slack; `offload-refines-plain-resize` states equality.
-- `src/grid/tests/scroll_region/unscroll.rs::grid_unscroll_preserves_wrapped_flag` hand-sets a continuation flag
-  on row 0, and `grid_unscroll_with_scroll_region` asserts with `||`, which does not fix which lines land where.
-- `src/grid/tests/reflow/cost_bound.rs::offload_window_lazy_buffer_is_bounded`'s 45k..52k window hides the exact
-  law (the newest CAP kept, every drop counted).
-- `src/grid/tests/style_perf.rs` holds no performance tests, and
-  `src/grid/tests/style_perf_complexity.rs::row_to_line_extracts_hyperlinks` is no complexity test and goes
-  through the `#[cfg(test)]` `row_to_line_with_hyperlinks`.
-- `src/state/presentation.rs::union_is_order_independent_past_the_arity_bound` never exceeds the 8-band bound it
-  is named for. Past the bound order independence does not hold: `from_merged` absorbs pairs order-dependently.
-- `src/page_tests/pointer_correctness.rs::alloc_zero_length_slice_is_stable_and_non_consuming` claims a len-0
-  alloc never advances the offset, but the alloc aligns it; the claim holds only for two `u32` allocations.
-
-Negative controls and model checks are not specs:
-- `tests/conformance_retention.rs::resurrected_pre_unification_split_is_rejected` and the forged-observation
-  halves of the conformance tests move into their spec's proof as its negative control. The
-  `*_spec_model_checked_in_trust` tests become verify-model obligations.
-- `tests/conformance_offload.rs` steps the detach window synchronously, while production may step the job on a
-  worker; hence gap 13 on `offload-window-refinement`.

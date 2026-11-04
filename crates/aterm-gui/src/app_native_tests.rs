@@ -5675,14 +5675,11 @@ fn preverify_read_running(
     done
 }
 
-/// What a person's press leaves when the fork lane holds it for the candidate's read
+/// What a person's press leaves when a lane holds it for the candidate's read
 /// ([`crate::UpdateHandoffStartError::HeldForRead`]): its installing row, its switch on record,
 /// and the hold.
 #[cfg(unix)]
 fn press_held_for_the_read(app: &mut App, build: u64) {
-    let running = app.native_updater_service.snapshot().current_build;
-    app.begin_update_installing(true);
-    app.record_update_switch_started(running, false, false);
     app.hold_person_apply(crate::HeldPersonApply {
         target_build: build,
         until: std::time::Instant::now() + crate::HANDOFF_PREVERIFY_READ_CEILING,
@@ -5692,7 +5689,8 @@ fn press_held_for_the_read(app: &mut App, build: u64) {
 /// A person's install held for the candidate's read runs when the read ends. With `[update]
 /// auto_apply = false`, while the read runs the press stands held: its row still says it
 /// installs, a second press joins it and starts nothing, and the loop looks again within the
-/// poll.
+/// poll. Its record of the read it waited for ends with it, whichever way its run went, so a
+/// later press never meets that read's answer; the automatic lane's record is its own.
 #[cfg(unix)]
 #[test]
 fn a_person_s_install_held_for_the_read_runs_when_it_ends_and_says_how_it_ended() {
@@ -5737,9 +5735,17 @@ fn a_person_s_install_held_for_the_read_runs_when_it_ends_and_says_how_it_ended(
     );
     assert_eq!(app.messages.log().records().count(), records, "nor records");
 
+    app.sessionless_waited.person = Some(now);
+    app.sessionless_waited.automatic = Some(now);
     done.store(true, std::sync::atomic::Ordering::Release);
     app.run_held_person_apply(std::time::Instant::now());
     assert!(!app.person_apply_is_held());
+    assert_eq!(app.sessionless_waited.person, None, "the press ended");
+    assert_eq!(
+        app.sessionless_waited.automatic,
+        Some(now),
+        "CONTROL: the lane's record stands"
+    );
     assert!(
         app.held_person_apply_deadline(std::time::Instant::now())
             .is_none()
@@ -5818,8 +5824,13 @@ fn a_held_press_is_bounded_by_its_window_and_its_stage_and_the_lane_waits_for_it
     app.auto_apply_intent = None;
     app.clear_messages_for_test();
     press_held_for_the_read(&mut app, build + 1);
+    app.sessionless_waited.person = Some(std::time::Instant::now());
     app.run_held_person_apply(std::time::Instant::now());
     assert!(!app.person_apply_is_held());
+    assert_eq!(
+        app.sessionless_waited.person, None,
+        "the dropped press ended"
+    );
     assert!(
         app.native_updater_service.snapshot().error.is_none(),
         "nothing ran for a stage that is not the one held"

@@ -785,6 +785,18 @@ fn the_hardware_hint_is_keyed_by_the_network() {
     assert!(!uuid.to_ascii_lowercase().contains(&hint));
 }
 
+/// A published `hw_hint` is the key `check` and a Mac's own registration match rows by, so the
+/// hint one network gives one Mac never moves: these 16 hex are what ring's HMAC-SHA256 wrote,
+/// and `openssl dgst -sha256 -mac HMAC` gives the same under the key this function derives.
+/// NEGATIVE CONTROL: with the message's domain or the key's seed spelled otherwise, this fails.
+#[test]
+fn the_hardware_hint_keeps_the_bytes_ring_computed() {
+    assert_eq!(
+        keys::hw_hint(&[1; 16], "C3396674-FCD3-52E5-A1C1-BD5B9E8F5C43"),
+        "4b0ccd5bc5c64927"
+    );
+}
+
 /// `check` names two live enrollments bound to one machine, one hint on two live uuids, a row
 /// that binds no known machine, and facts that differ from the owner's statement; gone uuids
 /// are history, not findings.

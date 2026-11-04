@@ -456,6 +456,16 @@ fn incoming_acceptance_rotates_after_a_connection_not_idle_ticks() {
     }
     held.push(std::net::TcpStream::connect(first).unwrap());
     held.push(std::net::TcpStream::connect(second).unwrap());
+    // A loopback `connect` can return before the kernel queues the connection at its listener;
+    // tick only once each attachment really holds one waiting.
+    for link in &transport.links {
+        let listener = link.listener.as_ref().unwrap();
+        assert!(
+            listener.pending_within(Duration::from_secs(60)).unwrap(),
+            "a connection to {} reaches its queue",
+            listener.local_addr().unwrap()
+        );
+    }
     transport.tick(now + Duration::from_millis(400)).unwrap();
     let accepted: Vec<_> = transport
         .workers

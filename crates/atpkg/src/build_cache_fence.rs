@@ -5,6 +5,7 @@
 
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use aterm_uds::holders::PathScan;
 
@@ -53,13 +54,47 @@ fn unused(scan: std::io::Result<PathScan>) -> Result<(), Blocked> {
 pub(super) struct Fence<'a> {
     processes: Processes<'a>,
     told: Cell<bool>,
+    /// Told a pass is at work ([`Self::working`]), where something waits on that.
+    hears_working: Option<&'a dyn Fn()>,
+    said_working: Cell<Option<Instant>>,
 }
+
+/// The most often a pass says it is working: a walk says so per build directory and a removal per
+/// entry, which is far more often than anything waiting on it reads.
+const WORKING_EVERY: Duration = Duration::from_secs(5);
 
 impl<'a> Fence<'a> {
     pub(super) fn new(processes: Processes<'a>) -> Self {
         Self {
             processes,
             told: Cell::new(false),
+            hears_working: None,
+            said_working: Cell::new(None),
+        }
+    }
+
+    /// Tell `hears` as a pass makes real progress, so a hung walk still goes quiet.
+    pub(super) fn telling(mut self, hears: &'a dyn Fn()) -> Self {
+        self.hears_working = Some(hears);
+        self
+    }
+
+    /// A step of the pass is done.
+    pub(super) fn working(&self) {
+        self.working_at(Instant::now());
+    }
+
+    fn working_at(&self, now: Instant) {
+        let Some(hears) = self.hears_working else {
+            return;
+        };
+        if self
+            .said_working
+            .get()
+            .is_none_or(|said| now.saturating_duration_since(said) >= WORKING_EVERY)
+        {
+            self.said_working.set(Some(now));
+            hears();
         }
     }
 
@@ -151,6 +186,24 @@ fn observed(dirs: &[PathBuf], skip: &[u32], processes: Processes<'_>) -> std::io
 mod tests {
     use super::*;
     use aterm_uds::holders::PathUse;
+
+    /// A PASS SAYS IT IS WORKING AT ONCE, THEN AT MOST EVERY [`WORKING_EVERY`]: a removal says so
+    /// per entry. NEGATIVE CONTROL: a fence nothing hears from says nothing.
+    #[test]
+    fn a_pass_says_it_is_working_at_most_so_often() {
+        let heard = Cell::new(0);
+        let hears = || heard.set(heard.get() + 1);
+        let fence = Fence::default().telling(&hears);
+        let start = Instant::now();
+        fence.working_at(start);
+        assert_eq!(heard.get(), 1);
+        fence.working_at(start + WORKING_EVERY / 2);
+        assert_eq!(heard.get(), 1);
+        fence.working_at(start + WORKING_EVERY);
+        assert_eq!(heard.get(), 2);
+        Fence::default().working_at(start);
+        assert_eq!(heard.get(), 2);
+    }
 
     #[test]
     fn unavailable_ownership_keeps_a_cache_but_platform_services_do_not_poison_the_scan() {
@@ -340,7 +393,7 @@ mod tests {
         let fence = Fence::new(&processes);
         let now = SystemTime::now();
         let day = Duration::from_secs(24 * 60 * 60);
-        let gone = super::super::RECLAIM_GONE;
+        let gone = super::super::ReclaimAfter::CALM;
         let mut held = Vec::new();
         let idle = super::super::reclaim_watched_on(
             &root,

@@ -1098,6 +1098,7 @@ fn an_ask_on_the_node_jobs_port_reaches_the_windows_desk_or_is_refused_with_none
     )));
     let device = open("j");
     let joining = joiner::Joining {
+        records_bound: aterm_secrets::crossing::RecordsBound::uncrossed(),
         device: &device,
         node: [7; 32],
         name: "j".into(),

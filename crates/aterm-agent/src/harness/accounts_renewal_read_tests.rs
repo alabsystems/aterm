@@ -21,10 +21,20 @@ impl Bed {
             accounts::Store::at_for(root.path(), cli, &root.path().join("home")).bounded_by(&[]);
         let path = root.path().join(cli.accounts().roster_file);
         let dirs = ["work-live", "next-old", "next-new"].map(|name| root.path().join(name));
-        for dir in &dirs {
+        for (index, dir) in dirs.iter().enumerate() {
             let credential = dir.join(cli.connector().stores[0]);
             fs::create_dir_all(credential.parent().unwrap()).unwrap();
             fs::write(credential, b"opaque fixture").unwrap();
+            if cli == Cli::Codex {
+                super::review_observation_tests::write_codex_login(
+                    dir,
+                    if index == 0 {
+                        "work@example.test"
+                    } else {
+                        "next@example.test"
+                    },
+                );
+            }
         }
         let raw = Roster {
             rows: ["work", "next"]
@@ -72,7 +82,21 @@ impl Bed {
                     None,
                     NOW,
                 ));
-                events.extend(accounts::note_login_end(state, logins, "next", NOW));
+                if cli == Cli::Codex {
+                    let effective = accounts::bound(&raw, logins);
+                    let context = store
+                        .capture_auth_context(effective.row("next").unwrap())
+                        .unwrap();
+                    accounts::stage_login_end(
+                        state,
+                        raw.row("next").unwrap(),
+                        logins,
+                        context,
+                        NOW,
+                    );
+                } else {
+                    events.extend(accounts::note_login_end(state, logins, "next", NOW));
+                }
                 events.extend(accounts::note_wall(
                     state,
                     "work",
@@ -106,7 +130,22 @@ impl Bed {
                 None,
                 NOW,
             );
-            events.extend(accounts::note_login_end(state, logins, "next", NOW));
+            if self.cli == Cli::Codex {
+                let effective = accounts::bound(&self.raw, logins);
+                let context = self
+                    .store
+                    .capture_auth_context(effective.row("next").unwrap())
+                    .unwrap();
+                accounts::stage_login_end(
+                    state,
+                    self.raw.row("next").unwrap(),
+                    logins,
+                    context,
+                    NOW,
+                );
+            } else {
+                events.extend(accounts::note_login_end(state, logins, "next", NOW));
+            }
             Ok(events)
         })
     }
@@ -137,28 +176,34 @@ impl Bed {
                     after: Some(&after),
                     mode: None,
                 },
-                |state, logins| {
-                    let mut events = accounts::note_renewed(
-                        state,
-                        logins,
-                        "next",
-                        None,
-                        self.dirs[2].to_str().unwrap(),
-                        None,
-                        NOW + 1,
-                    );
-                    events.extend(accounts::note_wall(
-                        state,
-                        "next",
-                        "weekly",
-                        Some(NOW + 3600),
-                        NOW + 1,
-                        NOW + 1,
-                    ));
-                    Ok(events)
-                },
+                |_, _| Ok(Vec::new()),
                 || Ok(()),
             )
+            .unwrap();
+        drop(held);
+        // The newer policy publishes before the replacement is observed under it. The old
+        // captured attempt must still refuse both the changed policy and the changed binding.
+        self.store
+            .transact_pool_logins_within(&[], &self.path, NOW + 1, &mut None, |_, state, logins| {
+                let mut events = accounts::note_renewed(
+                    state,
+                    logins,
+                    "next",
+                    None,
+                    self.dirs[2].to_str().unwrap(),
+                    None,
+                    NOW + 1,
+                );
+                events.extend(accounts::note_wall(
+                    state,
+                    "next",
+                    "weekly",
+                    Some(NOW + 3600),
+                    NOW + 1,
+                    NOW + 1,
+                ));
+                Ok(events)
+            })
             .unwrap();
     }
 
@@ -180,6 +225,10 @@ fn case(provider: i64, fault: i64, later: bool) -> (bool, bool, bool) {
     let cli =
         [Cli::Claude, Cli::Codex, Cli::Kimi, Cli::Grok][usize::try_from(provider - 1).unwrap()];
     let bed = Bed::new(cli);
+    let credentials_before = bed
+        .dirs
+        .each_ref()
+        .map(|dir| fs::read(dir.join(cli.connector().stores[0])).unwrap());
     match fault {
         1 | 6 => bed.pending(),
         2 => fs::write(&bed.path, "[[account]").unwrap(),
@@ -250,10 +299,14 @@ fn case(provider: i64, fault: i64, later: bool) -> (bool, bool, bool) {
             )
         }
     };
-    for dir in &bed.dirs {
+    for (index, dir) in bed.dirs.iter().enumerate() {
         assert_eq!(
             fs::read(dir.join(cli.connector().stores[0])).unwrap(),
-            b"opaque fixture"
+            if cli == Cli::Codex {
+                credentials_before[index].as_slice()
+            } else {
+                b"opaque fixture"
+            }
         );
     }
     (available, admitted, retained)

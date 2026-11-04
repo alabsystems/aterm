@@ -3,6 +3,210 @@
 
 use super::*;
 
+fn coherent_codex_auth(email: Option<&str>) -> Vec<u8> {
+    let token = crate::harness::codex_app_login::tests::make_jwt(&aterm_json::json!({
+        "email": email,
+        "https://api.openai.com/auth": {
+            "chatgpt_user_id": "fixture-user",
+            "chatgpt_account_id": "fixture-account"
+        }
+    }));
+    aterm_json::to_vec(&aterm_json::json!({
+        "auth_mode": "chatgpt",
+        "tokens": {"id_token": token, "access_token": token}
+    }))
+    .unwrap()
+}
+
+#[test]
+fn a_passthrough_codex_launch_checks_the_known_default_identity() {
+    for (lone, mode) in [(false, "off"), (true, "early")] {
+        let world = World::new("passthrough-codex-identity");
+        world.two(Cli::Codex);
+        let mut roster = world.seat().roster(Cli::Codex).unwrap();
+        roster.rows[0].email = Some("alias@example.test".into());
+        roster.rows[0].identity_email = Some("owner@example.test".into());
+        if lone {
+            roster.rows.truncate(1);
+        }
+        std::fs::write(
+            world.cfg.join(Cli::Codex.accounts().roster_file),
+            accounts::append_rows_for(Cli::Codex, "", &roster.rows).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            world.cfg.join("aterm.toml"),
+            format!("[harness]\naccounts = \"{mode}\"\n"),
+        )
+        .unwrap();
+        let auth = world.home.join(".codex/auth.json");
+        let no_poll = |_: Cli, _: &Path, _: Option<&str>, _: i64| -> Option<Usage> {
+            panic!("a pass-through launch reads no provider usage")
+        };
+        let replaced = coherent_codex_auth(Some("other@example.test"));
+        std::fs::write(&auth, &replaced).unwrap();
+        assert!(super::super::launch_env(&world.seat(), Cli::Codex, &no_poll).is_err());
+        assert!(super::super::default_row_now(&world.seat(), Cli::Codex).is_err());
+        assert_eq!(std::fs::read(&auth).unwrap(), replaced);
+
+        for email in [Some("owner@example.test"), None] {
+            let accepted = coherent_codex_auth(email);
+            std::fs::write(&auth, &accepted).unwrap();
+            assert_eq!(
+                super::super::launch_env(&world.seat(), Cli::Codex, &no_poll).unwrap(),
+                None
+            );
+            assert!(matches!(
+                super::super::default_row_now(&world.seat(), Cli::Codex).unwrap(),
+                crate::harness::codex_alab::DefaultRow::Serves(label) if label == "main"
+            ));
+            assert_eq!(std::fs::read(&auth).unwrap(), accepted);
+        }
+    }
+}
+
+#[test]
+fn a_default_identity_mismatch_does_not_refuse_an_independent_pinned_login() {
+    let world = World::new("independent-codex-identity");
+    let work = world.two(Cli::Codex);
+    let mut roster = world.seat().roster(Cli::Codex).unwrap();
+    for (row, email) in roster
+        .rows
+        .iter_mut()
+        .zip(["owner@example.test", "work@example.test"])
+    {
+        row.email = Some(email.into());
+    }
+    std::fs::write(
+        world.cfg.join(Cli::Codex.accounts().roster_file),
+        accounts::append_rows_for(Cli::Codex, "", &roster.rows).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        world.cfg.join("aterm.toml"),
+        "[harness]\naccounts = 'off'\n",
+    )
+    .unwrap();
+    let default_auth = world.home.join(".codex/auth.json");
+    let work_auth = work.join("auth.json");
+    let replaced = coherent_codex_auth(Some("other@example.test"));
+    let independent = coherent_codex_auth(Some("work@example.test"));
+    std::fs::write(&default_auth, &replaced).unwrap();
+    std::fs::write(&work_auth, &independent).unwrap();
+    pin(&world, Cli::Codex, "work").unwrap();
+    let no_poll = |_: Cli, _: &Path, _: Option<&str>, _: i64| -> Option<Usage> {
+        panic!("rotation off reads no provider usage")
+    };
+    let launch = super::super::launch_env(&world.seat(), Cli::Codex, &no_poll)
+        .unwrap()
+        .unwrap();
+    assert_eq!(launch.label, "work");
+    assert_eq!(std::fs::read(default_auth).unwrap(), replaced);
+    assert_eq!(std::fs::read(work_auth).unwrap(), independent);
+}
+
+#[test]
+fn an_observed_launch_preserves_the_last_identity_failure_when_alternatives_end() {
+    let world = World::new("observed-codex-exhaustion");
+    let work = world.two(Cli::Codex);
+    let mut roster = world.seat().roster(Cli::Codex).unwrap();
+    roster.rows[0].email = Some("owner@example.test".into());
+    roster.rows[1].email = Some("work@example.test".into());
+    std::fs::write(
+        world.cfg.join(Cli::Codex.accounts().roster_file),
+        accounts::append_rows_for(Cli::Codex, "", &roster.rows).unwrap(),
+    )
+    .unwrap();
+    let token = |user| {
+        crate::harness::codex_app_login::tests::make_jwt(&aterm_json::json!({
+            "email": "owner@example.test",
+            "https://api.openai.com/auth": {"chatgpt_user_id": user}
+        }))
+    };
+    let conflicting = aterm_json::to_vec(&aterm_json::json!({
+        "auth_mode": "chatgpt",
+        "tokens": {"id_token": token("one"), "access_token": token("another")}
+    }))
+    .unwrap();
+    let default_auth = world.home.join(".codex/auth.json");
+    let work_auth = work.join("auth.json");
+    let displaced = coherent_codex_auth(Some("other@example.test"));
+    std::fs::write(&default_auth, &conflicting).unwrap();
+    std::fs::write(&work_auth, &displaced).unwrap();
+    world.on_main(Cli::Codex, &[]);
+    world
+        .seat()
+        .store(Cli::Codex)
+        .transact(NOW, &mut None, |state| {
+            state.active = Some("work".into());
+            state.pinned = false;
+            Ok(Vec::new())
+        })
+        .unwrap();
+    let seat = world.seat();
+    let state = world.load(Cli::Codex);
+    let enrolled = accounts::enrolled_in(Cli::Codex, &roster, &world.home);
+    let before = [
+        seat.store(Cli::Codex).state_file(),
+        seat.store(Cli::Codex).logins_file(),
+    ]
+    .map(|path| std::fs::read(path).ok());
+    let refused = super::super::launch_observed(
+        (Cli::Codex, false, Mode::Early),
+        &roster,
+        &state,
+        &enrolled,
+        Some(&world.exe),
+        NOW,
+        &world.home,
+    )
+    .unwrap_err();
+    assert!(refused.contains("different users"));
+    assert_eq!(world.load(Cli::Codex), state);
+    assert_eq!(
+        [
+            seat.store(Cli::Codex).state_file(),
+            seat.store(Cli::Codex).logins_file()
+        ]
+        .map(|path| std::fs::read(path).ok()),
+        before
+    );
+    assert_eq!(std::fs::read(default_auth).unwrap(), conflicting);
+    assert_eq!(std::fs::read(work_auth).unwrap(), displaced);
+}
+
+#[test]
+fn a_passthrough_codex_launch_does_not_judge_a_non_file_backends_stale_file() {
+    for backend in ["keyring", "auto", "ephemeral", "unknown"] {
+        let world = World::new("passthrough-codex-backend");
+        world.two(Cli::Codex);
+        let mut roster = world.seat().roster(Cli::Codex).unwrap();
+        roster.rows[0].email = Some("owner@example.test".into());
+        std::fs::write(
+            world.cfg.join(Cli::Codex.accounts().roster_file),
+            accounts::append_rows_for(Cli::Codex, "", &roster.rows).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            world.home.join(".codex/config.toml"),
+            format!("cli_auth_credentials_store = \"{backend}\"\n"),
+        )
+        .unwrap();
+        let path = world.home.join(".codex/auth.json");
+        let stale = coherent_codex_auth(Some("other@example.test"));
+        std::fs::write(&path, &stale).unwrap();
+        assert!(world.seat().keyring_held(Cli::Codex));
+        let no_poll = |_: Cli, _: &Path, _: Option<&str>, _: i64| -> Option<Usage> {
+            panic!("a non-file backend reads no file-account usage")
+        };
+        assert_eq!(
+            super::super::launch_env(&world.seat(), Cli::Codex, &no_poll).unwrap(),
+            None
+        );
+        assert_eq!(std::fs::read(path).unwrap(), stale);
+    }
+}
+
 #[test]
 fn named_claude_login_refuses_another_account_identity() {
     for default in [false, true] {
@@ -198,12 +402,7 @@ fn running_codex_sessions_skip_a_conflicting_default_or_dedicated_login() {
             .unwrap();
         let auth = work.join("auth.json").to_string_lossy().into_owned();
         let env = [("CODEX_AUTH_PATH", auth.as_str())];
-        let mut session = session(
-            Cli::Codex,
-            Supervisor::Aterm,
-            Mode::Early,
-            Path::new("/opt/codex"),
-        );
+        let mut session = session(Cli::Codex, Supervisor::Aterm, Mode::Early, &world.exe);
         if default {
             session.env = &env;
         }

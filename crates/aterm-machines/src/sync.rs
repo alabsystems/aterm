@@ -68,7 +68,7 @@ pub const BUILDS_KEPT: usize = 8;
 pub const PEERS: &str = "sync.peers";
 /// `sync.vault`: the vault's subscriber (report only).
 pub const VAULT: &str = "sync.vault";
-/// `sync.github`: reconcile a legacy override with the delivered vault GitHub helper.
+/// `sync.github`: replace the block an earlier `aterm init` wrote with aterm's own GitHub helper.
 pub const GITHUB: &str = "sync.github";
 /// `sync.clone`: the GitHub step an `aterm init` owes, run once the vault's token lands
 /// ([`crate::init::owed_clone`]).
@@ -486,16 +486,21 @@ pub enum ReleaseRead {
     Due(String),
 }
 
-/// Readiness of the already delivered vault GitHub credential helper.
+/// Readiness of aterm's own GitHub credential route, and the block it replaces.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GithubRead {
     /// Explicitly disabled, custom or foreign configuration is left unchanged.
     NotApplicable(String),
-    /// The configured helper returns the authenticated vault token.
+    /// aterm's route hands back the vault's token.
     Current(String),
-    /// A legacy managed override shadows the authenticated vault helper.
-    Due(String),
-    /// Required local inputs or GitHub's authentication response are not ready.
+    /// The block an earlier `aterm init` wrote to git's global settings is there to replace.
+    Due {
+        /// What the settings read as.
+        from: String,
+        /// The shell commands that put the block back, which the engine journals first.
+        revert: String,
+    },
+    /// Required local inputs are not ready.
     Deferred(String),
 }
 
@@ -770,8 +775,9 @@ pub trait Ports: Sync {
             "vault GitHub helper is unavailable".into(),
         ))
     }
-    /// Migrate only a verified legacy override; never clone repositories.
-    fn sync_github(&self) -> Result<String, String> {
+    /// Replace the keychain block whose `journaled` revert the read gave; never clone
+    /// repositories.
+    fn sync_github(&self, _journaled: &str) -> Result<String, String> {
         Ok("vault GitHub helper is unavailable".into())
     }
     /// `sync.clone`'s read: the GitHub step an `aterm init` owes, whether System State came to
@@ -785,10 +791,11 @@ pub trait Ports: Sync {
             "aterm init owes no clone".into(),
         ))
     }
-    /// `sync.clone`'s apply: that step, run once ([`crate::init::clone_owed`]).
+    /// `sync.clone`'s apply: that step, run once ([`crate::init::clone_owed`]). The keychain
+    /// row's retry is `sync.github`'s.
     ///
     /// # Errors
-    /// A row of the step did not end in place.
+    /// A repository row of the step did not end in place.
     fn clone_owed(&self) -> Result<String, String> {
         Err("this build runs no clone aterm init owes".into())
     }
@@ -827,7 +834,8 @@ pub trait Ports: Sync {
     /// to a window.
     fn awake_startup_off(&self) -> bool;
     /// Old `aterm caffeine` login jobs no aterm will run again (their `aterm` is gone, is this
-    /// build, or answers no to `aterm help caffeine`, as 0.145.0 does): `sync.awake` retires
+    /// build, or answers no to `aterm help caffeine`, as 0.145.0 does; on a home that is not on a
+    /// disk of this Mac, only those whose `aterm` lies inside the home): `sync.awake` retires
     /// them even when a mug already runs or the person turned keep-awake or Enable at Startup off.
     fn awake_retired_jobs(&self) -> Vec<String> {
         Vec::new()
@@ -931,6 +939,12 @@ struct Synced<'a> {
     /// starting a mug, so its read-back verifies their removal even when keep-awake itself is off
     /// or deferred.
     retired_awake: std::sync::atomic::AtomicBool,
+    /// The commands that put back the block `sync.github`'s read found, which the engine
+    /// journals before the apply.
+    revert: Mutex<Option<String>>,
+    /// Whether this pass's `sync.github` apply replaced the block, so its read-back answers for
+    /// that whatever else the route waits on.
+    replaced_github: std::sync::atomic::AtomicBool,
 }
 
 impl<'a> Synced<'a> {
@@ -944,6 +958,8 @@ impl<'a> Synced<'a> {
             said: Mutex::new(None),
             aside: Mutex::new(None),
             retired_awake: std::sync::atomic::AtomicBool::new(false),
+            revert: Mutex::new(None),
+            replaced_github: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1225,14 +1241,26 @@ impl Item for Synced<'_> {
                     },
                 }
             }),
-            Kind::Github => read(self.ports.github(), |github| match github {
-                GithubRead::NotApplicable(why) => not_applicable(why),
-                GithubRead::Current(now) => Probe::Ok { now },
-                GithubRead::Due(from) => Probe::Change {
-                    from,
-                    to: "verified vault helper exposed; repositories unchanged".into(),
-                },
-                GithubRead::Deferred(why) => Probe::Deferred { why },
+            Kind::Github => read(self.ports.github(), |github| {
+                let replaced = self
+                    .replaced_github
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                match github {
+                    GithubRead::Current(now) => Probe::Ok { now },
+                    GithubRead::NotApplicable(now) | GithubRead::Deferred(now) if replaced => {
+                        Probe::Ok { now }
+                    }
+                    GithubRead::NotApplicable(why) => not_applicable(why),
+                    GithubRead::Due { from, revert } => {
+                        *self.revert.lock().unwrap_or_else(PoisonError::into_inner) = Some(revert);
+                        Probe::Change {
+                            from,
+                            to: "aterm's own GitHub helper in its place; repositories unchanged"
+                                .into(),
+                        }
+                    }
+                    GithubRead::Deferred(why) => Probe::Deferred { why },
+                }
             }),
             Kind::StewardRevoke => {
                 read(
@@ -1360,7 +1388,7 @@ impl Item for Synced<'_> {
                 "the aterm window keeps this Mac awake at launch and every five minutes",
             ),
             // A person's Enable at Startup off is no mug at login; a window still starts one,
-            // while dead or 0.145.0 `aterm caffeine` login jobs are still retired.
+            // while the old `aterm caffeine` login jobs no aterm will run again are still retired.
             Kind::Awake
                 if self.trigger == Trigger::Subscriber && self.ports.awake_startup_off() =>
             {
@@ -1405,6 +1433,14 @@ impl Item for Synced<'_> {
         }
     }
 
+    /// `sync.github`'s alone: the commands that put back the block its read found.
+    fn revert(&self) -> Option<String> {
+        self.revert
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     fn apply(&self) -> Result<(), String> {
         let said = match self.kind {
             Kind::Peers => match self.ports.join_peers()? {
@@ -1415,7 +1451,18 @@ impl Item for Synced<'_> {
                 }
             },
             Kind::Identity => self.ports.sync_identity()?,
-            Kind::Github => self.ports.sync_github()?,
+            Kind::Github => {
+                let journaled = self
+                    .revert
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone()
+                    .ok_or("sync.github applied with no revert journaled")?;
+                let said = self.ports.sync_github(&journaled)?;
+                self.replaced_github
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                said
+            }
             Kind::OwedClone => match self.owed_clone_held() {
                 // A Stop pressed, or the group turned off, since the row read what is owed holds
                 // the clone it has not begun (principle 4): the row reads it was not cloned.

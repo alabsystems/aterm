@@ -1364,9 +1364,12 @@ pub struct Bridge {
     recovery_owed: bool,
     /// The last bridge of the state dir ran in an earlier boot, as judged when this bridge
     /// started ([`StateDir::last_ran_in_an_earlier_boot`]): the run record named an earlier
-    /// boot, or, with no record, the incarnation lease did, and no lease named an attach of this
-    /// boot. The start's first roster, where it reads, sweeps that boot's sessions' files and
-    /// post reservations ([`Bridge::sweep_sessions_of_an_earlier_boot`]); no later roster does.
+    /// boot, or, with no record, the incarnation lease did, and a lease that reads named an
+    /// earlier boot too. A lease of this boot is an attach whose sessions may still run, and one
+    /// that names no boot (an older build's off the boot volume) cannot rule such an attach out:
+    /// either holds this false. The start's first roster, where it reads, sweeps that boot's
+    /// sessions' files and post reservations ([`Bridge::sweep_sessions_of_an_earlier_boot`]); no
+    /// later roster does.
     earlier_boot: bool,
     mailbox: Arc<Mailbox>,
     fx: Fx,
@@ -3744,6 +3747,28 @@ impl Bridge {
             return None;
         }
         self.take_held_commit()
+    }
+
+    /// THE COMMIT AHEAD OF THE FENCE (critic item D06's review): a mirror pass whose open has
+    /// yet to make the pin's fence ([`StateDir::ensure_logpin_durable`], two full flushes)
+    /// sends the inbox commit its burst would carry ([`Bridge::take_commit_for_the_mirror`])
+    /// first, alone. The first delivery after an attach or a handoff goes ahead of that pass
+    /// ([`Bridge::mirror_yields`]), so its commit trails it by no more than the round's
+    /// [`IDLE_ACK_GRACE`], never by the fence and the take as well. An open holds its fence
+    /// once its first pass made it, so this is one write of its own an open at most.
+    pub(super) fn commit_ahead_of_the_fence(&mut self) {
+        #[cfg(test)]
+        if self
+            .fx
+            .mutant(crate::sim::world::Mutant::CommitBehindTheFence)
+        {
+            return;
+        }
+        let owed = self.commit_held.is_some()
+            || (!self.mailbox.inbox_queued() && self.inbox_commit_due().is_some());
+        if owed && !self.state.logpin_fence_held() {
+            self.flush_inbox_commit();
+        }
     }
 
     fn flush_inbox_commit(&mut self) {
@@ -7354,10 +7379,9 @@ impl Bridge {
             }
         };
         let drain = parse_drain(&drained);
-        self.waits.count(
-            crate::wait_tally::Row::DrainPosts,
-            u64::try_from(drain.posts.len()).unwrap_or(u64::MAX),
-        );
+        let posts = u64::try_from(drain.posts.len()).unwrap_or(u64::MAX);
+        self.waits.count(crate::wait_tally::Row::DrainPosts, posts);
+        self.mirror_drained_posts(posts);
         self.release_replays(&drain);
         for (sid, off) in drain.fetches {
             if self.aterm_gone() {
@@ -9555,7 +9579,9 @@ impl Bridge {
             let wait = self.duty_wait(self.fx.now());
             return self.round(wait);
         }
-        self.mirror_step();
+        if !self.mirror_yields() {
+            self.mirror_step();
+        }
         self.settle_owed();
         let wait = self.park_wait(self.fx.now());
         self.park_and_take(wait)
@@ -9695,6 +9721,7 @@ impl Bridge {
                 true
             }
             Some(Item::Inbox(r)) => {
+                self.mirror_took_inbox();
                 self.on_inbox_record(&r);
                 true
             }
@@ -9758,6 +9785,15 @@ impl Bridge {
             span: None,
             off_volume: false,
         });
+    }
+
+    /// The state dir stands off the boot volume in the boot [`Bridge::simulate_boot`] set, and
+    /// with `before_rz2` its leases name no boot there, as an older build's did
+    /// ([`crate::sim::world::Mutant::LeaseNamesNoBootOffTheBootVolume`]).
+    pub(crate) fn simulate_off_the_boot_volume(&self, before_rz2: bool) {
+        self.state.stand_off_the_boot_volume();
+        self.state
+            .lease_names_no_boot_off_the_boot_volume(before_rz2);
     }
 
     /// Returns the uncommitted inbox offset and log identity currently owed by this bridge.
@@ -13529,12 +13565,7 @@ mod tests {
         bridge: &mut Bridge,
         records: &[(String, Vec<u8>)],
     ) -> Vec<(u64, u64)> {
-        let acked = bridge.state.root().join("acked");
-        let saved = std::fs::read(&acked).unwrap_or_default();
-        if acked.is_file() {
-            std::fs::remove_file(&acked).unwrap();
-        }
-        std::fs::create_dir(&acked).unwrap();
+        let refused = bridge.state.refuse_writes_of(Some("acked"));
         let mut published = Vec::new();
         for (subject, body) in records {
             let pin = plain_pin(bridge.next_seq().unwrap(), subject, body);
@@ -13542,8 +13573,7 @@ mod tests {
             assert!(!deduped);
             published.push((pin.seq, off));
         }
-        std::fs::remove_dir(&acked).unwrap();
-        std::fs::write(&acked, saved).unwrap();
+        bridge.state.refuse_writes_of(refused.as_deref());
         assert_eq!(bridge.state.in_flight().unwrap().len(), records.len());
         published
     }
@@ -14232,12 +14262,21 @@ mod tests {
             assert!(bridge.attach_broker(), "publication retry, reopen={reopen}");
             bridge.close_subscriptions();
         }
-        for (wait, on_volume) in [(true, false), (false, false), (false, true)] {
-            let case = format!("wait={wait} on_volume={on_volume}");
+        // Off the boot volume the lease of the attach past the wait names its boot (item RZ2),
+        // so only an older build's write there (`legacy`), which names none, leaves the guard
+        // nothing to read: the negative control.
+        for (wait, on_volume, legacy) in [
+            (true, false, false),
+            (false, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let case = format!("wait={wait} on_volume={on_volume} legacy={legacy}");
             let (lane, mut bridge) = FakeVerbLane::bridge(&[]);
             let (socket, _broker, _server) = serve_log(&lane, "f2-run");
             bridge.cfg.broker = socket;
             bridge.attach_past_an_earlier_boots_run = !wait;
+            bridge.state.lease_names_no_boot_off_the_boot_volume(legacy);
             let in_boot = |bridge: &Bridge, n| {
                 bridge.state.set_inc_seam(crate::state::IncSeam {
                     boot: Some(Some(crate::durability::test_boot(n))),
@@ -14306,7 +14345,7 @@ mod tests {
                 .exists();
             let relearned = bridge.state.self_acked().contains(&off);
             let accused = bridge.is_forged_self(off);
-            if wait || on_volume {
+            if wait || on_volume || !legacy {
                 assert!(
                     !retired && relearned && !accused,
                     "{case}: retired={retired} relearned={relearned} accused={accused}"
@@ -18211,7 +18250,9 @@ mod tests {
 
     /// WHAT A LOCAL POST COSTS THE STATE DIR (B19): four records of the post journal (its
     /// reservation, its record in flight, that record landed, the reservation retired) and the
-    /// landed offset appended to `acked`, and nothing renamed, unlinked or read.
+    /// landed offset appended to `acked`, and nothing renamed, unlinked or read. Nothing is
+    /// opened either: the first post opened the journal and `acked`, and each is held open for
+    /// the posts after it (D05: `acked` was opened, checked and closed at every landing).
     #[cfg(unix)]
     #[test]
     fn a_local_post_costs_the_state_dir_a_counted_set_of_operations() {
@@ -18228,6 +18269,7 @@ mod tests {
                     barriers: 0,
                     unlinks: 0,
                     appends: 5 * posts,
+                    opens: 0,
                 },
                 "{drains} drain(s) of {per_drain} post(s)"
             );
@@ -18412,8 +18454,7 @@ mod tests {
         let (first, appends, replaces) = post(&lane, &mut bridge, 1);
         assert_eq!((appends, replaces), (1, 0), "an ordinary append");
 
-        std::fs::remove_file(&acked).unwrap();
-        std::fs::create_dir(&acked).unwrap();
+        bridge.state.refuse_writes_of(Some("acked"));
         let (second, _, _) = post(&lane, &mut bridge, 2);
         assert!(!bridge.acked_appendable, "the write failed");
         assert_eq!(
@@ -18421,7 +18462,7 @@ mod tests {
             1,
             "the entry stays while acked does not hold its offset"
         );
-        std::fs::remove_dir(&acked).unwrap();
+        bridge.state.refuse_writes_of(None);
         let (third, appends, replaces) = post(&lane, &mut bridge, 3);
         assert_eq!((appends, replaces), (0, 1), "replaced whole");
         let on_disk = bridge.state.self_acked();
@@ -20824,7 +20865,7 @@ mod tests {
                 Mutant::ShortParkSendsTheHeldCommit,
             ),
         ] {
-            let rode = mirror_after_a_delivery(crate::fx::Fx::os(), pass);
+            let rode = mirror_after_a_delivery(crate::fx::Fx::os(), pass, true);
             assert_eq!(
                 rode.owed.first().copied(),
                 Some("commit"),
@@ -20850,7 +20891,7 @@ mod tests {
                 "{pass:?}: the group is through the delivery"
             );
 
-            let bare = mirror_after_a_delivery(crate::fx::Fx::os_without(mutant), pass);
+            let bare = mirror_after_a_delivery(crate::fx::Fx::os_without(mutant), pass, true);
             assert!(
                 bare.owed.iter().all(|kind| *kind == "mirror") && !bare.owed.is_empty(),
                 "{pass:?}: NEGATIVE CONTROL ({mutant:?}): the slots went bare: {:?}",
@@ -20872,7 +20913,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_mirror_pass_at_the_windows_edge_still_carries_the_due_commit() {
-        let rode = mirror_after_a_delivery(crate::fx::Fx::os(), MirrorPass::AtTheWindowsEdge);
+        let rode = mirror_after_a_delivery(crate::fx::Fx::os(), MirrorPass::AtTheWindowsEdge, true);
         let sent: Vec<&str> = rode
             .owed
             .iter()
@@ -20895,6 +20936,300 @@ mod tests {
             !rode.held_after_send && rode.committed && rode.on_bus,
             "taken by the mirror's burst, and the group is through the delivery"
         );
+    }
+
+    /// What [`first_rounds_after_an_attach`] saw of each step, in order.
+    #[cfg(unix)]
+    #[derive(Debug, PartialEq, Eq)]
+    struct FirstRound {
+        /// The lane's deliveries and the mirror's takes the step asked for, in its order.
+        asked: Vec<&'static str>,
+        /// Whether the open held the pin's fence once the step was over.
+        fenced: bool,
+    }
+
+    /// One step of the loop after an attach ([`first_rounds_after_an_attach`]).
+    #[cfg(unix)]
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum FirstStep {
+        /// A turn of [`Bridge::mirror_then_round`].
+        Round,
+        /// The turn's first half: the hold's judgement ([`Bridge::mirror_yields`]) and the pass
+        /// it lets go ([`Bridge::mirror_step`]), with no settle or park behind them, so a round
+        /// a hold would park for a minute is read without the wait.
+        Pass,
+        /// The next record comes back on the inbox face (one the attach's drain published).
+        Arrive,
+    }
+
+    /// An attach of a fresh open (no fence on `logpin`) whose first pass is held for at most
+    /// `hold`, its drain having listed `drained` posts to publish, with `queued` inbox records
+    /// waiting for the loop as that pass comes due and one more for each
+    /// [`FirstStep::Arrive`]; then `steps` on `fx`; and the wait tally's
+    /// [`crate::wait_tally::Row::LogpinFence`] count over them.
+    #[cfg(unix)]
+    fn first_rounds_after_an_attach(
+        fx: crate::fx::Fx,
+        queued: u64,
+        hold: Duration,
+        drained: u64,
+        steps: &[FirstStep],
+    ) -> (Vec<FirstRound>, u64) {
+        use crate::wait_tally::{Row, Tally, FILE};
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b")]);
+        bridge.fx = fx;
+        let arrivals = steps.iter().filter(|s| **s == FirstStep::Arrive).count();
+        let (records, _writer, _socket, _broker, _server) = burst_rig(
+            &lane,
+            &mut bridge,
+            "s-b",
+            queued + u64::try_from(arrivals).unwrap(),
+        );
+        let tally = bridge.state.root().join(FILE);
+        bridge.tally_to(&tally);
+        let mut run = mirror_run::MirrorRun::acked_for_tests(&bridge.state, aterm_slog::TAKE_MAX);
+        run.hold_first_pass_for_tests(hold);
+        bridge.mirror = Some(run);
+        let mut log = aterm_slog::Log::with_limits(
+            1,
+            aterm_slog::Limits::new(8, 1 << 20).expect("a small ring"),
+        );
+        log.open_session(
+            aterm_slog::Kind::Spawn,
+            aterm_slog::Src::Aterm,
+            aterm_slog::Conf::Exact,
+            aterm_slog::Actor::Aterm,
+            aterm_slog::Fields::new(),
+            aterm_slog::Stamp::new(1, 1),
+        )
+        .expect("the session opens");
+        lane.mirror
+            .lock()
+            .unwrap()
+            .logs
+            .insert("s-b".to_string(), log);
+        bridge.mirror_attached();
+        bridge.mirror_drained_posts(drained);
+        assert!(
+            !bridge.state.logpin_fence_held(),
+            "PRECONDITION: a fresh open holds no fence"
+        );
+        let generation = bridge.mailbox.broker_generation(Source::Inbox);
+        let mut records = records.into_iter();
+        let mut push = |bridge: &mut Bridge| {
+            let record = records.next().expect("a record for each arrival");
+            let _ = bridge
+                .mailbox
+                .push(Source::Inbox, record, generation, bridge.fx.now());
+        };
+        for _ in 0..queued {
+            push(&mut bridge);
+        }
+        let now = bridge.fx.now();
+        assert_eq!(
+            bridge.mirror_due(now),
+            Some(now),
+            "PRECONDITION: the pass is due now"
+        );
+        let mut seen = Vec::new();
+        for step in steps {
+            let before = lane.requests.lock().unwrap().len();
+            match step {
+                FirstStep::Round => assert!(bridge.mirror_then_round()),
+                FirstStep::Pass => {
+                    if !bridge.mirror_yields() {
+                        bridge.mirror_step();
+                    }
+                }
+                FirstStep::Arrive => push(&mut bridge),
+            }
+            let asked = lane.requests.lock().unwrap()[before..]
+                .iter()
+                .filter_map(|line| {
+                    if line.starts_with("deliver ") {
+                        Some("deliver")
+                    } else if line.starts_with("log-take ") {
+                        Some("log-take")
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            seen.push(FirstRound {
+                asked,
+                fenced: bridge.state.logpin_fence_held(),
+            });
+        }
+        bridge.tally_idle();
+        let t = Tally::parse(&std::fs::read_to_string(&tally).unwrap()).unwrap();
+        (seen, t.row(Row::LogpinFence).count)
+    }
+
+    /// **THE FIRST DELIVERY AFTER AN ATTACH GOES AHEAD OF THE PIN'S FENCE** (critic item D06).
+    /// A fresh open holds no fence on `logpin`, so its first mirror pass writes the pin durably
+    /// (two full flushes, the wait tally's `logpin_fence` row) before it takes. That pass is
+    /// held for what the attach owes a delivery, and follows it, the fence still ahead of its
+    /// take (the seeded worlds' `mirror fence:` law):
+    /// - two records queued: two rounds that deliver one each and leave the fence unmade, then
+    ///   a round that finds nothing queued and whose pass makes the fence and takes;
+    /// - nothing queued and no post drained: the pass is not held;
+    /// - a drain that listed a post, its record not yet back as the pass comes due: the hold
+    ///   waits for it past an empty queue, the record is delivered once it comes, and the hold
+    ///   ends at the first turn after it (the whole hold is a minute, so the loop, never the
+    ///   clock, ends it);
+    /// - a hold that is out lets the pass go ahead of what is still queued (the bound: a stream
+    ///   of items cannot starve the pass).
+    ///
+    /// Each hold but the last is a minute long ([`aterm_spec::wait::MUST_HAPPEN`]), so what ends
+    /// it is the loop going idle, never the clock.
+    ///
+    /// NEGATIVE CONTROLS: with the pass ahead of what is queued
+    /// ([`crate::sim::world::Mutant::MirrorAheadOfTheFirstDelivery`], the loop before D06), the
+    /// first round makes the fence and takes before it delivers; with the drained posts
+    /// forgotten ([`crate::sim::world::Mutant::FirstPassForgetsTheDrainedPosts`], D06's first
+    /// form, which measured no gain), the pass goes ahead of the post's record; and with the
+    /// record not counted off ([`crate::sim::world::Mutant::FirstPassAwaitsPastItsRecords`]),
+    /// the pass is still held after the record came.
+    #[cfg(unix)]
+    #[test]
+    fn the_first_delivery_after_an_attach_goes_ahead_of_the_pins_fence() {
+        use crate::sim::world::Mutant;
+        use FirstStep::{Arrive, Pass, Round};
+        let long = aterm_spec::wait::MUST_HAPPEN;
+        let round = |asked: &[&'static str], fenced| FirstRound {
+            asked: asked.to_vec(),
+            fenced,
+        };
+        let (rounds, fences) =
+            first_rounds_after_an_attach(crate::fx::Fx::os(), 2, long, 0, &[Round; 3]);
+        assert_eq!(
+            rounds,
+            [
+                round(&["deliver"], false),
+                round(&["deliver"], false),
+                round(&["log-take"], true),
+            ],
+            "the queued deliveries first, then the pass, its fence ahead of its take"
+        );
+        assert_eq!(fences, 1, "the open's one fence, timed in its own row");
+
+        let (rounds, fences) =
+            first_rounds_after_an_attach(crate::fx::Fx::os(), 0, long, 0, &[Round]);
+        assert_eq!(
+            rounds,
+            [round(&["log-take"], true)],
+            "nothing queued and nothing drained: the pass is not held"
+        );
+        assert_eq!(fences, 1);
+
+        let awaited = [Pass, Pass, Arrive, Round, Pass];
+        let (rounds, fences) =
+            first_rounds_after_an_attach(crate::fx::Fx::os(), 0, long, 1, &awaited);
+        assert_eq!(
+            rounds,
+            [
+                round(&[], false),
+                round(&[], false),
+                round(&[], false),
+                round(&["deliver"], false),
+                round(&["log-take"], true),
+            ],
+            "a drained post is waited for past an empty queue, delivered once its record comes, \
+             and the pass goes at the first turn after it"
+        );
+        assert_eq!(fences, 1);
+
+        let (rounds, _) = first_rounds_after_an_attach(
+            crate::fx::Fx::os_without(Mutant::FirstPassForgetsTheDrainedPosts),
+            0,
+            long,
+            1,
+            &awaited[..1],
+        );
+        assert_eq!(
+            rounds,
+            [round(&["log-take"], true)],
+            "NEGATIVE CONTROL: with the drained post forgotten, the pass, its fence and its take \
+             go ahead of the post's record"
+        );
+        let (rounds, _) = first_rounds_after_an_attach(
+            crate::fx::Fx::os_without(Mutant::FirstPassAwaitsPastItsRecords),
+            0,
+            long,
+            1,
+            &awaited,
+        );
+        assert_eq!(
+            rounds.last(),
+            Some(&round(&[], false)),
+            "NEGATIVE CONTROL: with the record not counted off, the pass is still held after it"
+        );
+
+        let (rounds, fences) =
+            first_rounds_after_an_attach(crate::fx::Fx::os(), 2, Duration::ZERO, 1, &[Round; 2]);
+        assert_eq!(
+            rounds,
+            [
+                round(&["deliver"], false),
+                round(&["log-take", "deliver"], true),
+            ],
+            "a hold that is out: the pass goes ahead of what is still queued"
+        );
+        assert_eq!(fences, 1);
+
+        let (rounds, fences) = first_rounds_after_an_attach(
+            crate::fx::Fx::os_without(Mutant::MirrorAheadOfTheFirstDelivery),
+            2,
+            long,
+            1,
+            &[Round],
+        );
+        assert_eq!(
+            rounds,
+            [round(&["log-take", "deliver"], true)],
+            "NEGATIVE CONTROL: the pass, its fence and its take ahead of the first delivery"
+        );
+        assert_eq!(fences, 1);
+    }
+
+    /// **A PASS THAT MAKES THE PIN'S FENCE SENDS THE COMMIT ITS DELIVERY OWES AHEAD OF IT**
+    /// (critic item D06's review). In a fresh open the first pass after a delivery, which the
+    /// hold lets go behind it ([`Bridge::mirror_yields`]), makes the fence (two full flushes)
+    /// before its take, so the commit the delivery owes goes out alone ahead of the fence
+    /// ([`Bridge::commit_ahead_of_the_fence`]) rather than in the pass's burst behind it: the
+    /// commit's write and the burst's, two writer batches, and the group through the delivery.
+    ///
+    /// NEGATIVE CONTROL: with the commit left for the burst
+    /// ([`crate::sim::world::Mutant::CommitBehindTheFence`]), it rides the burst behind the
+    /// fence, one batch.
+    #[cfg(unix)]
+    #[test]
+    fn a_pass_that_makes_the_pins_fence_sends_the_owed_commit_ahead_of_it() {
+        use crate::sim::world::Mutant;
+        for pass in [MirrorPass::AfterTheSettle, MirrorPass::BeforeTheSettle] {
+            let ahead = mirror_after_a_delivery(crate::fx::Fx::os(), pass, false);
+            assert_eq!(
+                (ahead.held_after_send, ahead.batches),
+                (false, 2),
+                "{pass:?}: the commit alone, then the burst: {:?}",
+                ahead.owed
+            );
+            assert!(
+                ahead.snapshot && ahead.committed && ahead.on_bus,
+                "{pass:?}: the take, the group through the delivery and every slot on the bus"
+            );
+            let behind = mirror_after_a_delivery(
+                crate::fx::Fx::os_without(Mutant::CommitBehindTheFence),
+                pass,
+                false,
+            );
+            assert_eq!(
+                (behind.owed.first().copied(), behind.batches),
+                (Some("commit"), 1),
+                "{pass:?}: NEGATIVE CONTROL: the commit rode the burst behind the fence: {:?}",
+                behind.owed
+            );
+        }
     }
 
     /// The order the loop meets a delivery's commit and the mirror pass it owes in
@@ -20933,10 +21268,11 @@ mod tests {
     }
 
     /// A delivery that owes its commit, then the mirror pass the endpoint's line owes, met in
-    /// the order `pass` names, on `fx`; once its acks are read, a commit still owed goes
-    /// alone, as the backstop sends it.
+    /// the order `pass` names, on `fx`, in an open that holds the pin's fence (`fenced`, the
+    /// steady state C13 is about) or a fresh one, whose pass makes it; once its acks are read,
+    /// a commit still owed goes alone, as the backstop sends it.
     #[cfg(unix)]
-    fn mirror_after_a_delivery(fx: crate::fx::Fx, pass: MirrorPass) -> MirrorRide {
+    fn mirror_after_a_delivery(fx: crate::fx::Fx, pass: MirrorPass, fenced: bool) -> MirrorRide {
         let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b")]);
         bridge.fx = fx;
         let (records, _reader, _socket, broker, _server) = burst_rig(&lane, &mut bridge, "s-b", 1);
@@ -20944,6 +21280,12 @@ mod tests {
             &bridge.state,
             aterm_slog::TAKE_MAX,
         ));
+        if fenced {
+            assert!(
+                bridge.mirror_key_on_the_media() && bridge.state.logpin_fence_held(),
+                "PRECONDITION: the open made the pin's fence"
+            );
+        }
         let mut log = aterm_slog::Log::with_limits(
             1,
             aterm_slog::Limits::new(8, 1 << 20).expect("a small ring"),

@@ -14,6 +14,8 @@ const USERINFO: &str = "https://openidconnect.googleapis.com/v1/userinfo";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     CredentialRejected,
+    Unavailable,
+    RateLimited,
     Refused(&'static str),
 }
 
@@ -21,6 +23,8 @@ impl Error {
     pub const fn message(self) -> &'static str {
         match self {
             Self::CredentialRejected => "Google rejected the current credential",
+            Self::Unavailable => "Google account verification is temporarily unavailable",
+            Self::RateLimited => "Google account verification is rate limited",
             Self::Refused(message) => message,
         }
     }
@@ -74,6 +78,12 @@ fn response(status: u16, body: &[u8], expected: &str) -> Result<GoogleProfile, E
     if status == 401 {
         return Err(Error::CredentialRejected);
     }
+    if status == 429 {
+        return Err(Error::RateLimited);
+    }
+    if status == 408 || (500..600).contains(&status) {
+        return Err(Error::Unavailable);
+    }
     if status != 200 || body.len() > 64 * 1024 {
         return Err("Google refused the account verification request".into());
     }
@@ -99,7 +109,7 @@ pub fn read(token: &str, expected: &str, wait: Duration) -> Result<GoogleProfile
         .limit(64 * 1024)
         .backstop(wait)
         .send(&[])
-        .map_err(|_| "Google account verification did not complete")?;
+        .map_err(|_| Error::Unavailable)?;
     response(reply.status(), reply.body(), expected)
 }
 
@@ -113,10 +123,20 @@ mod tests {
             response(401, b"", "owner@gmail.com"),
             Err(Error::CredentialRejected)
         ));
-        for status in [200, 302, 403, 429, 500, 503] {
+        for status in [200, 302, 403] {
             assert!(matches!(
                 response(status, b"", "owner@gmail.com"),
                 Err(Error::Refused(_))
+            ));
+        }
+        assert!(matches!(
+            response(429, b"", "owner@gmail.com"),
+            Err(Error::RateLimited)
+        ));
+        for status in [408, 500, 502, 503, 504, 599] {
+            assert!(matches!(
+                response(status, b"", "owner@gmail.com"),
+                Err(Error::Unavailable)
             ));
         }
         let other = br#"{"sub":"1234","email":"other@gmail.com","email_verified":true}"#;

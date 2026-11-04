@@ -51,6 +51,11 @@ fn run_at(
         let recovery = crate::generation::status(paths, deadline)?;
         let chosen = crate::generation::observed_paths_until(paths, deadline);
         let mut value = readiness(chosen.as_ref().unwrap_or(paths), config, deadline)?;
+        let history = membership_history(chosen.as_ref().unwrap_or(paths), deadline);
+        value
+            .as_object_mut()
+            .ok_or_else(|| Error::new("invalid Commons status"))?
+            .insert("membership_history".into(), history);
         if !recovery.is_null() {
             let fields = value
                 .as_object_mut()
@@ -145,6 +150,32 @@ fn run_at(
         "tables":entries, "rings":rings, "inert":snapshot.inert,
         "recovery_reader":snapshot.recovery, "writer_resume_authorized":false}),
     )
+}
+
+fn membership_history(paths: &Paths, deadline: std::time::Instant) -> Value {
+    match aterm_secrets::client::inspect_membership_history_until(paths, deadline) {
+        Ok(Some(history)) => json!({
+            "state": "available", "scope": "authenticated-local-membership-history",
+            "network_id": aterm_codec::hex::encode_lower(&history.network),
+            "retained_records": history.retained_records(),
+            "complete_records": history.complete.held(),
+            "waiting_records": history.waiting,
+            "complete_weighed_records": history.complete.weighed,
+            "complete_keyed_records": history.complete.keyed,
+            "remaining_records": history.remaining_records(),
+            "record_bytes": history.bytes,
+            "limits": {
+                "held_records": history.budgets.held,
+                "weighed_records": history.budgets.weighed,
+                "keyed_records": history.budgets.keyed,
+                "record_bytes": aterm_secrets::membership_log::MAX_RECORDS_STREAM,
+            },
+        }),
+        Err(error) if error.kind() == aterm_secrets::ErrorKind::VaultBusy => {
+            json!({"state": "busy"})
+        }
+        Ok(None) | Err(_) => json!({"state": "unavailable"}),
+    }
 }
 
 fn custody_inspection(
@@ -434,6 +465,12 @@ fn authority(paths: &Paths) -> Result<Value> {
             "genesis": aterm_codec::hex::encode_lower(&trust.genesis),
         })
     });
+    let audience = inspection.audience.as_ref().map(|audience| match audience {
+        aterm_secrets::text::Audience::Everyone => json!({ "kind": "everyone" }),
+        aterm_secrets::text::Audience::Hosts(hosts) => {
+            json!({ "kind": "hosts", "hosts": hosts })
+        }
+    });
     Ok(json!({
         "kind": "commons-authority", "scope": "locally-applied-vault",
         "authority_available": true, "vault_version": inspection.vault_version,
@@ -441,7 +478,7 @@ fn authority(paths: &Paths) -> Result<Value> {
         "lifetime_bound": inspection.lifetime_bound,
         "control": if inspection.descriptor.is_some() { "typed-descriptor" }
             else if inspection.entry_present { "opaque-entry" } else { "absent" },
-        "descriptor": descriptor, "can_initialize_network": false,
+        "descriptor": descriptor, "published_audience": audience, "can_initialize_network": false,
     }))
 }
 
@@ -664,6 +701,7 @@ mod tests {
         let observed = read();
         assert_eq!(observed["authority_available"].as_bool(), Some(true));
         assert_eq!(observed["control"].as_str(), Some("absent"));
+        assert!(observed["published_audience"].is_null());
         assert_eq!(observed["can_initialize_network"].as_bool(), Some(false));
         assert!(!paths.dir.join("commons").exists());
         assert_eq!(std::fs::read(&source).unwrap(), before);
@@ -685,11 +723,16 @@ mod tests {
         let owner = read(0);
         assert_eq!(owner["control"].as_str(), Some("typed-descriptor"));
         assert_eq!(owner["descriptor"]["authority"], owner["authority"]);
+        assert_eq!(
+            owner["published_audience"],
+            json!({ "kind": "hosts", "hosts": ["m1", "m2"] })
+        );
         assert_eq!(owner["can_initialize_network"].as_bool(), Some(false));
         let member = read(1);
         assert_eq!(member["authority_available"].as_bool(), Some(false));
         assert!(member.get("authority").is_none());
         assert!(member.get("descriptor").is_none());
+        assert!(member.get("published_audience").is_none());
         let invalid = run_at(
             "commons-authority",
             &mut BTreeMap::from([("--application", "ignored")]),
@@ -827,7 +870,40 @@ mod tests {
         .unwrap();
         assert_eq!(value["ready"].as_bool(), Some(false));
         assert_eq!(value["can_initialize_network"].as_bool(), Some(false));
+        assert_eq!(value["membership_history"]["state"], json!("unavailable"));
         assert!(!paths.home.exists());
+    }
+
+    #[test]
+    fn membership_history_is_reported_without_admin_or_table_initialization() {
+        use aterm_secrets::{client, commons::roster::Role};
+        let lab = crate::table::tests::Lab::with_foundation(&[Role::Writer, Role::Reader]);
+        client::seed_vault_genesis(&lab.paths[0], &lab._home.path().join("genesis.v2")).unwrap();
+        let encoded = client::load_records(&lab.paths[0]).unwrap().encode();
+        client::save_records(&lab.paths[1], &encoded).unwrap();
+        lab.bootstrap(1);
+        assert!(client::admin_cached(&lab.paths[1]).is_err());
+        let store = client::load_records(&lab.paths[1]).unwrap();
+        let before = crate::tests::files(lab._home.path());
+        let value = status(&lab.paths[1]);
+        let observed = &value["membership_history"];
+        assert_eq!(observed["state"], json!("available"));
+        assert_eq!(observed["retained_records"], json!(store.len()));
+        assert_eq!(
+            observed["complete_records"],
+            json!(store.log().unwrap().held_count())
+        );
+        assert_eq!(
+            observed["limits"]["held_records"],
+            json!(store.log().unwrap().budgets().held)
+        );
+        assert_eq!(
+            observed["remaining_records"],
+            json!(store.log().unwrap().budgets().held - store.len())
+        );
+        assert_eq!(value["can_initialize_network"], json!(false));
+        assert_eq!(crate::tests::files(lab._home.path()), before);
+        assert!(!lab.paths[1].dir.join("commons/tables").exists());
     }
 
     #[test]

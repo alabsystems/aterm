@@ -11,30 +11,43 @@ use aterm_db::{
 use aterm_secrets::client::Paths;
 use std::path::Path;
 
-pub(super) fn read(home: &Path) -> Result<Catalog, String> {
+/// The Commons account catalog under `home`: `None` where neither of its tables is declared there,
+/// the machine having set up no catalog, which is no failure to read one. Where one is declared and
+/// the other is not, the other's history is missing, so the catalog says it is incomplete.
+pub(super) fn read(home: &Path) -> Result<Option<Catalog>, String> {
     let paths = Paths::for_home(home);
+    let proposals = Proposals::at(paths.clone()).snapshot_if_declared();
+    let imports = Imports::at(paths).snapshot_if_declared();
+    if matches!((&proposals, &imports), (Ok(None), Ok(None))) {
+        return Ok(None);
+    }
+    const UNDECLARED: &str = "application table is not initialized";
     let mut catalog = Catalog {
         history_complete: true,
         ..Default::default()
     };
-    match Proposals::at(paths.clone()).snapshot() {
-        Ok(snapshot) => catalog = project(&snapshot),
+    match proposals {
+        Ok(Some(snapshot)) => catalog = project(&snapshot),
+        Ok(None) => catalog
+            .source_errors
+            .push(format!("proposals: {UNDECLARED}")),
         Err(why) => catalog.source_errors.push(format!("proposals: {why}")),
     }
-    match Imports::at(paths).snapshot() {
-        Ok(snapshot) => {
+    match imports {
+        Ok(Some(snapshot)) => {
             let imports = project_imports(&snapshot);
             catalog.import_table = imports.import_table;
             catalog.history_complete &= imports.history_complete;
             catalog.rows.extend(imports.rows);
         }
+        Ok(None) => catalog.source_errors.push(format!("imports: {UNDECLARED}")),
         Err(why) => catalog.source_errors.push(format!("imports: {why}")),
     }
     if catalog.table.is_empty() && catalog.import_table.is_none() {
         return Err(catalog.source_errors.join("; "));
     }
     catalog.history_complete &= catalog.source_errors.is_empty();
-    Ok(catalog)
+    Ok(Some(catalog))
 }
 
 fn complete(snapshot: &Snapshot) -> bool {

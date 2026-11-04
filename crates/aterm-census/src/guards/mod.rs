@@ -43,6 +43,7 @@ mod shown_term;
 mod slog_inert;
 mod stock_label;
 mod term_write;
+mod unmounted_test;
 mod usage_read;
 mod win_resources;
 
@@ -124,6 +125,7 @@ pub const GUARDS: &[Rule] = &[
     generated::GENERATED_SEAL,
     conflict_marker::CONFLICT_MARKER,
     mirror_rows::MIRROR_ROWS,
+    unmounted_test::UNMOUNTED_TEST,
     win_resources::WIN_RESOURCES,
 ];
 
@@ -446,12 +448,25 @@ impl Corpus {
     }
 }
 
+/// How a [`Load`] brings its files into the crate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LoadKind {
+    /// A body-less `mod x;` without an explicit `path` attribute.
+    Mod,
+    /// A body-less `mod x;` whose path is given by `#[path = "…"]` or `#[cfg_attr(…, path = "…")]`.
+    PathMod,
+    /// An `include!("…")` splice.
+    Include,
+}
+
 /// A file one source file brings into its crate ([`SourceFile::loads`]): an
 /// out-of-line `mod`, or an `include!` of a literal path.
 pub(crate) struct Load {
     /// The files it can name: `x.rs` and `x/mod.rs` for a `mod x;` without a
-    /// `path`, else the one file its `path` or literal names.
+    /// `path`, else the files its `path` attributes or `include!` literal name.
     pub(crate) files: Vec<String>,
+    /// How the loader brings [`Self::files`] in.
+    pub(crate) kind: LoadKind,
     /// Outside the shipped lines: inside an item whose `cfg` proves it
     /// test-only.
     pub(crate) gated: bool,
@@ -719,6 +734,21 @@ impl SourceFile {
     /// else `name.rs` or `name/mod.rs` in the module's own directory — and each
     /// `include!` of a literal, against the file's directory.
     pub(crate) fn loads(&self) -> Vec<Load> {
+        let dir_owner = matches!(self.name(), "lib.rs" | "main.rs" | "mod.rs");
+        let manifest_dir = self
+            .rel
+            .find("/src/")
+            .or_else(|| self.rel.find("/tests/"))
+            .or_else(|| self.rel.find("/benches/"))
+            .or_else(|| self.rel.find("/examples/"))
+            .map(|i| &self.rel[..i]);
+        self.loads_in(dir_owner, manifest_dir)
+    }
+
+    /// Like [`Self::loads`], with `dir_owner` true when `self` owns its parent directory directly
+    /// (a crate root such as `tests/suite.rs`, `mod.rs`, or a `#[path]`-mounted module) and
+    /// `manifest_dir` naming the compiling package's `CARGO_MANIFEST_DIR`.
+    pub(crate) fn loads_in(&self, dir_owner: bool, manifest_dir: Option<&str>) -> Vec<Load> {
         let Lexed { code, text } = self.lexed();
         let shipped = self
             .shipped
@@ -731,13 +761,14 @@ impl SourceFile {
             !shipped.get(line).copied().unwrap_or(true)
         };
         let dir = self.rel.rsplit_once('/').map_or("", |(dir, _)| dir);
-        let own = match self.name() {
-            "lib.rs" | "main.rs" | "mod.rs" => dir.to_string(),
-            name => format!("{dir}/{}", name.trim_end_matches(".rs")),
+        let own = if dir_owner || self.name() == "mod.rs" {
+            dir.to_string()
+        } else {
+            format!("{dir}/{}", self.name().trim_end_matches(".rs"))
         };
         // Every `mod <name>`: a declaration, or an inline module's body (its
         // braces, and the directory its children resolve in).
-        let mut decls: Vec<(usize, &str, Option<&str>)> = Vec::new();
+        let mut decls: Vec<(usize, &str, Vec<&str>)> = Vec::new();
         let mut inline: Vec<(usize, usize, &str)> = Vec::new();
         for at in hits(code, "mod", Bound::Word) {
             let rest = &code[at + 3..];
@@ -748,22 +779,22 @@ impl SourceFile {
             }
             let name = &code[name_at..name_at + len];
             let after = code[name_at + len..].trim_start();
-            let path = attr_path(code, text, at);
+            let paths = attr_paths(code, text, at);
             if after.starts_with(';') {
-                decls.push((at, name, path));
+                decls.push((at, name, paths));
             } else if after.starts_with('{') {
                 let open = code.len() - after.len();
                 if let Some(close) = brace_close(code, open) {
-                    inline.push((open, close, path.unwrap_or(name)));
+                    inline.push((open, close, paths.first().copied().unwrap_or(name)));
                 }
             }
         }
         let depth = depths_at(code, decls.iter().map(|d| d.0));
         let mut out = Vec::new();
-        for (&(at, name, path), depth) in decls.iter().zip(depth) {
+        for ((at, name, paths), depth) in decls.iter().zip(depth) {
             let chain: Vec<&str> = inline
                 .iter()
-                .filter(|&&(open, close, _)| open < at && at < close)
+                .filter(|&&(open, close, _)| open < *at && *at < close)
                 .map(|&(_, _, dir)| dir)
                 .collect();
             let base = if chain.is_empty() {
@@ -771,43 +802,26 @@ impl SourceFile {
             } else {
                 format!("{own}/{}", chain.join("/"))
             };
-            let files = match path {
-                Some(path) if chain.is_empty() => vec![joined(dir, path)],
-                Some(path) => vec![joined(&base, path)],
-                None => vec![format!("{base}/{name}.rs"), format!("{base}/{name}/mod.rs")],
+            let (files, kind) = if paths.is_empty() {
+                (
+                    vec![format!("{base}/{name}.rs"), format!("{base}/{name}/mod.rs")],
+                    LoadKind::Mod,
+                )
+            } else {
+                let root_dir = if chain.is_empty() { dir } else { base.as_str() };
+                (
+                    paths.iter().map(|p| joined(root_dir, p)).collect(),
+                    LoadKind::PathMod,
+                )
             };
             out.push(Load {
                 files,
-                gated: gated(at),
+                kind,
+                gated: gated(*at),
                 top: depth == 0,
             });
         }
-        for at in hits(code, "include", Bound::Word) {
-            let Some(args) = code[at + 7..].trim_start().strip_prefix('!') else {
-                continue;
-            };
-            let args = args.trim_start();
-            if !args.starts_with(['(', '[', '{']) {
-                continue;
-            }
-            // A literal first: `"…"`, or a raw `r"…"`, `r#"…"#`.
-            let lit = args[1..].trim_start();
-            let raw = lit
-                .strip_prefix('r')
-                .map_or(lit, |r| r.trim_start_matches('#'));
-            if !raw.starts_with('"') {
-                continue;
-            }
-            let open = code.len() - raw.len() + 1;
-            let Some(path) = text[open..].split_once('"').map(|(p, _)| p) else {
-                continue;
-            };
-            out.push(Load {
-                files: vec![joined(dir, path)],
-                gated: gated(at),
-                top: false,
-            });
-        }
+        include_loads(code, text, dir, manifest_dir, &gated, &mut out);
         out
     }
 
@@ -826,22 +840,114 @@ impl SourceFile {
     }
 }
 
-/// The path the attributes of the item whose keyword is at `at` name, if
-/// any: `path = "…"` in any of them (`#[path = "x.rs"]`,
-/// `#[cfg_attr(unix, path = "x.rs")]`), found in the CODE view and read from
-/// the TEXT view. The attributes are what lies between the item before (its
-/// `;`, `}` or a block's `{`) and the keyword.
-fn attr_path<'a>(code: &str, text: &'a str, at: usize) -> Option<&'a str> {
+/// Every literal-path or `CARGO_MANIFEST_DIR`-rooted `include!(…)` in `code`/`text`.
+fn include_loads(
+    code: &str,
+    text: &str,
+    dir: &str,
+    manifest_dir: Option<&str>,
+    gated: &dyn Fn(usize) -> bool,
+    out: &mut Vec<Load>,
+) {
+    for at in hits(code, "include", Bound::Word) {
+        let Some(args) = code[at + 7..].trim_start().strip_prefix('!') else {
+            continue;
+        };
+        let args = args.trim_start();
+        if !args.starts_with(['(', '[', '{']) {
+            continue;
+        }
+        let lit = args[1..].trim_start();
+        if let Some((suffix, _)) = manifest_concat_include(code, text, lit) {
+            if let Some(mdir) = manifest_dir {
+                out.push(Load {
+                    files: vec![joined(mdir, suffix.trim_start_matches('/'))],
+                    kind: LoadKind::Include,
+                    gated: gated(at),
+                    top: false,
+                });
+            }
+            continue;
+        }
+        // A literal first: `"…"`, or a raw `r"…"`, `r#"…"#`.
+        let raw = lit
+            .strip_prefix('r')
+            .map_or(lit, |r| r.trim_start_matches('#'));
+        if !raw.starts_with('"') {
+            continue;
+        }
+        let open = code.len() - raw.len() + 1;
+        let Some(path) = text[open..].split_once('"').map(|(p, _)| p) else {
+            continue;
+        };
+        out.push(Load {
+            files: vec![joined(dir, path)],
+            kind: LoadKind::Include,
+            gated: gated(at),
+            top: false,
+        });
+    }
+}
+
+/// Matches `concat!(env!("CARGO_MANIFEST_DIR"), "…")` at suffix `lit` of `code`.
+fn manifest_concat_include<'a>(
+    code: &'a str,
+    text: &'a str,
+    lit: &'a str,
+) -> Option<(&'a str, &'a str)> {
+    let s = lit
+        .strip_prefix("concat")?
+        .trim_start()
+        .strip_prefix('!')?
+        .trim_start();
+    let s = s.strip_prefix(['(', '[', '{'])?.trim_start();
+    let s = s
+        .strip_prefix("env")?
+        .trim_start()
+        .strip_prefix('!')?
+        .trim_start();
+    let s = s.strip_prefix(['(', '[', '{'])?.trim_start();
+    let (var, rest) = plain_str_at(code, text, s)?;
+    if var != "CARGO_MANIFEST_DIR" {
+        return None;
+    }
+    let rest = rest
+        .trim_start()
+        .strip_prefix([')', ']', '}'])?
+        .trim_start()
+        .strip_prefix(',')?
+        .trim_start();
+    let (suffix, tail) = plain_str_at(code, text, rest)?;
+    let tail = tail.trim_start();
+    let tail = tail.strip_prefix(',').map_or(tail, str::trim_start);
+    tail.starts_with([')', ']', '}']).then_some((suffix, tail))
+}
+
+/// Reads a plain `"…"` literal at suffix `s` of `code`, returning `(literal_text, after_close_in_code)`.
+fn plain_str_at<'a>(code: &'a str, text: &'a str, s: &'a str) -> Option<(&'a str, &'a str)> {
+    s.starts_with('"').then_some(())?;
+    let open = code.len() - s.len() + 1;
+    let len = code[open..].find('"')?;
+    Some((&text[open..open + len], &code[open + len + 1..]))
+}
+
+/// Every `path = "…"` literal on the attributes of the item whose keyword is at
+/// `at` (`#[path = "x.rs"]`, `#[cfg_attr(unix, path = "x.rs")]`), found in the
+/// CODE view and read from the TEXT view. The attributes are what lies between
+/// the item before (its `;`, `}` or a block's `{`) and the keyword.
+fn attr_paths<'a>(code: &str, text: &'a str, at: usize) -> Vec<&'a str> {
     let start = code[..at].rfind([';', '}', '{']).map_or(0, |b| b + 1);
     hits(&code[..at], "path", Bound::Word)
         .filter(|&p| p >= start)
-        .find_map(|p| {
+        .filter_map(|p| {
             let value = code[p + 4..at].trim_start().strip_prefix('=')?.trim_start();
-            // `value` runs to `at`: its `"` sits `value.len()` bytes before it.
+            // Notice `code[p + 4..at]` may hold later attributes after the closing `"`:
+            // `value` opens with `"` at `at - value.len()`, and `text` holds the literal.
             value.starts_with('"').then_some(())?;
             let open = at - value.len() + 1;
             text[open..at].split_once('"').map(|(path, _)| path)
         })
+        .collect()
 }
 
 /// The `}` that closes the `{` at `open` in a CODE view (whose literals and

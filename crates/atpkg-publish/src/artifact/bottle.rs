@@ -636,6 +636,26 @@ pub fn install_git_wrapper(program: &str, stage: &Path) -> Result<bool> {
     Ok(true)
 }
 
+/// Removes `git-credential-osxkeychain` from a staged git bottle. A bottle's binaries are signed
+/// ad hoc, so each build's helper has an identity of its own that no keychain item's access list
+/// names: a lookup raises macOS's consent dialog and git waits on it, which the owner ruled must
+/// not happen (2026-11-03; `docs/DESIGN-init-system-2026-10-20.md` §1.18). Git asked for a helper
+/// it lacks says so and goes on.
+///
+/// # Errors
+/// I/O failure removing a helper that is present.
+fn drop_keychain_helper(stage: &Path) -> Result<()> {
+    for dir in ["libexec/git-core", "bin"] {
+        let helper = stage.join(dir).join("git-credential-osxkeychain");
+        match std::fs::remove_file(&helper) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(Error::io(format!("rm {}", helper.display()), &e)),
+        }
+    }
+    Ok(())
+}
+
 fn check_stage_tree(
     program: &str,
     stage: &Path,
@@ -797,6 +817,7 @@ pub fn pack_bottle_with(
     materialize_symlinks(&stage)?;
     rewrite_bottle_text(&stage)?;
     if program == "git" {
+        drop_keychain_helper(&stage)?;
         git_text::rewrite(&stage, &version)?;
     }
     let _wrapped = install_git_wrapper(program, &stage)?;
@@ -1337,6 +1358,11 @@ mod tests {
                 TarEntry::File("git/2.51.0/bin/git", &arm64, 0o755),
                 TarEntry::Symlink("git/2.51.0/libexec/git-core/git", "../../bin/git"),
                 TarEntry::File(
+                    "git/2.51.0/libexec/git-core/git-credential-osxkeychain",
+                    &arm64,
+                    0o755,
+                ),
+                TarEntry::File(
                     "git/2.51.0/libexec/git-core/git-difftool",
                     b"#!@@HOMEBREW_PERL@@\nprint \"ok\\n\";\n",
                     0o755,
@@ -1458,6 +1484,12 @@ mod tests {
             std::fs::read(staged.join("libexec/git-core/git")).expect("read core git"),
             arm64,
             "wrapper write must not clobber hard-linked libexec/git-core/git binary"
+        );
+        assert!(
+            !staged
+                .join("libexec/git-core/git-credential-osxkeychain")
+                .exists(),
+            "a bottle never ships the keychain helper"
         );
         let perl_script = std::fs::read_to_string(staged.join("libexec/git-core/git-difftool"))
             .expect("read script");

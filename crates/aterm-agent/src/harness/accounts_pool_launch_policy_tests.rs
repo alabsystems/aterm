@@ -170,10 +170,16 @@ fn run_case(cli: Cli, off: bool, case: i64) -> (bool, bool) {
             .unwrap(),
             9 => {
                 store
-                    .transact(NOW, &mut None, |state| {
-                        state.accounts.entry("work".into()).or_default().auth =
-                            accounts::Auth::SignedOut;
-                        Ok(Vec::new())
+                    .transact_logins(NOW, &mut None, |state, logins| {
+                        Ok(stage_current_auth(
+                            &world,
+                            cli,
+                            state,
+                            logins,
+                            "work",
+                            accounts::Auth::SignedOut,
+                            NOW,
+                        ))
                     })
                     .unwrap();
             }

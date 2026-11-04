@@ -4,7 +4,7 @@
 //! Human CLI for session connections.
 
 use std::env;
-use std::io::{self, BufReader, Write};
+use std::io::{self, Write};
 use std::process::ExitCode;
 
 #[path = "resource_run.rs"]
@@ -187,7 +187,7 @@ impl ConnWire {
             stream.set_read_timeout(Some(CONN_DEADLINE))?;
             stream.set_write_timeout(Some(CONN_DEADLINE))?;
             super::send_request(&stream, token, &request)?;
-            let mut reader = BufReader::new(&stream);
+            let mut reader = super::reply_on(&stream);
             let mut status = String::new();
             if super::read_status_line(&mut reader, &mut status)? == 0 {
                 return Err(io::Error::new(

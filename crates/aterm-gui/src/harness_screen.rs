@@ -2875,7 +2875,9 @@ impl App {
     /// Perform a Settings ▸ Harness request (`AppEffect::Harness`): read the ledgers again, or set a session's Autopilot through the one writer ([`Self::set_session_autopilot`], which republishes).
     pub(crate) fn execute_native_harness(&mut self, request: crate::native_app::HarnessRequest) {
         match request {
-            crate::native_app::HarnessRequest::LabRefresh => self.start_lab_accounts_refresh(),
+            crate::native_app::HarnessRequest::LabAccountsRefresh => {
+                self.start_lab_accounts_refresh()
+            }
             crate::native_app::HarnessRequest::Refresh => {
                 self.start_harness_stats_refresh();
                 self.publish_native_harness_state();

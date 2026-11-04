@@ -778,7 +778,7 @@ pub fn front_door_send_within(
             format!("could not confirm the request's delivery ({e})"),
         ));
     }
-    let mut reader = BufReader::new(&stream);
+    let mut reader = reply_on(&stream);
     let mut line = String::new();
     match read_status_line(&mut reader, &mut line) {
         Ok(0) => Err(delivered(
@@ -1630,7 +1630,7 @@ impl Read for ProbeIo<'_> {
             self.stream
                 .set_read_timeout(Some(self.deadline.remaining()?)),
         )?;
-        Read::read(&mut self.stream, buf)
+        aterm_uds::hangup::Awake(self.stream).read(buf)
     }
 }
 
@@ -3675,7 +3675,7 @@ fn help_on(stream: CtlStream, name: &str, local: &LocalVerbs) -> io::Result<Exit
     if let Some(code) = send_served(&stream, format!("help {name}\n").as_bytes())? {
         return Ok(code);
     }
-    let mut reader = BufReader::new(&stream);
+    let mut reader = reply_on(&stream);
     let mut status = String::new();
     if read_status_line(&mut reader, &mut status)? == 0 {
         return Err(io::Error::new(
@@ -4451,7 +4451,7 @@ fn feed_bin_exchange(
             return Ok(code);
         }
 
-        let mut reader = BufReader::new(&stream);
+        let mut reader = reply_on(&stream);
         print_frame_answer(&read_frame_answer(&mut reader)?)
     })?;
     Ok(served.unwrap_or_else(std::convert::identity))
@@ -4473,7 +4473,7 @@ fn worker_exchange(
         if let Some(code) = send_served(&stream, line.as_bytes())? {
             return Ok(code);
         }
-        let mut reader = BufReader::new(&stream);
+        let mut reader = reply_on(&stream);
         let mut answer = read_frame_answer(&mut reader)?;
         if answer != go {
             if answer.starts_with("ERR usage: spawn") {
@@ -5234,7 +5234,7 @@ fn open_accepted(
         }
         return Ok(answer_left_behind(&stream, Some(file.as_path())));
     }
-    let mut reader = BufReader::new(&stream);
+    let mut reader = reply_on(&stream);
     let mut line = String::new();
     match read_bounded_line(&mut reader, &mut line) {
         Ok(0) => return Ok(Acceptance::Dropped),
@@ -5389,7 +5389,7 @@ const ARTIFACT_ACK_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::fro
 
 fn acknowledge_artifact_reply(
     mut stream: &CtlStream,
-    reader: &mut BufReader<&CtlStream>,
+    reader: &mut Reply<'_>,
     verb: &str,
     request: &str,
 ) -> io::Result<()> {
@@ -5560,7 +5560,7 @@ enum GuardedArtifactOutput {
 
 fn receive_guarded_artifact_reply(
     stream: &CtlStream,
-    reader: &mut BufReader<&CtlStream>,
+    reader: &mut Reply<'_>,
     verb: &str,
     request: &str,
     status_line: &str,
@@ -5601,6 +5601,14 @@ fn exchange(
     .map(|served| served.unwrap_or_else(std::convert::identity))
 }
 
+/// A served connection's reply, read through [`aterm_uds::hangup::Awake`]: a host that ends
+/// mid-reply is told by a shutdown, and only a read that sees it comes back.
+type Reply<'a> = BufReader<aterm_uds::hangup::Awake<'a>>;
+
+fn reply_on(stream: &CtlStream) -> Reply<'_> {
+    BufReader::new(aterm_uds::hangup::Awake(stream))
+}
+
 fn exchange_on(
     stream: CtlStream,
     path: &str,
@@ -5621,7 +5629,7 @@ fn exchange_on(
         Err(e) => Err(e),
     };
 
-    let mut reader = BufReader::new(&stream);
+    let mut reader = reply_on(&stream);
     let mut status_line = String::new();
     let got = sent.and_then(|()| read_status_line(&mut reader, &mut status_line));
     let request_parts: Vec<String> = request.split_whitespace().map(String::from).collect();

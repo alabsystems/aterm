@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests that an `aterm-lab band-launch` job runs its program as an app in its own coalition and
-//! is removed once that program ends, and that a keeper as the job's process (a windowed `lab
-//! instance`) holds its program in that coalition, as its own responsible process.
+//! Tests that an `aterm-lab band-launch` job runs its program as an app in its own coalition, only
+//! on its launcher's go, and is removed once that program ends, and that a keeper as the job's
+//! process (a windowed `lab instance`) holds its program in that coalition, as its own responsible
+//! process.
 
 #![cfg(target_os = "macos")]
 
-use std::fs::OpenOptions;
-use std::os::fd::OwnedFd;
+use std::fs::{File, OpenOptions};
+use std::io::Write as _;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -69,7 +70,7 @@ fn wait_for<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
 }
 
 /// The job's world: its environment file and the lifeline FIFO, whose held end is returned.
-fn world(dir: &Path) -> OwnedFd {
+fn world(dir: &Path) -> File {
     let fifo = dir.join("band.lifeline");
     let c = std::ffi::CString::new(fifo.to_str().expect("utf-8 path")).expect("path");
     // SAFETY: `c` is a valid NUL-terminated path.
@@ -84,7 +85,43 @@ fn world(dir: &Path) -> OwnedFd {
         .write(true)
         .open(&fifo)
         .expect("the lifeline's held end")
-        .into()
+}
+
+/// The job's pid, once it has written it, which it does only once its open of the lifeline has
+/// returned.
+fn job_pid(dir: &Path) -> i32 {
+    wait_for("the job's pid file", || {
+        std::fs::read_to_string(dir.join("band.pid"))
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+    })
+}
+
+/// The go `lab instance` gives its job once it has read the job's pid: a byte in the lifeline.
+fn go(mut held: &File) {
+    held.write_all(b"g").expect("the go");
+}
+
+/// `band-launch` of `program` in `dir`'s world as the job `label`, its log `dir/log`.
+fn band_launch(dir: &Path, label: &str, program: &[&str]) {
+    let d = dir.to_str().expect("utf-8");
+    let log = dir.join("log");
+    let launched = aterm_uds::spawnfd::command(env!("CARGO_BIN_EXE_aterm-lab"))
+        .args([
+            "band-launch",
+            d,
+            label,
+            "--cwd",
+            d,
+            "--log",
+            log.to_str().expect("utf-8"),
+            "--",
+        ])
+        .args(program)
+        .stdin(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    assert!(launched, "aterm-lab band-launch");
 }
 
 #[test]
@@ -100,32 +137,15 @@ fn an_app_band_job_runs_its_program_as_an_app_in_its_own_coalition_and_is_remove
             .to_string_lossy()
     );
     let lab = env!("CARGO_BIN_EXE_aterm-lab");
-    let runs = dir.join("runs");
-    let (d, log) = (dir.to_str().expect("utf-8"), dir.join("log"));
-    let launched = aterm_uds::spawnfd::command(lab)
-        .args([
-            "band-launch",
-            d,
-            &label,
-            "--cwd",
-            d,
-            "--log",
-            log.to_str().expect("utf-8"),
-            "--",
-            lab,
-            "band-standin",
-            runs.to_str().expect("utf-8"),
-        ])
-        .stdin(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
-    assert!(launched, "aterm-lab band-launch");
+    let (runs, log) = (dir.join("runs"), dir.join("log"));
+    band_launch(
+        &dir,
+        &label,
+        &[lab, "band-standin", runs.to_str().expect("utf-8")],
+    );
     let _loaded = Loaded(&label);
-    let pid: i32 = wait_for("the job's pid file", || {
-        std::fs::read_to_string(dir.join("band.pid"))
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-    });
+    let pid = job_pid(&dir);
+    go(&held);
     wait_for("the program's start", || {
         std::fs::read_to_string(&runs)
             .ok()
@@ -211,7 +231,7 @@ struct KeptJob {
     keeper: i32,
     kept: i32,
     log: std::path::PathBuf,
-    held: Option<OwnedFd>,
+    held: Option<File>,
     _world: aterm_tempfile::TempDir,
 }
 
@@ -231,37 +251,18 @@ impl KeptJob {
         );
         let lab = env!("CARGO_BIN_EXE_aterm-lab");
         let (runs, log) = (dir.join("runs"), dir.join("log"));
-        let d = dir.to_str().expect("utf-8");
-        let launched = aterm_uds::spawnfd::command(lab)
-            .args([
-                "band-launch",
-                d,
-                &label,
-                "--cwd",
-                d,
-                "--log",
-                log.to_str().expect("utf-8"),
-                "--",
-                lab,
-                "keeper",
-            ])
-            .args(disclaim.then_some("--disclaim"))
-            .args([
-                "--",
-                lab,
-                "band-standin",
-                runs.to_str().expect("utf-8"),
-                "--kept",
-            ])
-            .stdin(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success());
-        assert!(launched, "aterm-lab band-launch");
-        let keeper: i32 = wait_for("the job's pid file", || {
-            std::fs::read_to_string(dir.join("band.pid"))
-                .ok()
-                .and_then(|s| s.trim().parse().ok())
-        });
+        let mut program = vec![lab, "keeper"];
+        program.extend(disclaim.then_some("--disclaim"));
+        program.extend([
+            "--",
+            lab,
+            "band-standin",
+            runs.to_str().expect("utf-8"),
+            "--kept",
+        ]);
+        band_launch(&dir, &label, &program);
+        let keeper = job_pid(&dir);
+        go(&held);
         let kept = kept_pid(&runs);
         KeptJob {
             label,
@@ -377,4 +378,38 @@ fn a_keeper_jobs_program_killed_by_its_pid_ends_the_job() {
     assert!(sent, "SIGTERM the kept program");
     job.removed();
     assert!(!alive(job.keeper), "the keeper ended with its program");
+}
+
+/// A launcher gone after the job opened its lifeline but before its go: the job ends without
+/// starting its program, and launchd's restart removes it.
+#[test]
+fn a_job_whose_launcher_is_gone_before_its_go_never_starts_its_program() {
+    let owned_world = aterm_tempfile::TempDir::new_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("exclusive scratch world");
+    let dir = owned_world.path().to_path_buf();
+    let held = world(&dir);
+    let label = format!(
+        "aterm-lab.test.band-gone.{}",
+        dir.file_name()
+            .expect("exclusive world basename")
+            .to_string_lossy()
+    );
+    let lab = env!("CARGO_BIN_EXE_aterm-lab");
+    let runs = dir.join("runs");
+    band_launch(
+        &dir,
+        &label,
+        &[lab, "band-standin", runs.to_str().expect("utf-8")],
+    );
+    let _loaded = Loaded(&label);
+    job_pid(&dir);
+    drop(held);
+    wait_for("the job's removal", || {
+        (!launchctl(&["print", &target(&label)])).then_some(())
+    });
+    let job_log = std::fs::read_to_string(dir.join("log")).unwrap_or_default();
+    assert!(
+        !runs.exists(),
+        "the program never started (log: {job_log:?})"
+    );
 }

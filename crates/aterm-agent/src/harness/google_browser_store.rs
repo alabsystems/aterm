@@ -69,6 +69,18 @@ fn decode(identity: &Identity, bytes: &[u8]) -> Result<SecretBytes, Unavailable>
     Ok(SecretBytes::from(cookies))
 }
 
+/// Revision of the encrypted snapshot while its identity is exclusively claimed.
+pub(super) fn fingerprint(claim: &Session) -> Result<Option<[u8; 32]>, Unavailable> {
+    let bytes = aterm_secrets::fsx::read_private(&claim.profile().join(FILE), MAX_BYTES + 8192)
+        .map_err(|_| Unavailable)?;
+    Ok(bytes.map(|bytes| {
+        let mut digest = aterm_digest::Sha256::new();
+        digest.update(b"aterm.google-browser-revision.v1\0");
+        digest.update(bytes.as_slice());
+        digest.finalize()
+    }))
+}
+
 pub(super) fn load(
     home: &Path,
     identity: &Identity,

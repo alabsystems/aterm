@@ -303,6 +303,9 @@ pub struct RelayClient<S: Read + Write> {
     /// Hangs the transport up once a reply is left unread, so the server reads its caller gone
     /// ([`RelayClient::bounded`]).
     hang_up: fn(&S),
+    /// Waits until a read has something to return, so it never sleeps where the connection's end
+    /// can pass it by (`aterm_uds::ready::for_read`).
+    await_read: fn(&S) -> std::io::Result<()>,
     /// The monotonic clock, injected with a controlled transport in deadline tests.
     clock: fn(&S) -> std::time::Instant,
     /// One budget for writes, flush, header and the entire counted or framed reply.
@@ -366,6 +369,7 @@ impl<S: Read + Write> RelayClient<S> {
             help: Vec::new(),
             bound: None,
             hang_up: |_| {},
+            await_read: |_| Ok(()),
             clock: monotonic_now::<S>,
             exchange: None,
             reply_started: false,
@@ -507,7 +511,7 @@ impl<S: Read + Write> RelayClient<S> {
 
     fn read_some(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
         self.before_io()?;
-        let got = self.io.read(bytes);
+        let got = (self.await_read)(&self.io).and_then(|()| self.io.read(bytes));
         self.reply_started |= got.as_ref().is_ok_and(|n| *n > 0);
         self.remaining()?;
         got
@@ -770,8 +774,17 @@ impl RelayClient<aterm_uds::CtlStream> {
 
     fn authenticated(stream: aterm_uds::CtlStream, token: &str) -> std::io::Result<Self> {
         let mut client = Self::new(stream);
+        client.awaits_reads();
         client.write_line(&format!("AUTH {token}"))?;
         Ok(client)
+    }
+
+    /// Each read waits in `poll(2)` first (`aterm_uds::ready::for_read`).
+    fn awaits_reads(&mut self) {
+        #[cfg(unix)]
+        {
+            self.await_read = aterm_uds::ready::for_read;
+        }
     }
 
     /// Bound each validated request's writes, flush, header and entire reply body by one
@@ -793,6 +806,7 @@ impl RelayClient<aterm_uds::CtlStream> {
         self.hang_up = |stream| {
             aterm_uds::hangup::hang_up(stream);
         };
+        self.awaits_reads();
     }
 }
 
@@ -1484,6 +1498,52 @@ mod tests {
                 "timeout handling must not discard bytes"
             );
         }
+    }
+
+    /// Reads `lines` request lines from `far`, then answers `OK` a moment later: long enough that
+    /// a nonblocking read which did not wait says `WouldBlock` first.
+    #[cfg(unix)]
+    fn answers_late(far: aterm_uds::CtlStream, lines: usize) -> std::thread::JoinHandle<()> {
+        use std::io::BufRead as _;
+        std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(&far);
+            for _ in 0..lines {
+                reader.read_line(&mut String::new()).unwrap();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            (&far).write_all(b"OK\n").unwrap();
+        })
+    }
+
+    /// A read of a nonblocking stream says `WouldBlock` at once, so a reply that arrives here was
+    /// waited for in `poll(2)`, the one wait the connection's end cannot pass by
+    /// ([`aterm_uds::ready::for_read`]).
+    #[cfg(unix)]
+    #[test]
+    fn a_bounded_connection_waits_for_its_reply_in_poll() {
+        let (near, far) = aterm_uds::kept_out(aterm_uds::CtlStream::pair).unwrap();
+        near.set_nonblocking(true).unwrap();
+        let answering = answers_late(far, 1);
+        let mut client = RelayClient::new(near).bounded(aterm_spec::wait::MUST_HAPPEN);
+        assert_eq!(client.request_line("version").unwrap(), "OK");
+        answering.join().unwrap();
+    }
+
+    /// [`a_bounded_connection_waits_for_its_reply_in_poll`], on a connection with no bound.
+    #[cfg(unix)]
+    #[test]
+    fn an_unbounded_connection_waits_for_its_reply_in_poll() {
+        let dir = crate::supervise::ScratchDir::new("relay", "unbounded");
+        let sock = dir.join("c.sock");
+        let listener = aterm_uds::kept_out(|| aterm_uds::CtlListener::bind(&sock)).unwrap();
+        let accepting = std::thread::spawn(move || {
+            let (far, _) = aterm_uds::accept(&listener).unwrap();
+            answers_late(far, 2).join().unwrap();
+        });
+        let mut client = RelayClient::connect_local(sock.to_str().unwrap(), "token").unwrap();
+        client.transport().set_nonblocking(true).unwrap();
+        assert_eq!(client.request_line("version").unwrap(), "OK");
+        accepting.join().unwrap();
     }
 
     fn armed(_: &RecordingTransport, wait: std::time::Duration) -> std::io::Result<()> {

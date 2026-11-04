@@ -152,6 +152,7 @@ impl Recovery {
         let result = (|| {
             let greeting = joiner::greeting(&mut stream)?;
             let joining = Joining {
+                records_bound: aterm_secrets::crossing::RecordsBound::uncrossed(),
                 device,
                 node: *node.key().bytes(),
                 name: "recovering".to_owned(),
@@ -176,6 +177,9 @@ fn an_existing_seat_recovers_by_proof_on_a_headless_members_port_off_home() {
         .unwrap();
     let fresh = std::cell::Cell::new(false);
     let proving = desk::Proving {
+        reader: aterm_secrets::members::bundle::Reader::BoundedLog(
+            aterm_secrets::crossing::RecordsBound::uncrossed(),
+        ),
         request: &request,
         node: *f.node.key().bytes(),
         name: "recovering",
@@ -192,7 +196,10 @@ fn an_existing_seat_recovers_by_proof_on_a_headless_members_port_off_home() {
     f.server.stop();
     let bundle = result.expect("the existing seat's real proof recovers its log bundle off home");
     assert!(sent, "the existing seat answered the possession challenge");
-    assert!(matches!(bundle.handed, Handed::Log { admit, .. } if admit == f.admit));
+    assert!(
+        matches!(bundle.handed, Handed::Log { admit, source: Some(source), .. }
+        if admit == f.admit && source == aterm_secrets::crossing::RecordsBound::uncrossed())
+    );
     assert_eq!(bundle.allowed.binding(), request.binding());
     client::write_from_log_bundle(&f.paths, &bundle).unwrap();
     assert_eq!(

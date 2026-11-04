@@ -1135,3 +1135,22 @@ fn holdings_report_each_unpreferred_account_with_its_reason() {
     );
     assert_eq!(placed.holders(&placed.accounts[1]), ["m3", "m22"]);
 }
+
+/// THE `alab` SOURCE NAMED WHERE `[alab] roster = false` TURNS IT OFF SAYS THAT, NOT THAT THE LAB
+/// NAMES NO MACHINE, WHICH THE LAB MAY WELL DO. CONTROL: with the source on, and no lab held, the
+/// refusal says no machine is named.
+#[test]
+fn the_lab_source_turned_off_says_it_is_off() {
+    let dir = aterm_tempfile::TempDir::new().unwrap();
+    let plain = dir.path().join("plain.toml");
+    fs::write(&plain, "").unwrap();
+    let off = "`[alab] roster = false` in aterm.toml turns the lab source off";
+    let named = || match chosen(Cli::Claude, None, Some(SOURCE), Some(&plain)) {
+        Err(why) => why,
+        Ok(_) => panic!("no lab is held"),
+    };
+    assert!(while_turned_off(named).contains(off));
+    let why = named();
+    assert!(!why.contains(off), "CONTROL: {why}");
+    assert!(why.contains("names no machine"), "CONTROL: {why}");
+}

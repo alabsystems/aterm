@@ -547,6 +547,11 @@ mod tests {
         assert!(!no_comp.is_linked());
         assert!(!failed.is_linked());
 
+        assert!(!linked.is_failure());
+        assert!(!not_win.is_failure());
+        assert!(no_comp.is_failure());
+        assert!(failed.is_failure());
+
         assert!(linked.to_string().ends_with("out/a.res"));
         assert!(!not_win.to_string().is_empty());
         assert!(no_comp.to_string().ends_with(": rc.exe on PATH"));
@@ -566,6 +571,41 @@ mod tests {
             for j in (i + 1)..rendered.len() {
                 assert_ne!(rendered[i], rendered[j]);
             }
+        }
+    }
+
+    /// NEGATIVE CONTROL: Four-part Win32 `VS_FIXEDFILEINFO` version words must round-trip in little-endian word order without byte-swap or word transposition.
+    #[test]
+    fn winres_version_le_round_trips_and_lays_out_four_u32_words() {
+        assert_eq!(encode_winres_version_le(0, 0, 0, 0), [0; 16]);
+        assert_eq!(decode_winres_version_le([0; 16]), (0, 0, 0, 0));
+        assert_eq!(
+            encode_winres_version_le(u32::MAX, u32::MAX, u32::MAX, u32::MAX),
+            [0xFF; 16]
+        );
+        assert_eq!(
+            decode_winres_version_le([0xFF; 16]),
+            (u32::MAX, u32::MAX, u32::MAX, u32::MAX)
+        );
+
+        let words = (0x0102_0304, 0x0506_0708, 0x090A_0B0C, 0x0D0E_0F10);
+        let encoded = encode_winres_version_le(words.0, words.1, words.2, words.3);
+        assert_eq!(
+            encoded,
+            [
+                0x04, 0x03, 0x02, 0x01, 0x08, 0x07, 0x06, 0x05, 0x0C, 0x0B, 0x0A, 0x09, 0x10, 0x0F,
+                0x0E, 0x0D,
+            ]
+        );
+        assert_eq!(decode_winres_version_le(encoded), words);
+        assert_ne!(
+            decode_winres_version_le(encode_winres_version_le(words.1, words.0, words.2, words.3)),
+            words
+        );
+        for idx in 0..encoded.len() {
+            let mut mutated = encoded;
+            mutated[idx] ^= 0x01;
+            assert_ne!(decode_winres_version_le(mutated), words);
         }
     }
 }

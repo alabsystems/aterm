@@ -116,3 +116,45 @@ fn builtin_rules_select_the_token_under_the_cursor() {
         );
     }
 }
+
+/// NEGATIVE CONTROL: `is_ordered_cell_pair` rejects reversed rows and columns,
+/// `cell_span_width` saturates to `0` when `start_col > end_col`, and
+/// `encode_selection_bounds_le` / `decode_selection_bounds_le` round-trip signed rows and
+/// unsigned columns in little-endian byte order.
+#[test]
+fn selection_bounds_helpers_order_span_and_roundtrip_le_bytes() {
+    assert!(is_ordered_cell_pair(-5, usize::MAX, -4, 0));
+    assert!(!is_ordered_cell_pair(-4, 0, -5, usize::MAX));
+    assert!(is_ordered_cell_pair(7, 3, 7, 3));
+    assert!(is_ordered_cell_pair(7, 3, 7, 4));
+    assert!(!is_ordered_cell_pair(7, 4, 7, 3));
+    assert!(is_ordered_cell_pair(i64::MIN, usize::MAX, i64::MAX, 0));
+    assert!(!is_ordered_cell_pair(i64::MAX, 0, i64::MIN, usize::MAX));
+
+    assert_eq!(cell_span_width(3, 10), 7);
+    assert_eq!(cell_span_width(10, 10), 0);
+    assert_eq!(cell_span_width(10, 3), 0);
+    assert_eq!(cell_span_width(usize::MAX, 0), 0);
+    assert_eq!(cell_span_width(0, usize::MAX), usize::MAX);
+
+    let encoded = encode_selection_bounds_le(-2, 0x0102_0304, 0x0506_0708, u32::MAX);
+    assert_eq!(
+        encoded,
+        [
+            0xFE, 0xFF, 0xFF, 0xFF, // -2 in two's-complement LE
+            0x04, 0x03, 0x02, 0x01, // start_col LE
+            0x08, 0x07, 0x06, 0x05, // end_row LE
+            0xFF, 0xFF, 0xFF, 0xFF, // end_col LE
+        ]
+    );
+    for bounds in [
+        (0, 0, 0, 0),
+        (-1, 1, -1, u32::MAX),
+        (i32::MIN, 0, i32::MAX, u32::MAX),
+        (i32::MAX, u32::MAX, i32::MIN, 0),
+        (-42, 120, 18, 7),
+    ] {
+        let bytes = encode_selection_bounds_le(bounds.0, bounds.1, bounds.2, bounds.3);
+        assert_eq!(decode_selection_bounds_le(bytes), bounds);
+    }
+}

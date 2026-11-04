@@ -14420,7 +14420,8 @@ mod tests {
         let lex = lex_with_emphasis();
         let g = geom20();
         let t0 = Instant::now();
-        let run = |style: ProfanityStyle| -> Vec<Vec<InkCell>> {
+        let end_ms = nova::RING_END_MS + nova::PULSE_MS + 50;
+        let run = |style: ProfanityStyle| -> Vec<(u64, Vec<InkCell>)> {
             let cfgv = DecoConfig {
                 profanity_style: style,
                 ..cfg()
@@ -14430,7 +14431,7 @@ mod tests {
             term.process(b"fuck ultrathink");
             wd.rescan(&term, 2, 40, &lex, &cfgv, 1, t0);
             tick_nova(&mut wd, t0, &cfgv, g, None, None);
-            (240..900u64)
+            (0..end_ms)
                 .step_by(10)
                 .map(|ms| {
                     let (_, _, ink, _, _) = tick_nova(
@@ -14441,7 +14442,7 @@ mod tests {
                         None,
                         None,
                     );
-                    ink.into_iter().filter(|i| i.col >= 5).collect()
+                    (ms, ink.into_iter().filter(|i| i.col >= 5).collect())
                 })
                 .collect()
         };
@@ -14452,12 +14453,12 @@ mod tests {
             "coupling is a pure function of (center, t, span): replay-exact"
         );
         let control = run(ProfanityStyle::Sparkle);
-        let mut pulsed_frames = 0usize;
-        for (fa, fc) in a.iter().zip(&control) {
+        let mut pulsed_ms = Vec::new();
+        for ((ms, fa), (_, fc)) in a.iter().zip(&control) {
             if fa == fc {
                 continue;
             }
-            pulsed_frames += 1;
+            pulsed_ms.push(*ms);
             for (ca, cc) in fa.iter().zip(fc) {
                 let dl = (relative_luminance(rgb3_to_u32(ca.color))
                     - relative_luminance(rgb3_to_u32(cc.color)))
@@ -14466,12 +14467,19 @@ mod tests {
             }
         }
         assert!(
-            pulsed_frames > 0,
+            !pulsed_ms.is_empty(),
             "the ring crossing must actually pulse the neighbor"
         );
+        let first_ms = pulsed_ms[0];
+        let last_ms = *pulsed_ms.last().expect("non-empty pulsed_ms");
         assert!(
-            pulsed_frames <= 2 * 16,
-            "the pulse is one-shot (~150 ms), not the whole window: {pulsed_frames}"
+            first_ms >= nova::FLASH_END_MS && last_ms < nova::RING_END_MS + nova::PULSE_MS,
+            "pulse instants {first_ms}..={last_ms} ms must lie inside [FLASH_END_MS, RING_END_MS + PULSE_MS)"
+        );
+        assert!(
+            last_ms - first_ms < nova::PULSE_MS,
+            "the pulse is bounded by nova::PULSE_MS ({} ms): {first_ms}..={last_ms} ms",
+            nova::PULSE_MS
         );
     }
 

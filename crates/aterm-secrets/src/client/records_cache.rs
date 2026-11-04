@@ -21,7 +21,8 @@ const MAX_INPUT_BYTES: usize = 1024 * 1024;
 /// The entry charges kept together: records and index ([`Store::footprint`]), a small
 /// file's bytes, and entry/context storage. The budget is one maximum store plus a small
 /// file; smaller entries share that room, oldest let go first. This is a cache charge,
-/// not an allocator or process-footprint measurement.
+/// not an allocator or process-footprint measurement. Cached evaluations (membership,
+/// effective records and quorum weighing) are not counted; they grow with their records.
 const MAX_BYTES: usize = Store::MAX_FOOTPRINT + MAX_INPUT_BYTES;
 
 pub(super) fn read(paths: &Paths, vault: String, store: Store) -> crate::Result<Store> {
@@ -75,7 +76,8 @@ impl Cache {
         store: Store,
         after_observation: impl FnOnce(),
     ) -> crate::Result<Store> {
-        let Some(mut reader) = fsx::open_owned_reader(&paths.records_file())? else {
+        let Some(mut reader) = fsx::open_owned_reader(&paths.records_data_file()?)? else {
+            paths.records_data_file()?;
             return Ok(store);
         };
         let observed = observe(&mut reader)?;
@@ -99,6 +101,7 @@ impl Cache {
             })
         {
             reader.check_unchanged()?;
+            paths.records_data_file()?;
             return Ok(entry.store.clone());
         }
         #[cfg(test)]
@@ -113,6 +116,7 @@ impl Cache {
             && let Some(entry) = entries.iter().find(|entry| same(entry))
         {
             reader.check_unchanged()?;
+            paths.records_data_file()?;
             return Ok(entry.store.clone());
         }
         let (store, bytes) = match observed {
@@ -134,6 +138,7 @@ impl Cache {
             }
         };
         reader.check_unchanged()?;
+        paths.records_data_file()?;
         // The context keys and the cloned store each retain a lineage vector. Even an
         // empty records file must spend entry/context space, or zero-charge entries can
         // accumulate forever without triggering eviction.
@@ -278,6 +283,38 @@ mod tests {
     }
 
     #[test]
+    fn an_observed_capacity_change_refuses_even_a_warm_cached_snapshot() {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let paths = Paths::for_home(home.path());
+        fsx::ensure_private_dir(&paths.dir).unwrap();
+        fsx::write_atomic(&paths.records_file(), &signed(&SIGNER, 1), 0o600).unwrap();
+        let small = RecordBudgets {
+            weighed: 16,
+            keyed: 128,
+            held: 32,
+        };
+        let large = RecordBudgets { held: 64, ..small };
+        small.within(|| {
+            drop(crate::records_storage::write_path(&paths.records_file(), true).unwrap());
+            let cache = Cache::new();
+            assert!(
+                cache
+                    .read(&paths, "team".into(), base(&SIGNER))
+                    .unwrap()
+                    .log()
+                    .is_some()
+            );
+            let changed = cache.read_then(&paths, "team".into(), base(&SIGNER), || {
+                large.within(|| {
+                    drop(crate::records_storage::write_path(&paths.records_file(), false).unwrap());
+                });
+            });
+            assert!(changed.is_err());
+            assert!(cache.read(&paths, "team".into(), base(&SIGNER)).is_err());
+        });
+    }
+
+    #[test]
     fn equal_fresh_membership_bytes_need_no_repeated_digest() {
         let home = aterm_tempfile::tempdir().unwrap();
         let paths = Paths::for_home(home.path());
@@ -297,33 +334,79 @@ mod tests {
         assert_eq!(cache.hashes.load(Ordering::Relaxed), 1);
     }
 
+    #[test]
+    fn cache_reloads_the_complete_history_within_its_store_budget() {
+        use crate::crossing::fixture::{Batch, RAISED};
+
+        let batch = Batch::get();
+        let records = batch.whole();
+        let wire = encode_records(&records);
+        assert!(wire.len() <= MAX_INPUT_BYTES, "the slice recovery path");
+        let large = wire.repeat(MAX_INPUT_BYTES / wire.len() + 1);
+        assert!(large.len() > MAX_INPUT_BYTES, "the streaming recovery path");
+        for input in [wire.clone(), large] {
+            RAISED.within(|| {
+                let home = aterm_tempfile::tempdir().unwrap();
+                let paths = Paths::for_home(home.path());
+                fsx::ensure_private_dir(&paths.dir).unwrap();
+                fsx::write_atomic(&paths.records_file(), &input, 0o600).unwrap();
+                let cache = Cache::new();
+                for _ in 0..2 {
+                    let store = cache
+                        .read(&paths, "team".into(), Store::with_compiled(None))
+                        .unwrap();
+                    assert_eq!(store.log().unwrap().held_count(), records.len());
+                    assert!(store.encode() == wire, "every signed record survives");
+                }
+                assert!(
+                    std::fs::read(paths.records_file()).unwrap() == input,
+                    "recovery leaves the complete persisted input unchanged"
+                );
+            });
+        }
+    }
+
     /// Entry charges stay within the cache budget, letting the oldest go first; an entry
     /// past the whole budget is read and never kept, and each read still answers its own file.
+    /// Each entry is charged its store's footprint, which counts its one record and the one chunk
+    /// of index that record starts (the chunk's 63 words), the file's copy of the record, the
+    /// entry itself, and its vault name and both copies of its lineage keys.
     /// NEGATIVE CONTROL: the stores read together keep more than the budget, which a cache bounded
-    /// by its count of entries (16 before) would keep.
+    /// by its count of entries (16 before) would keep; and each charge is pinned to that sum, which
+    /// a charge leaving out the store or its index misses.
     #[test]
     fn the_cache_keeps_its_entries_within_its_byte_budget() {
+        const ONE_CHUNK: usize = 63 * size_of::<u64>();
         let home = aterm_tempfile::tempdir().unwrap();
         let paths = Paths::for_home(home.path());
         fsx::ensure_private_dir(&paths.dir).unwrap();
         let wires: Vec<Vec<u8>> = (1..=6).map(|tag| signed(&SIGNER, tag)).collect();
+        let vault = || String::from("fixture");
         let meter = Cache::new();
         let mut costs = Vec::new();
         for wire in &wires {
             fsx::write_atomic(&paths.records_file(), wire, 0o600).unwrap();
-            meter.read(&paths, "fixture".into(), base(&SIGNER)).unwrap();
+            meter.read(&paths, vault(), base(&SIGNER)).unwrap();
             costs.push(meter.entries.lock().unwrap().back().unwrap().kept);
         }
-        assert!(
-            costs.iter().all(|&cost| cost > wires[0].len()),
-            "the charge includes more than the file bytes"
-        );
+        let lineage = base(&SIGNER).keys().map_or(0, |keys| {
+            keys.to_vec().capacity() * 2 * size_of::<[u8; 32]>()
+        });
+        for (wire, &cost) in wires.iter().zip(&costs) {
+            let footprint = base(&SIGNER).recovering(wire).footprint();
+            assert_eq!(footprint, wire.len() + ONE_CHUNK, "the index counts");
+            assert_eq!(
+                cost,
+                footprint + wire.len() + size_of::<Entry>() + vault().capacity() + lineage,
+                "the charge is the store, the file, the entry and its context"
+            );
+        }
         let budget = costs[0] + costs[1] + costs[2];
         assert!(costs.iter().sum::<usize>() > budget);
         let cache = Cache::with_budget(budget);
         for (wire, cost) in wires.iter().zip(&costs) {
             fsx::write_atomic(&paths.records_file(), wire, 0o600).unwrap();
-            let store = cache.read(&paths, "fixture".into(), base(&SIGNER)).unwrap();
+            let store = cache.read(&paths, vault(), base(&SIGNER)).unwrap();
             assert_eq!(store.encode(), *wire);
             let entries = cache.entries.lock().unwrap();
             let kept: usize = entries.iter().map(|entry| entry.kept).sum();

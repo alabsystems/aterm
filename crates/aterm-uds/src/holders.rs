@@ -3305,18 +3305,26 @@ mod tests {
         use super::{Lookup, TableRead};
         use std::io::ErrorKind;
         let tmp = aterm_tempfile::tempdir().expect("tempdir");
-        let (held, sought) = (tmp.path().join("held"), tmp.path().join("sought"));
-        std::fs::write(&held, b"held").expect("write");
-        std::fs::write(&sought, b"sought").expect("write");
-        let mut child = crate::spawnfd::command("/bin/sleep")
+        let (held, sought, kept) = (
+            tmp.path().join("held"),
+            tmp.path().join("sought"),
+            tmp.path().join("kept"),
+        );
+        for file in [&held, &sought, &kept] {
+            std::fs::write(file, b"file").expect("write");
+        }
+        let open = |file: &std::path::Path| {
+            std::os::fd::OwnedFd::from(std::fs::File::open(file).expect("open"))
+        };
+        let mut sleep = crate::spawnfd::LaneCommand::new("/bin/sleep");
+        sleep
             .arg("600")
-            .stdin(crate::spawnfd::Stdio::from(
-                std::fs::File::open(&held).expect("open"),
-            ))
-            .stdout(crate::spawnfd::Stdio::null())
-            .stderr(crate::spawnfd::Stdio::null())
-            .spawn()
-            .expect("spawn");
+            .stdin(crate::spawnfd::ChildStdio::Fd(open(&held)))
+            .stdout(crate::spawnfd::ChildStdio::Null)
+            .stderr(crate::spawnfd::ChildStdio::Null);
+        // `kept` at fds 3 and 4 from the spawn on, for the child's whole life.
+        let mut child =
+            crate::spawnfd::spawn_with_two_fds(sleep, open(&kept), open(&kept)).expect("spawn");
         let pid = child.id();
         let started = Instant::now();
         while super::read_table(pid, &[file_key(&held)], Lookup::BY_FILE) != [TableRead::Holds] {
@@ -3324,6 +3332,12 @@ mod tests {
             std::thread::yield_now();
         }
         let key = file_key(&sought);
+        // "Nothing described" refuses every number up to 255, far past any the child holds, not
+        // just 0, 1 and 2: the child holds `kept` at fds 3 and 4 for its whole life, and while
+        // dyld starts `sleep` it holds vnodes of its own (fd 3 and up, gone within milliseconds,
+        // measured 2026-10-29 under load). One left unrefused reads, and the refusal is then
+        // rightly found to be the vnodes'.
+        let every: Vec<i32> = (0..256).collect();
         let table = |fds: &[i32], reads: usize, key: u128, lookup: Lookup| {
             hook::refusing(pid, fds, reads, || super::read_table(pid, &[key], lookup))
         };
@@ -3344,7 +3358,7 @@ mod tests {
             "it did not last"
         );
         assert_eq!(
-            table(&[0, 1, 2], hook::ALWAYS, key, file),
+            table(&every, hook::ALWAYS, key, file),
             [TableRead::Unreadable],
             "nothing described"
         );
@@ -3387,7 +3401,7 @@ mod tests {
             "it did not last"
         );
         assert_eq!(
-            files(&[0, 1, 2], hook::ALWAYS),
+            files(&every, hook::ALWAYS),
             Err(ErrorKind::PermissionDenied),
             "nothing described"
         );

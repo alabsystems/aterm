@@ -16,6 +16,33 @@ pub const CODE_CHECK_HANG: Duration = Duration::from_secs(60);
 /// How long a peer's code check ([`Identity::check`]) may take, at least.
 pub const PEER_CHECK_HANG: Duration = Duration::from_secs(10);
 
+/// The floor a test set on this process's peer waits, in milliseconds (0: none set).
+#[cfg(any(test, debug_assertions))]
+static PEER_WAITS_FOR_TEST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Wait at least `within` for each peer wait in this process: a serving keeper's check of each
+/// dial, and a CLI verb's connect, check and answer.
+///
+/// A test whose keeper and verbs must answer sets the hang detector here in each process it
+/// starts: past the product's bounds a loaded machine would read as a silent `trustd`.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub fn set_peer_waits_for_test(within: Duration) {
+    let ms = u64::try_from(within.as_millis()).unwrap_or(u64::MAX).max(1);
+    PEER_WAITS_FOR_TEST_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `bound`, or the longer floor a test set with [`set_peer_waits_for_test`].
+#[cfg(unix)]
+pub(crate) fn peer_wait(bound: Duration) -> Duration {
+    #[cfg(any(test, debug_assertions))]
+    match PEER_WAITS_FOR_TEST_MS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => {}
+        ms => return bound.max(Duration::from_millis(ms)),
+    }
+    bound
+}
+
 fn unanswered(what: &str) -> String {
     format!("macOS's code-signing service (trustd) is not answering; {what} was not checked")
 }

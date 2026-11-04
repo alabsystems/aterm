@@ -12,26 +12,44 @@ use crate::membership_log::encode_records;
 mod convergence;
 
 /// Every clock in the log-derived envelope survives persistence, including maximum
-/// timestamps. The former 64 KiB reader refuses this file and forgets every grace.
+/// timestamps: every held record an epoch (a due, a seen and a wait clock each), and half of
+/// them `Remove`s instead (a removal clock each). The former 64 KiB reader refuses either file
+/// and forgets every grace.
 #[test]
 fn tender_clocks_survive_the_full_record_bound() {
     let home = aterm_tempfile::tempdir().unwrap();
     let paths = Paths::for_home(home.path());
     fsx::ensure_private_dir(&paths.dir).unwrap();
-    let mut mark = TendMark::default();
-    for i in 0..u64::try_from(crate::membership_log::MAX_HELD_RECORDS).unwrap() {
-        let mut id = [0; 32];
-        id[..8].copy_from_slice(&i.to_le_bytes());
-        mark.due.insert(id, u64::MAX);
-        mark.seen.insert(id, (u64::MAX, u64::MAX));
+    let held = u64::try_from(crate::membership_log::MAX_HELD_RECORDS).unwrap();
+    for epochs in [held, held / 2] {
+        let mut mark = TendMark::default();
+        for i in 0..epochs {
+            let mut id = [0; 32];
+            id[..8].copy_from_slice(&i.to_le_bytes());
+            mark.due.insert(id, u64::MAX);
+            mark.seen.insert(id, (u64::MAX, u64::MAX));
+            mark.wait.insert(id, (u64::MAX, u64::MAX));
+        }
+        for i in epochs..held {
+            let mut target = [0xff; 48];
+            target[..8].copy_from_slice(&i.to_le_bytes());
+            mark.removal.insert(target, u64::MAX);
+        }
+        write_tend_mark(&paths, &mark).unwrap();
+        let path = epoch_mark_file(&paths);
+        assert!(fsx::read_private(&path, 64 * 1024).is_err());
+        assert!(std::fs::metadata(&path).unwrap().len() <= u64::try_from(MAX_TEND_MARK).unwrap());
+        let read = read_tend_mark(&paths);
+        assert_eq!(read.due, mark.due);
+        assert_eq!(read.seen, mark.seen);
+        assert_eq!(read.wait, mark.wait);
+        assert_eq!(read.removal, mark.removal);
+        assert_eq!(
+            read.removal.len(),
+            usize::try_from(held - epochs).unwrap(),
+            "CONTROL: the removal clocks fill what the epochs leave"
+        );
     }
-    write_tend_mark(&paths, &mark).unwrap();
-    let path = epoch_mark_file(&paths);
-    assert!(fsx::read_private(&path, 64 * 1024).is_err());
-    assert!(std::fs::metadata(&path).unwrap().len() <= u64::try_from(MAX_TEND_MARK).unwrap());
-    let read = read_tend_mark(&paths);
-    assert_eq!(read.due, mark.due);
-    assert_eq!(read.seen, mark.seen);
 }
 
 /// A Mac that asks `member` to join under `name` from its own home `dir`: [`newcomer`] with the
@@ -481,7 +499,7 @@ fn a_removed_mac_asking_again_shows_as_removed_not_new() {
         node: [0x40; 32],
         name: "m40",
         allowed,
-        reads_log: true,
+        reader: crate::members::bundle::Reader::LegacyLog,
         restore,
         held: None,
     };
@@ -530,7 +548,7 @@ fn an_older_restore_cannot_undo_the_current_rosters_later_removal() {
             node: [0x40; 32],
             name: "m40",
             allowed: &allowed,
-            reads_log: true,
+            reader: crate::members::bundle::Reader::LegacyLog,
             restore: true,
             held: None,
         },
@@ -954,7 +972,7 @@ fn a_mac_allowed_again_after_the_stewards_deny_rows_is_back_in_the_roster() {
             node: [0x40; 32],
             name: "m40",
             allowed: &allowed40,
-            reads_log: true,
+            reader: crate::members::bundle::Reader::LegacyLog,
             restore: true,
             held: None,
         },
@@ -1012,7 +1030,7 @@ fn a_mac_allowed_again_under_a_new_device_key_clears_its_node_and_recipient_deni
             node: [0x40; 32],
             name: "m40",
             allowed: &allowed40,
-            reads_log: true,
+            reader: crate::members::bundle::Reader::LegacyLog,
             restore: false,
             held: None,
         },
@@ -1102,7 +1120,7 @@ fn a_mac_allowed_again_under_a_new_device_key_clears_its_node_and_recipient_deni
             node: [0x40; 32],
             name: "m40",
             allowed: &allowed40_v2,
-            reads_log: true,
+            reader: crate::members::bundle::Reader::LegacyLog,
             restore: true,
             held: None,
         },
@@ -1421,7 +1439,7 @@ fn removing_one_split_clashed_mac_does_not_deny_surviving_mac_or_mark_restored_m
         mem_after.removed_labels()
     );
     let mut roster = crate::swarm_roster::SwarmRoster::default();
-    super::roster::overlay_log_membership(&log, &mut roster);
+    super::roster::overlay_log_membership(&log, None, &mut roster);
     assert!(
         !roster.is_label_denied("m40") && !roster.is_label_denied(&label1),
         "surviving split holder must not be label-denied: {:?}",
@@ -1529,7 +1547,7 @@ fn a_removed_mac_asking_again_with_fresh_secrets_key_and_same_node_key_is_restor
             node: node_key,
             name: "m40",
             allowed: &allowed40,
-            reads_log: true,
+            reader: crate::members::bundle::Reader::LegacyLog,
             restore: false,
             held: None,
         },
@@ -1607,7 +1625,7 @@ fn a_removed_mac_asking_again_with_fresh_secrets_key_and_same_node_key_is_restor
             node: node_key,
             name: "m40",
             allowed: &allowed_fresh,
-            reads_log: true,
+            reader: crate::members::bundle::Reader::LegacyLog,
             restore: true,
             held: None,
         },
@@ -2066,7 +2084,7 @@ fn removed_labels_overlay_and_local_label_resolution_enforce_node_and_recipient_
             },
         ],
     };
-    roster::overlay_log_membership(&log, &mut sw_roster);
+    roster::overlay_log_membership(&log, None, &mut sw_roster);
     assert!(
         !sw_roster.members.iter().any(|m| m.label == "m42"),
         "row with log-removed node_key must be evicted from members: {:?}",

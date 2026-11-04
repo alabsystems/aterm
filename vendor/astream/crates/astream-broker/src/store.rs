@@ -617,6 +617,13 @@ pub struct LogStats {
     pub held_records: usize,
     /// Their bytes, as retention counts them (`retention::record_bytes`).
     pub held_bytes: u64,
+    /// Retained records the residency tier keeps decoded in memory: all of them with no
+    /// budget ([`OpenOptions::resident_budget`]), the hot window at the head under one
+    /// ([`BrokerLog::residency`]).
+    pub resident_records: usize,
+    /// The bytes the residency budget charges them (subject and body, plus a fixed
+    /// overhead each).
+    pub resident_bytes: usize,
 }
 
 /// What one tail has been TOLD of the records retention gave up below it
@@ -716,8 +723,9 @@ pub struct BrokerLog {
     /// the file and its broker-stamped wall time (`bt=`, Unix ms, `REQUIREMENTS` R3); for
     /// the newest, within the residency budget, the decoded record behind an `Arc`, so
     /// the egress catch-up hands subscribers cheap shared handles. An older record is
-    /// read back from its frame ([`record_arc`](Self::record_arc)), so the log's
-    /// resident memory no longer grows with its retained history (`tier.rs`).
+    /// read back from its frame ([`record_arc`](Self::record_arc)). The budget limits
+    /// this decoded window, not all resident memory: positions, times and summaries
+    /// remain in memory for every retained record (`tier.rs`).
     tier: crate::tier::Tier,
     /// The lowest offset still retained (records below it were pruned by retention).
     /// `0` for a never-retained log; recovered from the `<log>.base` sidecar. Kept
@@ -1101,9 +1109,22 @@ mod offline_seal;
 #[cfg(all(feature = "at-rest", unix))]
 pub use offline_seal::SealedLog;
 
-/// The per-log cryptographic at-rest binding sidecar path (`<log>.seal`).
-#[cfg_attr(not(feature = "at-rest"), allow(dead_code))]
-pub(crate) fn seal_path(path: &Path) -> PathBuf {
+/// The open check that writes nothing ([`BrokerLog::check_open`]): what an open would make of a
+/// log, judged without writing a byte: `check_open.rs`.
+#[path = "check_open.rs"]
+mod check_open;
+pub use check_open::{InterruptedStep, OpenCheck};
+
+/// The path of a log's per-log cryptographic at-rest binding sidecar, `<log>.seal`. Beside a
+/// log it says the log's records, `.state` and `.held` are sealed under the key it binds, so
+/// an open without that key refuses the log (`refuse_keyless_sealed`) and a bound open with
+/// it refuses one that has lost it (`BrokerLog::open_encrypted_bound`). Public beside
+/// [`identity_path`](crate::identity_path) and [`health_path`](crate::health_path), so an
+/// embedder names the file by the rule astream does (to say whether a log is sealed, or to
+/// move a log aside with its sidecars) without spelling the suffix. Its CONTENTS are
+/// astream's: read them through a keyed open, never parse or write them.
+#[must_use]
+pub fn seal_path(path: &Path) -> PathBuf {
     let mut p = path.to_path_buf();
     p.as_mut_os_string().push(".seal");
     p
@@ -1136,6 +1157,21 @@ fn refuse_keyless_sealed(path: &Path) -> io::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }
+}
+
+/// Every open's refusal of a record in a NEWER format than this build reads (its version byte
+/// `version`, at `offset`, byte `at_byte`): a newer astream wrote it, so no repair applies.
+fn newer_record(path: &Path, offset: u64, at_byte: usize, version: u8) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!(
+            "{}: the record at offset {offset} (byte {at_byte}) is in record format v{version}, \
+             written by a newer astream; this build reads up to v{}: upgrade astream to open \
+             this log (the file is untouched, and no repair applies)",
+            path.display(),
+            crate::brecord::BREC_VERSION
+        ),
+    )
 }
 
 /// A keyless open that CREATED the log clears a `.seal` a deleted predecessor left, as the
@@ -2265,17 +2301,24 @@ fn resolve_at_rest_key(
     if require_bound && !at_rest_version_is_bound(ver, AT_REST_VER_BOUND) {
         let mut owned = AtRestKey { key, seal_id };
         owned.zeroize();
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "{}: at-rest: log has no `{}` binding sidecar (legacy v1 unbound log or deleted .seal); \
-                 open_encrypted_bound refuses unbound at-rest logs",
-                path.display(),
-                seal_path(path).display()
-            ),
-        ));
+        return Err(unbound_refusal(path));
     }
     Ok(Some(AtRestKey { key, seal_id }))
+}
+
+/// A bound open's refusal of a keyed log with no `<log>.seal`: a legacy v1 log, or one whose
+/// binding was deleted.
+#[cfg(feature = "at-rest")]
+fn unbound_refusal(path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "{}: at-rest: log has no `{}` binding sidecar (legacy v1 unbound log or deleted .seal); \
+             open_encrypted_bound refuses unbound at-rest logs",
+            path.display(),
+            seal_path(path).display()
+        ),
+    )
 }
 
 #[cfg(not(feature = "at-rest"))]
@@ -3348,10 +3391,11 @@ pub struct OpenOptions {
     /// an idempotent retry at `<= <seq>` commits. Ignored by [`BrokerLog::open_opts`].
     pub sticky_batch_refusal: bool,
     /// `Some(bytes)`: keep at most about `bytes` of decoded records resident (subject and
-    /// body, plus a small per-record overhead), reading older retained records back from
-    /// the file on demand, so a long-running broker's memory no longer grows with its
-    /// retained history ([`BrokerLog::set_resident_budget`]). The newest record always
-    /// stays resident. `None` (the default) keeps every retained record resident.
+    /// body, plus a fixed per-record charge), reading older retained records back from
+    /// the file on demand ([`BrokerLog::set_resident_budget`]). The newest record always
+    /// stays resident, even when it exceeds the budget. Positions, times, summaries and
+    /// indexes remain in memory and can grow with retained history; this is not a bound
+    /// on total broker memory. `None` (the default) keeps every retained record decoded.
     pub resident_budget: Option<usize>,
     /// The crash simulation's recovery mutation (a negative control).
     #[cfg(test)]
@@ -4772,17 +4816,7 @@ impl BrokerLog {
                 at_byte,
                 version,
             } => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    format!(
-                        "{}: the record at offset {offset} (byte {at_byte}) is in record format \
-                         v{version}, written by a newer astream; this build reads up to v{}: \
-                         upgrade astream to open this log (the file is untouched, and no repair \
-                         applies)",
-                        path.display(),
-                        crate::brecord::BREC_VERSION
-                    ),
-                ));
+                return Err(newer_record(&path, offset, at_byte, version));
             }
         };
         let pre_cut_head = base.0.saturating_add(scanned.records.len() as u64);
@@ -6451,6 +6485,8 @@ impl BrokerLog {
             held_bytes: self.hold.held_bytes,
             #[cfg(not(feature = "retention"))]
             held_bytes: 0,
+            resident_records: self.tier.resident(),
+            resident_bytes: self.tier.resident_bytes(),
         }
     }
 
@@ -7565,10 +7601,13 @@ impl BrokerLog {
     /// negative control, which stands in the writer that predates the marks).
     fn seals_batches(&self) -> bool {
         #[cfg(test)]
-        if self.unsealed_writer {
-            return false;
+        {
+            !self.unsealed_writer
         }
-        true
+        #[cfg(not(test))]
+        {
+            true
+        }
     }
 
     /// The mark a staged record takes: the batch continues past it — its last record is
@@ -9234,15 +9273,16 @@ impl BrokerLog {
     }
 
     /// Bound the decoded records this log keeps resident to about `budget` bytes of
-    /// subject and body (the newest record always stays). Older records are read back
-    /// from the file on demand. [`usize::MAX`] keeps every retained record resident,
-    /// which is the default.
+    /// subject, body and a fixed per-record charge (the newest record always stays,
+    /// even when it exceeds the budget). Older records are read back from the file on
+    /// demand. Positions, times, summaries and indexes remain resident independently
+    /// of this budget. [`usize::MAX`] keeps every retained record decoded, the default.
     pub fn set_resident_budget(&mut self, budget: usize) {
         self.tier.set_budget(budget);
     }
 
-    /// `(resident records, resident bytes, retained records)`: what the residency budget
-    /// is holding in memory now.
+    /// `(decoded records, charged decoded bytes, retained records)`: what the residency
+    /// budget holds now. The byte count excludes retained metadata and other broker memory.
     pub fn residency(&self) -> (usize, usize, usize) {
         (
             self.tier.resident(),

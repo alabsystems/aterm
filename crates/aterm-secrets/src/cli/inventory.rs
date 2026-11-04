@@ -21,7 +21,11 @@ fn description(name: &str) -> String {
         "~/.aterm/machine.toml" | "~/.aterm/release-ring/machine.toml" => {
             "Machine release identity".into()
         }
-        "ai-accounts.csv" => "AI provider account registry".into(),
+        "ai-accounts.csv" => {
+            "AI account sheet (the lab importer's input; read directly only on a Mac the lab does \
+             not name)"
+                .into()
+        }
         "ai-mailbox.toml" => "AI account mailbox configuration".into(),
         "~/.config/gh/hosts.yml" => "GitHub CLI authentication".into(),
         "~/.config/git/credentials" => "Git HTTPS credentials".into(),

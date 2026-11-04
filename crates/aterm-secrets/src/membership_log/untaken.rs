@@ -19,13 +19,14 @@
 //! when the store does not hold it complete after the pass, and then it can never be taken:
 //! - this build cannot read it ([`Record::decode`] is a function of its bytes), or it descends
 //!   from a frame this build cannot read;
-//! - or the store refused it, or keeps it waiting on a parent. A parent outside the stream is
-//!   one the server counted known: under the store's own ids, which the store held complete when
-//!   the pull named them (a note against a store that no longer holds them is dropped), or under
-//!   a memo's heads, which by induction cover only records the store holds or can never take. A
-//!   refusal holds for good for a store whose complete part only grows: the bounds count held
-//!   records, which only grow, [`super::Log::insert`] judges a complete record against its causal
-//!   past, which its id fixes, and another network stays another network.
+//! - or the store refused it, or keeps it waiting on a parent, or a pass of a store that has not
+//!   crossed left it out as a crossed log's record that only waited on one (`crate::crossing`). A
+//!   parent outside the stream is one the server counted known: under the store's own ids, which
+//!   the store held complete when the pull named them (a note against a store that no longer holds
+//!   them is dropped), or under a memo's heads, which by induction cover only records the store
+//!   holds or can never take. A refusal holds for good for a store whose complete part only grows:
+//!   the bounds count held records, which only grow, [`super::Log::insert`] judges a complete
+//!   record against its causal past, which its id fixes, and another network stays another network.
 //!
 //! The heads named are the counting frames no other counting frame names as a parent, so their
 //! closure is the counting frames and their ancestors, which the store holds or can never take.

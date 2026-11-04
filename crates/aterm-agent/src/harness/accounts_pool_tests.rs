@@ -104,6 +104,9 @@ struct World {
     cfg: PathBuf,
     state: PathBuf,
     home: PathBuf,
+    /// A CLI's program a session can move under: for Codex, a build that keeps a row's login its
+    /// own ([`crate::harness::codex_alab::auth_path_unread`] passes it).
+    exe: PathBuf,
 }
 
 impl World {
@@ -121,6 +124,7 @@ impl World {
             cfg: root.join("cfg"),
             state: root.join("state"),
             home: root.join("home"),
+            exe: crate::harness::codex_alab::lay_package(&root.join("store/keeps-a-row"), true),
             root,
         };
         // Each pooled CLI's default login is signed in on this machine, as a roster's default
@@ -260,9 +264,42 @@ fn session<'a>(cli: Cli, supervisor: Supervisor, mode: Mode, exe: &'a Path) -> S
 }
 
 fn condition_of(world: &World, cli: Cli, label: &str) -> Condition {
-    let roster = world.seat().roster(cli).expect("roster");
-    let row = roster.row(label).expect("row");
-    accounts::condition(row, &world.load(cli), true, NOW)
+    let records = world
+        .seat()
+        .store(cli)
+        .read_account_records(Some(&world.cfg.join(cli.accounts().roster_file)), NOW)
+        .expect("current account snapshot");
+    let row = records.roster.row(label).expect("row");
+    accounts::condition(row, &records.state, true, NOW)
+}
+
+/// Publish a fixture's explicit current auth observation with real synthetic credential material.
+fn stage_current_auth(
+    world: &World,
+    cli: Cli,
+    state: &mut State,
+    logins: &accounts::Logins,
+    label: &str,
+    word: accounts::Auth,
+    at: i64,
+) -> Vec<accounts::Event> {
+    if cli != Cli::Codex {
+        return accounts::note_auth(state, label, word, at);
+    }
+    let store = world.seat().store(cli);
+    let raw = Roster::load_for(cli, &world.cfg.join(cli.accounts().roster_file)).unwrap();
+    let effective = accounts::bound(&raw, logins);
+    let row = effective.row(label).unwrap();
+    if store.capture_auth_context(row).is_none() {
+        let default = world.home.join(cli.accounts().default_home);
+        let home = row.dir.as_deref().map_or(default.as_path(), Path::new);
+        usage_policy::write_context_login(home, 1);
+    }
+    let context = store
+        .capture_auth_context(row)
+        .expect("owned fixture credentials");
+    accounts::stage_auth(state, raw.row(label).unwrap(), logins, context, word, at);
+    Vec::new()
 }
 
 #[test]
@@ -270,7 +307,7 @@ fn a_low_codex_session_moves_onto_its_overlay_home_and_resumes_its_rollout() {
     let world = World::new("codex-move");
     let work = world.two(Cli::Codex);
     world.on_main(Cli::Codex, &[]);
-    let exe = Path::new("/opt/codex-old/bin/codex");
+    let exe = world.exe.as_path();
     let moved = session_move(
         &world.seat(),
         &session(Cli::Codex, Supervisor::Aterm, Mode::Early, exe),
@@ -290,8 +327,9 @@ fn a_low_codex_session_moves_onto_its_overlay_home_and_resumes_its_rollout() {
         line,
         format!(
             " '/usr/bin/env' -u 'CODEX_API_KEY' -u 'CODEX_ACCESS_TOKEN' 'CODEX_AUTH_PATH={}' \
-             '/opt/codex-old/bin/codex' 'resume' '019a-rollout-id'",
-            work.join("auth.json").display()
+             '{}' 'resume' '019a-rollout-id'",
+            work.join("auth.json").display(),
+            world.exe.display()
         )
     );
     assert!(!line.contains("CLAUDE"), "{line}");
@@ -556,7 +594,6 @@ fn each_cli_resumes_by_its_own_flag() {
 
 #[test]
 fn mode_off_records_every_clis_limits_and_moves_none() {
-    let exe = Path::new("/opt/bin/agent");
     for cli in Cli::ALL {
         let world = World::new(&format!("off-{}", cli.id()));
         world.two(cli);
@@ -568,7 +605,7 @@ fn mode_off_records_every_clis_limits_and_moves_none() {
         .unwrap();
         let moved = session_move(
             &world.seat(),
-            &session(cli, Supervisor::Aterm, Mode::Off, exe),
+            &session(cli, Supervisor::Aterm, Mode::Off, &world.exe),
         );
         assert_eq!(moved.advice, Advice::Stay(StayWhy::Off), "{cli:?}");
         assert_eq!(moved.line, None, "{cli:?}");
@@ -593,7 +630,7 @@ fn mode_off_records_every_clis_limits_and_moves_none() {
         world.on_main(cli, &[]);
         let moved = session_move(
             &world.seat(),
-            &session(cli, Supervisor::Aterm, Mode::Early, exe),
+            &session(cli, Supervisor::Aterm, Mode::Early, &world.exe),
         );
         if moves {
             assert!(
@@ -617,7 +654,7 @@ fn the_breaker_is_spent_in_one_clis_store_and_no_other() {
     let spent: Vec<i64> = (1..=4).map(|i| NOW - i * 5 * MIN).collect();
     world.on_main(Cli::Codex, &spent);
     world.on_main(Cli::Claude, &[]);
-    let exe = Path::new("/opt/bin/agent");
+    let exe = world.exe.as_path();
     let codex = session_move(
         &world.seat(),
         &session(Cli::Codex, Supervisor::Aterm, Mode::Early, exe),
@@ -786,7 +823,7 @@ fn a_launch_and_a_move_read_a_renewed_rows_login_where_logins_json_binds_it() {
 
     let moving = World::new("renewed-move");
     let staging = renewed_work(&moving);
-    let exe = Path::new("/opt/codex-old/bin/codex");
+    let exe = world.exe.as_path();
     let moved = session_move(
         &moving.seat(),
         &session(Cli::Codex, Supervisor::Aterm, Mode::Early, exe),
@@ -970,7 +1007,7 @@ fn a_store_without_proven_file_credentials_holds_the_codex_launch_and_move() {
             held,
             "{store}: direct usage poll"
         );
-        let exe = Path::new("/opt/codex-old/bin/codex");
+        let exe = world.exe.as_path();
         let moved = session_move(
             &world.seat(),
             &session(Cli::Codex, Supervisor::Aterm, Mode::Early, exe),
@@ -1029,7 +1066,7 @@ fn a_moved_session_that_served_its_turn_proves_its_row_and_can_leave_early_again
     let world = World::new("canary");
     let work = world.two(Cli::Codex);
     world.on_main(Cli::Codex, &[]);
-    let exe = Path::new("/opt/codex-old/bin/codex");
+    let exe = world.exe.as_path();
     let first = session_move(
         &world.seat(),
         &session(Cli::Codex, Supervisor::Aterm, Mode::Early, exe),
@@ -1080,8 +1117,7 @@ fn a_superseded_session_observation_cannot_prove_the_current_login() {
     let old = renewed_work(&world);
     let store = world.seat().store(Cli::Codex);
     let renewed = world.root.join("logins/codex/work+2");
-    std::fs::create_dir_all(&renewed).unwrap();
-    std::fs::write(renewed.join("auth.json"), "{}").unwrap();
+    usage_policy::write_context_login(&renewed, 1);
     store
         .transact_logins(NOW, &mut None, |state, logins| {
             let events = accounts::note_renewed(
@@ -1095,11 +1131,11 @@ fn a_superseded_session_observation_cannot_prove_the_current_login() {
             );
             state.active = Some("work".into());
             state.proven = false;
-            accounts::note_auth(state, "work", accounts::Auth::SignedOut, NOW);
             Ok(events)
         })
         .unwrap();
-    let exe = Path::new("/opt/codex-old/bin/codex");
+    observe_signed_out(&world, "work");
+    let exe = world.exe.as_path();
     let old_text = old.join("auth.json").to_string_lossy().into_owned();
     let old_env = [("CODEX_AUTH_PATH", old_text.as_str())];
     let mut s = session(Cli::Codex, Supervisor::Aterm, Mode::Off, exe);
@@ -1152,7 +1188,7 @@ fn a_renewal_after_observation_retains_usage_without_proving_the_new_login() {
             Ok(events)
         })
         .unwrap();
-    let exe = Path::new("/opt/codex-old/bin/codex");
+    let exe = world.exe.as_path();
     let s = session(Cli::Codex, Supervisor::Aterm, Mode::Off, exe);
     let current = record_session(&seat, &s, &who, &captured).unwrap();
     assert_eq!(
@@ -1182,11 +1218,10 @@ fn a_renewal_after_observation_retains_usage_without_proving_the_new_login() {
 
 #[test]
 fn a_low_session_of_a_cli_with_no_usage_probe_is_never_told_to_probe() {
-    let exe = Path::new("/opt/codex-old/bin/codex");
     let world = World::new("probe");
     world.two(Cli::Codex);
     world.on_main(Cli::Codex, &[]);
-    let mut s = session(Cli::Codex, Supervisor::Aterm, Mode::Early, exe);
+    let mut s = session(Cli::Codex, Supervisor::Aterm, Mode::Early, &world.exe);
     s.sample = Some(Sample {
         at: NOW - 11 * MIN,
         ..near_wall()
@@ -1240,7 +1275,7 @@ fn a_move_whose_line_cannot_be_written_commits_no_rotation() {
     let world = World::new("line-fails");
     world.two(Cli::Codex);
     world.on_main(Cli::Codex, &[]);
-    let exe = Path::new("/opt/codex-old/bin/codex");
+    let exe = world.exe.as_path();
     let remote = ["--remote".to_string(), "ws://h".to_string()];
     let mut unresumable = session(Cli::Codex, Supervisor::Aterm, Mode::Early, exe);
     unresumable.relaunch.flags = &remote;
@@ -1275,7 +1310,7 @@ fn an_unwritten_move_keeps_the_preparation_hold_on_its_running_session() {
             Ok(Vec::new())
         })
         .unwrap();
-    let exe = Path::new("/opt/codex-old/bin/codex");
+    let exe = world.exe.as_path();
     let moved = session_move_using(
         &world.seat(),
         &session(Cli::Codex, Supervisor::Aterm, Mode::Early, exe),
@@ -1641,15 +1676,47 @@ fn an_overlay_row_is_never_started_on_where_aterm_makes_no_links() {
 }
 
 /// A [`UsageReader`] answering each home its own [`Reading`], and nothing for any other.
-struct Readings(Vec<(PathBuf, Reading)>);
+struct Readings<'a> {
+    user_home: &'a Path,
+    readings: Vec<(PathBuf, Reading)>,
+}
 
-impl UsageReader for Readings {
+impl UsageReader for Readings<'_> {
     fn read(&self, _: Cli, home: &Path, _: Option<&str>, _: i64) -> Reading {
-        self.0
+        self.readings
             .iter()
             .find(|(at, _)| at == home)
             .map_or(Reading::Unread, |(_, reading)| reading.clone())
     }
+
+    fn read_observed(
+        &self,
+        cli: Cli,
+        home: &Path,
+        expected_email: Option<&str>,
+        now: i64,
+    ) -> UsageObservation {
+        let context = (cli == Cli::Codex)
+            .then(|| crate::harness::codex_app_login::current_context(home, self.user_home))
+            .flatten();
+        UsageObservation {
+            reading: self.read(cli, home, expected_email, now),
+            context,
+        }
+    }
+}
+
+fn observe_signed_out(world: &World, label: &str) {
+    let seat = world.seat();
+    let before = pool_snapshot(&seat, Cli::Codex).unwrap();
+    let row = before.roster.row(label).unwrap();
+    let home = row_home(Cli::Codex, row, &world.home).unwrap();
+    assert!(crate::harness::codex_app_login::current_context(&home, &world.home).is_some());
+    let read = Readings {
+        user_home: &world.home,
+        readings: vec![(home, Reading::SignedOut)],
+    };
+    poll_usage(&seat, Cli::Codex, &before, row, &read).unwrap();
 }
 
 #[test]
@@ -1657,8 +1724,13 @@ fn a_login_the_provider_refused_is_signed_out_and_launches_leave_it_until_it_rea
     let world = World::new("refused-login");
     let work = world.two(Cli::Codex);
     world.on_main(Cli::Codex, &[]);
+    usage_policy::write_context_login(&work, 1);
+    usage_policy::write_context_login(&world.home.join(Cli::Codex.accounts().default_home), 1);
     wall(&world, Cli::Codex, "main", NOW + HOUR);
-    let refused = Readings(vec![(work.clone(), Reading::SignedOut)]);
+    let refused = Readings {
+        user_home: &world.home,
+        readings: vec![(work.clone(), Reading::SignedOut)],
+    };
     let launch = super::launch_env(&world.seat(), Cli::Codex, &refused);
     assert!(
         launch
@@ -1685,18 +1757,21 @@ fn a_login_the_provider_refused_is_signed_out_and_launches_leave_it_until_it_rea
     std::fs::remove_file(world.cfg.join("aterm.toml")).expect("rotation on again");
 
     // A reading of its usage again (a sign-in by hand in its home) signs it in again.
-    let served = Readings(vec![(
-        work.clone(),
-        Reading::Usage(Usage {
-            sample: Sample {
-                session_pct: Some(10),
-                session_reset: Some(NOW + 4 * HOUR),
-                at: NOW,
-                ..Sample::default()
-            },
-            walls: Vec::new(),
-        }),
-    )]);
+    let served = Readings {
+        user_home: &world.home,
+        readings: vec![(
+            work.clone(),
+            Reading::Usage(Usage {
+                sample: Sample {
+                    session_pct: Some(10),
+                    session_reset: Some(NOW + 4 * HOUR),
+                    at: NOW,
+                    ..Sample::default()
+                },
+                walls: Vec::new(),
+            }),
+        )],
+    };
     let pick = launch_env(&world.seat(), Cli::Codex, &served).map(|pick| pick.label);
     assert_eq!(pick.as_deref(), Some("work"));
     assert_eq!(condition_of(&world, Cli::Codex, "work"), Condition::Usable);
@@ -1818,14 +1893,11 @@ fn a_refused_launch_on_a_program_that_ignores_codex_auth_path_waits_on_the_defau
         .store(Cli::Codex)
         .transact_within(&accounts::LOCK_LADDER, NOW, &mut note, |state| {
             state.pinned = false;
-            Ok(accounts::note_auth(
-                state,
-                "main",
-                accounts::Auth::SignedOut,
-                NOW,
-            ))
+            Ok(Vec::new())
         })
-        .expect("unpin, and sign `main` out");
+        .expect("unpin");
+    usage_policy::write_context_login(&world.home.join(Cli::Codex.accounts().default_home), 1);
+    observe_signed_out(&world, "main");
     assert_eq!(opening(&old), None, "a signed-out `main` opens by no wait");
 }
 
@@ -2088,4 +2160,60 @@ fn an_unclaimed_codex_default_row_says_its_claims_cannot_be_recorded() {
         default_serving(&roster, &state, &enrolled, NOW).is_ok(),
         "CONTROL"
     );
+}
+
+/// A CODEX BUILD THAT KEEPS NO ROW'S LOGIN ITS OWN MOVES NO SESSION: its relaunch line would name a
+/// row's login it never reads and run on this machine's own while the pool counted the row, so a
+/// session on `main` stays, at a turn end near its wall and at the wall, and one that has to yield
+/// holds rather than go on. CONTROL: on a build that keeps it, the same session moves to `work`.
+#[test]
+fn a_codex_session_on_a_build_that_keeps_no_rows_login_is_not_moved() {
+    let wall = Point::Wall {
+        window: "five_hour".to_string(),
+        at: None,
+    };
+    let plan = |reads: bool, point: &Point, yields: bool| {
+        let world = World::new("codex-keeps-no-row");
+        world.two(Cli::Codex);
+        world.on_main(Cli::Codex, &[]);
+        if yields {
+            let mut note = None;
+            world
+                .seat()
+                .store(Cli::Codex)
+                .transact_within(&accounts::LOCK_LADDER, NOW, &mut note, |state| {
+                    state.note_lease("main", "other-mac", NOW + 3600, NOW);
+                    Ok(Vec::new())
+                })
+                .expect("the lease");
+        }
+        let exe = crate::harness::codex_alab::lay_package(&world.root.join("store/tried"), reads);
+        let mut session = session(Cli::Codex, Supervisor::Aterm, Mode::Early, &exe);
+        session.point = point.clone();
+        session_plan(&world.seat(), &session, |_| {})
+            .advice()
+            .clone()
+    };
+    for point in [&Point::TurnEnd, &wall] {
+        let moved = plan(true, point, false);
+        assert!(
+            matches!(&moved, Advice::Move { to, .. } if to == "work"),
+            "CONTROL: {point:?}: {moved:?}"
+        );
+        let stayed = plan(false, point, false);
+        assert!(matches!(stayed, Advice::Stay(_)), "{point:?}: {stayed:?}");
+    }
+    let yields = plan(true, &Point::TurnEnd, true);
+    assert!(
+        matches!(
+            &yields,
+            Advice::Move {
+                yields: Some(_),
+                ..
+            }
+        ),
+        "CONTROL: {yields:?}"
+    );
+    let held = plan(false, &Point::TurnEnd, true);
+    assert!(matches!(held, Advice::Wait { .. }), "{held:?}");
 }

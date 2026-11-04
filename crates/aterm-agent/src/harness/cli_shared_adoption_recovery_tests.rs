@@ -192,7 +192,8 @@ impl shared_provider::Provider for UnknownAfter {
         context: &shared_provider::Context<'_>,
         row: &accounts::Row,
         staging: &Path,
-    ) -> Result<Option<Box<dyn shared_provider::LoginProof>>, String> {
+    ) -> Result<Option<Box<dyn shared_provider::LoginProof>>, shared_provider::ObservationError>
+    {
         shared_provider::ClaudeOauth.observe(context, row, staging)
     }
 }
@@ -394,7 +395,8 @@ impl shared_provider::Provider for Observed {
         context: &shared_provider::Context<'_>,
         row: &accounts::Row,
         staging: &Path,
-    ) -> Result<Option<Box<dyn shared_provider::LoginProof>>, String> {
+    ) -> Result<Option<Box<dyn shared_provider::LoginProof>>, shared_provider::ObservationError>
+    {
         let proof = shared_provider::ClaudeOauth.observe(context, row, staging)?;
         match self.case {
             4 => return Ok(proof.map(|proof| Box::new(DifferentEmail(proof)) as _)),
@@ -416,13 +418,82 @@ impl shared_provider::Provider for Observed {
                     .transact_logins(NOW, &mut None, |state, logins| {
                         accounts::forget_account(state, logins, &row.label);
                         Ok(Vec::new())
-                    })?;
+                    })
+                    .map_err(shared_provider::ObservationError::RecoveryRequired)?;
             }
             9 => return Ok(None),
-            12 => return Err("provider verification unavailable".into()),
+            12 => {
+                return Err(shared_provider::ObservationError::Unavailable(
+                    "provider verification unavailable".into(),
+                ));
+            }
             _ => {}
         }
         Ok(proof)
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn verification_outage_retains_one_consumed_attempt_until_observation_recovers() {
+    let (_tmp, env, approval, host) = fixture(0);
+    let grant = approval.prepare(&candidate(&approval).row).unwrap();
+    let provider = Arc::new(Observed {
+        case: 12,
+        approval: approval.clone(),
+    });
+    assert!(run_with_provider(&env, &host, &approval, provider.clone()).is_err());
+    let store = env.accounts_store();
+    let original = store.load_logins(NOW).unwrap().0;
+    let attempt = original.shared.latest(grant.source).unwrap().clone();
+    let path = Path::new(&attempt.intent.staging).join(".credentials.json");
+    let credential = fs::read(&path).unwrap();
+    for _ in 0..2 {
+        assert!(run_with_provider(&env, &host, &approval, provider.clone()).is_err());
+        assert_eq!(store.load_logins(NOW).unwrap().0, original);
+        assert_eq!(fs::read(&path).unwrap(), credential);
+    }
+    assert_eq!(approval.recoveries.load(Ordering::SeqCst), 0);
+    assert_eq!(run(&env, &host, &approval), Ok(true));
+    assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(approval.recoveries.load(Ordering::SeqCst), 0);
+    let after = store.load_logins(NOW).unwrap().0;
+    let published = after.shared.latest(grant.source).unwrap();
+    assert_eq!(published.intent, attempt.intent);
+    assert!(matches!(
+        published.outcome,
+        accounts::shared::Outcome::Published { .. }
+    ));
+    assert_eq!(fs::read(&path).unwrap(), credential);
+}
+
+#[cfg(unix)]
+#[test]
+fn native_claude_observation_preserves_outages_and_requests_rejected_token_recovery() {
+    for mode in [9, 10] {
+        let (_tmp, env, approval, mut host) = fixture(mode);
+        let grant = approval.prepare(&candidate(&approval).row).unwrap();
+        assert!(run(&env, &host, &approval).is_err());
+        let store = env.accounts_store();
+        let original = store.load_logins(NOW).unwrap().0;
+        let intent = original.shared.latest(grant.source).unwrap().intent.clone();
+        assert!(run(&env, &host, &approval).is_err());
+        assert_eq!(store.load_logins(NOW).unwrap().0, original);
+        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            approval.recoveries.load(Ordering::SeqCst),
+            if mode == 9 { 0 } else { 2 }
+        );
+        host.mode = 0;
+        assert_eq!(run(&env, &host, &approval), Ok(true));
+        let after = store.load_logins(NOW).unwrap().0;
+        let published = after.shared.latest(grant.source).unwrap();
+        assert_eq!(published.intent, intent);
+        assert!(matches!(
+            published.outcome,
+            accounts::shared::Outcome::Published { .. }
+        ));
+        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
     }
 }
 

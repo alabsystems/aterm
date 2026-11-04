@@ -47,11 +47,8 @@ fn sample(log: &Log) -> Sample {
     let records = &log.order;
     let graph = Graph::new(log.history());
     let candidates = graph.candidates();
-    let (accepted, apart, relations) = graph.weigh_all(
-        &candidates,
-        &mut Memo::new(),
-        &mut AuthScratch::new(records.len()),
-    );
+    let (accepted, apart, relations) =
+        graph.weigh_all(&candidates, &mut Memo::new(), &mut graph.scratch());
     let undoes: BTreeSet<_> = relations.undoes_pairs().collect();
     let strips: BTreeSet<_> = relations.strips_pairs().collect();
     let defeats = undoes

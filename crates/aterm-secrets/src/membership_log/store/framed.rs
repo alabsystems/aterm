@@ -5,7 +5,7 @@
 //! Callers retain their own count, verification and recovery policies.
 
 use super::{MAX_RECORDS_STREAM, Record, Store};
-use crate::membership_log::{FRAME_PREFIX_LEN, MAX_HELD_RECORDS, RecordId};
+use crate::membership_log::{FRAME_PREFIX_LEN, RecordId};
 use crate::{Error, Result};
 use std::collections::BTreeSet;
 use std::io::{self, Read};
@@ -140,20 +140,25 @@ impl DecodedRecords {
 
 impl Store {
     /// Recover from a local-file reader's first [`MAX_RECORDS_STREAM`] bytes. I/O errors refuse the whole read;
-    /// malformed record tails retain the same prefix as [`Store::recovering`]. Every byte of
-    /// the capped prefix is consumed, including after recovery stops, for its complete digest.
+    /// malformed record tails retain the same prefix as [`Store::recovering`], within this
+    /// store's held budget of verified frames. Every byte of the capped prefix is consumed,
+    /// including after recovery stops, for its complete digest.
     pub(crate) fn recovering_read(self, reader: impl Read) -> Result<Self> {
-        Ok(Self::read_records(reader)?.apply(self))
+        Ok(Self::read_records_bounded(reader, self.budgets.held)?.apply(self))
     }
 
-    /// Read the same capped recovery input without changing a Store. A server can finish
-    /// its whole-file length and descriptor checks before applying this batch.
-    pub(crate) fn read_records(reader: impl Read) -> Result<DecodedRecords> {
+    /// Read capped recovery input at the receiving store's explicit record limit. A server
+    /// finishes its whole-file length and descriptor checks before applying this batch.
+    pub(crate) fn read_records(reader: impl Read, record_limit: usize) -> Result<DecodedRecords> {
+        Self::read_records_bounded(reader, record_limit)
+    }
+
+    fn read_records_bounded(reader: impl Read, record_limit: usize) -> Result<DecodedRecords> {
         let mut reader = reader.take(MAX_RECORDS_STREAM as u64);
         let mut records = Vec::new();
         let mut strict = true;
         let mut frames = FrameReader::new();
-        while records.len() < MAX_HELD_RECORDS {
+        while records.len() < record_limit {
             let frame = match frames.read(&mut reader) {
                 Ok(None) => {
                     return Ok(DecodedRecords {

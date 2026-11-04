@@ -184,6 +184,61 @@ fn a_failed_wake_open_keeps_both_names_for_a_later_release() {
     drop(wake);
 }
 
+/// A FIFO some other writer filled never holds the release: its wake is non-blocking, so the line
+/// that does not fit fails to write and the release returns at once, with both names gone and no
+/// wake to keep (a shell that got through has the stray bytes to read already). A blocking wake
+/// would wait in that write for ever, and with it the sweep's caller, aterm's spare thread.
+#[test]
+fn a_full_pipe_never_holds_the_release() {
+    use std::io::{Read as _, Write as _};
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let dir = aterm_tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("7-1-s-0a");
+    mkfifo(&path);
+    let link = dir.path().join("s-0a");
+    std::os::unix::fs::symlink("7-1-s-0a", &link).expect("link");
+    // Read-write, so the bytes it writes stay in the pipe; it reads them only to free a release
+    // left waiting, so the test ends at its assertion rather than in a thread that never returns.
+    let stray = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&path)
+        .expect("the stray writer");
+    for chunk in [&[b'x'; 512][..], &b"x"[..]] {
+        loop {
+            match (&stray).write(chunk) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("fill the pipe: {e}"),
+            }
+        }
+    }
+    let (released, released_rx) = std::sync::mpsc::channel();
+    let releasing = std::thread::spawn({
+        let (path, link) = (path.clone(), link.clone());
+        move || {
+            let _ = released.send(release(&path, &link, write_end).is_some());
+        }
+    });
+    let got = released_rx.recv_timeout(MUST_HAPPEN);
+    if got.is_err() {
+        while (&stray).read(&mut [0u8; 512]).is_ok_and(|n| n > 0) {}
+    }
+    releasing.join().expect("the release's thread");
+    drop(stray);
+    assert_eq!(
+        got,
+        Ok(false),
+        "the release returned without its line: it did not wait on the full pipe"
+    );
+    assert_eq!(
+        names_in(dir.path()),
+        Vec::<String>::new(),
+        "both names are gone"
+    );
+}
+
 /// Lines written through a read-write open of `late`, held until the caller drops it: a reader
 /// left waiting at any step of [`read_late`], or of a test's own read, gets through, so no thread
 /// is left blocked when a test fails.

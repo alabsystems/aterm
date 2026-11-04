@@ -124,6 +124,24 @@ pub(crate) enum Mutant {
     /// cut short of the grace included (`Bridge::park_and_take`), so a commit that pass
     /// would carry goes alone.
     ShortParkSendsTheHeldCommit,
+    /// The bus mirror's first pass after an attach runs ahead of what the loop holds queued
+    /// while the open has yet to make the pin's fence, as before critic item D06
+    /// (`Bridge::mirror_yields`): the first delivery an attach or a handoff finds waiting
+    /// waits behind the fence's two full flushes and the pass.
+    MirrorAheadOfTheFirstDelivery,
+    /// The first-pass hold forgets the posts a drain listed (`Bridge::mirror_drained_posts`),
+    /// as D06's first form did: a pass due before their records come back goes ahead of them.
+    FirstPassForgetsTheDrainedPosts,
+    /// A held first pass counts no inbox record it took off the ones it awaits
+    /// (`Bridge::mirror_took_inbox`), so it waits out the whole hold after the record came.
+    FirstPassAwaitsPastItsRecords,
+    /// A pass that makes the pin's fence leaves the inbox commit its deliveries owe for its
+    /// burst behind the fence (`Bridge::commit_ahead_of_the_fence`).
+    CommitBehindTheFence,
+    /// The bus mirror takes and sends without first making the pin's fence durable
+    /// (`Bridge::mirror_key_on_the_media`): the control of the fence's law (critic item D06),
+    /// under which an open's first take can be answered with no pin of this build on the media.
+    TakeAheadOfTheFence,
     /// A drain peeks the outbox with a post still in flight, its answer not read first.
     PeekPastOwedPost,
     /// Every read of an owed ack waits for it (`Bridge::try_settle_one`).
@@ -171,6 +189,11 @@ pub(crate) enum Mutant {
     /// (`StateDir::sweep_sessions_of_an_earlier_boot`): a post whose `outbox sent` a power cut
     /// stopped holds its session, and the subjects it names, back from the budget for good.
     KeepEarlierBootReservations,
+    /// Every lease the bridge writes names only a boot whose page cache vouches for the state
+    /// dir ([`crate::state::StateDir::trusted_boot`]), as before item RZ2: off the boot volume
+    /// ([`Opts::off_boot_volume`]) none, so the next boot finds no earlier one and sweeps
+    /// nothing.
+    LeaseNamesNoBootOffTheBootVolume,
     /// An in-flight entry is published again at its pinned sequence without reading its
     /// record back first (`Bridge::landed_since`), trusting astream's dedup past a cut.
     ReplayWithoutReadingBack,
@@ -367,6 +390,9 @@ pub(crate) struct Opts {
     pub(crate) handoffs: bool,
     /// The door's journal ([`bus::Event`]).
     pub(crate) journal: bool,
+    /// The state dir stands off the boot volume (item RZ2): its page cache vouches for no lease
+    /// ([`crate::state::StateDir::trusted_boot`]), so every attach flushes `inc`.
+    pub(crate) off_boot_volume: bool,
 }
 
 /// The deadlines an ask draws ([`Opts::deadlines`]), in ms: from one that passes before its
@@ -477,6 +503,7 @@ impl Opts {
             deadlines: false,
             topics: false,
             handoffs: false,
+            off_boot_volume: false,
         }
     }
 
@@ -1009,6 +1036,9 @@ impl World {
         if opts.fetches {
             ep.watch(Arc::clone(&core));
         }
+        if opts.mirror {
+            ep.fence_takes(Arc::clone(&core));
+        }
         let cfg = Config {
             fleet: FLEET.to_string(),
             broker: "sim".to_string(),
@@ -1337,6 +1367,13 @@ impl World {
         self.stats.relaunches += 1;
         let lease = u8::from(self.opts.mutants.contains(&Mutant::LeaseAcrossBoots));
         bridge.simulate_boot(crate::durability::test_boot(self.boot), lease);
+        if self.opts.off_boot_volume {
+            bridge.simulate_off_the_boot_volume(
+                self.opts
+                    .mutants
+                    .contains(&Mutant::LeaseNamesNoBootOffTheBootVolume),
+            );
+        }
         if let Some(window) = self.opts.window {
             bridge.simulate_window(window);
         }
@@ -2909,13 +2946,31 @@ impl World {
         (n > 0).then(|| format!("mirror: stopped for its pin {n} times"))
     }
 
-    /// Across every boot, at every step: the node's takes
-    /// named ONE alias key over its whole life, so an edge has one alias on
-    /// the bus; and an engaged mirror's total is never below the highest
-    /// total any pin of the node was written with ([`Device::pin_total`]) —
-    /// whatever a power cut tore or rolled back.
+    /// Across every boot, at every step: every take was answered while the media held a pin of
+    /// this build ([`Device::pin_fenced`], critic item D06), however the loop ordered the pass
+    /// against its deliveries. That is what an open's fence is for: what the media keeps of the
+    /// pin, whatever a power cut does, is this build's. The law judges the media, not each
+    /// open: an open that skipped its fence while an earlier open's fenced pin is still the
+    /// durable one leaves the media as the fence would, so it breaks nothing stated here. It
+    /// counts no send: a slot goes out of a batch a take pinned (`StateDir::set_logpin`, durable
+    /// while the open does not hold the fence) or one recovered from the pin on the state dir,
+    /// so in these worlds, which seed no older build's pin, no send can precede a durable pin
+    /// of this build. D06's review counted such sends over every world of this suite and found
+    /// none, nor any in the world where `Mutant::TakeAheadOfTheFence`, which skips the fence
+    /// on both paths, breaks this law: a count no rule switched off can raise is no law. The
+    /// node's takes named ONE alias key over its whole life, so an edge has
+    /// one alias on the bus; and an engaged mirror's total is never below the highest total any
+    /// pin of the node was written with ([`Device::pin_total`]) — whatever a power cut tore or
+    /// rolled back.
     fn mirror_key_and_total(&self) -> Vec<String> {
         let mut bad = Vec::new();
+        let unfenced = lock(&self.ep.state).takes_unfenced;
+        if unfenced > 0 {
+            bad.push(format!(
+                "mirror fence: {unfenced} take(s) answered while the media held no pin of this \
+                 build: a take ran ahead of its open's durable pin"
+            ));
+        }
         let keys = lock(&self.ep.state).take_keys.clone();
         if keys.len() > 1 {
             bad.push(format!(

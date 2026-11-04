@@ -96,7 +96,7 @@ fn replay(mut bus: CtlStream, script: Vec<Unit>) -> Vec<Unit> {
 
 /// What an AT-SPI publisher does first, the script zbus ran.
 fn client(stream: CtlStream, uid: u32) {
-    let mut conn = Connection::handshake(stream, uid, None).unwrap();
+    let mut conn = Connection::handshake_within(stream, uid, None, HANG).unwrap();
     assert_eq!(conn.unique_name(), ME);
     assert_eq!(conn.server_guid(), "8e4f0c2a1b7d6e5f8e4f0c2a1b7d6e5f");
     conn.add_match(RULE, HANG).unwrap();

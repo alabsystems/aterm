@@ -1996,3 +1996,20 @@ fn this_process_reads_its_start_age_and_executable_on_every_desktop_os() {
         "an unused pid reads None"
     );
 }
+
+/// A running child and this process have not begun to exit, and a pid no process can hold is
+/// no process.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn exiting_reads_a_running_child_and_this_process_as_not_exiting() {
+    let mut child = aterm_uds::spawnfd::command("/bin/sleep")
+        .arg("60")
+        .spawn()
+        .expect("sleep starts");
+    let read = exiting(child.id());
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(read, Some(false), "a running child");
+    assert_eq!(exiting(std::process::id()), Some(false), "this process");
+    assert_eq!(exiting(99_999_999), None, "a pid no process holds");
+}

@@ -107,9 +107,12 @@ one the ALab vault has let in as a member; a fleet, another vault, a join still 
 or the vault answering on the LAN is no such Mac. Elsewhere Mac settings reads Left as
 is until you turn it on, and the sign-outs are left alone. Setup
 starts at once, with no countdown and nothing to confirm, whether or not anyone is at
-the Mac or an aterm window is in front, and after an update too. Only the steps that
-put something in front of you wait for you: the permission pages, the debugger
-question and the Messages and FaceTime sign-outs start
+the Mac or an aterm window is in front, and after an update too. macOS's grants that only a
+person can give (Full Disk Access, Developer Tools, the debugger) never ask by themselves: each
+reads Offered, nothing waits on it, and setup finishes without it. One quiet press at the foot
+of the page, Turn On macOS Access…, asks for them together (a record on this Mac keeps that
+press); `aterm init` and `doctor --apply` never ask macOS for a grant. Once you pressed it, the
+permission pages and the debugger question, like the Messages and FaceTime sign-outs, start
 while System State is in front and you are at the Mac (a key, click or trackpad used
 within the last minute, the screen unlocked), stop waiting when you lock the screen or
 step away, and go on when you come back. Once aterm finds the ALab signal before
@@ -193,8 +196,8 @@ and their kin, in the shells aterm opens, say so and exit instead of raising App
 dialog, whatever you press. For what those shells start with a PATH of its own (an agent's tool
 shell, a `zsh -lc`, a program that runs `/usr/bin/git` by its full path), aterm also names its
 own developer directory in `DEVELOPER_DIR` (never over your own), which Apple's `/usr/bin`
-programs follow; that this keeps their dialog away on a Mac without the tools is not yet
-measured. Apple's dialog can still come from a program with no aterm behind it (an app opened
+programs follow; on a macOS 27 Mac without the tools, `/usr/bin/git` run by its full path in an
+aterm tab answered with aterm's own line and no Apple dialog (2 runs). Apple's dialog can still come from a program with no aterm behind it (an app opened
 from Finder, the Dock or Spotlight, or by `open` in a tab, a login item, a launchd agent,
 another terminal app), one that empties its environment (`env -i`, `sudo`), one running as
 root, and one that sets its own `DEVELOPER_DIR`.
@@ -257,11 +260,12 @@ never moved.
 Only changed preference keys are backed up (no credentials). Restore previous settings
 puts them back, stops automatic setup and turns Mac settings off, leaving cloned repos,
 credentials, sign-outs and aterm's permissions in
-place (its permission steps go on by themselves, also after a Restore or `doctor
---apply` a quit or a crash cut short, which the next launch finishes; after a Restore
-that left no run to carry them, an older aterm's or one pressed before you answered the
-first offer, aterm sets them up with nothing else, at once or at the next launch, and
-restoring an older aterm's finished setup keeps them on; a choice you made after a
+place (the permission steps you asked for with Turn On macOS Access…, or an older aterm's
+setup approved, go on, also after a Restore or `doctor --apply` a quit or a crash cut short,
+which the next launch finishes; after a Restore that left no run to carry them, aterm sets
+them up with nothing else, at once or at the next launch; without either they stay on offer;
+restoring an older
+aterm's finished setup keeps them on; a choice you made after a
 Restore that a quit cut short is offered again at the next launch, never undone);
 turning Mac settings back on sets only its settings, and a Join or a line turned off
 sets none. The Caps Lock key, a scroll direction the Mac had never set,
@@ -793,7 +797,8 @@ THE DOCTOR
   line, an exception or an exit code: asked means the preferred CLI, named by `[ai.<id>]
   use = true` or an `[ai] reviewers` list, a pinned pool row, or actually used here (a
   review, a finished sign-in, a launch, a login in its default home). A roster row is
-  no ask, since the account sheet syncs those onto every Mac (`"asked"` in `--json`).
+  no ask, since rows are synced from the lab's preferences (or the vault's fleet on a Mac the
+  lab does not name), not chosen here (`"asked"` in `--json`).
   `aterm ai doctor` tries aterm's own fixes at a terminal or none, under an agent too,
   and says why any did not finish:
   it installs a CLI that is not installed and signs in through accounts v2's or a
@@ -836,7 +841,8 @@ THE DOCTOR
   not change that.
 
   States: `ok` (used within 6h), `idle` (signed in), `limited` (at a usage limit),
-  `due` (renew by a time it names), `unproven`, `signed-out`, `not-installed`, `off`.
+  `due` (renew by a time it names), `unproven`, `signed-out`, `refused` (its account roster
+  refuses every launch until a person mends it), `not-installed`, `off`.
   aterm never reads or relays credentials, and runs no test prompt on an idle login.
 
 REVIEWS ACROSS AIs
@@ -1310,7 +1316,7 @@ AUTOPILOT — how far the harness carries a session's work
   codex-alab does not tell it shows no hold.
 
   NEEDS YOU: a report line starting `NEEDS YOU: <what only a person can give>` puts an
-  `owner=needs kind=ask` entry on the menu bar (`❯N`) and window border while the
+  `owner=needs kind=ask` entry on the menu bar (`❯`) and window border while the
   agent works on everything else; `NEEDS YOU: nothing`, a `Nothing left:` defense,
   someone else's turn, or Autopilot `off` clears it. The menu bar's row says the
   first need whole and gives the next two a row each one level in (8 such rows in
@@ -1370,7 +1376,8 @@ THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
                                   Code's `accounts.toml`, and `accounts-codex.toml`,
                                   `accounts-grok.toml`, `accounts-kimi.toml`, whose
                                   pools pick a row when aterm starts a session and
-                                  move no running one)
+                                  move no running one but a codex-alab at its weekly
+                                  limit)
   limit_reset [false]             take an eligible limit reset on the usage-limit dialog
   limit_reset_kinds [[]]          which reset kinds `limit_reset` may spend
   usage_tap [true]                pass aterm's status-line tap on Claude Code relaunches;
@@ -1437,9 +1444,10 @@ THE VERBS (`aterm harness --help`; `aterm harness <verb> --help` for one)
   accounts   the Claude Code account pool (`accounts.toml`), sign-ins and renewals, and
              fleet account sync from a source this machine names or keeps in `~/.secrets`
              (`aterm harness accounts --help`); `--cli codex|grok|kimi` is that CLI's pool
-             (`accounts-<cli>.toml`), synced by default from its fleet
-             `~/.secrets/ai-accounts-<cli>.toml` or its column of `ai-accounts.csv`, even
-             where this machine keeps no roster yet (the sync writes it;
+             (`accounts-<cli>.toml`), synced by default from the lab registry where the lab
+             names this Mac (no vault file is read); on any other Mac from
+             `~/.secrets/ai-pool.toml`, else `ai-accounts-<cli>.toml`, else its column of
+             `ai-accounts.csv`, even where this machine keeps no roster yet (the sync writes it;
              `[harness] accounts = "off"` stops that sync); Claude Code's report ends with
              the outlook the footer and Accounts card show (`--json`: `outlook`, and `fresh`
              and `projection` beside each figure)
@@ -1942,7 +1950,8 @@ WHAT HAPPENS
 
   aterm starts `/usr/bin/sudo -k -A` itself on those exact words, with your
   stdin, stdout, stderr and directory, and raises a password sheet on your tab
-  showing them. The operator types the password; it authorizes that one command.
+  showing those words and that folder, where root resolves a relative word (`.`,
+  `./ssh`). The operator types the password; it authorizes that one command.
   You get the command's output and exit code (128+n for a signal). A program name
   is found on your PATH. Your environment is not passed: the command gets sudo's
   own, so name a variable with `/usr/bin/env VAR=value <command>`. For several
@@ -2840,7 +2849,9 @@ PROVISION — make this machine able to publish
       non-zero while one is open.
   aterm ship provision --id <machine-id>
       The same checks, acquiring what `--check` only reports: it runs `targo
-      --unverified verify provision --release`, builds this checkout's
+      --unverified verify provision --release` (OpenSSL 3 for source signing,
+      and the standalone CPython the publication engine runs on, which a
+      release puts first on the engine's PATH), builds this checkout's
       source-signing helper, lays rustup's `trust` link, asks before spending
       one of the five Developer ID slots, and runs `notarytool store-credentials`
       (it prompts for the app-specific password). Once the independent
@@ -2974,7 +2985,7 @@ LOG
     packages.log   the package manager's — 1 MiB, five older copies
 
   TO LOOK AT. What needs a look but not now takes no row from your terminal: it is
-  an entry of the "To look at" list (the menu-bar item shows `❯•`; Settings ▸
+  an entry of the "To look at" list (in the menu-bar item's menu; Settings ▸
   Messages puts them first), each saying why and the one thing to do. Dismiss all
   (menu bar), Dismiss (Settings) or `aterm ctl notice dismiss review` files them in
   messages.log; a filed fact is not raised again for a week (a month for a choice of
@@ -3159,7 +3170,7 @@ const NEEDS_PAGE: &str = r#"needs — what needs you, where it shows, and steppi
 
 WHAT IT IS
   A NEED is a session that requires a person now for something aterm cannot settle on its
-  own. One verdict per session drives the macOS menu bar badge (`❯`), the window border
+  own. One verdict per session drives the macOS menu bar item's menu (`❯`), the window border
   and tab-strip pill, tab marks, optional desktop notifications, and `aterm ctl @<sid>
   status` (`needs=`). Waits (`limit`, `api`, `overloaded`, `memory-restart`, `login`,
   and `entry`, a script's own `kind=wait`) show under ❯ ▸ Waiting and light no need.
@@ -3179,9 +3190,8 @@ THE WORDS
     question   question dialog under the same conditions
 
 THE BADGE, BORDER, PILL AND MARKS
-  * Menu bar (`❯`): `❯` nothing needed; `❯•` items waiting under "To look at" or "Done
-    for you"; `❯N` N active needs across this Mac and recent fleet reads (red if any is
-    stuck).
+  * Menu bar (`❯`): a stable entry to diagnostics whose title never changes; open it to see
+    Needs you and To look at.
   * Window border: red (stuck) or amber (decide) for the window's most pressing
     session (`View ▸ Show Needs in Windows` or `[presence] rim` toggles).
   * Tab-strip pill: unanswered approvals, questions and other direct requests. A

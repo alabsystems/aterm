@@ -11,8 +11,7 @@ notation, §4 lists the tests to trim, §5 the places where an implied spec and 
 disagree, and §6 orders the proofs. The claims come from reading the code.
 
 `tests/support/` is the serde_test token harness: test-only code the tests observe the crate
-through, and no spec is about it. §2 maps every test except
-`derive_input::self_inside_a_type_macro_remains_the_macros_input`.
+through, and no spec is about it. §2 maps every test in the suite.
 
 ## 0. Notation used in the statements
 

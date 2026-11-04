@@ -6384,6 +6384,18 @@ fn the_always_present_host_lines_fit_the_carry_at_their_worst() {
         name_fp: max,
     });
     let detail = "%E9".repeat(16);
+    let mut raw = Vec::new();
+    raw.extend_from_slice(&(max - 2).to_le_bytes());
+    raw.extend_from_slice(&(max - 3).to_le_bytes());
+    raw.push(3);
+    let raw = aterm_codec::base64::encode(&raw).unwrap();
+    let mut vendor = Vec::new();
+    vendor.extend_from_slice(&(max - 1).to_le_bytes());
+    vendor.extend_from_slice(&max.to_le_bytes());
+    vendor.extend_from_slice(&max.to_le_bytes());
+    vendor.extend_from_slice(&u32::MAX.to_le_bytes());
+    vendor.push(5);
+    let vendor = aterm_codec::base64::encode(&vendor).unwrap();
     let worst = format!(
         "tracker run=r4294967295 turn=t4294967295 word=wall:usage-session interrupted=1 \
          step=p4294967295 step_under=1 step_what=wall step_wall=usage-session step_detail={detail} \
@@ -6391,7 +6403,8 @@ fn the_always_present_host_lines_fit_the_carry_at_their_worst() {
          ledger={max} ledger_by={id40} ledger_wall={max} ledger_cause={id40} \
          input_by={id40} input_wall={max} input_cause={id40} \
          tx_fp={max:016x} tx_off={max} tx_id={max:x}:{max:x} tx_v={id40} tx_vt=t4294967295 \
-         tx_ve={max} tx_vp={max} tx_ref=usage-session tx_st=partial tx_ds=1 tx_dr={max} tx_du=1"
+         tx_ve={max} tx_vp={max} tx_ref=usage-session tx_st=partial tx_ds=1 tx_dr={max} tx_du=1 \
+         irq=v raw=t4294967295,{raw} vi={id40},{vendor}"
     );
     let who = [
         aterm_phase::Program::Claude,
@@ -6422,6 +6435,14 @@ fn the_always_present_host_lines_fit_the_carry_at_their_worst() {
         lines
     };
     let lines = always(s);
+    let tracker = lines
+        .iter()
+        .find(|line| line.starts_with("tracker "))
+        .expect("tracker host line");
+    assert!(
+        tracker.contains(" raw=t4294967295,") && tracker.contains(&format!(" vi={id40},")),
+        "the host canary must retain the nonempty maximum-width provenance: {tracker}"
+    );
     let tags = ["journal", "state", "cmd", "fg", "agent", "tracker", "typed"];
     assert_eq!(
         lines

@@ -1660,7 +1660,10 @@ impl super::super::cli::shared_provider::Provider for UnstartedCandidate {
         _: &super::super::cli::shared_provider::Context<'_>,
         _: &Row,
         _: &Path,
-    ) -> Result<Option<Box<dyn super::super::cli::shared_provider::LoginProof>>, String> {
+    ) -> Result<
+        Option<Box<dyn super::super::cli::shared_provider::LoginProof>>,
+        super::super::cli::shared_provider::ObservationError,
+    > {
         panic!("an unstarted provider has no credential to observe")
     }
 }
@@ -2144,9 +2147,16 @@ impl super::super::cli::shared_provider::Provider for ResumableAdoption {
         _: &super::super::cli::shared_provider::Context<'_>,
         _: &Row,
         staging: &Path,
-    ) -> Result<Option<Box<dyn super::super::cli::shared_provider::LoginProof>>, String> {
+    ) -> Result<
+        Option<Box<dyn super::super::cli::shared_provider::LoginProof>>,
+        super::super::cli::shared_provider::ObservationError,
+    > {
         let path = staging.join(".claude.json");
-        let bytes = fs::read(&path).map_err(|error| error.to_string())?;
+        let bytes = fs::read(&path).map_err(|error| {
+            super::super::cli::shared_provider::ObservationError::RecoveryRequired(
+                error.to_string(),
+            )
+        })?;
         Ok(Some(Box::new(RecordedAdoption { path, bytes })))
     }
 }
@@ -2299,7 +2309,10 @@ impl super::super::cli::shared_provider::Provider for ExistingMustUseRenewal {
         _: &super::super::cli::shared_provider::Context<'_>,
         _: &Row,
         _: &Path,
-    ) -> Result<Option<Box<dyn super::super::cli::shared_provider::LoginProof>>, String> {
+    ) -> Result<
+        Option<Box<dyn super::super::cli::shared_provider::LoginProof>>,
+        super::super::cli::shared_provider::ObservationError,
+    > {
         panic!("existing shared row reached first-adoption provider observation")
     }
 }

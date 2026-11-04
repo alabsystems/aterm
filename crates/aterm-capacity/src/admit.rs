@@ -23,9 +23,10 @@
 //! it held every claim behind it. A relief, or any pass that runs while it waits, can remove what
 //! a need was sized on (a run's own build directory, which the run then writes again from
 //! empty): the need sized again after each relief and at the look that admits a claim that
-//! waited ([`Relief::resized`]) re-enters the wait when it grew. SIGINT, SIGTERM or SIGHUP ends the wait within a nap
-//! ([`aterm_toolchain::interrupt`]), as its caller can ([`admit_until`]): the claim leaves the
-//! queue and [`Error::Stopped`] names what it was short of. A need that can never fit
+//! waited ([`Relief::resized`]) re-enters the wait when it grew. SIGINT, SIGTERM or SIGHUP ends the wait within a nap,
+//! `--admit now`'s wait for the ledger's lock included ([`aterm_toolchain::interrupt`]), as its
+//! caller can ([`admit_until`]): the claim leaves the queue and [`Error::Stopped`] names what it
+//! was short of. A need that can never fit
 //! ([`never`]) is refused before it enters. A load-only quiet claim with a [`crate::Patience`] waits for
 //! the load within it: past its reservation age it holds back claimed work that asked after it
 //! ([`Short::Reserved`]), and at its bound it starts whatever the load ([`QuietStart`]).
@@ -90,6 +91,16 @@ impl Default for Pace {
             poll: Duration::from_secs(2),
             line_every: Duration::from_secs(60),
         }
+    }
+}
+
+impl Pace {
+    /// How soon a look that met another admission holding the ledger's lock looks again:
+    /// [`Self::poll`], or 20 ms where that is longer. The lock is held only while one admission
+    /// decides, so this is no wait for capacity.
+    #[must_use]
+    pub fn turn_gap(self) -> Duration {
+        self.poll.min(TURN_GAP)
     }
 }
 
@@ -1130,6 +1141,14 @@ pub struct Claim {
 }
 
 impl Claim {
+    #[cfg(unix)]
+    pub(crate) fn check_cohort_namespace(
+        &self,
+        namespace: &crate::cohort_namespace::Namespace,
+    ) -> io::Result<()> {
+        self.laid.check_cohort_namespace(namespace)
+    }
+
     /// The observed resource-admission CPU interval, not a fresh measurement-entry permit.
     /// # Errors
     /// Missing/forced/adopted provenance, a weak policy, unavailable load, or expired hold.
@@ -2026,14 +2045,25 @@ impl Waiter {
         polled
     }
 
-    /// Admit it at once, room or not (`--admit now`), with what it would have waited for.
+    /// One look under `--admit now`: admit it room or not, with what it would have waited for;
+    /// on a cohort-aware ledger it only polls, so it meets the same checks as any other look.
+    /// Either way it decides only in its turn: while another admission holds the ledger's lock
+    /// it admits nothing and hands the waiter back ([`Forced::Turn`]) to look again, which
+    /// [`admit_with`]'s `now` does every [`Pace::turn_gap`] and the Trust lane's launch gate at
+    /// its next pass.
     ///
     /// # Errors
-    /// The admission lock is busy, or the ledger could not be read or marked admitted.
-    fn force(mut self, machine: &dyn Machine) -> io::Result<(Claim, Option<Shortfall>)> {
+    /// The ledger could not be read or marked admitted; on a cohort-aware ledger, also a look
+    /// short of anything but the ledger's lock.
+    pub fn force(mut self, machine: &dyn Machine) -> io::Result<Forced> {
         if self.ledger.cohort_aware()? {
             return match self.poll_mode(machine, true) {
-                Polled::Admitted(claim) => Ok((claim, None)),
+                Polled::Admitted(claim) => Ok(Forced::Admitted(claim, None)),
+                Polled::Waiting(waiter, short)
+                    if matches!(short.shorts[..], [Short::Turn { .. }]) =>
+                {
+                    Ok(Forced::Turn(waiter, short))
+                }
                 Polled::Waiting(_, short) => Err(io::Error::other(short.to_string())),
                 Polled::Gone(error) => Err(error),
                 Polled::Unqualified(why) => Err(io::Error::other(why)),
@@ -2042,10 +2072,7 @@ impl Waiter {
         let turn = match self.ledger.try_turn()? {
             Ok(turn) => turn,
             Err(holder) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    Short::Turn { holder }.to_string(),
-                ));
+                return Ok(Forced::Turn(self, Shortfall::only(Short::Turn { holder })));
             }
         };
         let asked = Grant {
@@ -2060,7 +2087,7 @@ impl Waiter {
         let polled = self.grant(granted, None, found.cpu, found.load1, true);
         drop(turn);
         match polled {
-            Polled::Admitted(claim) => Ok((claim, would)),
+            Polled::Admitted(claim) => Ok(Forced::Admitted(claim, would)),
             Polled::Waiting(_, short) => Err(io::Error::other(short.to_string())),
             Polled::Gone(e) => Err(e),
             Polled::Unqualified(why) => Err(io::Error::other(why)),
@@ -2111,6 +2138,22 @@ impl Waiter {
         }
         line
     }
+
+    /// What a wait for the ledger's lock alone says, by the wait loop's rule: its line for
+    /// `short` (which names the lock's holder) and how long the lock has kept it, once that is a
+    /// whole [`Pace::line_every`] since `since` (the first look that met the lock) and no line
+    /// was `said` in the last [`Pace::line_every`]; `None` before that.
+    #[must_use]
+    pub fn turn_line(
+        &self,
+        short: &Shortfall,
+        pace: Pace,
+        since: Instant,
+        said: Option<Instant>,
+    ) -> Option<String> {
+        (since.elapsed() >= pace.line_every && said.is_none_or(|t| t.elapsed() >= pace.line_every))
+            .then(|| format!("{}, for {}", self.line(short), span(since.elapsed())))
+    }
 }
 
 /// Whether a wait behind `holders` is stuck: when it names any, and every one is a held claim
@@ -2144,6 +2187,16 @@ struct Found {
     now: u64,
     /// The processes it read: `None` where it read none (no claim ahead, or no sweep).
     procs: Option<Procs>,
+}
+
+/// What one forced look found ([`Waiter::force`]).
+#[derive(Debug)]
+pub enum Forced {
+    /// Admitted, room or not, with what it would have waited for: `None` where it had room.
+    Admitted(Claim, Option<Shortfall>),
+    /// Another admission held the ledger's lock while it decided, so it decided nothing: the
+    /// waiter, still in the queue, and the short that names that lock's holder.
+    Turn(Waiter, Shortfall),
 }
 
 /// Why [`admit`] admitted nothing.
@@ -2290,10 +2343,11 @@ impl Relief for NoRelief {
 }
 
 /// Admit `need` in `ledger` on `machine`: resource-only admission refuses a need that can never
-/// fit under `wait`, starts at once under `now`, or waits for room. Timing instead requires
-/// qualifying CPU/load and refuses overrides. Say what it is short of and who holds it at the
-/// first look and every [`Pace::line_every`] after. A wait only for the ledger's lock is said
-/// once one holder has kept it a whole [`Pace::line_every`], naming that holder.
+/// fit under `wait`, starts under `now` as soon as no other admission holds the ledger's lock,
+/// or waits for room. Timing instead requires qualifying CPU/load and refuses overrides. Say what
+/// it is short of and who holds it at the first look and every [`Pace::line_every`] after. A wait
+/// only for the ledger's lock, under either, is said once one holder has kept it a whole
+/// [`Pace::line_every`], naming that holder.
 ///
 /// # Errors
 /// As [`admit`].
@@ -2335,8 +2389,9 @@ pub fn admit_relieved(
 }
 
 /// [`admit_with`], its wait ended by `stopped` too (an interrupt its caller caught before the
-/// wait began), which it asks before each look and through each nap: the claim then leaves the
-/// queue, and [`Error::Stopped`] names what it was short of.
+/// wait began), which it asks before each look and through each nap (under `now`, through each
+/// nap after a look that met the ledger's lock): the claim then leaves the queue, and
+/// [`Error::Stopped`] names what it was short of.
 ///
 /// # Errors
 /// As [`admit`], and [`Error::Stopped`].
@@ -2366,7 +2421,9 @@ pub fn admit_until(
 /// ([`aterm_toolchain::interrupt::Watch`]): the wait ends within [`aterm_toolchain::interrupt::NAP`]
 /// of one, and one that came during the look that admitted it ends it all the same. A need that
 /// asks to ([`Need::ends_when_stuck`]) ends at the look its waiter believes stuck
-/// ([`Waiter::stuck`]), whatever that look is short of.
+/// ([`Waiter::stuck`]), whatever that look is short of. Under `now` it waits only for the
+/// ledger's lock, holding a watch from the first look that met it, so an interrupt or `stopped`
+/// ends that wait the same way.
 #[expect(
     clippy::too_many_arguments,
     reason = "admission's six, the relief that frees room and the interrupt that ends its wait"
@@ -2414,7 +2471,52 @@ fn admit_waiting(
     // When it first entered: a need entered again keeps it, so its wait counts from there.
     let first = waiter.since;
     if mode == Admit::Now {
-        let (claim, would) = waiter.force(machine).map_err(Error::Ledger)?;
+        // It overrides room, never the ledger's lock: one that meets another admission deciding
+        // (a verify run admits several stages at once) waits its turn as the wait loop does,
+        // saying so by the same rule. That wait holds a watch from the first look that met the
+        // lock, so an interrupt or `stopped` ends it as either ends a wait for room, and one that
+        // came during the look that then admitted it ends it all the same. A look that had its
+        // turn at once holds none: an interrupt during it reaches the process's own handling.
+        let mut turn: Option<(aterm_toolchain::interrupt::Watch, Instant)> = None;
+        let mut said: Option<Instant> = None;
+        let mut last: Option<Shortfall> = None;
+        let (claim, would) = loop {
+            match waiter.force(machine).map_err(Error::Ledger)? {
+                Forced::Admitted(claim, would) => {
+                    if let Some((watch, _)) = &turn {
+                        let signal = watch.take();
+                        if signal.is_some() || stopped() {
+                            drop(claim);
+                            return Err(Error::Stopped {
+                                signal,
+                                short: last,
+                            });
+                        }
+                    }
+                    break (claim, would);
+                }
+                Forced::Turn(w, short) => {
+                    let (watch, since) = turn.get_or_insert_with(|| {
+                        (aterm_toolchain::interrupt::Watch::enter(), Instant::now())
+                    });
+                    if let Some(line) = w.turn_line(&short, pace, *since, said) {
+                        say(&line);
+                        said = Some(Instant::now());
+                    }
+                    watch.nap(pace.turn_gap(), stopped);
+                    let signal = watch.take();
+                    if signal.is_some() || stopped() {
+                        drop(w);
+                        return Err(Error::Stopped {
+                            signal,
+                            short: Some(short),
+                        });
+                    }
+                    waiter = w;
+                    last = Some(short);
+                }
+            }
+        };
         match (refused, would) {
             (Some(why), _) => {
                 say(&format!(
@@ -2534,21 +2636,15 @@ fn admit_waiting(
             Polled::Waiting(w, short) if matches!(short.shorts[..], [Short::Turn { .. }]) => {
                 waited = true;
                 let since = *turn_since.get_or_insert_with(Instant::now);
-                if since.elapsed() >= pace.line_every
-                    && said.is_none_or(|t| t.elapsed() >= pace.line_every)
-                {
-                    say(&format!(
-                        "{}, for {}",
-                        w.line(&short),
-                        span(since.elapsed())
-                    ));
+                if let Some(line) = w.turn_line(&short, pace, since, said) {
+                    say(&line);
                     said = Some(Instant::now());
                 }
                 waiter = w;
                 if last.is_none() {
                     last = Some(short);
                 }
-                nap(pace.poll.min(TURN_GAP));
+                nap(pace.turn_gap());
             }
             Polled::Waiting(w, short)
                 if relieve_now(sized_for.as_deref(), unservable, &short)

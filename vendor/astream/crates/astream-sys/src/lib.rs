@@ -73,7 +73,9 @@
 //!   `SIGHUP` disposition.
 //! - The owner-only file rule: [`open_nonblocking`] opens a path read-only and
 //!   without waiting (`O_NONBLOCK`, so a FIFO opens at once), following or refusing a
-//!   link at its last component (`O_NOFOLLOW`); [`owner_private`] and
+//!   link at its last component (`O_NOFOLLOW`), and [`open_nonblocking_rw`] the same
+//!   way for reading and writing, writing nothing, so a check is refused where a writer
+//!   in place would be; [`owner_private`] and
 //!   [`owner_private_dir`] judge the open descriptor: the kind asked for (a regular
 //!   file, a directory), owned by [`euid`], no group or other permission bit, and on
 //!   macOS no access-list entry that allows anyone anything (`acl_get_fd_np`), because
@@ -92,7 +94,8 @@
 //! (`cfg(unix)`): `geteuid` behind [`euid`] and [`owner_private`], and on Apple
 //! `acl_get_fd_np`, `acl_get_entry`, `acl_get_tag_type` and `acl_free` behind
 //! [`owner_private`] and [`owner_private_dir`]; the per-OS `O_NONBLOCK` and
-//! `O_NOFOLLOW` numbers [`open_nonblocking`] passes to safe `std` live there too.
+//! `O_NOFOLLOW` numbers [`open_nonblocking`] and [`open_nonblocking_rw`] pass to safe
+//! `std` live there too.
 //! `file_identity` (`cfg(windows)`) reads the kernel's volume and file index for
 //! [`file_matches_path`], so a path replacement is never judged by size or time.
 //! Nothing else here may use `unsafe` — the compiler refuses it — and no errno or raw
@@ -176,6 +179,30 @@ macro_rules! apple_ffi {
         // async-signal-safe `extern "C" fn(c_int)` that only performs an atomic fetch_add.
         unsafe { signal($sig, $handler) }
     };
+}
+
+/// Evaluates `$call` until it answers anything but `EINTR`
+/// ([`io::ErrorKind::Interrupted`]): the retry every flush of the cordon makes, so an
+/// interrupted flush is never reported as a failed one.
+#[cfg(any(test, target_vendor = "apple"))]
+macro_rules! retried_on_eintr {
+    ($call:expr) => {{
+        loop {
+            let step: ::std::io::Result<()> = $call;
+            match step {
+                Err(e) if crate::is_eintr(&e) => {}
+                answer => break answer,
+            }
+        }
+    }};
+}
+
+#[cfg(target_vendor = "apple")]
+pub(crate) use retried_on_eintr;
+
+#[cfg(any(test, target_vendor = "apple"))]
+pub(crate) fn is_eintr(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::Interrupted
 }
 
 #[cfg(target_vendor = "apple")]
@@ -484,19 +511,6 @@ pub fn plain_fsync(file: &File) -> io::Result<()> {
     }
 }
 
-/// `call` until it answers anything but `EINTR` ([`io::ErrorKind::Interrupted`]): the
-/// retry every flush of the cordon makes, so an interrupted flush is never reported as
-/// a failed one.
-#[cfg(any(test, target_vendor = "apple"))]
-fn retried_on_eintr(mut call: impl FnMut() -> io::Result<()>) -> io::Result<()> {
-    loop {
-        match call() {
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            answer => return answer,
-        }
-    }
-}
-
 /// The [`full_sync`] and [`full_sync_data`] calls this process has made ([`flush_tally`]).
 static FULL_FLUSHES: AtomicU64 = AtomicU64::new(0);
 
@@ -799,6 +813,94 @@ pub fn parse_boot_id(raw: &[u8]) -> Option<[u8; 16]> {
 /// does not.
 pub const KERNEL_SPELLS_BOOT_ID_LOWER: bool = cfg!(any(target_os = "linux", target_os = "android"));
 
+const fn nibble_hex_char(nibble: u8, lower: bool) -> char {
+    match nibble & 0x0F {
+        0 => '0',
+        1 => '1',
+        2 => '2',
+        3 => '3',
+        4 => '4',
+        5 => '5',
+        6 => '6',
+        7 => '7',
+        8 => '8',
+        9 => '9',
+        10 => {
+            if lower {
+                'a'
+            } else {
+                'A'
+            }
+        }
+        11 => {
+            if lower {
+                'b'
+            } else {
+                'B'
+            }
+        }
+        12 => {
+            if lower {
+                'c'
+            } else {
+                'C'
+            }
+        }
+        13 => {
+            if lower {
+                'd'
+            } else {
+                'D'
+            }
+        }
+        14 => {
+            if lower {
+                'e'
+            } else {
+                'E'
+            }
+        }
+        _ => {
+            if lower {
+                'f'
+            } else {
+                'F'
+            }
+        }
+    }
+}
+
+const fn byte_hex_pair(byte: u8, lower: bool) -> (char, char) {
+    (
+        nibble_hex_char(byte >> 4, lower),
+        nibble_hex_char(byte & 0x0F, lower),
+    )
+}
+
+const fn boot_id_chars(id: [u8; 16], lower: bool) -> [char; 36] {
+    let [b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15] = id;
+    let (h0, l0) = byte_hex_pair(b0, lower);
+    let (h1, l1) = byte_hex_pair(b1, lower);
+    let (h2, l2) = byte_hex_pair(b2, lower);
+    let (h3, l3) = byte_hex_pair(b3, lower);
+    let (h4, l4) = byte_hex_pair(b4, lower);
+    let (h5, l5) = byte_hex_pair(b5, lower);
+    let (h6, l6) = byte_hex_pair(b6, lower);
+    let (h7, l7) = byte_hex_pair(b7, lower);
+    let (h8, l8) = byte_hex_pair(b8, lower);
+    let (h9, l9) = byte_hex_pair(b9, lower);
+    let (h10, l10) = byte_hex_pair(b10, lower);
+    let (h11, l11) = byte_hex_pair(b11, lower);
+    let (h12, l12) = byte_hex_pair(b12, lower);
+    let (h13, l13) = byte_hex_pair(b13, lower);
+    let (h14, l14) = byte_hex_pair(b14, lower);
+    let (h15, l15) = byte_hex_pair(b15, lower);
+    [
+        h0, l0, h1, l1, h2, l2, h3, l3, '-', h4, l4, h5, l5, '-', h6, l6, h7, l7, '-', h8, l8, h9,
+        l9, '-', h10, l10, h11, l11, h12, l12, h13, l13, h14, l14, h15, l15,
+    ]
+}
+
 /// A boot id as text, the inverse of [`parse_boot_id`]: its 32 hex digits hyphenated
 /// 8-4-4-4-12, the kernel's own form, lower-case when `lower` and upper-case otherwise.
 /// [`KERNEL_SPELLS_BOOT_ID_LOWER`] is the case this host's kernel answers in, so
@@ -807,21 +909,7 @@ pub const KERNEL_SPELLS_BOOT_ID_LOWER: bool = cfg!(any(target_os = "linux", targ
 /// `parse_boot_id(boot_id_text(id, lower).as_bytes()) == Some(id)`, in either case.
 #[must_use]
 pub fn boot_id_text(id: [u8; 16], lower: bool) -> String {
-    let digits: &[u8; 16] = if lower {
-        b"0123456789abcdef"
-    } else {
-        b"0123456789ABCDEF"
-    };
-    let mut text = String::with_capacity(36);
-    for (at, byte) in id.into_iter().enumerate() {
-        if matches!(at, 4 | 6 | 8 | 10) {
-            text.push('-');
-        }
-        for nibble in [byte >> 4, byte & 0x0F] {
-            text.push(char::from(digits[usize::from(nibble)]));
-        }
-    }
-    text
+    String::from_iter(boot_id_chars(id, lower))
 }
 
 /// This process's effective user id: the owner [`owner_private`] holds a file to.
@@ -860,6 +948,27 @@ pub enum Links {
 /// opened without them. Off Unix, a plain read-only open: there is no FIFO to wait
 /// on, and `links` is not judged.
 pub fn open_nonblocking(path: &std::path::Path, links: Links) -> io::Result<File> {
+    open_flagged(path, links, false)
+}
+
+/// [`open_nonblocking`] for READING AND WRITING (`O_RDWR | O_NONBLOCK`), which writes
+/// nothing itself: the access an open that will write in place asks for, so a file
+/// that open would be refused (its mode, its owner, an immutable flag, an access-list
+/// entry that denies the write, a read-only volume) is refused here the same way,
+/// while one it would take opens without a byte changed. A FIFO opens at once, as it
+/// does read-only.
+///
+/// # Errors
+///
+/// As [`open_nonblocking`], the open's own error for the write access included
+/// (`PermissionDenied` for the mode, `EPERM` for an immutable flag, `EROFS`,
+/// `EISDIR` for a directory, which no read-write open takes). Off Unix, a plain
+/// read-write open.
+pub fn open_nonblocking_rw(path: &std::path::Path, links: Links) -> io::Result<File> {
+    open_flagged(path, links, true)
+}
+
+fn open_flagged(path: &std::path::Path, links: Links, write: bool) -> io::Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -875,13 +984,17 @@ pub fn open_nonblocking(path: &std::path::Path, links: Links) -> io::Result<File
         };
         std::fs::OpenOptions::new()
             .read(true)
+            .write(write)
             .custom_flags(flags)
             .open(path)
     }
     #[cfg(not(unix))]
     {
         let _ = links;
-        File::open(path)
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(write)
+            .open(path)
     }
 }
 
@@ -1359,7 +1472,7 @@ mod tests {
         };
         assert_eq!(interrupted().kind(), io::ErrorKind::Interrupted);
         let mut calls = 0;
-        retried_on_eintr(|| {
+        retried_on_eintr!({
             calls += 1;
             if calls < 3 {
                 Err(interrupted())
@@ -1370,7 +1483,7 @@ mod tests {
         .expect("the third call succeeded");
         assert_eq!(calls, 3, "each EINTR is retried");
         let mut calls = 0;
-        let failed = retried_on_eintr(|| {
+        let failed = retried_on_eintr!({
             calls += 1;
             if calls < 2 {
                 Err(interrupted())

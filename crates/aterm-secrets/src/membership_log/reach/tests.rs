@@ -88,8 +88,8 @@ fn has(set: &[u64], a: usize) -> bool {
 }
 
 /// How many of the index's answers differ from the walk's: every `before` and `upto` pair, each
-/// row copied and unioned over a set that starts full of another row, `in_past_of` and
-/// `past_intersects` probes, and closures of a few roots.
+/// row unioned into an empty set and into another record's closure, `in_past_of` probes, and
+/// closures of a few roots.
 pub(in crate::membership_log) fn disagreements(
     past: &[Vec<bool>],
     reach: &Reach,
@@ -104,20 +104,16 @@ pub(in crate::membership_log) fn disagreements(
             wrong += usize::from(reach.upto(a, b) != (a == b || earlier));
         }
         wrong += usize::from(reach.before(b, n) || reach.upto(n, n));
-        let mut copy = vec![u64::MAX; words];
-        reach.copy_past_into(b, &mut copy);
-        wrong += (0..n).filter(|&a| has(&copy, a) != row[a]).count();
+        let mut alone = vec![0; words];
+        reach.union_past_into(b, &mut alone);
+        wrong += (0..n).filter(|&a| has(&alone, a) != row[a]).count();
         let other = rng.below(n);
-        let mut union = vec![0; words];
-        reach.copy_past_into(other, &mut union);
+        let mut union = reach.closure([other]);
         reach.union_past_into(b, &mut union);
         wrong += (0..n)
-            .filter(|&a| has(&union, a) != (row[a] || past[other][a]))
+            .filter(|&a| has(&union, a) != (row[a] || a == other || past[other][a]))
             .count();
         let probe = rng.below(n);
-        let mut one = vec![0; words];
-        one[probe / 64] |= 1 << (probe % 64);
-        wrong += usize::from(reach.past_intersects(b, &one) != row[probe]);
         let after: Vec<usize> = (0..1 + rng.below(3)).map(|_| rng.below(n)).collect();
         let want = after.iter().any(|&p| p == probe || past[p][probe]);
         wrong += usize::from(reach.in_past_of(probe, &after) != want);
@@ -219,4 +215,69 @@ fn clones_share_their_chunks_and_an_append_copies_at_most_one() {
     clone.push([191]);
     assert_eq!(clone.cost.chunk_copies, 0, "a new chunk copies nothing");
     assert!((0..3).all(|c| clone.shares_chunk(&original, c)));
+}
+
+/// The row words a closure of `roots` ORs, and the set it gives.
+fn closure_cost(reach: &Reach, roots: &[usize]) -> (usize, Vec<u64>) {
+    CLOSURE_ORS.set(0);
+    let set = reach.closure(roots.iter().copied());
+    (CLOSURE_ORS.get(), set)
+}
+
+/// A closure ORs one row for each distinct root that lies in no other root's past: 4,096 copies
+/// of a chain's head, or every record of the chain listed lowest first, cost the head's 64 words
+/// alone, and on 200 seeded histories a few random roots, repeated, cost the rows of those no
+/// other root follows, while every closure answers what the walk does.
+/// NEGATIVE CONTROL: a closure that unions every root's row reads the head's row once per copy.
+#[test]
+fn a_closure_reads_one_row_for_each_root_no_other_root_follows() {
+    let n: usize = 4_096;
+    let chain: Vec<Vec<usize>> = (0..n)
+        .map(|i| i.checked_sub(1).into_iter().collect())
+        .collect();
+    let reach = indexed(&chain);
+    let head = n - 1;
+    let row = head.div_ceil(64);
+    assert_eq!(row, 64);
+    let repeats = vec![head; n];
+    let every: Vec<usize> = (0..n).collect();
+    for roots in [&repeats, &every] {
+        let (ors, set) = closure_cost(&reach, roots);
+        assert_eq!(ors, row);
+        assert!((0..n).all(|a| has(&set, a)));
+    }
+    MUTANT.set(Some(Mutant::UnionEveryRoot));
+    let (ors, _) = closure_cost(&reach, &repeats);
+    MUTANT.set(None);
+    assert_eq!(ors, n * row, "unioning every root goes unnoticed");
+
+    let mut uncovered = 0;
+    for seed in 1..=200 {
+        let parents = random_parents(seed);
+        let past = walked(&parents);
+        let reach = indexed(&parents);
+        let mut rng = Rng(seed);
+        let n = parents.len();
+        let picked: Vec<usize> = (0..1 + rng.below(6)).map(|_| rng.below(n)).collect();
+        let roots: Vec<usize> = picked.iter().flat_map(|&r| [r, r]).collect();
+        let tops: std::collections::BTreeSet<usize> = picked
+            .iter()
+            .copied()
+            .filter(|&r| !picked.iter().any(|&other| past[other][r]))
+            .collect();
+        uncovered += tops.len();
+        let (ors, set) = closure_cost(&reach, &roots);
+        assert_eq!(
+            ors,
+            tops.iter().map(|&r| r.div_ceil(64)).sum::<usize>(),
+            "seed {seed}"
+        );
+        let held = |a: usize| picked.iter().any(|&r| r == a || past[r][a]);
+        let wrong = (0..n).filter(|&a| has(&set, a) != held(a)).count();
+        assert_eq!(wrong, 0, "seed {seed}");
+    }
+    assert!(
+        uncovered > 200,
+        "some histories had several roots no other followed"
+    );
 }

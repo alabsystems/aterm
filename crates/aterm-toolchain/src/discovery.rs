@@ -339,7 +339,12 @@ pub fn store_stage2_bin(prefix: &Path) -> PathBuf {
 
 const STORE_CHANNEL: &str = "trust";
 
+#[cfg(not(test))]
 const DATE_PROBE_BOUND: Duration = Duration::from_secs(5);
+/// A unit test's drivers are stand-ins that print and exit: their answer must come, so the
+/// probe waits on the hang detector.
+#[cfg(test)]
+const DATE_PROBE_BOUND: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 /// A rustup `trust` toolchain ranked below the `atpkg` store because its `commit-date` is older
 /// than the store build's.
@@ -2024,7 +2029,7 @@ mod tests {
                 "-c",
                 "dd if=/dev/zero bs=1024 count=64 2>/dev/null | tr '\\0' x",
             ],
-            Duration::from_secs(5),
+            aterm_spec::wait::MUST_HAPPEN,
         );
         assert_eq!(exact.as_ref().map(String::len), Some(64 << 10));
         let over = bounded_stdout(
@@ -2033,7 +2038,7 @@ mod tests {
                 "-c",
                 "dd if=/dev/zero bs=1024 count=65 2>/dev/null | tr '\\0' x",
             ],
-            Duration::from_secs(5),
+            aterm_spec::wait::MUST_HAPPEN,
         );
         assert_eq!(over, None);
     }

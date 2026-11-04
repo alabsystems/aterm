@@ -87,6 +87,7 @@ impl Grant {
     /// The grant `nonce`'s file holds, or `None` for anything that is not one agh wrote:
     /// not JSON, another `v`, a field missing or of the wrong type, or a slug that does not
     /// parse.
+    #[cfg(any(unix, test, debug_assertions))]
     fn from_json(nonce: &str, bytes: &[u8]) -> Option<Grant> {
         let value: aterm_json::Value = aterm_json::from_slice(bytes).ok()?;
         if value.get("v")?.as_u64()? != 1 {

@@ -41,8 +41,10 @@ aterm secrets: one credentials file for every machine (aterm help secrets).
                                          need retire <want|id> [--declined] [--note <text>]
                                          withdraws or declines one, need pass runs this
                                          machine's pass now (aterm secrets need --help)
-  aterm secrets git-credential [--dev-user <login>] [<op>]
-                                         git's credential helper over ~/.secrets
+  aterm secrets git-credential [--dev-user <login>] [--token-file <path> [--token-key <name>]] [<op>]
+                                         git's credential helper over ~/.secrets (or, for
+                                         the dev token, the file --token-file names and, in
+                                         it, the <name>= line --token-key names)
 admin (a machine in [admins]):
   aterm secrets create <url>|<path> [--import <dir>] [--name <host>]
         [--no-agent] [--serve]           a new open vault (at a <url> a machine is let in by
@@ -96,12 +98,12 @@ admin (a machine in [admins]):
                                          a full age key can name a device already removed
   aterm secrets admins add|remove <host|code>   (remove also rotates the vault key)
   aterm secrets rotate-key               sign with a new vault key the current one endorses
-  aterm secrets commons init             initialize Commons on this existing vault, sharing its
-                                         control descriptor with every current vault machine
-                                         and approving each one with no admission record;
-                                         retries finish the same network and never replace a root;
-                                         an open vault's only admin founds it by itself, with
-                                         the vault's open policy as each machine's approval
+  aterm secrets commons init             establish an initial Commons foundation, or finish its
+                                         setup on the same root; an existing access failure
+                                         is inspected with commons restore
+  aterm secrets commons restore          inspect a recovery plan for the existing published root;
+        [--expect <plan-digest>]          with its exact digest, restore control access for eligible
+                                         existing members, preserving history and explicit denials
   aterm secrets genesis <file>           ALab's admin, once, with a released aterm: sign
                                          Genesis v2 (every [machines] key, with its Commons
                                          binding where Commons holds one) into a new <file>;
@@ -218,6 +220,10 @@ enum Command {
     Get(String),
     GitCredential {
         dev_user: Option<String>,
+        /// The dev token's file in place of `~/.secrets/gh_access_token` (absolute).
+        token_file: Option<std::path::PathBuf>,
+        /// The `<name>=` line of `token_file` that holds the token.
+        token_key: Option<String>,
         operation: Option<String>,
     },
     Create {
@@ -262,6 +268,9 @@ enum Command {
     },
     RotateKey,
     CommonsInit,
+    CommonsRestore {
+        expected: Option<[u8; 32]>,
+    },
     Genesis(String),
     Serve(Vec<String>),
     Agent {
@@ -781,21 +790,42 @@ fn parse(words: &[String]) -> Result<Command, String> {
             }
         }
         "git-credential" => {
-            let f = flags(rest, &["--dev-user"], &[])?;
+            let f = flags(rest, &["--dev-user", "--token-file", "--token-key"], &[])?;
             if f.operands.len() > 1 {
                 return Err("git-credential takes at most one operation".into());
             }
-            let dev_users = f.all("--dev-user");
-            if dev_users.len() > 1 {
-                return Err("git-credential takes at most one --dev-user".into());
+            for flag in ["--dev-user", "--token-file", "--token-key"] {
+                if f.all(flag).len() > 1 {
+                    return Err(format!("git-credential takes at most one {flag}"));
+                }
             }
-            if let Some(user) = dev_users.first()
-                && !is_github_login(user)
+            let dev_user = f.one("--dev-user");
+            if dev_user
+                .as_deref()
+                .is_some_and(|user| !is_github_login(user))
             {
                 return Err("git-credential --dev-user takes a GitHub login".into());
             }
+            let token_file = f.one("--token-file").map(std::path::PathBuf::from);
+            if token_file
+                .as_deref()
+                .is_some_and(|file| !file.is_absolute())
+            {
+                return Err("git-credential --token-file takes an absolute path".into());
+            }
+            let token_key = f.one("--token-key");
+            if let Some(key) = &token_key {
+                if token_file.is_none() {
+                    return Err("git-credential --token-key reads the --token-file it names".into());
+                }
+                if !crate::token_line::assignable(key) {
+                    return Err("git-credential --token-key takes an assignment name".into());
+                }
+            }
             Ok(Command::GitCredential {
-                dev_user: dev_users.into_iter().next(),
+                dev_user,
+                token_file,
+                token_key,
                 operation: f.operands.first().cloned(),
             })
         }
@@ -984,10 +1014,23 @@ fn parse(words: &[String]) -> Result<Command, String> {
             Ok(Command::RotateKey)
         }
         "commons" => {
-            let f = flags(rest, &[], &[])?;
+            let f = flags(rest, &["--expect"], &[])?;
             match f.operands.as_slice() {
-                [verb] if verb == "init" => Ok(Command::CommonsInit),
-                _ => Err("commons takes init".into()),
+                [verb] if verb == "init" && f.one("--expect").is_none() => Ok(Command::CommonsInit),
+                [verb] if verb == "restore" && f.all("--expect").len() <= 1 => {
+                    let expected = f
+                        .one("--expect")
+                        .map(|text| {
+                            aterm_codec::hex::decode_vec(text.as_bytes())
+                                .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+                                .ok_or_else(|| {
+                                    "--expect requires a 64-digit plan digest".to_owned()
+                                })
+                        })
+                        .transpose()?;
+                    Ok(Command::CommonsRestore { expected })
+                }
+                _ => Err("commons takes init or restore [--expect <plan-digest>]".into()),
             }
         }
         "genesis" => {
@@ -1116,10 +1159,19 @@ mod unix {
     pub(super) fn run(command: Command) -> crate::Result<ExitCode> {
         if let Command::GitCredential {
             dev_user,
+            token_file,
+            token_key,
             operation,
         } = command
         {
-            return git_credential(dev_user.as_deref(), operation.as_deref());
+            let dev = match &token_file {
+                Some(file) => DevToken::File {
+                    file,
+                    key: token_key.as_deref(),
+                },
+                None => DevToken::Vault,
+            };
+            return git_credential(dev_user.as_deref(), &dev, operation.as_deref());
         }
         let paths = Paths::live()?;
         let state = || service::state(&paths.home, Job::Subscriber);
@@ -1264,6 +1316,51 @@ mod unix {
                 );
                 if !done.approved.is_empty() {
                     println!("approved for Commons: {}", done.approved.join(", "));
+                }
+                Ok(ExitCode::SUCCESS)
+            }
+            Command::CommonsRestore { expected } => {
+                let hex = aterm_codec::hex::encode_lower;
+                if let Some(expected) = expected {
+                    let done = client::restore_commons_control(&paths, &expected)?;
+                    println!(
+                        "{}",
+                        aterm_json::json!({
+                            "schema": 1, "kind": "commons-control-recovery",
+                            "scope": "local-committed-state", "changed": done.changed,
+                            "network_id": hex(&done.trust.network),
+                            "authority": hex(&done.trust.authority), "genesis": hex(&done.trust.genesis),
+                            "epoch": hex(&done.epoch), "recipients": done.recipients,
+                            "convergence_verified": false,
+                        })
+                    );
+                } else {
+                    let plan = client::plan_commons_control_recovery(&paths)?;
+                    println!(
+                        "{}",
+                        aterm_json::json!({
+                            "schema": 1, "kind": "commons-control-recovery-plan",
+                            "scope": "authenticated-local-snapshot", "plan_digest": hex(&plan.digest),
+                            "network_id": hex(&plan.trust.network),
+                            "authority": hex(&plan.trust.authority), "genesis": hex(&plan.trust.genesis),
+                            "vault_version": plan.vault_version, "current_epoch": hex(&plan.current_epoch),
+                            "needed": plan.needed, "published_descriptor": plan.published_descriptor,
+                            "record_capacity": {
+                                "held_records": plan.record_capacity.current.held(),
+                                "additional_records": plan.record_capacity.additional.held(),
+                                "required_records": plan.record_capacity.current.plus(plan.record_capacity.additional).held(),
+                                "held_limit": plan.record_capacity.budgets.held,
+                                "weighed_records": plan.record_capacity.current.weighed,
+                                "weighed_limit": plan.record_capacity.budgets.weighed,
+                                "keyed_records": plan.record_capacity.current.keyed,
+                                "keyed_limit": plan.record_capacity.budgets.keyed,
+                                "exceeded": plan.record_capacity.exceeded.map(|budget| budget.counts()),
+                            },
+                            "recipients": plan.recipients.iter().map(|target| aterm_json::json!({
+                                "recipient": target.recipient, "label": target.label, "restored": target.restored,
+                            })).collect::<Vec<_>>(),
+                        })
+                    );
                 }
                 Ok(ExitCode::SUCCESS)
             }
@@ -2391,10 +2488,27 @@ mod unix {
     const VAULT_RECORD_MAX: usize = 4 * 1024;
     const INIT_TOML_MAX: usize = 64 * 1024;
 
-    /// `aterm secrets git-credential [--dev-user <login>] [<op>]`: git's credential helper over
-    /// `~/.secrets`. Answers on `get` only; `store`, `erase` and unknown operations write nothing
-    /// and exit 0.
-    fn git_credential(dev_user: Option<&str>, operation: Option<&str>) -> crate::Result<ExitCode> {
+    /// Where `aterm secrets git-credential` reads the dev token.
+    #[derive(Debug, Clone, Copy)]
+    pub(super) enum DevToken<'a> {
+        /// The vault's `~/.secrets/gh_access_token`.
+        Vault,
+        /// `--token-file`, the whole file or (`--token-key`) its `<key>=` line.
+        File {
+            file: &'a Path,
+            key: Option<&'a str>,
+        },
+    }
+
+    /// `aterm secrets git-credential [--dev-user <login>] [--token-file <path> [--token-key
+    /// <name>]] [<op>]`: git's credential helper over `~/.secrets`, the dev token read from
+    /// `dev`. Answers on `get` only; `store`, `erase` and unknown operations write nothing and
+    /// exit 0.
+    fn git_credential(
+        dev_user: Option<&str>,
+        dev: &DevToken<'_>,
+        operation: Option<&str>,
+    ) -> crate::Result<ExitCode> {
         let stdin = std::io::stdin();
         let is_terminal = stdin.is_terminal();
         let home = aterm_types::dirs::home_dir();
@@ -2403,6 +2517,7 @@ mod unix {
             home.as_deref(),
             xdg_config.as_deref(),
             dev_user,
+            dev,
             operation,
             is_terminal,
             &mut stdin.lock(),
@@ -2421,6 +2536,7 @@ mod unix {
         home: Option<&Path>,
         xdg_config_home: Option<&Path>,
         dev_user: Option<&str>,
+        dev: &DevToken<'_>,
         operation: Option<&str>,
         is_terminal: bool,
         input: &mut dyn Read,
@@ -2472,7 +2588,7 @@ mod unix {
             };
         }
         if username.is_none_or(|u| u.is_empty() || u.eq_ignore_ascii_case("x-access-token")) {
-            let Some(token) = read_credential_token(&home.join(DEV_TOKEN_FILE)) else {
+            let Some(token) = read_dev_token(home, dev) else {
                 return SecretBytes::new(CREDENTIAL_QUIT.to_vec());
             };
             let out_user = match username.filter(|u| !u.is_empty()) {
@@ -2486,7 +2602,7 @@ mod unix {
         if !is_github_login(requested) {
             return SecretBytes::new(Vec::new());
         }
-        let token = read_credential_token(&home.join(DEV_TOKEN_FILE));
+        let token = read_dev_token(home, dev);
         let known = known_dev_login(
             home,
             xdg_config_home,
@@ -2563,7 +2679,32 @@ mod unix {
         let raw = fsx::read_private(path, CREDENTIAL_TOKEN_MAX)
             .ok()
             .flatten()?;
-        let trimmed = raw.as_slice().trim_ascii();
+        graphic_token(raw.as_slice())
+    }
+
+    /// The dev token `dev` names: the vault's file under `home`, or the `--token-file`, whole
+    /// or its `--token-key` line ([`crate::token_line::assigned`]); `None` where it is missing,
+    /// loose, symlinked, not one graphic token, or (a key) assigned other than once.
+    fn read_dev_token(home: &Path, dev: &DevToken<'_>) -> Option<SecretBytes> {
+        match dev {
+            DevToken::Vault => read_credential_token(&home.join(DEV_TOKEN_FILE)),
+            DevToken::File { file, key: None } => read_credential_token(file),
+            DevToken::File {
+                file,
+                key: Some(key),
+            } => {
+                let raw = fsx::read_private(file, CREDENTIAL_INPUT_MAX)
+                    .ok()
+                    .flatten()?;
+                let text = std::str::from_utf8(raw.as_slice()).ok()?;
+                graphic_token(crate::token_line::assigned(text, key).ok()?.as_bytes())
+            }
+        }
+    }
+
+    /// `raw`, trimmed, when it is one token of graphic ASCII.
+    fn graphic_token(raw: &[u8]) -> Option<SecretBytes> {
+        let trimmed = raw.trim_ascii();
         if trimmed.is_empty() || !trimmed.iter().all(u8::is_ascii_graphic) {
             return None;
         }
@@ -5480,6 +5621,25 @@ mod tests {
     }
 
     #[test]
+    fn commons_recovery_requires_an_explicit_valid_plan_digest_to_write() {
+        assert_eq!(
+            parse(&words("commons restore")),
+            Ok(Command::CommonsRestore { expected: None })
+        );
+        let command = format!("commons restore --expect {}", "01".repeat(32));
+        assert_eq!(
+            parse(&words(&command)),
+            Ok(Command::CommonsRestore {
+                expected: Some([1; 32])
+            })
+        );
+        assert!(parse(&words("commons restore --expect bad")).is_err());
+        assert!(parse(&words("commons init --expect bad")).is_err());
+        assert!(parse(&words("commons restore --expect 00 --expect 00")).is_err());
+        assert!(parse(&words("commons restore extra")).is_err());
+    }
+
+    #[test]
     fn genesis_takes_one_file() {
         assert_eq!(
             parse(&words("genesis alab.genesis")),
@@ -6688,15 +6848,18 @@ mod tests {
         };
         let admin = crate::client::Paths::for_home(&root.path().join("ma"));
         let url = format!("http://{}/v1/team", server.addr);
-        unix::create(
-            &admin,
-            &url,
-            None,
-            Some("ma".into()),
-            true,
-            &played(&running, &install),
-        )
-        .expect("created");
+        assert_eq!(
+            unix::create(
+                &admin,
+                &url,
+                None,
+                Some("ma".into()),
+                true,
+                &played(&running, &install),
+            )
+            .expect("created"),
+            ExitCode::SUCCESS
+        );
         assert_eq!(installs.get(), 0, "a running subscriber is left be");
         assert_eq!(
             approving_here(&admin),
@@ -6704,7 +6867,10 @@ mod tests {
             "a new vault is open"
         );
         let password = |action, subscriber: &unix::Subscriber<'_>| {
-            unix::password(&admin, action, true, subscriber).expect("published")
+            assert_eq!(
+                unix::password(&admin, action, true, subscriber).expect("published"),
+                ExitCode::SUCCESS
+            );
         };
         password(Password::Off, &played(&unread, &install));
         assert_eq!(approving_here(&admin), Ok(None), "closed, nothing approves");
@@ -6719,8 +6885,11 @@ mod tests {
         );
         password(Password::Open, &played(&running, &install));
         assert_eq!(installs.get(), 2, "a running approver is left be");
-        unix::password(&admin, Password::Open, false, &played(&absent, &install))
-            .expect("published");
+        assert_eq!(
+            unix::password(&admin, Password::Open, false, &played(&absent, &install))
+                .expect("published"),
+            ExitCode::SUCCESS
+        );
         assert_eq!(installs.get(), 2, "--no-agent installs nothing");
         password(Password::Off, &played(&unread, &install));
         assert_eq!(approving_here(&admin), Ok(None), "closed, nothing approves");
@@ -6734,20 +6903,26 @@ mod tests {
         let no_queue =
             || -> crate::Result<crate::service::State> { panic!("a path has no queue to approve") };
         // A new path vault is open too: close it so opening runs the arm that publishes.
-        unix::password(
-            &at_a_path,
-            Password::Off,
-            true,
-            &played(&no_queue, &install),
-        )
-        .expect("closed");
-        unix::password(
-            &at_a_path,
-            Password::Open,
-            true,
-            &played(&no_queue, &install),
-        )
-        .expect("published");
+        assert_eq!(
+            unix::password(
+                &at_a_path,
+                Password::Off,
+                true,
+                &played(&no_queue, &install),
+            )
+            .expect("closed"),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            unix::password(
+                &at_a_path,
+                Password::Open,
+                true,
+                &played(&no_queue, &install),
+            )
+            .expect("published"),
+            ExitCode::SUCCESS
+        );
         assert_eq!(installs.get(), 2, "nor is one put in there");
 
         let line = |approval, state| unix::approver_line(approval, &state, None);
@@ -6807,6 +6982,8 @@ mod tests {
             parse(&words("git-credential")),
             Ok(Command::GitCredential {
                 dev_user: None,
+                token_file: None,
+                token_key: None,
                 operation: None,
             })
         );
@@ -6814,6 +6991,8 @@ mod tests {
             parse(&words("git-credential get")),
             Ok(Command::GitCredential {
                 dev_user: None,
+                token_file: None,
+                token_key: None,
                 operation: Some("get".into()),
             })
         );
@@ -6821,6 +7000,19 @@ mod tests {
             parse(&words("git-credential --dev-user octo-cat get")),
             Ok(Command::GitCredential {
                 dev_user: Some("octo-cat".into()),
+                token_file: None,
+                token_key: None,
+                operation: Some("get".into()),
+            })
+        );
+        assert_eq!(
+            parse(&words(
+                "git-credential --dev-user octo-cat --token-file /t/env --token-key GH_TOKEN get"
+            )),
+            Ok(Command::GitCredential {
+                dev_user: Some("octo-cat".into()),
+                token_file: Some("/t/env".into()),
+                token_key: Some("GH_TOKEN".into()),
                 operation: Some("get".into()),
             })
         );
@@ -6830,6 +7022,10 @@ mod tests {
             "git-credential --dev-user a--b get",
             "git-credential --dev-user a --dev-user b get",
             "git-credential --unknown get",
+            "git-credential --token-file relative/token get",
+            "git-credential --token-file /a --token-file /b get",
+            "git-credential --token-key GH_TOKEN get",
+            "git-credential --token-file /t --token-key GH-TOKEN get",
         ] {
             assert!(parse(&words(refused)).is_err(), "{refused}");
         }
@@ -6849,12 +7045,83 @@ mod tests {
         crate::fsx::write_atomic(&dev_path, b"ghp_dev_token_1\n", 0o600).expect("dev token");
         crate::fsx::write_atomic(&rel_path, b"ghp_rel_token_2\n", 0o600).expect("rel token");
 
-        let ask = |dev_user: Option<&str>, op: Option<&str>, term: bool, stdin: &[u8]| -> String {
+        let ask_from = |dev: &unix::DevToken<'_>,
+                        dev_user: Option<&str>,
+                        op: Option<&str>,
+                        term: bool,
+                        stdin: &[u8]|
+         -> String {
             let mut cursor = std::io::Cursor::new(stdin);
             let reply =
-                unix::git_credential_reply(Some(&home), None, dev_user, op, term, &mut cursor);
+                unix::git_credential_reply(Some(&home), None, dev_user, dev, op, term, &mut cursor);
             String::from_utf8(reply.as_slice().to_vec()).expect("utf8")
         };
+        let ask = |dev_user: Option<&str>, op: Option<&str>, term: bool, stdin: &[u8]| -> String {
+            ask_from(&unix::DevToken::Vault, dev_user, op, term, stdin)
+        };
+
+        // A --token-file answers in the vault file's place, whole or by its --token-key line;
+        // a loose file, or a key assigned twice, answers quit=1.
+        let raw = root.path().join("profile_token");
+        crate::fsx::write_atomic(&raw, b"ghp_profile_3\n", 0o600).expect("profile token");
+        let env = root.path().join("profile.env");
+        crate::fsx::write_atomic(&env, b"# x\nexport GH_TOKEN='ghp_keyed_4'\n", 0o600)
+            .expect("profile env");
+        let request = b"protocol=https\nhost=github.com\n\n";
+        assert_eq!(
+            ask_from(
+                &unix::DevToken::File {
+                    file: &raw,
+                    key: None
+                },
+                Some("octocat"),
+                Some("get"),
+                false,
+                request
+            ),
+            "username=octocat\npassword=ghp_profile_3\n"
+        );
+        assert_eq!(
+            ask_from(
+                &unix::DevToken::File {
+                    file: &env,
+                    key: Some("GH_TOKEN")
+                },
+                Some("octocat"),
+                Some("get"),
+                false,
+                request
+            ),
+            "username=octocat\npassword=ghp_keyed_4\n"
+        );
+        crate::fsx::write_atomic(&env, b"GH_TOKEN=a\nGH_TOKEN=b\n", 0o600).expect("twice");
+        assert_eq!(
+            ask_from(
+                &unix::DevToken::File {
+                    file: &env,
+                    key: Some("GH_TOKEN")
+                },
+                Some("octocat"),
+                Some("get"),
+                false,
+                request
+            ),
+            "quit=1\n"
+        );
+        std::fs::set_permissions(&raw, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            ask_from(
+                &unix::DevToken::File {
+                    file: &raw,
+                    key: None
+                },
+                Some("octocat"),
+                Some("get"),
+                false,
+                request
+            ),
+            "quit=1\n"
+        );
 
         // Without a known login, an unnamed github.com lookup gets the dev token as x-access-token.
         assert_eq!(

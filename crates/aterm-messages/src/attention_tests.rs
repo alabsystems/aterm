@@ -673,30 +673,55 @@ fn a_fault_echo_wears_the_warn_glyph_and_says_failed() {
 #[test]
 fn echoes_never_change_the_row_count() {
     let now = t0();
-    let run = |row: Message, echoes: usize| -> Vec<Option<u16>> {
+    let check_shrink_boundary = |row: Message, expected_echo_span: Option<Duration>| {
+        let resolve_at = now + ms(10);
         let mut c = fresh(now);
         let id = c.post(row, stamp(), now).id;
         let other = c.post(warn("other").hold(Hold::STANDING), stamp(), now).id;
-        let mut answers = vec![c.commit_rows(now, 3)];
-        c.resolve(id, Outcome::Ok, now + ms(10));
-        assert_eq!(c.echoes().len(), echoes);
-        for step in 0..40u64 {
-            let at = now + ms(10 + step * 50);
+        assert_eq!(c.commit_rows(now, 3), Some(2));
+        c.resolve(id, Outcome::Ok, resolve_at);
+        let echo_until = c.echoes().first().map(|e| e.until);
+        assert_eq!(echo_until, expected_echo_span.map(|span| resolve_at + span));
+        let shrink_at = echo_until.map_or(resolve_at + SHRINK_QUIET, |u| {
+            (resolve_at + SHRINK_QUIET).max(u)
+        });
+
+        let mut at = resolve_at;
+        while at < shrink_at {
             c.settle(at, true);
-            answers.push(c.commit_rows(at, 3));
             assert_eq!(c.wanted_rows(), 1, "the echo is never wanted");
+            assert_eq!(c.commit_rows(at, 3), None);
+            assert_eq!(c.committed_rows(), 2);
+            at += ms(50);
         }
-        c.resolve(other, Outcome::Ok, now + ms(3000));
-        answers.push(c.commit_rows(now + ms(3000), 3));
-        answers.push(c.commit_rows(now + ms(3000) + SHRINK_QUIET, 3));
-        answers
+        let just_before = shrink_at - ms(1);
+        c.settle(just_before, true);
+        assert_eq!(c.wanted_rows(), 1, "the echo is never wanted");
+        assert_eq!(c.commit_rows(just_before, 3), None);
+        assert_eq!(c.committed_rows(), 2);
+
+        c.settle(shrink_at, true);
+        assert_eq!(c.wanted_rows(), 1, "the echo is never wanted");
+        assert_eq!(c.commit_rows(shrink_at, 3), Some(1));
+        assert!(c.echoes().is_empty());
+
+        let end_at = shrink_at + SHRINK_QUIET;
+        c.settle(end_at, true);
+        assert_eq!(c.commit_rows(end_at, 3), None);
+        c.resolve(other, Outcome::Ok, end_at);
+        assert_eq!(c.commit_rows(end_at, 3), None);
+        assert_eq!(c.commit_rows(end_at + SHRINK_QUIET - ms(1), 3), None);
+        assert_eq!(c.commit_rows(end_at + SHRINK_QUIET, 3), Some(0));
     };
-    let held = run(warn("held"), 0);
-    assert_eq!(held[31], Some(1), "the held run shrinks at step 30 (+1510)");
-    assert_eq!(run(download(51_800_000), 1), held);
-    let mut late = held.clone();
-    late.swap(31, 34);
-    assert_eq!(run(busy("work"), 1), late);
+
+    let short_span = EchoKind::Complete.span(700);
+    let busy_span = EchoKind::Complete.span(0);
+    assert!(short_span <= SHRINK_QUIET);
+    assert!(busy_span > SHRINK_QUIET);
+    check_shrink_boundary(warn("held"), None);
+    check_shrink_boundary(download(51_800_000), Some(short_span));
+    check_shrink_boundary(busy("work"), Some(busy_span));
+
     let mut c = fresh(now);
     c.post(warn("top").hold(Hold::STANDING), stamp(), now);
     let id = c.post(busy("work"), stamp(), now).id;

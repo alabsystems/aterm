@@ -1391,3 +1391,1538 @@ impl FederationRunner {
         }
     }
 }
+
+/// Maximum federated peer endpoints tracked by [`FederationMesh`].
+pub const MAX_FEDERATION_PEERS: usize = 128;
+
+/// Maximum distinct remote regions routed by [`FederationMesh`].
+pub const MAX_FEDERATION_REGIONS: usize = 64;
+
+/// Maximum exported subject prefixes per [`PeerAdvertisement`].
+pub const MAX_PEER_EXPORT_PREFIXES: usize = 16;
+
+/// Maximum smoothed RTT sample cap (`10_000_000` us = 10 seconds) enforced via
+/// [`federation_seq_clamp`].
+pub const MAX_FEDERATION_RTT_US: u64 = 10_000_000;
+
+/// Default EWMA hysteresis margin (`2_000` us = 2 ms) required before switching an
+/// already-healthy regional gateway to a lower-RTT candidate.
+pub const DEFAULT_ROUTE_HYSTERESIS_US: u64 = 2_000;
+
+/// Default retained registry prefix (`"/f/fed/peers"`) used by [`FederationDirectory`]
+/// for dynamic peer discovery across seed brokers.
+pub const DEFAULT_PEER_REGISTRY_PREFIX: &str = "/f/fed/peers";
+
+contract_fn! {
+    /// Verified check that a candidate gateway's hysteresis-padded RTT threshold
+    /// (`cand_srtt_us + hysteresis_us`) beats or ties the active gateway's `cur_rtt_us`
+    /// (`switch_threshold_us <= cur_rtt_us`), linked via `clean-kernel-defeq` to
+    /// `federation_route_preferred_isl`.
+    #[must_use]
+    pub const fn federation_route_preferred(cur_rtt_us: u64, switch_threshold_us: u64) -> bool
+    clauses [ensures result == (switch_threshold_us <= cur_rtt_us)]
+    {
+        switch_threshold_us <= cur_rtt_us
+    }
+}
+
+contract_fn! {
+    /// Verified check that an observed SWIM peer incarnation meets or exceeds `min_inc`
+    /// (`min_inc <= observed_inc`), linked via `clean-kernel-defeq` to
+    /// `federation_incarnation_fresh_isl`.
+    #[must_use]
+    pub const fn federation_incarnation_fresh(observed_inc: u64, min_inc: u64) -> bool
+    clauses [ensures result == (min_inc <= observed_inc)]
+    {
+        min_inc <= observed_inc
+    }
+}
+
+/// SWIM-style membership health state advertised or observed for a peer in [`FederationMesh`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerHealthState {
+    /// Healthy gateway eligible for primary multi-region routing.
+    Alive,
+    /// Probe failure or gossip suspicion; bypassed when an [`PeerHealthState::Alive`] gateway exists.
+    Suspect,
+    /// Graceful operator drain; bypassed immediately so traffic shifts cleanly before shutdown.
+    Draining,
+    /// Tombstoned at this incarnation until superseded by a strictly higher incarnation.
+    Dead,
+}
+
+impl PeerHealthState {
+    /// Canonical lowercase token used in [`PeerAdvertisement::encode_text`].
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            PeerHealthState::Alive => "alive",
+            PeerHealthState::Suspect => "suspect",
+            PeerHealthState::Draining => "draining",
+            PeerHealthState::Dead => "dead",
+        }
+    }
+
+    /// Parse a canonical [`PeerHealthState`] token.
+    pub fn parse(token: &str) -> Result<Self, String> {
+        match token {
+            "alive" => Ok(PeerHealthState::Alive),
+            "suspect" => Ok(PeerHealthState::Suspect),
+            "draining" => Ok(PeerHealthState::Draining),
+            "dead" => Ok(PeerHealthState::Dead),
+            _ => Err(format!("invalid peer state {token:?}")),
+        }
+    }
+
+    const fn degradation_rank(self) -> u8 {
+        match self {
+            PeerHealthState::Alive => 0,
+            PeerHealthState::Suspect => 1,
+            PeerHealthState::Draining => 2,
+            PeerHealthState::Dead => 3,
+        }
+    }
+}
+
+/// Wire-advertisable transport kind in [`PeerAdvertisement`] (secrets and keys never travel
+/// inside gossip advertisements; authenticated wire wrappers are attached locally via
+/// [`FederationMeshConfig`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerTransportKind {
+    /// Local Unix-domain socket path (`Transport::Unix`).
+    Unix,
+    /// TCP `host:port` endpoint (`Transport::Tcp`, or upgraded locally by mesh policy).
+    Tcp,
+}
+
+impl PeerTransportKind {
+    /// Canonical lowercase token used in [`PeerAdvertisement::encode_text`].
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            PeerTransportKind::Unix => "unix",
+            PeerTransportKind::Tcp => "tcp",
+        }
+    }
+
+    /// Parse a canonical [`PeerTransportKind`] token.
+    pub fn parse(token: &str) -> Result<Self, String> {
+        match token {
+            "unix" => Ok(PeerTransportKind::Unix),
+            "tcp" => Ok(PeerTransportKind::Tcp),
+            _ => Err(format!("invalid peer transport {token:?}")),
+        }
+    }
+}
+
+fn validate_mesh_segment(seg: &str, field: &str) -> Result<(), String> {
+    if seg.is_empty() || seg.contains('/') {
+        return Err(format!(
+            "{field} {seg:?} must be a non-empty single subject segment without '/'"
+        ));
+    }
+    let probe = format!("/g/{seg}");
+    if Subject::new(&probe).is_err() {
+        return Err(format!(
+            "{field} {seg:?} is not a valid astream Subject segment"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_endpoint_token(endpoint: &str) -> Result<(), String> {
+    if endpoint.is_empty() {
+        return Err("peer endpoint must not be empty".to_string());
+    }
+    let mut bytes = endpoint.as_bytes();
+    while let &[b, ref rest @ ..] = bytes {
+        if b <= b' ' || b == 0x7f {
+            return Err(format!(
+                "peer endpoint {endpoint:?} must not contain whitespace or ASCII control bytes"
+            ));
+        }
+        bytes = rest;
+    }
+    Ok(())
+}
+
+/// Dynamic peer-discovery record published onto seed registry brokers under
+/// `"{registry_prefix}/{peer_id}"` (`DEFAULT_PEER_REGISTRY_PREFIX`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerAdvertisement {
+    /// Unique single-segment peer identifier (e.g. `"us-east-gw1"`).
+    pub peer_id: String,
+    /// Single-segment region identifier (e.g. `"us-east"`, `"eu-west"`).
+    pub region: String,
+    /// Socket path (`PeerTransportKind::Unix`) or `host:port` (`PeerTransportKind::Tcp`).
+    pub endpoint: String,
+    /// Advertised base transport kind (credentials/keys stay out of gossip).
+    pub transport_kind: PeerTransportKind,
+    /// Monotone SWIM incarnation number (`0..=u64::MAX`).
+    pub incarnation: u64,
+    /// Advertised [`PeerHealthState`].
+    pub state: PeerHealthState,
+    /// Validated subject prefixes exported by this peer (`0..=MAX_PEER_EXPORT_PREFIXES`).
+    pub export_prefixes: Vec<String>,
+}
+
+impl PeerAdvertisement {
+    /// Construct and validate a [`PeerAdvertisement`].
+    pub fn new(
+        peer_id: &str,
+        region: &str,
+        endpoint: &str,
+        transport_kind: PeerTransportKind,
+        incarnation: u64,
+        state: PeerHealthState,
+        export_prefixes: Vec<String>,
+    ) -> Result<Self, String> {
+        let ad = Self {
+            peer_id: peer_id.to_string(),
+            region: region.to_string(),
+            endpoint: endpoint.to_string(),
+            transport_kind,
+            incarnation,
+            state,
+            export_prefixes,
+        };
+        ad.validate()?;
+        Ok(ad)
+    }
+
+    /// Validate segment grammar, endpoint safety, and exported subject prefixes.
+    pub fn validate(&self) -> Result<(), String> {
+        validate_mesh_segment(&self.peer_id, "peer_id")?;
+        validate_mesh_segment(&self.region, "region")?;
+        validate_endpoint_token(&self.endpoint)?;
+        if self.export_prefixes.len() > MAX_PEER_EXPORT_PREFIXES {
+            return Err(format!(
+                "export_prefixes count ({}) exceeds MAX_PEER_EXPORT_PREFIXES ({MAX_PEER_EXPORT_PREFIXES})",
+                self.export_prefixes.len()
+            ));
+        }
+        let mut i = 0usize;
+        while i < self.export_prefixes.len() {
+            if let Some(pfx) = self.export_prefixes.get(i) {
+                validate_prefix_shape(pfx, "export_prefix")?;
+                let mut j = 0usize;
+                while j < i {
+                    if let Some(prev) = self.export_prefixes.get(j) {
+                        if prev == pfx {
+                            return Err(format!("duplicate export_prefix {pfx:?}"));
+                        }
+                    }
+                    j = j.saturating_add(1);
+                }
+            }
+            i = i.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    /// Registry subject (`"{registry_prefix}/{peer_id}"`) under which this peer advertises.
+    pub fn registry_subject(&self, registry_prefix: &str) -> Result<String, String> {
+        validate_prefix_shape(registry_prefix, "registry_prefix")?;
+        validate_mesh_segment(&self.peer_id, "peer_id")?;
+        let subj = format!("{registry_prefix}/{}", self.peer_id);
+        if Subject::new(&subj).is_err() {
+            return Err(format!("invalid registry subject {subj:?}"));
+        }
+        Ok(subj)
+    }
+
+    /// Canonical deterministic text wire representation (`v=1 ...`) containing zero secrets.
+    #[must_use]
+    pub fn encode_text(&self) -> String {
+        let mut exports = String::new();
+        let mut idx = 0usize;
+        while idx < self.export_prefixes.len() {
+            if let Some(pfx) = self.export_prefixes.get(idx) {
+                if idx > 0 {
+                    exports.push(',');
+                }
+                exports.push_str(pfx);
+            }
+            idx = idx.saturating_add(1);
+        }
+        if exports.is_empty() {
+            exports.push('-');
+        }
+        format!(
+            "v=1 peer={} region={} transport={} endpoint={} incarnation={} state={} exports={exports}\n",
+            self.peer_id,
+            self.region,
+            self.transport_kind.as_str(),
+            self.endpoint,
+            self.incarnation,
+            self.state.as_str()
+        )
+    }
+
+    /// Fail-closed parser for [`Self::encode_text`] payloads.
+    pub fn decode_text(text: &str) -> Result<Self, String> {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Err("empty peer advertisement".to_string());
+        }
+        let mut version_ok = false;
+        let mut peer_id: Option<String> = None;
+        let mut region: Option<String> = None;
+        let mut transport_kind: Option<PeerTransportKind> = None;
+        let mut endpoint: Option<String> = None;
+        let mut incarnation: Option<u64> = None;
+        let mut state: Option<PeerHealthState> = None;
+        let mut exports: Option<Vec<String>> = None;
+
+        for tok in trimmed.split_whitespace() {
+            let Some((key, val)) = tok.split_once('=') else {
+                return Err(format!("malformed peer advertisement token {tok:?}"));
+            };
+            if key == "v" {
+                if val != "1" {
+                    return Err(format!("unsupported peer advertisement version {val:?}"));
+                }
+                version_ok = true;
+            } else if key == "peer" {
+                if peer_id.is_some() {
+                    return Err("duplicate `peer=` key".to_string());
+                }
+                peer_id = Some(val.to_string());
+            } else if key == "region" {
+                if region.is_some() {
+                    return Err("duplicate `region=` key".to_string());
+                }
+                region = Some(val.to_string());
+            } else if key == "transport" {
+                if transport_kind.is_some() {
+                    return Err("duplicate `transport=` key".to_string());
+                }
+                transport_kind = Some(PeerTransportKind::parse(val)?);
+            } else if key == "endpoint" {
+                if endpoint.is_some() {
+                    return Err("duplicate `endpoint=` key".to_string());
+                }
+                endpoint = Some(val.to_string());
+            } else if key == "incarnation" {
+                if incarnation.is_some() {
+                    return Err("duplicate `incarnation=` key".to_string());
+                }
+                let parsed = match val.parse::<u64>() {
+                    Ok(v) => v,
+                    Err(_) => return Err(format!("invalid incarnation {val:?}")),
+                };
+                incarnation = Some(parsed);
+            } else if key == "state" {
+                if state.is_some() {
+                    return Err("duplicate `state=` key".to_string());
+                }
+                state = Some(PeerHealthState::parse(val)?);
+            } else if key == "exports" {
+                if exports.is_some() {
+                    return Err("duplicate `exports=` key".to_string());
+                }
+                let mut list = Vec::new();
+                if val != "-" {
+                    for item in val.split(',') {
+                        list.push(item.to_string());
+                    }
+                }
+                exports = Some(list);
+            } else {
+                return Err(format!("unknown peer advertisement key {key:?}"));
+            }
+        }
+
+        if !version_ok {
+            return Err("missing required `v=1` in peer advertisement".to_string());
+        }
+        let Some(peer_val) = peer_id else {
+            return Err("missing `peer=` in peer advertisement".to_string());
+        };
+        let Some(region_val) = region else {
+            return Err("missing `region=` in peer advertisement".to_string());
+        };
+        let Some(tk_val) = transport_kind else {
+            return Err("missing `transport=` in peer advertisement".to_string());
+        };
+        let Some(ep_val) = endpoint else {
+            return Err("missing `endpoint=` in peer advertisement".to_string());
+        };
+        let Some(inc_val) = incarnation else {
+            return Err("missing `incarnation=` in peer advertisement".to_string());
+        };
+        let Some(st_val) = state else {
+            return Err("missing `state=` in peer advertisement".to_string());
+        };
+        let export_vec = match exports {
+            Some(v) => v,
+            None => return Err("missing `exports=` in peer advertisement".to_string()),
+        };
+
+        PeerAdvertisement::new(
+            &peer_val,
+            &region_val,
+            &ep_val,
+            tk_val,
+            inc_val,
+            st_val,
+            export_vec,
+        )
+    }
+}
+
+/// Tracked gossip + RTT telemetry entry for one discovered peer in [`FederationDirectory`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerRouteEntry {
+    /// Latest accepted SWIM [`PeerAdvertisement`].
+    pub ad: PeerAdvertisement,
+    /// Smoothed EWMA round-trip latency in microseconds (`0` before first sample).
+    pub srtt_us: u64,
+    /// Monotone count of RTT observations integrated into `srtt_us`.
+    pub rtt_samples: u64,
+    /// Consecutive wire `Hello` probe failures (or poisoned responses).
+    pub consecutive_failures: u32,
+    /// Latest observed [`LogIdentity`] from wire `Hello` probes.
+    pub last_log_id: Option<LogIdentity>,
+    /// Whether the peer's latest `HelloHealth` reported a poisoned log.
+    pub poisoned: bool,
+}
+
+impl PeerRouteEntry {
+    fn from_advertisement(ad: PeerAdvertisement) -> Self {
+        Self {
+            ad,
+            srtt_us: 0,
+            rtt_samples: 0,
+            consecutive_failures: 0,
+            last_log_id: None,
+            poisoned: false,
+        }
+    }
+
+    /// Whether this peer is currently eligible to serve as a regional federation gateway.
+    #[must_use]
+    pub fn is_routable_for(&self, local_region: &str) -> bool {
+        self.ad.region != local_region
+            && self.ad.state == PeerHealthState::Alive
+            && !self.poisoned
+            && self.consecutive_failures == 0
+            && !self.ad.export_prefixes.is_empty()
+    }
+
+    fn effective_rtt_us(&self) -> u64 {
+        if self.rtt_samples == 0 {
+            MAX_FEDERATION_RTT_US
+        } else {
+            self.srtt_us
+        }
+    }
+
+    fn observe_rtt_sample(&mut self, sample_us: u64) -> u64 {
+        let clamped = federation_seq_clamp(sample_us, MAX_FEDERATION_RTT_US);
+        let next_srtt = if self.rtt_samples == 0 {
+            clamped
+        } else {
+            let weighted = (self.srtt_us & 0x0FFF_FFFF_FFFF_FFFF).saturating_mul(7);
+            weighted.saturating_add(clamped) >> 3
+        };
+        self.srtt_us = federation_seq_clamp(next_srtt, MAX_FEDERATION_RTT_US);
+        self.rtt_samples =
+            federation_cursor_advance(self.rtt_samples, self.rtt_samples.saturating_add(1));
+        self.srtt_us
+    }
+}
+
+/// Selected gateway decision for one remote region in [`FederationDirectory`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegionRouteDecision {
+    /// Remote region name (e.g. `"us-east"`).
+    pub region: String,
+    /// Chosen gateway `peer_id` in `region`.
+    pub gateway_peer_id: String,
+    /// Chosen gateway's advertised endpoint.
+    pub endpoint: String,
+    /// Chosen gateway's [`PeerTransportKind`].
+    pub transport_kind: PeerTransportKind,
+    /// Chosen gateway's smoothed RTT (`0` if unprobed).
+    pub srtt_us: u64,
+    /// Exported subject prefixes mirrored from this region.
+    pub export_prefixes: Vec<String>,
+}
+
+/// SWIM incarnation-resolved dynamic peer directory and EWMA hysteresis multi-region
+/// route selector (`MAX_FEDERATION_PEERS` peers, `MAX_FEDERATION_REGIONS` regions).
+#[derive(Clone, Debug)]
+pub struct FederationDirectory {
+    local_region: String,
+    hysteresis_us: u64,
+    suspect_failure_threshold: u32,
+    peers: Vec<PeerRouteEntry>,
+    active_gateways: Vec<(String, String)>,
+    route_switches: usize,
+}
+
+impl FederationDirectory {
+    /// Create an empty directory for `local_region` with `hysteresis_us` EWMA damping.
+    pub fn new(local_region: &str, hysteresis_us: u64) -> Result<Self, String> {
+        validate_mesh_segment(local_region, "local_region")?;
+        Ok(Self {
+            local_region: local_region.to_string(),
+            hysteresis_us: federation_seq_clamp(hysteresis_us, MAX_FEDERATION_RTT_US),
+            suspect_failure_threshold: 2,
+            peers: Vec::new(),
+            active_gateways: Vec::new(),
+            route_switches: 0,
+        })
+    }
+
+    /// Override the consecutive probe-failure threshold (`>= 1`) that marks an `Alive`
+    /// peer `Suspect`.
+    #[must_use]
+    pub const fn with_suspect_threshold(mut self, failures: u32) -> Self {
+        self.suspect_failure_threshold = if failures == 0 { 1 } else { failures };
+        self
+    }
+
+    /// Local region identifier.
+    #[must_use]
+    pub fn local_region(&self) -> &str {
+        &self.local_region
+    }
+
+    /// Configured EWMA route-switch hysteresis margin in microseconds.
+    #[must_use]
+    pub const fn hysteresis_us(&self) -> u64 {
+        self.hysteresis_us
+    }
+
+    /// Total number of primary regional gateway switches since creation.
+    #[must_use]
+    pub const fn route_switches(&self) -> usize {
+        self.route_switches
+    }
+
+    /// Snapshot of all tracked [`PeerRouteEntry`] records.
+    #[must_use]
+    pub fn peers(&self) -> &[PeerRouteEntry] {
+        &self.peers
+    }
+
+    /// Look up a tracked peer by `peer_id`.
+    #[must_use]
+    pub fn peer(&self, peer_id: &str) -> Option<&PeerRouteEntry> {
+        let mut idx = 0usize;
+        while idx < self.peers.len() {
+            if let Some(entry) = self.peers.get(idx) {
+                if entry.ad.peer_id == peer_id {
+                    return Some(entry);
+                }
+            }
+            idx = idx.saturating_add(1);
+        }
+        None
+    }
+
+    /// Publish `ad` as retained state under `"{registry_prefix}/{ad.peer_id}"` on a seed
+    /// registry broker.
+    pub fn publish_advertisement(
+        registry: &FederationEndpoint,
+        registry_prefix: &str,
+        producer_id: u64,
+        seq: u64,
+        ad: &PeerAdvertisement,
+    ) -> Result<(Offset, bool), FederationError> {
+        if let Err(msg) = ad.validate() {
+            return Err(FederationError::Config(msg));
+        }
+        let subject = match ad.registry_subject(registry_prefix) {
+            Ok(s) => s,
+            Err(msg) => return Err(FederationError::Config(msg)),
+        };
+        let payload = ad.encode_text();
+        let (mut client, _closer) = match registry.dial() {
+            Ok(pair) => pair,
+            Err(e) => return Err(FederationError::Io(e)),
+        };
+        match client.publish(producer_id, seq, &subject, payload.as_bytes()) {
+            Ok(ack) => Ok(ack),
+            Err(e) => Err(FederationError::Io(e)),
+        }
+    }
+
+    /// Discover all retained [`PeerAdvertisement`] records under `"{registry_prefix}/>"` from
+    /// a seed registry broker via `Client::last_all`. Malformed records fail closed with
+    /// [`FederationError::Config`].
+    pub fn discover_from_registry(
+        registry: &FederationEndpoint,
+        registry_prefix: &str,
+    ) -> Result<Vec<PeerAdvertisement>, FederationError> {
+        if let Err(msg) = validate_prefix_shape(registry_prefix, "registry_prefix") {
+            return Err(FederationError::Config(msg));
+        }
+        let filter = format!("{registry_prefix}/>");
+        if Filter::new(&filter).is_err() {
+            return Err(FederationError::Config(format!(
+                "invalid registry filter {filter:?}"
+            )));
+        }
+        let (mut client, _closer) = match registry.dial() {
+            Ok(pair) => pair,
+            Err(e) => return Err(FederationError::Io(e)),
+        };
+        let (records, _head) = match client.last_all(&filter) {
+            Ok(page) => page,
+            Err(e) => return Err(FederationError::Io(e)),
+        };
+        let mut out = Vec::with_capacity(records.len().min(MAX_FEDERATION_PEERS));
+        let mut idx = 0usize;
+        while idx < records.len() {
+            if let Some((_off, _subj, body)) = records.get(idx) {
+                let text = match std::str::from_utf8(body) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        return Err(FederationError::Config(
+                            "non-UTF8 peer advertisement in registry".to_string(),
+                        ))
+                    }
+                };
+                let ad = match PeerAdvertisement::decode_text(text) {
+                    Ok(a) => a,
+                    Err(msg) => return Err(FederationError::Config(msg)),
+                };
+                out.push(ad);
+            }
+            idx = idx.saturating_add(1);
+        }
+        Ok(out)
+    }
+
+    /// Apply a [`PeerAdvertisement`] under SWIM monotone incarnation rules:
+    /// - A strictly higher incarnation (`observed >= current + 1`, verified via
+    ///   [`federation_incarnation_fresh`]) supersedes any prior state (allowing a live peer to
+    ///   refute false `Suspect` gossip or rejoin cleanly after restart).
+    /// - Equal incarnation permits only monotone health degradation
+    ///   (`Alive -> Suspect -> Draining -> Dead`) and metadata refresh if nothing degrades backwards.
+    /// - Lower incarnations are ignored as stale gossip (`Ok(false)`).
+    pub fn apply_advertisement(&mut self, ad: PeerAdvertisement) -> Result<bool, String> {
+        ad.validate()?;
+        let mut idx = 0usize;
+        while idx < self.peers.len() {
+            if let Some(entry) = self.peers.get_mut(idx) {
+                if entry.ad.peer_id == ad.peer_id {
+                    if let Some(min_fresh) = entry.ad.incarnation.checked_add(1) {
+                        if ad.incarnation > entry.ad.incarnation
+                            && federation_incarnation_fresh(ad.incarnation, min_fresh)
+                        {
+                            let next_inc =
+                                federation_cursor_advance(entry.ad.incarnation, ad.incarnation);
+                            let mut updated = ad;
+                            updated.incarnation = next_inc;
+                            if updated.state == PeerHealthState::Alive {
+                                entry.consecutive_failures = 0;
+                            }
+                            entry.ad = updated;
+                            return Ok(true);
+                        }
+                    }
+                    if ad.incarnation == entry.ad.incarnation
+                        && ad.state.degradation_rank() > entry.ad.state.degradation_rank()
+                    {
+                        entry.ad.state = ad.state;
+                        return Ok(true);
+                    }
+                    return Ok(false);
+                }
+            }
+            idx = idx.saturating_add(1);
+        }
+
+        if self.peers.len() >= MAX_FEDERATION_PEERS {
+            return Err(format!(
+                "peer table full at MAX_FEDERATION_PEERS ({MAX_FEDERATION_PEERS})"
+            ));
+        }
+        self.peers.push(PeerRouteEntry::from_advertisement(ad));
+        Ok(true)
+    }
+
+    /// Record a deterministic or measured RTT sample (in microseconds) for `peer_id`, resetting
+    /// `consecutive_failures` and `poisoned`. Returns `true` if `peer_id` is known.
+    pub fn record_rtt_sample(&mut self, peer_id: &str, sample_us: u64) -> bool {
+        let mut idx = 0usize;
+        while idx < self.peers.len() {
+            if let Some(entry) = self.peers.get_mut(idx) {
+                if entry.ad.peer_id == peer_id {
+                    let _ = entry.observe_rtt_sample(sample_us);
+                    entry.consecutive_failures = 0;
+                    entry.poisoned = false;
+                    return true;
+                }
+            }
+            idx = idx.saturating_add(1);
+        }
+        false
+    }
+
+    /// Record a probe failure (or poisoned log health) for `peer_id`, transitioning `Alive`
+    /// to `Suspect` once `consecutive_failures >= suspect_failure_threshold`.
+    pub fn record_probe_failure(&mut self, peer_id: &str, poisoned: bool) -> bool {
+        let threshold = self.suspect_failure_threshold;
+        let mut idx = 0usize;
+        while idx < self.peers.len() {
+            if let Some(entry) = self.peers.get_mut(idx) {
+                if entry.ad.peer_id == peer_id {
+                    entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+                    if poisoned {
+                        entry.poisoned = true;
+                    }
+                    if entry.ad.state == PeerHealthState::Alive
+                        && (poisoned || entry.consecutive_failures >= threshold)
+                    {
+                        entry.ad.state = PeerHealthState::Suspect;
+                    }
+                    return true;
+                }
+            }
+            idx = idx.saturating_add(1);
+        }
+        false
+    }
+
+    fn current_gateway_for(&self, region: &str) -> Option<&str> {
+        let mut idx = 0usize;
+        while idx < self.active_gateways.len() {
+            if let Some((reg, gw)) = self.active_gateways.get(idx) {
+                if reg == region {
+                    return Some(gw.as_str());
+                }
+            }
+            idx = idx.saturating_add(1);
+        }
+        None
+    }
+
+    /// Recompute the optimal gateway per remote region using EWMA `srtt_us` with
+    /// `hysteresis_us` stickiness (verified via [`federation_route_preferred`]), returning
+    /// decisions sorted lexicographically by `region`.
+    pub fn recompute_routes(&mut self) -> Vec<RegionRouteDecision> {
+        let mut regions: Vec<String> = Vec::new();
+        let mut i = 0usize;
+        while i < self.peers.len() {
+            if let Some(entry) = self.peers.get(i) {
+                if entry.ad.region != self.local_region && regions.len() < MAX_FEDERATION_REGIONS {
+                    let mut seen = false;
+                    let mut r_idx = 0usize;
+                    while r_idx < regions.len() {
+                        if let Some(existing) = regions.get(r_idx) {
+                            if existing == &entry.ad.region {
+                                seen = true;
+                                break;
+                            }
+                        }
+                        r_idx = r_idx.saturating_add(1);
+                    }
+                    if !seen {
+                        regions.push(entry.ad.region.clone());
+                    }
+                }
+            }
+            i = i.saturating_add(1);
+        }
+
+        // Insertion-sort `regions` lexicographically without closures or panicking indexing.
+        let mut sort_i = 1usize;
+        while sort_i < regions.len() {
+            let mut j = sort_i;
+            while j > 0 {
+                let prev = j.saturating_sub(1);
+                let Some((left_half, right_half)) = regions.split_at_mut_checked(j) else {
+                    break;
+                };
+                let (Some(left), Some(right)) = (left_half.get_mut(prev), right_half.first_mut())
+                else {
+                    break;
+                };
+                if *left > *right {
+                    std::mem::swap(left, right);
+                } else {
+                    break;
+                }
+                j = prev;
+            }
+            sort_i = sort_i.saturating_add(1);
+        }
+
+        let mut next_active: Vec<(String, String)> = Vec::new();
+        let mut decisions: Vec<RegionRouteDecision> = Vec::new();
+
+        let mut reg_i = 0usize;
+        while reg_i < regions.len() {
+            let Some(region) = regions.get(reg_i) else {
+                break;
+            };
+
+            // Find lowest-RTT eligible candidate in `region` (tie-break by `peer_id`).
+            let mut best_idx: Option<usize> = None;
+            let mut p_i = 0usize;
+            while p_i < self.peers.len() {
+                if let Some(cand) = self.peers.get(p_i) {
+                    if cand.ad.region == *region && cand.is_routable_for(&self.local_region) {
+                        let take = match best_idx {
+                            None => true,
+                            Some(cur_best_idx) => match self.peers.get(cur_best_idx) {
+                                None => true,
+                                Some(cur_best) => {
+                                    let c_rtt = cand.effective_rtt_us();
+                                    let b_rtt = cur_best.effective_rtt_us();
+                                    c_rtt < b_rtt
+                                        || (c_rtt == b_rtt && cand.ad.peer_id < cur_best.ad.peer_id)
+                                }
+                            },
+                        };
+                        if take {
+                            best_idx = Some(p_i);
+                        }
+                    }
+                }
+                p_i = p_i.saturating_add(1);
+            }
+
+            // Check whether `region` already had a healthy active gateway that holds within hysteresis.
+            let prev_gw_id: Option<String> = match self.current_gateway_for(region) {
+                Some(id) => Some(id.to_string()),
+                None => None,
+            };
+            let mut prev_idx: Option<usize> = None;
+            if let Some(ref prev_id) = prev_gw_id {
+                let mut k = 0usize;
+                while k < self.peers.len() {
+                    if let Some(p) = self.peers.get(k) {
+                        if p.ad.peer_id == *prev_id
+                            && p.ad.region == *region
+                            && p.is_routable_for(&self.local_region)
+                        {
+                            prev_idx = Some(k);
+                            break;
+                        }
+                    }
+                    k = k.saturating_add(1);
+                }
+            }
+
+            let chosen_idx = match (prev_idx, best_idx) {
+                (None, None) => None,
+                (None, Some(b)) => Some(b),
+                (Some(p), None) => Some(p),
+                (Some(p), Some(b)) => {
+                    if p == b {
+                        Some(p)
+                    } else {
+                        match (self.peers.get(p), self.peers.get(b)) {
+                            (Some(prev_peer), Some(best_peer)) => {
+                                if prev_peer.rtt_samples > 0 && best_peer.rtt_samples > 0 {
+                                    match best_peer.srtt_us.checked_add(self.hysteresis_us) {
+                                        Some(thresh)
+                                            if federation_route_preferred(
+                                                prev_peer.srtt_us,
+                                                thresh,
+                                            ) =>
+                                        {
+                                            Some(b)
+                                        }
+                                        _ => Some(p),
+                                    }
+                                } else if prev_peer.rtt_samples == 0 && best_peer.rtt_samples > 0 {
+                                    Some(b)
+                                } else {
+                                    Some(p)
+                                }
+                            }
+                            _ => Some(b),
+                        }
+                    }
+                }
+            };
+
+            if let Some(c_idx) = chosen_idx {
+                if let Some(chosen) = self.peers.get(c_idx) {
+                    if let Some(ref prev_id) = prev_gw_id {
+                        if prev_id != &chosen.ad.peer_id {
+                            self.route_switches = self.route_switches.saturating_add(1);
+                        }
+                    }
+                    next_active.push((region.clone(), chosen.ad.peer_id.clone()));
+                    decisions.push(RegionRouteDecision {
+                        region: region.clone(),
+                        gateway_peer_id: chosen.ad.peer_id.clone(),
+                        endpoint: chosen.ad.endpoint.clone(),
+                        transport_kind: chosen.ad.transport_kind,
+                        srtt_us: chosen.srtt_us,
+                        export_prefixes: chosen.ad.export_prefixes.clone(),
+                    });
+                }
+            }
+
+            reg_i = reg_i.saturating_add(1);
+        }
+
+        self.active_gateways = next_active;
+        decisions
+    }
+}
+
+const fn derive_mesh_producer_id(base: u64, log_id: &[u8; 16], prefix_idx: u64) -> u64 {
+    let mut acc = base ^ 0x9E37_79B9_7F4A_7C15 ^ prefix_idx;
+    let mut rest: &[u8] = log_id;
+    while let &[b, ref tail @ ..] = rest {
+        acc = (acc ^ (b as u64)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        rest = tail;
+    }
+    acc ^= acc >> 30;
+    if acc == 0 {
+        1
+    } else {
+        acc
+    }
+}
+
+/// Configuration for [`FederationMesh`] (dynamic seed-registry discovery + automatic
+/// multi-region gateway selection and loop-free inbound subtree mirroring).
+#[derive(Clone, Debug)]
+pub struct FederationMeshConfig {
+    /// Local region identifier (e.g. `"us-west"`).
+    pub local_region: String,
+    /// Local broker endpoint receiving mirrored multi-region subtrees.
+    pub local_endpoint: FederationEndpoint,
+    /// Local region's own exported prefixes, automatically added to `exclude_prefixes` on all
+    /// inbound regional bridges so bidirectional multi-region meshes never echo records back
+    /// to their origin region (split-horizon loop prevention).
+    pub local_export_prefixes: Vec<String>,
+    /// Seed registry brokers polled via `Client::last_all` during dynamic discovery.
+    pub seed_registries: Vec<FederationEndpoint>,
+    /// Retained registry subject prefix (`DEFAULT_PEER_REGISTRY_PREFIX` = `"/f/fed/peers"`).
+    pub registry_prefix: String,
+    /// Base `producer_id` used on `local_endpoint`.
+    pub base_producer_id: u64,
+    /// When `true` (default), derives a deterministic non-zero `producer_id` from
+    /// `(base_producer_id, source_log_identity.id, prefix_idx)` so independent gateway logs in
+    /// the same region never collide `(producer_id, seq)` dedup slots while replicas sharing a
+    /// `LogIdentity.id` preserve exact failover deduplication. Set `false` when `local_endpoint`
+    /// uses a capability grant bound to a single fixed principal `p=<principal>`.
+    pub per_source_log_producer_id: bool,
+    /// EWMA hysteresis margin in microseconds (`DEFAULT_ROUTE_HYSTERESIS_US`).
+    pub hysteresis_us: u64,
+    /// Consecutive wire probe failures before marking an `Alive` peer `Suspect`.
+    pub suspect_failure_threshold: u32,
+    /// Connect/IO timeout used for live wire `Hello` RTT + `HelloHealth` probes.
+    pub probe_timeout: Duration,
+    /// Maximum records mirrored per regional bridge step (`1..=FEDERATION_BATCH_CAP`).
+    pub batch_size: usize,
+    /// Maximum federation hop budget (`1` by default).
+    pub max_hops: u8,
+}
+
+impl FederationMeshConfig {
+    /// Construct a default [`FederationMeshConfig`] for `(local_region, local_endpoint)`.
+    #[must_use]
+    pub fn new(
+        local_region: &str,
+        local_endpoint: FederationEndpoint,
+        base_producer_id: u64,
+    ) -> Self {
+        Self {
+            local_region: local_region.to_string(),
+            local_endpoint,
+            local_export_prefixes: Vec::new(),
+            seed_registries: Vec::new(),
+            registry_prefix: DEFAULT_PEER_REGISTRY_PREFIX.to_string(),
+            base_producer_id,
+            per_source_log_producer_id: true,
+            hysteresis_us: DEFAULT_ROUTE_HYSTERESIS_US,
+            suspect_failure_threshold: 2,
+            probe_timeout: Duration::from_millis(500),
+            batch_size: DEFAULT_FEDERATION_BATCH,
+            max_hops: 1,
+        }
+    }
+}
+
+/// Summary of one [`FederationMesh::sync_once`] discovery + probing + multi-region sync tick.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FederationMeshReport {
+    /// Total peers currently tracked in the mesh directory.
+    pub discovered_peers: usize,
+    /// Number of remote regions with an active healthy gateway selected.
+    pub active_regions: usize,
+    /// Cumulative gateway switches recorded by [`FederationDirectory`].
+    pub route_switches: usize,
+    /// Records fetched across all active regional bridges in this tick.
+    pub fetched: usize,
+    /// Records mirrored onto `local_endpoint` in this tick.
+    pub mirrored: usize,
+    /// Records deduplicated on `local_endpoint` in this tick.
+    pub deduped: usize,
+    /// Records skipped by split-horizon / hop-budget filters in this tick.
+    pub skipped: usize,
+    /// Selected `(region, gateway_peer_id)` pairs sorted by `region`.
+    pub active_gateways: Vec<(String, String)>,
+}
+
+struct ActiveRegionBridge {
+    region: String,
+    gateway_peer_id: String,
+    prefix_idx: usize,
+    export_prefix: String,
+    bridge: FederationBridge,
+}
+
+/// Dynamic multi-region federation coordinator combining seed-registry peer discovery,
+/// wire `Hello` RTT + `HelloHealth.poisoned` probing, hysteresis-damped gateway selection,
+/// automatic gateway failover, split-horizon echo suppression, and healed [`FederatedCut`]
+/// tracking across regions.
+pub struct FederationMesh {
+    cfg: FederationMeshConfig,
+    directory: FederationDirectory,
+    peer_wire_overrides: Vec<(String, FederationEndpoint)>,
+    bridges: Vec<ActiveRegionBridge>,
+    cut: FederatedCut,
+    stopped: Arc<AtomicBool>,
+}
+
+impl FederationMesh {
+    /// Validate `cfg` and initialize an empty [`FederationMesh`].
+    pub fn open(cfg: FederationMeshConfig) -> Result<Self, FederationError> {
+        if let Err(msg) = validate_prefix_shape(&cfg.registry_prefix, "registry_prefix") {
+            return Err(FederationError::Config(msg));
+        }
+        let mut idx = 0usize;
+        while idx < cfg.local_export_prefixes.len() {
+            if let Some(pfx) = cfg.local_export_prefixes.get(idx) {
+                if let Err(msg) = validate_prefix_shape(pfx, "local_export_prefix") {
+                    return Err(FederationError::Config(msg));
+                }
+            }
+            idx = idx.saturating_add(1);
+        }
+        let dir = match FederationDirectory::new(&cfg.local_region, cfg.hysteresis_us) {
+            Ok(d) => d.with_suspect_threshold(cfg.suspect_failure_threshold),
+            Err(msg) => return Err(FederationError::Config(msg)),
+        };
+        Ok(Self {
+            cfg,
+            directory: dir,
+            peer_wire_overrides: Vec::new(),
+            bridges: Vec::new(),
+            cut: FederatedCut::new(),
+            stopped: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    /// Register an authenticated [`FederationEndpoint`] (e.g. Sealed, Handshake, Identity, or
+    /// capability-bearing endpoint) to use whenever dialing `peer_id`, keeping secrets out of
+    /// [`PeerAdvertisement`] gossip records.
+    pub fn set_peer_endpoint_override(&mut self, peer_id: &str, endpoint: FederationEndpoint) {
+        let mut idx = 0usize;
+        while idx < self.peer_wire_overrides.len() {
+            if let Some(slot) = self.peer_wire_overrides.get_mut(idx) {
+                if slot.0 == peer_id {
+                    slot.1 = endpoint;
+                    return;
+                }
+            }
+            idx = idx.saturating_add(1);
+        }
+        if self.peer_wire_overrides.len() < MAX_FEDERATION_PEERS {
+            self.peer_wire_overrides
+                .push((peer_id.to_string(), endpoint));
+        }
+    }
+
+    /// Return a cooperative stop handle for background mesh loops.
+    #[must_use]
+    pub fn closer(&self) -> FederationRunnerCloser {
+        FederationRunnerCloser {
+            stopped: Arc::clone(&self.stopped),
+        }
+    }
+
+    /// Borrow the underlying [`FederationDirectory`].
+    #[must_use]
+    pub const fn directory(&self) -> &FederationDirectory {
+        &self.directory
+    }
+
+    /// Mutably borrow the underlying [`FederationDirectory`] (e.g. for direct gossip injection).
+    pub fn directory_mut(&mut self) -> &mut FederationDirectory {
+        &mut self.directory
+    }
+
+    /// Current Chandy-Lamport consistent [`FederatedCut`] across all regional links mirrored
+    /// by this mesh.
+    #[must_use]
+    pub const fn cut(&self) -> &FederatedCut {
+        &self.cut
+    }
+
+    fn endpoint_for(&self, ad: &PeerAdvertisement) -> FederationEndpoint {
+        let mut idx = 0usize;
+        while idx < self.peer_wire_overrides.len() {
+            if let Some((pid, ep)) = self.peer_wire_overrides.get(idx) {
+                if pid == &ad.peer_id {
+                    return ep.clone();
+                }
+            }
+            idx = idx.saturating_add(1);
+        }
+        let transport = match ad.transport_kind {
+            PeerTransportKind::Unix => Transport::Unix,
+            PeerTransportKind::Tcp => Transport::Tcp,
+        };
+        FederationEndpoint::new(&ad.endpoint, transport)
+            .with_timeouts(Some(self.cfg.probe_timeout), Some(self.cfg.probe_timeout))
+    }
+
+    /// Poll all configured `seed_registries` via `Client::last_all` and fold discovered
+    /// [`PeerAdvertisement`] records into [`FederationDirectory`]. Seed registries that are
+    /// temporarily unreachable are skipped as long as at least one seed succeeds (or no seeds
+    /// are configured).
+    pub fn refresh_discovery(&mut self) -> Result<usize, FederationError> {
+        if self.cfg.seed_registries.is_empty() {
+            return Ok(self.directory.peers().len());
+        }
+        let mut any_ok = false;
+        let mut last_err: Option<FederationError> = None;
+        let mut idx = 0usize;
+        while idx < self.cfg.seed_registries.len() {
+            if let Some(seed) = self.cfg.seed_registries.get(idx) {
+                match FederationDirectory::discover_from_registry(seed, &self.cfg.registry_prefix) {
+                    Ok(ads) => {
+                        any_ok = true;
+                        let mut a_i = 0usize;
+                        while a_i < ads.len() {
+                            if let Some(ad) = ads.get(a_i) {
+                                if let Err(msg) = self.directory.apply_advertisement(ad.clone()) {
+                                    return Err(FederationError::Config(msg));
+                                }
+                            }
+                            a_i = a_i.saturating_add(1);
+                        }
+                    }
+                    Err(FederationError::Config(msg)) => {
+                        return Err(FederationError::Config(msg));
+                    }
+                    Err(e) => {
+                        last_err = Some(e);
+                    }
+                }
+            }
+            idx = idx.saturating_add(1);
+        }
+        if !any_ok {
+            if let Some(err) = last_err {
+                return Err(err);
+            }
+        }
+        Ok(self.directory.peers().len())
+    }
+
+    /// Probe every non-`Dead` remote peer over the wire with `Client::hello_identity`,
+    /// recording measured EWMA `srtt_us`, [`LogIdentity`], and `HelloHealth.poisoned` status.
+    pub fn probe_peers(&mut self) {
+        let mut targets: Vec<PeerAdvertisement> = Vec::new();
+        let mut idx = 0usize;
+        while idx < self.directory.peers.len() {
+            if let Some(entry) = self.directory.peers.get(idx) {
+                if entry.ad.region != self.cfg.local_region
+                    && entry.ad.state != PeerHealthState::Dead
+                {
+                    targets.push(entry.ad.clone());
+                }
+            }
+            idx = idx.saturating_add(1);
+        }
+
+        let mut t_i = 0usize;
+        while t_i < targets.len() {
+            if let Some(ad) = targets.get(t_i) {
+                let ep = self.endpoint_for(ad);
+                let started = std::time::Instant::now();
+                let mut probe_ok = false;
+                let mut poisoned = false;
+                let mut seen_log: Option<LogIdentity> = None;
+
+                if let Ok((mut client, _closer)) = ep.dial() {
+                    if let Ok((_nonce, log_id)) = client.hello_identity() {
+                        seen_log = log_id;
+                        if let Some(h) = client.broker_health() {
+                            if h.poisoned.is_some() {
+                                poisoned = true;
+                            }
+                        }
+                        if !poisoned {
+                            probe_ok = true;
+                        }
+                    }
+                }
+
+                let elapsed = started.elapsed();
+                let sample_us = match u64::try_from(elapsed.as_micros()) {
+                    Ok(0) => 1,
+                    Ok(v) => v,
+                    Err(_) => MAX_FEDERATION_RTT_US,
+                };
+
+                if probe_ok {
+                    let _ = self.directory.record_rtt_sample(&ad.peer_id, sample_us);
+                    let mut p_idx = 0usize;
+                    while p_idx < self.directory.peers.len() {
+                        if let Some(entry) = self.directory.peers.get_mut(p_idx) {
+                            if entry.ad.peer_id == ad.peer_id {
+                                entry.last_log_id = seen_log;
+                                break;
+                            }
+                        }
+                        p_idx = p_idx.saturating_add(1);
+                    }
+                } else {
+                    let _ = self.directory.record_probe_failure(&ad.peer_id, poisoned);
+                }
+            }
+            t_i = t_i.saturating_add(1);
+        }
+    }
+
+    fn open_region_bridge(
+        &self,
+        decision: &RegionRouteDecision,
+        prefix_idx: usize,
+        export_prefix: &str,
+    ) -> Result<ActiveRegionBridge, FederationError> {
+        let ad = PeerAdvertisement {
+            peer_id: decision.gateway_peer_id.clone(),
+            region: decision.region.clone(),
+            endpoint: decision.endpoint.clone(),
+            transport_kind: decision.transport_kind,
+            incarnation: 0,
+            state: PeerHealthState::Alive,
+            export_prefixes: decision.export_prefixes.clone(),
+        };
+        let mut src_ep = self.endpoint_for(&ad);
+        if src_ep.io_timeout == Some(self.cfg.probe_timeout) {
+            src_ep.io_timeout = self.cfg.local_endpoint.io_timeout;
+        }
+        let group = format!(
+            "/g/mesh/{}/{}/p{prefix_idx}",
+            self.cfg.local_region, decision.region
+        );
+        let filter = format!("{export_prefix}/>");
+
+        let mut rw = SubjectRewrite::passthrough().with_hop_budget(0, self.cfg.max_hops);
+        let mut ex_i = 0usize;
+        while ex_i < self.cfg.local_export_prefixes.len() {
+            if let Some(local_pfx) = self.cfg.local_export_prefixes.get(ex_i) {
+                rw = match rw.with_excluded_prefix(local_pfx) {
+                    Ok(next) => next,
+                    Err(msg) => return Err(FederationError::Config(msg)),
+                };
+            }
+            ex_i = ex_i.saturating_add(1);
+        }
+
+        let mut producer_id = self.cfg.base_producer_id;
+        if self.cfg.per_source_log_producer_id {
+            if let Some(peer_entry) = self.directory.peer(&decision.gateway_peer_id) {
+                if let Some(log_id) = peer_entry.last_log_id {
+                    let p_idx_u64 = u64::try_from(prefix_idx).unwrap_or(0);
+                    producer_id =
+                        derive_mesh_producer_id(self.cfg.base_producer_id, &log_id.id, p_idx_u64);
+                }
+            }
+        }
+
+        let bridge = FederationBridge::open(FederationConfig {
+            source: src_ep,
+            dest: self.cfg.local_endpoint.clone(),
+            group,
+            filter,
+            producer_id,
+            rewrite: rw,
+        })?;
+
+        Ok(ActiveRegionBridge {
+            region: decision.region.clone(),
+            gateway_peer_id: decision.gateway_peer_id.clone(),
+            prefix_idx,
+            export_prefix: export_prefix.to_string(),
+            bridge,
+        })
+    }
+
+    fn reconcile_bridges(
+        &mut self,
+        decisions: &[RegionRouteDecision],
+    ) -> Result<(), FederationError> {
+        let mut old_bridges = std::mem::take(&mut self.bridges);
+        let mut pool: Vec<Option<ActiveRegionBridge>> = Vec::new();
+        while let Some(bridge) = old_bridges.pop() {
+            pool.push(Some(bridge));
+        }
+
+        let mut next_bridges: Vec<ActiveRegionBridge> = Vec::new();
+        let mut d_i = 0usize;
+        while d_i < decisions.len() {
+            if let Some(dec) = decisions.get(d_i) {
+                let mut p_i = 0usize;
+                while p_i < dec.export_prefixes.len() {
+                    if let Some(export_pfx) = dec.export_prefixes.get(p_i) {
+                        // Reuse existing bridge if `(region, gateway_peer_id, prefix_idx, export_prefix)` matches.
+                        let mut reused: Option<ActiveRegionBridge> = None;
+                        let mut b_i = 0usize;
+                        while b_i < pool.len() {
+                            if let Some(slot) = pool.get_mut(b_i) {
+                                let matches = match slot.as_ref() {
+                                    Some(b) => {
+                                        b.region == dec.region
+                                            && b.gateway_peer_id == dec.gateway_peer_id
+                                            && b.prefix_idx == p_i
+                                            && b.export_prefix == *export_pfx
+                                    }
+                                    None => false,
+                                };
+                                if matches {
+                                    reused = slot.take();
+                                    break;
+                                }
+                            }
+                            b_i = b_i.saturating_add(1);
+                        }
+                        match reused {
+                            Some(existing) => next_bridges.push(existing),
+                            None => {
+                                let opened = self.open_region_bridge(dec, p_i, export_pfx)?;
+                                next_bridges.push(opened);
+                            }
+                        }
+                    }
+                    p_i = p_i.saturating_add(1);
+                }
+            }
+            d_i = d_i.saturating_add(1);
+        }
+        self.bridges = next_bridges;
+        Ok(())
+    }
+
+    /// Execute one complete dynamic mesh cycle:
+    /// 1. Poll seed registries (`refresh_discovery`) and fold SWIM incarnations.
+    /// 2. Probe remote peer endpoints (`probe_peers`) when `run_wire_probes` is `true`.
+    /// 3. Recompute hysteresis-damped lowest-RTT regional gateways (`recompute_routes`).
+    /// 4. Reconcile [`FederationBridge`] instances across active gateways, draining up to
+    ///    `cfg.batch_size` records per exported prefix and healing `self.cut()`.
+    pub fn sync_once(
+        &mut self,
+        run_wire_probes: bool,
+    ) -> Result<FederationMeshReport, FederationError> {
+        if self.stopped.load(Ordering::Acquire) {
+            return Ok(FederationMeshReport {
+                discovered_peers: self.directory.peers().len(),
+                route_switches: self.directory.route_switches(),
+                ..FederationMeshReport::default()
+            });
+        }
+        let discovered = self.refresh_discovery()?;
+        if run_wire_probes {
+            self.probe_peers();
+        }
+        let decisions = self.directory.recompute_routes();
+        self.reconcile_bridges(&decisions)?;
+
+        let batch = self.cfg.batch_size.clamp(1, FEDERATION_BATCH_CAP);
+        let mut all_links: Vec<FederationLink> = Vec::new();
+        let mut report = FederationMeshReport {
+            discovered_peers: discovered,
+            active_regions: decisions.len(),
+            route_switches: self.directory.route_switches(),
+            fetched: 0,
+            mirrored: 0,
+            deduped: 0,
+            skipped: 0,
+            active_gateways: Vec::new(),
+        };
+
+        let mut d_i = 0usize;
+        while d_i < decisions.len() {
+            if let Some(dec) = decisions.get(d_i) {
+                report
+                    .active_gateways
+                    .push((dec.region.clone(), dec.gateway_peer_id.clone()));
+            }
+            d_i = d_i.saturating_add(1);
+        }
+
+        let mut b_i = 0usize;
+        while b_i < self.bridges.len() {
+            if self.stopped.load(Ordering::Acquire) {
+                break;
+            }
+            let step_res = match self.bridges.get_mut(b_i) {
+                Some(active) => {
+                    let src_id = active.bridge.source_identity();
+                    let res = active.bridge.sync_once(batch);
+                    (active.gateway_peer_id.clone(), src_id, res)
+                }
+                None => break,
+            };
+            let (gw_id, src_id, res) = step_res;
+            match res {
+                Ok(step) => {
+                    report.fetched = report.fetched.saturating_add(step.fetched);
+                    report.mirrored = report.mirrored.saturating_add(step.mirrored);
+                    report.deduped = report.deduped.saturating_add(step.deduped);
+                    report.skipped = report.skipped.saturating_add(step.skipped);
+                    if step.next_cursor > 0 {
+                        self.cut.advance(src_id, step.next_cursor);
+                    }
+                    let mut l_i = 0usize;
+                    while l_i < step.links.len() {
+                        if let Some(link) = step.links.get(l_i) {
+                            self.cut
+                                .advance(link.src_log, link.src_offset.saturating_add(1));
+                            self.cut
+                                .advance(link.dst_log, link.dst_offset.saturating_add(1));
+                            all_links.push(link.clone());
+                        }
+                        l_i = l_i.saturating_add(1);
+                    }
+                    b_i = b_i.saturating_add(1);
+                }
+                Err(FederationError::Io(_)) => {
+                    // Mark failed gateway suspect so the next `sync_once` fails over automatically!
+                    let _ = self.directory.record_probe_failure(&gw_id, false);
+                    let _ = self.directory.record_probe_failure(&gw_id, false);
+                    b_i = b_i.saturating_add(1);
+                }
+                Err(other) => return Err(other),
+            }
+        }
+
+        if !all_links.is_empty() {
+            let _ = self.cut.heal(&all_links);
+        }
+        Ok(report)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn federation_directory_enforces_swim_incarnation_and_ewma_hysteresis() {
+        let gw1 = PeerAdvertisement::new(
+            "us-east-gw1",
+            "us-east",
+            "/tmp/gw1.sock",
+            PeerTransportKind::Unix,
+            1,
+            PeerHealthState::Alive,
+            vec!["/f/us-east".to_string()],
+        )
+        .expect("valid gw1 advertisement");
+        let encoded = gw1.encode_text();
+        let decoded = PeerAdvertisement::decode_text(&encoded).expect("round-trip decode");
+        assert_eq!(decoded, gw1);
+
+        // Fail-closed validation checks.
+        assert!(PeerAdvertisement::decode_text("").is_err());
+        assert!(PeerAdvertisement::decode_text("peer=a region=b").is_err());
+        assert!(PeerAdvertisement::new(
+            "bad/slash",
+            "us-east",
+            "/tmp/x",
+            PeerTransportKind::Unix,
+            1,
+            PeerHealthState::Alive,
+            vec!["/f/us-east".to_string()],
+        )
+        .is_err());
+
+        let mut dir = FederationDirectory::new("us-west", 2_000).expect("valid directory");
+        assert!(dir.apply_advertisement(gw1.clone()).unwrap());
+
+        // Equal incarnation allows Alive -> Suspect degradation, but rejects stale Suspect -> Alive.
+        let gw1_suspect = PeerAdvertisement::new(
+            "us-east-gw1",
+            "us-east",
+            "/tmp/gw1.sock",
+            PeerTransportKind::Unix,
+            1,
+            PeerHealthState::Suspect,
+            vec!["/f/us-east".to_string()],
+        )
+        .unwrap();
+        assert!(dir.apply_advertisement(gw1_suspect).unwrap());
+        assert_eq!(
+            dir.peer("us-east-gw1").unwrap().ad.state,
+            PeerHealthState::Suspect
+        );
+        assert!(!dir.apply_advertisement(gw1).unwrap());
+
+        // Strictly higher incarnation refutes Suspect back to Alive (`federation_incarnation_fresh`).
+        let gw1_refuted = PeerAdvertisement::new(
+            "us-east-gw1",
+            "us-east",
+            "/tmp/gw1.sock",
+            PeerTransportKind::Unix,
+            2,
+            PeerHealthState::Alive,
+            vec!["/f/us-east".to_string()],
+        )
+        .unwrap();
+        assert!(dir.apply_advertisement(gw1_refuted).unwrap());
+        assert_eq!(
+            dir.peer("us-east-gw1").unwrap().ad.state,
+            PeerHealthState::Alive
+        );
+
+        let gw2 = PeerAdvertisement::new(
+            "us-east-gw2",
+            "us-east",
+            "/tmp/gw2.sock",
+            PeerTransportKind::Unix,
+            1,
+            PeerHealthState::Alive,
+            vec!["/f/us-east".to_string()],
+        )
+        .unwrap();
+        assert!(dir.apply_advertisement(gw2).unwrap());
+
+        // Establish initial route on gw1 (`10_000` us vs `12_000` us).
+        assert!(dir.record_rtt_sample("us-east-gw1", 10_000));
+        assert!(dir.record_rtt_sample("us-east-gw2", 12_000));
+        let r0 = dir.recompute_routes();
+        assert_eq!(r0.len(), 1);
+        assert_eq!(r0[0].gateway_peer_id, "us-east-gw1");
+        assert_eq!(dir.route_switches(), 0);
+
+        // Candidate improves to 8_500 us (`8_500 + 2_000 = 10_500 > 10_000`): hysteresis holds gw1!
+        let mut i = 0;
+        while i < 32 {
+            dir.record_rtt_sample("us-east-gw2", 8_500);
+            i += 1;
+        }
+        let r1 = dir.recompute_routes();
+        assert_eq!(r1[0].gateway_peer_id, "us-east-gw1");
+        assert_eq!(dir.route_switches(), 0);
+
+        // Candidate improves to 7_000 us (`srtt <= 8_000`, `cand + 2_000 <= 10_000`): switches cleanly!
+        let mut j = 0;
+        while j < 32 {
+            dir.record_rtt_sample("us-east-gw2", 7_000);
+            j += 1;
+        }
+        let r2 = dir.recompute_routes();
+        assert_eq!(r2[0].gateway_peer_id, "us-east-gw2");
+        assert_eq!(dir.route_switches(), 1);
+    }
+}

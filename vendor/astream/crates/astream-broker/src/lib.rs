@@ -169,11 +169,15 @@ pub use client::{
     LAST_WALK_PAGES_MAX,
 };
 pub use federation::{
-    federation_cursor_advance, federation_hop_allowed, federation_seq_clamp,
-    parse_federation_rules, parse_rewrite_spec, FederatedCut, FederationBridge, FederationConfig,
-    FederationEndpoint, FederationError, FederationLink, FederationReport, FederationRule,
-    FederationRunner, FederationRunnerCloser, FederationWire, SubjectRewrite,
-    DEFAULT_FEDERATION_BATCH, MAX_FEDERATION_RULES,
+    federation_cursor_advance, federation_hop_allowed, federation_incarnation_fresh,
+    federation_route_preferred, federation_seq_clamp, parse_federation_rules, parse_rewrite_spec,
+    FederatedCut, FederationBridge, FederationConfig, FederationDirectory, FederationEndpoint,
+    FederationError, FederationLink, FederationMesh, FederationMeshConfig, FederationMeshReport,
+    FederationReport, FederationRule, FederationRunner, FederationRunnerCloser, FederationWire,
+    PeerAdvertisement, PeerHealthState, PeerRouteEntry, PeerTransportKind, RegionRouteDecision,
+    SubjectRewrite, DEFAULT_FEDERATION_BATCH, DEFAULT_PEER_REGISTRY_PREFIX,
+    DEFAULT_ROUTE_HYSTERESIS_US, MAX_FEDERATION_PEERS, MAX_FEDERATION_REGIONS,
+    MAX_FEDERATION_RTT_US, MAX_FEDERATION_RULES, MAX_PEER_EXPORT_PREFIXES,
 };
 
 /// Capability minting and principal derivation (`cap` feature), re-exported so
@@ -194,11 +198,16 @@ pub use escalation::{
     EscalationParseKind,
 };
 pub use failover::{
-    elect_highest_candidate, failover_epoch_advance, failover_fences_stale, failover_quorum_clamp,
-    inspect_node_log, promote_replica_log, repair_follower_for_leader, ElectionCandidate,
-    ElectionWinner, PromotedReplica,
+    elect_highest_candidate, failover_epoch_advance, failover_fences_stale, failover_lease_expired,
+    failover_quorum_clamp, inspect_node_log, promote_replica_log, repair_follower_for_leader,
+    ElectionCandidate, ElectionWinner, FailoverCluster, FailoverDaemon, FailoverDaemonCloser,
+    FailoverEvent, FailoverLeaseConfig, FailoverNodeSpec, FailoverSnapshot, PromotedReplica,
+    DEFAULT_FAILOVER_GUARD_BAND_MS, DEFAULT_FAILOVER_LEASE_TTL_MS, MAX_FAILOVER_CLUSTER_NODES,
+    MAX_FAILOVER_EVENTS, MAX_FAILOVER_LEASE_TTL_MS,
 };
-pub use health::{health_path, read_health, BrokerHealth, HealthRead, HealthWriter, HEALTH_SUFFIX};
+pub use health::{
+    health_path, read_health, BrokerHealth, HealthRead, HealthWriter, Residency, HEALTH_SUFFIX,
+};
 pub use logid::{
     identity_path, logid_generation_advance, logid_lineage_within_cap, Lineage, LogIdentity,
 };
@@ -233,10 +242,10 @@ pub use store::RetentionTick;
 pub use store::SealedLog;
 pub use store::{
     at_rest_version_advance, at_rest_version_is_bound, broker_bt_advance, incarnation_base,
-    incarnation_of, is_hidden_record, on_boot_volume, store_ack_seq_in_reserved_half,
+    incarnation_of, is_hidden_record, on_boot_volume, seal_path, store_ack_seq_in_reserved_half,
     store_head_advance, will_seq, Boot, BrokerLog, CheckedPublishError, Durability, FlushCounts,
-    InjectedFaults, LogStats, OpenOptions, Prepared, RateLimit, ToldPage, Volume, INC_MAX,
-    MAX_RATE_BUDGET, ORDERED_HORIZON, RETIRE_SUBJECT, WILL_SEQ_LOW,
+    InjectedFaults, InterruptedStep, LogStats, OpenCheck, OpenOptions, Prepared, RateLimit,
+    ToldPage, Volume, INC_MAX, MAX_RATE_BUDGET, ORDERED_HORIZON, RETIRE_SUBJECT, WILL_SEQ_LOW,
 };
 
 #[cfg(test)]

@@ -26,7 +26,8 @@ fn rotation_controls_are_rechecked_at_the_writer() {
         set_controls(&switches, "off", true);
     });
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("wait:account-changed")
     );
     assert_eq!(a.asked("restart:"), 0);
@@ -47,12 +48,13 @@ fn rotation_controls_are_rechecked_before_restart() {
     let switches = Arc::clone(&idle.switches);
     let original = Arc::clone(&idle.hooks.acts.restart);
     let retry = Arc::clone(&original);
-    idle.hooks.acts.restart = Arc::new(move |sid, grace, why, selected| {
+    idle.hooks.acts.restart = Arc::new(move |sid, grace, why, ask, selected| {
         set_controls(&switches, "off", true);
-        original(sid, grace, why, selected)
+        original(sid, grace, why, ask, selected)
     });
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("wait:account-changed")
     );
     assert_eq!(a.asked("restart:"), 0);
@@ -64,7 +66,8 @@ fn rotation_controls_are_rechecked_before_restart() {
     set_controls(&idle.switches, "early", true);
     assert_eq!(moves(&idle.account(usage_wall())), Some("work-2"));
     assert_eq!(
-        idle.restart(&move_to("work-2", AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to("work-2", AccountAt::Wall))
+            .as_deref(),
         Some("adopted")
     );
     assert_eq!(a.asked("restart:"), 1);
@@ -82,13 +85,13 @@ fn login_repair_obeys_its_own_control_with_rotation_off() {
         assert_eq!(moves(&idle.account(AccountPoint::TurnEnd)), Some("main"));
         let switches = Arc::clone(&idle.switches);
         let original = Arc::clone(&idle.hooks.acts.restart);
-        idle.hooks.acts.restart = Arc::new(move |sid, grace, why, selected| {
+        idle.hooks.acts.restart = Arc::new(move |sid, grace, why, ask, selected| {
             if cancel {
                 set_controls(&switches, "off", false);
             }
-            original(sid, grace, why, selected)
+            original(sid, grace, why, ask, selected)
         });
-        let step = idle.restart(&move_to("main", AccountAt::Ahead));
+        let step = idle.restart_once(&move_to("main", AccountAt::Ahead));
         assert_eq!(
             step.as_deref(),
             Some(if cancel {

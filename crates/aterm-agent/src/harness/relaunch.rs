@@ -26,8 +26,8 @@ use super::upgrade_drive::{
 };
 use crate::supervise::approvals;
 use crate::supervise::limit::one_line;
-pub use crate::supervise::policy::turn_end::Restart;
 use crate::supervise::policy::turn_end::TurnEndReading;
+pub use crate::supervise::policy::turn_end::{Restart, RestartAsk};
 use crate::supervise::screen::HumanInput;
 
 #[cfg(all(test, unix))]
@@ -3135,6 +3135,89 @@ pub(super) const CAUSE_ACCOUNT: &str = "account:";
 /// What an account move answers where a restart of another kind was in flight for the conversation ([`restart_as`], [`carried_word`]).
 pub const IN_FLIGHT_OTHER: &str = "wait:restart-in-flight";
 
+/// What a restart in place answers where it was asked of another process than the tab's agent
+/// now ([`asked_of`]): the process it was asked of no longer holds the tab, and no other process
+/// is restarted in its place.
+pub const AGENT_CHANGED: &str = "wait:agent-changed";
+
+/// Whether `snap`, the tab's agent now, is the process the restart `why` was asked of: a restart
+/// for a lost line ([`Restart::InputLost`]) names the process the line was written to and is made
+/// of it alone (its pid, and its start where both are known), so a host whose word lags the tab
+/// never has a process restarted that holds nothing of the line; every other restart, and one for
+/// a line written where the host named no process, is of the tab's agent (that one, asked again,
+/// is kept from ending the process its own relaunch started by [`its_own`]: the record any of its
+/// asks claimed is its own).
+pub(super) fn asked_of(why: &Restart, snap: &Snapshot) -> bool {
+    let Restart::InputLost {
+        of: (pid, started), ..
+    } = why
+    else {
+        return true;
+    };
+    let start =
+        super::upgrade_models::parse_lstart(&snap.start).and_then(|s| i64::try_from(s).ok());
+    pid.is_none_or(|pid| pid == snap.pid) && started.zip(start).is_none_or(|(was, is)| was == is)
+}
+
+/// WHETHER THE RESTART `why`, ASKED BY THE AGENT `sf` NAMES, SUPERSEDES THE CONVERSATION'S RECORD
+/// `st` IN FLIGHT rather than being answered by carrying it ([`restart_as`]): the record is
+/// `Relaunched` and its relaunch already landed in the asker (adopted, `relaunched_pid`, or the
+/// process its line started by its parent, `k`'s read), so carrying it ends nothing of the asker
+/// (its held wait finds the asker and answers `adopted` at once) and would answer the restart
+/// asked with a word for a restart never made. The asked restart is made of the asker instead,
+/// its own record the conversation's from its claim; the record's carry-on, owed the asker and
+/// not booked typed (a carry-on booked typed leaves the record `Done`), goes with it, and the
+/// relaunch after the restart is owed its own. Not where the record holds a native restart's state
+/// (`St::native`, `native_prepare`), whose host operation its carry observes and completes
+/// (`native_restart::complete`): that record is carried as before. Never for an account move,
+/// whose record of the same account is the move asked ([`carried_word`]), nor where the record is
+/// the asked restart's own ([`its_own`], by its `ask`): asked again after its relaunch answered a
+/// wait (the process it started not yet registered, its ledger's evidence unread), carrying it
+/// adopts the process that restart started, which a restart made over it would end.
+pub(super) fn supersedes(
+    why: &Restart,
+    ask: &RestartAsk,
+    st: &St,
+    sf: &SessionFile,
+    session: &str,
+    k: &dyn Kernel,
+) -> bool {
+    !matches!(why, Restart::Account { .. })
+        && !its_own(why, ask, st)
+        && matches!(st.phase, upgrade::Phase::Relaunched { .. })
+        && st.native.is_none()
+        && st.native_prepare.is_empty()
+        && (st.relaunched_pid == sf.pid
+            || relaunch_of(k, sf, session, st.pid, st.shell) == Relaunch::Ours)
+}
+
+/// Whether the record `st` is the restart `why`'s own, asked again as `ask` ([`supersedes`]): the
+/// record an ask of that restart claimed ([`St::ask`], the [`RestartAsk`] every ask of one
+/// restart carries: a lost line's its line's, any other restart's its run's), of its cause
+/// ([`model_restart`]: a memory restart's, a model's move onto the same model, its way back, a lost
+/// line's). Asked again after a deferral, a restart meets its own record wherever the relaunch of
+/// the ask that claimed it landed, its first ask's or a later one's: carried, it adopts the process
+/// that relaunch started, which superseding would end, a second relaunch for one restart. Any other
+/// record of its cause is another restart's, made before this one was asked and landed in the
+/// process now asking (an earlier memory restart's, a model's earlier move, an earlier line's), and
+/// so is one met where this restart's first ask was deferred before it claimed anything
+/// (`busy:another-sweep`, `wait:changed`, `wait:no-session-record`): carrying it would answer the
+/// restart asked with a word for a restart never made, the process it is asked for left running.
+/// The cause alone never says whose a record is. A lost line's restart that names its process is of
+/// that process alone ([`asked_of`]), so asked again after its relaunch landed it answers
+/// [`AGENT_CHANGED`] before any record is read. An account move's is [`carried_word`]'s to answer.
+pub(super) fn its_own(why: &Restart, ask: &RestartAsk, st: &St) -> bool {
+    let cause = st.cause.as_str();
+    let of_cause = match why {
+        Restart::Memory => cause == CAUSE_MEMORY,
+        Restart::Model { to } => cause.strip_prefix(CAUSE_MODEL) == Some(to.as_str()),
+        Restart::ModelBack { .. } => cause.starts_with(CAUSE_MODEL_BACK),
+        Restart::InputLost { .. } => cause == CAUSE_INPUT_LOST,
+        Restart::Account { .. } => false,
+    };
+    of_cause && st.ask == ask.word()
+}
+
 /// The word [`restart_as`] answers after carrying the conversation's in-flight restart (cause `cause`, the carry's word `step`) instead of making the restart `why`.
 pub(super) fn carried_word(why: &Restart, cause: &str, step: String) -> String {
     match why {
@@ -3158,7 +3241,7 @@ pub(super) fn model_restart(
 ) -> ModelRestart {
     let origin = prior.and_then(fallback_origin);
     match why {
-        Restart::Memory | Restart::InputLost => ModelRestart {
+        Restart::Memory | Restart::InputLost { .. } => ModelRestart {
             fallback_from: fallback_carried(origin, riding.as_deref(), hand.as_deref()),
             model: riding.or(hand),
             cause: if matches!(why, Restart::Memory) {
@@ -3327,10 +3410,10 @@ pub fn resumed_prompt_as(agent: &str, version: &str, cause: &str) -> String {
     )
 }
 
-/// The restart in place.
+/// The restart in place `why`, asked as `ask` ([`RestartAsk`]).
 #[must_use]
-pub fn restart_here(opts: &Opts, why: &Restart) -> Report {
-    restart_from(opts, why, snapshot(opts))
+pub fn restart_here(opts: &Opts, why: &Restart, ask: &RestartAsk) -> Report {
+    restart_from(opts, why, ask, snapshot(opts))
 }
 
 /// [`restart_here`] for a host that keeps the owner's roster of Claude Code accounts.
@@ -3338,10 +3421,19 @@ pub fn restart_here(opts: &Opts, why: &Restart) -> Report {
 pub fn restart_under(
     opts: &Opts,
     why: &Restart,
+    ask: &RestartAsk,
     roster: &accounts::Roster,
     selected: &AccountRestart,
 ) -> Report {
-    restart_as(opts, why, roster, snapshot(opts), Some(selected), &Live)
+    restart_as(
+        opts,
+        why,
+        ask,
+        roster,
+        snapshot(opts),
+        Some(selected),
+        &Live,
+    )
 }
 
 /// The process, target row and reason chosen by an account decision.
@@ -3448,7 +3540,7 @@ pub fn cold_login(
     }
     let active = state.active.as_deref().filter(|_| state.proven)?;
     let row = roster.row(active).filter(|row| here(row))?;
-    if state.account(active).auth == accounts::Auth::SignedOut {
+    if state.account(active).current_auth(row) == accounts::Auth::SignedOut {
         return None;
     }
     Some(accounts::login_env(row).1)
@@ -3753,19 +3845,21 @@ pub fn pool_line(
 pub(super) fn restart_from(
     opts: &Opts,
     why: &Restart,
+    ask: &RestartAsk,
     snap: Result<Snapshot, &'static str>,
 ) -> Report {
-    restart_with(opts, why, snap, &Live)
+    restart_with(opts, why, ask, snap, &Live)
 }
 
 /// [`restart_from`] with process facts from `k` ([`Kernel`]), the seam a test scripts the agent's job and terminal through.
 pub(super) fn restart_with(
     opts: &Opts,
     why: &Restart,
+    ask: &RestartAsk,
     snap: Result<Snapshot, &'static str>,
     k: &dyn Kernel,
 ) -> Report {
-    restart_as(opts, why, &accounts::Roster::default(), snap, None, k)
+    restart_as(opts, why, ask, &accounts::Roster::default(), snap, None, k)
 }
 
 /// The login an account move's relaunch line carries.
@@ -3773,10 +3867,14 @@ pub(super) fn account_login(roster: &accounts::Roster, label: &str) -> Option<St
     roster.row(label).map(|row| accounts::login_env(row).1)
 }
 
-/// [`restart_with`] under `roster` ([`restart_under`]).
+/// [`restart_with`] under `roster` ([`restart_under`]). A restart asked of another process than
+/// the tab's agent makes none ([`asked_of`]); the conversation's record in flight answers the
+/// restart asked by being carried ([`carried_word`]) unless the restart supersedes it
+/// ([`supersedes`]); the record it claims keeps its `ask` ([`St::ask`]).
 pub(super) fn restart_as(
     opts: &Opts,
     why: &Restart,
+    ask: &RestartAsk,
     roster: &accounts::Roster,
     snap: Result<Snapshot, &'static str>,
     selected: Option<&AccountRestart>,
@@ -3811,6 +3909,9 @@ pub(super) fn restart_as(
         Err(why) => return said(r, format!("wait:{why}")),
     };
     r.pid = snap.pid;
+    if !asked_of(why, &snap) {
+        return said(r, AGENT_CHANGED);
+    }
     if snap.shell == NO_SHELL {
         return said(r, "refused:not-a-shell-job");
     }
@@ -3834,10 +3935,12 @@ pub(super) fn restart_as(
         if selected.is_some_and(|s| !s.is_current()) {
             return said(r, "wait:account-changed");
         }
-        let cause = st.cause.clone();
-        let carried = carry_in_flight(opts, r, st, &session, &tab);
-        let step = carried_word(why, &cause, carried.step.clone());
-        return said(carried, step);
+        if !supersedes(why, ask, &st, &sf, &session, k) {
+            let cause = st.cause.clone();
+            let carried = carry_in_flight(opts, r, st, &session, &tab);
+            let step = carried_word(why, &cause, carried.step.clone());
+            return said(carried, step);
+        }
     }
     if upgrade::one_shot(&snap.argv) {
         return said(r, "refused:one-shot");
@@ -3855,7 +3958,7 @@ pub(super) fn restart_as(
         &snap.argv,
         matches!(
             why,
-            Restart::Memory | Restart::InputLost | Restart::Account { .. }
+            Restart::Memory | Restart::InputLost { .. } | Restart::Account { .. }
         ),
         snap.profile.as_ref(),
     );
@@ -3902,6 +4005,7 @@ pub(super) fn restart_as(
         to: sf.version.clone(),
         source: SAME_PROGRAM.to_string(),
         cause,
+        ask: ask.word().to_string(),
         salt: now_s(),
         launch_model,
         model_list,
@@ -4065,18 +4169,43 @@ pub(super) fn restart_as(
     r
 }
 
-/// Whether the tab's screen lets [`restart_as`] signal its agent: the composer empty, or, for an
-/// account move, a sign-in menu drawn in the composer's place
-/// ([`TurnEndReading::sign_in_menu_drawn`], read as Claude Code's, the one agent whose accounts
-/// move), where nothing typed stands to lose and the login the move leaves is the menu's own.
+/// Whether the tab's screen lets [`restart_as`] signal its agent: none of the agent's own work
+/// running under its turn's end as the screen names it ([`aterm_phase::phase::work_running`],
+/// read as Claude Code's, the one agent restarted in place), unless the restart is made over it
+/// ([`over_own_work`]); and the composer empty, or, for an account move, a sign-in menu drawn in
+/// the composer's place ([`TurnEndReading::sign_in_menu_drawn`]), where nothing typed stands to
+/// lose and the login the move leaves is the menu's own. The processes under the agent (a shell,
+/// a monitor) are the process table's to say ([`live_background`]); this reads the work Claude
+/// Code runs in its own process, which no process row names.
 fn at_rest_for(why: &Restart, c: &mut Client, tab: &str, scr: &Screen) -> bool {
-    composer_empty(c, tab, scr)
-        || (matches!(why, Restart::Account { .. })
-            && TurnEndReading::sign_in_menu_drawn(
-                Some(aterm_phase::Program::Claude.name()),
-                &scr.rows,
-                scr.cursor.map(|(_, col)| col),
-            ))
+    (over_own_work(why) || aterm_phase::phase::work_running(&scr.rows).is_none())
+        && (composer_empty(c, tab, scr)
+            || (matches!(why, Restart::Account { .. })
+                && TurnEndReading::sign_in_menu_drawn(
+                    Some(aterm_phase::Program::Claude.name()),
+                    &scr.rows,
+                    scr.cursor.map(|(_, col)| col),
+                )))
+}
+
+/// WHETHER THE RESTART `why` IS MADE OVER THE AGENT'S OWN WORK ITS SCREEN NAMES RUNNING
+/// ([`at_rest_for`]): a memory restart alone, the remedy for that very process's memory (Claude
+/// Code's critical-memory banner, or the Mac short of memory with it the largest past aterm's
+/// ceiling), whose in-process work lives in that memory and ends with the process's crash, which
+/// waiting risks; the work's processes still hold it, as every restart's do ([`live_background`]).
+/// Every other restart waits for the work to end, as the upgrade's automatic restart does
+/// ([`super::upgrade_drive`]'s `turn_over_shown`): a lost line's restart, for a process that runs
+/// on and whose line the loop holds meanwhile (`custody::Rest::working`); a model's move onto its
+/// fallback, or back at its reset, and an account move, each a move a later turn's end makes as
+/// well, where the work it would end costs the session more than the wait.
+const fn over_own_work(why: &Restart) -> bool {
+    match why {
+        Restart::Memory => true,
+        Restart::InputLost { .. }
+        | Restart::Model { .. }
+        | Restart::ModelBack { .. }
+        | Restart::Account { .. } => false,
+    }
 }
 
 /// What a relaunch needs, read while the agent runs (argv, parent and start time go with the process).

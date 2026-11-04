@@ -69,3 +69,7 @@ aterm-models-session = { workspace = true }
 # The explicit connection diagnostic uses the shared block and dispatch queue wrappers
 # to read Network.framework's per-connection path without loading a GUI framework.
 aterm-objc = { workspace = true }
+
+[[example]]
+name = "connection_probe"
+test = true

@@ -310,7 +310,9 @@ Run aterm's checks in place, alone or in any combination.
 
 Sets:
   dev      fmt census lint test doc (the default); its lint brings cells,
-           one cell per other OS that builds a selected crate
+           one cell per other OS that builds a selected crate, and one of
+           this OS for a lint with debug assertions off, which shipped code
+           calling a debug-only seam fails
   release  every check `ship release` requires; --all implied, --app required
 
 Checks:

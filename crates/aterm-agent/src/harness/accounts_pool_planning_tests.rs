@@ -27,7 +27,7 @@ fn trial_with_stamp(case: i64, action: &str, stamped: bool) -> [i64; 7] {
             Ok(Vec::new())
         })
         .unwrap();
-    let mut s = session(cli, Supervisor::Aterm, Mode::Early, Path::new("/opt/codex"));
+    let mut s = session(cli, Supervisor::Aterm, Mode::Early, &world.exe);
     if case >= 9 {
         s.point = Point::Wall {
             window: "five_hour".into(),
@@ -37,7 +37,7 @@ fn trial_with_stamp(case: i64, action: &str, stamped: bool) -> [i64; 7] {
     let plan = super::super::session_plan(&world.seat(), &s, |note| note.record());
     let debug = format!("{plan:?}");
     assert!(!debug.contains(plan.prepared.as_ref().unwrap().line.as_str()));
-    assert!(!debug.contains("/opt/codex"));
+    assert!(!debug.contains(world.exe.to_str().unwrap()));
     assert!(matches!(plan.advice(), Advice::Move { to, rotates: true, .. } if to == "work"));
     let after_plan = world.load(cli);
     assert_eq!(after_plan.active.as_deref(), Some("main"));
@@ -226,7 +226,7 @@ fn a_nonmoving_plan_commits_without_touching_the_store_again() {
         "[harness]\naccounts = 'off'\n",
     )
     .unwrap();
-    let s = session(cli, Supervisor::Aterm, Mode::Off, Path::new("/opt/codex"));
+    let s = session(cli, Supervisor::Aterm, Mode::Off, &world.exe);
     let plan = super::super::session_plan(&world.seat(), &s, |note| note.record());
     assert!(!matches!(plan.advice(), Advice::Move { .. }));
     let store = world.seat().store(cli);

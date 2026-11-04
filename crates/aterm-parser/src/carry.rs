@@ -90,7 +90,8 @@ pub enum CarryRefusal {
     State(State),
     /// More than [`MAX_PARAMS`] parameters.
     Params,
-    /// A subparameter bit at or past `params.len()`, but for the bit that marks a full list as cut.
+    /// A subparameter bit on `params[0]`, a colon with no preceding parameter, or a bit at or past
+    /// `params.len()` except the cut-list mark.
     SubparamMask,
     /// `current_param` non-zero while no digit was read.
     CurrentParam,
@@ -267,10 +268,16 @@ impl Parser {
         if has_params && !parameters {
             return Err(CarryRefusal::FieldOutsideState);
         }
+        let csi_parameters = matches!(carry.state, State::CsiParam | State::CsiIntermediate);
+        if (carry.subparam_mask != 0 || carry.last_was_colon) && !csi_parameters {
+            return Err(CarryRefusal::FieldOutsideState);
+        }
         if carry.params.len() > MAX_PARAMS {
             return Err(CarryRefusal::Params);
         }
-        if !crate::csi::subparam_mask_fits(carry.subparam_mask, carry.params.len()) {
+        if !crate::csi::subparam_mask_fits(carry.subparam_mask, carry.params.len())
+            || (carry.last_was_colon && carry.params.is_empty())
+        {
             return Err(CarryRefusal::SubparamMask);
         }
         if !carry.param_started && carry.current_param != 0 {

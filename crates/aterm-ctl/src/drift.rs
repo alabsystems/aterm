@@ -3,7 +3,7 @@
 
 //! `cast drift` on the client.
 
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, Read, Write};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -395,7 +395,7 @@ fn fetch(
         let mut line = String::from(request);
         line.push('\n');
         send_request(&stream, token, &line)?;
-        let mut reader = BufReader::new(&stream);
+        let mut reader = super::reply_on(&stream);
         let mut status = String::new();
         if read_status_line(&mut reader, &mut status)? == 0 {
             return Err(io::Error::new(
@@ -569,7 +569,7 @@ fn probe(
         if let Some(code) = send_served(&stream, request.as_bytes())? {
             return Ok(Probe::Answered(code));
         }
-        let mut reader = BufReader::new(&stream);
+        let mut reader = super::reply_on(&stream);
         let mut status = String::new();
         if read_status_line(&mut reader, &mut status)? == 0 {
             return Err(io::Error::new(
@@ -789,7 +789,7 @@ mod tests {
             let mut seen = Vec::new();
             for _ in 0..8 {
                 let (conn, _) = listener.accept().expect("accept");
-                let mut r = BufReader::new(conn.try_clone().expect("clone"));
+                let mut r = std::io::BufReader::new(conn.try_clone().expect("clone"));
                 let mut line = String::new();
                 r.read_line(&mut line).expect("request");
                 let req = line.trim_end().to_string();

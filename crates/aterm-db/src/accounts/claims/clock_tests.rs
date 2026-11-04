@@ -146,9 +146,9 @@ fn a_clock_two_days_ahead_writes_no_claim() {
     let next = counter(&read, &a).map_or(1, |c| c + 1);
     write_at(&lab.paths[0], &row(next, floor), floor, caps).unwrap();
     repair_commons_at(&lab, 6, &[floor; 3]);
-    for n in 1..3 {
+    for (n, paths) in lab.paths[..3].iter().enumerate().skip(1) {
         assert_eq!(
-            counter(&read_at(&lab.paths[n], floor, caps).unwrap(), &a),
+            counter(&read_at(paths, floor, caps).unwrap(), &a),
             Some(next),
             "Mac {n}"
         );

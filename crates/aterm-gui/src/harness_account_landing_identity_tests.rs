@@ -100,7 +100,8 @@ fn setup(case: Case) -> (Arc<Accts>, WorkerIdle, PathBuf) {
     a.unread.store(true, Ordering::SeqCst);
     assert_eq!(moves(&idle.account(usage_wall())), Some(target));
     assert_eq!(
-        idle.restart(&move_to(target, AccountAt::Wall)).as_deref(),
+        idle.restart_once(&move_to(target, AccountAt::Wall))
+            .as_deref(),
         Some("wait:account-unverified")
     );
     a.readable();

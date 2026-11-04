@@ -104,7 +104,9 @@ fn fields(inv: &Invocation) -> Result<Vec<Field>> {
             return Err(inv.usage(format!("{flag} wants KEY=VALUE")));
         };
         if flag == "-F" && value.starts_with('@') {
-            return Err(inv.usage("-F k=@file is not supported: agh api reads no file"));
+            return Err(
+                inv.usage("-F k=@file is not supported: use --input FILE for a JSON request body")
+            );
         }
         pairs.push(Field {
             key: key.to_string(),
@@ -214,6 +216,11 @@ pub(crate) fn api(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     let method = method(inv)?;
     if !method.is_read() {
         return api_write(ctx, inv, method);
+    }
+    if inv.has("--input") {
+        return Err(
+            inv.usage("--input supplies a write's JSON body; use -X POST, PATCH, PUT or DELETE")
+        );
     }
     if inv.has("--dry-run") || inv.has("--confirm") {
         return Err(inv.usage("--dry-run and --confirm are a write's flags"));
@@ -462,9 +469,15 @@ fn append(
 ///
 /// # Errors
 ///
-/// A usage error for a key whose brackets do not parse, or one that makes a field both a
-/// value and an object or array.
+/// A usage error for a key whose brackets do not parse, one that makes a field both a value and
+/// an object or array, or mixed field and file bodies; or an unreadable or invalid JSON file.
 fn body_of(inv: &Invocation, pairs: Vec<Field>) -> Result<Option<Value>> {
+    if let Some(file) = inv.flag("--input") {
+        if !pairs.is_empty() {
+            return Err(inv.usage("--input and -f/-F cannot supply the same request body"));
+        }
+        return read_input(file).map(Some);
+    }
     if pairs.is_empty() {
         return Ok(None);
     }
@@ -474,6 +487,34 @@ fn body_of(inv: &Invocation, pairs: Vec<Field>) -> Result<Option<Value>> {
         put(&mut object, name, &steps, field_value(value, magic)).map_err(|why| inv.usage(why))?;
     }
     Ok(Some(Value::Object(object)))
+}
+
+/// A bounded JSON body supplied explicitly, avoiding the operating system's argv limit.
+/// Open nonblocking and judge the opened handle so a FIFO cannot wait for a writer.
+fn read_input(file: &str) -> Result<Value> {
+    use std::io::Read as _;
+    const MAX: u64 = 8 * 1024 * 1024;
+    let unread = |e: &dyn std::fmt::Display| Error::local(format!("{file}: {e}"));
+    let invalid = |why: &str| Error::new(Kind::Invalid, format!("{file}: {why}"));
+    let opened =
+        crate::download::open_nonblocking(std::path::Path::new(file)).map_err(|e| unread(&e))?;
+    let meta = opened.metadata().map_err(|e| unread(&e))?;
+    if !meta.is_file() {
+        return Err(invalid("JSON input must be a regular file"));
+    }
+    if meta.len() > MAX {
+        return Err(invalid("JSON input exceeds 8 MiB"));
+    }
+    let mut bytes = Vec::new();
+    opened
+        .take(MAX + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| unread(&e))?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX {
+        return Err(invalid("JSON input exceeds 8 MiB"));
+    }
+    // Parse errors must not copy request contents (which may include private data).
+    aterm_json::from_slice(&bytes).map_err(|_| invalid("input is not valid JSON"))
 }
 
 /// The journal as `Raw::send` writes it, keeping the id its `begin` returned: the report names

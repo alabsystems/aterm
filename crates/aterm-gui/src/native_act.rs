@@ -37,7 +37,31 @@ pub(crate) use observe_control::serve as serve_observation;
 mod renewal;
 pub(crate) use renewal::serve as serve_codex_renewal;
 pub(crate) use renewal::serve_rotation as serve_codex_rotation;
-pub(crate) use renewal::{cancel_owner as cancel_renewal_owner, pending as renewal_pending};
+pub(crate) fn cancel_renewal_owner(ctx: &crate::SessionCtx) -> Result<bool, &'static str> {
+    #[cfg(unix)]
+    let exec = exec_handoff::cancel_owner(ctx);
+    #[cfg(not(unix))]
+    let exec = false;
+    renewal::cancel_owner(ctx).map(|cancelled| cancelled || exec)
+}
+pub(crate) fn renewal_pending(ctx: &crate::SessionCtx) -> bool {
+    #[cfg(unix)]
+    if exec_handoff::pending(ctx) {
+        return true;
+    }
+    renewal::pending(ctx)
+}
+pub(crate) fn retain_exec_claim(ctx: &crate::SessionCtx, connection: u64) -> bool {
+    #[cfg(unix)]
+    {
+        exec_handoff::retain_claim(ctx, connection)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (ctx, connection);
+        false
+    }
+}
 
 /// A cancelled native cohort is positively closed and its exact original shell
 /// is in front. Stale task chrome must not turn Stop into a shell signal.
@@ -145,6 +169,8 @@ impl Clock {
 pub(crate) struct Operations {
     #[cfg(unix)]
     exec_prepare: Option<Arc<exec_handoff::Preparation>>,
+    #[cfg(unix)]
+    exec_operation: Option<Arc<Mutex<exec_handoff::Operation>>>,
     observations: Arc<Mutex<crate::native_observe::Store>>,
     renewal_seals: BTreeMap<String, renewal::Seal>,
     renewal_services: BTreeMap<String, Arc<renewal::Service>>,

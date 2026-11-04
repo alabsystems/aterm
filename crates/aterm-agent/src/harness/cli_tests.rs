@@ -35,6 +35,9 @@ mod renewal_read;
 #[path = "cli_renewal_identity_tests.rs"]
 mod renewal_identity;
 
+#[path = "cli_default_identity_tests.rs"]
+mod default_identity;
+
 #[path = "cli_signin_epoch_tests.rs"]
 mod signin_epoch;
 
@@ -2122,7 +2125,13 @@ fn a_kimi_limits_read_persists_the_month_and_session() {
     let stats = |json: bool| {
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = run_accounts_stats_of(Cli::Kimi, &env, json, &mut out, &mut err);
+        let code = run_accounts_stats_of(
+            (Cli::Kimi, Launch::default()),
+            &env,
+            json,
+            &mut out,
+            &mut err,
+        );
         assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&err));
         out
     };
@@ -2156,7 +2165,13 @@ fn a_kimi_row_with_no_monthly_reading_says_why() {
     std::fs::write(env.accounts_roster_for(Cli::Kimi).unwrap(), roster).unwrap();
     let mut out = Vec::new();
     let mut err = Vec::new();
-    let code = run_accounts_stats_of(Cli::Kimi, &env, false, &mut out, &mut err);
+    let code = run_accounts_stats_of(
+        (Cli::Kimi, Launch::default()),
+        &env,
+        false,
+        &mut out,
+        &mut err,
+    );
     assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&err));
     let text = String::from_utf8(out).unwrap();
     let row = text
@@ -8611,11 +8626,7 @@ fn the_accounts_report_shows_no_figure_of_another_account() {
             let doc: Value = aterm_json::from_str(json.trim()).expect("stats JSON");
             let row = &doc["accounts"][0];
             assert_eq!(row["login"][0]["state"], Value::from(expected), "{doc}");
-            assert_eq!(
-                row["login"][0]["renew_by"],
-                Value::from(ends - accounts::DUE_S),
-                "{doc}"
-            );
+            assert_eq!(row["login"][0]["renew_by"], Value::from(ends), "{doc}");
             if held == Some(a) && observed == STATS_OTHER {
                 assert_eq!(row["key"], Value::from(b.to_string()), "{doc}");
                 assert_eq!(
@@ -8628,6 +8639,29 @@ fn the_accounts_report_shows_no_figure_of_another_account() {
             assert_eq!(code, exit(0), "{err}");
             assert!(
                 text.contains(&format!("login: here {expected}, renew by ")),
+                "{text}"
+            );
+            // "Renew by" means one date on every surface: when the login is forecast to end. The
+            // window it comes due in opens at `due_from`.
+            let (code, json, err) = acc_quiet(AccountsCmd::Report { json: true }, &env);
+            assert_eq!(code, exit(0), "{err}");
+            let doc: Value = aterm_json::from_str(json.trim()).expect("report JSON");
+            let row = doc["accounts"]
+                .as_array()
+                .expect("rows")
+                .iter()
+                .find(|row| row["label"] == Value::from(ACCOUNTS_OWN_LABEL))
+                .expect("the row");
+            assert_eq!(row["renew_by"], Value::from(ends), "{doc}");
+            assert_eq!(
+                row["due_from"],
+                Value::from(ends - accounts::DUE_S),
+                "{doc}"
+            );
+            let (code, text, err) = acc_quiet(AccountsCmd::Report { json: false }, &env);
+            assert_eq!(code, exit(0), "{err}");
+            assert!(
+                text.contains(&format!("renew by {}", rfc3339_utc(ends))),
                 "{text}"
             );
             assert_eq!(
