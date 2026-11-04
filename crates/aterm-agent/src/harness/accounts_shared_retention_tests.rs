@@ -301,8 +301,8 @@ fn legacy_source_sync_preserves_only_owned_shared_rows_without_rewriting_conflic
     // lab's reclassification is refused as a change to the retained account).
     let mut reclassed = row.clone();
     reclassed.class = match row.class {
-        accounts::Class::Dedicated => accounts::Class::Shared,
-        accounts::Class::Shared => accounts::Class::Dedicated,
+        accounts::Class::Preferred => accounts::Class::Pool,
+        accounts::Class::Pool => accounts::Class::Preferred,
     };
     let mut sheet = Roster {
         rows: vec![reclassed.clone()],

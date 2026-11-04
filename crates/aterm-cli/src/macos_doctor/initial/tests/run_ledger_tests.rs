@@ -608,3 +608,72 @@ fn a_stage_wedged_in_this_process_says_it_still_runs_with_no_check_again() {
         "Check again changes nothing of it"
     );
 }
+
+/// A reader that writes nothing (`aterm status`) sees a stage the live pass has run past the
+/// hang limit as running past it, and leaves the ledger as it was: the park stays the first
+/// marking reading's. NEGATIVE CONTROL: the marking reading of the same run parks it.
+#[test]
+fn a_read_only_reading_parks_no_hung_stage() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let revision = authorize_at(root.path(), &Plan::default())
+        .unwrap()
+        .expect("a revision");
+    let _pass = HeldLock::try_take(root.path())
+        .unwrap()
+        .expect("the pass's hold");
+    let stamp = ledger::Stamp {
+        boot: ledger::boot_session(),
+        at: ledger::now_secs(),
+        awake: None,
+        run: HeldLock::profile_holder(root.path()),
+    };
+    ledger::update(root.path(), revision, |ledger| {
+        ledger.begin(Stage::Repositories, 0, stamp, Path::new(UNLATCHED))
+    })
+    .unwrap();
+    let late = |active| ledger::Live {
+        active,
+        boot: ledger::boot_session(),
+        now: ledger::now_secs() + 2 * ledger::HANG_LIMIT,
+        ..ledger::Live::default()
+    };
+    let parked = || {
+        ledger::load(root.path(), revision)
+            .ledger
+            .parked(Stage::Repositories)
+    };
+    let rows = snapshot_at_reading(root.path(), Plan::default(), late, Hung::Leave)
+        .unwrap()
+        .rows;
+    assert_eq!(
+        row_in(&rows, Stage::Repositories),
+        (
+            "running".to_owned(),
+            ledger::overdue_words(Stage::Repositories)
+        ),
+        "it reads as running past the limit"
+    );
+    assert_eq!(parked(), None, "the read-only reading wrote no park");
+    snapshot_at_reading(root.path(), Plan::default(), late, Hung::Mark).unwrap();
+    assert_eq!(
+        parked(),
+        Some(ledger::Park::Hung),
+        "the marking reading parks it"
+    );
+}
+
+/// Before aterm.app's first launch writes a record the setup has not begun, though its rows show
+/// the default plan's stages pending; a saved plan begins it.
+#[test]
+fn a_setup_begins_with_its_first_record() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let fresh = snapshot_at(root.path(), Plan::default()).unwrap();
+    assert!(!fresh.begun, "no records: not begun");
+    assert!(
+        fresh.rows.iter().all(|row| row.status == "pending"),
+        "{:?}",
+        fresh.rows
+    );
+    authorize_at(root.path(), &Plan::default()).unwrap();
+    assert!(snapshot_at(root.path(), Plan::default()).unwrap().begun);
+}

@@ -423,8 +423,8 @@ fn place_racing(
     vz: &Path,
     meanwhile: &mut dyn FnMut(Race, &Path),
 ) -> Result<Placed, String> {
-    let bytes =
-        std::fs::read(built).map_err(|e| format!("could not read {} ({e})", built.display()))?;
+    let bytes = crate::util::read_regular_file(built)
+        .map_err(|e| format!("could not read {} ({e})", built.display()))?;
     if let Some(why) = not_a_static_guest_elf(&bytes) {
         return Err(format!("{} is {why}", built.display()));
     }
@@ -439,7 +439,8 @@ fn place_racing(
         bytes: size,
         fresh,
     };
-    let holds = || std::fs::read(&path).is_ok_and(|there| sha256_hex(&there) == sha256);
+    let holds =
+        || crate::util::read_regular_file(&path).is_ok_and(|there| sha256_hex(&there) == sha256);
     if holds() {
         return Ok(placed(false));
     }

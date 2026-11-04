@@ -2110,7 +2110,7 @@ impl Stub {
         {
             let mtime = meta.modified().ok();
             if st.mode_file_mtime != mtime {
-                let text = std::fs::read_to_string(path).unwrap_or_default();
+                let text = crate::util::read_regular_text(path).unwrap_or_default();
                 st.mode_file_mtime = mtime;
                 let m = text.trim();
                 if !m.is_empty() {
@@ -2202,7 +2202,7 @@ impl Stub {
         self.args
             .headers_file
             .as_ref()
-            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|p| crate::util::read_regular_text(p).ok())
             .and_then(|t| J::parse(&t).ok())
     }
 
@@ -2216,7 +2216,7 @@ impl Stub {
     /// The mode the `--auth-modes-file` names for the credential `label` ([`auth_mode`]).
     fn credential_mode(&self, label: &str) -> Option<String> {
         let path = self.args.auth_modes_file.as_ref()?;
-        let modes = J::parse(&std::fs::read_to_string(path).ok()?).ok()?;
+        let modes = J::parse(&crate::util::read_regular_text(path).ok()?).ok()?;
         auth_mode(&modes, label)
     }
 
@@ -2278,13 +2278,13 @@ impl Stub {
             return None;
         }
         let dir = self.args.modes_dir.as_ref()?;
-        let text = std::fs::read_to_string(dir.join(format!("{name}.json"))).ok()?;
+        let text = crate::util::read_regular_text(&dir.join(format!("{name}.json"))).ok()?;
         J::parse(&text).ok().filter(|j| matches!(j, J::Obj(_)))
     }
 
     fn reply_text(&self, kind: &str, mode: &str, n: i64) -> String {
         if let Some(p) = &self.args.reply_file
-            && let Ok(t) = std::fs::read_to_string(p)
+            && let Ok(t) = crate::util::read_regular_text(p)
             && !t.trim().is_empty()
         {
             return t.trim_end_matches('\n').to_string();
@@ -2516,7 +2516,7 @@ impl Stub {
                     .args
                     .log
                     .as_ref()
-                    .and_then(|p| std::fs::read_to_string(p).ok())
+                    .and_then(|p| crate::util::read_regular_text(p).ok())
                     .unwrap_or_default();
                 let lines: Vec<&str> = text.lines().collect();
                 let tail: Vec<J> = lines[lines.len().saturating_sub(n)..]
@@ -2607,7 +2607,7 @@ impl Stub {
                 .args
                 .tool_file
                 .as_ref()
-                .and_then(|p| std::fs::read_to_string(p).ok())
+                .and_then(|p| crate::util::read_regular_text(p).ok())
                 .and_then(|t| J::parse(&t).ok());
             if let Some(turn) = script.and_then(|s| tool_turn(body, &s)) {
                 return self.tool_turn_answer(&base.in_mode(&mode), body, &summary, turn, out);
@@ -2817,7 +2817,7 @@ impl Stub {
                 .args
                 .tool_file
                 .as_ref()
-                .and_then(|p| std::fs::read_to_string(p).ok())
+                .and_then(|p| crate::util::read_regular_text(p).ok())
                 .and_then(|t| J::parse(&t).ok());
             let facts = (method, path, blen, mode.as_str());
             match script.and_then(|s| muse::tool_turn(body, &s)) {
@@ -3385,7 +3385,7 @@ impl Stub {
             .args
             .account_file
             .as_ref()
-            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|p| crate::util::read_regular_text(p).ok())
             .and_then(|t| J::parse(&t).ok())
             .and_then(|spec| spec.get(route.key()).cloned())
             .filter(|b| !matches!(b, J::Null));
@@ -3426,7 +3426,7 @@ impl Stub {
         let file = self.args.modes_dir.as_ref().map(|d| d.join(REFRESH_FILE));
         let spec = file
             .as_ref()
-            .and_then(|f| std::fs::read_to_string(f).ok())
+            .and_then(|f| crate::util::read_regular_text(f).ok())
             .and_then(|t| J::parse(&t).ok())
             .filter(|j| matches!(j, J::Obj(_)));
         let from_file = spec.is_some();
@@ -3954,7 +3954,7 @@ pub fn main(argv: &[String]) -> i32 {
 fn logged_with(log: &Path, wants: &[&str], limit: Duration) -> String {
     let deadline = std::time::Instant::now() + limit;
     loop {
-        let text = std::fs::read_to_string(log).unwrap_or_default();
+        let text = crate::util::read_regular_text(log).unwrap_or_default();
         if wants.iter().all(|w| text.contains(w)) || std::time::Instant::now() >= deadline {
             return text;
         }

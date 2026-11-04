@@ -114,6 +114,7 @@ mod agent_act;
 mod alert_keys;
 mod alt_screen_resync;
 mod app_about;
+mod app_allocation;
 mod app_colorscheme;
 mod app_config;
 mod app_icon;
@@ -180,6 +181,7 @@ mod host_exceptions_tests;
 mod ledger_key;
 mod native_about;
 mod native_act;
+mod native_allocation;
 mod native_mail;
 mod native_mail_host;
 mod native_observe;
@@ -537,6 +539,10 @@ fn mend_secrets_subscriber_once(headless: bool) {
 }
 
 pub use clt_install::offer_developer_tools_install;
+/// The lost-wake watch `about_to_wait` hands each turn to, for `tests/headless_event_loop.rs`.
+#[cfg(all(target_os = "macos", any(test, debug_assertions)))]
+#[doc(hidden)]
+pub use spawn::OutputWakeWatchProbe;
 pub use system_state_host::{
     CheckStarted, InitialSetupApplyReceipt, InitialSetupHandlers, PhraseJoinReceipt, PhraseOutcome,
     publish_initial_setup_status, set_initial_setup_handlers, system_state_on_screen,
@@ -2162,7 +2168,8 @@ pub(crate) const UI_READ_HANDOFF: Duration = if cfg!(test) {
 /// [`term_lock_ui`] with a bound: the UI thread's read of a terminal it must not misread as
 /// empty while the PTY reader holds it for a batch (the reader hands the lock over, as it does
 /// for [`term_lock_ui`]), which never blocks on a holder that does not hand over, this thread
-/// included (the lock is not reentrant). `None` once `bound` has passed.
+/// included (the lock is not reentrant), and sleeps between its tries ([`pause_for_handover`]).
+/// `None` once `bound` has passed.
 #[track_caller]
 pub(crate) fn term_lock_ui_within<'a>(
     term: &'a Mutex<Terminal>,
@@ -2175,18 +2182,109 @@ pub(crate) fn term_lock_ui_within<'a>(
         return Some(guard);
     }
     ui_waiting.fetch_add(1, Ordering::Release);
-    let start = Instant::now();
+    let deadline = Instant::now() + bound;
     let guard = loop {
-        std::thread::yield_now();
         if let Some(guard) = term_try_lock(term) {
             break Some(guard);
         }
-        if start.elapsed() >= bound {
+        if !pause_for_handover(ui_waiting, deadline) {
             break None;
         }
     };
     ui_waiting.fetch_sub(1, Ordering::Release);
     guard
+}
+
+/// How long a bounded waiter for a busy terminal sleeps between its tries: a quarter of the
+/// hand-over a releasing holder spins for it ([`UI_HANDOFF_SPIN`]), so it wakes inside that
+/// hand-over.
+const UI_WAIT_SLICE: Duration = Duration::from_micros(50);
+const _: () = assert!(UI_WAIT_SLICE.as_micros() * 4 <= UI_HANDOFF_SPIN.as_micros());
+
+/// A bounded waiter's pause between its tries for a terminal a holder may hand over, registered
+/// on `ui_waiting` ([`term_lock_ui_within`], the update capture's take): `false` once `deadline`
+/// has passed, else after a sleep of at most [`UI_WAIT_SLICE`]. A sleep, never a yield: on macOS
+/// a thread that yields while other work is runnable is set aside for a whole 10 ms scheduling
+/// quantum, so on a busy machine a yielding waiter missed the holder's hand-over and outlasted
+/// its own bound.
+pub(crate) fn pause_for_handover(
+    ui_waiting: &std::sync::atomic::AtomicU32,
+    deadline: Instant,
+) -> bool {
+    debug_assert!(
+        ui_waiting.load(Ordering::Acquire) > 0,
+        "a waiter pauses for a hand-over only while registered for it"
+    );
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return false;
+    }
+    #[cfg(test)]
+    handover_pauses_for_test::paused(ui_waiting);
+    std::thread::sleep(left.min(UI_WAIT_SLICE));
+    true
+}
+
+/// The pauses bounded waiters take ([`pause_for_handover`]), counted per `ui_waiting`, for a test
+/// whose holder hands the lock over only once its waiter is asleep.
+#[cfg(test)]
+pub(crate) mod handover_pauses_for_test {
+    use std::sync::atomic::AtomicU32;
+    use std::sync::{Mutex, PoisonError};
+
+    static WATCHED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+    fn address(ui_waiting: &AtomicU32) -> usize {
+        std::ptr::from_ref(ui_waiting).addr()
+    }
+
+    /// Counts the pauses of the waiters on one `ui_waiting` while it lives.
+    #[must_use = "the pauses are counted only while the watch is held"]
+    pub(crate) struct Watch(usize);
+
+    impl Watch {
+        /// How many pauses the waiters on the watched `ui_waiting` have taken.
+        pub(crate) fn pauses(&self) -> usize {
+            WATCHED
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .find(|(at, _)| *at == self.0)
+                .map_or(0, |(_, pauses)| *pauses)
+        }
+    }
+
+    impl Drop for Watch {
+        fn drop(&mut self) {
+            WATCHED
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .retain(|(at, _)| *at != self.0);
+        }
+    }
+
+    /// Watch `ui_waiting` from now.
+    pub(crate) fn watch(ui_waiting: &AtomicU32) -> Watch {
+        let at = address(ui_waiting);
+        WATCHED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((at, 0));
+        Watch(at)
+    }
+
+    pub(super) fn paused(ui_waiting: &AtomicU32) {
+        let at = address(ui_waiting);
+        for (watched_at, pauses) in WATCHED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter_mut()
+        {
+            if *watched_at == at {
+                *pauses += 1;
+            }
+        }
+    }
 }
 
 /// The releaser's half of [`term_lock_ui`]'s handoff, called by the PTY reader and the compress worker between batches.
@@ -2281,6 +2379,36 @@ mod ui_handoff_tests {
             11,
             "`t0` plus ten 20 µs steps — the spin ends AT the bound, not before it and \
              not after it"
+        );
+    }
+
+    /// A bounded read of a busy terminal waits asleep, registered for the hand-over: this holder
+    /// lets go only once its waiter has slept for it, which a waiter that yields between its
+    /// tries never does.
+    #[test]
+    fn a_bounded_read_sleeps_for_the_handover_and_never_yields() {
+        let term = Arc::new(Mutex::new(Terminal::new(2, 10)));
+        let waiting = Arc::new(AtomicU32::new(0));
+        let watch = handover_pauses_for_test::watch(&waiting);
+        let held = term_lock(&term);
+        let (t2, w2) = (term.clone(), waiting.clone());
+        let reader =
+            std::thread::spawn(move || term_lock_ui_within(&t2, &w2, UI_READ_HANDOFF).is_some());
+        let slept = aterm_spec::wait::within(aterm_spec::wait::MUST_HAPPEN, Duration::ZERO, || {
+            (waiting.load(Ordering::Acquire) > 0 && watch.pauses() > 0).then_some(())
+        });
+        drop(held);
+        yield_to_ui_waiter(&waiting);
+        let read = reader.join().expect("the reader");
+        assert!(
+            slept.is_some(),
+            "timed out waiting for the read to sleep as a registered waiter"
+        );
+        assert!(read, "the read took the handed-over terminal");
+        assert_eq!(
+            waiting.load(Ordering::Acquire),
+            0,
+            "and left no registration"
         );
     }
 
@@ -3253,8 +3381,10 @@ enum Wake {
     /// Whether a setup pass's Repositories stage, at its end, waits on Apple's Command Line
     /// Tools: a tab installs them ([`clt_install`]).
     DeveloperToolsInstall(u64, bool),
-    /// The second of a watch for Apple's Command Line Tools, on a Mac that lacks them.
-    DeveloperToolsWatch,
+    /// The second of a watch for Apple's Command Line Tools, on a Mac that lacks them, with what it
+    /// read of this Mac's installers on its own thread; `None` once the tools exist and the watch
+    /// ends ([`clt_install::watch_for_tools`]).
+    DeveloperToolsWatch(Option<clt_install::Reading>),
     /// Whether the network this Mac uses now is in Low Data Mode, read while a pass wants the
     /// Command Line Tools: their tab waits for a network without it ([`clt_install`]).
     #[cfg_attr(
@@ -5178,6 +5308,25 @@ pub fn quiet_driver_event_loop_builder<T: 'static>() -> aterm_window::event_loop
     driver_event_loop_builder(LaunchPosture::QUIET_DRIVER)
 }
 
+/// Returns `Some(reason)` when macOS has no active CoreGraphics display to show a driven window,
+/// or `None` when at least one display is active (and off macOS).
+#[must_use]
+pub fn driver_display_unavailable() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let online = aterm_cg::CGDisplay::online_displays();
+        let active = aterm_cg::CGDisplay::active_displays();
+        platform::active_display_unavailable_from(
+            online.as_deref().map_err(|&e| e),
+            active.as_deref().map_err(|&e| e),
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 #[cfg(test)]
 mod headless_activation_posture_tests {
     use super::{AppActivation, LaunchPosture, launch_posture};
@@ -5792,7 +5941,7 @@ struct Session {
     last_output_ns: Arc<AtomicU64>,
     output_request_booked_ns: AtomicU64,
     latest_output_activity_ns: Arc<AtomicU64>,
-    reader_join: Option<std::thread::JoinHandle<()>>,
+    reader_join: Option<crate::spawn::ReaderJoin>,
     wake_wr: i32,
     reader_stop: Arc<AtomicBool>,
     reflow_cancel: Arc<AtomicBool>,
@@ -19508,9 +19657,9 @@ impl ApplicationHandler<Wake> for App {
             }
         }
         let latch_now_ns = u64::try_from(self.lat_epoch.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        let wake_pass = self.output_wake_watch.pass(
+        let wake_pass = self.output_wake_watch.pass_for_turn(
+            el,
             latch_now_ns,
-            el.user_events_drained(),
             self.pool.iter().map(|s| (s.id, &*s.output_wake_pending)),
         );
         if let Some(recheck_ns) = wake_pass.recheck_ns {
@@ -20372,7 +20521,7 @@ impl App {
             Wake::DeveloperToolsInstall(revision, wanted) => {
                 self.want_developer_tools_install(revision, wanted)
             }
-            Wake::DeveloperToolsWatch => self.developer_tools_watch(),
+            Wake::DeveloperToolsWatch(reading) => self.developer_tools_watch(reading),
             Wake::DeveloperToolsLowData(on) => self.developer_tools_low_data(on),
             Wake::InitialSetupStatus { generation, status } => {
                 self.receive_system_state_status(generation, status)
@@ -29020,7 +29169,7 @@ pub fn main_entry_with_network(
         event_loop_failed: false,
     };
     app.recover_developer_tools_install(0);
-    app.developer_tools_watch();
+    app.developer_tools_first_look();
     if !headless {
         let launch_ms = aterm_time::unix_millis()
             .and_then(|ms| i64::try_from(ms).ok())

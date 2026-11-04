@@ -28,6 +28,9 @@ aterm-time.workspace = true
 aterm-types.workspace = true
 aterm-tempfile.workspace = true
 aterm-toml.workspace = true
+# The seal the lab's generated exports carry (`aterm db alab export`, design §9): a hand edit of
+# an exported file shows in `check` as `edited`, not as the lab having moved.
+aterm-census.workspace = true
 # The macOS major version the lab journal's `sum` row states
 # (docs/DESIGN-alab-lab-model-2026-11-01.md §4.17), and a repair round's CPU time (tests).
 aterm-sysprobe.workspace = true

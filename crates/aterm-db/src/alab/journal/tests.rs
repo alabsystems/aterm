@@ -1547,3 +1547,150 @@ fn only_a_probe_may_name_its_realm_alone() {
     };
     assert_eq!(Event::from_value(&workspace.to_value()), None);
 }
+
+/// A holding is on probation until this Mac's journal saw the account run or sign in here, then
+/// takes the harness's reason, its `since` moving only when its reason does; an account the
+/// harness stops reporting is stated once more with `until` at its end and then forgotten (one
+/// never stated is forgotten at once); a live row is carried into each new week with an `until`
+/// past that week; and `None` from the report (nothing known) ends nothing.
+/// NEGATIVE CONTROL: with `hold` ignoring `proven` (always the harness's reason), the first row
+/// says `borrow` (`left: "borrow" right: "probation"`); with `hold` dropping a stated row at once
+/// instead of ending it, no ending row is due (`an end is stated once`).
+#[test]
+fn a_holding_is_on_probation_until_it_runs_here_and_ends_once() {
+    use place::{Holding, Why};
+    let ann = pk("ann@example.test");
+    let bob = pk("bob@example.test");
+    let now = W * WEEK + 3600;
+    let mut book = Book::default();
+    let holding = |account, why| Holding { account, why };
+    book.hold(&[holding(ann, Why::Borrow), holding(bob, Why::Fill)], now);
+    let due = book.places_due(1, W, now);
+    assert_eq!(due.len(), 2);
+    let row = |due: &[(Pk, Value)], account: Pk| {
+        due.iter()
+            .find(|(pk, _)| *pk == account)
+            .map(|(_, row)| row.clone())
+            .unwrap()
+    };
+    assert_eq!(row(&due, ann)["why"], json!("probation"));
+    assert_eq!(row(&due, ann)["until"], json!((W + 2) * WEEK));
+    let planned = book::Planned {
+        places: due,
+        ..book::Planned::default()
+    };
+    book.wrote(&planned, 1, W, now);
+    assert!(
+        book.places_due(2, W, now + 60).is_empty(),
+        "nothing changed"
+    );
+
+    // ann ran here: an hour later the row takes the harness's reason, since then.
+    book.fold(&[ev(now + 100, Kind::SessionStart, ann)]);
+    book.hold(
+        &[holding(ann, Why::Borrow), holding(bob, Why::Fill)],
+        now + 200,
+    );
+    assert!(book.places_due(2, W, now + 300).is_empty(), "hourly");
+    let due = book.places_due(2, W, now + 3600 + 200);
+    assert_eq!(due.len(), 1);
+    assert_eq!(row(&due, ann)["why"], json!("borrow"));
+    assert_eq!(row(&due, ann)["since"], json!(now + 200));
+    book.wrote(
+        &book::Planned {
+            places: due,
+            ..book::Planned::default()
+        },
+        2,
+        W,
+        now + 3800,
+    );
+
+    // Nothing known: nothing ends. bob dropped: its row is stated once, ended, then forgotten.
+    let later = now + 2 * 3600;
+    book.hold(&[holding(ann, Why::Borrow)], later);
+    let due = book.places_due(3, W, later + 3600);
+    assert_eq!(due.len(), 1, "an end is stated once");
+    assert_eq!(row(&due, bob)["until"], json!(later));
+    book.wrote(
+        &book::Planned {
+            places: due,
+            ..book::Planned::default()
+        },
+        3,
+        W,
+        later + 3600,
+    );
+    assert!(!book.places.contains_key(&bob));
+    // A holding never stated is forgotten at once when it goes.
+    let cy = pk("cy@example.test");
+    book.hold(
+        &[holding(ann, Why::Borrow), holding(cy, Why::Fill)],
+        later + 4000,
+    );
+    book.hold(&[holding(ann, Why::Borrow)], later + 4100);
+    assert!(!book.places.contains_key(&cy));
+
+    // The next week carries ann's live row with an `until` past that week.
+    let next = (W + 1) * WEEK + 10;
+    let due = book.places_due(4, W + 1, next);
+    assert_eq!(due.len(), 1);
+    assert_eq!(row(&due, ann)["until"], json!((W + 3) * WEEK));
+    // The book keeps its places across a save.
+    assert_eq!(Book::from_value(&book.to_value()).places, book.places);
+}
+
+/// End to end: the flusher writes this Mac's holdings as `place` rows at `<account pk>.<uuid32>`
+/// in the same records as its other rows, the reader finds them live with this Mac's `sum` word,
+/// and a report of nothing known (`None`) changes no row.
+/// NEGATIVE CONTROL: with `pass_with` not calling `book.hold`, no place row is read
+/// (`left: 0 right: 1`).
+#[test]
+fn the_flusher_writes_holdings_as_place_rows_the_reader_finds() {
+    use place::{Holding, Why};
+    let lab = Lab::new(&[Role::Writer]);
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let spool = &spools(scratch.path(), 1)[0];
+    let ann = pk("ann@example.test");
+    let now = W * WEEK + 3600;
+    let held = || {
+        Some(vec![Holding {
+            account: ann,
+            why: Why::Fill,
+        }])
+    };
+    let pass = |holdings: &dyn Fn() -> Option<Vec<Holding>>, now| {
+        flush::pass_with(
+            &lab.paths[0],
+            spool,
+            &Presence::default,
+            holdings,
+            false,
+            now,
+        )
+        .unwrap()
+    };
+    assert!(matches!(pass(&held, now), Flushed::Wrote { .. }));
+    let read = rows(&lab.paths[0], now + 1, &PLACE);
+    assert_eq!(read.rows.len(), 1);
+    let (key, row) = read.rows.iter().next().unwrap();
+    let (me, _) = window_at(&lab.paths[0], now + 1);
+    assert_eq!(*key, format!("{}.{}", ann.as_str(), hex::encode_lower(&me)));
+    assert_eq!(row.value["why"], json!("probation"), "never ran here");
+    let places = place::read(&lab.paths[0], now + 1).unwrap().unwrap();
+    assert_eq!(places.rows.len(), 1);
+    assert_eq!(places.rows[0].account, ann.as_str());
+    assert_eq!(places.rows[0].uuid, hex::encode_lower(&me));
+    // Past the routine interval, a report of nothing known ends nothing.
+    let later = now + book::ROUTINE_S + 60;
+    pass(&|| None, later);
+    let places = place::read(&lab.paths[0], later + 1).unwrap().unwrap();
+    assert_eq!(places.rows.len(), 1, "None ends nothing");
+    // An empty report ends the row, which the reader no longer finds live.
+    let end = later + book::ROUTINE_S + 60;
+    spool.append(&ev(end - 30, Kind::SignedIn, ann)).unwrap();
+    pass(&|| Some(Vec::new()), end - 20);
+    pass(&|| Some(Vec::new()), end);
+    let places = place::read(&lab.paths[0], end + 1).unwrap().unwrap();
+    assert!(places.rows.is_empty(), "ended: {places:?}");
+}

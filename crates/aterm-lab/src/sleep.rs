@@ -497,7 +497,7 @@ impl Ops for Live {
             let mut f = crate::sys::scratch_file(p).ok()??;
             let mut buf = Vec::new();
             f.seek(SeekFrom::Start(from)).ok()?;
-            f.read_to_end(&mut buf).ok()?;
+            f.take(64 * 1024 * 1024).read_to_end(&mut buf).ok()?;
             Some(buf)
         })
     }

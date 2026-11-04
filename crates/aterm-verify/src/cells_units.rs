@@ -1,142 +1,102 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The target dependencies of each selected member, projected from Cargo's compact unit graph.
-
-use std::collections::{BTreeMap, BTreeSet};
+//! Target packages and full build inputs, projected from the shared typed Cargo unit graph.
 
 use aterm_forge::model::PkgId;
-use aterm_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
 
-struct Unit {
-    package: PkgId,
-    target: bool,
-    proc_macro: bool,
-    dependencies: Vec<usize>,
+pub(super) struct Projection {
+    pub targets: BTreeMap<String, BTreeSet<PkgId>>,
+    pub inputs: BTreeMap<String, BTreeSet<PkgId>>,
 }
 
-fn index(value: &Value, count: usize) -> Result<usize, String> {
-    value
-        .as_u64()
-        .and_then(|i| usize::try_from(i).ok())
-        .filter(|i| *i < count)
-        .ok_or_else(|| "the unit graph references a missing unit".to_string())
-}
-
-fn package(id: &str) -> Result<PkgId, String> {
-    let name = super::package_id_name(id);
-    let version = id
-        .rsplit_once('#')
-        .map(|(_, fragment)| fragment.rsplit('@').next().unwrap_or_default())
-        .or_else(|| id.split_whitespace().nth(1))
-        .filter(|version| !version.is_empty())
-        .ok_or_else(|| format!("the unit graph has a package without a version: {id}"))?;
-    if name.is_empty() {
-        return Err("the unit graph has an unnamed package".into());
-    }
-    Ok(PkgId::new(name, version))
-}
-
-/// Read exactly `roots`' target dependencies. Unit indices preserve feature and host/target
-/// distinctions until each root's traversal is complete; package names alone cannot do so.
+/// Project exactly the requested roots, preserving indexed feature and host/target contexts.
 /// # Errors
-/// A malformed unit graph, a missing or extra root, or an ordinary root with no target unit.
+/// Malformed Cargo context, a missing or extra root, or an invalid package identity.
 pub(super) fn read(
     text: &str,
     triple: &str,
     roots: &BTreeSet<String>,
-) -> Result<BTreeMap<String, BTreeSet<PkgId>>, String> {
-    // Reuse the shared version, dependency-index and cycle validation.
-    crate::unitgraph::Graph::read(text, &mut crate::unitgraph::Interner::default()).map(|_| ())?;
-    let graph: Value = aterm_json::from_str(text).map_err(|error| error.to_string())?;
-    let raw = graph
-        .get("units")
-        .and_then(Value::as_array)
-        .ok_or("the unit graph lists no units")?;
-    let units = raw
-        .iter()
-        .map(|unit| {
-            let id = unit
-                .get("pkg_id")
-                .and_then(Value::as_str)
-                .ok_or("unit has no package id")?;
-            let kinds = unit
-                .pointer("/target/kind")
-                .and_then(Value::as_array)
-                .filter(|kinds| !kinds.is_empty())
-                .ok_or("unit has no target kinds")?
-                .iter()
-                .map(|kind| kind.as_str().ok_or("unit has a malformed target kind"))
-                .collect::<Result<Vec<_>, _>>()?;
-            let platform = unit.get("platform").ok_or("unit has no platform")?;
-            if !platform.is_null() && platform.as_str().is_none() {
-                return Err("unit has a malformed platform".to_string());
-            }
-            let proc_macro = kinds.contains(&"proc-macro");
-            let target = platform.as_str() == Some(triple)
-                && !proc_macro
-                && !kinds.contains(&"custom-build");
-            let dependencies = unit
-                .get("dependencies")
-                .and_then(Value::as_array)
-                .ok_or("unit has no dependency list")?
-                .iter()
-                .map(|dep| index(dep.get("index").unwrap_or(&Value::Null), raw.len()))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(Unit {
-                package: package(id)?,
-                target,
-                proc_macro,
-                dependencies,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    let root_units = graph
-        .get("roots")
-        .and_then(Value::as_array)
-        .ok_or("the unit graph lists no roots")?
-        .iter()
-        .map(|root| index(root, units.len()))
-        .collect::<Result<Vec<_>, _>>()?;
-    let seen: BTreeSet<String> = root_units
-        .iter()
-        .map(|i| units[*i].package.name.clone())
-        .collect();
-    let covered: BTreeSet<String> = root_units
-        .iter()
-        .filter(|i| units[**i].target || units[**i].proc_macro)
-        .map(|i| units[*i].package.name.clone())
-        .collect();
-    if seen != *roots || covered != *roots {
-        return Err(format!(
-            "unit graph roots {seen:?}, with target or macro roots {covered:?}, are not selected members {roots:?}"
-        ));
-    }
-    let mut dependencies: BTreeMap<String, BTreeSet<PkgId>> = roots
-        .iter()
-        .map(|root| (root.clone(), BTreeSet::new()))
-        .collect();
-    for root in root_units {
-        let packages = dependencies
-            .get_mut(&units[root].package.name)
-            .ok_or("the unit graph has an unselected root")?;
-        let mut seen = BTreeSet::new();
-        let mut todo = vec![root];
-        while let Some(i) = todo.pop() {
-            let unit = &units[i];
-            if !unit.target || !seen.insert(i) {
-                continue;
-            }
-            packages.insert(unit.package.clone());
-            todo.extend(unit.dependencies.iter().copied());
+) -> Result<Projection, String> {
+    let graph = crate::unitgraph::Graph::read(text, &mut crate::unitgraph::Interner::default())?;
+    for unit in &graph.units {
+        if unit.platform.as_deref().is_some_and(|p| p != triple)
+            || !matches!(unit.mode.as_str(), "check" | "build" | "run-custom-build")
+        {
+            return Err(
+                "the all-targets check unit graph has an unexpected platform or mode".into(),
+            );
         }
     }
-    Ok(dependencies)
+    let package = |unit: &crate::unitgraph::Unit| -> Result<PkgId, String> {
+        let fragment = unit
+            .package_id
+            .rsplit_once('#')
+            .map(|(_, f)| f)
+            .ok_or_else(|| format!("unit package identity has no version: {}", unit.package_id))?;
+        let version = fragment.rsplit_once('@').map_or(fragment, |(_, v)| v);
+        let name = crate::unitgraph::package_name(&unit.package_id);
+        if name.is_empty() || version.is_empty() {
+            return Err(format!(
+                "invalid unit package identity: {}",
+                unit.package_id
+            ));
+        }
+        Ok(PkgId::new(name, version))
+    };
+    let target = |unit: &crate::unitgraph::Unit| {
+        unit.platform.as_deref() == Some(triple)
+            && matches!(unit.mode.as_str(), "check" | "build")
+            && !unit
+                .target_kinds
+                .iter()
+                .any(|k| matches!(k.as_str(), "custom-build" | "proc-macro"))
+    };
+    let mut seen = BTreeSet::new();
+    let mut by_root: BTreeMap<String, BTreeSet<PkgId>> = BTreeMap::new();
+    let mut inputs: BTreeMap<String, BTreeSet<PkgId>> = BTreeMap::new();
+    for &root in &graph.roots {
+        let unit = &graph.units[root];
+        let id = package(unit)?;
+        seen.insert(id.name.clone());
+        let build = inputs.entry(id.name.clone()).or_default();
+        let reached = by_root.entry(id.name).or_default();
+        // Host macros have no target coverage, but their inputs affect consumers.
+        if !(target(unit)
+            || unit.platform.is_none() && unit.target_kinds.iter().any(|k| k == "proc-macro"))
+        {
+            return Err("a selected all-targets root has no target or proc-macro context".into());
+        }
+        let mut pending = vec![root];
+        let mut visited = BTreeSet::new();
+        while let Some(index) = pending.pop() {
+            if !visited.insert(index) {
+                continue;
+            }
+            let unit = &graph.units[index];
+            build.insert(package(unit)?);
+            if target(unit) {
+                reached.insert(package(unit)?);
+            }
+            pending.extend(unit.dependencies.iter().copied());
+        }
+    }
+    if seen != *roots {
+        return Err(format!(
+            "the all-targets unit graph's roots {seen:?} are not the requested members {roots:?}"
+        ));
+    }
+    Ok(Projection {
+        targets: by_root,
+        inputs,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aterm_json::Value;
 
     const TRIPLE: &str = "aarch64-unknown-linux-gnu";
 
@@ -145,7 +105,10 @@ mod tests {
             "pkg_id": format!("path+file:///fixture/{name}#1.0.0"),
             "target": {"name": name, "kind": ["lib"], "crate_types": ["lib"]},
             "platform": TRIPLE, "mode": "check", "profile": {}, "features": [],
-            "dependencies": dependencies.iter().map(|i| aterm_json::json!({"index": i})).collect::<Vec<_>>()
+            "dependencies": dependencies.iter().map(|i| aterm_json::json!({
+                "index": i, "extern_crate_name": format!("dependency_{i}"),
+                "public": false, "noprelude": false
+            })).collect::<Vec<_>>()
         })
     }
 
@@ -174,7 +137,9 @@ mod tests {
             .insert("platform".into(), Value::Null);
         let text = aterm_json::json!({"version": 1, "units": units, "roots": [0, 1]}).to_string();
         let roots = BTreeSet::from(["a".into(), "b".into()]);
-        let graph = read(&text, TRIPLE, &roots).expect("the unit graph");
+        let projection = read(&text, TRIPLE, &roots).expect("the unit graph");
+        assert!(projection.inputs["a"].contains(&PkgId::new("host", "1.0.0")));
+        let graph = projection.targets;
         let names = |root: &str| {
             graph[root]
                 .iter()

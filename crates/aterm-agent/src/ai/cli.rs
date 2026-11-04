@@ -1232,7 +1232,9 @@ fn csv(v: &str) -> Vec<String> {
 /// row whose person's step is a mend ([`state::Row::mend`]: of the pin or roster that refuses its
 /// launches, a pinned row's sign-in the pool's does not make, or the sign-in of this machine's own
 /// login at a terminal and then its pin, [`state::sign_in_then_pin`]) is told that mend and the
-/// refusal, never sent to a sign-in.
+/// refusal, never sent to a sign-in. A sign-in that ran and left every launch refused with a
+/// person's step to end it ([`still_refused`]: the pin that sign-in leaves where it is) says that
+/// step, and exits 1.
 fn login_verb(
     env: &Env,
     runner: &dyn Runner,
@@ -1322,10 +1324,39 @@ fn login_verb(
     let done = sign_in_one(env, runner, &store, f, row, out);
     let _ = writeln!(out, "{}", done_line(f.connector, &done));
     match done {
-        Done::SignedIn(_) | Done::NotChecked => ExitCode::SUCCESS,
+        Done::SignedIn(_) | Done::NotChecked => match still_refused(env, id) {
+            // The sign-in ran, but a launch is refused as before: the person's step that ends
+            // it is said now, and the exit is not a success, as with no terminal.
+            Some(line) => {
+                let _ = writeln!(out, "{line}");
+                ExitCode::from(1)
+            }
+            None => ExitCode::SUCCESS,
+        },
         Done::Refused(_) => ExitCode::from(2),
         Done::SignedOut | Done::Failed(_) => ExitCode::from(1),
     }
+}
+
+/// After a sign-in of `id` ran, the line that says a launch of it is still refused and the
+/// person's step that ends that, where the look then finds both: the pool refuses every launch
+/// ([`crate::ai::facts::CliAccounts::launch_refused`]) and the row's step is a mend
+/// ([`state::Row::mend`]), as where the owner's pin holds every launch to a row the build does
+/// not run, which the sign-in of this machine's own login leaves where it is
+/// ([`state::sign_in_then_pin`]). `None` where a launch runs, or its refusal ends by itself.
+fn still_refused(env: &Env, id: &str) -> Option<String> {
+    let l = look(env);
+    let row = l.rows.iter().find(|r| r.connector.id == id)?;
+    let f = l.facts.iter().find(|f| f.connector.id == id)?;
+    let mend = row.mend.as_deref()?;
+    let why = f.pool.as_ref()?.launch_refused.as_deref()?;
+    let why = why
+        .strip_suffix(crate::harness::accounts_pool::NO_WORKER)
+        .unwrap_or(why);
+    Some(format!(
+        "{id}: its launches stay refused until a person at this Mac does one more step: {mend}; a \
+         launch of {id} now is refused: {why}"
+    ))
 }
 
 /// Parsed `aterm ai review` arguments.

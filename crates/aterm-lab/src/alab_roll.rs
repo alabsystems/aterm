@@ -368,6 +368,8 @@ mod tests {
     /// The run itself, on three scratch custodies: every check holds.
     #[test]
     fn the_partition_run_passes() {
+        aterm_spec::fs_lane::join();
+        let _lease = aterm_spec::subprocess_lane::acquire();
         let ev = run().unwrap();
         let failed: Vec<&str> = judge(&ev)
             .into_iter()

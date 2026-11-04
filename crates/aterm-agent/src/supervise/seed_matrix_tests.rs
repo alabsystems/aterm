@@ -91,9 +91,37 @@ struct Loop<'m> {
     key_at: Option<i64>,
     person_on_screen: bool,
     windows: Vec<Window>,
+    track: Track,
 }
 
-#[derive(Clone, Copy, Debug)]
+/// A follower's acts against the first loop's, and the stops it marks on its way
+/// ([`Loop::cut_before`]).
+#[derive(Default)]
+struct Track {
+    chain: Vec<Act>,
+    diverged: Option<Act>,
+    stops: Vec<i64>,
+    marks: Vec<Mark>,
+}
+
+/// How far a follower had come when it reached a stop: every step it took before the stop, and
+/// none at or after it, which is what a follower whose run ends at that stop does.
+struct Mark {
+    stop: i64,
+    log: usize,
+    windows: usize,
+    stamped: usize,
+    journal: usize,
+    chain: usize,
+    diverged: Option<Act>,
+    due: Option<i64>,
+    /// No wake before the stop was left due: a follower that ends there wakes every one (unless
+    /// it diverged first), so one left due (a sleep this run slept across the stop, or the wake
+    /// guard) means that follower would stand otherwise.
+    same: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct Window {
     at: i64,
     rows: usize,
@@ -260,6 +288,26 @@ impl Loop<'_> {
         self.s.now_unix()
     }
 
+    /// Marks each stop at or before `t`, where this run's next step is.
+    fn cut_before(&mut self, t: i64) {
+        while let Some(&stop) = self.track.stops.first().filter(|&&s| s <= t) {
+            self.track.stops.remove(0);
+            let diverged = self.track.diverged.clone();
+            let same = diverged.is_some() || self.due.is_none_or(|u| u >= stop);
+            self.track.marks.push(Mark {
+                stop,
+                log: self.log.len(),
+                windows: self.windows.len(),
+                stamped: self.stamped.len(),
+                journal: self.journal.len(),
+                chain: self.track.chain.len(),
+                diverged,
+                due: self.due,
+                same,
+            });
+        }
+    }
+
     fn advance(&mut self, to: i64) {
         let from_ms = self.s.now_unix_ms();
         if to * 1000 <= from_ms {
@@ -323,6 +371,19 @@ impl Loop<'_> {
                     .to_string()
             };
             let rule = field("rule_id");
+            if rule == crate::supervise::policy::turn_end::RULE_GO_AHEAD_HOUR {
+                // A time a row carries is on the clock the row is stamped by, which a follower's
+                // seed reads it by: a person's hour starts no later than its own row, which this
+                // loop stamps by its second.
+                let from = field("command")
+                    .strip_prefix("from=")
+                    .and_then(|from| from.parse::<i64>().ok())
+                    .expect("the hour's start");
+                assert!(
+                    from <= ms + 1000,
+                    "a person's hour booked at {ms} ms starts at {from} ms"
+                );
+            }
             self.log.push(format!(
                 "    +{} row {} {} {:?} {:?}",
                 now,
@@ -503,6 +564,7 @@ impl Loop<'_> {
                 break;
             }
             n += 1;
+            self.cut_before(u);
             self.advance(u);
             let new = self.wake();
             if stop && let Some(a) = new.into_iter().next() {
@@ -629,6 +691,7 @@ fn run_first(sc: &Scenario, dir: &Path) -> First {
         key_at: None,
         person_on_screen: sc.person_on_screen,
         windows: Vec::new(),
+        track: Track::default(),
     };
     l.s.set_zone_lookup(test_zones);
     l.s.ledger = Ledger::open(Some(&ledger), Some(SID), &mut Vec::new());
@@ -646,6 +709,9 @@ fn run_first(sc: &Scenario, dir: &Path) -> First {
         .min()
         .unwrap_or(sc.t0);
     l.s.set_clock(first_at.min(sc.t0), PDT);
+    // Rows are stamped by the scenario's clock, as a loop stamps them by its own: a time a row
+    // carries (a go-ahead hour's `from=`) is then on the clock a follower's seed reads it by.
+    l.s.test_clock().stamp_by_script();
     l.s.set_mono_standing();
     l.s.count_sleeps(Duration::ZERO);
     l.s.turn_end_seeded = true;
@@ -718,6 +784,10 @@ fn run_first(sc: &Scenario, dir: &Path) -> First {
 
 type Cell = (Option<Act>, usize, Option<i64>, Vec<String>);
 
+/// Each `(handoff, stop)`'s successor cut at the stop ([`run_follower_cut`]).
+type Cuts = std::collections::BTreeMap<(i64, i64), Option<Followed>>;
+
+#[derive(Clone, PartialEq)]
 struct Followed {
     diverged: Option<Act>,
     at_k: usize,
@@ -799,29 +869,72 @@ impl Followed {
 }
 
 fn run_successor(sc: &Scenario, first: &First, h: i64, dir: &Path, seed: bool) -> Cell {
-    let before: Vec<&Act> = first.acts.iter().filter(|a| a.at < h).collect();
-    let last = before.last().map(|a| a.at);
-    let f = run_follower(
+    let (f, _) = successor_cut(sc, first, h, &[], dir, seed);
+    (f.diverged, f.at_k, f.due, f.log)
+}
+
+/// The successor attached at `h` to the first loop's books, and cut at each of `stops`
+/// ([`run_follower_cut`]).
+fn successor_cut(
+    sc: &Scenario,
+    first: &First,
+    h: i64,
+    stops: &[i64],
+    dir: &Path,
+    seed: bool,
+) -> (Followed, Vec<Option<Followed>>) {
+    run_follower_cut(
         sc,
         first,
         first.books(),
-        (h, before.len(), last),
+        successor_from(first, h),
         None,
+        stops,
         dir,
         seed,
-    );
-    (f.diverged, f.at_k, f.due, f.log)
+    )
+}
+
+/// Where a successor attached at `h` to the first loop's books starts: the acts before `h`.
+fn successor_from(first: &First, h: i64) -> (i64, usize, Option<i64>) {
+    let before: Vec<&Act> = first.acts.iter().filter(|a| a.at < h).collect();
+    (h, before.len(), before.last().map(|a| a.at))
 }
 
 fn run_follower(
     sc: &Scenario,
     first: &First,
     on: Books<'_>,
-    (h, k0, last): (i64, usize, Option<i64>),
+    from: (i64, usize, Option<i64>),
     until: Option<i64>,
     dir: &Path,
     seed: bool,
 ) -> Followed {
+    run_follower_cut(sc, first, on, from, until, &[], dir, seed).0
+}
+
+/// [`run_follower`], and at each of `stops` the follower a run ending there would be (the same
+/// follower with that stop as its `until`), or `None` where this run did not stand as that one
+/// would ([`Mark::same`]). A run ending at a stop takes every step this run takes before it, in
+/// the same order, and none after; so this run marks each stop before its first step at or past
+/// it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "run_follower's inputs and the stops to mark on the way"
+)]
+fn run_follower_cut(
+    sc: &Scenario,
+    first: &First,
+    on: Books<'_>,
+    (h, k0, last): (i64, usize, Option<i64>),
+    until: Option<i64>,
+    stops: &[i64],
+    dir: &Path,
+    seed: bool,
+) -> (Followed, Vec<Option<Followed>>) {
+    let mut cuts = stops.to_vec();
+    cuts.sort_unstable();
+    cuts.dedup();
     let books = dir.join("books.jsonl");
     let lifted_at = first
         .events
@@ -936,6 +1049,10 @@ fn run_follower(
         key_at,
         person_on_screen: sc.person_on_screen,
         windows: Vec::new(),
+        track: Track {
+            stops: cuts.clone(),
+            ..Track::default()
+        },
     };
     l.s.set_zone_lookup(test_zones);
     l.s.set_turn_end_timing(TurnEndTiming {
@@ -943,6 +1060,7 @@ fn run_follower(
         ..TurnEndTiming::default()
     });
     l.s.set_clock(h, PDT);
+    l.s.test_clock().stamp_by_script();
     l.s.set_mono_standing();
     l.s.count_sleeps(first.asleep_at(h));
     if first.machine.rebooted {
@@ -995,16 +1113,12 @@ fn run_follower(
                 || (w.text == got.text && (0..=40).contains(&(got.at - w.at)))
         })
     };
-    let mut matched = 0usize;
-    let mut diverged: Option<Act> = None;
-    let mut chain: Vec<Act> = Vec::new();
-    let mut take = |acts: Vec<Act>, matched: &mut usize, chain: &mut Vec<Act>| -> bool {
+    let take = |l: &mut Loop<'_>, acts: Vec<Act>| -> bool {
         for a in acts {
-            if same(first.acts.get(k0 + *matched), &a) {
-                *matched += 1;
-                chain.push(a);
+            if same(first.acts.get(k0 + l.track.chain.len()), &a) {
+                l.track.chain.push(a);
             } else {
-                diverged = Some(a);
+                l.track.diverged = Some(a);
                 return false;
             }
         }
@@ -1021,9 +1135,10 @@ fn run_follower(
             }
             _ => Vec::new(),
         };
-        going = take(acts, &mut matched, &mut chain);
+        going = take(&mut l, acts);
     }
     let end = until.unwrap_or(first.end);
+    assert!(cuts.iter().all(|&c| c < end), "a stop past the run's end");
     let mut evs: Vec<&(i64, String, Ev, Option<usize>)> = first
         .events
         .iter()
@@ -1040,83 +1155,113 @@ fn run_follower(
         let next = evs
             .iter()
             .enumerate()
-            .filter_map(|(i, e)| at_of(e, &chain).map(|t| (i, t)))
+            .filter_map(|(i, e)| at_of(e, &l.track.chain).map(|t| (i, t)))
             .min_by_key(|&(i, t)| (t, i))
             .filter(|&(_, t)| t < end);
-        let typed = matched;
+        let typed = l.track.chain.len();
         let awake = next.map_or(end, |(i, t)| t - evs[i].2.slept());
         while going && let Some(a) = l.waits_before(awake, true) {
-            going = take(vec![a], &mut matched, &mut chain);
+            going = take(&mut l, vec![a]);
         }
-        if !going || matched != typed {
+        if !going || l.track.chain.len() != typed {
             continue;
         }
         let Some((i, t)) = next else {
             break;
         };
         let (_, label, ev, _) = evs.remove(i);
+        l.cut_before(t);
         l.advance_to(t, ev.slept());
         l.log.push(format!("  {} == {label}", t - sc.t0));
         let acts = l.event(ev);
-        going = take(acts, &mut matched, &mut chain);
+        going = take(&mut l, acts);
     }
     while going && let Some(a) = l.waits_before(end, true) {
-        going = take(vec![a], &mut matched, &mut chain);
+        going = take(&mut l, vec![a]);
     }
-    let due = l.due;
-    let mut log = std::mem::take(&mut l.log);
-    log.push(format!(
-        "  matched the first loop's acts {}..{}: {:?}",
-        k0,
-        k0 + matched,
-        chain
+    l.cut_before(i64::MAX);
+    let whole = Mark {
+        stop: end,
+        log: l.log.len(),
+        windows: l.windows.len(),
+        stamped: l.stamped.len(),
+        journal: l.journal.len(),
+        chain: l.track.chain.len(),
+        diverged: l.track.diverged.clone(),
+        due: l.due,
+        same: true,
+    };
+    let followed = |m: &Mark| {
+        let chain = &l.track.chain[..m.chain];
+        let matched = chain.len();
+        let mut log = l.log[..m.log].to_vec();
+        log.push(format!(
+            "  matched the first loop's acts {}..{}: {:?}",
+            k0,
+            k0 + matched,
+            chain
+                .iter()
+                .map(|a| format!("+{} {}", a.at - sc.t0, a.rule))
+                .collect::<Vec<_>>()
+        ));
+        let windows = l.windows[..m.windows]
             .iter()
-            .map(|a| format!("+{} {}", a.at - sc.t0, a.rule))
-            .collect::<Vec<_>>()
-    ));
-    let windows = l
-        .windows
+            .map(|w| Window {
+                rows: standing_rows.len() + w.rows,
+                lines: standing_lines.len() + w.lines,
+                ..*w
+            })
+            .collect();
+        let mut stamped = standing_rows.clone();
+        stamped.extend(l.stamped[..m.stamped].iter().cloned());
+        let mut lines = standing_lines.clone();
+        lines.extend(l.journal[..m.journal].iter().cloned());
+        Followed {
+            diverged: m.diverged.clone(),
+            at_k: k0 + matched,
+            last: chain.last().map(|a| a.at).or(last).max(
+                (k0 + matched)
+                    .checked_sub(1)
+                    .and_then(|k| first.acts.get(k))
+                    .map(|a| a.at),
+            ),
+            due: m.due,
+            log,
+            stamped,
+            journal: lines,
+            windows,
+        }
+    };
+    let at = stops
         .iter()
-        .map(|w| Window {
-            rows: standing_rows.len() + w.rows,
-            lines: standing_lines.len() + w.lines,
-            ..*w
+        .map(|&stop| {
+            let m = l.track.marks.iter().find(|m| m.stop == stop)?;
+            m.same.then(|| followed(m))
         })
         .collect();
-    let mut stamped = standing_rows;
-    stamped.extend(l.stamped.iter().cloned());
-    let mut lines = standing_lines;
-    lines.extend(l.journal.iter().cloned());
-    drop(l);
-    Followed {
-        diverged,
-        at_k: k0 + matched,
-        last: chain.last().map(|a| a.at).or(last).max(
-            (k0 + matched)
-                .checked_sub(1)
-                .and_then(|k| first.acts.get(k))
-                .map(|a| a.at),
-        ),
-        due,
-        log,
-        stamped,
-        journal: lines,
-        windows,
-    }
+    (followed(&whole), at)
 }
 
-fn run_chain(sc: &Scenario, first: &First, h1: i64, h2: i64, dir: &Path) -> Option<Cell> {
-    let before: Vec<&Act> = first.acts.iter().filter(|a| a.at < h1).collect();
-    let last = before.last().map(|a| a.at);
-    let second = run_follower(
-        sc,
-        first,
-        first.books(),
-        (h1, before.len(), last),
-        Some(h2),
-        dir,
-        true,
-    );
+/// The successor attached at `h1` and run to `h2` (`cut`, that successor cut there, where it
+/// stood as one run to `h2` does), then a third loop attached at `h2` to its books.
+fn run_chain(
+    sc: &Scenario,
+    first: &First,
+    (h1, h2): (i64, i64),
+    cut: Option<Followed>,
+    dir: &Path,
+) -> Option<Cell> {
+    let second = cut.unwrap_or_else(|| {
+        run_follower(
+            sc,
+            first,
+            first.books(),
+            successor_from(first, h1),
+            Some(h2),
+            dir,
+            true,
+        )
+    });
     if second.diverged.is_some() {
         return None;
     }
@@ -1251,15 +1396,38 @@ fn run_matrix_owed(sc: &Scenario, seed: bool, owed: bool) -> (String, Tally) {
             }
         };
     let hs = handoffs(&first);
+    // A seeded matrix runs each successor on to the end and also stopped at the next handoff (the
+    // chain's second loop) and just after each window it is the last handoff before (the loop
+    // that stopped in that window's successor): one run, cut at those stops.
+    let mut stops: Vec<Vec<i64>> = vec![Vec::new(); hs.len()];
+    if seed {
+        for (i, at) in stops.iter_mut().enumerate() {
+            at.extend(hs.get(i + 1));
+        }
+        for w in &first.windows {
+            if let Some(i) = hs.iter().rposition(|&h| h <= w.at) {
+                stops[i].push(w.at + 1);
+            }
+        }
+    }
+    let mut cuts = Cuts::new();
     for (i, &h) in hs.iter().enumerate() {
+        let (f, at) = successor_cut(sc, &first, h, &stops[i], &dir, seed);
+        cuts.extend(stops[i].iter().map(|&stop| (h, stop)).zip(at));
         cell(
             format!("handoff +{}", h - sc.t0),
-            run_successor(sc, &first, h, &dir, seed),
+            (f.diverged, f.at_k, f.due, f.log),
             &mut out,
             &mut tally,
         );
         if let Some(&h2) = hs.get(i + 1).filter(|_| seed)
-            && let Some(c) = run_chain(sc, &first, h, h2, &dir)
+            && let Some(c) = run_chain(
+                sc,
+                &first,
+                (h, h2),
+                cuts.get(&(h, h2)).cloned().flatten(),
+                &dir,
+            )
         {
             cell(
                 format!("chain +{} then +{}", h - sc.t0, h2 - sc.t0),
@@ -1269,7 +1437,7 @@ fn run_matrix_owed(sc: &Scenario, seed: bool, owed: bool) -> (String, Tally) {
             );
         }
     }
-    for (what, c) in window_cells(sc, &first, &hs, &dir, seed, owed) {
+    for (what, c) in window_cells(sc, &first, &hs, &cuts, &dir, seed, owed) {
         cell(what, c, &mut out, &mut tally);
     }
     let _ = std::fs::remove_dir_all(&dir);
@@ -1309,41 +1477,56 @@ fn window_cells(
     sc: &Scenario,
     first: &First,
     hs: &[i64],
+    cuts: &Cuts,
     dir: &Path,
     seed: bool,
     owed: bool,
 ) -> Vec<(String, Cell)> {
     let mut cells = Vec::new();
     let attach_at = |at: i64| first.window_attach(at);
-    let follow =
-        |what: &str, on: Stood, at: i64, log: &[String], cells: &mut Vec<(String, Cell)>| {
-            let books = Books {
-                rows: &on.0,
-                journal: &on.1,
-                restored: None,
-            };
-            let (k0, last) = typed_on(books.rows);
-            for h in attach_at(at) {
-                let f = run_follower(sc, first, books, (h, k0, last), None, dir, seed);
-                let mut lines = log.to_vec();
-                lines.push(format!("  attached at +{}:", h - sc.t0));
-                lines.extend(f.log);
-                cells.push((
-                    format!(
-                        "{what} stopped in the window at +{}, attached at +{}",
-                        at - sc.t0,
-                        h - sc.t0
-                    ),
-                    (f.diverged, f.at_k, f.due, lines),
-                ));
-            }
+    // The followers attached just after the window cut at `stops` (the attach at `at + 1`).
+    let follow = |what: &str,
+                  on: Stood,
+                  at: i64,
+                  log: &[String],
+                  stops: &[i64],
+                  cells: &mut Vec<(String, Cell)>| {
+        let books = Books {
+            rows: &on.0,
+            journal: &on.1,
+            restored: None,
         };
+        let (k0, last) = typed_on(books.rows);
+        let mut cut = Vec::new();
+        for h in attach_at(at) {
+            let here = if h == at + 1 { stops } else { &[] };
+            let (f, at_stops) =
+                run_follower_cut(sc, first, books, (h, k0, last), None, here, dir, seed);
+            if h == at + 1 {
+                cut = at_stops;
+            }
+            let mut lines = log.to_vec();
+            lines.push(format!("  attached at +{}:", h - sc.t0));
+            lines.extend(f.log);
+            cells.push((
+                format!(
+                    "{what} stopped in the window at +{}, attached at +{}",
+                    at - sc.t0,
+                    h - sc.t0
+                ),
+                (f.diverged, f.at_k, f.due, lines),
+            ));
+        }
+        cut
+    };
     for w in &first.windows {
-        follow(
+        let h2 = hs.iter().copied().find(|&h| h > w.at + 1).filter(|_| seed);
+        let cut = follow(
             "the first loop",
             in_window(first.books(), *w, owed),
             w.at,
             &[],
+            h2.as_slice(),
             &mut cells,
         );
         if !seed {
@@ -1356,8 +1539,10 @@ fn window_cells(
             restored: None,
         };
         let (k0, last) = typed_on(on.rows);
-        if let Some(&h2) = hs.iter().find(|&&h| h > w.at + 1) {
-            let second = run_follower(sc, first, on, (w.at + 1, k0, last), Some(h2), dir, true);
+        if let Some(h2) = h2 {
+            let second = cut.into_iter().next().flatten().unwrap_or_else(|| {
+                run_follower(sc, first, on, (w.at + 1, k0, last), Some(h2), dir, true)
+            });
             if second.diverged.is_none() {
                 let third = run_follower(
                     sc,
@@ -1384,16 +1569,21 @@ fn window_cells(
             }
         }
         if let Some(&h1) = hs.iter().rev().find(|&&h| h <= w.at) {
-            let before: Vec<&Act> = first.acts.iter().filter(|a| a.at < h1).collect();
-            let second = run_follower(
-                sc,
-                first,
-                first.books(),
-                (h1, before.len(), before.last().map(|a| a.at)),
-                Some(w.at + 1),
-                dir,
-                true,
-            );
+            let second = cuts
+                .get(&(h1, w.at + 1))
+                .cloned()
+                .flatten()
+                .unwrap_or_else(|| {
+                    run_follower(
+                        sc,
+                        first,
+                        first.books(),
+                        successor_from(first, h1),
+                        Some(w.at + 1),
+                        dir,
+                        true,
+                    )
+                });
             if second.diverged.is_none()
                 && let Some(sw) = second.windows.iter().rev().find(|x| x.at == w.at)
             {
@@ -1404,6 +1594,7 @@ fn window_cells(
                     in_window(second.books(), *sw, owed),
                     w.at,
                     &log,
+                    &[],
                     &mut cells,
                 );
             }
@@ -4830,6 +5021,191 @@ fn a_loop_that_follows_types_as_the_first_loop_at_every_handoff() {
     );
 }
 
+/// A SUCCESSOR CUT AT A STOP IS THE FOLLOWER THAT STOPS THERE ([`run_follower_cut`]), which the
+/// seeded matrices take for the second loops they stand for instead of running each: every cut
+/// handed back equals the follower run with that stop as its `until` (its divergence, act,
+/// last act, wake, log, books, journal and windows), and the run it was cut from equals one that
+/// marked no stop. The stops are the matrices' own (the next handoff, a second after a window)
+/// and each other kind a run can end at (a later read and the second after it, a sleep's start,
+/// a second into it, its middle). The scenarios are some of the matrix's, as they are and with
+/// the Mac asleep before each read that follows a read, a key, a tail or a mark, so a wake the
+/// loop had due falls inside a sleep: no cut may stand for a run that ends after that wake
+/// ([`Mark::same`]), and such stops are met here as no matrix's handoff meets one. NEGATIVE
+/// CONTROLS: a cut at every stop whatever was due, and a stop marked after the step at it, each
+/// make cuts unlike their runs.
+#[test]
+fn a_successor_cut_at_a_stop_is_the_follower_that_stops_there() {
+    let picked = || {
+        scenarios()
+            .into_iter()
+            .filter(|sc| CUT_SCENARIOS.contains(&sc.name.as_str()))
+    };
+    let mut cases: Vec<Scenario> = picked().collect();
+    assert_eq!(cases.len(), CUT_SCENARIOS.len(), "the scenarios picked");
+    cases.extend(picked().map(|sc| asleep_before_reads(sc, 700)));
+    let checks = aterm_spec::check::each_on(aterm_spec::fs_lane::PLACES, &cases, cuts_against_runs);
+    let mut all = CutCheck::default();
+    for c in checks {
+        all.cut += c.cut;
+        all.slept += c.slept;
+        all.withheld += c.withheld;
+        all.unlike.extend(c.unlike);
+    }
+    assert!(
+        all.unlike.is_empty(),
+        "{} cuts are not the runs they stand for:\n{}",
+        all.unlike.len(),
+        all.unlike.join("\n")
+    );
+    assert!(all.cut > 500, "{} cuts checked", all.cut);
+    assert!(all.slept > 0, "no cut stood at a stop inside a sleep");
+    assert!(
+        all.withheld > 0,
+        "no stop came after a wake left due, so nothing checked that no cut stands for one"
+    );
+}
+
+/// The scenarios [`a_successor_cut_at_a_stop_is_the_follower_that_stops_there`] cuts: a ladder
+/// met again, windows a successor attaches after, a landing Off lifts, a person's hour booked,
+/// and the take windows whose waits a sleep crosses.
+const CUT_SCENARIOS: [&str; 6] = [
+    "D spend (met again, the ladder)",
+    "B five-hour Esc'd, the loop's try (met again)",
+    "R4 Off lifts after the landing (Land, in words)",
+    "R9 five-hour Esc'd, a person's keystroke before the try",
+    "R9 spend, a person's keystrokes at the first rung and the try, take window",
+    "TW spend, take window (the notice read inside the window, a local command, a person's 3h \
+     turn ends on it)",
+];
+
+/// `sc` with the Mac asleep `asleep` seconds before each read that follows a read, a key, a tail
+/// or a mark: a wait the loop had running is slept across.
+fn asleep_before_reads(sc: Scenario, asleep: i64) -> Scenario {
+    let mut after_idle = false;
+    let beats = sc
+        .beats
+        .into_iter()
+        .map(|b| {
+            let slept = after_idle;
+            after_idle = matches!(b.ev, Ev::Point(_) | Ev::Key | Ev::Tail(_) | Ev::Mark);
+            match b.ev {
+                Ev::Point(rows) if slept => Beat {
+                    ev: Ev::Woke(asleep, rows),
+                    ..b
+                },
+                _ => b,
+            }
+        })
+        .collect();
+    Scenario {
+        name: format!("{} (the Mac asleep {asleep} s before each read)", sc.name),
+        beats,
+        ..sc
+    }
+}
+
+#[derive(Default)]
+struct CutCheck {
+    cut: usize,
+    slept: usize,
+    withheld: usize,
+    unlike: Vec<String>,
+}
+
+/// Each successor of `sc`'s first loop cut at every stop after its handoff, against the follower
+/// run to that stop ([`a_successor_cut_at_a_stop_is_the_follower_that_stops_there`]).
+fn cuts_against_runs(sc: &Scenario) -> CutCheck {
+    let tag: String = sc
+        .name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let dir = crate::supervise::test_scratch_path("seed-matrix-cuts", &tag);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    let first = run_first(sc, &dir);
+    let hs = handoffs(&first);
+    let in_sleep = |s: i64| {
+        first
+            .events
+            .iter()
+            .any(|(t, _, ev, _)| ev.slept() > 0 && t - ev.slept() <= s && s <= *t)
+    };
+    let mut out = CutCheck::default();
+    for (i, &h) in hs.iter().enumerate() {
+        let mut stops: Vec<i64> = hs.get(i + 1).copied().into_iter().collect();
+        stops.extend(first.windows.iter().map(|w| w.at + 1));
+        for (t, _, ev, _) in &first.events {
+            stops.extend([*t, t + 1]);
+            let slept = ev.slept();
+            if slept > 0 {
+                stops.extend([t - slept, t - slept + 1, t - slept / 2]);
+            }
+        }
+        stops.retain(|&s| h < s && s < first.end);
+        stops.sort_unstable();
+        stops.dedup();
+        let (whole, cuts) = successor_cut(sc, &first, h, &stops, &dir, true);
+        let (alone, _) = successor_cut(sc, &first, h, &[], &dir, true);
+        if whole != alone {
+            out.unlike.push(format!(
+                "{} | handoff +{}: marking its stops changed the run ({})",
+                sc.name,
+                h - sc.t0,
+                unlike_in(&whole, &alone)
+            ));
+        }
+        for (&stop, cut) in stops.iter().zip(cuts) {
+            let Some(cut) = cut else {
+                out.withheld += 1;
+                continue;
+            };
+            let run = run_follower(
+                sc,
+                &first,
+                first.books(),
+                successor_from(&first, h),
+                Some(stop),
+                &dir,
+                true,
+            );
+            if cut == run {
+                out.cut += 1;
+                out.slept += usize::from(in_sleep(stop));
+            } else {
+                out.unlike.push(format!(
+                    "{} | handoff +{}, stop +{}: {}",
+                    sc.name,
+                    h - sc.t0,
+                    stop - sc.t0,
+                    unlike_in(&cut, &run)
+                ));
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    out
+}
+
+/// Which of two followers' parts differ.
+fn unlike_in(a: &Followed, b: &Followed) -> String {
+    [
+        ("diverged", a.diverged != b.diverged),
+        ("at_k", a.at_k != b.at_k),
+        ("last", a.last != b.last),
+        ("due", a.due != b.due),
+        ("log", a.log != b.log),
+        ("stamped", a.stamped != b.stamped),
+        ("journal", a.journal != b.journal),
+        ("windows", a.windows != b.windows),
+    ]
+    .iter()
+    .filter(|(_, differ)| *differ)
+    .map(|(what, _)| *what)
+    .collect::<Vec<_>>()
+    .join(", ")
+}
+
 #[test]
 fn a_land_episode_a_reading_in_another_mode_ended_is_over_for_a_loop_that_follows() {
     use crate::supervise::config::Autopilot;
@@ -7221,18 +7597,31 @@ fn restored_cells(sc: &Scenario, i: usize, noted: bool, owed: bool) -> (usize, V
             ..first.books()
         };
         let last = before.last().map(|a| a.at);
-        let f = run_follower(sc, &first, on, (h, before.len(), last), None, &dir, true);
+        // One run to the end, cut at the next handoff for the chain's second loop.
+        let next = hs.get(i + 1).copied();
+        let (f, cut) = run_follower_cut(
+            sc,
+            &first,
+            on,
+            (h, before.len(), last),
+            None,
+            next.as_slice(),
+            &dir,
+            true,
+        );
         cell(format!("attached at +{}", h - sc.t0), &f);
-        if let Some(&h2) = hs.get(i + 1) {
-            let second = run_follower(
-                sc,
-                &first,
-                on,
-                (h, before.len(), last),
-                Some(h2),
-                &dir,
-                true,
-            );
+        if let Some(h2) = next {
+            let second = cut.into_iter().next().flatten().unwrap_or_else(|| {
+                run_follower(
+                    sc,
+                    &first,
+                    on,
+                    (h, before.len(), last),
+                    Some(h2),
+                    &dir,
+                    true,
+                )
+            });
             if second.diverged.is_none() {
                 let on = Books {
                     restored,

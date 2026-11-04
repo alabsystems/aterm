@@ -117,7 +117,7 @@ fn prepared(result: Option<SecretBytes>) -> Result<(), ReadError> {
 
 /// The executable's private child route, before GUI or account initialization.
 /// It accepts only a staged directory, and writes bytes only to an anonymous pipe.
-#[must_use]
+#[must_use = "return a handled command's exit status to the caller"]
 pub fn entry() -> Option<std::process::ExitCode> {
     let mut args = std::env::args_os().skip(1);
     let mode = args.next();

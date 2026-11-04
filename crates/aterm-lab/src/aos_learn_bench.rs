@@ -34,6 +34,7 @@ use crate::paths::{from_caller, paths};
 use crate::stop::{check, install, ring, sleep};
 use crate::sys::{await_exit, digest_file};
 use crate::trail_gallery::{checkouts, resolve_out};
+use crate::util::{read_regular_file, read_regular_text};
 use crate::{Fail, Res};
 
 /// The verb's own help (`aos-learn-bench --help`).
@@ -490,8 +491,8 @@ fn files_under(dir: &Path, sub: &str) -> Result<Vec<(String, Vec<u8>)>, String> 
             if kind.is_dir() {
                 walk(root, &path, out)?;
             } else {
-                let bytes =
-                    fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+                let bytes = read_regular_file(&path)
+                    .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
                 let name = path.strip_prefix(root).unwrap_or(&path).to_string_lossy();
                 out.push((name.into_owned(), bytes));
             }
@@ -861,7 +862,7 @@ fn run_child(lab: &Path, name: &str, args: &[String], out: &Path) -> Child {
         c.error
             .get_or_insert(format!("cannot flush its output: {e}"));
     }
-    c.summary = fs::read_to_string(&stdout)
+    c.summary = read_regular_text(&stdout)
         .ok()
         .and_then(|t| Summary::parse(&t));
     c

@@ -106,6 +106,7 @@ src/bloom_tests.rs	bloom_large_capacity_no_overflow	bloom-layout
 src/bloom_tests.rs	bloom_no_false_negatives	bloom-no-false-negatives	
 src/bloom_tests.rs	bloom_with_size_max_no_overflow	bloom-layout	
 src/bloom_tests.rs	bloom_with_size_rounding	bloom-layout	
+src/bloom_tests.rs	hash_pair_folds_as_aterm_hash_does	bloom-no-false-negatives	
 src/budgeted.rs	a_row_read_short_of_its_end_is_reported_like_the_one_shot	budgeted-refines-one-shot	
 src/budgeted.rs	a_row_the_regex_scan_cannot_finish_is_reported_like_the_one_shot	budgeted-refines-one-shot	
 src/budgeted.rs	the_row_feed_equals_one_shot_across_all_modes	budgeted-refines-one-shot	
@@ -217,10 +218,10 @@ tests/index_release_memory.rs	release_reclaims_real_heap_that_clear_retains_with
 tests/search_vs_bruteforce.rs	verified_search_matches_bruteforce	index-literal-cs	
 ```
 
-Three tests are missing from the map: `src/grapheme.rs::column_map_matches_byte_to_column`
-samples `column-map-walk`, `src/grapheme.rs::lower_byte_map_matches_map_lower_byte_to_original`
-samples `lower-byte-map`, and `src/literal.rs::finds_every_ascii_case_insensitive_occurrence`
-samples `ascii-ci-matches`.
+## 3. Coverage
+
+- All 121 live `#[test]` functions across `src/` and `tests/` appear in §2: 117 spec samples across
+  the 39 specs in §1 + 4 `move-to-bench` rows in §4.
 
 ## 4. Tests that are not spec samples
 

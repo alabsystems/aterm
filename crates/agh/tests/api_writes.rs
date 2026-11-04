@@ -129,6 +129,90 @@ fn args(owned: &[String]) -> Vec<&str> {
     owned.iter().map(String::as_str).collect()
 }
 
+/// `-F` carries the JSON type a REST body needs (a pull request's `draft`), and `-f` keeps
+/// the same words a string, the control that `-F` alone typed them.
+#[test]
+fn a_write_field_is_typed_by_capital_f_and_a_string_by_small_f() {
+    let w = World::new("api-field-types", true);
+    let mut owned = post_tag("typed");
+    for field in [
+        "-F",
+        "draft=true",
+        "-F",
+        "gone=null",
+        "-F",
+        "count=7",
+        "-F",
+        "word=truly",
+        "-f",
+        "small=true",
+        "-f",
+        "small_count=7",
+    ] {
+        owned.push(field.into());
+    }
+    let ran = w.run(&args(&owned));
+    assert_eq!(ran.exit, 0, "stderr {}", ran.stderr);
+    let bodies = w.fake.bodies();
+    let text = bodies
+        .last()
+        .and_then(|body| body.json.as_deref())
+        .expect("the POST's JSON body");
+    let body: Value = aterm_json::from_str(text).expect("JSON");
+    assert_eq!(body["draft"], Value::Bool(true), "{text}");
+    assert_eq!(body["gone"], Value::Null, "{text}");
+    assert_eq!(body["count"], Value::from(7_u64), "{text}");
+    assert_eq!(body["word"], Value::from("truly"), "{text}");
+    assert_eq!(body["small"], Value::from("true"), "{text}");
+    assert_eq!(body["small_count"], Value::from("7"), "{text}");
+}
+
+/// A bracketed key builds the arrays and objects a REST body needs (labels, reviewers, a
+/// review's comments, branch protection), as `gh api` reads the same arguments; the plain key
+/// beside them is the control that brackets alone nested anything.
+#[test]
+fn a_bracketed_write_field_builds_arrays_and_objects() {
+    let w = World::new("api-field-shapes", true);
+    let mut owned = post_tag("shaped");
+    for field in [
+        "-f",
+        "labels[]=bug",
+        "-f",
+        "labels[]=infra",
+        "-F",
+        "checks[strict]=true",
+        "-f",
+        "comments[][path]=a.rs",
+        "-F",
+        "comments[][line]=3",
+        "-f",
+        "comments[][path]=b.rs",
+        "-f",
+        "plain[x]y=z",
+    ] {
+        owned.push(field.into());
+    }
+    let refused = w.run(&args(&owned));
+    assert_ne!(refused.exit, 0, "text after a bracket is refused");
+    owned.truncate(owned.len() - 2);
+    owned.extend(["-f".to_string(), "plain=word".to_string()]);
+    let ran = w.run(&args(&owned));
+    assert_eq!(ran.exit, 0, "stderr {}", ran.stderr);
+    let bodies = w.fake.bodies();
+    let text = bodies
+        .last()
+        .and_then(|body| body.json.as_deref())
+        .expect("the POST's JSON body");
+    let body: Value = aterm_json::from_str(text).expect("JSON");
+    let labels: Value = aterm_json::from_str(r#"["bug","infra"]"#).expect("JSON");
+    assert_eq!(body["labels"], labels, "{text}");
+    assert_eq!(body["checks"]["strict"], Value::Bool(true), "{text}");
+    let comments: Value =
+        aterm_json::from_str(r#"[{"path":"a.rs","line":3},{"path":"b.rs"}]"#).expect("JSON");
+    assert_eq!(body["comments"], comments, "{text}");
+    assert_eq!(body["plain"], Value::from("word"), "{text}");
+}
+
 #[test]
 fn api_post_prints_the_report_with_the_answer() {
     let w = World::new("api-post", true);

@@ -171,21 +171,26 @@ fn a_cold_server_load_bounds_input_scratch_beside_retained_records() {
     assert_eq!(on_file, Some(expected.len()));
     let retained = LIVE.with(Cell::get);
     assert!(
-        retained >= 2 * VALUES * VALUE_BYTES,
-        "the measured Store retains each Put's wire and decoded ciphertext"
+        retained >= VALUES * VALUE_BYTES,
+        "the measured Store retains each Put's signed ciphertext"
     );
     drop(observed);
     drop(measuring);
     assert_eq!(LIVE.with(Cell::get), 0, "all measured owners released");
     let peak = PEAK.with(Cell::get);
-    // Record retains both its wire and decoded body. Budget both entire streams,
-    // one maximum-sized frame, and 1 MiB for small headers, indexing and traversal.
-    // No whole-input copy fits in the remaining allowance for this signed fixture.
-    let bound = 2 * wire.len() + MAX_RECORD + 1024 * 1024;
+    // A decoded body shares its record's wire. Bound that retained wire and metadata,
+    // then the current input frame and signature-message scratch. A whole-input copy
+    // does not fit the remaining allowance for this signed fixture.
+    let retained_bound = wire.len() + 1024 * 1024;
+    let bound = wire.len() + 2 * MAX_RECORD + 1024 * 1024;
     println!(
         "cold server wire={} records={} retained={retained} peak={peak} bound={bound}",
         wire.len(),
         expected.len()
+    );
+    assert!(
+        retained <= retained_bound,
+        "cold server retained {retained} exceeds {retained_bound}"
     );
     assert!(peak <= bound, "cold server peak {peak} exceeds {bound}");
 }

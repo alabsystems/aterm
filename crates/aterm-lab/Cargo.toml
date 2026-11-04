@@ -102,11 +102,14 @@ libc = { workspace = true }
 aterm-durable = { workspace = true }
 # Bind the held baseline's complete image to the authenticated native Store receipt.
 aterm-update-core = { workspace = true }
-# The node ring a bridge attaches with (`enable::node_grants`), THE ring
-# `aterm fabric on` mints: `codex-alab-proof` stands its own bus up for the
-# mail step, and a grant the bridge needs cannot be added there and forgotten
-# here.
+# The rendezvous file, the plain-word rule and the person-id grammar of the bus
+# `codex-alab-proof` stands up for the mail step.
 aterm-link = { path = "../aterm-link" }
+# The node and observer rings that bus mints: astream's ceilings' rules
+# (`GrantCeiling::aterm_node_ring`, `aterm_person_ring`), THE rings `aterm fabric on`
+# and `mint-for` mint, so a grant the bridge needs cannot be added there and
+# forgotten here. Not a new edge in the build graph: aterm-link depends on it.
+astream-cap = { path = "../../vendor/astream/crates/astream-cap" }
 
 # The named lock, the waits' variable and the interrupt a lab's VM, Windows and Linux
 # runs wait on (`named_lock`, `waits`, `interrupt`). Not a new edge in the build graph:

@@ -663,6 +663,35 @@ pub fn check_private_dir(dir: &Path) -> io::Result<()> {
     }
 }
 
+/// Verifies that `dir` already exists as an owned real directory (never a symlink or another user's).
+///
+/// Unlike [`check_private_dir`], group/other mode bits and inherited ACLs are permitted so callers
+/// that clean up or record state inside an owned directory do not reject loose permissions.
+/// # Errors
+/// Returns `NotFound` when `dir` is missing, `NotADirectory` when `dir` is not a directory, or
+/// `PermissionDenied` when `dir` is a symlink or owned by another user.
+pub fn check_owned_dir(dir: &Path) -> io::Result<()> {
+    match dir_is(dir)? {
+        DirIs::Private | DirIs::Open(_) | DirIs::Acl => Ok(()),
+        DirIs::Missing => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "the directory {}: there is no such directory",
+                dir.display()
+            ),
+        )),
+        DirIs::NotDir => Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("the directory {} is no directory", dir.display()),
+        )),
+        DirIs::Symlink => Err(dir_refused(
+            dir,
+            "is a symlink; it must be a directory of its own",
+        )),
+        DirIs::Others => Err(dir_refused(dir, "is another user's")),
+    }
+}
+
 /// Atomically writes `bytes` to `name` in private directory `dir` with mode `0600`.
 /// # Errors
 /// Returns an error if `name` spans multiple components, `dir` is not private, or write fails.
@@ -719,9 +748,21 @@ pub fn write_private_new(
 
 /// Removes single-component file `name` from `dir`, returning `Ok(true)` if it existed (none does where `dir` is no directory).
 /// # Errors
-/// Returns an error if `name` spans multiple components or unlinking fails.
+/// Returns an error if `name` spans multiple components, `dir` is a symlink or owned by another user, or unlinking fails.
 pub fn remove_private(dir: &Path, name: &str) -> io::Result<bool> {
     one_component_io(name)?;
+    match check_owned_dir(dir) {
+        Ok(()) => {}
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(false);
+        }
+        Err(e) => return Err(e),
+    }
     match std::fs::remove_file(dir.join(name)) {
         Ok(()) => Ok(true),
         Err(e)
@@ -837,9 +878,10 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        OwnedRead, PrivateDir, PrivateFileError, PrivateLock, PrivateRead, create_private_dir,
-        ensure_private_dir, judge_private_dir, open_private_rw, read_owned_into, read_private,
-        read_private_into, remove_private, write_private, write_private_new,
+        OwnedRead, PrivateDir, PrivateFileError, PrivateLock, PrivateRead, check_owned_dir,
+        create_private_dir, ensure_private_dir, judge_private_dir, open_private_rw,
+        read_owned_into, read_private, read_private_into, remove_private, write_private,
+        write_private_new,
     };
 
     /// The busy text the lock tests hand [`PrivateLock::take`].
@@ -1374,7 +1416,29 @@ mod tests {
         let file = root.path().join("state");
         assert!(!remove_private(&file, "token").unwrap());
         assert!(!remove_private(&file.join("sub"), "token").unwrap());
+        assert!(!remove_private(&root.path().join("missing"), "token").unwrap());
         assert!(file.exists());
+    }
+
+    /// NEGATIVE CONTROL: `remove_private` and `check_owned_dir` refuse a symlinked directory
+    /// without unlinking entries inside the symlink target.
+    #[test]
+    fn remove_private_and_check_owned_dir_refuse_symlinked_directory() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let outside = dir_in(root.path(), "outside", 0o700);
+        file_in(&outside, "kept.entry", b"kept", 0o600);
+        let linked = root.path().join("state-link");
+        std::os::unix::fs::symlink(&outside, &linked).unwrap();
+
+        assert_eq!(
+            check_owned_dir(&linked).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            remove_private(&linked, "kept.entry").unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(std::fs::read(outside.join("kept.entry")).unwrap(), b"kept");
     }
 
     #[test]

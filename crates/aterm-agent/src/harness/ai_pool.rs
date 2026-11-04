@@ -310,7 +310,7 @@ pub fn resolve_local_pool_identity(
         machine_override,
         &[],
     )
-    .and_then(&filter_denied)
+    .and_then(filter_denied)
     {
         return Some(resolved);
     }
@@ -450,13 +450,13 @@ impl PoolAccount {
         self.warm.iter().any(|slot| identity.matches(slot))
     }
 
-    /// Contention class implied by the warm set (`Dedicated` for ≤1 warm Mac, `Shared` for >1).
+    /// The order the warm set implies (`Preferred` for ≤1 warm Mac, `Pool` for >1), never a limit.
     #[must_use]
     pub fn class(&self) -> Class {
         if self.warm.len() > 1 {
-            Class::Shared
+            Class::Pool
         } else {
-            Class::Dedicated
+            Class::Preferred
         }
     }
 
@@ -1063,9 +1063,9 @@ warm = ["m3"]
         let parsed = Pool::from_toml(raw, "ai-pool.toml").expect("valid pool parses");
         assert_eq!(parsed.accounts.len(), 5);
         assert_eq!(parsed.accounts[0].home_mac(), Some("m3"));
-        assert_eq!(parsed.accounts[0].class(), Class::Shared);
+        assert_eq!(parsed.accounts[0].class(), Class::Pool);
         assert_eq!(parsed.accounts[1].holder_word(), POOL_HOLDER_UNASSIGNED);
-        assert_eq!(parsed.accounts[3].class(), Class::Dedicated);
+        assert_eq!(parsed.accounts[3].class(), Class::Preferred);
 
         let rendered = parsed.to_toml();
         let reparsed = Pool::from_toml(&rendered, "round-trip").expect("rendered pool parses");
@@ -1227,21 +1227,21 @@ warm = ["m3"]
             rows: vec![
                 accounts::Row {
                     label: "pool-a".into(),
-                    class: Class::Shared,
+                    class: Class::Pool,
                     dir: Some("/tmp/pool-a".into()),
                     email: Some("a@example.test".into()),
                     ..accounts::Row::default()
                 },
                 accounts::Row {
                     label: "pool-b".into(),
-                    class: Class::Shared,
+                    class: Class::Pool,
                     dir: Some("/tmp/pool-b".into()),
                     email: Some("b@example.test".into()),
                     ..accounts::Row::default()
                 },
                 accounts::Row {
                     label: "cold-c".into(),
-                    class: Class::Shared,
+                    class: Class::Pool,
                     dir: Some("/tmp/cold-c".into()),
                     email: Some("c@example.test".into()),
                     held_by: Some("m9".into()),

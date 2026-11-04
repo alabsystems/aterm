@@ -6,19 +6,17 @@ use super::*;
 use aterm_mail::Mailbox;
 
 pub(super) const BUSY: &str = "Native Proton mailbox is owned by another process";
+const GOOGLE_AUTH_MISSING: &str = "No stored Gmail authorization or app password is available";
 
 fn is_proton_webmail_url(url: &str) -> bool {
     strip_ascii_prefix_ci(url.trim(), "https://mail.proton.me")
         .is_some_and(|rest| rest.is_empty() || rest.starts_with(['/', '?', '#']))
 }
 
-fn managed_google_target(
+pub(super) fn managed_google_target(
     cfg: &MailboxConfig,
     target: Option<&str>,
 ) -> Option<(String, ParsedImapUrl)> {
-    if cfg.routed && cfg.unready.is_some() {
-        return None;
-    }
     let route = cfg.route_for(target);
     let (imap, webmail, http) = if let Some(route) = &route {
         (&route.imap_url, &route.webmail_url, &route.http_url)
@@ -50,9 +48,16 @@ fn managed_google_target(
     }) {
         return None;
     }
+    let declared_login = route.as_ref().map(|route| route.login.clone());
+    if let (Some(explicit), Some(declared)) = (&explicit_user, &declared_login)
+        && !explicit.eq_ignore_ascii_case(declared)
+    {
+        return None;
+    }
     let login = explicit_user
+        .or(declared_login)
         .or_else(|| cfg.webmail_user_for(target))
-        .filter(|login| login.contains('@'))?;
+        .filter(|login| super::super::accounts::email_refusal(login).is_none())?;
     if imap.is_none()
         && webmail.is_none()
         && !login.rsplit_once('@').is_some_and(|(_, domain)| {
@@ -64,6 +69,18 @@ fn managed_google_target(
     }
     endpoint.user = Some(login.clone());
     Some((login, endpoint))
+}
+
+fn saved_google<S>(
+    cfg: &MailboxConfig,
+    target: Option<&str>,
+    load: impl FnOnce(&str) -> Result<Option<S>, String>,
+) -> Result<Option<(String, ParsedImapUrl, S)>, &'static str> {
+    let Some((account, endpoint)) = managed_google_target(cfg, target) else {
+        return Ok(None);
+    };
+    let session = load(&account).map_err(|_| "Stored Google mail authorization is unavailable")?;
+    Ok(session.map(|session| (account, endpoint, session)))
 }
 
 #[cfg(test)]
@@ -105,11 +122,11 @@ pub(super) fn poll(
             return None;
         }
     }
-    if let Some((account, imap)) = managed_google_target(source_cfg, target)
-        && let Some(home) = aterm_types::dirs::home_dir()
-    {
-        match aterm_mail::oauth::session::shared(&home, &account) {
-            Ok(Some(session)) => {
+    if let Some(home) = aterm_types::dirs::home_dir() {
+        match saved_google(source_cfg, target, |account| {
+            aterm_mail::oauth::session::shared(&home, account)
+        }) {
+            Ok(Some((account, imap, session))) => {
                 return Some(
                     run_gmail(
                         cfg,
@@ -131,9 +148,21 @@ pub(super) fn poll(
                     }),
                 );
             }
-            Err(_) => return Some(Err("Stored Google mail authorization is unavailable")),
+            Err(why) => return Some(Err(why)),
             Ok(None) => {}
         }
+    }
+    if managed_google_target(source_cfg, target).is_some()
+        && cfg
+            .password_for(target)
+            .is_none_or(|password| password.chars().all(char::is_whitespace))
+        && explicit_imap
+            .as_deref()
+            .and_then(parse_imap_url)
+            .and_then(|url| url.password)
+            .is_none_or(|password| password.chars().all(char::is_whitespace))
+    {
+        return Some(Err(GOOGLE_AUTH_MISSING));
     }
     if let Some(url) = explicit_imap {
         let imap = parse_imap_url(&url)?;
@@ -293,7 +322,7 @@ fn run_gmail(
             };
             for message in messages {
                 if inspected.contains(&message.id)
-                    || !MailFilter::of(cfg).admits(&envelope(&message))
+                    || !MailFilter::of(cfg).admits_envelope(&envelope(&message))
                 {
                     continue;
                 }
@@ -467,7 +496,9 @@ fn run(
             Err(_) => return Err("Native Proton inbox read failed"),
         };
         for message in messages {
-            if inspected.contains(&message.id) || !MailFilter::of(cfg).admits(&envelope(&message)) {
+            if inspected.contains(&message.id)
+                || !MailFilter::of(cfg).admits_envelope(&envelope(&message))
+            {
                 continue;
             }
             deadline.left()?;
@@ -566,6 +597,62 @@ fn accept_raw(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn routed_gmail_uses_its_saved_encrypted_grant_without_a_password() {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let cfg = MailboxConfig::from_toml_str(
+            "[[mailboxes]]\nlogin='saved@gmail.com'\nimap_url='imaps://imap.gmail.com/Archive'\nreceives=['alias@example.com']\n",
+            None,
+        ).unwrap();
+        let target = Some("alias@example.com");
+        assert!(!cfg.route_for(target).unwrap().ready());
+        assert!(cfg.is_configured_for(target));
+        assert_eq!(cfg.unready_words(target), None);
+        aterm_mail::oauth::session::register(
+            home.path(),
+            "saved@gmail.com",
+            "fixture-client",
+            None,
+            aterm_mail::Secret::new("fixture-refresh".into()),
+        )
+        .unwrap();
+        let mut requested = Vec::new();
+        let (account, endpoint, _session) = saved_google(&cfg, target, |account| {
+            requested.push(account.to_owned());
+            aterm_mail::oauth::session::shared(home.path(), account)
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(account, "saved@gmail.com");
+        assert_eq!(requested, ["saved@gmail.com"]);
+        assert_eq!(endpoint.host, "imap.gmail.com");
+        assert_eq!(endpoint.mailbox, "Archive");
+        assert!(endpoint.password.is_none());
+        let missing=MailboxConfig::from_toml_str("[[mailboxes]]\nlogin='missing@gmail.com'\nwebmail_url='https://mail.google.com/'\nreceives=['alias@example.com']\n",None).unwrap();
+        assert!(
+            saved_google(&missing, target, |account| {
+                aterm_mail::oauth::session::shared(home.path(), account)
+            })
+            .unwrap()
+            .is_none(),
+            "another account's stored grant is never a fallback"
+        );
+        for text in [
+            "[[mailboxes]]\nlogin='saved@gmail.com'\nimap_url='imaps://other@gmail.com@imap.gmail.com/INBOX'\nreceives=['alias@example.com']\n",
+            "[[mailboxes]]\nlogin='saved@gmail.com'\nimap_url='imap://imap.gmail.com/INBOX'\nreceives=['alias@example.com']\n",
+            "[[mailboxes]]\nlogin='saved@gmail.com'\nimap_url='imaps://imap.gmail.com.evil.test/INBOX'\nreceives=['alias@example.com']\n",
+        ] {
+            let other = MailboxConfig::from_toml_str(text, None).unwrap();
+            assert!(
+                saved_google::<()>(&other, target, |_| panic!(
+                    "unrelated or insecure endpoint reached the Google grant"
+                ))
+                .unwrap()
+                .is_none()
+            );
+        }
+    }
 
     #[test]
     fn managed_google_mail_uses_the_configured_mailbox_identity() {
@@ -764,9 +851,9 @@ receives = ["*@workspace.example.test"]
         let active = Deadline::new(Duration::from_secs(5), &clock);
         let mut seen = BTreeSet::new();
 
-        // Missing or whitespace-only Gmail / Proton passwords yield `None` so relay_enabled and
-        // unready_words paths run without attempting an unauthenticated network connection.
-        for cfg in [
+        // Native Gmail reports missing saved authorization; Proton retains its unready
+        // password path. Neither dials without a credential, and the outer poll can still relay.
+        for (cfg, expected) in [
             MailboxConfig {
                 imap_url: Some("imaps://imap.gmail.com/INBOX".into()),
                 user: Some("unit-test-missing-pw@example.invalid".into()),
@@ -793,7 +880,14 @@ receives = ["*@workspace.example.test"]
                 password: Some("  ".into()),
                 ..Default::default()
             },
-        ] {
+        ]
+        .into_iter()
+        .zip([
+            Some(Err(GOOGLE_AUTH_MISSING)),
+            Some(Err(GOOGLE_AUTH_MISSING)),
+            None,
+            None,
+        ]) {
             assert_eq!(
                 poll(
                     &cfg,
@@ -803,7 +897,7 @@ receives = ["*@workspace.example.test"]
                     &mut seen,
                     "expired"
                 ),
-                None
+                expected
             );
         }
 

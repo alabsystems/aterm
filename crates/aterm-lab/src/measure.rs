@@ -201,7 +201,7 @@ pub(crate) fn committed(f: &Family, steps: &Path) -> Result<Vec<Reduction>, Stri
         if !(f.holds)(&name) {
             continue;
         }
-        let text = std::fs::read_to_string(e.path()).map_err(|e| format!("{name}: {e}"))?;
+        let text = crate::util::read_regular_text(&e.path()).map_err(|e| format!("{name}: {e}"))?;
         out.push(Reduction {
             build: header_build(f.program, &text).map(str::to_owned),
             name,

@@ -4312,14 +4312,24 @@ impl crate::App {
         let pooled = self.pool.get(session)?;
         let holds = pooled.ctx.fabric.holds();
         let (hold, hold_origin) = (u8::from(holds.is_held()), holds.origins());
-        let detail = {
+        // The screen's generation is read under the same try_lock as the detail: O(1), no row
+        // read or hashed on the main thread, and `-` while another holder has the terminal, as
+        // `status`'s `gen=` is. The bridge's presence row takes its `gen=` from here rather
+        // than reading the screen for it.
+        let (detail, generation) = {
             let term = match pooled.term.try_lock() {
                 Ok(t) => Some(t),
                 Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
                 Err(std::sync::TryLockError::WouldBlock) => None,
             };
-            term.as_deref()
-                .and_then(|t| executing_detail(t, &pooled.ctx.ran))
+            (
+                term.as_deref()
+                    .and_then(|t| executing_detail(t, &pooled.ctx.ran)),
+                term.as_deref().map_or_else(
+                    || "-".to_string(),
+                    |t| crate::control::screen_gen(t).to_string(),
+                ),
+            )
         };
         let status = self.session_status.status(session);
         let (revision, detail) = match status {
@@ -4338,11 +4348,11 @@ impl crate::App {
         Some(match agent {
             Some(word) => format!(
                 "sid={session} revision={revision} hold={hold} hold_origin={hold_origin} \
-                 detail={detail} agent={word}"
+                 detail={detail} agent={word} gen={generation}"
             ),
             None => format!(
                 "sid={session} revision={revision} hold={hold} hold_origin={hold_origin} \
-                 detail={detail} agent_deferred=1"
+                 detail={detail} agent_deferred=1 gen={generation}"
             ),
         })
     }

@@ -1080,6 +1080,12 @@ impl NativeLeafRestore {
         descriptor
     }
 
+    pub(crate) fn allocation() -> Self {
+        let mut descriptor = Self::about();
+        descriptor.restore_tag = "allocation".into();
+        descriptor
+    }
+
     pub(crate) fn system_state() -> Self {
         let mut descriptor = Self::settings("/".into());
         descriptor.restore_tag = "system-state".into();
@@ -1177,7 +1183,7 @@ impl NativeLeafRestore {
         match self.restore_tag.as_str() {
             "mail" => (self.route.is_some() || self.uri.is_some())
                 .then_some("Mail has no document or Settings route"),
-            "about" => (self.route.is_some() || self.uri.is_some())
+            "about" | "allocation" => (self.route.is_some() || self.uri.is_some())
                 .then_some("About has no document or Settings route"),
             "system-state" => (self.route.is_some() || self.uri.is_some())
                 .then_some("System State has no document or Settings route"),
@@ -1640,6 +1646,7 @@ impl PaneLayout {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum NativeTabRestore {
+    Allocation,
     Mail,
     About,
     #[serde(rename = "system-state")]
@@ -1659,7 +1666,11 @@ impl NativeTabRestore {
     #[cfg(test)]
     pub(crate) fn document_uri(&self) -> Option<&str> {
         match self {
-            Self::Mail | Self::About | Self::Settings { .. } | Self::SystemState => None,
+            Self::Mail
+            | Self::About
+            | Self::Allocation
+            | Self::Settings { .. }
+            | Self::SystemState => None,
             Self::Markdown { uri } | Self::Editor { uri } => Some(uri),
         }
     }
@@ -1672,7 +1683,7 @@ impl NativeTabRestore {
 
     fn shape_is_valid(&self) -> bool {
         match self {
-            Self::Mail | Self::About | Self::SystemState => true,
+            Self::Mail | Self::About | Self::Allocation | Self::SystemState => true,
             Self::Settings { route } => {
                 !route.is_empty()
                     && route.len() <= MAX_SETTINGS_ROUTE_BYTES
@@ -2019,6 +2030,7 @@ impl RestoredTab {
 
     pub(crate) fn from_legacy_native(descriptor: &NativeTabRestore) -> Option<Self> {
         let native = match descriptor {
+            NativeTabRestore::Allocation => NativeLeafRestore::allocation(),
             NativeTabRestore::About => NativeLeafRestore::about(),
             NativeTabRestore::Mail => NativeLeafRestore::mail(),
             NativeTabRestore::SystemState => NativeLeafRestore::system_state(),

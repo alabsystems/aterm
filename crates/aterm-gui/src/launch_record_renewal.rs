@@ -161,18 +161,20 @@ pub(crate) fn decide(facts: RenewalFacts) -> RenewalDecision {
 enum NotStarted {
     /// Terminal activity deferred it: the automatic lane's retry, uncounted.
     Deferred,
-    /// The sessionless handoff cannot carry these windows (`App::sessionless_handoff_refused`):
-    /// the person's state holds it, uncounted, as unsaved work does.
+    /// The sessionless handoff cannot carry these windows for a cause the person's desk holds
+    /// (`crate::app_update_handoff::held_by_the_desk`: no window, no restorable tab): it waits,
+    /// uncounted, as unsaved work does. A cause of this process or machine (a launched-lane
+    /// guard) is no wait: nothing at the desk clears it, so it is counted.
     PersonState,
     /// Anything else spends one of the [`ATTEMPTS`].
     Counted,
 }
 
 /// THE ATTEMPT RULE: an attempt the person's desk refused is a wait, never a spent attempt.
-const fn not_started(activity_deferred: bool, sessionless_refused: bool) -> NotStarted {
+const fn not_started(activity_deferred: bool, desk_refused: bool) -> NotStarted {
     if activity_deferred {
         NotStarted::Deferred
-    } else if sessionless_refused {
+    } else if desk_refused {
         NotStarted::PersonState
     } else {
         NotStarted::Counted
@@ -430,7 +432,8 @@ impl crate::App {
             }
             Err(error) => match not_started(
                 error.is_activity_deferred(),
-                self.sessionless_handoff_refused.is_some(),
+                self.sessionless_handoff_refused
+                    .is_some_and(crate::app_update_handoff::held_by_the_desk),
             ) {
                 NotStarted::Deferred => {
                     aterm_log::debug!("launch record: the renewal was deferred: {error}");
@@ -593,10 +596,31 @@ mod tests {
         }
     }
 
-    /// A renewal the sessionless handoff cannot carry waits for the desk, uncounted, as one
-    /// that unsaved work holds does: three such refusals never spend the renewal.
+    /// A renewal the sessionless handoff cannot carry for a cause the desk holds waits for the
+    /// desk, uncounted, as one that unsaved work holds does: three such refusals never spend the
+    /// renewal. REVIEW FINDING (2026-11-03): every other cause (a launched-lane guard, which
+    /// nothing at the desk clears) was a wait too, so a renewal it refused retried every minute
+    /// for the life of the process, each look retiring the warm spare shell; it is counted now,
+    /// and settles after its attempts as the same cause with a terminal tab open does.
     #[test]
     fn a_desk_the_handoff_cannot_carry_never_spends_an_attempt() {
+        use crate::app_update_handoff::held_by_the_desk;
+        for desk in [
+            "no window is open to hand over",
+            "no open tab is one the new build can restore",
+        ] {
+            assert!(held_by_the_desk(desk), "{desk}");
+        }
+        for lane in [
+            "this platform has no LaunchServices launcher",
+            "this process does not run from a .app bundle",
+            "the rendezvous path does not fit sun_path on this machine",
+            "the authorized target build is older than this build",
+            "the launch environment needs a removal a merge cannot express",
+            "the new build failed its pre-park verification",
+        ] {
+            assert!(!held_by_the_desk(lane), "a cause no desk clears: {lane}");
+        }
         assert_eq!(not_started(true, false), NotStarted::Deferred);
         assert_eq!(not_started(true, true), NotStarted::Deferred);
         assert_eq!(not_started(false, true), NotStarted::PersonState);

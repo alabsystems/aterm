@@ -59,6 +59,8 @@ pub use consent::{
 };
 pub use mode::{ContainmentMode, ParseModeError};
 pub use policy::{Capabilities, ContainmentPolicy};
+#[cfg(unix)]
+pub use sbpl::build_sandbox_wrap;
 pub use sbpl::{BASE_PROFILE, SANDBOX_EXEC_PATH};
 
 use std::sync::OnceLock;

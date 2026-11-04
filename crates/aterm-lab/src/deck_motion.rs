@@ -899,7 +899,7 @@ pub fn needle_angle(rgba: &[u8], w: usize, g: &Geom) -> (Option<f64>, f64) {
 /// The index or a frame cannot be read or decoded.
 pub fn read_take(index: &Path, g: &Geom) -> Result<Frames, String> {
     let base = index.parent().unwrap_or(Path::new("."));
-    let text = std::fs::read_to_string(index)
+    let text = crate::util::read_regular_text(index)
         .map_err(|e| format!("cannot read {}: {e}", index.display()))?;
     let doc: aterm_json::Value =
         aterm_json::from_str(&text).map_err(|e| format!("{} is not JSON: {e}", index.display()))?;
@@ -919,7 +919,8 @@ pub fn read_take(index: &Path, g: &Geom) -> Result<Frames, String> {
             .get("t_us")
             .and_then(aterm_json::Value::as_i64)
             .ok_or("a frame has no t_us")?;
-        let bytes = std::fs::read(base.join(file)).map_err(|e| format!("{file}: {e}"))?;
+        let bytes =
+            crate::util::read_regular_file(&base.join(file)).map_err(|e| format!("{file}: {e}"))?;
         let (rgba, w, _) =
             aterm_png::decode_rgba8(&bytes, 1 << 15).ok_or_else(|| format!("{file}: not a PNG"))?;
         let kind = match &prev {

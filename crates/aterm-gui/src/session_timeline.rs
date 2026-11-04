@@ -5872,12 +5872,26 @@ impl SessionTimeline {
     /// `(path word, "path_evidence= copy= upgrade=")` for `status` and roster rows, after
     /// `supervisor=`.
     pub(crate) fn owner_columns(&self, mark: bool, now_s: u64) -> (&'static str, String) {
+        self.owner_columns_with_awake(
+            mark,
+            now_s,
+            aterm_agent::harness::upgrade_drive::awake_since(),
+        )
+    }
+
+    /// [`Self::owner_columns`] judged against an explicit awake-clock reading `awake_s`.
+    pub(crate) fn owner_columns_with_awake(
+        &self,
+        mark: bool,
+        now_s: u64,
+        awake_s: u64,
+    ) -> (&'static str, String) {
         let (path, evidence) = path_columns(mark, self.path_reading());
         let upgrade = self.upgrade.as_ref().map_or_else(
             || "-".to_string(),
             |(row, _)| {
                 let mut row = row.clone();
-                row.reread(now_s);
+                row.reread_with_awake(now_s, awake_s);
                 row.column(now_s)
             },
         );
@@ -6236,11 +6250,14 @@ mod tests {
         assert!(!m.any_set());
     }
 
+    /// NEGATIVE CONTROL: when the awake clock is unknown (`0`) or still inside `WAKE_GRACE_S`,
+    /// `owner_columns_with_awake` keeps `upgrade=pending/...`; once `now >= awake + WAKE_GRACE_S`,
+    /// the same stored row reads `upgrade=stalled/.../unwatched:3h/1h`.
     #[test]
     fn the_upgrade_column_reads_the_awake_clock_as_it_stands_now() {
         use aterm_agent::harness::upgrade::Phase;
-        use aterm_agent::harness::upgrade_drive::{Row, WAKE_GRACE_S, system_awake_since};
-        let now = crate::upgrade_host::now_s();
+        use aterm_agent::harness::upgrade_drive::{Row, WAKE_GRACE_S};
+        let now = 1_800_000_000_u64;
         let row = Row {
             tab: "s-a".into(),
             from: "2.1.281".into(),
@@ -6255,17 +6272,22 @@ mod tests {
         assert_eq!(row.column(now), "pending/2.1.282/-/1h", "as stored");
         let mut tl = SessionTimeline::default();
         assert!(tl.set_upgrade(Some(row)));
-        let (_, cols) = tl.owner_columns(false, now);
-        let awake = system_awake_since();
-        let past_grace = awake != 0 && now >= awake + WAKE_GRACE_S;
-        assert_eq!(
-            cols.ends_with(" upgrade=stalled/2.1.282/unwatched:3h/1h"),
-            past_grace,
-            "{cols} (awake since {awake}, now {now})"
-        );
-        if !past_grace {
-            assert!(cols.ends_with(" upgrade=pending/2.1.282/-/1h"), "{cols}");
+        for awake in [0, now - WAKE_GRACE_S + 1] {
+            let (_, cols) = tl.owner_columns_with_awake(false, now, awake);
+            assert!(
+                cols.ends_with(" upgrade=pending/2.1.282/-/1h"),
+                "awake={awake}: {cols}"
+            );
         }
+        for awake in [now - WAKE_GRACE_S, now - 4 * 3_600] {
+            let (_, cols) = tl.owner_columns_with_awake(false, now, awake);
+            assert!(
+                cols.ends_with(" upgrade=stalled/2.1.282/unwatched:3h/1h"),
+                "awake={awake}: {cols}"
+            );
+        }
+        let (_, live_cols) = tl.owner_columns(false, now);
+        assert!(live_cols.contains(" upgrade="), "{live_cols}");
     }
 }
 

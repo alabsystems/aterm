@@ -184,7 +184,7 @@ fn file_at(path: &Path) -> Option<(u64, u64)> {
 /// Called in an executable's `main` before anything that starts a thread. Asked for [`VERB`], it
 /// serves it and answers the exit code. Otherwise it records this executable as the one this
 /// process's tethered spawns run through on Darwin, and answers `None`.
-#[must_use]
+#[must_use = "return a handled tether command's exit status to the caller"]
 pub fn entry() -> Option<ExitCode> {
     #[cfg(unix)]
     {

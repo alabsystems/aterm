@@ -37,10 +37,26 @@ fn a_post_crosses_two_nodes_and_ls_sees_both() {
             c.first() == Some(&node) && c.get(2) == Some(&sid)
         })
     };
-    let listing = until("aterm link ls to list both nodes' sessions", || {
-        let out = fleet.ls();
-        (names(&out, &a.node, &sid_a) && names(&out, &b.node, &sid_b)).then_some(out)
-    });
+    let generation_of = |out: &str, sid: &str| -> Option<String> {
+        out.lines()
+            .find(|l| l.contains(sid))?
+            .split_whitespace()
+            .find_map(|t| t.strip_prefix("gen="))
+            .map(str::to_string)
+    };
+    // A session's first row can go out before aterm names its screen (`gen=-`: the terminal
+    // was busy at that status read); the next read names it and the row is owed again, so a
+    // row with a generation must come.
+    let listing = until(
+        "aterm link ls to list both nodes' sessions, each with its screen's generation",
+        || {
+            let out = fleet.ls();
+            let named = |node: &str, sid: &str| {
+                names(&out, node, sid) && generation_of(&out, sid).is_some_and(|g| g != "-")
+            };
+            (named(&a.node, &sid_a) && named(&b.node, &sid_b)).then_some(out)
+        },
+    );
     for node in [&a.node, &b.node] {
         assert!(
             names(&listing, node, "node") && listing.contains("state=live"),
@@ -62,17 +78,15 @@ fn a_post_crosses_two_nodes_and_ls_sees_both() {
         assert!(listing.contains(column), "ls dropped {column}:\n{listing}");
     }
     for sid in [&sid_a, &sid_b] {
-        let row = listing
-            .lines()
-            .find(|l| l.contains(sid.as_str()))
-            .unwrap_or_else(|| panic!("ls lost {sid}:\n{listing}"));
-        let generation = row
-            .split_whitespace()
-            .find_map(|t| t.strip_prefix("gen="))
-            .unwrap_or("-");
+        let generation = generation_of(&listing, sid).unwrap_or_default();
+        let shaped = generation.split_once(':').is_some_and(|(seq, fold)| {
+            seq.parse::<u64>().is_ok()
+                && fold.len() == 16
+                && fold.bytes().all(|b| b.is_ascii_hexdigit())
+        });
         assert!(
-            generation.contains(':') && generation != "-",
-            "a session row must carry `<content_seq>:<fp16>`: {row}"
+            shaped,
+            "a session row must carry `<content_seq>:<fp16>`: {sid} in\n{listing}"
         );
     }
 
@@ -243,7 +257,12 @@ fn an_observer_delivers_nothing_and_never_makes_a_session_ambiguous() {
     let state = fleet.tmp.join("watch");
     std::fs::create_dir_all(&state).expect("observer state dir");
     std::fs::write(state.join("node"), format!("{watcher}\n")).expect("seed the observer id");
-    let cap_path = fleet.cap_file("watch", &harness::node_grants(&watcher));
+    let cap_path = fleet.cap_file(
+        "watch",
+        &astream_cap::GrantCeiling::aterm_node_ring(FLEET, &watcher)
+            .expect("a node ring")
+            .rules(),
+    );
     let token_file = fleet.tmp.join("watch.token");
     std::fs::write(&token_file, format!("{}\n", b.token)).expect("write the token file");
     let log = fleet.tmp.join("watch.log");

@@ -6149,6 +6149,7 @@ fn a_relaunch_keeps_when_the_join_began_asking() {
         asking_record: Some(record.clone()),
         ..Host::default()
     };
+    let before = aterm_time::unix_millis().expect("the wall clock");
     first.track(&asking, now);
     let kept: u64 = std::fs::read_to_string(&record)
         .expect("the asking start is kept")
@@ -6156,7 +6157,10 @@ fn a_relaunch_keeps_when_the_join_began_asking() {
         .parse()
         .expect("wall-clock milliseconds");
     let wall = aterm_time::unix_millis().expect("the wall clock");
-    assert!(wall.abs_diff(kept) < 5_000, "kept as now: {kept} vs {wall}");
+    assert!(
+        (before..=wall).contains(&kept),
+        "kept as now: {before} <= {kept} <= {wall}"
+    );
     // The first launch quit 20 s after the join began asking.
     std::fs::write(&record, (wall - 20_000).to_string()).expect("the record");
     let mut relaunched = Host {
@@ -6164,10 +6168,12 @@ fn a_relaunch_keeps_when_the_join_began_asking() {
         ..Host::default()
     };
     relaunched.track(&asking, now);
+    let read_by = aterm_time::unix_millis().expect("the wall clock");
     let since = relaunched.asking_since.expect("the join still asks");
     let ago = now.saturating_duration_since(since);
     assert!(
-        ago >= Duration::from_secs(19) && ago <= Duration::from_secs(25),
+        ago >= Duration::from_secs(20)
+            && ago <= Duration::from_millis(20_000 + read_by.saturating_sub(wall)),
         "the relaunch picks the quiet up 20 s in, not at 0: {ago:?}"
     );
     let calm = fixture_status("set-up").expect("set-up");

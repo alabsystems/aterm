@@ -6,6 +6,16 @@
 //! join requests, under per-server and per-address caps.
 
 mod heard;
+#[path = "server/records_input.rs"]
+mod records_input;
+
+#[cfg(test)]
+#[path = "server/persistence_tests.rs"]
+mod persistence_tests;
+
+#[cfg(test)]
+#[path = "server/reply_tests.rs"]
+mod reply_tests;
 
 use crate::envelope::{self, MAX_ENVELOPE};
 use crate::transport::{JoinRequest, parse_join_line};
@@ -683,6 +693,54 @@ impl Running {
             .unwrap_or_default()
     }
 
+    /// Handle one connected stream synchronously through the actual HTTP request path.
+    /// This lets a fixture measure its caller thread without racing the accept loop.
+    ///
+    /// # Errors
+    /// The connected stream's peer address cannot be read.
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    pub fn test_handle_stream(&self, stream: TcpStream) -> io::Result<()> {
+        let peer = stream.peer_addr()?.ip();
+        handle(&self.shared, stream, peer);
+        Ok(())
+    }
+
+    /// Observe the existing records slot's durable prefix without refreshing it from disk.
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    pub fn test_records_on_file(&self, vault: &str) -> Option<usize> {
+        self.shared
+            .lock_server_state()
+            .records
+            .get(vault)
+            .and_then(|slot| slot.on_file)
+    }
+
+    /// Persist an already accepted Store through the actual append/rewrite operation.
+    /// This holds the normal write fences, without installing a Store or refreshing a file.
+    ///
+    /// # Errors
+    /// The append and fallback rewrite cannot persist the accepted records.
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    pub fn test_persist_records(
+        &self,
+        name: &str,
+        accepted: &crate::membership_log::Store,
+        stamp: Option<fsx::FileStamp>,
+        on_file: Option<usize>,
+    ) -> crate::Result<Option<fsx::FileStamp>> {
+        let _write = self
+            .shared
+            .record_writes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let _writing = Writing::mark(&self.shared, name);
+        persist_records(&self.shared, name, accepted, stamp, on_file)
+            .map_err(|failure| failure.error)
+    }
+
     /// How many long-polls it holds now.
     #[cfg(test)]
     pub(crate) fn waiting(&self) -> usize {
@@ -991,7 +1049,7 @@ struct RecordSlot {
     /// `Some(n)` when the file holds exactly the records of the log's first `n` (as a set: a
     /// reload may order them otherwise), so what the log holds past them can go on its end.
     on_file: Option<usize>,
-    /// A POST is writing the file ([`post_records`], [`Writing`]): a look reads nothing, since
+    /// A record application is writing the file ([`apply_records`], [`Writing`]): a look reads nothing, since
     /// what the file holds past the stamp may not be durable yet, and reading it would take
     /// those records into the store and verify the whole file under `server_state`. The POST
     /// stamps the slot when its write is done.
@@ -1102,19 +1160,19 @@ struct Shared {
     /// GETs of a vault's join queue (`/v1/<name>/join`, long-polls among them) since the start.
     #[cfg(test)]
     join_gets: AtomicUsize,
-    /// The records long-polls a POST woke ([`post_records`]) since the start.
+    /// The records long-polls an application woke ([`apply_records`]) since the start.
     #[cfg(test)]
     record_wakes: AtomicUsize,
     /// The looks at a records file ([`look_for_records`]) since the start.
     #[cfg(test)]
     record_looks: AtomicUsize,
-    /// The copies of a records slot's store a POST took ([`post_records`]) since the start.
+    /// The copies of a records slot's store an application took ([`apply_records`]) since the start.
     #[cfg(test)]
     post_clones: AtomicUsize,
-    /// The records a POST verified ([`post_records`]) since the start.
+    /// The records a POST verified ([`records_input`]) since the start.
     #[cfg(test)]
     post_verifies: AtomicUsize,
-    /// Run by a records POST as it starts verifying its body ([`post_records`]).
+    /// Run by a records POST as it starts verifying its body ([`records_input`]).
     #[cfg(test)]
     verifying: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// While set, a records POST's append fails having touched nothing
@@ -1142,28 +1200,33 @@ impl Shared {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// [`fsx::append_at`] of a records POST's new records ([`post_records`]), which a test's
+    /// [`fsx::append_at_with`] of an application's new records ([`apply_records`]), which a test's
     /// disk refuses having touched nothing while `appends_fail` or `writes_fail` is set, or cuts
     /// short while `appends_tear` is.
     fn append_records(
         &self,
         path: &Path,
-        left: &fsx::FileStamp,
-        bytes: &[u8],
+        accepted: &crate::membership_log::Store,
+        plan: &AppendAttempt,
     ) -> crate::Result<fsx::FileStamp> {
         #[cfg(test)]
         {
             if self.appends_tear.load(Ordering::SeqCst) {
-                use std::io::Write as _;
                 let mut file = std::fs::OpenOptions::new().append(true).open(path)?;
-                file.write_all(&bytes[..bytes.len().saturating_sub(1)])?;
+                let mut prefix = PrefixWriter {
+                    file: &mut file,
+                    remaining: plan.len.saturating_sub(1),
+                };
+                write_held_buffered(&mut prefix, accepted, plan.from)?;
                 return Err(Error::new("the test's disk cut the append short"));
             }
             if self.appends_fail.load(Ordering::SeqCst) || self.writes_fail.load(Ordering::SeqCst) {
                 return Err(Error::new("the test's disk refused the append"));
             }
         }
-        let appended = fsx::append_at(path, left, bytes);
+        let appended = fsx::append_at_with(path, &plan.stamp, plan.len, |writer| {
+            write_held_buffered(writer, accepted, plan.from)
+        });
         #[cfg(test)]
         if appended.is_ok() {
             let hook = self
@@ -1178,14 +1241,20 @@ impl Shared {
         appended
     }
 
-    /// [`fsx::write_atomic_stamped`] of a records POST's held records ([`post_records`]),
+    /// [`fsx::write_atomic_stamped_with`] of an application's held records ([`apply_records`]),
     /// which a test's disk refuses having touched nothing while `writes_fail` is set.
-    fn write_records(&self, path: &Path, bytes: &[u8]) -> crate::Result<Option<fsx::FileStamp>> {
+    fn write_records(
+        &self,
+        path: &Path,
+        accepted: &crate::membership_log::Store,
+    ) -> crate::Result<Option<fsx::FileStamp>> {
         #[cfg(test)]
         if self.writes_fail.load(Ordering::SeqCst) {
             return Err(Error::new("the test's disk refused the whole write"));
         }
-        fsx::write_atomic_stamped(path, bytes, 0o600)
+        fsx::write_atomic_stamped_with(path, 0o600, |writer| {
+            write_held_buffered(writer, accepted, 0)
+        })
     }
 
     fn pinned_key(&self, name: &str) -> Option<[u8; 32]> {
@@ -1866,7 +1935,7 @@ enum Body {
     Empty,
     Text(String),
     Envelope(Arc<Vec<u8>>),
-    Records(Vec<u8>),
+    Records(Vec<crate::membership_log::Record>),
 }
 
 impl Reply {
@@ -1940,12 +2009,48 @@ fn write_reply(
     stall: Duration,
     within: Duration,
 ) -> io::Result<()> {
-    let deadline = Instant::now().checked_add(within);
-    let (body, content_type): (&[u8], &str) = match &reply.body {
-        Body::Empty => (&[], "text/plain; charset=utf-8"),
-        Body::Text(text) => (text.as_bytes(), "text/plain; charset=utf-8"),
-        Body::Envelope(bytes) => (bytes, "text/plain; charset=utf-8"),
-        Body::Records(bytes) => (bytes, "application/octet-stream"),
+    write_reply_to(stream, reply, boot, stall, within)
+}
+
+/// The socket operations used by every reply, with a controlled clock in sender tests.
+trait ReplyWriter: Write {
+    fn set_wait(&mut self, wait: Duration) -> io::Result<()>;
+
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
+
+impl ReplyWriter for TcpStream {
+    fn set_wait(&mut self, wait: Duration) -> io::Result<()> {
+        self.set_write_timeout(Some(wait))
+    }
+}
+
+fn record_reply_len(records: &[crate::membership_log::Record]) -> io::Result<usize> {
+    records.iter().try_fold(0usize, |length, record| {
+        length
+            .checked_add(record.bytes().len())
+            .filter(|length| *length <= crate::membership_log::MAX_RECORDS_STREAM)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "record reply is too large"))
+    })
+}
+
+fn write_reply_to(
+    stream: &mut impl ReplyWriter,
+    reply: &Reply,
+    boot: Option<&str>,
+    stall: Duration,
+    within: Duration,
+) -> io::Result<()> {
+    let deadline = stream.now().checked_add(within);
+    // Finish length validation before sending even the status line. The selected Records
+    // own immutable wire data, so the same length remains valid throughout the send.
+    let (length, content_type) = match &reply.body {
+        Body::Empty => (0, "text/plain; charset=utf-8"),
+        Body::Text(text) => (text.len(), "text/plain; charset=utf-8"),
+        Body::Envelope(bytes) => (bytes.len(), "text/plain; charset=utf-8"),
+        Body::Records(records) => (record_reply_len(records)?, "application/octet-stream"),
     };
     let mut head = format!(
         "HTTP/1.1 {} {}\r\nConnection: close\r\nCache-Control: no-store\r\n",
@@ -1980,19 +2085,61 @@ fn write_reply(
     }
     if reply.status != 204 {
         head.push_str(&format!("Content-Type: {content_type}\r\n"));
-        head.push_str(&format!("Content-Length: {}\r\n", body.len()));
+        head.push_str(&format!("Content-Length: {length}\r\n"));
     }
     head.push_str("\r\n");
     send(stream, head.as_bytes(), stall, deadline)?;
     if reply.status != 204 {
-        send(stream, body, stall, deadline)?;
+        match &reply.body {
+            Body::Empty => {}
+            Body::Text(text) => send(stream, text.as_bytes(), stall, deadline)?,
+            Body::Envelope(bytes) => send(stream, bytes, stall, deadline)?,
+            Body::Records(records) => {
+                record_chunks(records, |bytes| send(stream, bytes, stall, deadline))?;
+            }
+        }
     }
     stream.flush()
 }
 
+/// Coalesce across record boundaries, keeping exactly one bounded partial chunk. Complete
+/// chunks of an existing record are sent directly, without copying their immutable bytes.
+fn record_chunks(
+    records: &[crate::membership_log::Record],
+    mut send_chunk: impl FnMut(&[u8]) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut partial = [0u8; WRITE_CHUNK];
+    let mut used = 0;
+    for record in records {
+        let mut bytes = record.bytes();
+        if used != 0 {
+            let take = (WRITE_CHUNK - used).min(bytes.len());
+            partial[used..used + take].copy_from_slice(&bytes[..take]);
+            used += take;
+            bytes = &bytes[take..];
+            if used == WRITE_CHUNK {
+                send_chunk(&partial)?;
+                used = 0;
+            }
+        }
+        while bytes.len() >= WRITE_CHUNK {
+            send_chunk(&bytes[..WRITE_CHUNK])?;
+            bytes = &bytes[WRITE_CHUNK..];
+        }
+        if !bytes.is_empty() {
+            partial[..bytes.len()].copy_from_slice(bytes);
+            used = bytes.len();
+        }
+    }
+    if used != 0 {
+        send_chunk(&partial[..used])?;
+    }
+    Ok(())
+}
+
 /// Write all of `bytes`, no write blocking longer than `stall` and none past `deadline`.
 fn send(
-    stream: &mut TcpStream,
+    stream: &mut impl ReplyWriter,
     mut bytes: &[u8],
     stall: Duration,
     deadline: Option<Instant>,
@@ -2000,13 +2147,13 @@ fn send(
     while !bytes.is_empty() {
         let wait = match deadline {
             Some(deadline) => deadline
-                .checked_duration_since(Instant::now())
+                .checked_duration_since(stream.now())
                 .filter(|left| !left.is_zero())
                 .ok_or(io::ErrorKind::TimedOut)?
                 .min(stall),
             None => stall,
         };
-        stream.set_write_timeout(Some(wait))?;
+        stream.set_wait(wait)?;
         match stream.write(&bytes[..bytes.len().min(WRITE_CHUNK)]) {
             Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
             Ok(n) => bytes = &bytes[n..],
@@ -2382,8 +2529,8 @@ fn respond(shared: &Shared, stream: &mut TcpStream, peer: IpAddr, mut request: R
                 Ok(reading) => reading,
                 Err(reply) => return reply,
             };
-            match read_body(stream, request, length, &shared.tuning) {
-                Ok(body) => post_records(shared, name, &body, local),
+            match records_input::from_http(shared, name, stream, request, length) {
+                Ok(records) => apply_records(shared, name, records, local),
                 Err(reply) => reply,
             }
         }
@@ -3005,7 +3152,7 @@ fn take_records_from_store(shared: &Shared, state: &mut State, name: &str) {
 }
 
 /// [`take_records_from_store`], saying why the look read no file: a POST about to write answers
-/// 500 when the read failed ([`post_records`]), since what it held then could replace records on
+/// 500 when the read failed ([`apply_records`]), since what it held then could replace records on
 /// file it never read.
 ///
 /// # Errors
@@ -3198,10 +3345,10 @@ fn have_query(query: Option<&str>) -> Result<Vec<crate::membership_log::RecordId
     Ok(out)
 }
 
-fn records_reply(records: &[crate::membership_log::Record], records_need: bool) -> Reply {
+fn records_reply(records: Vec<crate::membership_log::Record>, records_need: bool) -> Reply {
     Reply {
         status: 200,
-        body: Body::Records(crate::membership_log::encode_records(records)),
+        body: Body::Records(records),
         etag: None,
         vault_head: None,
         allow: None,
@@ -3257,7 +3404,9 @@ fn get_records(
     if let Some(slot) = state.records.get(name) {
         let missing = slot.store.missing(&have);
         if !missing.is_empty() {
-            return records_reply(&missing, server_lacks_have(&state, name, &have));
+            let need = server_lacks_have(&state, name, &have);
+            drop(state);
+            return records_reply(missing, need);
         }
     }
     if no_wait {
@@ -3297,7 +3446,7 @@ fn get_records(
         .get(name)
         .map(|slot| slot.store.missing(&have))
     {
-        Some(missing) if !missing.is_empty() => records_reply(&missing, lacks),
+        Some(missing) if !missing.is_empty() => records_reply(missing, lacks),
         _ => {
             let mut reply = Reply::empty(204);
             reply.records_need = lacks;
@@ -3312,10 +3461,133 @@ fn get_records(
     }) {
         state.records.remove(name);
     }
+    drop(state);
     reply
 }
 
-/// Take the records `body` brings into `name`'s store and its file
+/// The slice adapter uses the same strict staging and application as a real HTTP POST.
+#[cfg(test)]
+fn post_records(shared: &Shared, name: &str, body: &[u8], local: bool) -> Reply {
+    match records_input::from_bytes(shared, name, body) {
+        Ok(records) => apply_records(shared, name, records, local),
+        Err(reply) => reply,
+    }
+}
+
+/// A completed peer response keeps its original frame metadata through both candidates.
+/// Selection does not bypass the current-state checks in the common application path.
+fn apply_pulled_records(
+    shared: &Shared,
+    name: &str,
+    received: crate::membership_log::untaken::ReceivedFrames,
+) -> (crate::membership_log::untaken::Sent, Reply) {
+    let length = received.byte_len();
+    let mut reply = match received.whole() {
+        Some(records) => apply_records(
+            shared,
+            name,
+            records_input::StagedRecords::from_verified(records),
+            false,
+        ),
+        None => Reply::text(400, "the peer records do not verify as a whole"),
+    };
+    if reply.status == 400 {
+        let part = received.readable();
+        let part_len: usize = part.iter().map(|record| record.bytes().len()).sum();
+        if !part.is_empty() && part_len < length {
+            reply = apply_records(
+                shared,
+                name,
+                records_input::StagedRecords::from_verified(part),
+                false,
+            );
+        }
+    }
+    (received.into_sent(), reply)
+}
+
+#[derive(Clone, Copy)]
+struct AppendAttempt {
+    stamp: fsx::FileStamp,
+    from: usize,
+    len: usize,
+}
+
+/// Bound small-record write calls while keeping the final flush inside the producer result.
+fn write_held_buffered(
+    writer: &mut dyn Write,
+    accepted: &crate::membership_log::Store,
+    from: usize,
+) -> io::Result<()> {
+    let mut buffered = std::io::BufWriter::with_capacity(64 * 1024, writer);
+    accepted.write_held_from(from, &mut buffered)?;
+    buffered.flush()
+}
+
+/// The test's torn append consumes the normal writer while keeping only its prefix.
+#[cfg(test)]
+struct PrefixWriter<'a> {
+    file: &'a mut std::fs::File,
+    remaining: usize,
+}
+
+#[cfg(test)]
+impl Write for PrefixWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let take = bytes.len().min(self.remaining);
+        self.file.write_all(&bytes[..take])?;
+        self.remaining -= take;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+struct PersistFailure {
+    error: Error,
+    attempted: Option<AppendAttempt>,
+}
+
+/// Persist only the accepted Store's complete prefix. The caller owns record_writes and
+/// the Writing fence, and publishes the Store only after this operation succeeds.
+fn persist_records(
+    shared: &Shared,
+    name: &str,
+    accepted: &crate::membership_log::Store,
+    stamp: Option<fsx::FileStamp>,
+    on_file: Option<usize>,
+) -> Result<Option<fsx::FileStamp>, Box<PersistFailure>> {
+    let path = shared.records_path(name);
+    let tail = match (on_file, stamp) {
+        (Some(from), Some(stamp)) => Some(AppendAttempt {
+            stamp,
+            from,
+            len: accepted.held_len_from(from).map_err(|error| {
+                Box::new(PersistFailure {
+                    error: Error::new(error.to_string()),
+                    attempted: None,
+                })
+            })?,
+        }),
+        _ => None,
+    };
+    let appended = tail
+        .as_ref()
+        .and_then(|plan| shared.append_records(&path, accepted, plan).ok());
+    match appended {
+        Some(left) => Ok(Some(left)),
+        None => shared.write_records(&path, accepted).map_err(|error| {
+            Box::new(PersistFailure {
+                error,
+                attempted: tail,
+            })
+        }),
+    }
+}
+
+/// Take strictly staged records into `name`'s store and its file
 /// (`docs/DESIGN-fluid-swarm-2026-10-28.md` §4.1 F23, rules 1 and 4). The file holds the log's
 /// complete records only ([`crate::membership_log::Store::encode_held`]); a record waiting on a
 /// parent is held in memory only, under the store's bounds. The store is tried on a copy, which
@@ -3331,9 +3603,12 @@ fn get_records(
 /// unchanged, so a retry adds the records again and writes them; an append cut short gives the
 /// slot the file's stamp, so no look takes the part it left.
 ///
-/// The body is framed and its ids named outside every lock (rule 4.1), and a POST whose records
-/// the store holds already (complete or waiting) answers 204 having copied, verified and
-/// written nothing (rule 4.2): any LAN host may POST, and the same records come again from
+/// The body is strictly framed and verified before this function refreshes a file or changes
+/// a slot. Invalid input therefore returns 400 before a concurrent file or post-body admission
+/// refusal; an incomplete or stalled body still takes precedence over its semantic errors.
+/// Its ids are named outside every lock (rule 4.1), and a POST whose records
+/// the store holds already (complete or waiting) answers 204 without copying a Store, verifying
+/// a signature or writing records (rule 4.2): any LAN host may POST, and the same records come again from
 /// every member pass and peer pull. The rest are verified outside every lock too (rule 4.3), so
 /// the bodies the server reads at once ([`MAX_PUTS`]) verify at once rather than one after
 /// another under `record_writes`. A record the body brings that the store holds waiting is
@@ -3373,15 +3648,13 @@ fn get_records(
         project = "aterm_secrets::server::tests::records_file_projection"
     )
 )]
-fn post_records(shared: &Shared, name: &str, body: &[u8], local: bool) -> Reply {
-    if body.is_empty() {
-        return Reply::text(400, "a POST to /records needs at least one record");
-    }
-    let frames = match crate::membership_log::store::frame_ids(body) {
-        Ok(frames) => frames,
-        Err(e) => return Reply::text(400, e.to_string()),
-    };
-    let (unheld, mut records) = {
+fn apply_records(
+    shared: &Shared,
+    name: &str,
+    staged: records_input::StagedRecords,
+    local: bool,
+) -> Reply {
+    {
         let mut state = shared.lock_server_state();
         if let Some(reply) = unreadable_records(shared, &mut state, name) {
             return reply;
@@ -3389,47 +3662,13 @@ fn post_records(shared: &Shared, name: &str, body: &[u8], local: bool) -> Reply 
         if let Some(reply) = refuse_unheld_records(shared, &state, name, local) {
             return reply;
         }
-        let store = state.records.get(name).map(|slot| &slot.store);
-        let mut unheld: Vec<std::ops::Range<usize>> = Vec::new();
-        let mut again: Vec<crate::membership_log::Record> = Vec::new();
-        for frame in frames {
-            match store {
-                Some(store) if store.holds(&frame.id) => {}
-                Some(store) => match store.uncomplete(&frame.id) {
-                    Some(record) => again.push(record.clone()),
-                    None => unheld.push(frame.range),
-                },
-                None => unheld.push(frame.range),
-            }
-        }
-        (unheld, again)
-    };
-    // Every record held already: none is new, so none can make the store let one go.
-    if unheld.is_empty() {
-        return Reply::empty(204);
-    }
-    #[cfg(test)]
-    {
-        let verifying = shared
-            .verifying
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        if let Some(verifying) = verifying {
-            verifying();
-        }
-    }
-    records.reserve(unheld.len());
-    for range in unheld {
-        #[cfg(test)]
-        shared.post_verifies.fetch_add(1, Ordering::SeqCst);
-        match body
-            .get(range)
-            .ok_or_else(|| Error::new("membership record is truncated"))
-            .and_then(crate::membership_log::Record::decode)
-        {
-            Ok(record) => records.push(record),
-            Err(e) => return Reply::text(400, e.to_string()),
+        if state.records.get(name).is_some_and(|slot| {
+            staged
+                .records()
+                .iter()
+                .all(|record| slot.store.contains(record.id()))
+        }) {
+            return Reply::empty(204);
         }
     }
     let _writing = shared
@@ -3443,6 +3682,14 @@ fn post_records(shared: &Shared, name: &str, body: &[u8], local: bool) -> Reply 
         }
         if let Some(reply) = refuse_unheld_records(shared, &state, name, local) {
             return reply;
+        }
+        if state.records.get(name).is_some_and(|slot| {
+            staged
+                .records()
+                .iter()
+                .all(|record| slot.store.contains(record.id()))
+        }) {
+            return Reply::empty(204);
         }
         let keys = record_keys(shared, &state, name);
         match state.records.get(name) {
@@ -3462,6 +3709,8 @@ fn post_records(shared: &Shared, name: &str, body: &[u8], local: bool) -> Reply 
         }
     };
     let held_before = copy.log().map_or(0, crate::membership_log::Log::held_count);
+    let mut records = staged.into_records();
+    records.retain(|record| !copy.holds(record.id()));
     let added = match copy.ingest_records(records) {
         Ok(added) => added,
         Err(e) => return Reply::text(400, e.to_string()),
@@ -3504,38 +3753,31 @@ fn post_records(shared: &Shared, name: &str, body: &[u8], local: bool) -> Reply 
     }
     let path = shared.records_path(name);
     let _writing = Writing::mark(shared, name);
-    let tail = match (on_file, stamp) {
-        (Some(on_file), Some(left)) => Some((left, copy.encode_held_from(on_file))),
-        _ => None,
-    };
-    let appended = tail
-        .as_ref()
-        .and_then(|(left, bytes)| shared.append_records(&path, left, bytes).ok());
-    let written = match appended {
-        Some(left) => Some(left),
-        None => match shared.write_records(&path, &copy.encode_held()) {
-            Ok(left) => left,
-            Err(e) => {
-                note(&format!("{name}: could not store records: {e}"));
-                // An append cut short left part of its records on the end of the file, never
-                // flushed: the slot takes the file's stamp so no look takes them in (a POST of
-                // them would answer 204 while they are not durable), and the next growth writes
-                // the file whole. A file another writer put there keeps the slot's stamp, so a
-                // look reads it.
-                let now = fsx::stamp(&path);
-                let mut state = shared.lock_server_state();
-                if let (Some((left, bytes)), Some(now), Some(slot)) =
-                    (&tail, now, state.records.get_mut(name))
-                    && (now.dev, now.ino) == (left.dev, left.ino)
-                    && now.len > left.len
-                    && now.len <= left.len.saturating_add(bytes.len() as u64)
-                {
-                    slot.stamp = Some(now);
-                    slot.on_file = None;
-                }
-                return Reply::text(500, "the server could not write to its store");
+    let written = match persist_records(shared, name, &copy, stamp, on_file) {
+        Ok(left) => left,
+        Err(failure) => {
+            note(&format!(
+                "{name}: could not store records: {}",
+                failure.error
+            ));
+            // An append cut short left part of its records on the end of the file, never
+            // flushed: the slot takes the file's stamp so no look takes them in (a POST of
+            // them would answer 204 while they are not durable), and the next growth writes
+            // the file whole. A file another writer put there keeps the slot's stamp, so a
+            // look reads it.
+            let now = fsx::stamp(&path);
+            let mut state = shared.lock_server_state();
+            if let (Some(attempted), Some(now), Some(slot)) =
+                (failure.attempted, now, state.records.get_mut(name))
+                && (now.dev, now.ino) == (attempted.stamp.dev, attempted.stamp.ino)
+                && now.len > attempted.stamp.len
+                && now.len <= attempted.stamp.len.saturating_add(attempted.len as u64)
+            {
+                slot.stamp = Some(now);
+                slot.on_file = None;
             }
-        },
+            return Reply::text(500, "the server could not write to its store");
+        }
     };
     // A whole write whose file another writer replaced at once leaves no stamp: the next look
     // reads the file, and the next growth writes it whole.
@@ -3561,7 +3803,7 @@ fn post_records(shared: &Shared, name: &str, body: &[u8], local: bool) -> Reply 
     Reply::empty(204)
 }
 
-/// A records POST's look at `name`'s file ([`look_for_records`]): a 500 when the read failed,
+/// A records application's look at `name`'s file ([`look_for_records`]): a 500 when the read failed,
 /// since the POST would write what the store holds, and a file it could not read may hold
 /// records the store lacks. A file the read refuses is replaced by the next growth.
 fn unreadable_records(shared: &Shared, state: &mut State, name: &str) -> Option<Reply> {
@@ -4409,8 +4651,8 @@ fn is_obviously_self_url(
 }
 
 /// How many peers' records a server reads at once ([`pull_from_peer`]): each body is up to
-/// [`crate::membership_log::MAX_RECORDS_STREAM`], and is decoded again where [`post_records`]
-/// stores it, one at a time. A pass asks all its peers (up to
+/// [`crate::membership_log::MAX_RECORDS_STREAM`]. Frames reuse exact known owners or verify as
+/// they arrive, and the completed response enters [`apply_records`]. A pass asks its peers (up to
 /// [`crate::discover::MAX_CANDIDATES`]) for their envelopes at once, which finds the dark ones
 /// in one budget, and holds this many records bodies: one read while another is stored. A
 /// client's records pass reads its peers' longer answers as many at once (`crate::client`'s
@@ -4659,17 +4901,18 @@ fn pull_from_peer(
                     None => (Vec::new(), Vec::new()),
                 }
             };
-            let bytes = match crate::transport::fetch_records(
+            let received = match crate::transport::fetch_record_frames_with_known(
                 &vault_url,
                 &have_records,
                 None,
                 budget,
                 None,
+                |id| records_input::known_record(shared, &vault_name, id),
             ) {
-                Ok(bytes) => bytes,
+                Ok(answer) => answer.received,
                 Err(_) => return stored,
             };
-            if bytes.is_empty() {
+            if received.byte_len() == 0 {
                 continue;
             }
             let before_len = shared
@@ -4677,16 +4920,7 @@ fn pull_from_peer(
                 .records
                 .get(&vault_name)
                 .map_or(0, |slot| slot.store.len());
-            let stream = crate::membership_log::untaken::Sent::read(&bytes);
-            let mut reply = post_records(shared, &vault_name, &bytes, false);
-            if reply.status == 400 {
-                // A stream that does not decode as a whole (a record of a kind only a newer build
-                // writes): what of it this build reads, and descends from none it cannot read.
-                let part = stream.readable(&bytes);
-                if !part.is_empty() && part.len() < bytes.len() {
-                    reply = post_records(shared, &vault_name, &part, false);
-                }
-            }
+            let (stream, reply) = apply_pulled_records(shared, &vault_name, received);
             // Only a verdict says what the store cannot take: a `204` (it took what it could), or
             // a `400` (every record refused, or none this build reads). A `500` (it could not
             // write its store), `507` or `403` judged none of it, and the same pull may land
@@ -10796,7 +11030,7 @@ mod tests {
                         audience: EpochAudience::Everyone,
                         epoch: [0x44; 32],
                         salt: [0x33; 32],
-                        ciphertext: vec![0x5a; 4_096],
+                        ciphertext: vec![0x5a; 4_096].into(),
                     },
                 }
                 .sign(&[0xee; 32], [0xee; 16])

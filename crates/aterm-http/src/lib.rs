@@ -20,6 +20,7 @@ pub use client::{
     Body, BodyReader, Client, Error, Exchange, Method, Phase, RequestBuilder, Response, SendError,
 };
 pub use local_network::REFUSED as LOCAL_NETWORK_REFUSED;
+pub use local_network::is_local_name;
 pub use proxy::ProxyMode;
 pub use stream::{AlwaysAuthorized, Connect, Deadline, Guard, TcpConnector};
 pub use tls::Trust;

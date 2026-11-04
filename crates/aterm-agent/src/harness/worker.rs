@@ -378,6 +378,22 @@ pub fn codex_launch_program_in(agents: Option<&Path>) -> PathBuf {
     codex_launch_program_by(|word| super::upgrade_drive::twin_naming(&agents?.join(word), word))
 }
 
+/// The program a launch aterm makes of `cli`, a pooled CLI other than Claude Code and Codex
+/// (Grok Build, Kimi Code CLI), runs where it finds no starter's own: atpkg's managed copy in
+/// `layout` (`None`: no atpkg layout) where one is laid, as the doctor finds it
+/// ([`crate::ai::facts::managed_of`]), else its program word, which the launch's shell looks for
+/// on its `PATH`. The accounts report's `next:` and `accounts use` judge by it whether a launch
+/// would start anything here ([`crate::ai::facts::launch_finds_nothing`]).
+#[must_use]
+pub fn pooled_launch_program_in(
+    cli: super::accounts::Cli,
+    layout: Option<&atpkg::store::Layout>,
+) -> PathBuf {
+    layout
+        .and_then(|layout| crate::ai::facts::managed_of(layout, cli.id()))
+        .map_or_else(|| PathBuf::from(cli.id()), |managed| managed.path)
+}
+
 /// [`codex_launch_program`] with atpkg's managed twin of the Codex row's word read by `twin`.
 fn codex_launch_program_by(twin: impl FnOnce(&str) -> Option<PathBuf>) -> PathBuf {
     let Some(cli) = worker_cli(Program::Codex) else {

@@ -31,7 +31,7 @@ struct Instance {
     child: Child,
     /// Cut after `child` is killed (fields drop after `Drop::drop`), and closed by
     /// the kernel if this test process dies first: the instance goes with it.
-    _lifeline: aterm_uds::lifeline::Lifeline,
+    _lifeline: launch_isolation::Lifeline,
     sock: PathBuf,
 }
 

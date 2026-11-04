@@ -15,7 +15,7 @@ fn fallback_uses_the_post_poll_state_as_its_preparation_snapshot() {
         let mut roster = world.seat().roster(Cli::Codex).unwrap();
         roster.rows.push(Row {
             label: "spare".into(),
-            class: accounts::Class::Shared,
+            class: accounts::Class::Pool,
             dir: Some(spare.to_string_lossy().into_owned()),
             ..Row::default()
         });

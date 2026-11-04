@@ -192,6 +192,46 @@ fn unix_store_bin_dir(home: &Path) -> PathBuf {
     }
 }
 
+#[cfg_attr(trust_verify, trust::skip)]
+fn open_regular_nonblock(path: &Path, follow_links: bool) -> Option<(std::fs::File, u64)> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut flags = libc::O_NONBLOCK | libc::O_CLOEXEC;
+        if !follow_links {
+            flags |= libc::O_NOFOLLOW;
+        }
+        opts.custom_flags(flags);
+    }
+    #[cfg(not(unix))]
+    if !follow_links && !std::fs::symlink_metadata(path).ok()?.file_type().is_file() {
+        return None;
+    }
+    let file = opts.open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    meta.is_file().then_some((file, meta.len()))
+}
+
+#[cfg_attr(trust_verify, trust::skip)]
+fn read_store_shim_text(path: &Path, follow_links: bool) -> Option<String> {
+    use std::io::Read as _;
+    let (file, len) = open_regular_nonblock(path, follow_links)?;
+    if len > MAX_STORE_SHIM_BYTES {
+        return None;
+    }
+    let cap = usize::try_from(len.min(MAX_STORE_SHIM_BYTES).saturating_add(1)).unwrap_or(0);
+    let mut buf = Vec::with_capacity(cap);
+    file.take(MAX_STORE_SHIM_BYTES + 1)
+        .read_to_end(&mut buf)
+        .ok()?;
+    if buf.len() as u64 > MAX_STORE_SHIM_BYTES {
+        return None;
+    }
+    String::from_utf8(buf).ok()
+}
+
 /// The file a store shim forwards to, when it forwards to a real one.
 #[cfg_attr(trust_verify, trust::skip)]
 #[must_use]
@@ -200,7 +240,7 @@ pub fn resolve_store_shim(shim: &Path) -> Option<PathBuf> {
     let target = if meta.file_type().is_symlink() {
         shim.to_path_buf()
     } else if meta.file_type().is_file() && meta.len() <= MAX_STORE_SHIM_BYTES {
-        let content = std::fs::read_to_string(shim).ok()?;
+        let content = read_store_shim_text(shim, false)?;
         let target = parse_exec_stub_target(&content)?;
         if !target.is_absolute() {
             return None;
@@ -352,11 +392,7 @@ fn store_copies_in(store_root: &Path, exe: &str) -> Vec<StoreCopy> {
 
 #[cfg_attr(trust_verify, trust::skip)]
 fn exec_stub_target(p: &Path) -> Option<PathBuf> {
-    let meta = std::fs::metadata(p).ok()?;
-    if !meta.is_file() || meta.len() > MAX_STORE_SHIM_BYTES {
-        return None;
-    }
-    parse_exec_stub_target(&std::fs::read_to_string(p).ok()?)
+    parse_exec_stub_target(&read_store_shim_text(p, true)?)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -477,7 +513,7 @@ enum Hop {
 #[cfg_attr(trust_verify, trust::skip)]
 fn script_exec_target(p: &Path, len: u64) -> Hop {
     use std::io::Read as _;
-    let Ok(mut file) = std::fs::File::open(p) else {
+    let Some((mut file, _)) = open_regular_nonblock(p, true) else {
         return Hop::Binary;
     };
     let mut magic = [0u8; 2];
@@ -994,7 +1030,7 @@ fn unreached_store_note(bin: &str) -> String {
 #[cfg_attr(trust_verify, trust::skip)]
 fn is_pending_stub(cand: &Path) -> bool {
     use std::io::Read as _;
-    let Ok(file) = std::fs::File::open(cand) else {
+    let Some((file, _)) = open_regular_nonblock(cand, true) else {
         return false;
     };
     let mut head = Vec::new();

@@ -65,7 +65,7 @@ impl Trial {
         let a = Accts::new();
         let row = accounts::Row {
             label: "main".into(),
-            class: accounts::Class::Dedicated,
+            class: accounts::Class::Preferred,
             email: case.named.then(|| "alias@example.test".into()),
             identity_email: case.named.then(|| "OWNER@EXAMPLE.TEST".into()),
             dir: case.dedicated.then(|| a.login_dir("work-2")),

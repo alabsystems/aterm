@@ -159,7 +159,7 @@ fn running_codex_sessions_skip_a_conflicting_default_or_dedicated_login() {
         let mut roster = world.seat().roster(Cli::Codex).unwrap();
         roster.rows.push(Row {
             label: "spare".into(),
-            class: accounts::Class::Shared,
+            class: accounts::Class::Pool,
             dir: Some(spare.to_string_lossy().into_owned()),
             ..Row::default()
         });

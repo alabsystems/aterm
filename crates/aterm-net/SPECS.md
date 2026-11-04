@@ -31,7 +31,7 @@ Source: `crates/aterm-net` (read only). The pass read every `#[test]` (`src/lib.
 `src/drive.rs` 29 = 41), plus the production code each one reaches. Nothing was compiled or run.
 The claims below come from reading the code.
 
-Result: **12 specs**, covering **25 tests** (one fewer since `tls::relay` went). **1 test is not a spec sample** (§4).
+Result: **12 specs**, covering **26 mapped spec-sample tests** in §2 (plus **1 non-spec sample** in §4; newer `fleet` / `fleet_member` tests added after the 2026-10-16 pass bring the crate total to 314 `#[test]` functions).
 
 ## 0. Notation used in the statements
 
@@ -162,6 +162,11 @@ src/fleet_member_tests.rs	a_copy_is_read_only_beside_the_issuer_it_came_from	fle
 src/fleet_member_tests.rs	a_machine_at_the_issuers_old_address_never_speaks_for_the_issuer	fleet-book	(its read_whole half: the issuer's survey finding it at its name stays a test)
 src/fleet_member_tests.rs	an_issuer_that_cannot_share_its_book_now_leaves_the_copy	fleet-book	(its read_whole half stays a test)
 ```
+
+## 3. Coverage
+
+- §2 maps 27 tests (26 spec samples across the 12 specs in §1 + 1 non-spec hang detector in §4);
+  the crate currently holds 314 `#[test]` functions including newer `fleet` and `fleet_member` suites.
 
 ## 4. Tests that are not spec samples
 

@@ -1,0 +1,20 @@
+[package]
+name = "trust-build-cpu"
+version = "0.12.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Andrew Yates"]
+description = "Native per-unit CPU leases shared by Trust builds and aterm"
+
+[package.metadata.aterm-origin]
+project = "Trust"
+commit = "afda6b4602be9bebc79e3ec20ad2aba40449bd7f"
+path = "crates/trust-build-cpu"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[workspace]

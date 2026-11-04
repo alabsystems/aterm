@@ -72,13 +72,15 @@ impl Drop for WorldGuard {
 pub struct Instance {
     pub child: Child,
     /// Cut after `child` is killed (fields drop after `Drop::drop`).
-    _lifeline: aterm_uds::lifeline::Lifeline,
+    _lifeline: launch_isolation::Lifeline,
     pub tmp: PathBuf,
     pub log: PathBuf,
     /// The control socket (`<tmp>/run/aterm/aterm.sock`).
     pub sock: String,
     // Fields drop in order, after the owned child is stopped and the lifeline is cut.
     world: WorldGuard,
+    /// Released last, after the scratch world and its spare FIFOs are swept.
+    _lease: std::sync::Arc<aterm_spec::subprocess_lane::SubprocessLease>,
 }
 
 impl Drop for Instance {
@@ -263,6 +265,7 @@ fn boot_under(
     configure: impl FnOnce(&Path, &mut Command),
     ready: impl Fn(&Instance) -> bool,
 ) -> Instance {
+    let lease = aterm_spec::subprocess_lane::acquire();
     let world = WorldGuard::new(scratch_root(prefix));
     let tmp = world.path().to_path_buf();
     let log = tmp.join("gui.log");
@@ -308,6 +311,7 @@ fn boot_under(
              (`-e`), so no login shell of the instance can be asked what it names {by_name:?}"
         ));
     }
+    let _boot = aterm_spec::subprocess_lane::acquire_boot_permit();
     let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => could_not_run(format!("cannot launch aterm --headless ({e})")),
@@ -320,6 +324,7 @@ fn boot_under(
         tmp,
         log,
         world,
+        _lease: lease,
     };
     let log = inst.log.clone();
     await_ready(&mut inst, |i| &mut i.child, &mut signal, &log, ready);

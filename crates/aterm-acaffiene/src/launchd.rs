@@ -242,10 +242,77 @@ fn validate_label(label: &str) -> io::Result<()> {
     }
 }
 
+fn check_existing_tree_from(base: &Path, leaf: &Path) -> io::Result<bool> {
+    let Ok(rel) = leaf.strip_prefix(base) else {
+        return crate::paths::existing_real_dir(leaf);
+    };
+    if !crate::paths::existing_real_dir(base)? {
+        return Ok(false);
+    }
+    let mut cur = base.to_path_buf();
+    for part in rel.components() {
+        cur.push(part);
+        if !crate::paths::existing_real_dir(&cur)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn check_existing_launch_agents_dir(paths: &Paths) -> io::Result<bool> {
+    check_existing_tree_from(&paths.home, &paths.launch_agents())
+}
+
+#[cfg(unix)]
+fn ensure_tree_from(base: &Path, leaf: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    if check_existing_tree_from(base, leaf)? {
+        return Ok(());
+    }
+    std::fs::create_dir_all(leaf)?;
+    let opened = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(leaf)
+        .map_err(|err| match err.raw_os_error() {
+            Some(code) if code == libc::ELOOP || code == libc::ENOTDIR => io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is not a directory", leaf.display()),
+            ),
+            _ => err,
+        })?;
+    let meta = opened.metadata()?;
+    if !meta.is_dir() || meta.uid() != aterm_uds::peer::our_uid() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is not this user's directory", leaf.display()),
+        ));
+    }
+    if !check_existing_tree_from(base, leaf)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a directory", leaf.display()),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_launch_agents_dir(paths: &Paths) -> io::Result<()> {
+    ensure_tree_from(&paths.home, &paths.launch_agents())
+}
+
+#[cfg(unix)]
+fn ensure_logs_dir(paths: &Paths) -> io::Result<()> {
+    ensure_tree_from(&paths.home, &paths.logs_dir)
+}
+
 /// Whether Enable at Startup is on for `label` ([`startup`]).
 #[must_use]
 pub fn startup_enabled(paths: &Paths, label: &str) -> bool {
-    crate::code::plain_name(label) && is_regular_file(&paths.startup_plist(label))
+    crate::code::plain_name(label)
+        && matches!(check_existing_launch_agents_dir(paths), Ok(true))
+        && is_regular_file(&paths.startup_plist(label))
 }
 
 /// What Enable at Startup does at the next login.
@@ -290,7 +357,9 @@ impl Startup {
 /// Startup state ([`Startup::Off`], [`Startup::Disabled`], [`Startup::Blocked`], [`Startup::On`]).
 #[must_use]
 pub fn startup(paths: &Paths, label: &str, doors: &StartupDoors) -> Startup {
-    if !crate::code::plain_name(label) {
+    if !crate::code::plain_name(label)
+        || !matches!(check_existing_launch_agents_dir(paths), Ok(true))
+    {
         return Startup::Off;
     }
     let plist = paths.startup_plist(label);
@@ -307,22 +376,28 @@ pub fn startup(paths: &Paths, label: &str, doors: &StartupDoors) -> Startup {
 
 /// Toggle Enable at Startup for `label` and `program` ([`prune_orphans`]).
 /// # Errors
-/// `label` is not a plain name, the plist cannot be written or removed, or `program` is not a
-/// UTF-8 path.
+/// `label` is not a plain name, `paths`'s `LaunchAgents` or `logs_dir` root is not this user's
+/// plain directory, the plist cannot be written or removed, or `program` is not a UTF-8 path.
 #[cfg(unix)]
 pub fn set_startup(paths: &Paths, label: &str, program: &Path, on: bool) -> io::Result<()> {
     validate_label(label)?;
     let plist = paths.startup_plist(label);
     if !on {
-        let removed = match std::fs::remove_file(&plist) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
-            _ => Ok(()),
+        let agents_exist = check_existing_launch_agents_dir(paths)?;
+        let removed = if agents_exist {
+            match std::fs::remove_file(&plist) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+                _ => Ok(()),
+            }
+        } else {
+            Ok(())
         };
         prune_orphans(paths);
         return removed;
     }
     utf8(program)?;
-    let _ = std::fs::create_dir_all(&paths.logs_dir);
+    ensure_logs_dir(paths)?;
+    ensure_launch_agents_dir(paths)?;
     let text = plist_text(
         label,
         program,
@@ -435,6 +510,9 @@ pub(crate) fn login_jobs(
     serve_args: &[&str],
     pick: impl Fn(&Path) -> bool,
 ) -> Vec<(String, std::path::PathBuf)> {
+    if !matches!(check_existing_launch_agents_dir(paths), Ok(true)) {
+        return Vec::new();
+    }
     let mut found = Vec::new();
     for entry in std::fs::read_dir(paths.launch_agents())
         .into_iter()
@@ -490,23 +568,22 @@ pub(crate) fn program_gone(program: &Path) -> bool {
 #[cfg(unix)]
 #[must_use]
 pub fn sweep_plist_temps(paths: &Paths) -> Vec<(std::path::PathBuf, io::Result<usize>)> {
+    let session = paths.session_dir();
+    let old = crate::legacy::session_dir(paths);
+    let agents = paths.launch_agents();
     let mut swept = Vec::new();
-    for (dir, private_state) in [
-        (paths.session_dir(), true),
-        (crate::legacy::session_dir(paths), true),
-        (paths.launch_agents(), false),
+    for (dir, exists) in [
+        (session.clone(), check_existing_session_dir(&session)),
+        (old.clone(), check_existing_session_dir(&old)),
+        (agents, check_existing_launch_agents_dir(paths)),
     ] {
-        let listed = if private_state {
-            check_existing_session_dir(&dir).and_then(|exists| {
-                if exists {
-                    plists_with_temps(&dir)
-                } else {
-                    Ok(Vec::new())
-                }
-            })
-        } else {
-            plists_with_temps(&dir)
-        };
+        let listed = exists.and_then(|present| {
+            if present {
+                plists_with_temps(&dir)
+            } else {
+                Ok(Vec::new())
+            }
+        });
         match listed {
             Ok(plists) => swept.extend(plists.into_iter().map(|plist| {
                 let after = aterm_uds::atomic_file::ABANDONED_AFTER;
@@ -780,8 +857,7 @@ pub fn ensure_running(paths: &Paths, label: &str, program: &Path) -> Result<Star
         }
         JobState::Absent => {}
     }
-    std::fs::create_dir_all(&paths.logs_dir)
-        .map_err(|e| format!("{}: {e}", paths.logs_dir.display()))?;
+    ensure_logs_dir(paths).map_err(|e| format!("{}: {e}", paths.logs_dir.display()))?;
     let plist = if startup_enabled(paths, label) {
         paths.startup_plist(label)
     } else {
@@ -1545,6 +1621,110 @@ mod tests {
         assert!(
             outside_record.exists(),
             "outside record must remain untouched"
+        );
+
+        let outside_agents = root.path().join("outside-agents");
+        std::fs::create_dir(&outside_agents).expect("outside agents");
+        let outside_plist = outside_agents.join(format!("{label}.plist"));
+        let gone_program = root.path().join("missing-aterm");
+        std::fs::write(
+            &outside_plist,
+            plist_text(label, &gone_program, &paths.log_file(), None),
+        )
+        .expect("seed outside login plist");
+        let outside_temp = outside_agents.join(format!(".{label}.plist.tmp.4294967295.0123abcd"));
+        let temp_file = std::fs::File::create(&outside_temp).expect("seed outside temp");
+        temp_file
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7200))
+            .expect("age outside temp");
+
+        for (case, make_home) in [
+            ("symlinked home", {
+                let target_home = root.path().join("target-home");
+                std::fs::create_dir_all(target_home.join("Library")).expect("target Library");
+                std::os::unix::fs::symlink(
+                    &outside_agents,
+                    target_home.join("Library/LaunchAgents"),
+                )
+                .expect("link target LaunchAgents");
+                let h = root.path().join("symlink-home");
+                std::os::unix::fs::symlink(&target_home, &h).expect("symlink home");
+                h
+            }),
+            ("symlinked Library", {
+                let target_lib = root.path().join("target-lib");
+                std::fs::create_dir(&target_lib).expect("target lib");
+                std::os::unix::fs::symlink(&outside_agents, target_lib.join("LaunchAgents"))
+                    .expect("link LaunchAgents");
+                let h = root.path().join("home-with-symlink-lib");
+                std::fs::create_dir(&h).expect("home");
+                std::os::unix::fs::symlink(&target_lib, h.join("Library"))
+                    .expect("symlink Library");
+                h
+            }),
+            ("symlinked LaunchAgents", {
+                let h = root.path().join("home-with-symlink-agents");
+                std::fs::create_dir_all(h.join("Library")).expect("home Library");
+                std::os::unix::fs::symlink(&outside_agents, h.join("Library/LaunchAgents"))
+                    .expect("symlink LaunchAgents");
+                h
+            }),
+        ] {
+            let aliased_home = Paths {
+                state_dir: root
+                    .path()
+                    .join(format!("state-{}", case.replace(' ', "-"))),
+                home: make_home,
+                logs_dir: root.path().join("logs"),
+            };
+            assert!(!startup_enabled(&aliased_home, label), "{case}");
+            assert_eq!(
+                startup(&aliased_home, label, &doors),
+                Startup::Off,
+                "{case}"
+            );
+            assert!(orphans(&aliased_home).is_empty(), "{case}");
+            assert!(
+                set_startup(&aliased_home, label, program, true).is_err(),
+                "{case}: set_startup(on) must refuse symlinked LaunchAgents ancestry"
+            );
+            assert!(
+                set_startup(&aliased_home, label, program, false).is_err(),
+                "{case}: set_startup(off) must refuse symlinked LaunchAgents ancestry"
+            );
+            assert!(
+                choose_startup(&aliased_home, label, program, true).is_err(),
+                "{case}"
+            );
+            assert!(
+                choose_startup(&aliased_home, label, program, false).is_err(),
+                "{case}"
+            );
+            let swept = sweep_plist_temps(&aliased_home);
+            assert_eq!(swept.len(), 1, "{case}");
+            assert!(swept[0].1.is_err(), "{case}");
+            assert!(
+                outside_plist.exists() && outside_temp.exists(),
+                "{case}: outside plist and temp must remain untouched"
+            );
+        }
+
+        let outside_logs = root.path().join("outside-logs");
+        std::fs::create_dir(&outside_logs).expect("outside logs");
+        let symlink_logs = root.path().join("symlink-logs");
+        std::os::unix::fs::symlink(&outside_logs, &symlink_logs).expect("symlink logs");
+        let aliased_logs = Paths {
+            state_dir: root.path().join("state-aliased-logs"),
+            home: root.path().join("home-aliased-logs"),
+            logs_dir: symlink_logs,
+        };
+        assert!(
+            set_startup(&aliased_logs, label, program, true).is_err(),
+            "set_startup(on) must refuse symlinked logs_dir"
+        );
+        assert!(
+            !aliased_logs.startup_plist(label).exists(),
+            "no login plist written when logs_dir is a symlink"
         );
 
         for bad_label in ["", ".", "..", "../escape", "a/b", "a\\b", "x.partial"] {

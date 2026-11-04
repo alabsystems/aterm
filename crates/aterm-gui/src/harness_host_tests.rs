@@ -9001,7 +9001,7 @@ fn the_recorder_is_handed_this_process_wall_for_the_account_its_environment_name
     const NOW: i64 = 1_790_000_000;
     let row = |label: &str, dir: Option<&str>| accounts::Row {
         label: label.to_string(),
-        class: accounts::Class::Dedicated,
+        class: accounts::Class::Preferred,
         dir: dir.map(str::to_string),
         ..accounts::Row::default()
     };
@@ -19926,6 +19926,136 @@ fn the_quiet_tell_follows_the_tabs_autopilot_its_guards_and_its_restart_offer() 
             "Cruise, {guard:?}"
         );
     }
+}
+
+/// A worker whose upgrade is due at every point and whose carry-on is owed where `owed` says
+/// (its record standing, so the loop's own act waits on it: [`WorkerIdle::carry_holds`]),
+/// keeping in `stepped` each of its steps that would type into the agent (`step` and `notice`,
+/// the upgrade's at an idle point and at a break; `resume`, the carry-on).
+fn typing_worker(
+    world: &Arc<World>,
+    owed: &Arc<AtomicBool>,
+) -> (WorkerIdle, Arc<Mutex<Vec<&'static str>>>) {
+    let stepped: Arc<Mutex<Vec<&'static str>>> = Arc::default();
+    let (s1, s2, s3, o1, o2) = (
+        Arc::clone(&stepped),
+        Arc::clone(&stepped),
+        Arc::clone(&stepped),
+        Arc::clone(owed),
+        Arc::clone(owed),
+    );
+    let (idle, _) = attended_worker_with(world, &[], move |hooks| {
+        hooks.acts.step = Arc::new(move |_, _, _| {
+            s1.lock().unwrap().push("step");
+            "wait:background".to_string()
+        });
+        hooks.acts.notice = Arc::new(move |_, _, _| {
+            s2.lock().unwrap().push("notice");
+            "wait:background".to_string()
+        });
+        hooks.acts.owed = Arc::new(move |_, _| o1.load(Ordering::SeqCst));
+        hooks.acts.carry_owed = Arc::new(move |_, _| o2.load(Ordering::SeqCst));
+        hooks.acts.resume = Arc::new(move |_, _, _| {
+            s3.lock().unwrap().push("resume");
+            "wait:draft".to_string()
+        });
+    });
+    (idle, stepped)
+}
+
+/// A point its loop holds a line in custody at that may still come ([`LineHeld::Stands`]).
+fn held_line() -> IdlePoint {
+    IdlePoint {
+        line_held: Some(LineHeld::Stands),
+        ..IdlePoint::default()
+    }
+}
+
+/// A point its loop holds a line in custody at that it judged lost and makes no restart for
+/// ([`LineHeld::Lost`]).
+fn lost_line() -> IdlePoint {
+    IdlePoint {
+        line_held: Some(LineHeld::Lost),
+        ..IdlePoint::default()
+    }
+}
+
+/// A LINE ITS LOOP HOLDS IN CUSTODY THAT MAY STILL COME HOLDS THE UPGRADE'S STEP WHOLE
+/// ([`LineHeld::Stands`], ATERM-KI-1101-3): a line typed behind it would join it, and a restart
+/// could lose it, so the step is held at an idle point (`upgrade step=wait:held`) and at a break
+/// (nothing): its announcement, its tell and its restart. A line the loop judged lost and makes
+/// no restart for ([`LineHeld::Lost`]) holds it no more than a free point does, at either: the
+/// upgrade's move ends the process that read the line, the restart the loop would make itself
+/// where it could, so a session whose agent has no restart lane is not kept on the old build for
+/// good. Negative controls by mutation: the hold dropped from [`WorkerIdle::idle_step`]:
+/// `upgrade step=wait:background`; from [`WorkerIdle::at_background_on`]: the notice stepped
+/// behind the held line; [`upgrade_held_by_line`] holding a lost line too: nothing stepped at the
+/// lost line's points.
+#[test]
+fn a_line_held_in_custody_holds_the_upgrades_step_whole_until_it_is_lost() {
+    let world = Arc::new(World::default());
+    let (idle, stepped) = typing_worker(&world, &Arc::new(AtomicBool::new(false)));
+    let step = idle.at_idle_on(held_line()).expect("the upgrade's step");
+    assert_eq!(step.line, "upgrade step=wait:held");
+    assert!(!step.moved && step.typed.is_none(), "{step:?}");
+    assert_eq!(
+        idle.at_background_on(held_line()),
+        None,
+        "no notice at the break"
+    );
+    assert!(
+        stepped.lock().unwrap().is_empty(),
+        "nothing stepped behind the held line: {:?}",
+        stepped.lock()
+    );
+    let _ = idle.at_idle_on(IdlePoint::default());
+    let _ = idle.at_background_on(IdlePoint::default());
+    assert_eq!(
+        *stepped.lock().unwrap(),
+        ["step", "notice"],
+        "free: stepped"
+    );
+    let (idle, stepped) = typing_worker(&world, &Arc::new(AtomicBool::new(false)));
+    let step = idle.at_idle_on(lost_line()).expect("the upgrade's step");
+    assert_eq!(step.line, "upgrade step=wait:background", "{step:?}");
+    let _ = idle.at_background_on(lost_line());
+    assert_eq!(
+        *stepped.lock().unwrap(),
+        ["step", "notice"],
+        "lost: stepped as at a free point"
+    );
+}
+
+/// A LINE ITS LOOP HOLDS IN CUSTODY HOLDS A RELAUNCH'S CARRY-ON, AND NOT THE LOOP
+/// ([`IdlePoint::line_held`]): standing or lost, the line holds the carry-on owed with nothing
+/// typed and no step taken, and a free point carries it. Holding it renews nothing of the hold the
+/// carry-on puts on the loop's own act ([`WorkerIdle::carry_holds`]): run out on its bound, the
+/// worker owns no turn end however often a held line's points are offered, so the loop's gate
+/// decides the line, its restart in place included, and the two never wait on each other.
+/// Negative controls by mutation: the hold dropped from [`WorkerIdle::idle_step`]'s carry-on: the
+/// carry-on typed behind the held line; the held line answered `wait:held` as a step (which
+/// [`relaunch::carry_stands`] renews): the worker owns the turn ends again after its bound.
+#[test]
+fn a_line_held_in_custody_holds_the_carry_on_and_not_the_loop() {
+    let world = Arc::new(World::default());
+    let (idle, stepped) = typing_worker(&world, &Arc::new(AtomicBool::new(true)));
+    assert!(idle.owns_turn_end(), "the carry-on holds the loop's act");
+    with_kept_of(&idle.kept, |k| k.carry_hold = Some(Instant::now()));
+    for point in [held_line(), lost_line(), held_line()] {
+        let step = idle.at_idle_on(point);
+        assert!(
+            !idle.owns_turn_end(),
+            "{point:?}: the carry-on's bound stands run out ({step:?})"
+        );
+        assert_eq!(step, None, "{point:?}: no step");
+    }
+    assert!(
+        stepped.lock().unwrap().is_empty(),
+        "no carry-on typed behind the held line: {:?}",
+        stepped.lock()
+    );
+    let _ = idle.at_idle_on(IdlePoint::default());
+    assert_eq!(*stepped.lock().unwrap(), ["resume"], "free: carried");
 }
 
 #[test]
@@ -38313,7 +38443,10 @@ fn the_disk_free_line_waits_out_a_persons_grace_and_is_released_from_a_session_t
 /// ([`IdleHost::at_background_fact`]), and the worker steps it there as at an idle point: the same
 /// act, the same guards. Before, the worker typed only the upgrade's notice there, and the line was
 /// handed on undelivered after its delivery window, and as the only seat the episode parked for
-/// six hours with nothing freed.
+/// six hours with nothing freed. A line its loop holds in custody ([`IdlePoint::line_held`]) holds
+/// the ask at an idle point as a person's grace does, `wait:held`, the line kept owed. Negative
+/// control by mutation: the held line's word dropped from [`WorkerIdle::disk_free_step`]: the ask
+/// typed behind it.
 #[test]
 fn the_disk_free_line_goes_at_a_background_break_where_the_turn_is_over() {
     use aterm_agent::supervise::IdleHost;
@@ -38371,6 +38504,12 @@ fn the_disk_free_line_goes_at_a_background_break_where_the_turn_is_over() {
         "a person's grace: nothing typed"
     );
     assert!(idle.fact_owed(), "and the line still owed");
+    assert_eq!(
+        idle.at_idle_on(held_line()).map(|s| s.line),
+        None,
+        "a line held in custody at an idle point: nothing typed"
+    );
+    assert!(idle.fact_owed(), "and the line still owed");
     let step = idle
         .at_background_fact(IdlePoint::default())
         .expect("a break nothing holds types it");
@@ -38384,6 +38523,7 @@ fn the_disk_free_line_goes_at_a_background_break_where_the_turn_is_over() {
         *calls.lock().unwrap(),
         [
             ("s-df-manager".to_string(), None, Some("person")),
+            ("s-df-manager".to_string(), None, Some("held")),
             ("s-df-manager".to_string(), None, None),
         ]
     );
@@ -38578,11 +38718,14 @@ fn a_limit_episode_publishes_its_wall_for_the_ask_until_it_closes() {
     assert_eq!(wall(), None, "the limit ended");
 }
 
-/// The disk resume is a carry-on, so it is typed into no turn break the loop holds for a person:
-/// a person's grace keeps it owed, spending none of its tries, and the next turn break types it;
-/// the person's own exchange gives it up, as the conversation is theirs until they hand it back.
+/// The disk resume is a carry-on, so it is typed into no turn break the loop holds for a person,
+/// nor behind a line the loop holds in custody ([`IdlePoint::line_held`], which it would join):
+/// a person's grace and a held line keep it owed, spending none of its tries, and the next turn
+/// break types it; the person's own exchange gives it up, as the conversation is theirs until
+/// they hand it back. Negative control by mutation: the held line's arm dropped from
+/// [`WorkerIdle::idle_point`]: the resume typed behind it.
 #[test]
-fn the_disk_resume_waits_out_a_persons_grace_and_is_given_up_in_their_own_exchange() {
+fn the_disk_resume_waits_out_a_persons_grace_and_a_held_line_and_is_given_up_in_their_exchange() {
     use aterm_agent::harness::disk::Level;
     use aterm_phase::disk_full::{Code, DiskFull, Source};
     static BOARD: Shelf = Shelf::new();
@@ -38643,6 +38786,17 @@ fn the_disk_resume_waits_out_a_persons_grace_and_is_given_up_in_their_own_exchan
     assert!(
         disk_owed(&BOARD, "s-dr-grace").is_some(),
         "a person's grace spends none of its tries"
+    );
+    for _ in 0..=DISK_RESUME_TRIES {
+        assert_eq!(
+            grace.at_idle_on(held_line()).map(|s| s.line),
+            None,
+            "nothing typed behind a line held in custody"
+        );
+    }
+    assert!(
+        disk_owed(&BOARD, "s-dr-grace").is_some(),
+        "a held line spends none of its tries"
     );
     let theirs = IdlePoint {
         held: Some(Guard::Exchange),

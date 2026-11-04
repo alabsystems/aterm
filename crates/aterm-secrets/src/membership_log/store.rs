@@ -13,7 +13,11 @@ use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[cfg(unix)]
-mod framed;
+pub(crate) mod framed;
+
+#[cfg(test)]
+#[path = "store/writer_tests.rs"]
+mod writer_tests;
 
 /// Largest concatenated record stream [`decode_records`] reads (`64 MiB`).
 pub const MAX_RECORDS_STREAM: usize = 64 * 1024 * 1024;
@@ -59,13 +63,13 @@ pub fn decode_records(bytes: &[u8]) -> Result<Vec<Record>> {
     Ok(out)
 }
 
-/// One record frame of a stream, as [`frames`] reads it: its id (the SHA-256 of its bytes, which
-/// is [`Record::id`] for a record this build reads), the parents its bytes name, and where it
-/// sits in the stream.
+/// One record frame of a stream: its id (the SHA-256 of its bytes, which
+/// is [`Record::id`] for a record this build reads) and the parents its bytes name.
 #[cfg(unix)]
 pub(crate) struct Frame {
     pub(crate) id: RecordId,
     pub(crate) parents: Vec<RecordId>,
+    #[cfg(test)]
     pub(crate) range: std::ops::Range<usize>,
 }
 
@@ -73,13 +77,13 @@ pub(crate) struct Frame {
 /// frame's kind and without verifying anything ([`Record::frame_prefix`]): a stream holding a
 /// record of a kind only a newer build writes still names each of its records. It is for naming
 /// ids back to the server that sent them (`untaken`), never for trusting them. One walk, two
-/// judgments: [`decode_records`] refuses an unknown kind ([`Record::wire_len_prefix`]), and
-/// [`frame_ids`] is this with that check.
+/// judgments: [`decode_records`] and the strict HTTP frame reader refuse an unknown kind,
+/// while this framing pass retains its identity without trusting it.
 ///
 /// # Errors
 /// `bytes` exceeds [`MAX_RECORDS_STREAM`], holds more than [`MAX_RECORDS`] frames, or holds one
 /// this layout cannot frame (truncated, oversized, another layout version).
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 pub(crate) fn frames(bytes: &[u8]) -> Result<Vec<Frame>> {
     if bytes.len() > MAX_RECORDS_STREAM {
         return Err(Error::new("membership record stream is too large"));
@@ -105,25 +109,6 @@ pub(crate) fn frames(bytes: &[u8]) -> Result<Vec<Frame>> {
     Ok(out)
 }
 
-/// [`frames`] that refuses a frame of a kind this build does not know, as [`decode_records`]
-/// does ([`Record::wire_len_prefix`]): one walk, the other judgment. A vault server names a
-/// records POST's ids with it before taking any lock, and verifies only the frames its store
-/// does not hold already (`server::post_records`, `docs/DESIGN-fluid-swarm-2026-10-28.md` §4.1
-/// F23, rule 4.1). Nothing is verified: a frame's id is the SHA-256 of its bytes, which is
-/// [`Record::id`] once it verifies, so a held id's frame is byte for byte a record verified
-/// already.
-///
-/// # Errors
-/// As [`frames`], or a frame is of a kind this build does not know.
-#[cfg(unix)]
-pub(crate) fn frame_ids(bytes: &[u8]) -> Result<Vec<Frame>> {
-    let frames = frames(bytes)?;
-    for frame in &frames {
-        Record::wire_len_prefix(&bytes[frame.range.clone()])?;
-    }
-    Ok(frames)
-}
-
 /// The frames of `bytes` (read into `frames`, [`frames`]) that this build reads
 /// ([`Record::decode`]) and that descend from no frame of `bytes` it cannot read, in stream order:
 /// what a pull still offers its store of a stream [`decode_records`] refuses as a whole. A server
@@ -132,8 +117,29 @@ pub(crate) fn frame_ids(bytes: &[u8]) -> Result<Vec<Frame>> {
 /// that holds it. A frame that descends from one this build cannot read is left out: it could
 /// only wait, on a parent that never lands. Each frame is checked on its own, as
 /// [`Store::recovering`] reads a records file.
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 pub(crate) fn readable_part(bytes: &[u8], frames: &[Frame]) -> Vec<u8> {
+    let readable = readable_mask(frames, |_, frame| {
+        bytes
+            .get(frame.range.clone())
+            .is_some_and(|wire| Record::decode(wire).is_ok())
+    });
+    frames
+        .iter()
+        .zip(readable)
+        .filter(|(_, readable)| *readable)
+        .filter_map(|(frame, _)| bytes.get(frame.range.clone()))
+        .flatten()
+        .copied()
+        .collect()
+}
+
+/// Which frames are readable and descend from no unreadable frame in this stream.
+#[cfg(unix)]
+pub(crate) fn readable_mask(
+    frames: &[Frame],
+    mut readable: impl FnMut(usize, &Frame) -> bool,
+) -> Vec<bool> {
     let at: BTreeMap<RecordId, usize> = frames
         .iter()
         .enumerate()
@@ -151,11 +157,8 @@ pub(crate) fn readable_part(bytes: &[u8], frames: &[Frame]) -> Vec<u8> {
     }
     let mut unread: Vec<bool> = frames
         .iter()
-        .map(|frame| {
-            bytes
-                .get(frame.range.clone())
-                .is_none_or(|wire| Record::decode(wire).is_err())
-        })
+        .enumerate()
+        .map(|(i, frame)| !readable(i, frame))
         .collect();
     let mut stack: Vec<usize> = (0..unread.len()).filter(|&i| unread[i]).collect();
     while let Some(j) = stack.pop() {
@@ -166,14 +169,7 @@ pub(crate) fn readable_part(bytes: &[u8], frames: &[Frame]) -> Vec<u8> {
             }
         }
     }
-    frames
-        .iter()
-        .zip(&unread)
-        .filter(|(_, unread)| !**unread)
-        .filter_map(|(frame, _)| bytes.get(frame.range.clone()))
-        .flatten()
-        .copied()
-        .collect()
+    unread.into_iter().map(|unread| !unread).collect()
 }
 
 /// `records`, each after every genesis and parent among them, ties by id. A record that will
@@ -529,18 +525,30 @@ impl Store {
     /// first, then records waiting on a missing parent by id.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        if let Some(log) = &self.log {
-            out = self.encode_held();
-            for record in causal(log.waiting.values(), |id| log.held.contains_key(id)) {
-                out.extend_from_slice(record.bytes());
-            }
-        } else {
-            for record in causal(self.unrooted.values(), |_| false) {
-                out.extend_from_slice(record.bytes());
-            }
+        self.encoded_records()
+            .flat_map(Record::bytes)
+            .copied()
+            .collect()
+    }
+
+    /// Write exactly [`Store::encode`]'s canonical signed stream without a whole-stream buffer.
+    ///
+    /// # Errors
+    /// The writer fails before the entire stream is written.
+    pub fn write_encoded<W: std::io::Write + ?Sized>(&self, writer: &mut W) -> std::io::Result<()> {
+        for record in self.encoded_records() {
+            writer.write_all(record.bytes())?;
         }
-        out
+        Ok(())
+    }
+
+    fn encoded_records(&self) -> impl Iterator<Item = &Record> {
+        let pending = if let Some(log) = &self.log {
+            causal(log.waiting.values(), |id| log.held.contains_key(id))
+        } else {
+            causal(self.unrooted.values(), |_| false)
+        };
+        self.held_from(0).iter().chain(pending)
     }
 
     /// The bytes of the log's records, each after its parents ([`Store::encode`]'s first part):
@@ -558,14 +566,48 @@ impl Store {
     /// records file that holds those, already in causal order.
     #[must_use]
     pub fn encode_held_from(&self, from: usize) -> Vec<u8> {
-        self.log
-            .as_ref()
-            .and_then(|log| log.order.get(from..))
-            .unwrap_or_default()
+        self.held_from(from)
             .iter()
             .flat_map(Record::bytes)
             .copied()
             .collect()
+    }
+
+    /// Write exactly [`Store::encode_held_from`]'s complete-record suffix without collecting it.
+    ///
+    /// # Errors
+    /// The writer fails before every byte is written.
+    pub fn write_held_from<W: std::io::Write + ?Sized>(
+        &self,
+        from: usize,
+        writer: &mut W,
+    ) -> std::io::Result<()> {
+        for record in self.held_from(from) {
+            writer.write_all(record.bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Exact byte length of [`Store::encode_held_from`]'s complete-record suffix.
+    ///
+    /// # Errors
+    /// The sum cannot be represented as a byte length.
+    pub fn held_len_from(&self, from: usize) -> std::io::Result<usize> {
+        self.held_from(from).iter().try_fold(0usize, |sum, record| {
+            sum.checked_add(record.bytes().len()).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "held record length overflow",
+                )
+            })
+        })
+    }
+
+    fn held_from(&self, from: usize) -> &[Record] {
+        self.log
+            .as_ref()
+            .and_then(|log| log.order.get(from..))
+            .unwrap_or_default()
     }
 
     /// Whether the store holds no records.
@@ -622,7 +664,7 @@ impl Store {
 
     /// The record `id` when it is held but not complete: waiting on a parent, or held before a
     /// genesis. A store at its bound may let it go for another record ([`make_room`]), so a
-    /// caller that offers it again with its parent (`server::post_records`) still lands it.
+    /// caller that offers it again with its parent (`server::apply_records`) still lands it.
     #[cfg_attr(
         not(unix),
         expect(dead_code, reason = "only the unix vault server offers records again")
@@ -1930,7 +1972,7 @@ mod tests {
                         audience: super::super::EpochAudience::Everyone,
                         epoch: parent,
                         salt: [i as u8; 32],
-                        ciphertext: ciphertext.clone(),
+                        ciphertext: ciphertext.clone().into(),
                     },
                 }
                 .sign(&w_junk, inc_junk)

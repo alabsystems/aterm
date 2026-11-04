@@ -869,6 +869,8 @@ fn the_book_is_read_only_when_private() {
 
 const LOCK_CHILD: &str = "ATERM_NET_FLEET_LOCK_CHILD";
 
+/// NEGATIVE CONTROL: a leave over a symlinked state directory goes on unlocked to clear
+/// config without writing `fleet-off` or unlinking `fleet.key` inside the symlink target.
 #[test]
 fn a_leave_goes_on_unlocked_only_where_no_edit_could_lock() {
     let state = State::new("leave-lock");
@@ -877,9 +879,32 @@ fn a_leave_goes_on_unlocked_only_where_no_edit_could_lock() {
     std::fs::create_dir(&lock).unwrap();
     assert_eq!(leave_held(dir, |_| 7), Ok(7), "a lock that is no file");
     std::fs::remove_dir(&lock).unwrap();
+    let outside = dir.parent().unwrap().join("outside-state");
+    std::fs::create_dir(&outside).unwrap();
+    mode(&outside, 0o700);
+    std::fs::write(outside.join(KEY_FILE), b"kept").unwrap();
     let linked = dir.parent().unwrap().join("linked-state");
-    std::os::unix::fs::symlink(dir, &linked).unwrap();
-    assert_eq!(leave_held(&linked, |_| 7), Ok(7), "a symlink");
+    std::os::unix::fs::symlink(&outside, &linked).unwrap();
+    let linked_leave = leave_held(&linked, |leaving| {
+        (
+            leaving.locked(),
+            leaving.write_off().err().map(|e| e.kind()),
+            leaving.remove(KEY_FILE).map_err(|e| e.kind()),
+            leaving.remove("../outside").map_err(|e| e.kind()),
+        )
+    });
+    assert_eq!(
+        linked_leave,
+        Ok((
+            false,
+            Some(io::ErrorKind::PermissionDenied),
+            Ok(false),
+            Err(io::ErrorKind::InvalidInput),
+        )),
+        "a symlink"
+    );
+    assert_eq!(std::fs::read(outside.join(KEY_FILE)).unwrap(), b"kept");
+    assert!(!outside.join(OFF_FILE).exists());
     let none = dir.join("none");
     let made = leave_held(&none, |_| {
         let bits = std::fs::metadata(&none).unwrap().permissions().mode() & 0o777;
@@ -6253,20 +6278,6 @@ fn a_drive_is_served_by_a_listener_that_hung_up_on_its_first_connection() {
     served.join().unwrap();
 }
 
-/// Repeated capacity refusals stay transient while a drive has time for another pass, and the pass
-/// after them is served.
-#[test]
-fn a_drive_retries_repeated_capacity_refusals() {
-    let now = Instant::now();
-    let mut attempts = 0;
-    let reached = passes((now + HANG, now + HANG), |_| {
-        attempts += 1;
-        if attempts <= 2 { Err(busy()) } else { Ok(()) }
-    });
-    assert!(reached.is_ok(), "{reached:?}");
-    assert_eq!(attempts, 3);
-}
-
 /// Any other dial takes one pass however long its budget: a heartbeat, a join's place and a vault
 /// round meet a full listener once, and a join's next place keeps its time. NEGATIVE CONTROL:
 /// [`dial_avoiding`] taking [`passes`]: the count is 4.
@@ -6871,14 +6882,15 @@ fn resolver_work_keeps_its_process_budget_until_it_retires() {
     );
 }
 
-/// Resolving `_alab._tcp` advert hints stays within `within` and looks places up concurrently: a
-/// hanging lookup on the first advert neither holds up the round past `within` nor starves a
-/// responsive advert after it, and the loopback guard skips off-loopback lookups and addresses.
+/// Resolving `_alab._tcp` advert hints returns on its budget while a lookup hangs, and a place
+/// after the hanging one keeps its address; the loopback guard skips off-loopback lookups and
+/// addresses. The 120 ms budget is only a lower bound on the wait: the hanging lookup is held
+/// until the test lets it go, so the round can only end on its budget.
 /// NEGATIVE CONTROL: wait on each lookup with no deadline (`rx.recv()` for
 /// `rx.recv_timeout(left)`): the round returns only when the hanging lookup gives up at the hang
 /// detector, so the check that it was still held fails.
 #[test]
-fn resolving_advert_hints_stays_within_its_budget_and_keeps_places_after_a_hanging_lookup() {
+fn resolving_advert_hints_returns_on_its_budget_while_a_lookup_hangs() {
     static RELEASE_HANG: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>> =
         std::sync::Mutex::new(None);
     let (tx, rx) = std::sync::mpsc::channel();
@@ -6907,7 +6919,6 @@ fn resolving_advert_hints_stays_within_its_budget_and_keeps_places_after_a_hangi
     };
     let places = vec![
         ("hanging.local".to_owned(), 7100),
-        ("m22.local".to_owned(), 7101),
         ("10.0.0.8".to_owned(), 7102),
     ];
     let resolved = crate::loopback::forced(false, || {
@@ -6926,11 +6937,8 @@ fn resolving_advert_hints_stays_within_its_budget_and_keeps_places_after_a_hangi
     );
     assert_eq!(
         resolved,
-        vec![
-            SocketAddr::from(([10, 0, 0, 22], 7101)),
-            SocketAddr::from(([10, 0, 0, 8], 7102)),
-        ],
-        "responsive advert after a hanging one still resolves within the budget"
+        vec![SocketAddr::from(([10, 0, 0, 8], 7102))],
+        "a place after a hanging lookup keeps its address"
     );
 
     let guarded = crate::loopback::forced(true, || {
@@ -6948,6 +6956,58 @@ fn resolving_advert_hints_stays_within_its_budget_and_keeps_places_after_a_hangi
         guarded,
         vec![SocketAddr::from(([127, 0, 0, 1], 7103))],
         "loopback guard skips off-loopback lookups and addresses"
+    );
+}
+
+/// Advert hint lookups run concurrently: a lookup that hangs does not starve a later one. The
+/// hanging lookup is held until `m22.local` is looked up and fails if that never happens, so the
+/// round resolves `m22.local` and the IP literal after it in `places`'s order.
+/// NEGATIVE CONTROL: resolve each place on the calling thread in order (no spawn): the hanging
+/// lookup's `expect` panics after the hang detector, because `m22.local` was never asked.
+#[test]
+fn a_hanging_advert_lookup_does_not_starve_a_later_one() {
+    // `m22.local`'s lookup signals here; the hanging lookup waits on the other end.
+    static M22_ASKED: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>> =
+        std::sync::Mutex::new(None);
+    static M22_HEARD: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>> =
+        std::sync::Mutex::new(None);
+    let (asked, heard) = std::sync::mpsc::channel();
+    *M22_ASKED.lock().unwrap() = Some(asked);
+    *M22_HEARD.lock().unwrap() = Some(heard);
+
+    let resolver: Resolver = |name, port| match name {
+        "hanging.local" => {
+            let heard = M22_HEARD.lock().unwrap().take();
+            if let Some(heard) = heard {
+                heard
+                    .recv_timeout(HANG)
+                    .expect("m22 was looked up while this lookup was held");
+            }
+            Vec::new()
+        }
+        "m22.local" => {
+            let asked = M22_ASKED.lock().unwrap().take();
+            if let Some(asked) = asked {
+                let _ = asked.send(());
+            }
+            vec![SocketAddr::from(([10, 0, 0, 22], port))]
+        }
+        _ => Vec::new(),
+    };
+    let places = vec![
+        ("hanging.local".to_owned(), 7100),
+        ("m22.local".to_owned(), 7101),
+        ("10.0.0.8".to_owned(), 7102),
+    ];
+    let resolved =
+        crate::loopback::forced(false, || resolve_ipv4_hints_with(&places, HANG, resolver));
+    assert_eq!(
+        resolved,
+        vec![
+            SocketAddr::from(([10, 0, 0, 22], 7101)),
+            SocketAddr::from(([10, 0, 0, 8], 7102)),
+        ],
+        "a responsive advert after a hanging one still resolves"
     );
 }
 

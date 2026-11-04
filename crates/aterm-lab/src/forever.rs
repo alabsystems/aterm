@@ -5891,6 +5891,8 @@ struct Tab {
     sid: String,
     dir: PathBuf,
     seen: Seen,
+    journal_cursor: crate::util::LineTailCursor,
+    ledger_cursor: crate::util::LineTailCursor,
     t0: i64,
     ask_tried: bool,
     over: bool,
@@ -6496,6 +6498,8 @@ fn spawn_worker(
             },
             ..Seen::default()
         },
+        journal_cursor: crate::util::LineTailCursor::default(),
+        ledger_cursor: crate::util::LineTailCursor::default(),
         t0,
         over: false,
         ask_tried: false,
@@ -6818,7 +6822,7 @@ fn first_screen_step(door: &Door<'_>, tab: &mut Tab) {
 fn tool_results_of(run: &Run, token: &str) -> usize {
     crate::stub::turn_dumps(&run.w.join("dump"))
         .into_iter()
-        .filter_map(|(_, p)| std::fs::read(p).ok())
+        .filter_map(|(_, p)| crate::util::read_regular_file(&p).ok())
         .filter(|body| String::from_utf8_lossy(body).contains(token))
         .filter(|body| {
             crate::stub::messages_answered(body)
@@ -6828,34 +6832,42 @@ fn tool_results_of(run: &Run, token: &str) -> usize {
         .count()
 }
 
+fn parse_journal_lines(text: &str) -> impl Iterator<Item = (i64, String)> + '_ {
+    text.lines().filter_map(|l| {
+        let j = J::parse(l).ok()?;
+        let t = j.get("t").and_then(J::as_i64)?;
+        Some((t, j.get("line").and_then(J::as_str)?.to_string()))
+    })
+}
+
+fn parse_ledger_lines(text: &str) -> impl Iterator<Item = Row> + '_ {
+    text.lines().filter_map(|l| {
+        let j = J::parse(l).ok()?;
+        let s = |k: &str| j.get(k).and_then(J::as_str).unwrap_or("").to_string();
+        Some(Row {
+            ts: j.get("ts").and_then(J::as_i64)?,
+            box_seq: j
+                .get("box_seq")
+                .and_then(J::as_i64)
+                .and_then(|seq| u64::try_from(seq).ok()),
+            rule: s("rule_id"),
+            decision: s("decision"),
+            command: s("command"),
+            reason: s("reason"),
+        })
+    })
+}
+
 pub(crate) fn records(run: &Run, sid: &str) -> (Vec<(i64, String)>, Vec<Row>) {
     let drive = run.state().join("drive");
-    let journal = crate::util::scratch_text(&drive.join(format!("{sid}.journal.jsonl")))
-        .lines()
-        .filter_map(|l| {
-            let j = J::parse(l).ok()?;
-            let t = j.get("t").and_then(J::as_i64)?;
-            Some((t, j.get("line").and_then(J::as_str)?.to_string()))
-        })
-        .collect();
-    let ledger = crate::util::scratch_text(&drive.join(format!("{sid}.jsonl")))
-        .lines()
-        .filter_map(|l| {
-            let j = J::parse(l).ok()?;
-            let s = |k: &str| j.get(k).and_then(J::as_str).unwrap_or("").to_string();
-            Some(Row {
-                ts: j.get("ts").and_then(J::as_i64)?,
-                box_seq: j
-                    .get("box_seq")
-                    .and_then(J::as_i64)
-                    .and_then(|seq| u64::try_from(seq).ok()),
-                rule: s("rule_id"),
-                decision: s("decision"),
-                command: s("command"),
-                reason: s("reason"),
-            })
-        })
-        .collect();
+    let journal = parse_journal_lines(&crate::util::scratch_text(
+        &drive.join(format!("{sid}.journal.jsonl")),
+    ))
+    .collect();
+    let ledger = parse_ledger_lines(&crate::util::scratch_text(
+        &drive.join(format!("{sid}.jsonl")),
+    ))
+    .collect();
     (journal, ledger)
 }
 
@@ -6961,14 +6973,14 @@ pub fn dumps_in(dir: &Path) -> Vec<(i64, Vec<u8>)> {
     crate::stub::turn_dumps(dir)
         .into_iter()
         .filter_map(|(_, p)| {
-            let t = std::fs::metadata(&p)
-                .ok()?
+            let (body, meta) = crate::util::read_regular_file_with_meta(&p).ok()?;
+            let t = meta
                 .modified()
                 .ok()?
                 .duration_since(std::time::UNIX_EPOCH)
                 .ok()?;
             let t = i64::try_from(t.as_millis()).ok()?;
-            Some((t, std::fs::read(&p).ok()?))
+            Some((t, body))
         })
         .collect()
 }
@@ -7858,7 +7870,7 @@ fn unread_step(run: &Run, tab: &mut Tab, now: i64) {
             let token = tab.chain.token();
             let file = files.into_iter().find(|p| {
                 p.extension().is_some_and(|e| e == "jsonl")
-                    && std::fs::read_to_string(p).is_ok_and(|t| t.contains(&token))
+                    && crate::util::read_regular_text(p).is_ok_and(|t| t.contains(&token))
             });
             let Some(file) = file else {
                 let why = format!("no transcript holds {token} under {}", projects.display());
@@ -7915,16 +7927,31 @@ fn unread_step(run: &Run, tab: &mut Tab, now: i64) {
 
 fn look(run: &Run, door: &Door<'_>, tab: &mut Tab) {
     let now = now_ms();
-    let (journal, ledger) = records(run, &tab.sid);
-    for (t, l) in journal.iter().skip(tab.seen.journal.len()) {
+    let drive = run.state().join("drive");
+    let (j_reset, j_delta) = tab
+        .journal_cursor
+        .poll_scratch_text(&drive.join(format!("{}.journal.jsonl", tab.sid)))
+        .unwrap_or_default();
+    if j_reset {
+        tab.seen.journal.clear();
+    }
+    for (t, l) in parse_journal_lines(&j_delta) {
         println!(
             "  [{}] +{} journal {}",
             tab.chain.name(),
-            at(tab.t0, *t),
-            crate::util::one_line(l, 220)
+            at(tab.t0, t),
+            crate::util::one_line(&l, 220)
         );
+        tab.seen.journal.push((t, l));
     }
-    for r in ledger.iter().skip(tab.seen.ledger.len()) {
+    let (l_reset, l_delta) = tab
+        .ledger_cursor
+        .poll_scratch_text(&drive.join(format!("{}.jsonl", tab.sid)))
+        .unwrap_or_default();
+    if l_reset {
+        tab.seen.ledger.clear();
+    }
+    for r in parse_ledger_lines(&l_delta) {
         println!(
             "  [{}] +{} ledger  {} {} {}",
             tab.chain.name(),
@@ -7933,9 +7960,8 @@ fn look(run: &Run, door: &Door<'_>, tab: &mut Tab) {
             r.rule,
             crate::util::one_line(&r.command, 200)
         );
+        tab.seen.ledger.push(r);
     }
-    tab.seen.journal = journal;
-    tab.seen.ledger = ledger;
     let put = |list: &mut Vec<(i64, String)>, what: &str, v: String| {
         if list.last().is_none_or(|(_, last)| *last != v) {
             println!(
@@ -8517,6 +8543,8 @@ fn run_check(
                 task: launched.task.into_iter().collect(),
                 ..Seen::default()
             },
+            journal_cursor: crate::util::LineTailCursor::default(),
+            ledger_cursor: crate::util::LineTailCursor::default(),
             t0: 0,
             ask_tried: false,
             gate_opened: false,

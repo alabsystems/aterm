@@ -54,9 +54,15 @@ fn paragraphs() -> [Vec<String>; 2] {
 /// the room, counting the cell an exactly full row before it leaves unused at its head
 /// ([`crate::wrap::lead`]). A URL wider than a narrow pane's box is drawn so.
 fn drawn_as(run: &[String], text: &str, room: usize) -> bool {
+    drawn_from(run, text, room, 0)
+}
+
+/// [`drawn_as`] from a row `lead` cells into the room ([`crate::wrap::lead`]): the first row of a
+/// wrap read from part-way through it.
+fn drawn_from(run: &[String], text: &str, room: usize, lead: usize) -> bool {
     use crate::question::cells;
     let mut rest = text;
-    let mut lead = 0;
+    let mut lead = lead;
     for (k, row) in run.iter().enumerate() {
         let drawn = crate::text::trim(row);
         let Some(after) = rest.strip_prefix(drawn).filter(|_| !drawn.is_empty()) else {
@@ -95,7 +101,7 @@ fn drawn_as(run: &[String], text: &str, room: usize) -> bool {
 /// paragraphs, each read across the rows the box wraps it to ([`drawn_as`], in a box as wide as
 /// the rule less the title's column on each side), say the intro's words in one of its two forms
 /// ([`paragraphs`]) and nothing else. An intro taller than the pane, its head scrolled off, is not
-/// read whole, so it is not read.
+/// read whole, so it is not read here: [`intro_cut`] reads it cut.
 pub(crate) fn intro_box(rows: &[String]) -> Option<PromptV2> {
     use crate::phase::{composer_frame, is_rule, leading_spaces, shell_mode_frame};
     let blank = |r: &String| crate::text::trim(r).is_empty();
@@ -116,23 +122,9 @@ pub(crate) fn intro_box(rows: &[String]) -> Option<PromptV2> {
     {
         return None;
     }
-    let mut blocks: Vec<std::ops::Range<usize>> = Vec::new();
-    for (i, row) in rows.iter().enumerate().take(footer).skip(title) {
-        match blocks.last_mut() {
-            _ if blank(row) => {}
-            Some(b) if b.end == i => b.end = i + 1,
-            _ => blocks.push(i..i + 1),
-        }
-    }
+    let blocks = blocks_of(rows, title, footer);
     let (heading, body) = blocks.split_first()?;
-    let apart = blocks
-        .windows(2)
-        .all(|pair| pair[1].start == pair[0].end + 1);
-    if heading.start != title
-        || body.is_empty()
-        || !apart
-        || blocks.last().is_none_or(|b| b.end + 1 != footer)
-    {
+    if heading.start != title || body.is_empty() || !apart(&blocks, footer) {
         return None;
     }
     let width = crate::text::trim_end(&rows[rule]).chars().count();
@@ -148,7 +140,134 @@ pub(crate) fn intro_box(rows: &[String]) -> Option<PromptV2> {
                 .zip(body)
                 .all(|(text, b)| drawn_as(&rows[b.clone()], text, room))
     })?;
-    Some(PromptV2 {
+    Some(intro(rows, (title, end), footer, &said, false))
+}
+
+/// The drawn rows from `first` to `footer`, as blocks of rows ([`intro_box`]).
+fn blocks_of(rows: &[String], first: usize, footer: usize) -> Vec<std::ops::Range<usize>> {
+    let mut blocks: Vec<std::ops::Range<usize>> = Vec::new();
+    for (i, row) in rows.iter().enumerate().take(footer).skip(first) {
+        match blocks.last_mut() {
+            _ if crate::text::trim(row).is_empty() => {}
+            Some(b) if b.end == i => b.end = i + 1,
+            _ => blocks.push(i..i + 1),
+        }
+    }
+    blocks
+}
+
+/// Whether `blocks` stand one blank row apart, the last one blank row over `footer`.
+fn apart(blocks: &[std::ops::Range<usize>], footer: usize) -> bool {
+    blocks
+        .windows(2)
+        .all(|pair| pair[1].start == pair[0].end + 1)
+        && blocks.last().is_some_and(|b| b.end + 1 == footer)
+}
+
+/// Parse the `Claude in Chrome` intro with its head cut off `rows` (a pane, or the rows a reader
+/// was given, that starts below its rule): the footer ends on the last drawn row as in
+/// [`intro_box`], no rule stands above it, the first drawn row is the first row or the one under
+/// it, every drawn row down to the footer's first is at the footer's column, 1 to 3; the blocks
+/// stand one blank row apart, one blank row over the footer; and they say the last of the title
+/// and the paragraphs of one of the intro's forms, in order, in a box whose room is the widest
+/// drawn row or one more (a hard break fills it; the rule that gives it is cut). A first block
+/// on the first row is read from a row of its text's wrap ([`drawn_tail`]); one under a blank
+/// first row opens a paragraph, never the title, whose rule is no blank row. The read is `head_off_screen`: a reader
+/// reads the rows above it again, a supervisor joins its head from the history, and its confirm
+/// is never pressed ([`PromptV2::chrome_intro_confirm`]).
+pub(crate) fn intro_cut(rows: &[String]) -> Option<PromptV2> {
+    use crate::phase::{is_rule, leading_spaces};
+    use crate::question::cells;
+    let blank = |r: &String| crate::text::trim(r).is_empty();
+    let end = rows.iter().rposition(|r| !blank(r))?;
+    let footer = crate::auto_mode::footer_from(rows, end)?;
+    let first = rows.iter().position(|r| !blank(r))?;
+    let col = leading_spaces(&rows[footer]);
+    if first > 1
+        || first >= footer
+        || rows[..footer].iter().any(|r| is_rule(r))
+        || !(1..=3).contains(&col)
+        || rows[first..footer]
+            .iter()
+            .any(|r| !blank(r) && leading_spaces(r) != col)
+    {
+        return None;
+    }
+    let blocks = blocks_of(rows, first, footer);
+    if blocks.first().is_none_or(|b| b.start != first) || !apart(&blocks, footer) {
+        return None;
+    }
+    let widest = rows[first..=end]
+        .iter()
+        .map(|r| cells(crate::text::trim(r)))
+        .max()?;
+    let (cut, whole) = blocks.split_first()?;
+    let heading = crate::anchor!("chrome.intro_heading");
+    let said = paragraphs().into_iter().find(|texts| {
+        let all: Vec<&str> = std::iter::once(heading)
+            .chain(texts.iter().map(String::as_str))
+            .collect();
+        let Some(from) = all.len().checked_sub(blocks.len()) else {
+            return false;
+        };
+        // A blank first row is the blank row between two blocks, so the block under it opens
+        // its paragraph; the title's rule, never a blank row, stands over the title.
+        if first == 1 && from == 0 {
+            return false;
+        }
+        [widest, widest + 1].into_iter().any(|room| {
+            let opens = if first == 0 {
+                drawn_tail(&rows[cut.clone()], all[from], room)
+            } else {
+                drawn_as(&rows[cut.clone()], all[from], room)
+            };
+            opens
+                && all[from + 1..]
+                    .iter()
+                    .zip(whole)
+                    .all(|(text, b)| drawn_as(&rows[b.clone()], text, room))
+        })
+    })?;
+    Some(intro(rows, (first, end), footer, &said, true))
+}
+
+/// Whether rows `run` say the end of `text` as Ink wraps it into a box `room` cells wide: from a
+/// row its wrap starts on, after a space (a word wrap) or inside a word wider than the room (a
+/// hard break), that row's text `0` or `1` cell into the room ([`drawn_from`]).
+fn drawn_tail(run: &[String], text: &str, room: usize) -> bool {
+    use crate::question::cells;
+    let Some(head) = run.first().map(|r| crate::text::trim(r)) else {
+        return false;
+    };
+    if head.is_empty() {
+        return false;
+    }
+    text.char_indices()
+        .map(|(at, _)| at)
+        .filter(|&at| text[at..].starts_with(head))
+        .any(|at| {
+            let before = &text[..at];
+            let starts = at == 0 || before.ends_with(' ') || {
+                let word = before.rfind(' ').map_or(0, |i| i + 1);
+                let word_end = text[at..].find(' ').map_or(text.len(), |i| at + i);
+                cells(&text[word..word_end]) > room
+            };
+            starts && (0..=1).any(|lead| drawn_from(run, &text[at..], room, lead))
+        })
+}
+
+/// The intro as read: its title, `said` paragraphs, the footer's Enter as its one input on the
+/// footer's first row `footer`, and `span`, its rows from the title (or the first drawn row of a
+/// cut) to the footer's last.
+fn intro(
+    rows: &[String],
+    span: (usize, usize),
+    footer: usize,
+    said: &[String],
+    head_off_screen: bool,
+) -> PromptV2 {
+    let heading_text = crate::anchor!("chrome.intro_heading");
+    PromptV2 {
         kind: PromptKind::ChromeIntro,
         title: heading_text.to_string(),
         command_rows: Vec::new(),
@@ -176,23 +295,29 @@ pub(crate) fn intro_box(rows: &[String]) -> Option<PromptV2> {
             effect: CancelEffect::Back,
         }),
         question: None,
-        span: (title, end),
-        footer: Some(crate::text::trim(&crate::wrap::rejoined(&rows[footer..=end])).to_string()),
-        head_off_screen: false,
+        span,
+        footer: Some(crate::text::trim(&crate::wrap::rejoined(&rows[footer..=span.1])).to_string()),
+        head_off_screen,
         question_dialog: None,
         reason_rows: Vec::new(),
-    })
+    }
+}
+
+/// The intro on `rows`, read whole ([`intro_box`]) or cut ([`intro_cut`]).
+pub(crate) fn intro_on(rows: &[String]) -> Option<PromptV2> {
+    intro_box(rows).or_else(|| intro_cut(rows))
 }
 
 impl PromptV2 {
     /// The `Claude in Chrome` intro's one input, its footer's `Enter to confirm`, when this is
-    /// that intro read whole ([`intro_box`]).
+    /// that intro read whole ([`intro_box`]): never on one read cut ([`intro_cut`]).
     #[must_use]
     pub fn chrome_intro_confirm(&self) -> Option<&Opt> {
         let [confirm] = self.options.as_slice() else {
             return None;
         };
         (self.kind == PromptKind::ChromeIntro
+            && !self.head_off_screen
             && confirm.focused
             && confirm.n.is_none()
             && confirm.label == crate::anchor!("prompt.confirm"))

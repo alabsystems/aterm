@@ -6,6 +6,15 @@
 use aterm_spec::derive::{Liveness, Model};
 
 /// Supervisor account rotation and rate-limit failover model.
+///
+/// Accounts 1 and 2 (`d1`, `d2`) are rows this Mac prefers, account 3 (`sh`) a pool row: one
+/// another Mac prefers or none does (`docs/DESIGN-alab-lab-model-2026-11-01.md` §0). The order is
+/// an order and never a limit: `PreferredBeforePool` says a move takes a preferred row while one
+/// of them is neither low nor at its wall, and `NoWaitWhileOneIsUsable` with the liveness
+/// `EveryUsableAccountIsTried` say the pool row is moved to, never waited past, once the
+/// preferred rows are spent. The model has no clock: that a wait is for the earliest instant of
+/// any row, never a preferred row's later one, is `accounts::wait_instant`'s, held by
+/// `accounts_tests::the_wait_is_for_the_earliest_instant_and_a_preference_never_holds_it_back`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn supervisor_account_rotation_model() -> Model {
@@ -646,7 +655,7 @@ pub fn supervisor_account_rotation_model() -> Model {
                 pw = 0;
                 cx = 0;
             }
-            action SharedFirst when (
+            action PoolFirst when (
                 Buggy == 1 && w1 == 0 && jobs == 0 && s1 == 1 && d1 == 2 && d2 == 0 && sh == 0
                 && run == 0 && rot <= Budget - 1
             ) {
@@ -766,7 +775,7 @@ pub fn supervisor_account_rotation_model() -> Model {
                         && ((s1 == 1 && d1 <= 1) || (s1 == 2 && d2 <= 1) || (s1 == 3 && sh <= 1)))
                     || (mv == 2
                         && ((s2 == 1 && d1 <= 1) || (s2 == 2 && d2 <= 1) || (s2 == 3 && sh <= 1))));
-            invariant DedicatedBeforeShared:
+            invariant PreferredBeforePool:
                 mv == 0 || act == pa || (mv == 1 && s1 <= 2) || (mv == 2 && s2 <= 2)
                 || (1 <= d1 && 1 <= d2);
             invariant FreshBeforeLow:

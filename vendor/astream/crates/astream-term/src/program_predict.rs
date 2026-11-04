@@ -432,6 +432,15 @@ impl ProgramPredictor {
             None => self.base.screen(),
         };
         let pre_context = ScreenContext::of(pre_screen);
+        if !program_ops_within_cap(self.pending.len().saturating_add(1), MAX_PROGRAM_RULES) {
+            if let Some(in_off) = in_offset {
+                if !bytes.is_empty() && program_ops_within_cap(bytes.len(), MAX_RULE_INPUT_BYTES) {
+                    self.record_observed(in_off, pre_context, bytes);
+                }
+            }
+            self.abstentions = self.abstentions.saturating_add(1);
+            return false;
+        }
         let Some(predicted_ops) = self.lookup_ops(&pre_context, bytes) else {
             if let Some(in_off) = in_offset {
                 if !bytes.is_empty() && program_ops_within_cap(bytes.len(), MAX_RULE_INPUT_BYTES) {
@@ -922,6 +931,18 @@ impl SpeculativeTerminal {
             None => self.inner.base.screen(),
         };
         let pre_context = ScreenContext::of(pre_screen);
+        if !program_ops_within_cap(
+            self.inner.pending.len().saturating_add(1),
+            MAX_PROGRAM_RULES,
+        ) {
+            if let Some(in_off) = in_offset {
+                if !bytes.is_empty() && program_ops_within_cap(bytes.len(), MAX_RULE_INPUT_BYTES) {
+                    self.inner.record_observed(in_off, pre_context, bytes);
+                }
+            }
+            self.inner.abstentions = self.inner.abstentions.saturating_add(1);
+            return false;
+        }
         let Some(predicted_ops) = self.lookup_ops(&pre_context, bytes) else {
             if let Some(in_off) = in_offset {
                 if !bytes.is_empty() && program_ops_within_cap(bytes.len(), MAX_RULE_INPUT_BYTES) {
@@ -1041,15 +1062,22 @@ impl SpeculativeTerminal {
         }
 
         // Partial echo of a multi-op head prediction (e.g., "ls" echoed as "l" then "s"):
-        // trim the already-applied prefix and wait for the rest of the echo.
+        // trim the already-applied prefix and wait for the rest of the echo only if
+        // applying the remaining suffix on top of the updated authoritative screen still
+        // reaches `head.post_screen`.
+        let base_screen = self.inner.base.screen().clone();
         if let Some(head) = self.inner.pending.first_mut() {
             if ops_strict_prefix(&actual_ops, &head.predicted_ops) {
                 let mut rem = Vec::new();
                 if let Some(suffix) = head.predicted_ops.get(actual_ops.len()..) {
                     rem.extend_from_slice(suffix);
                 }
-                head.predicted_ops = rem;
-                return Vec::new();
+                let mut projected = base_screen;
+                apply_ops_to(&mut projected, &rem);
+                if projected == head.post_screen {
+                    head.predicted_ops = rem;
+                    return Vec::new();
+                }
             }
         }
 
@@ -1195,5 +1223,35 @@ impl SpeculativeTerminal {
     /// `view().serialize() == authoritative().serialize()`.
     pub fn reconcile(&mut self) -> Vec<(u64, Verdict)> {
         self.inner.reconcile()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_queue_is_bounded_by_max_program_rules() {
+        let mut st = SpeculativeTerminal::new(80, 24);
+        for seq in 0..(MAX_PROGRAM_RULES as u64) {
+            assert!(st.predict(seq, b"a"));
+        }
+        assert_eq!(st.pending_count(), MAX_PROGRAM_RULES);
+        assert!(!st.predict(MAX_PROGRAM_RULES as u64, b"a"));
+        assert_eq!(st.pending_count(), MAX_PROGRAM_RULES);
+        assert_eq!(st.abstentions(), 1);
+    }
+
+    #[test]
+    fn apply_output_at_handles_split_echo_prefix_confluently() {
+        let mut st = SpeculativeTerminal::new(80, 24);
+        assert!(st.predict(1, b"ls"));
+        assert!(st
+            .apply_output_at(1, &Record::Out(b"l".to_vec()))
+            .is_empty());
+        assert_eq!(st.pending_count(), 1);
+        let verdicts = st.apply_output_at(2, &Record::Out(b"s".to_vec()));
+        assert_eq!(verdicts, vec![(1, Verdict::Confirmed)]);
+        assert_eq!(st.pending_count(), 0);
     }
 }

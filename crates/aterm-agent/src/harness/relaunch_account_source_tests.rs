@@ -85,7 +85,7 @@ fn selection_case(case: i64) -> bool {
         13 => rows.rows[0].dir = Some("/other/login".into()),
         14 => rows.rows[0].email = Some("other@example.test".into()),
         15 => rows.rows[0].identity_email = Some("other@example.test".into()),
-        16 => rows.rows[0].class = accounts::Class::Shared,
+        16 => rows.rows[0].class = accounts::Class::Pool,
         17 => rows.rows[0].browser = Some("another-browser".into()),
         18 => rows.rows[0].was.push(Some("/prior/login".into())),
         19 => rows.rows[0].vendor.flow = Some(crate::ai::connector::Flow::Device),

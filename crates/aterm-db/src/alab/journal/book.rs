@@ -10,6 +10,7 @@
 
 use super::{
     event::{Event, Kind, MAX_EVENT, Pk, Window, Word},
+    place::{Holding, Why},
     relay::{Entry, Heard, Rk},
     spool::{KEEP_S, MAX_SPOOL},
 };
@@ -275,10 +276,33 @@ pub struct Presence {
     pub os: Option<u64>,
 }
 
+/// One account this Mac holds that no preference here names (design §4.17 `place`): its row's
+/// reason, since when it has held for that reason, until when the row stands unless restated,
+/// and what the row last said.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Place {
+    pub why: Why,
+    pub since: u64,
+    pub until: u64,
+    /// The harness no longer reports it: the row is restated once with `until` at the end, then
+    /// the book forgets it.
+    pub ended: bool,
+    pub stated: Option<Stated>,
+}
+
+/// When a live place row stated in week `period` lapses unless restated: the end of the next
+/// week, so the weekly carry always restates it before it lapses, and a Mac that went away
+/// leaves it live at most two weeks.
+pub(crate) fn place_until(period: u64) -> u64 {
+    period.saturating_add(2).saturating_mul(WEEK)
+}
+
 /// The flusher's state.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Book {
     pub accounts: BTreeMap<Pk, Facts>,
+    /// What this Mac holds that no preference here names, by account ([`Self::hold`]).
+    pub places: BTreeMap<Pk, Place>,
     /// The last counter a record of this Mac's used: never reused, so an `ev` batch key is new.
     pub n: u64,
     /// The week of the last `sum` row.
@@ -319,6 +343,7 @@ pub(crate) struct Planned {
     pub events: usize,
     pub sum: bool,
     pub uses: Vec<(Pk, Value)>,
+    pub places: Vec<(Pk, Value)>,
     pub relays: Vec<(u8, Value)>,
     /// Planned with the journal off: its `sum` says so.
     pub off: bool,
@@ -496,6 +521,91 @@ impl Book {
         Ok(due)
     }
 
+    /// Whether this Mac's journal saw `account` run or sign in here: a session start or a sign-in
+    /// on its row. Until then a holding of it is [`Why::Probation`].
+    fn proven(&self, account: &Pk) -> bool {
+        self.accounts
+            .get(account)
+            .is_some_and(|f| f.last_start > 0 || f.signin.as_ref().is_some_and(|s| s.state == "in"))
+    }
+
+    /// Take the harness's `holdings` at `now` (design §4.17 `place`): a new account, or one whose
+    /// reason changed, holds since `now`; one whose journal shows no run or sign-in here is on
+    /// [`Why::Probation`]; a held one stands until [`place_until`] of this week; one the harness no
+    /// longer reports ends at `now` (stated once, then forgotten; one never stated is forgotten at
+    /// once). At most [`MAX_ACCOUNTS`] are kept, the first reported.
+    pub(crate) fn hold(&mut self, holdings: &[Holding], now: u64) {
+        let until = place_until(now / WEEK);
+        let mut held = BTreeSet::new();
+        for holding in holdings.iter().take(MAX_ACCOUNTS) {
+            if !held.insert(holding.account) {
+                continue;
+            }
+            let why = if self.proven(&holding.account) {
+                holding.why
+            } else {
+                Why::Probation
+            };
+            match self.places.get_mut(&holding.account) {
+                Some(place) if !place.ended && place.why == why => place.until = until,
+                Some(place) => {
+                    place.why = why;
+                    place.since = now;
+                    place.until = until;
+                    place.ended = false;
+                }
+                None => {
+                    self.places.insert(
+                        holding.account,
+                        Place {
+                            why,
+                            since: now,
+                            until,
+                            ended: false,
+                            stated: None,
+                        },
+                    );
+                }
+            }
+        }
+        self.places.retain(|account, place| {
+            if held.contains(account) {
+                return true;
+            }
+            if place.stated.is_none() {
+                return false;
+            }
+            if !place.ended {
+                place.ended = true;
+                place.until = now.min(place.until);
+            }
+            true
+        });
+    }
+
+    /// The `place` rows due now: a row that changed (a new reason, an end) and was last written an
+    /// hour or more ago, and once a week each live row with its new `until` (the weekly carry).
+    pub(crate) fn places_due(&self, n: u64, period: u64, now: u64) -> Vec<(Pk, Value)> {
+        let mut due = Vec::new();
+        for (pk, place) in &self.places {
+            let until = if place.ended {
+                place.until
+            } else {
+                place.until.max(place_until(period))
+            };
+            let row = json!({"r": VERSION, "n": n, "why": place.why.word(),
+                "since": place.since, "until": until});
+            let said = place.stated.as_ref();
+            let changed = said.is_none_or(|s| s.value != content(&row))
+                && said.is_none_or(|s| now >= s.at.saturating_add(USE_EVERY));
+            let carry = !place.ended && said.is_some_and(|s| s.period < period);
+            if changed || carry {
+                due.push((*pk, row));
+            }
+        }
+        due
+    }
+
     /// The `relay` rows due now: a duty bucket's row that changed and was last written six
     /// hours or more ago, and once a week each duty bucket's row (the weekly carry).
     pub(crate) fn relays_due(
@@ -569,9 +679,9 @@ impl Book {
 
     /// One flush record from `outbox`, the rows due and `heard`'s relays, at counter `n` (design
     /// §4.17 "Record packing"): the `ev` batch first, then `sum`, then the changed `use` rows,
-    /// then the `relay` rows, while the record stays within 64 changes and 60 KiB; what does
+    /// then the `place` rows, then the `relay` rows, while the record stays within 64 changes and 60 KiB; what does
     /// not fit goes in the next flush. With the journal off (`off`) the record holds the `sum`
-    /// row alone, saying so: no event, `use` or `relay` row is published.
+    /// row alone, saying so: no event, `use`, `place` or `relay` row is published.
     ///
     /// # Errors
     /// A row cannot be built within its cap.
@@ -637,6 +747,16 @@ impl Book {
                 planned.uses.push((pk, row));
             }
         }
+        for (pk, row) in self.places_due(n, period, now) {
+            let change = Change {
+                collection: super::PLACE.name.into(),
+                key: format!("{}.{uuid}", pk.as_str()),
+                value: Some(row.clone()),
+            };
+            if offer(&mut planned, change) {
+                planned.places.push((pk, row));
+            }
+        }
         for (bucket, row) in self.relays_due(heard, me, n, period, now)? {
             let change = Change {
                 collection: super::RELAY.name.into(),
@@ -669,6 +789,19 @@ impl Book {
                     at: now,
                     period,
                 });
+            }
+        }
+        for (pk, row) in &planned.places {
+            let ended = self.places.get_mut(pk).is_some_and(|place| {
+                place.stated = Some(Stated {
+                    value: content(row),
+                    at: now,
+                    period,
+                });
+                place.ended
+            });
+            if ended {
+                self.places.remove(pk);
             }
         }
         for (bucket, row) in &planned.relays {
@@ -741,6 +874,19 @@ impl Book {
             "held_until": self.held_until,
             "kept": self.kept,
             "accounts": accounts,
+            "places": self.places.iter()
+                .map(|(pk, p)| {
+                    let mut o = Map::new();
+                    o.insert("why".into(), Value::from(p.why.word()));
+                    o.insert("since".into(), Value::from(p.since));
+                    o.insert("until".into(), Value::from(p.until));
+                    o.insert("ended".into(), Value::from(p.ended));
+                    if let Some(s) = &p.stated {
+                        o.insert("stated".into(), stated(s));
+                    }
+                    (pk.as_str().to_owned(), Value::Object(o))
+                })
+                .collect::<Map>(),
             "relays": self.relays.iter()
                 .map(|(b, s)| (b.to_string(), stated(s)))
                 .collect::<Map>(),
@@ -840,6 +986,28 @@ impl Book {
                 .get("plan")
                 .and_then(|p| Some((p.get("word")?.as_str()?.to_owned(), p.get("t")?.as_u64()?)));
             book.accounts.insert(pk, facts);
+        }
+        for (pk, p) in v
+            .get("places")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+        {
+            let parsed = (|| {
+                Some((
+                    Pk::new(pk)?,
+                    Place {
+                        why: Why::parse(p.get("why")?.as_str()?)?,
+                        since: p.get("since")?.as_u64()?,
+                        until: p.get("until")?.as_u64()?,
+                        ended: p.get("ended")?.as_bool()?,
+                        stated: stated(p.get("stated")),
+                    },
+                ))
+            })();
+            if let Some((pk, place)) = parsed {
+                book.places.insert(pk, place);
+            }
         }
         for (b, s) in v
             .get("relays")

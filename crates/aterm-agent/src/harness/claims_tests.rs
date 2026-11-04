@@ -183,7 +183,7 @@ fn users(on: &[&Mac], account: &str, now: i64) -> Vec<String> {
 fn roster() -> Roster {
     let row = |label: &str| accounts::Row {
         label: label.into(),
-        class: Class::Shared,
+        class: Class::Pool,
         dir: Some(format!("/tmp/{label}")),
         email: Some(format!("{label}@example.test")),
         ..accounts::Row::default()

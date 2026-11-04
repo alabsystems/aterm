@@ -123,7 +123,7 @@ fn deccolm_with_mode_40_clears_screen_and_homes_cursor() {
     assert_eq!(s.cursor(), (0, 0), "DECCOLM switch homes the cursor");
 
     let mut t = Terminal::new(24, 132);
-    t.process(b"\x1b[?40h\x1b[?3h");
+    t.process(b"\x1b[?40h\x1b[3g\x1b[?3h");
     let _ = t.take_response();
     t.process(b"\x1b[?3$p");
     assert_eq!(
@@ -131,15 +131,52 @@ fn deccolm_with_mode_40_clears_screen_and_homes_cursor() {
         Some(b"\x1b[?3;1$y".as_slice()),
         "DECRQM reports 132-column mode set after ?40h + ?3h"
     );
+    assert!(
+        t.grid().tab_stops().iter().all(|&stop| !stop),
+        "DECCOLM preserves the tab stops"
+    );
 }
 
 #[test]
-fn decncsm_suppresses_clear_on_deccolm_switch() {
-    let mut s = Screen::new(24, 132);
-    s.feed(b"\x1b[?40h\x1b[?95h"); // enable column switching + DECNCSM
-    s.feed(b"keep");
-    s.feed(b"\x1b[?3h");
-    assert_eq!(s.row(0), "keep", "DECNCSM suppresses the DECCOLM clear");
+fn decncsm_preserves_cells_but_not_other_deccolm_resets() {
+    let mut t = Terminal::new(24, 132);
+    t.process(b"\x1b[?40h\x1b[?95hkeep"); // enable column switching + DECNCSM
+    t.process(b"\x1b[3;20r\x1b[?69h\x1b[5;120s"); // scroll region + DECLRMM/DECSLRM
+    t.process(b"\x1b[1;1H\x1b#6\x1b[3g\x1b[7;11H"); // DECDWL + clear tabs + move
+
+    let region = t.grid().scroll_region();
+    assert_eq!((region.top, region.bottom), (2, 19));
+    assert!(t.modes().left_right_margin_mode);
+    let margins = t.grid().horizontal_margins();
+    assert_eq!((margins.left, margins.right), (4, 119));
+    assert!(t.grid().has_horizontal_margins());
+    assert_eq!(
+        t.grid().row(0).expect("visible row").line_size(),
+        aterm_core::grid::LineSize::DoubleWidth
+    );
+    assert!(t.grid().tab_stops().iter().all(|&stop| !stop));
+
+    t.process(b"\x1b[?3h");
+
+    assert_eq!(
+        t.row_text(0).as_deref(),
+        Some("keep"),
+        "DECNCSM suppresses only the DECCOLM screen clear"
+    );
+    assert_eq!((t.cursor().row, t.cursor().col), (0, 0));
+    let region = t.grid().scroll_region();
+    assert_eq!((region.top, region.bottom), (0, 23));
+    assert!(!t.modes().left_right_margin_mode);
+    assert!(t.grid().horizontal_margins().is_full(132));
+    assert!(!t.grid().has_horizontal_margins());
+    assert!(
+        (0..24).all(|row| t.grid().row(row).expect("visible row").line_size()
+            == aterm_core::grid::LineSize::SingleWidth)
+    );
+    assert!(
+        t.grid().tab_stops().iter().all(|&stop| !stop),
+        "DECCOLM preserves the tab stops under DECNCSM too"
+    );
 }
 
 #[test]

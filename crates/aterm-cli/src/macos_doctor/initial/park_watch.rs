@@ -5,8 +5,7 @@
 //! ([`super::InitialSetupParkMark::watches`]): the secrets folder changing (the subscriber's
 //! `state.toml`, a join's identity or source, and materialized `~/.secrets` files), this Mac's
 //! network addresses changing (a route socket's address and interface messages), and a `git`
-//! arriving (the Command Line Tools' or
-//! Xcode's). A watch only
+//! arriving (atpkg's, the Command Line Tools' or Xcode's). A watch only
 //! says "look again": the park reads its mark again and runs a pass only when a fact changed.
 //! Each watch lets a burst settle before it says so, and the network watch says so at most once a
 //! minute, so an interface that keeps going up and down moves a park no more often than the
@@ -27,7 +26,7 @@ pub struct Watches {
     pub secrets: bool,
     /// This Mac's network addresses.
     pub network: bool,
-    /// A `git` arriving: the Command Line Tools', or Xcode's where macOS installs it.
+    /// A `git` arriving: atpkg's, the Command Line Tools' or Xcode's.
     pub developer_tools: bool,
 }
 
@@ -81,6 +80,9 @@ impl ParkWatch {
                 .map_or_else(PathBuf::new, Path::to_path_buf);
             folders.push((tools, PathBuf::from("/Library")).into());
             folders.push((PathBuf::from(XCODE_BIN), PathBuf::from("/Applications")).into());
+            if let Some(layout) = atpkg::store::resolve_configured() {
+                folders.extend(packaged_git_folders(&layout.prefix));
+            }
         }
         if !folders.is_empty() {
             watch.files = Some(watch_folders(
@@ -172,6 +174,16 @@ fn secrets_folders(home: &Path) -> Vec<FolderTarget> {
             floor: home.to_path_buf(),
             follow_links: false,
         },
+    ]
+}
+
+/// Package activation writes `current` and its ready record under `store/git`, and
+/// lays the executable shim in `bin`. Watch both, including before the prefix exists.
+fn packaged_git_folders(prefix: &Path) -> Vec<FolderTarget> {
+    let floor = PathBuf::from("/");
+    vec![
+        (prefix.join("store/git"), floor.clone()).into(),
+        (prefix.join("bin"), floor).into(),
     ]
 }
 
@@ -567,6 +579,42 @@ mod tests {
     }
 
     static MATERIALIZED_FIRED: AtomicUsize = AtomicUsize::new(0);
+
+    static GIT_FIRED: AtomicUsize = AtomicUsize::new(0);
+
+    fn git_fired() {
+        GIT_FIRED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn packaged_git_activation_wakes_a_park_waiting_for_git() {
+        let home = aterm_tempfile::TempDir::new().unwrap();
+        let prefix = home.path().join("pkg");
+        std::fs::create_dir_all(prefix.join("store/git")).unwrap();
+        std::fs::create_dir_all(prefix.join("bin")).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let lost = Arc::new(AtomicBool::new(false));
+        let watcher = watch_folders(
+            packaged_git_folders(&prefix),
+            Arc::clone(&stop),
+            Arc::clone(&lost),
+            git_fired,
+        )
+        .unwrap();
+        let before = GIT_FIRED.load(Ordering::SeqCst);
+        std::fs::write(prefix.join("store/git/42.ready"), "ready").unwrap();
+        until("the managed Git activation never woke setup", || {
+            GIT_FIRED.load(Ordering::SeqCst) > before
+        });
+        let before = GIT_FIRED.load(Ordering::SeqCst);
+        std::fs::write(prefix.join("bin/git"), "shim").unwrap();
+        until("the managed Git shim never woke setup", || {
+            GIT_FIRED.load(Ordering::SeqCst) > before
+        });
+        assert!(!lost.load(Ordering::Acquire));
+        stop.store(true, Ordering::Release);
+        watcher.wake().unwrap();
+    }
 
     fn materialized_fired() {
         MATERIALIZED_FIRED.fetch_add(1, Ordering::SeqCst);

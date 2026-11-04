@@ -152,8 +152,7 @@ pub(crate) fn compute_edges(
 /// Assigns edge indices to segments after edge sorting stabilizes.
 fn link_segments_to_edges(axis: &mut Axis) {
     let segments = axis.segments.as_mut_slice();
-    for edge_ix in 0..axis.edges.len() {
-        let edge = &axis.edges[edge_ix];
+    for (edge_ix, edge) in axis.edges.iter().enumerate() {
         let mut ix = edge.first_ix as usize;
         let last_ix = edge.last_ix as usize;
         loop {

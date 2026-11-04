@@ -188,27 +188,6 @@ fn a_dev_request_answers_the_dev_token() {
 }
 
 #[test]
-fn store_and_erase_quit() {
-    let world = World::canonical("helper-store");
-    for op in ["store", "erase", "approve"] {
-        let (exit, out) = world.helper(MapEnv::new(), op, DEV_REQUEST.as_bytes());
-        assert_eq!((exit, out.as_str()), (0, QUIT), "{op}");
-    }
-}
-
-#[test]
-fn a_terminal_quits() {
-    let world = World::canonical("helper-terminal");
-    let (ctx, captured) = world.ctx(MapEnv::new());
-    let mut ctx = ctx
-        .with_stdin(DEV_REQUEST.as_bytes().to_vec())
-        .with_stdin_terminal(true);
-    let exit = common::run_cli(&mut ctx, &["auth", "git-credential", "get"]);
-    assert_eq!((exit, captured.stdout_text().as_str()), (0, QUIT));
-    assert_eq!(captured.stderr_text(), "");
-}
-
-#[test]
 fn a_pathless_request_quits() {
     let world = World::canonical("helper-pathless");
     assert_eq!(
@@ -693,6 +672,7 @@ fn a_terminal_stdin_is_never_read() {
     ctx.stdin = Box::new(Watched(std::sync::Arc::clone(&read)));
     let exit = common::run_cli(&mut ctx, &["auth", "git-credential", "get"]);
     assert_eq!((exit, captured.stdout_text().as_str()), (0, QUIT));
+    assert_eq!(captured.stderr_text(), "");
     assert!(
         !read.load(std::sync::atomic::Ordering::SeqCst),
         "the terminal was read"
@@ -701,15 +681,17 @@ fn a_terminal_stdin_is_never_read() {
 
 /// Rule 2 before the read: `store` and `erase`, which git sends with the credential it used,
 /// answer `quit=1` without reading stdin, so the token they carry is never held in a buffer.
+/// An op agh does not know (`approve`) also answers `quit=1` unread.
 #[test]
 fn store_and_erase_are_never_read() {
     let world = World::canonical("helper-store-unread");
-    for op in ["store", "erase"] {
+    for op in ["store", "erase", "approve"] {
         let (mut ctx, captured) = world.ctx(MapEnv::new());
         let read = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         ctx.stdin = Box::new(Watched(std::sync::Arc::clone(&read)));
         let exit = common::run_cli(&mut ctx, &["auth", "git-credential", op]);
         assert_eq!((exit, captured.stdout_text().as_str()), (0, QUIT), "{op}");
+        assert_eq!(captured.stderr_text(), "", "{op}");
         assert!(
             !read.load(std::sync::atomic::Ordering::SeqCst),
             "{op}'s stdin was read"

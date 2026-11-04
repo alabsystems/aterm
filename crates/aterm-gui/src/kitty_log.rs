@@ -718,19 +718,18 @@ fn prepare_ledger_parent(path: &Path) -> bool {
     let Ok(metadata) = std::fs::symlink_metadata(parent) else {
         return false;
     };
-    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
-        return false;
-    }
+    let regular_directory = metadata.file_type().is_dir() && !metadata.file_type().is_symlink();
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt as _;
 
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return false;
-        }
+        regular_directory && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
     }
-    true
+    #[cfg(not(windows))]
+    {
+        regular_directory
+    }
 }
 
 fn atomic_write_toml(path: &Path, value: &impl Serialize) -> bool {
@@ -784,19 +783,18 @@ fn ledger_destination_is_safe(path: &Path) -> bool {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
         Err(_) => return false,
     };
-    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-        return false;
-    }
+    let regular_file = metadata.file_type().is_file() && !metadata.file_type().is_symlink();
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt as _;
 
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return false;
-        }
+        regular_file && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
     }
-    true
+    #[cfg(not(windows))]
+    {
+        regular_file
+    }
 }
 
 fn lock_not_regular() -> std::io::Error {

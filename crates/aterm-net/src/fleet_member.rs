@@ -432,7 +432,9 @@ impl Drop for HeldSilent {
     }
 }
 
-use aterm_uds::private_file::{PrivateDir, judge_private_dir, remove_private, write_private};
+use aterm_uds::private_file::{
+    PrivateDir, check_owned_dir, judge_private_dir, remove_private, write_private,
+};
 pub use aterm_uds::private_file::{PrivateFileError, ensure_private_dir, read_private};
 
 /// A new fleet secret, [`SECRET_LEN`] bytes from the OS CSPRNG.
@@ -466,7 +468,7 @@ const CODE_FILE_MAX: usize = 4096;
 /// (its join code names the port), or a member's join again.
 #[must_use]
 pub fn moves_listener(dir: &Path) -> &'static str {
-    if std::fs::symlink_metadata(dir.join(CODE_FILE)).is_ok() {
+    if check_owned_dir(dir).is_ok() && std::fs::symlink_metadata(dir.join(CODE_FILE)).is_ok() {
         "`aterm fleet init --rotate --port <n>` moves it (every member joins again)"
     } else {
         "`aterm fleet join --port <n>` moves it"
@@ -2209,17 +2211,25 @@ impl Leaving<'_> {
     /// # Errors
     /// `name` is no one file name, or the file is there and cannot be removed.
     pub fn remove(&self, name: &str) -> io::Result<bool> {
-        remove_private(self.dir, name)
+        match remove_private(self.dir, name) {
+            Err(e)
+                if !self.locked() && stops_every_edit(&e) && check_owned_dir(self.dir).is_err() =>
+            {
+                Ok(false)
+            }
+            other => other,
+        }
     }
 
     /// Write [`OFF_FILE`], empty, in whatever directory the leave holds.
     /// # Errors
-    /// It cannot be written.
+    /// It cannot be written, or `dir` is not an owned real directory.
     pub fn write_off(&self) -> io::Result<()> {
         #[cfg(any(test, debug_assertions))]
         if let Some(kind) = OFF_REFUSED.get() {
             return Err(io::Error::from(kind));
         }
+        check_owned_dir(self.dir)?;
         aterm_uds::atomic_file::write(&self.dir.join(OFF_FILE), b"", 0o600)
     }
 }

@@ -3508,6 +3508,68 @@ pub fn local_network_heard() -> LocalNetworkHeard {
     }
 }
 
+/// Whether the Local Network question macOS puts this process is aterm's own, the one aterm's
+/// records keep: the process macOS holds responsible for this one is this process (one launchd or
+/// the window started by itself) or runs this same executable (aterm's window, for a tab's
+/// program). A process another app is responsible for (a shell in Terminal) is asked that app's
+/// question, and one whose responsible process cannot be read is asked none aterm knows. Read by
+/// file, a window an update swapped aside while it runs counts as another program until it
+/// relaunches: what its tabs hear meanwhile is not kept, which a later look hears again.
+#[must_use]
+pub fn local_network_question_is_own() -> bool {
+    let Ok(me) = i32::try_from(std::process::id()) else {
+        return false;
+    };
+    let Some(responsible) = aterm_containment::consent::responsible_pid(me) else {
+        return false;
+    };
+    responsible == me
+        || matches!(
+            (
+                aterm_uds::sudo::exe_path(responsible),
+                aterm_uds::sudo::exe_path(me),
+            ),
+            (Some(theirs), Some(mine)) if same_executable(&theirs, &mine)
+        )
+}
+
+/// Whether `a` and `b` are one regular file (its device and inode), as two processes'
+/// executables are when both run one aterm, through whatever links named it.
+#[cfg(unix)]
+fn same_executable(a: &std::path::Path, b: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.is_file() && a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+/// Off Unix no process's question is aterm's to read.
+#[cfg(not(unix))]
+fn same_executable(_: &std::path::Path, _: &std::path::Path) -> bool {
+    false
+}
+
+/// What keeps what this process's looks and vault syncs at a `.local` address hear of macOS's
+/// Local Network switch (`aterm_machines::init_secrets::on_lan_heard`): `aterm init`'s, the
+/// window's Secrets stage and `sync.peers`, kept as the window's own looks keep it, where the
+/// question macOS puts this process is aterm's own ([`local_network_question_is_own`]). A look
+/// from another app's process heard that app's switch, which says nothing of aterm's.
+pub const LAN_KEEPER: aterm_machines::init_secrets::LanKeeper =
+    aterm_machines::init_secrets::LanKeeper {
+        keeps: local_network_question_is_own,
+        keep: keep_lan_heard,
+    };
+
+/// [`LAN_KEEPER`]'s keep, once its `keeps` said this process's question is aterm's own.
+fn keep_lan_heard(heard: aterm_machines::init_secrets::LanHeard) {
+    use aterm_machines::init_secrets::LanHeard;
+    access::lan_answered(match heard {
+        LanHeard::Reached => access::LanAnswer::Reached,
+        LanHeard::Refused => access::LanAnswer::Refused,
+    });
+}
+
 /// Who may make this process's first use of the LAN, which is when macOS puts its Local Network
 /// question on screen, as the Commons runtime reads it before its own (design §6: System State's
 /// Local Network step is the one meant to raise that question, in its order).
@@ -3697,6 +3759,10 @@ pub struct InitialSetupSnapshot {
     /// beside the records), so Restore previous settings has something to put back
     /// ([`restorable_at`]).
     pub restorable: bool,
+    /// This Mac holds setup records of any run: a saved plan, a run's progress or a decision.
+    /// Before aterm.app's first launch (aterm installed from a terminal and the app never
+    /// opened) there are none, and the rows are the default plan's, nothing running them.
+    pub begun: bool,
     pub observation: InitialSetupObservation,
 }
 
@@ -3988,14 +4054,44 @@ pub fn initial_setup_snapshot() -> Result<InitialSetupSnapshot, InitialSetupSnap
     snapshot_in_vault(&root, live_configured_vault())
 }
 
+/// [`initial_setup_snapshot`] for a reader that writes nothing (`aterm status`): a stage a live
+/// process has run past the hang limit reads as running past it, and is left for System State's
+/// own reading to park ([`ledger::read_marking_hung`]).
+pub fn initial_setup_snapshot_read_only() -> Result<InitialSetupSnapshot, InitialSetupSnapshotError>
+{
+    let root = state_root().map_err(InitialSetupSnapshotError::read)?;
+    snapshot_in_vault_reading(&root, live_configured_vault(), Hung::Leave)
+}
+
+/// What a reading does with a stage a live process has run past the hang limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Hung {
+    /// Park it in the ledger, a mark that outlives the process ([`ledger::read_marking_hung`]).
+    Mark,
+    /// Leave the ledger as it is: the reading writes nothing.
+    Leave,
+}
+
 fn snapshot_in_vault(
     root: &Path,
     configured: Result<Option<ConfiguredVault>, String>,
 ) -> Result<InitialSetupSnapshot, InitialSetupSnapshotError> {
+    snapshot_in_vault_reading(root, configured, Hung::Mark)
+}
+
+/// [`snapshot_in_vault`], doing with a hung stage what `hung` says.
+fn snapshot_in_vault_reading(
+    root: &Path,
+    configured: Result<Option<ConfiguredVault>, String>,
+    hung: Hung,
+) -> Result<InitialSetupSnapshot, InitialSetupSnapshotError> {
     let saved =
         saved_plan_record(root).map_err(|why| InitialSetupSnapshotError::read_at(root, why))?;
     let fallback = offered_plan(saved, configured.clone());
-    let mut snapshot = snapshot_at(root, fallback)?;
+    let mut snapshot = match hung {
+        Hung::Mark => snapshot_at(root, fallback)?,
+        Hung::Leave => snapshot_at_reading(root, fallback, ledger::Live::now, hung)?,
+    };
     if let Ok(Some(vault)) = configured {
         snapshot.plan = shown_in_vault(snapshot.plan, &snapshot.observation.records, &vault);
     }
@@ -4501,6 +4597,16 @@ fn snapshot_at_when(
     fallback: Plan,
     live: impl FnOnce(bool) -> ledger::Live,
 ) -> Result<InitialSetupSnapshot, InitialSetupSnapshotError> {
+    snapshot_at_reading(root, fallback, live, Hung::Mark)
+}
+
+/// [`snapshot_at_when`], doing with a hung stage what `hung` says.
+fn snapshot_at_reading(
+    root: &Path,
+    fallback: Plan,
+    live: impl FnOnce(bool) -> ledger::Live,
+    hung: Hung,
+) -> Result<InitialSetupSnapshot, InitialSetupSnapshotError> {
     let observation = observation_at(root)?;
     let active = HeldLock::profile_active(root).map_err(InitialSetupSnapshotError::read)?;
     // The latest hold's mark: a stage is alive only while the lock is held by the hold that
@@ -4518,7 +4624,10 @@ fn snapshot_at_when(
         .records
         .progress
         .filter(|progress| progress.belongs_to(raw_plan));
-    let ledger = ledger::read_marking_hung(root, progress, live);
+    let ledger = match hung {
+        Hung::Mark => ledger::read_marking_hung(root, progress, live),
+        Hung::Leave => ledger::read(root, progress),
+    };
     Ok(InitialSetupSnapshot {
         recovered: set_aside::shown(root),
         restorable: restorable_at(root),
@@ -4962,6 +5071,9 @@ fn snapshot_from_observation(
         cancelled: records.cancelled.is_some(),
         recovered: false,
         restorable: false,
+        begun: records.plan.is_some()
+            || records.progress.is_some()
+            || records.decision != Decision::Missing,
         observation,
     }
 }
@@ -9443,6 +9555,31 @@ mod tests {
             LocalNetworkFirstUse::Asked,
             "an older revision's step"
         );
+    }
+
+    /// Two processes run one aterm when their executables are one file, whatever link or hard
+    /// link named it; another file holding the same bytes is another program (its switch is its
+    /// own), and a folder or a path with nothing there is no executable.
+    /// NEGATIVE CONTROL: a comparison of the paths' bytes calls the link another program; one of
+    /// the files' contents calls the copy this one.
+    #[cfg(unix)]
+    #[test]
+    fn one_aterm_is_one_file_whatever_names_it() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let exe = dir.path().join("aterm");
+        std::fs::write(&exe, b"one program").unwrap();
+        let linked = dir.path().join("linked");
+        std::os::unix::fs::symlink(&exe, &linked).unwrap();
+        let hard = dir.path().join("hard");
+        std::fs::hard_link(&exe, &hard).unwrap();
+        let copy = dir.path().join("copy");
+        std::fs::write(&copy, b"one program").unwrap();
+        assert!(same_executable(&exe, &exe));
+        assert!(same_executable(&linked, &exe), "a link names it");
+        assert!(same_executable(&exe, &hard), "a hard link names it");
+        assert!(!same_executable(&exe, &copy), "a copy is another program");
+        assert!(!same_executable(dir.path(), dir.path()), "a folder");
+        assert!(!same_executable(&dir.path().join("none"), &exe));
     }
 
     /// A newer aterm's setup records give this build no access revision, so its window never runs

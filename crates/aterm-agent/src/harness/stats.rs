@@ -1519,7 +1519,23 @@ struct Listed {
     modified_ms: Option<i64>,
 }
 
+fn drive_files_under(state_dir: &Path, since_ms: i64) -> Vec<Listed> {
+    if !matches!(
+        super::upgrade_drive::check_owned_plain_dir_existing(state_dir),
+        Ok(true)
+    ) {
+        return Vec::new();
+    }
+    drive_files(&state_dir.join("drive"), since_ms)
+}
+
 fn drive_files(drive: &Path, since_ms: i64) -> Vec<Listed> {
+    if !matches!(
+        super::upgrade_drive::check_owned_plain_dir_existing(drive),
+        Ok(true)
+    ) {
+        return Vec::new();
+    }
     let Ok(entries) = std::fs::read_dir(drive) else {
         return Vec::new();
     };
@@ -1572,11 +1588,18 @@ fn upgrade_ledger(harness_state: &Path) -> PathBuf {
     harness_state.join("upgrade").join("ledger.jsonl")
 }
 
+fn checked_upgrade_ledger(harness_state: &Path) -> Option<PathBuf> {
+    super::upgrade_drive::check_upgrade_tree(harness_state, None)
+        .ok()
+        .flatten()
+        .map(|_| upgrade_ledger(harness_state))
+}
+
 /// WHAT THE HARNESS DID since `since_ms` (unix ms), read from the files it keeps.
 #[must_use]
 pub fn stats_under(state_dir: &Path, harness_state: &Path, since_ms: i64) -> HarnessStats {
     let mut acc = HarnessStats::new(since_ms);
-    for file in drive_files(&state_dir.join("drive"), since_ms) {
+    for file in drive_files_under(state_dir, since_ms) {
         let Ok(lines) = tail_lines(&file.path, READ_MAX_ROWS) else {
             continue;
         };
@@ -1604,8 +1627,8 @@ pub fn stats_under(state_dir: &Path, harness_state: &Path, since_ms: i64) -> Har
             }
         }
     }
-    let path = upgrade_ledger(harness_state);
-    if !untouched_since(&path, since_ms)
+    if let Some(path) = checked_upgrade_ledger(harness_state)
+        && !untouched_since(&path, since_ms)
         && let Ok(lines) = tail_lines(&path, READ_MAX_ROWS)
     {
         let oldest = lines
@@ -1642,7 +1665,7 @@ fn stats_windows_with(
 ) -> (HarnessStats, HarnessStats) {
     let mut today = HarnessStats::per_session(today_ms);
     let mut week = HarnessStats::new(week_ms);
-    for file in drive_files(&state_dir.join("drive"), today_ms.min(week_ms)) {
+    for file in drive_files_under(state_dir, today_ms.min(week_ms)) {
         let wants = [
             !untouched(file.modified_ms, today_ms),
             !untouched(file.modified_ms, week_ms),
@@ -1696,33 +1719,34 @@ fn stats_windows_with(
             }
         }
     }
-    let path = upgrade_ledger(harness_state);
-    let modified = modified_ms(&path);
-    let wants = [
-        !untouched(modified, today_ms),
-        !untouched(modified, week_ms),
-    ];
-    if wants.contains(&true)
-        && let Ok(lines) = read(&path)
-    {
-        let mut oldest = None;
-        for line in &lines {
-            let row = row_and_time(line, "t");
-            if oldest.is_none() {
-                oldest = row.as_ref().map(|(_, t)| t.saturating_mul(1000));
-            }
-            for (acc, wanted) in [(&mut today, wants[0]), (&mut week, wants[1])] {
-                match &row {
-                    Some((v, t)) if wanted => fold_upgrade_row(acc, v, *t),
-                    None if wanted => bump(&mut acc.bad),
-                    _ => {}
+    if let Some(path) = checked_upgrade_ledger(harness_state) {
+        let modified = modified_ms(&path);
+        let wants = [
+            !untouched(modified, today_ms),
+            !untouched(modified, week_ms),
+        ];
+        if wants.contains(&true)
+            && let Ok(lines) = read(&path)
+        {
+            let mut oldest = None;
+            for line in &lines {
+                let row = row_and_time(line, "t");
+                if oldest.is_none() {
+                    oldest = row.as_ref().map(|(_, t)| t.saturating_mul(1000));
+                }
+                for (acc, wanted) in [(&mut today, wants[0]), (&mut week, wants[1])] {
+                    match &row {
+                        Some((v, t)) if wanted => fold_upgrade_row(acc, v, *t),
+                        None if wanted => bump(&mut acc.bad),
+                        _ => {}
+                    }
                 }
             }
-        }
-        for (acc, wanted) in [(&mut today, wants[0]), (&mut week, wants[1])] {
-            // The upgrade ledger is every session's: its cut is the window's.
-            if wanted && window_cut(lines.len(), DISK_LEDGER_KEEP_ROWS, oldest, acc.since_ms) {
-                acc.cut = true;
+            for (acc, wanted) in [(&mut today, wants[0]), (&mut week, wants[1])] {
+                // The upgrade ledger is every session's: its cut is the window's.
+                if wanted && window_cut(lines.len(), DISK_LEDGER_KEEP_ROWS, oldest, acc.since_ms) {
+                    acc.cut = true;
+                }
             }
         }
     }

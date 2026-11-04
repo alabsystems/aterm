@@ -7,6 +7,8 @@
 //! importer and every Mac's pool then read one sheet one way: Kimi Code's bare `1` held, Codex
 //! and Grok Build's flow words, a disqualifying note pausing the vendor it names (or every
 //! vendor when it names none) and, as Claude Code's pool reads it, Claude Code whatever it names.
+//! The generated exports (`aterm db alab export`, §9) are rendered here the same way, by the
+//! harness's own writers (`alab_exports`), so an older Mac reads them with the parser it runs.
 
 use aterm_agent::harness::{
     accounts::{Cli, Vendor},
@@ -58,6 +60,26 @@ impl Vendors for Harness {
     /// This Mac, read as a registration pass reads it.
     fn this_mac(&self) -> Option<aterm_db::alab::register::ThisMac> {
         crate::alab_register::this_mac()
+    }
+
+    fn export_names(&self) -> Vec<String> {
+        aterm_agent::harness::alab_exports::names()
+    }
+
+    /// The generated exports, rendered by the harness from the registry and the journal's place
+    /// rows (`alab_exports::render`); no mailbox login is read for them.
+    fn exports(
+        &self,
+        view: &aterm_db::alab::view::LabView,
+        places: &aterm_db::alab::journal::place::Places,
+        current: &std::collections::BTreeMap<String, String>,
+    ) -> Result<Vec<(String, String)>, String> {
+        let mut lab = crate::alab_view::harness_lab(view, false, &Default::default());
+        lab.places = crate::alab_view::placements(view, places);
+        Ok(aterm_agent::harness::alab_exports::render(&lab, current)?
+            .into_iter()
+            .map(|export| (export.name, export.body))
+            .collect())
     }
 
     /// A fleet file through the harness's own parser (the file's name says whose it is, as

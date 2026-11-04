@@ -54,7 +54,7 @@ pub(super) fn add(desk: &Desk, label: &str, email: Option<&str>) -> (ExitCode, S
     let code = run_accounts(
         &AccountsCmd::Add {
             label: label.to_owned(),
-            class: Class::Dedicated,
+            class: Class::Preferred,
             email: email.map(str::to_owned),
             identity_email: None,
             browser: None,

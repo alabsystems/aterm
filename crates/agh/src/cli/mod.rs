@@ -68,7 +68,7 @@ use out::OutputOpts;
 use verbs::{Noun, Verb};
 
 /// `aterm agh`, argv0 `agh` and the dev shim: the arguments after the program's name.
-#[must_use]
+#[must_use = "handle or propagate the command's exit status"]
 pub fn main_entry(args: Vec<std::ffi::OsString>) -> std::process::ExitCode {
     aterm_uds::secret::no_core_dumps();
     let mut ctx = Ctx::production();

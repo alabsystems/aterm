@@ -73,15 +73,34 @@ fn adopted(mut session: crate::Session, local: u64) -> crate::Session {
     session
 }
 
+/// The receipt the landing of `session`'s tab wrote beside `mark`, read back as an adopting
+/// launch reads it.
 fn receipt_for(
     mark: &std::path::Path,
     session: &crate::Session,
+) -> crate::clt_install::receipt::Receipt {
+    crate::clt_install::receipt::Receipt::adopt(
+        mark,
+        session.ctx.self_id.as_str(),
+        session.pid,
+        session.shell_identity.birth,
+    )
+    .expect("the landing's receipt")
+}
+
+/// A receipt for `session`'s child beside `mark`, its landing claim having added `claimed`'s
+/// line (none: no line), not yet written.
+fn new_receipt(
+    mark: &std::path::Path,
+    session: &crate::Session,
+    claimed: Option<&str>,
 ) -> crate::clt_install::receipt::Receipt {
     crate::clt_install::receipt::Receipt::for_child(
         mark,
         session.ctx.self_id.as_str(),
         session.pid,
         session.shell_identity.birth,
+        claimed,
     )
     .unwrap()
 }
@@ -97,6 +116,11 @@ fn clt_recovery_a_live_adopted_installer_keeps_custody_without_retyping_its_comm
     let (session, read) = landed_child(&mark);
     let receipt = receipt_for(&mark, &session);
     assert!(receipt.matches());
+    assert_eq!(
+        receipt.claimed(),
+        Some(aterm_types::version::build_id().as_str()),
+        "the automatic landing's claim added this build's line"
+    );
     let original_sid = session.ctx.self_id.clone();
     let original_identity = session.shell_identity;
     let (mut recovered, wid) = recovered_page(&mark);
@@ -180,6 +204,244 @@ fn clt_recovery_an_adopted_live_installer_puts_the_shim_back_on_new_shells() {
         shim.is_dir(),
         "the directory stays for the shells that have it"
     );
+}
+
+/// An earlier build's tab, as an update hands it over: the record names that build (and this
+/// one too where `this_build_asked`, as a decline under this build or its follow-up's ask left
+/// it), and the tab's receipt says its landing added the earlier build's line.
+fn earlier_builds_tab(
+    mark: &std::path::Path,
+    earlier: &str,
+    this_build_asked: bool,
+) -> (crate::Session, std::fs::File) {
+    let (session, read) = landed_child(mark);
+    std::fs::write(mark, format!("opened {earlier}\n")).unwrap();
+    if this_build_asked {
+        this_builds_mark(mark);
+    }
+    std::fs::remove_file(receipt_for(mark, &session).path()).unwrap();
+    new_receipt(mark, &session, Some(earlier))
+        .write_exclusive()
+        .unwrap();
+    (session, read)
+}
+
+/// A live install an earlier build's tab carries on with across an update is the adopting build's
+/// ask: adoption notes that build in the account's record, so a person's stop under it keeps the
+/// opening spent (its next launch opens no tab by itself), while a failure takes it back. Where
+/// the record named the adopting build already (a decline under it), the adoption's claim added
+/// no line, and the tab's receipt claims only the earlier build's: a failure keeps the line.
+/// NEGATIVE CONTROL: the failure leaves the record naming the earlier build alone, as before the
+/// adoption; the earlier build's own line stays either way. The mutant that reads any build the
+/// receipt claims as this one's (`receipt.claimed().is_some()` in place of `== Some(build_id)`)
+/// takes back the line the decline kept.
+#[test]
+fn clt_recovery_an_install_adopted_across_an_update_is_the_adopting_builds_ask() {
+    use aterm_pty::ChildExit;
+    if !crate::test_alone::alone() {
+        return;
+    }
+    let earlier = "0.1.0+gdeadbeef";
+    let stopped = i32::from(aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_STOPPED);
+    for (this_build_asked, end, kept) in [
+        (false, ChildExit::Code(stopped), true),
+        (false, ChildExit::Code(1), false),
+        (true, ChildExit::Code(1), true),
+    ] {
+        let case = format!("this build asked: {this_build_asked}, {end:?}");
+        let directory = aterm_tempfile::tempdir().unwrap();
+        let mark = directory.path().join("command-line-tools-tab");
+        let (session, _read) = earlier_builds_tab(&mark, earlier, this_build_asked);
+        let (mut recovered, _) = page();
+        recovered.workstation_setup.developer_tools_mark = Mark::at(mark.clone());
+        recovered.access_steps.set_reach(dialog_reach());
+        assert_eq!(
+            recovered.workstation_setup.developer_tools_mark.opened(),
+            this_build_asked,
+            "{case}"
+        );
+        let local = recovered.next_session_id + 30;
+        let session = adopted(session, local);
+        App::register_session(&recovered.store, &session, None);
+        recovered.pool_insert(session);
+        assert!(recovered.developer_tools_install_active(), "{case}");
+        assert!(
+            Mark::at(mark.clone()).opened(),
+            "{case}: the adopting build is claimed"
+        );
+        recovered.developer_tools_install_ended(local, Some(end));
+        assert_eq!(Mark::at(mark.clone()).opened(), kept, "{case}");
+        assert!(
+            aterm_types::clt_mark::opened_on_build(&aterm_types::clt_mark::Live, &mark, earlier),
+            "{case}: the earlier build's line stays"
+        );
+        assert!(recovered.exit_session_logical(local).is_empty());
+        assert!(!recovered.developer_tools_install_active(), "{case}");
+        assert!(!macos_dialog_up(), "{case}");
+    }
+}
+
+/// A tab an earlier build opened, adopted across an update, and adopted again by a launch of the
+/// adopting build once the window that adopted it went (a crash the PTY keeper outlived), is
+/// still that build's ask by the first adoption's claim: the claim rewrote the tab's receipt to
+/// say so, so a failure (exit 1) under the second adoption takes the line back and the next launch
+/// asks by itself again, while a person's stop keeps it.
+/// NEGATIVE CONTROL: the stop keeps the line. The mutant whose adoption leaves the receipt as the
+/// earlier build wrote it (no `Receipt::claim` call in `recover_developer_tools_install`) fails
+/// the receipt's look after the first adoption, and without that look keeps the line on exit 1.
+#[test]
+fn clt_recovery_an_update_adopted_tab_adopted_again_after_a_crash_takes_back_its_line() {
+    use aterm_pty::ChildExit;
+    if !crate::test_alone::alone() {
+        return;
+    }
+    let earlier = "0.1.0+gdeadbeef";
+    let build = aterm_types::version::build_id();
+    let stopped = i32::from(aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_STOPPED);
+    for (end, kept) in [
+        (ChildExit::Code(1), false),
+        (ChildExit::Code(stopped), true),
+    ] {
+        let directory = aterm_tempfile::tempdir().unwrap();
+        let mark = directory.path().join("command-line-tools-tab");
+        let (session, _read) = earlier_builds_tab(&mark, earlier, false);
+
+        // The update: this build adopts the earlier build's tab and claims its own line.
+        let (mut first, _) = page();
+        first.workstation_setup.developer_tools_mark = Mark::at(mark.clone());
+        first.access_steps.set_reach(dialog_reach());
+        assert!(!first.workstation_setup.developer_tools_mark.opened());
+        let local = first.next_session_id + 30;
+        let session = adopted(session, local);
+        App::register_session(&first.store, &session, None);
+        first.pool_insert(session);
+        assert!(first.developer_tools_install_active(), "{end:?}");
+        assert!(
+            Mark::at(mark.clone()).opened(),
+            "{end:?}: the line is added"
+        );
+        assert_eq!(
+            receipt_for(&mark, first.pool.get(local).unwrap()).claimed(),
+            Some(build.as_str()),
+            "{end:?}: the receipt says the adoption's claim"
+        );
+
+        // The crash: that window goes, while the keeper keeps the child.
+        let session = first.pool.sessions.remove(&local).unwrap().session;
+        drop(first);
+        assert!(!macos_dialog_up(), "{end:?}");
+
+        // A launch of the same build adopts it again.
+        let (mut second, _) = recovered_page(&mark);
+        let local = second.next_session_id + 30;
+        let session = adopted(session, local);
+        App::register_session(&second.store, &session, None);
+        second.pool_insert(session);
+        assert!(second.developer_tools_install_active(), "{end:?}");
+        second.developer_tools_install_ended(local, Some(end));
+        assert_eq!(Mark::at(mark.clone()).opened(), kept, "{end:?}");
+        assert!(
+            aterm_types::clt_mark::opened_on_build(&aterm_types::clt_mark::Live, &mark, earlier),
+            "{end:?}: the earlier build's line stays"
+        );
+        assert!(second.exit_session_logical(local).is_empty());
+        assert!(!second.developer_tools_install_active(), "{end:?}");
+        assert!(!macos_dialog_up(), "{end:?}");
+    }
+}
+
+/// A live tab an earlier aterm opened whose recovery record this launch cannot read (none, an
+/// earlier format, another folder) gives no custody here, but it still runs the Command Line
+/// Tools tab's program under aterm's pinned title, its `sudo` perhaps asking now with nothing a
+/// probe could see: the automatic tab waits for it, at its due check and at its landing, and
+/// opens once that tab's program has ended.
+/// NEGATIVE CONTROL: an adopted live tab under another title, or none, holds nothing. The mutant
+/// whose due check skips `developer_tools_tab_adopted` reads the automatic tab due beside it,
+/// and the one whose landing check skips it lands the tab beside it.
+#[test]
+fn clt_recovery_an_earlier_aterms_tab_with_no_custody_here_holds_the_automatic_tab() {
+    for title in [Some(TAB_TITLE), Some("zsh"), None] {
+        let (mut app, wid) = page();
+        let local = app.next_session_id + 30;
+        let (mut session, _read) = registered_piped_session(local);
+        session.handoff_local_id = Some(3);
+        if let Some(title) = title {
+            let _ = session
+                .ctx
+                .meta
+                .lock()
+                .unwrap()
+                .set("title", Some(title.to_owned()));
+        }
+        App::register_session(&app.store, &session, None);
+        app.pool_insert(session);
+        assert!(
+            !app.developer_tools_install_active(),
+            "{title:?}: no custody"
+        );
+        if title != Some(TAB_TITLE) {
+            assert_retry_lands_once(&mut app, wid, 4);
+            continue;
+        }
+        assert!(
+            !app.developer_tools_install_due(false),
+            "it holds the due check"
+        );
+        let id = book(&mut app, wid, 4);
+        assert_deferred(&mut app, wid, id, Install::Wanted(4));
+        app.pool
+            .get(local)
+            .unwrap()
+            .child_exit
+            .set(aterm_pty::ChildExit::Code(1))
+            .unwrap();
+        assert_retry_lands_once(&mut app, wid, 4);
+    }
+}
+
+/// A live install a tab of this same build carries on with once the window that opened it went
+/// (a crash the PTY keeper outlived) is still that tab's ask: its receipt says its landing's claim
+/// added this build's line, so a failure (exit 1) takes the line back and the next launch asks by
+/// itself again, as the window that opened it would have; a person's stop keeps it.
+/// NEGATIVE CONTROL: a tab whose own claim added no line (a person's Install… pressed after this
+/// build asked already) keeps the line when it fails, adopted as before.
+#[test]
+fn clt_recovery_a_same_build_adoption_takes_back_only_the_line_its_own_landing_added() {
+    use aterm_pty::ChildExit;
+    if !crate::test_alone::alone() {
+        return;
+    }
+    let stopped = i32::from(aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_STOPPED);
+    for (asked_before, end, kept) in [
+        (false, ChildExit::Code(1), false),
+        (false, ChildExit::Code(stopped), true),
+        (true, ChildExit::Code(1), true),
+    ] {
+        let case = format!("asked before: {asked_before}, {end:?}");
+        let directory = aterm_tempfile::tempdir().unwrap();
+        let mark = directory.path().join("command-line-tools-tab");
+        if asked_before {
+            this_builds_mark(&mark);
+        }
+        // The automatic tab where this build had not asked, else a person's press.
+        let (session, _read) = landed_child(&mark);
+        assert_eq!(
+            receipt_for(&mark, &session).claimed().is_some(),
+            !asked_before,
+            "{case}"
+        );
+        let (mut recovered, _) = recovered_page(&mark);
+        let local = recovered.next_session_id + 30;
+        let session = adopted(session, local);
+        App::register_session(&recovered.store, &session, None);
+        recovered.pool_insert(session);
+        assert!(recovered.developer_tools_install_active(), "{case}");
+        recovered.developer_tools_install_ended(local, Some(end));
+        assert_eq!(Mark::at(mark.clone()).opened(), kept, "{case}");
+        assert!(recovered.exit_session_logical(local).is_empty());
+        assert!(!recovered.developer_tools_install_active(), "{case}");
+        assert!(!macos_dialog_up(), "{case}");
+    }
 }
 
 #[test]
@@ -339,7 +601,7 @@ fn clt_recovery_receipt_before_command_bytes_restores_custody_without_starting_t
     child.pid = CHILD_PID;
     child.shell_identity =
         aterm_pty::ShellIdentity::from_parts(CHILD_PID, Some(CHILD_BIRTH), false);
-    let receipt = receipt_for(&mark, &child);
+    let receipt = new_receipt(&mark, &child, None);
     receipt.write_exclusive().unwrap();
     assert!(
         drain(&read).is_empty(),
@@ -381,7 +643,7 @@ fn clt_recovery_a_receipt_collision_refuses_dispatch_and_keeps_the_existing_reco
     child.pid = CHILD_PID;
     child.shell_identity =
         aterm_pty::ShellIdentity::from_parts(CHILD_PID, Some(CHILD_BIRTH), false);
-    let receipt = receipt_for(&mark, &child);
+    let receipt = new_receipt(&mark, &child, None);
     receipt.write_exclusive().unwrap();
 
     assert!(source.install_spawned_tab(TabSpawned {
@@ -403,10 +665,18 @@ fn clt_recovery_a_receipt_collision_refuses_dispatch_and_keeps_the_existing_reco
         shown.concat().contains(&not_started_line()),
         "the result tab says why, in plain words: {shown:?}"
     );
+    assert!(
+        !source.workstation_setup.developer_tools_mark.opened() && !Mark::at(mark.clone()).opened(),
+        "an install that never started takes its opening back: the next launch asks again"
+    );
     assert!(source.developer_tools_install_active());
     assert!(macos_dialog_up());
     assert!(receipt.matches());
     assert!(source.exit_session_logical(id).is_empty());
+    assert!(
+        !Mark::at(mark.clone()).opened(),
+        "its end keeps it taken back"
+    );
     assert!(!source.developer_tools_install_active());
     assert!(!macos_dialog_up());
     assert!(

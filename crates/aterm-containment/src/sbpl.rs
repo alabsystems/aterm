@@ -516,6 +516,43 @@ fn push_sbpl_escaped_str(out: &mut String, text: &str) {
     }
 }
 
+/// Build the fail-closed `sandbox-exec -p <sbpl> <prog> <orig_argv[1..]…>` target and argv.
+#[cfg(unix)]
+pub fn build_sandbox_wrap(
+    wrapper_path: &str,
+    sbpl: &str,
+    prog: &std::ffi::CString,
+    orig_argv: &[std::ffi::CString],
+) -> std::io::Result<(std::ffi::CString, Vec<std::ffi::CString>)> {
+    let exec_bin = std::ffi::CString::new(wrapper_path.as_bytes())
+        .map_err(|_| std::io::Error::other("sandbox-exec path not representable"))?;
+    // SAFETY: `exec_bin` is a valid NUL-terminated absolute path.
+    let present = unsafe { libc::access(exec_bin.as_ptr(), libc::X_OK) } == 0;
+    if !present {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "OS sandbox demanded but {wrapper_path} is missing/not executable — refusing \
+                 to spawn an unsandboxed shell (fail-closed, ATERM_DESIGN §5.6)"
+            ),
+        ));
+    }
+    let sbpl_c = std::ffi::CString::new(sbpl.as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "SBPL profile has interior NUL",
+        )
+    })?;
+    let mut argv_out: Vec<std::ffi::CString> =
+        Vec::with_capacity(orig_argv.len().saturating_add(3).min(4096));
+    argv_out.push(std::ffi::CString::new("sandbox-exec").unwrap_or_else(|_| exec_bin.clone()));
+    argv_out.push(std::ffi::CString::from(c"-p"));
+    argv_out.push(sbpl_c);
+    argv_out.push(prog.clone());
+    argv_out.extend(orig_argv.iter().skip(1).cloned());
+    Ok((exec_bin, argv_out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

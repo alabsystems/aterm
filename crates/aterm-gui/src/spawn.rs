@@ -11,7 +11,7 @@ use std::time::Instant;
 use aterm_core::terminal::{ClipboardAccess, ClipboardOperation, Terminal};
 use aterm_session::sink::SinkWriter;
 use aterm_session::{EdgeTable, EdgeToken, LaunchNonce, Op, SessionId};
-use aterm_window::event_loop::EventLoopProxy;
+use aterm_window::event_loop::{ActiveEventLoop, EventLoopProxy};
 
 use crate::{
     Session, SessionCtx, Wake, WindowId, control, control_auth, notify, proxy, session_store,
@@ -1013,6 +1013,19 @@ pub(crate) struct ChildProvision {
 
 /// The child's view of who spawned it.
 pub(crate) fn provision_child_identity_env(parent_sid: &SessionId) -> Vec<(String, String)> {
+    provision_child_identity_env_with(
+        parent_sid,
+        std::env::var("TMUX").ok().as_deref(),
+        std::env::var("STY").ok().as_deref(),
+    )
+}
+
+/// Pure assembly of [`provision_child_identity_env`] for explicit `$TMUX` and `$STY` inputs.
+pub(crate) fn provision_child_identity_env_with(
+    parent_sid: &SessionId,
+    tmux: Option<&str>,
+    sty: Option<&str>,
+) -> Vec<(String, String)> {
     use aterm_types::domain::ENV_PARENT_SESSION_ID;
     vec![
         (
@@ -1021,14 +1034,9 @@ pub(crate) fn provision_child_identity_env(parent_sid: &SessionId) -> Vec<(Strin
         ),
         (
             aterm_types::domain::ENV_MUX_BASE.to_string(),
-            mux_env_signature_now(),
+            format!("{}|{}", tmux.unwrap_or(""), sty.unwrap_or("")),
         ),
     ]
-}
-
-fn mux_env_signature_now() -> String {
-    let get = |k: &str| std::env::var(k).unwrap_or_default();
-    format!("{}|{}", get("TMUX"), get("STY"))
 }
 
 /// The controller-spawn observation hint.
@@ -3410,7 +3418,10 @@ mod colorfgbg_env_tests {
 
 #[cfg(test)]
 mod child_identity_env_tests {
-    use super::{provision_child_identity_env, provision_child_recursion_env};
+    use super::{
+        provision_child_identity_env, provision_child_identity_env_with,
+        provision_child_recursion_env,
+    };
     use aterm_session::SessionId;
     use aterm_types::domain::{ENV_LAUNCH_NONCE, ENV_PARENT_SESSION_ID, ENV_SESSION_ID};
 
@@ -3418,31 +3429,42 @@ mod child_identity_env_tests {
         env.iter().map(|(k, _)| k.as_str()).collect()
     }
 
+    /// NEGATIVE CONTROL: absent `$TMUX` and `$STY` still emit the `"|"` delimiter rather than omitting `ENV_MUX_BASE`.
     #[test]
     fn identity_env_carries_the_parent_id_and_the_multiplexer_baseline() {
         let parent = SessionId::generate();
-        let env = provision_child_identity_env(&parent);
-        assert_eq!(
-            keys(&env),
-            vec![ENV_PARENT_SESSION_ID, aterm_types::domain::ENV_MUX_BASE],
-            "identity is WHO spawned it plus WHAT it was born into — both pure \
-             facts, neither a capability"
-        );
-        assert_eq!(env[0].1, parent.as_str());
-        let base = &env[1].1;
-        assert!(
-            base.contains('|'),
-            "the baseline keeps both halves, got {base:?}"
-        );
-        assert_eq!(
-            *base,
-            format!(
-                "{}|{}",
-                std::env::var("TMUX").unwrap_or_default(),
-                std::env::var("STY").unwrap_or_default()
+        for (tmux, sty, want_base) in [
+            (None, None, "|"),
+            (
+                Some("/tmp/tmux-501/default,123,0"),
+                None,
+                "/tmp/tmux-501/default,123,0|",
             ),
-            "the stamp is THIS process's signature at the moment of the spawn"
+            (None, Some("456.pts-0.host"), "|456.pts-0.host"),
+            (
+                Some("/tmp/tmux-501/default,123,0"),
+                Some("456.pts-0.host"),
+                "/tmp/tmux-501/default,123,0|456.pts-0.host",
+            ),
+        ] {
+            let env = provision_child_identity_env_with(&parent, tmux, sty);
+            assert_eq!(
+                keys(&env),
+                vec![ENV_PARENT_SESSION_ID, aterm_types::domain::ENV_MUX_BASE],
+                "identity is WHO spawned it plus WHAT it was born into — both pure \
+                 facts, neither a capability"
+            );
+            assert_eq!(env[0].1, parent.as_str());
+            assert_eq!(env[1].1, want_base);
+        }
+
+        let live = provision_child_identity_env(&parent);
+        assert_eq!(
+            keys(&live),
+            vec![ENV_PARENT_SESSION_ID, aterm_types::domain::ENV_MUX_BASE]
         );
+        assert_eq!(live[0].1, parent.as_str());
+        assert!(live[1].1.contains('|'), "got {:?}", live[1].1);
     }
 
     #[test]
@@ -3839,6 +3861,107 @@ fn attach_reader_inner(
     Ok(())
 }
 
+/// A session's PTY reader thread, and the end it signals as its last act.
+///
+/// `park_reader` sleeps on that end, which the reader's return wakes, instead of polling the
+/// thread: a poll that yields is a `sched_yield`, and on macOS a thread that yields while another
+/// is runnable on its core sinks to the lowest priority for a whole scheduler quantum (10 ms), so
+/// on a busy machine a park that polled its readers one at a time took 10 ms a reader, however
+/// promptly each one stopped.
+pub(crate) struct ReaderJoin {
+    thread: std::thread::JoinHandle<()>,
+    /// Never sent on: disconnected once the reader's body has returned (or unwound) and dropped
+    /// everything it held.
+    #[cfg(any(unix, test))]
+    ended: std::sync::mpsc::Receiver<std::convert::Infallible>,
+    /// How many times a waiter looked at the reader (`ended_by`, `is_finished`).
+    #[cfg(test)]
+    looks: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ReaderJoin {
+    /// Run `body` as a reader on a lane thread named `name`.
+    pub(crate) fn spawn(
+        name: String,
+        role: crate::qos::Role,
+        body: impl FnOnce() + Send + 'static,
+    ) -> std::io::Result<Self> {
+        #[cfg(any(unix, test))]
+        let (end, ended) = std::sync::mpsc::sync_channel::<std::convert::Infallible>(0);
+        let thread = crate::qos::spawn_lane_thread(name, role, move || {
+            // `body` drops what it captured as its call returns, so the end follows all of it.
+            body();
+            #[cfg(any(unix, test))]
+            drop(end);
+        })?;
+        Ok(Self {
+            thread,
+            #[cfg(any(unix, test))]
+            ended,
+            #[cfg(test)]
+            looks: Arc::default(),
+        })
+    }
+
+    /// Whether the reader's thread has finished.
+    #[must_use]
+    pub(crate) fn is_finished(&self) -> bool {
+        let finished = self.thread.is_finished();
+        #[cfg(test)]
+        self.looks.fetch_add(1, Ordering::AcqRel);
+        finished
+    }
+
+    /// Wait for the reader's thread to finish: `Err` when the reader panicked.
+    pub(crate) fn join(self) -> std::thread::Result<()> {
+        self.thread.join()
+    }
+
+    /// Sleep until the reader has ended or `deadline` passes: whether it ended.
+    #[cfg(any(unix, test))]
+    fn ended_by(&self, deadline: Instant) -> bool {
+        #[cfg(test)]
+        self.looks.fetch_add(1, Ordering::AcqRel);
+        match self
+            .ended
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        {
+            Ok(never) => match never {},
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => true,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
+        }
+    }
+
+    /// A reader running `body`, handed the count of the looks a waiter has taken at it.
+    #[cfg(test)]
+    pub(crate) fn watched_for_test(
+        body: impl FnOnce(&std::sync::atomic::AtomicUsize) + Send + 'static,
+    ) -> (Self, Arc<std::sync::atomic::AtomicUsize>) {
+        let looks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&looks);
+        let mut reader = Self::spawn(
+            "aterm-test-reader".to_string(),
+            crate::qos::Role::Responsive,
+            move || body(&seen),
+        )
+        .expect("spawn a test reader");
+        reader.looks = Arc::clone(&looks);
+        (reader, looks)
+    }
+
+    /// A reader running `body`.
+    #[cfg(test)]
+    pub(crate) fn for_test(body: impl FnOnce() + Send + 'static) -> Self {
+        Self::watched_for_test(move |_| body()).0
+    }
+
+    /// The count of the looks a waiter has taken at this reader.
+    #[cfg(all(test, unix))]
+    pub(crate) fn looks_for_test(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        Arc::clone(&self.looks)
+    }
+}
+
 /// True when a parked or deferred session can be reattached without blocking the caller on its
 /// old PTY reader or on the writer still writing what that reader queued.
 #[must_use]
@@ -3846,7 +3969,7 @@ pub(crate) fn reader_attach_ready(session: &Session) -> bool {
     session
         .reader_join
         .as_ref()
-        .is_none_or(std::thread::JoinHandle::is_finished)
+        .is_none_or(ReaderJoin::is_finished)
         && session
             .temporal_drain
             .as_ref()
@@ -3906,7 +4029,7 @@ pub(crate) fn park_reader(session: &mut Session, deadline: Instant) -> bool {
         .as_ref()
         .map(crate::temporal::TemporalDrain::waiting);
     session.temporal_tx = None;
-    let Some(join) = session.reader_join.take() else {
+    let Some(reader) = session.reader_join.take() else {
         return true;
     };
     session.ctx.update_parked.park();
@@ -3917,26 +4040,20 @@ pub(crate) fn park_reader(session: &mut Session, deadline: Instant) -> bool {
     session
         .reader_stop
         .store(true, std::sync::atomic::Ordering::Release);
-    while !join.is_finished() {
-        if Instant::now() >= deadline {
-            session.reader_join = Some(join);
-            return false;
-        }
-        crate::watchdog::beat(crate::watchdog::Breadcrumb::UpdateHandoff);
-        std::thread::yield_now();
+    crate::watchdog::beat(crate::watchdog::Breadcrumb::UpdateHandoff);
+    if !reader.ended_by(deadline) {
+        session.reader_join = Some(reader);
+        return false;
     }
-    if join.join().is_err() {
+    if reader.join().is_err() {
         return false;
     }
     if let Some(drain) = session.temporal_drain.take() {
         drain.request_urgency();
-        while !drain.is_finished() {
-            if Instant::now() >= deadline {
-                session.temporal_drain = Some(drain);
-                return false;
-            }
-            crate::watchdog::beat(crate::watchdog::Breadcrumb::UpdateHandoff);
-            std::thread::yield_now();
+        crate::watchdog::beat(crate::watchdog::Breadcrumb::UpdateHandoff);
+        if !drain.written_by(deadline) {
+            session.temporal_drain = Some(drain);
+            return false;
         }
     }
     true
@@ -3961,6 +4078,10 @@ mod act_barrier_reader_tests;
 #[cfg(all(test, unix))]
 #[path = "holder_image_reader_tests.rs"]
 mod holder_image_reader_tests;
+
+#[cfg(all(test, unix))]
+#[path = "spawn_adopted_rows_tests.rs"]
+mod spawn_adopted_rows_tests;
 
 #[cfg(all(test, unix))]
 mod spare_promotion_tests {
@@ -4553,7 +4674,7 @@ mod park_reader_tests {
     #[test]
     fn panicked_reader_fails_closed_instead_of_authorizing_handoff() {
         let mut session = crate::stub_session(77);
-        session.reader_join = Some(std::thread::spawn(|| {
+        session.reader_join = Some(super::ReaderJoin::for_test(|| {
             panic!("injected PTY reader failure");
         }));
         let waits = crate::session_watch::Subscription::single(&session.ctx.watchers);
@@ -4626,7 +4747,7 @@ mod park_reader_tests {
     fn a_park_past_its_deadline_keeps_the_unfinished_handle() {
         let mut session = crate::stub_session(79);
         let (finish_reader, reader_held) = std::sync::mpsc::channel::<()>();
-        session.reader_join = Some(std::thread::spawn(move || {
+        session.reader_join = Some(super::ReaderJoin::for_test(move || {
             let _ = reader_held.recv();
         }));
         assert!(!park_reader(&mut session, std::time::Instant::now()));
@@ -4641,7 +4762,7 @@ mod park_reader_tests {
         assert!(session.reader_join.is_none());
         assert!(super::reader_attach_ready(&session));
 
-        let reader = std::thread::spawn(|| {});
+        let reader = super::ReaderJoin::for_test(|| {});
         let stopped = aterm_spec::wait::within(
             aterm_spec::wait::MUST_HAPPEN,
             std::time::Duration::ZERO,
@@ -4676,7 +4797,7 @@ mod park_reader_tests {
     #[test]
     fn an_abandoned_writer_can_finish_parking_without_claiming_capture() {
         let mut session = crate::stub_session(80);
-        let reader = std::thread::spawn(|| {});
+        let reader = super::ReaderJoin::for_test(|| {});
         assert!(
             aterm_spec::wait::within(
                 aterm_spec::wait::MUST_HAPPEN,
@@ -4696,6 +4817,182 @@ mod park_reader_tests {
         assert!(!observed_drain.capture_complete_for_test());
         assert_eq!(observed_drain.demands_for_test(), [0, 0, 0]);
         assert!(park_reader(&mut session, std::time::Instant::now()));
+    }
+
+    /// The park sleeps on the reader's end, which the reader's return wakes: it looks at the
+    /// reader once, however long the reader takes to stop.
+    #[test]
+    fn a_park_sleeps_until_its_reader_ends_and_never_polls_it() {
+        let mut session = crate::stub_session(83);
+        let (reader, looks) = super::ReaderJoin::watched_for_test(|looks| {
+            // This reader stops only once the park has looked at it, so a park that polls the
+            // thread finds it still running and looks again.
+            let looked = aterm_spec::wait::within(
+                aterm_spec::wait::MUST_HAPPEN,
+                std::time::Duration::ZERO,
+                || (looks.load(std::sync::atomic::Ordering::Acquire) > 0).then_some(()),
+            );
+            assert!(looked.is_some(), "timed out waiting for the park to look");
+        });
+        session.reader_join = Some(reader);
+
+        assert!(park_reader(
+            &mut session,
+            std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+        ));
+        assert!(session.reader_join.is_none(), "the ended reader is joined");
+        assert_eq!(
+            looks.load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "the park looked at its reader once, and the reader's end woke it"
+        );
+    }
+
+    /// A reader ends only once its body has returned: the park joins a reader it saw end
+    /// without a deadline, so one still in its body is not ended, and the park keeps its handle.
+    #[test]
+    fn a_reader_still_in_its_body_has_not_ended() {
+        let mut session = crate::stub_session(84);
+        let (entered_tx, entered) = std::sync::mpsc::channel::<()>();
+        let (finish_reader, reader_held) = std::sync::mpsc::channel::<()>();
+        let reader = super::ReaderJoin::for_test(move || {
+            entered_tx.send(()).expect("the test waits");
+            let _ = reader_held.recv();
+        });
+        entered
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("the reader runs its body");
+        assert!(
+            !reader.ended_by(std::time::Instant::now()),
+            "a reader in its body has not ended"
+        );
+        session.reader_join = Some(reader);
+        assert!(!park_reader(&mut session, std::time::Instant::now()));
+        assert!(session.reader_join.is_some(), "the running reader is kept");
+        drop(finish_reader);
+        assert!(park_reader(
+            &mut session,
+            std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+        ));
+        assert!(session.reader_join.is_none(), "the ended reader is joined");
+    }
+
+    /// A park past its deadline still lets go of what has finished: a reader that has ended and
+    /// a recording queue that is written.
+    #[test]
+    fn a_late_park_lets_go_of_an_ended_reader_and_a_written_queue() {
+        let mut session = crate::stub_session(85);
+        let reader = super::ReaderJoin::for_test(|| {});
+        let ended = aterm_spec::wait::within(
+            aterm_spec::wait::MUST_HAPPEN,
+            std::time::Duration::ZERO,
+            || reader.is_finished().then_some(()),
+        );
+        assert!(ended.is_some(), "timed out waiting for the reader to end");
+        session.reader_join = Some(reader);
+        let (drain, finish_writer) = crate::temporal::TemporalDrain::held_for_test();
+        drop(finish_writer);
+        session.temporal_drain = Some(drain);
+        assert!(
+            park_reader(&mut session, std::time::Instant::now()),
+            "nothing unfinished is left to wait for"
+        );
+        assert!(session.reader_join.is_none(), "the ended reader is joined");
+        assert!(
+            session.temporal_drain.is_none(),
+            "the written queue's drain is let go"
+        );
+    }
+
+    /// A park waiting out what its reader's recording queued sleeps until the writer's last
+    /// write wakes it.
+    #[test]
+    fn a_park_waiting_out_a_recording_is_woken_by_its_last_write() {
+        let mut session = crate::stub_session(82);
+        session.reader_join = Some(super::ReaderJoin::for_test(|| {}));
+        let (drain, finish_writer) = crate::temporal::TemporalDrain::held_for_test();
+        let observed_drain = drain.clone();
+        session.temporal_drain = Some(drain);
+        let writer = std::thread::spawn(move || {
+            // The writer finishes only once the park sleeps on its queue: a park that polls the
+            // queue never sleeps, and one that sleeps is woken only by the write's ring, or else
+            // by its deadline.
+            let slept = aterm_spec::wait::within(
+                aterm_spec::wait::MUST_HAPPEN,
+                std::time::Duration::ZERO,
+                || (finish_writer.sleeps() > 0).then_some(()),
+            );
+            drop(finish_writer);
+            slept.is_some()
+        });
+
+        let parked = park_reader(
+            &mut session,
+            std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+        );
+        assert!(
+            writer.join().expect("the writer"),
+            "timed out waiting for the park to sleep on the queue"
+        );
+        assert!(parked, "the park waited out the queue");
+        assert_eq!(
+            observed_drain.slept_out_for_test(),
+            0,
+            "the writer's last write woke the park, not its deadline"
+        );
+        assert!(
+            session.temporal_drain.is_none(),
+            "the written queue's drain is let go"
+        );
+    }
+
+    /// An idle reader sits in its poll of the master: the park's wake ends it, and its end wakes
+    /// the park.
+    #[cfg(unix)]
+    #[test]
+    fn an_idle_reader_is_woken_by_the_park_and_its_end_wakes_the_park() {
+        let app = crate::App::headless_for_test();
+        let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
+        let mut session = crate::stub_session(81);
+        session.master = master;
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let post = std::sync::Arc::new(move |wake: crate::Wake| {
+            if matches!(wake, crate::Wake::Ready { .. }) {
+                let _ = ready_tx.send(());
+            }
+            true
+        });
+        super::attach_reader_inner(
+            &mut session,
+            crate::WindowId(0),
+            post,
+            &app.session_factory,
+            None,
+        )
+        .expect("attach the real reader");
+        ready_rx
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("the reader's gather started");
+        let looks = session
+            .reader_join
+            .as_ref()
+            .expect("the attached reader")
+            .looks_for_test();
+
+        let parked = park_reader(
+            &mut session,
+            std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+        );
+        let master = std::mem::replace(&mut session.master, -1);
+        aterm_pty::close_fd(slave);
+        aterm_pty::close_fd(master);
+        assert!(parked, "the woken reader stopped before the deadline");
+        assert!(session.reader_join.is_none(), "the ended reader is joined");
+        assert_eq!(
+            looks.load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "the park slept once, until the reader's end woke it"
+        );
     }
 }
 
@@ -4867,7 +5164,7 @@ mod update_park_catch_up_tests {
             session
                 .reader_join
                 .as_ref()
-                .is_some_and(std::thread::JoinHandle::is_finished)
+                .is_some_and(super::ReaderJoin::is_finished)
         });
         assert!(
             session.ctx.update_parked.is_parked(),
@@ -7321,7 +7618,7 @@ mod card_seen_probe_tests {
     }
 }
 
-fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, String> {
+fn spawn_pty_reader(w: PtyReaderWiring) -> Result<ReaderJoin, String> {
     let PtyReaderWiring {
         master,
         id,
@@ -7458,7 +7755,7 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
     };
     #[cfg(not(unix))]
     let probe_sink = std::sync::Weak::<SinkWriter>::new();
-    let parse = crate::qos::spawn_lane_thread(
+    let parse = ReaderJoin::spawn(
         format!("aterm-pty-reader-{id}"),
         crate::qos::Role::Responsive,
         move || {
@@ -7700,10 +7997,13 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                             .and_then(|a| a.next_cut(off))
                             .filter(|_| {
                                 #[cfg(test)]
-                                if crate::holder_image::hold_hook::no_c_cut(id) {
-                                    return false;
+                                {
+                                    !crate::holder_image::hold_hook::no_c_cut(id)
                                 }
-                                true
+                                #[cfg(not(test))]
+                                {
+                                    true
+                                }
                             })
                             .map_or(limit, |cut| cut.min(limit));
                         let end = off
@@ -8697,6 +8997,18 @@ pub(crate) struct OutputWakePass {
 }
 
 impl OutputWakeWatch {
+    /// [`Self::pass`] at the end of the turn `el` is about to wait after, the one way
+    /// `App::about_to_wait` reaches the watch: whether that turn's drain emptied the user-event
+    /// queue is the loop's own word ([`ActiveEventLoop::user_events_drained`]).
+    pub(crate) fn pass_for_turn<'a>(
+        &mut self,
+        el: &ActiveEventLoop,
+        now_ns: u64,
+        latches: impl IntoIterator<Item = (u64, &'a AtomicU64)>,
+    ) -> OutputWakePass {
+        self.pass(now_ns, el.user_events_drained(), latches)
+    }
+
     /// Judge every session's latch at `now_ns` (this `about_to_wait`'s stamp), heal the ones
     /// proven lost (a CAS from the observed word, so a concurrent handler clear or reader
     /// re-stamp is never clobbered), and book the late ones once. `drained` is whether this
@@ -8704,7 +9016,7 @@ impl OutputWakeWatch {
     /// then has every wake posted before the previous pass been handed out, so that pass
     /// becomes the drained-through instant (a drain that stopped part-way may leave such a wake
     /// queued).
-    pub(crate) fn pass<'a>(
+    fn pass<'a>(
         &mut self,
         now_ns: u64,
         drained: bool,
@@ -8757,6 +9069,33 @@ impl OutputWakeWatch {
         self.late_booked = still_late;
         self.last_pass_ns = now_ns;
         out
+    }
+}
+
+/// One session's [`OutputWakeWatch`], handed each turn as `App::about_to_wait` hands it
+/// ([`OutputWakeWatch::pass_for_turn`]), for `tests/headless_event_loop.rs`: its display-free
+/// loop ends a turn whose drain met a send in progress, which no unit test can build.
+#[cfg(all(target_os = "macos", any(test, debug_assertions)))]
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct OutputWakeWatchProbe {
+    watch: OutputWakeWatch,
+    latch: AtomicU64,
+}
+
+#[cfg(all(target_os = "macos", any(test, debug_assertions)))]
+impl OutputWakeWatchProbe {
+    /// Post the session's output wake at `sent_ns` (`lat_epoch` ns) as its PTY reader posts one,
+    /// and leave it unhandled: whether it was posted (the latch was clear).
+    pub fn post(&self, sent_ns: u64) -> bool {
+        gated_output_wake(&self.latch, sent_ns, 0, false, || true, || sent_ns) == WakeGate::Posted
+    }
+
+    /// End the turn `el` is about to wait after at `now_ns`: whether the watch healed the
+    /// session's wake as lost.
+    pub fn end_turn(&mut self, el: &ActiveEventLoop, now_ns: u64) -> bool {
+        let pass = self.watch.pass_for_turn(el, now_ns, [(0, &self.latch)]);
+        pass.healed > 0
     }
 }
 

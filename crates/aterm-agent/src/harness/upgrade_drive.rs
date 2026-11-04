@@ -2991,19 +2991,46 @@ impl ModelCtx {
 
     fn read(opts: &Opts, targets: &Targets) -> ModelCtx {
         let now = i64::try_from(now_s()).unwrap_or(0);
-        let path = state_dir(opts).join("models.json");
+        let upgrade_dir = if opts.dry_run {
+            match check_upgrade_tree(&opts.state, None) {
+                Ok(dir) => dir,
+                Err(_) => return ModelCtx::none(),
+            }
+        } else {
+            match ensure_upgrade_tree(&opts.state, None) {
+                Ok(dir) => Some(dir),
+                Err(_) => return ModelCtx::none(),
+            }
+        };
+        let path = upgrade_dir
+            .as_deref()
+            .map_or_else(|| state_dir(opts), Path::to_path_buf)
+            .join("models.json");
         let Ok(list) = (if opts.dry_run {
-            crate::harness::accounts::read_bounded(&path, 1024 * 1024)
-                .ok()
-                .flatten()
-                .map_or_else(
-                    || Ok(Priority::seed(now)),
-                    |t| Priority::parse(&t).ok_or_else(String::new),
-                )
+            match upgrade_dir.as_ref() {
+                Some(_) => crate::harness::accounts::read_bounded(&path, 1024 * 1024)
+                    .ok()
+                    .flatten()
+                    .map_or_else(
+                        || Ok(Priority::seed(now)),
+                        |t| Priority::parse(&t).ok_or_else(String::new),
+                    ),
+                None => Ok(Priority::seed(now)),
+            }
         } else {
             models::load_or_seed(&path, now)
         }) else {
             return ModelCtx::none();
+        };
+        let builds_dir = if opts.dry_run {
+            check_upgrade_tree(&opts.state, Some("builds"))
+        } else {
+            ensure_upgrade_tree(&opts.state, Some("builds")).map(Some)
+        };
+        let baked_of = |bin: &Path| match &builds_dir {
+            Ok(Some(dir)) if !opts.dry_run => catalog::baked_cached(bin, dir),
+            Ok(Some(_)) | Ok(None) => catalog::scan_baked(bin),
+            Err(_) => None,
         };
         let managed = targets.managed.as_ref();
         let baked = managed
@@ -3013,15 +3040,13 @@ impl ModelCtx {
                     .flatten()
             })
             .and_then(|twin| catalog::twin_binary(&twin))
-            .and_then(|bin| catalog::baked_cached(&bin, &state_dir(opts).join("builds")));
+            .and_then(|bin| baked_of(&bin));
         let label = managed.map(|m| m.version.to_string()).unwrap_or_default();
         let ev = model_evidence(opts, &Records::of(&opts.home, None));
-        let native = targets.native.as_ref().map(|n| {
-            (
-                n.version.to_string(),
-                catalog::baked_cached(&n.exe, &state_dir(opts).join("builds")),
-            )
-        });
+        let native = targets
+            .native
+            .as_ref()
+            .map(|n| (n.version.to_string(), baked_of(&n.exe)));
         let mut ctx = ModelCtx {
             list,
             baked,
@@ -3336,15 +3361,11 @@ fn managed_preferences_dir() -> Option<PathBuf> {
     MANAGED_PREFERENCES.with(|dir| dir.borrow().clone())
 }
 
-fn model_record_path(opts: &Opts, session: &str) -> PathBuf {
-    model_record_in(&opts.state, session)
-}
-
-fn model_record_in(state: &Path, session: &str) -> PathBuf {
-    state
-        .join("upgrade")
-        .join("models")
-        .join(format!("{session}.json"))
+fn checked_model_record_in(state: &Path, session: &str) -> Option<PathBuf> {
+    check_upgrade_tree(state, Some("models"))
+        .ok()
+        .flatten()
+        .map(|dir| dir.join(format!("{session}.json")))
 }
 
 /// The resume line a person is told to run, under the relaunch's own model rule.
@@ -3355,9 +3376,12 @@ pub fn resume_command_kept(state: Option<&Path>, argv: &[String], session: &str)
     }
     let launch = upgrade::launch_model(argv);
     let dropped = launch.as_deref().zip(state).is_some_and(|(m, state)| {
-        let record = super::accounts::read_bounded(&model_record_in(state, session), 64 * 1024)
-            .ok()
-            .flatten()
+        let record = checked_model_record_in(state, session)
+            .and_then(|path| {
+                super::accounts::read_bounded(&path, 64 * 1024)
+                    .ok()
+                    .flatten()
+            })
             .and_then(|t| ModelRecord::parse(&t))
             .unwrap_or_default();
         models::launch_model_kept(Some(m), &record).is_none()
@@ -3376,18 +3400,24 @@ fn load_model_record(opts: &Opts, session: &str) -> ModelRecord {
     if !upgrade::is_session_id(session) {
         return ModelRecord::default();
     }
-    super::accounts::read_bounded(&model_record_path(opts, session), 64 * 1024)
-        .ok()
-        .flatten()
+    checked_model_record_in(&opts.state, session)
+        .and_then(|path| {
+            super::accounts::read_bounded(&path, 64 * 1024)
+                .ok()
+                .flatten()
+        })
         .and_then(|t| ModelRecord::parse(&t))
         .unwrap_or_default()
 }
 
 fn save_model_record(opts: &Opts, session: &str, rec: &ModelRecord) {
-    if opts.dry_run {
+    if opts.dry_run || !upgrade::is_session_id(session) {
         return;
     }
-    let _ = models::write_atomic(&model_record_path(opts, session), &rec.render());
+    let Ok(dir) = ensure_upgrade_tree(&opts.state, Some("models")) else {
+        return;
+    };
+    let _ = models::write_atomic(&dir.join(format!("{session}.json")), &rec.render());
 }
 
 struct ModelRead {
@@ -3732,13 +3762,16 @@ pub fn models_report(opts: &Opts) -> String {
 /// `aterm harness upgrade models set <id>,<id>,...`.
 pub fn set_models(opts: &Opts, list: &str) -> Result<Vec<String>, String> {
     let now = i64::try_from(now_s()).unwrap_or(0);
-    let path = state_dir(opts).join("models.json");
     let ids: Vec<String> = list
         .split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
-    let mut p = models::load_or_seed(&path, now).unwrap_or_else(|_| Priority::seed(now));
+    let mut p = check_upgrade_tree(&opts.state, None)
+        .ok()
+        .flatten()
+        .and_then(|dir| models::load_or_seed(&dir.join("models.json"), now).ok())
+        .unwrap_or_else(|| Priority::seed(now));
     let candidate = Priority {
         ids: ids.clone(),
         history: p.history.clone(),
@@ -3756,6 +3789,9 @@ pub fn set_models(opts: &Opts, list: &str) -> Result<Vec<String>, String> {
         source: "owner".into(),
         at: now,
     });
+    let path = ensure_upgrade_tree(&opts.state, None)
+        .map_err(|e| format!("{}: {e}", state_dir(opts).join("models.json").display()))?
+        .join("models.json");
     models::write_atomic(&path, &p.render()).map_err(|e| format!("{}: {e}", path.display()))?;
     let r = Report {
         pid: 0,
@@ -5752,6 +5788,150 @@ pub(super) fn state_dir(opts: &Opts) -> PathBuf {
     opts.state.join("upgrade")
 }
 
+/// Validates that `dir`, if present, is a plain non-symlink directory owned by this user.
+pub(super) fn check_owned_plain_dir_existing(dir: &Path) -> std::io::Result<bool> {
+    let meta = match std::fs::symlink_metadata(dir) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    if meta.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{}: is a symbolic link", dir.display()),
+        ));
+    }
+    if !meta.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            format!("{}: is not a directory", dir.display()),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if meta.uid() != aterm_uds::peer::our_uid() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("{}: owned by another user", dir.display()),
+            ));
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        if meta.file_attributes() & 0x0000_0400 != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("{}: is a reparse point", dir.display()),
+            ));
+        }
+    }
+    Ok(true)
+}
+
+fn create_owned_plain_dir(dir: &Path) -> std::io::Result<()> {
+    if check_owned_plain_dir_existing(dir)? {
+        return Ok(());
+    }
+    let create = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            std::fs::DirBuilder::new().mode(0o700).create(dir)
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::DirBuilder::new().create(dir)
+        }
+    };
+    match create {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    if check_owned_plain_dir_existing(dir)? {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("{}: disappeared after create", dir.display()),
+        ))
+    }
+}
+
+/// Ensures `dir` exists as a plain directory owned by this user.
+pub(super) fn ensure_owned_plain_dir(dir: &Path) -> std::io::Result<()> {
+    if check_owned_plain_dir_existing(dir)? {
+        return Ok(());
+    }
+    if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty())
+        && !check_owned_plain_dir_existing(parent)?
+    {
+        if let Some(grand) = parent.parent().filter(|p| !p.as_os_str().is_empty())
+            && !check_owned_plain_dir_existing(grand)?
+        {
+            if let Some(great) = grand.parent().filter(|p| !p.as_os_str().is_empty()) {
+                std::fs::create_dir_all(great)?;
+            }
+            create_owned_plain_dir(grand)?;
+        }
+        create_owned_plain_dir(parent)?;
+    }
+    create_owned_plain_dir(dir)
+}
+
+/// Validates `<state>`, `<state>/upgrade`, and optional child `sub` without creating missing components.
+pub(super) fn check_upgrade_tree(
+    state: &Path,
+    sub: Option<&str>,
+) -> std::io::Result<Option<PathBuf>> {
+    if !check_owned_plain_dir_existing(state)? {
+        return Ok(None);
+    }
+    let upgrade = state.join("upgrade");
+    if !check_owned_plain_dir_existing(&upgrade)? {
+        return Ok(None);
+    }
+    let Some(sub) = sub else {
+        return Ok(Some(upgrade));
+    };
+    let child = upgrade.join(sub);
+    if !check_owned_plain_dir_existing(&child)? {
+        return Ok(None);
+    }
+    Ok(Some(child))
+}
+
+/// Opens `<state>/upgrade` for listing after validating `<state>` and `<state>/upgrade`.
+pub(super) fn read_upgrade_dir(state: &Path) -> std::io::Result<std::fs::ReadDir> {
+    match check_upgrade_tree(state, None)? {
+        Some(upgrade) => std::fs::read_dir(upgrade),
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("{}: absent", state.join("upgrade").display()),
+        )),
+    }
+}
+
+/// Ensures `<state>` (creating missing parents first), `<state>/upgrade`, and optional child `sub` exist as owned plain directories.
+pub(super) fn ensure_upgrade_tree(state: &Path, sub: Option<&str>) -> std::io::Result<PathBuf> {
+    if !check_owned_plain_dir_existing(state)? {
+        if let Some(parent) = state.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
+        create_owned_plain_dir(state)?;
+    }
+    let upgrade = state.join("upgrade");
+    create_owned_plain_dir(&upgrade)?;
+    let Some(sub) = sub else {
+        return Ok(upgrade);
+    };
+    let child = upgrade.join(sub);
+    create_owned_plain_dir(&child)?;
+    Ok(child)
+}
+
 /// Small regular record files; a FIFO must never park the synchronous upgrade watcher.
 fn read_record_text(path: &Path) -> std::io::Result<Option<String>> {
     super::accounts::read_bounded(path, 2 * 1024 * 1024)
@@ -5865,7 +6045,7 @@ fn prune_states(opts: &Opts, files: &[SessionFile], now: u64) {
     if opts.dry_run {
         return;
     }
-    let Ok(dir) = std::fs::read_dir(state_dir(opts)) else {
+    let Ok(dir) = read_upgrade_dir(&opts.state) else {
         return;
     };
     let live: std::collections::BTreeSet<&str> =
@@ -5986,8 +6166,8 @@ pub(super) fn build_proved(
 }
 
 mod record {
-    use super::{Opts, St, state_dir};
-    use std::path::{Path, PathBuf};
+    use super::{Opts, St};
+    use std::path::Path;
 
     fn replace_text(path: &Path, text: &str) -> std::io::Result<()> {
         #[cfg(unix)]
@@ -6008,16 +6188,9 @@ mod record {
         }
     }
 
-    fn state_path(opts: &Opts, session: &str) -> PathBuf {
-        state_dir(opts).join(format!("{session}.json"))
-    }
-
-    fn move_path(opts: &Opts, session: &str) -> PathBuf {
-        state_dir(opts).join(format!("{session}.move"))
-    }
-
     pub(in super::super) fn kept_move(opts: &Opts, session: &str) -> Option<St> {
-        St::from_json(&super::read_record_text(&move_path(opts, session)).ok()??)
+        let dir = super::check_upgrade_tree(&opts.state, None).ok()??;
+        St::from_json(&super::read_record_text(&dir.join(format!("{session}.move"))).ok()??)
             .filter(|st| st.moved_at != 0)
     }
 
@@ -6026,6 +6199,9 @@ mod record {
         if moved == 0 || kept_move(opts, session).is_some_and(|kept| kept.moved_at >= moved) {
             return;
         }
+        let Ok(dir) = super::ensure_upgrade_tree(&opts.state, None) else {
+            return;
+        };
         let (moved_login, moved_left_model) = super::super::relaunch::last_move_target(disk);
         let kept = St {
             phase: super::Phase::Done,
@@ -6035,7 +6211,7 @@ mod record {
             moved_left_model,
             ..St::default()
         };
-        let path = move_path(opts, session);
+        let path = dir.join(format!("{session}.move"));
         let _ = replace_text(&path, &kept.to_json());
     }
 
@@ -6050,7 +6226,9 @@ mod record {
         if now < spent || opts.dry_run {
             return true;
         }
-        let _ = std::fs::remove_file(move_path(opts, session));
+        if let Ok(Some(dir)) = super::check_upgrade_tree(&opts.state, None) {
+            let _ = std::fs::remove_file(dir.join(format!("{session}.move")));
+        }
         false
     }
 
@@ -6059,8 +6237,13 @@ mod record {
     }
 
     fn load_checked(opts: &Opts, session: &str) -> std::io::Result<Option<St>> {
-        Ok(super::read_record_text(&state_path(opts, session))?
-            .and_then(|text| St::from_json(&text)))
+        let Some(dir) = super::check_upgrade_tree(&opts.state, None)? else {
+            return Ok(None);
+        };
+        Ok(
+            super::read_record_text(&dir.join(format!("{session}.json")))?
+                .and_then(|text| St::from_json(&text)),
+        )
     }
 
     pub(in super::super) fn save_at(opts: &Opts, session: &str, st: &St, now: u64) {
@@ -6136,18 +6319,18 @@ mod record {
         if opts.dry_run {
             return;
         }
-        let path = state_path(opts, session);
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let _ = replace_text(&path, &st.to_json());
+        let Ok(dir) = super::ensure_upgrade_tree(&opts.state, None) else {
+            return;
+        };
+        let _ = replace_text(&dir.join(format!("{session}.json")), &st.to_json());
     }
 
     fn write_verbatim_checked(opts: &Opts, session: &str, st: &St) -> std::io::Result<()> {
         if opts.dry_run {
             return Ok(());
         }
-        let path = state_path(opts, session);
+        let dir = super::ensure_upgrade_tree(&opts.state, None)?;
+        let path = dir.join(format!("{session}.json"));
         #[cfg(unix)]
         {
             aterm_uds::atomic_file::write(&path, st.to_json().as_bytes(), 0o600)
@@ -6177,7 +6360,9 @@ mod record {
         if let Some(disk) = load(opts, session) {
             keep_move(opts, session, &disk);
         }
-        let _ = std::fs::remove_file(state_path(opts, session));
+        if let Ok(Some(dir)) = super::check_upgrade_tree(&opts.state, None) {
+            let _ = std::fs::remove_file(dir.join(format!("{session}.json")));
+        }
     }
 
     #[cfg(all(test, unix))]
@@ -6207,9 +6392,10 @@ pub(super) fn ledger(opts: &Opts, r: &Report, detail: &str) {
         o.insert(k.into(), Value::from(v.as_str()));
     }
     o.insert("detail".into(), Value::from(detail));
-    let dir = state_dir(opts);
-    let _ = std::fs::create_dir_all(&dir);
-    let path = ledger_path(opts);
+    let Ok(dir) = ensure_upgrade_tree(&opts.state, None) else {
+        return;
+    };
+    let path = dir.join("ledger.jsonl");
     let mut open = std::fs::OpenOptions::new();
     open.create(true).append(true);
     #[cfg(unix)]
@@ -6882,12 +7068,14 @@ fn typed_through(
         return Ok(Vec::new());
     };
     let ledgered = if let Some(session) = session {
-        ledger_tabs(
-            &super::accounts::read_bounded(&ledger_path(opts), 16 * 1024 * 1024)?
-                .unwrap_or_default(),
-            session,
-            tab,
-        )
+        let text = match check_upgrade_tree(&opts.state, None)? {
+            Some(dir) => {
+                super::accounts::read_bounded(&dir.join("ledger.jsonl"), 16 * 1024 * 1024)?
+                    .unwrap_or_default()
+            }
+            None => String::new(),
+        };
+        ledger_tabs(&text, session, tab)
     } else {
         Vec::new()
     };
@@ -7407,8 +7595,11 @@ impl Finished {
     }
 }
 
-fn writes_note_path(opts: &Opts, session: &str) -> PathBuf {
-    state_dir(opts).join(format!("{session}.writes"))
+fn read_writes_note(opts: &Opts, session: &str) -> Option<String> {
+    let dir = check_upgrade_tree(&opts.state, None).ok()??;
+    read_record_text(&dir.join(format!("{session}.writes")))
+        .ok()
+        .flatten()
 }
 
 /// Record the directory a moved agent writes its conversation in while it lives.
@@ -7421,22 +7612,21 @@ pub fn note_writes(opts: &Opts, snap: &super::relaunch::Snapshot, dir: &Path) {
         return;
     }
     let text = dir.to_string_lossy();
-    let path = writes_note_path(opts, session);
-    if read_record_text(&path)
-        .ok()
-        .flatten()
-        .is_some_and(|t| t.trim_end() == text)
-    {
+    if read_writes_note(opts, session).is_some_and(|t| t.trim_end() == text) {
         return;
     }
-    let _ = models::write_atomic(&path, &format!("{text}\n"));
+    let Ok(upgrade_dir) = ensure_upgrade_tree(&opts.state, None) else {
+        return;
+    };
+    let _ = models::write_atomic(
+        &upgrade_dir.join(format!("{session}.writes")),
+        &format!("{text}\n"),
+    );
 }
 
 pub(super) fn finish_dir(opts: &Opts, records: &Records, session: &str) -> Option<PathBuf> {
     let filed = records.dir().map(Path::to_path_buf);
-    let noted = read_record_text(&writes_note_path(opts, session))
-        .ok()
-        .flatten()
+    let noted = read_writes_note(opts, session)
         .map(|t| PathBuf::from(t.trim_end()))
         .filter(|d| !d.as_os_str().is_empty());
     let newest = |dir: &Path| transcript_in(dir, session).and_then(|p| newest_row_at(&p));
@@ -7482,9 +7672,7 @@ pub(super) fn note_moved_writes(
             bases.push(wt);
         }
     }
-    let noted = read_record_text(&writes_note_path(opts, session))
-        .ok()
-        .flatten()
+    let noted = read_writes_note(opts, session)
         .map(|t| PathBuf::from(t.trim_end()))
         .filter(|d| !d.as_os_str().is_empty());
     let floor = [Some(filed_dir.clone()), noted]
@@ -8385,7 +8573,7 @@ fn instance_tabs(opts: &Opts) -> Vec<LiveTab> {
 }
 
 fn recorded_homes(opts: &Opts) -> Vec<Records> {
-    let Ok(dir) = std::fs::read_dir(state_dir(opts)) else {
+    let Ok(dir) = read_upgrade_dir(&opts.state) else {
         return Vec::new();
     };
     dir.flatten()
@@ -8939,7 +9127,7 @@ pub fn hold_clock(opts: &Opts, until: u64) -> bool {
         Err("another-sweep") => return false,
         Err(_) => return true,
     };
-    let Ok(dir) = std::fs::read_dir(state_dir(opts)) else {
+    let Ok(dir) = read_upgrade_dir(&opts.state) else {
         return true;
     };
     for e in dir.flatten() {
@@ -9417,8 +9605,7 @@ pub(super) fn sweep_lock(opts: &Opts) -> Result<Option<SweepLock>, &'static str>
     if opts.dry_run {
         return Ok(None);
     }
-    let dir = state_dir(opts);
-    std::fs::create_dir_all(&dir).map_err(|_| "state-unwritable")?;
+    let dir = ensure_upgrade_tree(&opts.state, None).map_err(|_| "state-unwritable")?;
     let mut open = std::fs::OpenOptions::new();
     open.create(true).truncate(false).write(true);
     #[cfg(unix)]
@@ -9500,7 +9687,7 @@ impl Drop for SweepLock {
 }
 
 fn confirming(opts: &Opts) -> bool {
-    std::fs::read_dir(state_dir(opts)).is_ok_and(|dir| {
+    read_upgrade_dir(&opts.state).is_ok_and(|dir| {
         dir.flatten().any(|e| {
             let path = e.path();
             path.extension().is_some_and(|x| x == "json")
@@ -9518,7 +9705,7 @@ fn confirming(opts: &Opts) -> bool {
 /// List conversations left mid-restart by an earlier upgrade sweep.
 #[must_use]
 pub fn in_flight(opts: &Opts) -> Vec<String> {
-    let Ok(dir) = std::fs::read_dir(state_dir(opts)) else {
+    let Ok(dir) = read_upgrade_dir(&opts.state) else {
         return Vec::new();
     };
     let mut out: Vec<String> = dir
@@ -11086,7 +11273,7 @@ fn resumed_by_another(opts: &Opts, mut r: Report, st: &mut St, sf: &SessionFile)
 }
 
 fn orphans(opts: &Opts, files: &[SessionFile], live_tabs: Option<&[LiveTab]>) -> Vec<Report> {
-    let Ok(dir) = std::fs::read_dir(state_dir(opts)) else {
+    let Ok(dir) = read_upgrade_dir(&opts.state) else {
         return Vec::new();
     };
     let fresh = std::cell::OnceCell::new();
@@ -12158,7 +12345,7 @@ fn confirmations(opts: &Opts) -> Vec<Report> {
     if opts.dry_run {
         return Vec::new();
     }
-    let Ok(dir) = std::fs::read_dir(state_dir(opts)) else {
+    let Ok(dir) = read_upgrade_dir(&opts.state) else {
         return Vec::new();
     };
     let now = now_s();

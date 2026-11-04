@@ -187,10 +187,10 @@ pub const CHECKS: [Spec; 19] = [
         check: Check::Checkers,
         name: "checkers",
         stages: &[StageId::CheckersCompile, StageId::SpecCheckers],
-        reach: Reach::WholeTree,
+        reach: Reach::Selection,
         needs: &["targo", "ty"],
         also: "",
-        runs: "targo test --workspace --features aterm-spec/checkers --tests (own target dir; after test; binaries in parallel)",
+        runs: "targo test <selection plus shared aterm-spec runtime> --features aterm-spec/checkers --tests (own target dir; after test; binaries in parallel)",
     },
     Spec {
         check: Check::GpuOracle,

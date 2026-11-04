@@ -66,6 +66,7 @@ fn verifys_schema_2_file_reads_as_its_serde_derive_wrote_it() {
         Records::decode(&text.replace("\"schema\":2", "\"schema\":1")),
         Records::default()
     );
+    assert_eq!(Records::decode("not json"), Records::default());
     assert_eq!(
         Records::decode(&text.replace(
             "\"checkout\":\"/ck\",\"crates\":[\"aterm-gui\"]}",
@@ -124,6 +125,15 @@ fn an_oversized_book_save_preserves_the_previous_readable_peaks() {
     previous.save(&path).expect("ordinary readable book");
     let bytes = std::fs::read(&path).expect("previous bytes");
     assert_eq!(Records::load(&path), previous, "ordinary round trip");
+    assert_eq!(
+        std::fs::read_dir(dir.path()).expect("listed").count(),
+        1,
+        "no stage folder is left beside it"
+    );
+    assert_eq!(
+        Records::load(&dir.path().join("absent")),
+        Records::default()
+    );
     let result = book_past_the_read_bound().save(&path);
     assert_eq!(
         result

@@ -51,7 +51,7 @@ use aterm_agent::supervise::tap_clock::{TapWindow, UsageWindow};
 use aterm_agent::supervise::tape::store as tape;
 use aterm_agent::supervise::{
     AgentResumed, Autopilot, BuiltinAuthority, Ctl, CtlReply, Endpoint, Guard, HostStep, IdleHost,
-    IdlePoint, Interrupter, ProbeMiss, RelayCtl, Session, StallSeen, SuperviseOpts,
+    IdlePoint, Interrupter, LineHeld, ProbeMiss, RelayCtl, Session, StallSeen, SuperviseOpts,
     SupervisorConfig, UsageSeen,
 };
 use aterm_log::words::{Len, Panic};
@@ -2577,7 +2577,8 @@ type HoldFn = dyn Fn(&str, u64) -> bool + Send + Sync;
 type DiskResumeFn = dyn Fn(&str, &str) -> String + Send + Sync;
 /// Type or release the `disk-free@v1` line owed a tab, the step's word back ([`Acts::disk_free`]):
 /// `(sid, owed, unfit, held)`, `unfit` naming why the session may not be asked, `held` what holds
-/// the line at this turn break ([`IdlePoint::held`]'s word: a wait, the line kept owed).
+/// the line at this turn break ([`IdlePoint::held`]'s word, or [`LINE_HELD`] for a line the loop
+/// holds in custody: a wait, the line kept owed).
 type DiskFreeFn =
     dyn Fn(&str, &crate::disk_board::AskOwed, AskWord, AskWord) -> String + Send + Sync;
 /// A word [`DiskFreeFn`] is handed: why a session may not be asked, or what holds its line.
@@ -3908,6 +3909,19 @@ fn host_carries_relaunch(agent: Program) -> bool {
     relaunches(agent) && !aterm_agent::harness::lanes::sweep_carries_relaunch(agent)
 }
 
+/// The word a line the loop holds in custody ([`IdlePoint::line_held`]) holds a line the host
+/// would type into the agent by, kept owed: the word a drive's [`relaunch::WAIT_HELD`] names an
+/// input the tab reads held by.
+const LINE_HELD: &str = "held";
+
+/// Whether a line the loop holds in custody holds the upgrade's step whole at `point`
+/// ([`LineHeld::Stands`]: the line may still come, so neither its notice nor its restart goes).
+/// One the loop judged lost and makes no restart for ([`LineHeld::Lost`]) lets the step go as at
+/// a free point: its move ends the process that read the line.
+fn upgrade_held_by_line(point: IdlePoint) -> bool {
+    point.line_held == Some(LineHeld::Stands)
+}
+
 /// The one agent whose owed relaunch `agent`'s worker carries ([`Acts::owed`], [`CarryPoint::only`]).
 fn carries_only(agent: Program) -> Option<upgrade::Agent> {
     if host_carries_relaunch(agent) {
@@ -5203,7 +5217,9 @@ impl IdleHost for WorkerIdle {
     }
 
     /// A break of the agent's own background work its loop offers, under the guards it read there
-    /// (`point`, which hold the quiet upgrade's line: [`Self::upgrade_tell`]).
+    /// (`point`, which hold the quiet upgrade's line: [`Self::upgrade_tell`]). A line its loop
+    /// holds in custody that may still come ([`upgrade_held_by_line`]) holds the upgrade's step
+    /// whole, its notice for a later break.
     fn at_background_on(
         &self,
         point: IdlePoint,
@@ -5215,6 +5231,7 @@ impl IdleHost for WorkerIdle {
             || !upgrades(self.agent)
             || !self.switches.upgrade()
             || self.program_check_stuck()
+            || upgrade_held_by_line(point)
         {
             return None;
         }
@@ -6851,8 +6868,9 @@ impl WorkerIdle {
             std::mem::take(&mut k.account.adopted_ahead)
         });
         // The resume is a carry-on: the loop types none into the person's own exchange, and none
-        // while a person is at the session (their grace, or another driver's hand). A person's
-        // grace keeps it owed for a later point; an exchange gives it up, as the conversation is
+        // while a person is at the session (their grace, or another driver's hand) or a line its
+        // loop wrote stands held in custody (`IdlePoint::line_held`). A person's grace and a held
+        // line keep it owed for a later point; an exchange gives it up, as the conversation is
         // theirs until they hand it back.
         let owed = disk_owed(self.hooks.acts.disk_board, &self.sid);
         if owed.is_some()
@@ -6866,12 +6884,15 @@ impl WorkerIdle {
                 self.sid,
                 aterm_agent::harness::disk::RULE_DISK_RESUME
             );
-        } else if owed.is_some() && point.held == Some(Guard::Person) {
+        } else if owed.is_some()
+            && let Some(why) = (point.held == Some(Guard::Person))
+                .then(|| Guard::Person.word())
+                .or_else(|| point.line_held.map(|_| LINE_HELD))
+        {
             aterm_log::info!(
-                "harness @{}: {} step=wait:{}: nothing typed, still owed",
+                "harness @{}: {} step=wait:{why}: nothing typed, still owed",
                 self.sid,
-                aterm_agent::harness::disk::RULE_DISK_RESUME,
-                Guard::Person.word()
+                aterm_agent::harness::disk::RULE_DISK_RESUME
             );
         } else if let Some(text) = owed {
             let step = (self.hooks.acts.disk_resume)(&self.sid, &text);
@@ -6943,11 +6964,15 @@ impl WorkerIdle {
     /// The ask to free space's step at a turn break `point` describes: an idle point
     /// ([`Self::idle_point`]) or a break of the agent's own background work where its turn is over
     /// ([`IdleHost::at_background_fact`]). The finding is made first ([`Self::disk_ask_found`]),
-    /// then a line owed is stepped ([`Acts::disk_free`]); `Some` where it was typed.
+    /// then a line owed is stepped ([`Acts::disk_free`]), held by the loop's guards and by a line
+    /// it holds in custody ([`LINE_HELD`]); `Some` where it was typed.
     fn disk_free_step(&self, point: IdlePoint) -> Option<HostStep> {
         let unfit = self.disk_ask_found(point.theirs);
         let owed = disk_ask_owed(self.hooks.acts.disk_board, &self.sid)?;
-        let held = point.held.map(Guard::word);
+        let held = point
+            .held
+            .map(Guard::word)
+            .or_else(|| point.line_held.map(|_| LINE_HELD));
         let step = (self.hooks.acts.disk_free)(&self.sid, &owed, unfit, held);
         if !step.starts_with("wait:") {
             disk_ask_stepped(self.hooks.acts.disk_board, &self.sid);
@@ -7012,6 +7037,18 @@ impl WorkerIdle {
             if !self.on() || self.autopilot() == Autopilot::Off {
                 return None;
             }
+            // A line the loop holds in custody holds the carry-on ([`IdlePoint::line_held`]): it
+            // stands owed, nothing typed and no step taken, so the hold the carry-on puts on the
+            // loop's own act ([`Self::carry_holds`]) is not renewed and runs out on its bound, and
+            // the loop's gate decides the line, its restart in place included.
+            if point.line_held.is_some() {
+                aterm_log::info!(
+                    "harness @{}: carry-on step={}: nothing typed, still owed",
+                    self.sid,
+                    relaunch::WAIT_HELD
+                );
+                return None;
+            }
             let carry = CarryPoint {
                 land: self.autopilot() == Autopilot::Land,
                 done_under_land: point.done_under_land,
@@ -7046,8 +7083,15 @@ impl WorkerIdle {
                     if !self.on() {
                         return None;
                     }
-                    let tell = self.upgrade_tell(point);
-                    let step = self.act(|| (hooks.acts.step)(&self.sid, self.grace, tell));
+                    // A line the loop holds in custody that may still come holds the upgrade's
+                    // step whole: its announcement, its tell and its restart
+                    // ([`upgrade_held_by_line`]).
+                    let step = if upgrade_held_by_line(point) {
+                        relaunch::WAIT_HELD.to_string()
+                    } else {
+                        let tell = self.upgrade_tell(point);
+                        self.act(|| (hooks.acts.step)(&self.sid, self.grace, tell))
+                    };
                     laps::lap("upgrade");
                     ("upgrade", step)
                 }
@@ -7240,7 +7284,9 @@ impl WorkerIdle {
     /// guards holds a host's fact (`held`: a person's grace, their own exchange, a manager's
     /// wait; under Cruise the last two hold it no more than they hold Cruise's carry at a break,
     /// which types into such a session all the same); the restart the agent may run itself only
-    /// where the tab offers and promises it ([`Acts::offered`]).
+    /// where the tab offers and promises it ([`Acts::offered`]). A line the loop holds in custody
+    /// that may still come holds the whole step before any of this is asked
+    /// ([`upgrade_held_by_line`]).
     fn upgrade_tell(&self, point: IdlePoint) -> upgrade_drive::Tell {
         let autopilot = self.autopilot();
         let held = point.held.filter(|guard| {

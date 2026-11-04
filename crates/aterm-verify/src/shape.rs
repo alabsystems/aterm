@@ -267,9 +267,14 @@ fn kept(book: &Shaping<'_>, piece: &Piece, variant: Option<&str>) -> Option<Esti
 /// the selection is kept: measured 2026-10-29, S1 less aterm-gui held 13 GiB where its units
 /// summed 21 GiB. `None` with none kept.
 fn unit_sum(book: &Shaping<'_>, graph: &Graph) -> Option<Estimate> {
-    let mut found: Vec<(u64, &UnitName)> = graph
-        .names()
-        .into_iter()
+    named_unit_sum(book, graph.names().into_iter())
+}
+
+fn named_unit_sum<'a>(
+    book: &Shaping<'_>,
+    names: impl Iterator<Item = &'a UnitName>,
+) -> Option<Estimate> {
+    let mut found: Vec<(u64, &UnitName)> = names
         .filter_map(|n| {
             most(
                 book.records,
@@ -606,16 +611,16 @@ impl Planner<'_, '_> {
             push(less(&p.crates));
         }
         let weight = |c: &String| {
-            let units = Graph {
-                units: whole_graph
-                    .units
-                    .iter()
-                    .filter(|u| u.name.as_ref().is_some_and(|n| n.package == package(c)))
-                    .cloned()
-                    .collect(),
-            };
             kept(self.book, &Piece::of(std::slice::from_ref(c), false), None)
-                .or_else(|| unit_sum(self.book, &units))
+                .or_else(|| {
+                    named_unit_sum(
+                        self.book,
+                        whole_graph
+                            .names()
+                            .into_iter()
+                            .filter(|n| n.package == package(c)),
+                    )
+                })
                 .map_or(0, |e| e.peak)
         };
         if whole.crates.len() > 1

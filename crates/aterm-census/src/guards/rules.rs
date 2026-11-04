@@ -2980,6 +2980,28 @@ mod tests {
                 .contains("`not-locked`, which Cargo.lock does not hold"),
             "{found:?}"
         );
+        let hash = "1234567890123456789012345678901234567890";
+        let root = tree_with(
+            "keeper-git-closure",
+            &format!(
+                "[dependencies]\nhelper = {{ git = \"https://github.com/example/helper.git\", rev = \"{hash}\" }}\n"
+            ),
+        );
+        let path = root.join("Cargo.lock");
+        let locked = std::fs::read_to_string(&path).unwrap().replacen(
+            "source = \"registry+https://github.com/rust-lang/crates.io-index\"",
+            &format!("source = \"git+https://github.com/example/helper.git?rev={hash}#{hash}\""),
+            1,
+        );
+        std::fs::write(path, locked).unwrap();
+        let found = run_on(&root);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].detail.contains(
+                "reaches `objc2-foundation` through helper -> middle -> objc2-foundation"
+            ),
+            "{found:?}"
+        );
     }
 
     #[test]

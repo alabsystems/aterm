@@ -59,7 +59,7 @@ const PARENT_SESSION_ENV: &str = "ATERM_PARENT_SESSION_ID";
 
 /// `amacs [ARGS]` / `aterm edit [ARGS]` (`args` past the program name or verb): the whole program,
 /// to its exit status.
-#[must_use]
+#[must_use = "handle or propagate the editor's exit status"]
 pub fn run_client(args: Vec<OsString>, write: aterm_buffer::WriteCap) -> ExitCode {
     let mut tty = std::io::stderr();
     let args = match client::parse_args(&args) {

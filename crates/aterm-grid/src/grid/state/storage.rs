@@ -460,6 +460,18 @@ impl GridStorage {
         self.rows.get((self.ring_head + base) % self.rows.len())
     }
 
+    /// Return the mutable live on-screen row at `screen_row`, ignoring `display_offset`.
+    #[inline]
+    pub(crate) fn row_at_screen_mut(&mut self, screen_row: u16) -> Option<&mut Row> {
+        if screen_row >= self.visible_rows || self.rows.is_empty() {
+            return None;
+        }
+        let ring_scrollback = self.total_lines.saturating_sub(self.visible_rows as usize);
+        let base = ring_scrollback + usize::from(screen_row);
+        let idx = (self.ring_head + base) % self.rows.len();
+        self.rows.get_mut(idx)
+    }
+
     /// Get a mutable row by visible row index.
     #[inline]
     pub(crate) fn row_mut(&mut self, visible_row: u16) -> Option<&mut Row> {

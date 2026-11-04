@@ -1700,7 +1700,8 @@ impl Run<'_> {
         if !copied.ok() {
             return Err(format!("{guest_png}: {}", copied.tail(2)));
         }
-        let bytes = std::fs::read(&host).map_err(|e| format!("{}: {e}", host.display()))?;
+        let bytes = crate::util::read_regular_file(&host)
+            .map_err(|e| format!("{}: {e}", host.display()))?;
         aterm_png::decode_rgba8(&bytes, 8192)
             .map(|(rgba, w, h)| Screen { rgba, w, h })
             .ok_or_else(|| format!("{}: not a PNG this lab decodes", host.display()))

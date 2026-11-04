@@ -202,28 +202,41 @@ fn me_at(fx: &mut Fx, week: u32) {
     fx.session("s-me", "me", NOW);
 }
 
-/// `alt1`, Max 20x, its week at `week` tenths read 16:30, idle here since; its 5h reset 18:40.
-fn alt1_idle(fx: &mut Fx, week: u32) {
+/// `alt1`, Max 20x, its week at `week` tenths read 19:30 (now), run here last at 15:30; its
+/// 5h window, reset 18:40, unopened since.
+fn alt1_read(fx: &mut Fx, week: u32) {
+    alt1_read_at(fx, week, NOW);
+}
+
+/// `alt1` as [`alt1_read`], its reading taken at `at` (a 5h figure only before its reset).
+fn alt1_read_at(fx: &mut Fx, week: u32, at: i64) {
     fx.plan("alt1", "max", Some("20x"), NOW - 2 * D);
     fx.ran("alt1", NOW - 4 * H);
-    fx.read(
-        "alt1",
-        Some((120, NOW - 50 * MIN)),
-        Some((week, FRI14)),
-        NOW - 3 * H,
-    );
+    let five_reset = NOW - 50 * MIN;
+    let five = (at < five_reset).then_some((120, five_reset));
+    fx.read("alt1", five, Some((week, FRI14)), at);
+}
+
+/// Scenario A with `alt1` read 16:30 and idle here since: `idle-here`, a bound, since another
+/// Mac may prefer and run it too.
+fn scenario_a_idle() -> Fx {
+    let mut fx = scenario_a();
+    fx.state.accounts.remove("alt1");
+    fx.series.remove("alt1");
+    alt1_read_at(&mut fx, 310, NOW - 3 * H);
+    fx
 }
 
 /// Scenario A: covered.
 fn scenario_a() -> Fx {
     let mut fx = Fx::new(&[
-        ("me", Class::Dedicated),
-        ("alt1", Class::Dedicated),
-        ("alt2", Class::Dedicated),
-        ("pool1", Class::Shared),
+        ("me", Class::Preferred),
+        ("alt1", Class::Preferred),
+        ("alt2", Class::Preferred),
+        ("pool1", Class::Pool),
     ]);
     me_at_today(&mut fx);
-    alt1_idle(&mut fx, 310);
+    alt1_read(&mut fx, 310);
     fx.plan("alt2", "max", Some("5x"), NOW - 6 * D);
     fx.ran("alt2", THU22 - 3 * D - H);
     fx.read("alt2", None, Some((710, THU22)), THU22 - 3 * D);
@@ -233,27 +246,27 @@ fn scenario_a() -> Fx {
 
 /// Scenario B: a gap.
 fn scenario_b() -> Fx {
-    let mut fx = Fx::new(&[("me", Class::Dedicated), ("alt1", Class::Dedicated)]);
+    let mut fx = Fx::new(&[("me", Class::Preferred), ("alt1", Class::Preferred)]);
     me_at_today(&mut fx);
-    alt1_idle(&mut fx, 920);
+    alt1_read(&mut fx, 920);
     fx
 }
 
 /// Scenario C: an account never read.
 fn scenario_c() -> Fx {
     let mut fx = Fx::new(&[
-        ("me", Class::Dedicated),
-        ("alt1", Class::Dedicated),
-        ("pool1", Class::Shared),
+        ("me", Class::Preferred),
+        ("alt1", Class::Preferred),
+        ("pool1", Class::Pool),
     ]);
     me_at_today(&mut fx);
-    alt1_idle(&mut fx, 920);
+    alt1_read(&mut fx, 920);
     fx
 }
 
-/// Scenario D: `me`'s 5h at 81% since 17:00 (32.4 points an hour), `alt1`'s at 95% read 19:10.
+/// Scenario D: `me`'s 5h at 81% since 17:00 (32.4 points an hour), `alt1`'s at 95% read 19:20.
 fn scenario_d() -> Fx {
-    let mut fx = Fx::new(&[("me", Class::Dedicated), ("alt1", Class::Dedicated)]);
+    let mut fx = Fx::new(&[("me", Class::Preferred), ("alt1", Class::Preferred)]);
     fx.plan("me", "max", Some("20x"), NOW - H);
     for (t, week) in [(NOW - 24 * H, 420), (NOW - 8 * H, 527)] {
         fx.fig("me", t, None, Some((week, THU9)));
@@ -273,7 +286,7 @@ fn scenario_d() -> Fx {
         "alt1",
         Some((950, NOW + 100 * MIN)),
         Some((310, FRI14)),
-        NOW - 20 * MIN,
+        NOW - 10 * MIN,
     );
     fx
 }
@@ -308,7 +321,7 @@ fn rise_of(fx: &Fx, w: Window, lookback: i64) -> (i64, Option<i64>, bool) {
 /// gives another pace.
 #[test]
 fn demand_survives_a_rotation() {
-    let mut fx = Fx::new(&[("me", Class::Dedicated), ("alt1", Class::Dedicated)]);
+    let mut fx = Fx::new(&[("me", Class::Preferred), ("alt1", Class::Preferred)]);
     fx.plan("me", "max", Some("20x"), NOW - 3 * D);
     fx.plan("alt1", "max", Some("20x"), NOW - 3 * D);
     for (t, week) in [
@@ -342,7 +355,7 @@ fn demand_survives_a_rotation() {
 /// merging the runs counts the reset's drop as no rise at all.
 #[test]
 fn runs_split_at_reset_refill_epoch() {
-    let mut fx = Fx::new(&[("me", Class::Dedicated)]);
+    let mut fx = Fx::new(&[("me", Class::Preferred)]);
     let old = NOW - 2 * H;
     let new = old + 7 * D;
     // A run up to its reset; the new window's run; a refill inside it; then a limit reset used.
@@ -396,7 +409,7 @@ fn runs_split_at_reset_refill_epoch() {
 /// starting at the window's first row under-counts its rise.
 #[test]
 fn a_window_begins_empty() {
-    let mut fx = Fx::new(&[("me", Class::Dedicated)]);
+    let mut fx = Fx::new(&[("me", Class::Preferred)]);
     let reset = NOW + 5 * H - 40 * MIN;
     fx.fig("me", NOW - 30 * MIN, Some((100, reset)), None);
     fx.fig("me", NOW, Some((300, reset)), None);
@@ -416,7 +429,7 @@ fn a_window_begins_empty() {
 /// the lookback.
 #[test]
 fn a_gap_in_the_readings_is_spread_over_it() {
-    let mut fx = Fx::new(&[("me", Class::Dedicated)]);
+    let mut fx = Fx::new(&[("me", Class::Preferred)]);
     fx.fig("me", NOW - 8 * H, None, Some((527, THU9)));
     fx.fig("me", NOW, None, Some((580, THU9)));
     let (units, earliest, before) = rise_of(&fx, Window::Week, H);
@@ -431,7 +444,7 @@ fn a_gap_in_the_readings_is_spread_over_it() {
         (580 - 573) * 20,
         "an eighth of the gap's rise, not all of it"
     );
-    let mut fx = Fx::new(&[("me", Class::Dedicated)]);
+    let mut fx = Fx::new(&[("me", Class::Preferred)]);
     fx.fig("me", NOW - 72 * H, None, Some((400, THU9)));
     fx.fig("me", NOW, None, Some((580, THU9)));
     let (units, _, _) = rise_of(&fx, Window::Week, 24 * H);
@@ -441,7 +454,7 @@ fn a_gap_in_the_readings_is_spread_over_it() {
         "a third of three days' rise falls in the last day"
     );
     // A row exactly at the lookback's start is the start, read as it is.
-    let mut fx = Fx::new(&[("me", Class::Dedicated)]);
+    let mut fx = Fx::new(&[("me", Class::Preferred)]);
     fx.fig("me", NOW - H, None, Some((570, THU9)));
     fx.fig("me", NOW, None, Some((580, THU9)));
     assert_eq!(rise_of(&fx, Window::Week, H).0, 10 * 20);
@@ -452,7 +465,7 @@ fn a_gap_in_the_readings_is_spread_over_it() {
 #[test]
 fn pace_refusals() {
     // Stale: the carrier's week read 3 h ago while a session runs on it.
-    let mut stale = Fx::new(&[("me", Class::Dedicated), ("alt1", Class::Dedicated)]);
+    let mut stale = Fx::new(&[("me", Class::Preferred), ("alt1", Class::Preferred)]);
     me_at_today(&mut stale);
     stale.state.accounts.clear();
     stale.read("me", None, Some((580, THU9)), NOW - 3 * H);
@@ -485,7 +498,7 @@ fn pace_refusals() {
     // Too early: the week began an hour ago (so it is known empty from then), read for 40
     // minutes; neither an hour of rise nor an hour-old week is enough.
     let early = |began: i64| {
-        let mut fx = Fx::new(&[("me", Class::Dedicated), ("alt1", Class::Dedicated)]);
+        let mut fx = Fx::new(&[("me", Class::Preferred), ("alt1", Class::Preferred)]);
         let reset = NOW + 7 * D - began;
         fx.fig("me", NOW - 40 * MIN, None, Some((10, reset)));
         fx.read("me", None, Some((30, reset)), NOW);
@@ -515,10 +528,10 @@ fn pace_refusals() {
 
     // No figure: the carrier's week was never read, or was read before a reset that has passed
     // since (that figure says nothing of this week).
-    let mut none = Fx::new(&[("me", Class::Dedicated), ("alt1", Class::Dedicated)]);
+    let mut none = Fx::new(&[("me", Class::Preferred), ("alt1", Class::Preferred)]);
     none.read("me", Some((100, NOW + H)), None, NOW);
     assert_eq!(none.outlook().demand.week.err(), Some(Refusal::NoFigure));
-    let mut passed = Fx::new(&[("me", Class::Dedicated), ("alt1", Class::Dedicated)]);
+    let mut passed = Fx::new(&[("me", Class::Preferred), ("alt1", Class::Preferred)]);
     passed.read("me", None, Some((580, NOW - H)), NOW - 2 * H);
     assert_eq!(
         passed.outlook().demand.week.err(),
@@ -540,24 +553,34 @@ fn class_of(fx: &Fx, label: &str, w: Window) -> Fresh {
         .expect("the row")
 }
 
-/// T7: EACH CLASS OF §6 FROM A FIXTURE, AND ONE BIT MOVES IT. Negative controls: `shared` turns
-/// `fresh-since-reset` into `reset-unread`; a `ran_at` after the reset does the same; a session
-/// after the reading turns `idle-here` into `used-since`.
+/// T7: EACH CLASS OF §6 FROM A FIXTURE, AND ONE BIT MOVES IT. A reset that passed unread is
+/// `reset-unread` whatever this Mac's order for the row, since any Mac may run an account (§0 of
+/// the lab model: a preference is no claim), so no row is counted fresh since its reset.
+/// Negative controls: a session after the reading turns `idle-here` into `used-since`; a
+/// `FreshSinceReset` arm restored for a preferred row turns `alt2` fresh (`no row is fresh`).
 #[test]
 fn freshness_one_bit() {
     let a = scenario_a();
     assert_eq!(class_of(&a, "me", Window::Week), Fresh::Now);
-    assert_eq!(class_of(&a, "alt1", Window::Week), Fresh::IdleHere);
-    assert_eq!(class_of(&a, "alt2", Window::Week), Fresh::FreshSinceReset);
+    assert_eq!(class_of(&a, "alt1", Window::Week), Fresh::Now);
+    assert_eq!(
+        class_of(&scenario_a_idle(), "alt1", Window::Week),
+        Fresh::IdleHere
+    );
+    assert_eq!(
+        class_of(&a, "alt2", Window::Week),
+        Fresh::ResetUnread,
+        "no row is fresh since a reset nobody read"
+    );
     assert_eq!(class_of(&a, "pool1", Window::Week), Fresh::Pool);
     assert_eq!(
         class_of(&scenario_c(), "pool1", Window::Week),
         Fresh::NeverRead
     );
 
-    let mut shared = scenario_a();
-    shared.roster.rows[2].class = Class::Shared;
-    assert_eq!(class_of(&shared, "alt2", Window::Week), Fresh::ResetUnread);
+    let mut pool = scenario_a();
+    pool.roster.rows[2].class = Class::Pool;
+    assert_eq!(class_of(&pool, "alt2", Window::Week), Fresh::ResetUnread);
 
     let mut ran = scenario_a();
     ran.ran("alt2", THU22 + H);
@@ -567,7 +590,7 @@ fn freshness_one_bit() {
     since.session("s-2", "alt2", THU22);
     assert_eq!(class_of(&since, "alt2", Window::Week), Fresh::ResetUnread);
 
-    let mut used = scenario_a();
+    let mut used = scenario_a_idle();
     used.session("s-alt1", "alt1", NOW - 2 * H);
     assert_eq!(class_of(&used, "alt1", Window::Week), Fresh::UsedSince);
 
@@ -630,9 +653,9 @@ fn random_fixture(draw: &mut Draw) -> Fx {
             (
                 names[i],
                 if draw.below(3) == 0 {
-                    Class::Shared
+                    Class::Pool
                 } else {
-                    Class::Dedicated
+                    Class::Preferred
                 },
             )
         })
@@ -783,8 +806,9 @@ fn replay_is_the_policy() {
 }
 
 /// T10: THE REPLAY SEES ONLY WHAT WAS OBSERVED. In A, `alt2`'s reset passed and nothing read it
-/// since, so the policy ranks it with no week reset, as the real one does, and `alt1` is picked.
-/// Negative control: writing the forecast's assumed reset into the clone picks `alt2`.
+/// since, so the policy ranks it with no week reset, as the real one does, and `alt1` is picked:
+/// another Mac may have run it since its reset.
+/// Negative control: writing a fresh week into the clone for the unread reset picks `alt2`.
 #[test]
 fn replay_sees_only_what_was_observed() {
     let out = scenario_a().outlook();
@@ -796,10 +820,6 @@ fn replay_sees_only_what_was_observed() {
             .collect::<Vec<_>>(),
         ["me", "alt1"]
     );
-    assert!(out.approx.iter().any(|a| matches!(
-        a,
-        Approx::FreshAssumed { label, next, .. } if label == "alt2" && *next == THU22 + 7 * D
-    )));
 }
 
 /// T11: THE SCENARIOS TO THE MINUTE, from the policy's own functions (the store's half-up whole
@@ -906,6 +926,22 @@ fn scenarios_to_the_minute() {
     );
 }
 
+/// A PREFERENCE IS NO CLAIM: `alt1` read three hours ago and idle here since is `idle-here`,
+/// and the replay counts its reading as a bound, as it does a pool row's, since another Mac may
+/// prefer and run it too (§0 of the lab model). So the idle A leans on alt1 where the same
+/// figure read now is continuous. Negative control (run): counting `idle-here` as exact
+/// (`Known::Exact` in `Fresh::known`) makes the idle A continuous.
+#[test]
+fn an_idle_preferred_row_is_a_bound() {
+    let idle = scenario_a_idle().outlook();
+    assert!(
+        matches!(&idle.verdict, Verdict::Lean { row, why: Fresh::IdleHere, .. } if row == "alt1"),
+        "the idle A leans on alt1: {:?}",
+        idle.verdict
+    );
+    assert_eq!(scenario_a().outlook().verdict, Verdict::Continuous);
+}
+
 /// T12: A LEAN BOUNDS BOTH WAYS: an unread row gives a lean with a worst-case stop and a best
 /// case. Negative control: taking the unread row as fresh shows `continuous`.
 #[test]
@@ -931,6 +967,377 @@ fn a_lean_bounds_both_ways() {
     assert!(out.verdict_words().unwrap().full.ends_with(" ?"));
 }
 
+#[test]
+fn unavailable_carriers_never_resume_from_a_quota_reset() {
+    for not_enrolled in [false, true] {
+        for proven in [false, true] {
+            let mut fx = Fx::new(&[("me", Class::Preferred)]);
+            me_at(&mut fx, 1000);
+            fx.credits = true;
+            fx.state.proven = proven;
+            if not_enrolled {
+                fx.roster.rows[0].dir = Some("/logins/me".into());
+                fx.enrolled.clear();
+            } else {
+                accounts::note_auth(&mut fx.state, "me", accounts::Auth::SignedOut, NOW);
+            }
+            let before = fx.state.clone();
+            let (out, trace) = outlook_traced(&fx.inputs());
+            assert_eq!(out.verdict, Verdict::Refused(Refusal::AccountUnavailable));
+            assert_eq!(out.carrier, None);
+            assert!(out.week.is_none() && out.working.is_none() && trace.is_empty());
+            assert_eq!(out.rows.len(), 1);
+            let window = out.rows[0].window(Window::Week).unwrap();
+            assert_eq!((window.reset, window.at), (Some(THU9), Some(NOW)));
+            assert_eq!(window.used_x10, None);
+            assert_eq!(fx.state, before);
+            fx.now = THU9 + 1;
+            let after_reset = fx.outlook();
+            assert_eq!(after_reset.verdict, out.verdict);
+            assert!(after_reset.week.is_none() && after_reset.working.is_none());
+
+            // An actual access change, unlike a quota reset, admits the same history.
+            fx.enrolled.insert("me".into());
+            accounts::note_auth(&mut fx.state, "me", accounts::Auth::Ok, NOW + 1);
+            fx.now = NOW + 1;
+            for mode in [Mode::Off, Mode::Wall, Mode::Early] {
+                fx.mode = mode;
+                for pinned in [false, true] {
+                    fx.state.pinned = pinned;
+                    let admitted = fx.outlook();
+                    assert_eq!(admitted.carrier.as_deref(), Some("me"));
+                    assert!(admitted.week.as_ref().unwrap().chain.iter().any(|link| {
+                        link.label == "me" && link.from >= THU9 && link.to > link.from
+                    }));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn available_alternatives_do_not_prove_a_signed_out_active_account() {
+    for alternate_pct in [310, 1000] {
+        let mut fx = Fx::new(&[("me", Class::Preferred), ("alt1", Class::Preferred)]);
+        me_at(&mut fx, 1000);
+        alt1_read(&mut fx, alternate_pct);
+        if alternate_pct == 1000 {
+            accounts::note_wall(
+                &mut fx.state,
+                "alt1",
+                accounts::WEEK_LIMIT,
+                Some(FRI14),
+                NOW,
+                NOW,
+            );
+        }
+        accounts::note_auth(&mut fx.state, "me", accounts::Auth::SignedOut, NOW);
+        fx.state.proven = false;
+        let before = fx.state.clone();
+        let (out, trace) = outlook_traced(&fx.inputs());
+        assert_eq!(out.carrier.as_deref(), Some("alt1"));
+        assert!(!trace.is_empty());
+        assert!(
+            trace
+                .iter()
+                .all(|decision| { decision.state.account("me").auth == accounts::Auth::SignedOut })
+        );
+        let mut passes: Vec<_> = out.week.iter().chain(out.working.iter()).collect();
+        while let Some(pass) = passes.pop() {
+            assert!(pass.chain.iter().all(|link| link.label != "me"));
+            if let Some(lean) = &pass.lean {
+                passes.push(&lean.worst);
+                passes.push(&lean.best);
+            }
+        }
+        assert!(out.rows.iter().all(|row| {
+            row.walled
+                .as_ref()
+                .is_none_or(|wall| wall.to.as_deref() != Some("me"))
+        }));
+        assert_eq!(fx.state, before);
+    }
+}
+
+#[test]
+fn retained_access_refusals_cannot_become_forecast_carriers() {
+    for blocker in 0..4 {
+        let mut fx = Fx::new(&[("me", Class::Preferred)]);
+        me_at(&mut fx, 1000);
+        match blocker {
+            0 => fx.roster.rows[0].held_by = Some("another-machine".into()),
+            1 => {
+                fx.state.prepared_accounts.insert("me".into());
+            }
+            2 => fx.state.note_lease("me", "another-machine", NOW + D, NOW),
+            3 => fx.state.unrecorded = true,
+            _ => unreachable!(),
+        }
+        let out = fx.outlook();
+        assert_eq!(out.verdict, Verdict::Refused(Refusal::AccountUnavailable));
+        assert!(out.carrier.is_none() && out.week.is_none() && out.working.is_none());
+        fx.roster.rows[0].held_by = None;
+        fx.state.prepared_accounts.clear();
+        fx.state.clear_lease("me");
+        fx.state.unrecorded = false;
+        assert!(fx.outlook().week.is_some());
+    }
+}
+
+#[test]
+fn enrollment_without_a_reading_remains_an_unknown_budget() {
+    let mut fx = Fx::new(&[("me", Class::Preferred)]);
+    let home = fx.outlook();
+    assert_eq!(home.carrier.as_deref(), Some("me"));
+    assert_eq!(home.verdict, Verdict::Refused(Refusal::NoFigure));
+    let mut missing = Fx::new(&[("me", Class::Preferred)]);
+    me_at_today(&mut missing);
+    missing.enrolled.clear();
+    let before = missing.state.clone();
+    let absent = missing.outlook();
+    assert_eq!(
+        absent.verdict,
+        Verdict::Refused(Refusal::AccountUnavailable)
+    );
+    assert!(absent.carrier.is_none() && absent.week.is_none() && absent.working.is_none());
+    assert_eq!(absent.rows[0].condition, accounts::Condition::NotEnrolled);
+    assert_eq!(missing.state, before);
+    fx.roster.rows[0].dir = Some("/logins/me".into());
+    let enrolled = fx.outlook();
+    assert_eq!(enrolled.carrier, home.carrier);
+    assert_eq!(enrolled.verdict, home.verdict);
+}
+
+#[test]
+fn rotation_off_does_not_replace_an_unavailable_current_account() {
+    let mut fx = Fx::new(&[("me", Class::Preferred), ("alt1", Class::Preferred)]);
+    me_at(&mut fx, 1000);
+    alt1_read(&mut fx, 310);
+    fx.mode = Mode::Off;
+    let limited = fx.outlook();
+    assert_eq!(limited.carrier.as_deref(), Some("me"));
+    assert!(
+        limited
+            .week
+            .as_ref()
+            .unwrap()
+            .chain
+            .iter()
+            .all(|link| link.label == "me")
+    );
+    accounts::note_auth(&mut fx.state, "me", accounts::Auth::SignedOut, NOW);
+    let unavailable = fx.outlook();
+    assert_eq!(unavailable.verdict, Verdict::Refused(Refusal::RotationOff));
+    assert!(unavailable.carrier.is_none() && unavailable.week.is_none());
+    fx.state.active = Some("removed".into());
+    let removed = fx.outlook();
+    assert_eq!(removed.verdict, Verdict::Refused(Refusal::RotationOff));
+    assert!(removed.carrier.is_none() && removed.week.is_none());
+    fx.state.active = None;
+    assert_eq!(fx.outlook().carrier.as_deref(), Some("alt1"));
+    fx.state.active = Some("me".into());
+    fx.mode = Mode::Early;
+    assert_eq!(fx.outlook().carrier.as_deref(), Some("alt1"));
+}
+
+#[test]
+fn a_custody_refused_pin_holds_only_while_the_active_account_runs() {
+    for pct in [580, 1000] {
+        for assigned_elsewhere in [false, true] {
+            let case = format!("pct={pct}, assigned_elsewhere={assigned_elsewhere}");
+            let mut fx = Fx::new(&[("me", Class::Preferred), ("alt1", Class::Preferred)]);
+            me_at(&mut fx, pct);
+            alt1_read(&mut fx, 310);
+            if pct == 1000 {
+                accounts::note_wall(
+                    &mut fx.state,
+                    "me",
+                    accounts::WEEK_LIMIT,
+                    Some(THU9),
+                    NOW,
+                    NOW,
+                );
+            }
+            assert_eq!(
+                matches!(
+                    accounts::condition(&fx.roster.rows[0], &fx.state, true, NOW),
+                    accounts::Condition::Limited { .. }
+                ),
+                pct == 1000,
+                "{case}"
+            );
+            fx.state.pinned = true;
+            if assigned_elsewhere {
+                fx.roster.rows[0].held_by = Some("another-machine".into());
+            } else {
+                fx.state.note_lease("me", "another-machine", NOW + D, NOW);
+            }
+            let held = fx.outlook();
+            if pct == 580 && !assigned_elsewhere {
+                assert_eq!(
+                    held.verdict,
+                    Verdict::Refused(Refusal::AccountUnavailable),
+                    "{case}"
+                );
+                assert!(held.carrier.is_none() && held.week.is_none(), "{case}");
+            } else {
+                assert_eq!(held.carrier.as_deref(), Some("alt1"), "{case}");
+                let mut passes = vec![held.week.as_ref().unwrap()];
+                let mut chain = Vec::new();
+                while let Some(pass) = passes.pop() {
+                    chain.extend(&pass.chain);
+                    if let Some(lean) = &pass.lean {
+                        passes.push(&lean.worst);
+                        passes.push(&lean.best);
+                    }
+                }
+                if assigned_elsewhere {
+                    assert!(
+                        chain.iter().all(|link| link.label != "me"),
+                        "{case}: {chain:?}"
+                    );
+                } else {
+                    let not_before = fx.state.leases["me"]
+                        .until
+                        .max(fx.state.accounts["me"].limited_until(NOW).unwrap());
+                    let resumed: Vec<_> = chain.iter().filter(|link| link.label == "me").collect();
+                    assert!(!resumed.is_empty(), "{case}: {chain:?}");
+                    assert!(
+                        resumed.iter().all(|link| link.from >= not_before),
+                        "{case}: {chain:?}"
+                    );
+                }
+            }
+            fx.state.pinned = false;
+            assert_eq!(
+                fx.outlook().carrier.as_deref(),
+                Some("alt1"),
+                "{case}: unpinned"
+            );
+        }
+    }
+}
+
+#[test]
+fn unavailable_pool_cards_keep_the_reason_and_observed_rows() {
+    let mut fx = scenario_b();
+    for label in ["me", "alt1"] {
+        accounts::note_auth(&mut fx.state, label, accounts::Auth::SignedOut, NOW);
+    }
+    for (mode, why) in [
+        (Mode::Early, Refusal::AccountUnavailable),
+        (Mode::Off, Refusal::RotationOff),
+    ] {
+        fx.mode = mode;
+        let out = fx.outlook();
+        let json = out.json();
+        assert_eq!(json["verdict"]["why"].as_str(), Some(why.word()));
+        assert!(json["passes"].as_array().unwrap().is_empty());
+        assert!(out.strip(56, 4).is_none());
+        assert!(
+            out.rows
+                .iter()
+                .flat_map(|row| &row.windows)
+                .all(|window| window.projection.is_none())
+        );
+        for room in [60, 44, 30] {
+            let rows = out.card_rows(Some("me"), room, None);
+            assert!(rows.iter().all(|row| row.width() <= room));
+            assert!(matches!(rows[0], CardRow::Note { .. }));
+            assert!(row_text(&rows[0]).contains(&why.words()));
+            let labels: Vec<_> = rows
+                .iter()
+                .filter_map(|row| match row {
+                    CardRow::Account { label, .. } => Some(label.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(labels, ["me", "alt1"]);
+        }
+    }
+}
+
+#[test]
+fn a_paused_session_keeps_pool_observations_without_service_advice() {
+    let raw = scenario_b().outlook();
+    let before = raw.clone();
+    assert!(raw.week.is_some());
+    let view = raw.observations_only(Refusal::SessionPaused);
+    assert_eq!(view.verdict, Verdict::Refused(Refusal::SessionPaused));
+    assert!(view.carrier.is_none() && view.week.is_none() && view.working.is_none());
+    assert!(view.not_needed.is_empty());
+    assert_eq!(
+        (view.as_of, view.mode, view.credits, view.demand),
+        (raw.as_of, raw.mode, raw.credits, raw.demand)
+    );
+    for (shown, observed) in view.rows.iter().zip(&raw.rows) {
+        assert_eq!(
+            (
+                &shown.label,
+                shown.active,
+                shown.condition,
+                &shown.plan,
+                shown.ran_at
+            ),
+            (
+                &observed.label,
+                observed.active,
+                observed.condition,
+                &observed.plan,
+                observed.ran_at
+            )
+        );
+        assert!(!shown.carrier && shown.walled.is_none());
+        assert_eq!(shown.windows.len(), observed.windows.len());
+        for (shown, observed) in shown.windows.iter().zip(&observed.windows) {
+            assert_eq!(
+                (
+                    shown.window,
+                    shown.used_x10,
+                    shown.reset,
+                    shown.at,
+                    shown.fresh,
+                    shown.source
+                ),
+                (
+                    observed.window,
+                    observed.used_x10,
+                    observed.reset,
+                    observed.at,
+                    observed.fresh,
+                    observed.source
+                )
+            );
+            assert!(shown.projection.is_none());
+        }
+    }
+    for width in [60, 44, 30] {
+        let labels: Vec<_> = view
+            .card_rows(Some("me"), width, None)
+            .into_iter()
+            .filter_map(|row| {
+                if let CardRow::Account { label, .. } = row {
+                    Some(label)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            raw.rows
+                .iter()
+                .map(|row| row.label.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(view.strip(width, 4).is_none());
+    }
+    assert_eq!(raw, before);
+    let mut busy = view.clone();
+    busy.verdict = Verdict::Refused(Refusal::ObserverBusy);
+    assert_eq!(raw.observations_only(Refusal::ObserverBusy), busy);
+}
+
 /// T13: THE BREAKER, `Mode::Off` AND CREDITS. The breaker gives a stop to its end; `off` gives the
 /// carrier alone; credits turn a stop into `→ credits`. Negative controls: each switch flipped.
 #[test]
@@ -938,13 +1345,13 @@ fn breaker_pin_off_credits() {
     // The breaker: five rotations in the last half hour on two rows, and `me` walls in minutes.
     let breaker = |rotations: bool| {
         let mut fx = Fx::new(&[
-            ("me", Class::Dedicated),
-            ("alt1", Class::Dedicated),
-            ("alt2", Class::Dedicated),
-            ("pool1", Class::Shared),
+            ("me", Class::Preferred),
+            ("alt1", Class::Preferred),
+            ("alt2", Class::Preferred),
+            ("pool1", Class::Pool),
         ]);
         me_at(&mut fx, 999);
-        alt1_idle(&mut fx, 310);
+        alt1_read(&mut fx, 310);
         if rotations {
             fx.state.rotations = (0..9).map(|i| NOW - (30 - i) * MIN).collect();
         }
@@ -1123,7 +1530,7 @@ fn replay_is_bounded() {
         .collect();
     let rows: Vec<(&str, Class)> = names
         .iter()
-        .map(|n| (n.as_str(), Class::Dedicated))
+        .map(|n| (n.as_str(), Class::Preferred))
         .collect();
     let mut fx = Fx::new(&rows);
     let week = NOW + 6 * D;
@@ -1169,11 +1576,11 @@ fn replay_is_bounded() {
 /// plan spends the 5x as slowly as the 20x.
 #[test]
 fn plan_multiples() {
-    let mut fx = Fx::new(&[("me", Class::Dedicated), ("five", Class::Dedicated)]);
+    let mut fx = Fx::new(&[("me", Class::Preferred), ("five", Class::Preferred)]);
     me_at(&mut fx, 970);
     fx.plan("five", "max", Some("5x"), NOW - D);
     fx.ran("five", NOW - 2 * D);
-    fx.read("five", None, Some((0, NOW + 6 * D)), NOW - H);
+    fx.read("five", None, Some((0, NOW + 6 * D)), NOW - 10 * MIN);
     let out = fx.outlook();
     let week = out.week.as_ref().unwrap();
     let five = week
@@ -1603,7 +2010,7 @@ fn a_row_taken_spent_walls_at_once() {
 /// advancing every carrier from its reading's instant ends its link two days early.
 #[test]
 fn an_idle_carrier_keeps_its_figure() {
-    let mut fx = Fx::new(&[("me", Class::Dedicated), ("alt1", Class::Dedicated)]);
+    let mut fx = Fx::new(&[("me", Class::Preferred), ("alt1", Class::Preferred)]);
     me_at_today(&mut fx);
     fx.plan("alt1", "max", Some("20x"), NOW - 3 * D);
     fx.ran("alt1", NOW - 2 * D - H);
@@ -1720,9 +2127,9 @@ fn a_leans_stop_ends_on_the_reset() {
     );
 }
 
-/// EVERY ASSUMPTION IS SAID ON THE CARD AND IN THE TEXT: A's `alt2` counted fresh past an
-/// unread reset, an unseen plan and mixed multiples each show, in the words the one renderer
-/// gives. Negative control: a card that leaves an assumption kind out misses A's `alt2`.
+/// EVERY ASSUMPTION IS SAID ON THE CARD AND IN THE TEXT: an unseen plan and mixed multiples
+/// each show, in the words the one renderer gives. Negative control: a card that leaves an
+/// assumption kind out misses it.
 #[test]
 fn every_assumption_is_said_on_the_card_and_in_the_text() {
     let mut fx = scenario_a();
@@ -1732,13 +2139,12 @@ fn every_assumption_is_said_on_the_card_and_in_the_text() {
         .approx
         .iter()
         .map(|a| match a {
-            Approx::FreshAssumed { .. } => "fresh",
             Approx::PlanAssumed { .. } => "plan",
             Approx::PlansAlike { .. } => "alike",
             Approx::MultiplesScaled => "scaled",
         })
         .collect();
-    for kind in ["fresh", "plan", "scaled"] {
+    for kind in ["plan", "scaled"] {
         assert!(kinds.contains(&kind), "A says {kind}: {:?}", out.approx);
     }
     let card: Vec<String> = out
@@ -1820,7 +2226,7 @@ fn the_glance_says_its_reset_aloud() {
 #[test]
 fn a_reset_past_a_daylight_change_is_said_on_its_own_clock() {
     const PST_FROM: i64 = 1_793_523_600;
-    let mut fx = Fx::new(&[("me", Class::Dedicated)]);
+    let mut fx = Fx::new(&[("me", Class::Preferred)]);
     fx.offset = |t| if t < PST_FROM { -7 * H } else { -8 * H };
     let reset = NOW + 7 * D - H;
     fx.plan("me", "max", Some("20x"), NOW - H);

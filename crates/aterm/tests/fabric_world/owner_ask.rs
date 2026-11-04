@@ -11,7 +11,7 @@ use aterm_uds::spawnfd::{Child as OwnedChild, Stdio as OwnedStdio};
 
 use super::harness::{
     self, DEADLINE, FIXTURE_GUI_CONFIG, FLEET, SECRET, World, cap_line, connect, connect_within,
-    kv, node_grants, until, write_cap,
+    kv, until, write_cap,
 };
 
 /// One private fabric: the production broker binary (`aterm link broker`, with the default rules
@@ -163,7 +163,12 @@ impl Inst {
         }
         std::fs::write(root.join("link/node"), format!("{node}\n")).expect("the node id");
         let cap = root.join("node.cap");
-        let caps: String = node_grants(node).iter().map(|g| cap_line(g)).collect();
+        let caps: String = astream_cap::GrantCeiling::aterm_node_ring(FLEET, node)
+            .expect("a node ring")
+            .rules()
+            .iter()
+            .map(|g| cap_line(g))
+            .collect();
         write_cap(&cap, caps);
         // The bridge command `aterm fabric on` writes (`enable::bridge_command`): this node's own
         // sessions' tasks arrive undemoted.
@@ -982,7 +987,9 @@ fn paced_mark(inst: &Inst, sid: &str, mark: &str) {
 /// A person's (here a program's, `a-<name>`) cap file in `inst`'s scratch.
 fn person_cap(inst: &Inst, person: &str) -> PathBuf {
     let path = inst.root.join(format!("{person}.cap"));
-    let caps: String = aterm_link::enable::person_grants(FLEET, person)
+    let caps: String = astream_cap::GrantCeiling::aterm_person_ring(FLEET, person)
+        .expect("a person ring")
+        .rules()
         .iter()
         .map(|g| cap_line(g))
         .collect();
@@ -2426,8 +2433,18 @@ fn restore_store(rel: &Path) -> bool {
     let Some(name) = rel.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
+    // A journal's write in flight is the same store: `crash_journal` creates its temporary
+    // (`.journal-<run>.w-<seed>.tmp`, 0600, beside the journal) and renames it over
+    // `journal-<run>.toml`, so a sweep that reads the folder while a live instance writes finds
+    // the journal's own sentinels in it.
+    let in_flight = name
+        .strip_prefix(".journal-")
+        .and_then(|rest| rest.strip_suffix(".tmp"))
+        .is_some_and(|rest| rest.contains(".w-"));
     rel.parent() == Some(Path::new("astate"))
-        && (name == "session.toml" || (name.starts_with("journal-") && name.ends_with(".toml")))
+        && (name == "session.toml"
+            || (name.starts_with("journal-") && name.ends_with(".toml"))
+            || in_flight)
 }
 
 /// Where the design keeps each sentinel on disk, by a file's path relative to an instance's root

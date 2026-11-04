@@ -88,6 +88,9 @@ pub struct OwnClaimFinding {
 /// An observed session decision, not an instruction to activate credentials.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct AccountProgress {
+    /// This pane's session policy withdrew future automatic recovery authority.
+    /// Independently observed work can still retain its in-flight phase.
+    pub forecasts_paused: bool,
     pub observed_at: i64,
     pub account: Option<String>,
     pub known: Option<usize>,
@@ -105,6 +108,7 @@ impl AccountProgress {
     #[must_use]
     pub fn unknown(observed_at: i64) -> Self {
         Self {
+            forecasts_paused: false,
             observed_at,
             account: None,
             known: None,

@@ -5,7 +5,8 @@
 
 Each §1 row is one property of `crates/aterm-release` that its tests sample, stated from the code.
 Once Trust/Clean proves a spec about the compiled function, the tests it subsumes are deleted. §2
-maps each test to its specs, §3 lists the tests that are not spec samples, and §4 the open findings.
+maps each test to its specs, §3 summarizes coverage, §4 lists the tests that are not spec samples,
+and §5 lists implied specs that look wrong or disagree with the code.
 
 > Status 2026-10-17: the rows naming 6 more deleted tests and 6 more specs whose functions are
 > gone (the deleted `build.rs`, the fixture-guard and census copies of step 4, the config-table
@@ -1387,9 +1388,9 @@ tests/it/trust_facts_model.rs	the_retired_floor_excuses_are_refused	tf-model-saf
 tests/it/trust_facts_model.rs	the_unchecked_reuse_reader_is_refused	tf-model-safety	judge-floor-rule
 ```
 
-## 3. Tests that are not spec samples
+## 3. Coverage
 
-- 909 tests read. 880 map to one of the 372 specs; 29 are not spec samples (§4). Every cited test exists in the tree, and every test in the tree is cited or listed in §4 (checked mechanically against the `#[test]` fns of `build.rs`, `src/**` and `tests/**`).
+- 909 tests originally read (880 mapped to 372 specs; 29 not spec samples in §4). After subsequent deletions and additions, the crate currently has 1,114 live `#[test]` functions in the tree (`build.rs` removed; 10 non-spec tests remain in §4).
 - Spec samples per file: src/apple.rs 10, src/buildplan.rs 18, src/bundle.rs 3, src/changelog.rs 10, src/channel.rs 15, src/clean.rs 3, src/dev_app.rs 12, src/dev_identity.rs 12, src/dmg.rs 1, src/gates.rs 56, src/linux_release.rs 9, src/machines.rs 10, src/provision.rs 20, src/publish.rs 45, src/release_steps.rs 21, src/sign.rs 7, src/site/diff.rs 1, src/site/engine.rs 4, src/site/hosting/files.rs 5, src/site/hosting/key.rs 2, src/site/hosting/rest.rs 3, src/site/hosting/tests.rs 14, src/site/linux.rs 5, src/site/mod.rs 4, src/site/notes.rs 3, src/site/pages.rs 7, src/site/releases.rs 11, src/site/sitemap.rs 2, src/site/toolchain.rs 5, src/site/world.rs 2, src/snapshot.rs 1, src/transforms.rs 4, src/trust_facts.rs 28, src/trust_lane.rs 103, src/trust_oblig.rs 4, src/verify.rs 8, tests/it/apple_tier.rs 44, tests/it/build_once.rs 9, tests/it/changelog_golden.rs 11, tests/it/channel_floor_model.rs 6, tests/it/channel_latest.rs 24, tests/it/claim_landing_model.rs 3, tests/it/durable_post_intent_model.rs 9, tests/it/handoff_policy_bundle.rs 2, tests/it/hooks.rs 12, tests/it/journal_prefix_model.rs 1, tests/it/ledger_race.rs 19, tests/it/machine_roster.rs 19, tests/it/plist_stamp.rs 10, tests/it/publisher_fence_liveness.rs 17, tests/it/publisher_fence_model.rs 5, tests/it/release_fixtures.rs 6, tests/it/release_flow.rs 59, tests/it/release_lease.rs 9, tests/it/resume.rs 47, tests/it/signconf.rs 12, tests/it/site_sync.rs 26, tests/it/snapshot_take.rs 15, tests/it/trust_facts_model.rs 6.
 - The biggest collapses (primary tests): `channel-head-safety` (12), `fence-reclaim-only-dead` (11), `rs-scan-release-page` (10), `plist-stamp-contract` (9).
 - 369 specs retire at least one test as primary. 3 specs are only secondary for every test they cite (another, more specific spec retires each one) but each states a property of its own (a composed path or a second function), so it is still proved: `rel-x86-probe-record`, `rel-slice-drives-session`, `rl-lease-mutual-exclusion`.
@@ -1421,8 +1422,6 @@ guard row, a `pub doctor` check or the bench, not in a function spec).
 | tests/it/export_policy.rs::the_export_selects_no_gitlink_and_none_of_the_withheld_files | Asserts what this repository's publish/manifest.txt selects: a guard over committed data. | move-to-bench |
 | tests/it/export_policy.rs::the_public_clone_command_reads_as_one_line_and_admits_only_a_public_version | Checks publish/config.sh's `CHECK_CMD_DEFAULT` and runs grep on it: a tree-content guard over a shell file. | move-to-bench |
 | tests/it/plist_stamp.rs::the_shipped_bundle_requires_native_execution | Template half is a data-file guard; stamping half follows from `plist-stamp-contract`. | move-to-bench |
-
-## 4. Implied specs that look wrong, or disagree with the code
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
@@ -1465,17 +1464,17 @@ guard row, a `pub doctor` check or the bench, not in a function spec).
 12. **Goldens as definitions.** `tests/it/site_sync.rs::a_release_sync_rewrites_rebuilds_commits_pushes_deploys_and_verifies`
     and `release_bodies_render_releases_when_the_public_tree_has_no_changelog` compare /releases to
     golden HTML and pin commit-message prose; `ss-pages-rewrite` takes the renderer as the definition.
-11. **Partial resume coverage.** `tests/it/release_flow.rs::a_run_stopped_at_any_step_resumes_there_and_repeats_nothing_done`
+13. **Partial resume coverage.** `tests/it/release_flow.rs::a_run_stopped_at_any_step_resumes_there_and_repeats_nothing_done`
     checks only the calls the first run made before its stop step; other tests sample the rest of
     `rf-resume-no-repeat`.
-12. **Model-only negative controls.** The `tests/it/trust_facts_model.rs` negative controls
+14. **Model-only negative controls.** The `tests/it/trust_facts_model.rs` negative controls
     (`the_pre_facts_receipt_reader_is_refused`, `the_unchecked_reuse_reader_is_refused`,
     `the_retired_floor_excuses_are_refused`) check that the model refuses a hand-built state, which
     holds whatever the code does (`tf-model-safety`); only their trailing `assemble()`/`judge()` calls
     sample production (`judge-floor-rule`).
-13. **Overlapping triage specs.** `rel-fresh-cut-triage` (one arm) is subsumed by
+15. **Overlapping triage specs.** `rel-fresh-cut-triage` (one arm) is subsumed by
     `rs-older-format-triage` (the whole table); prove the latter and retire both tests with it.
-17. **Literal `#[test]` in strings.** `src/transforms.rs` carries a `"#[test]"` inside a string
+16. **Literal `#[test]` in strings.** `src/transforms.rs` carries a `"#[test]"` inside a string
     literal (a fixture), so a naive count of the crate's tests is one too many.
 
 ## 6. The three specs I would prove first (easiest, high value)

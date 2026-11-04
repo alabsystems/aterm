@@ -2892,7 +2892,9 @@ pub(super) fn hand(
 /// the hold (log: true) names the policy's server: [\"http://127.0.0.1:…/v1/alab\"]".
 #[test]
 fn a_bundle_built_under_the_desks_hold_names_the_policys_servers() {
-    let policy_url = "http://policy-a.local:7484/v1/alab".to_owned();
+    // An `.invalid` name (RFC 6761) fails at once: a `.local` one waited out an mDNS lookup of
+    // five seconds on every sync that dialled it, 40 s of this test.
+    let policy_url = "http://policy-a.invalid:7484/v1/alab".to_owned();
     let policy = crate::swarm_roster::SwarmPolicy {
         servers: vec![policy_url.clone()],
         ..crate::swarm_roster::SwarmPolicy::default()

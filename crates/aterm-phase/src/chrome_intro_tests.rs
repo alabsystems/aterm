@@ -436,10 +436,11 @@ fn a_quoted_intro_in_the_transcript_is_not_the_intro() {
 }
 
 /// THE PANE TOO SHORT: an intro taller than its pane (20 columns in a 40-row pane, 16 in a 59-row
-/// one) has its rule, title and first rows scrolled off; it is not read whole, so it is not read,
-/// and nothing presses on it.
+/// one) has its rule, title and first rows scrolled off. It is read cut, `head_off_screen`, so a
+/// reader reads the rows above it again and a supervisor joins its head from the history; its
+/// confirm is never pressed off a cut read.
 #[test]
-fn an_intro_taller_than_its_pane_is_not_read() {
+fn an_intro_taller_than_its_pane_is_read_cut_and_never_confirmed() {
     for (width, text) in CHROME_INTRO_HEAD_OFF {
         let rows = screen(text);
         assert!(
@@ -450,13 +451,116 @@ fn an_intro_taller_than_its_pane_is_not_read() {
             !rows.iter().any(|r| r.trim() == TITLE),
             "{width}: PRECONDITION the title scrolled off"
         );
-        assert!(!is_intro(&rows), "{width}");
+        let p = parse_prompt_v2(&rows).unwrap_or_else(|| panic!("{width}: the cut intro"));
+        assert_eq!(p.kind, PromptKind::ChromeIntro, "{width}");
+        assert!(p.head_off_screen, "{width}");
+        assert_eq!(p.chrome_intro_confirm(), None, "{width}: never pressed cut");
+        assert_eq!(p.description, NOT_FOUND.join(" "), "{width}");
         let r = crate::reader::read(Some("claude"), &rows, None);
-        assert_ne!(
-            r.prompt.map(|p| p.kind),
-            Some(PromptKind::ChromeIntro),
+        assert!(
+            r.prompt
+                .is_some_and(|p| p.kind == PromptKind::ChromeIntro && p.head_off_screen),
             "{width}"
         );
+    }
+}
+
+/// REVIEW FINDING (2026-11-03): at 20 to 24 columns the intro is taller than the 40-row live zone
+/// the GUI and the supervisor classify, so in a pane tall enough to show it whole it was read
+/// nowhere: the zone cut its rule and title off. Every whole capture cut at every row a block
+/// starts below reads cut, its footer's Enter on the footer's row of the cut and its span ending
+/// on the cut's last drawn row, as a head joined from the history must match; the 20-column
+/// capture's live zone in a 60-row pane reads cut, and its whole screen whole.
+#[test]
+fn every_capture_cut_at_any_row_reads_cut() {
+    for (name, text, _, found) in all() {
+        let rows = screen(text);
+        let paragraphs: &[&str] = if found { &FOUND } else { &NOT_FOUND };
+        let title = title_at(&rows);
+        let (footer, last) = footer_at(&rows);
+        let mut cuts = 0;
+        for k in title..footer - 1 {
+            let cut = &rows[k..];
+            let p = parse_prompt_v2(cut).unwrap_or_else(|| panic!("{name} cut at {k}"));
+            assert_eq!(p.kind, PromptKind::ChromeIntro, "{name} cut at {k}");
+            assert!(p.head_off_screen, "{name} cut at {k}");
+            assert_eq!(p.chrome_intro_confirm(), None, "{name} cut at {k}");
+            assert_eq!(p.span.1, last - k, "{name} cut at {k}");
+            assert_eq!(
+                p.options.iter().map(|o| o.row).collect::<Vec<_>>(),
+                [footer - k],
+                "{name} cut at {k}"
+            );
+            assert!(
+                [NOT_FOUND.join(" "), FOUND.join(" ")].contains(&p.description),
+                "{name} cut at {k}: {}",
+                p.description
+            );
+            if k <= title_at(&rows) + 2 {
+                assert_eq!(p.description, paragraphs.join(" "), "{name} cut at {k}");
+            }
+            cuts += 1;
+        }
+        assert!(cuts >= 8, "{name}: {cuts} cuts");
+    }
+    let mut tall = inline(20);
+    let foot = tall.len();
+    tall.resize(60, String::new());
+    let zone = &tall[crate::reader::live_zone_start(&tall, 40)..];
+    assert!(
+        zone.len() < foot,
+        "PRECONDITION: the live zone cuts the intro"
+    );
+    let cut = parse_prompt_v2(zone).expect("the zone's cut intro");
+    assert!(cut.head_off_screen && cut.chrome_intro_confirm().is_none());
+    let whole = parse_prompt_v2(&tall).expect("the whole screen's intro");
+    assert!(!whole.head_off_screen && whole.chrome_intro_confirm().is_some());
+}
+
+/// NEGATIVE CONTROLS for the cut read: a cut in other words, further in, with a first row that
+/// starts inside a word that fits (no wrap Ink draws), its blocks apart, a ruleless title under a blank first row
+/// (no cut: the rule stands right over the title), a rule above it, or its footer's rows in other
+/// words, is no intro.
+#[test]
+fn a_cut_look_alike_is_not_the_intro() {
+    let rows = inline(40);
+    let k = row_of(&rows, "Requires the Chrome extension. Get");
+    let cut: Vec<String> = rows[k..].to_vec();
+    assert!(
+        parse_prompt_v2(&cut).is_some_and(|p| p.head_off_screen),
+        "CONTROL: the cut reads"
+    );
+    let mut cases: Vec<(&str, Vec<String>)> = vec![
+        ("one word changed", replaced(&cut, "Manage", "Change")),
+        (
+            "another docs link",
+            replaced(&cut, "docs/en/chro", "docs/en/brow"),
+        ),
+        (
+            "a footer in other words",
+            replaced(&cut, FOOTER, "Enter to select · Esc to cancel"),
+        ),
+    ];
+    let mut further = cut.clone();
+    further[0] = format!(" {}", cut[0]);
+    cases.push(("its first row further in", further));
+    let mut broken = cut.clone();
+    broken[0] = "  rome extension. Get".to_string();
+    cases.push(("a first row inside a word that fits", broken));
+    let mut apart = cut.clone();
+    apart.insert(1, String::new());
+    cases.push(("a paragraph's rows apart", apart));
+    let mut ruled = cut.clone();
+    ruled.insert(0, "─".repeat(40));
+    cases.push(("a rule over the cut", ruled));
+    let mut untitled = vec![String::new()];
+    untitled.extend(rows[title_at(&rows)..].iter().cloned());
+    cases.push(("a ruleless title under a blank row", untitled));
+    let mut transcript = vec!["⏺ Here is the intro:".to_string()];
+    transcript.extend(cut.iter().cloned());
+    cases.push(("a transcript row over it", transcript));
+    for (what, edited) in cases {
+        assert!(!is_intro(&edited), "{what}");
     }
 }
 

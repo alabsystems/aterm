@@ -49,8 +49,9 @@ pub const DOG_GLYPH_IDS: &[DogGlyphId] = &[
     DogGlyphId::D1Shepherd,
 ];
 
-/// Every breed head's const drawlist, indexed by [`DogGlyphId`] order.
-pub const DOG_GLYPHS: &[GlyphDef] = &[
+/// Every breed head's drawlist, indexed by [`DogGlyphId`] order.
+/// A `static`, so the binary holds one copy (a `const` is copied into each crate that reads it).
+pub static DOG_GLYPHS: &[GlyphDef] = &[
     // D1Beagle (d1_beagle)
     GlyphDef { id: "d1_beagle", kind: GlyphKind::Head, aspect_x1000: 1176, eye_y: 2048, center_x: 2048, word_top: 4096, layers: &[
         Layer { role: GlyphRole::Outline, recolor: Recolor::Fixed, fill: 0x2B2530, paths: &[

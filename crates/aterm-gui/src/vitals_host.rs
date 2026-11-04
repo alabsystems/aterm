@@ -250,6 +250,8 @@ pub(crate) static PROC_EDGE: ProcEdge = ProcEdge::new();
 #[derive(Default)]
 pub(crate) struct Handover {
     snap: Option<Arc<Snapshot>>,
+    sampled_at: Option<Instant>,
+    cpu_leases: Option<Arc<crate::native_allocation::ObservedCpu>>,
     /// When the probe thread began the oldest reading, handed over since the loop last adopted one,
     /// that carries `snap`'s jobs view, so the view is dated no later than its making. A reading
     /// with a new view restarts it, since an earlier reading's start (a `sys` pull's while the loop
@@ -309,6 +311,8 @@ fn due_at(
 /// What the loop asks the thread to read.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Request {
+    /// The Allocation view requests a nonblocking lease read on this worker.
+    pub(crate) allocation: bool,
     /// This process's pid (aterm's tree is rooted here).
     pub(crate) self_pid: u32,
     /// Every pane's shell: each terminal session a tab holds is its own root, so a split pane's
@@ -656,6 +660,9 @@ pub(crate) struct VitalsHost {
     latest: Arc<Mutex<Handover>>,
     /// The snapshot the Deck draws.
     pub(crate) snapshot: Option<Arc<Snapshot>>,
+    /// Worker read start, never the later UI adoption time.
+    pub(crate) sampled_at: Option<Instant>,
+    pub(crate) cpu_leases: Option<Arc<crate::native_allocation::ObservedCpu>>,
     /// When the held snapshot's jobs view was adopted: what a reading no window shows counts its
     /// next from ([`Self::windowless_due`]).
     pub(crate) adopted_at: Option<Instant>,
@@ -749,6 +756,8 @@ impl Default for VitalsHost {
             tried: false,
             latest: Arc::default(),
             snapshot: None,
+            sampled_at: None,
+            cpu_leases: None,
             adopted_at: None,
             read_began: None,
             full_adopted_at: None,
@@ -803,15 +812,20 @@ impl VitalsHost {
 
     /// Adopts the thread's newest snapshot if newer than the held one, along with its job events.
     pub(crate) fn adopt(&mut self, now: Instant) -> bool {
-        let (fresh, began, words, events) = {
+        let (fresh, began, words, events, leases, sampled_at) = {
             let mut h = self.latest.lock().unwrap_or_else(PoisonError::into_inner);
             (
                 h.snap.take(),
                 h.began.take(),
                 std::mem::take(&mut h.words),
                 std::mem::take(&mut h.job_events),
+                h.cpu_leases.take(),
+                h.sampled_at.take(),
             )
         };
+        if leases.is_some() {
+            self.cpu_leases = leases;
+        }
         self.job_events.extend(events);
         if self.job_events.len() > JOB_EVENTS_CAP {
             let over = self.job_events.len() - JOB_EVENTS_CAP;
@@ -852,6 +866,7 @@ impl VitalsHost {
                     now,
                 ));
                 self.prev_snapshot = self.snapshot.clone();
+                self.sampled_at = sampled_at;
                 self.read_began = began;
                 self.snapshot = Some(crate::strain_script::adopt(snap, now));
                 true
@@ -1367,7 +1382,19 @@ fn run(
             last_whole = Some(Instant::now());
         }
         let words = req.ttys.iter().map(TtyWord::seen).collect();
-        let jobs_moved = hand_over(latest, &snap, words, began);
+        let leases = req.allocation.then(|| {
+            Arc::new(crate::native_allocation::ObservedCpu {
+                value: if cfg!(test) {
+                    aterm_capacity::CpuObservation::Absent
+                } else {
+                    aterm_capacity::CpuObservation::read(
+                        aterm_capacity::ledger::user_dir().as_deref(),
+                    )
+                },
+                at: Instant::now(),
+            })
+        });
+        let jobs_moved = hand_over_allocation(latest, &snap, words, began, leases);
         crate::metrics::note_reading(crate::metrics::ReadingStep::Handed);
         if let Some(sys) = sys {
             sys.publish(snap, source.machine().unwrap_or(&no_machine));
@@ -1469,11 +1496,22 @@ fn keep_warm_events(warm: Snapshot, snap: &mut Snapshot) {
     snap.events = events;
 }
 
+#[cfg(test)]
 fn hand_over(
     latest: &Mutex<Handover>,
     snap: &Arc<Snapshot>,
     words: Vec<WordSeen>,
     began: Instant,
+) -> bool {
+    hand_over_allocation(latest, snap, words, began, None)
+}
+
+fn hand_over_allocation(
+    latest: &Mutex<Handover>,
+    snap: &Arc<Snapshot>,
+    words: Vec<WordSeen>,
+    began: Instant,
+    leases: Option<Arc<crate::native_allocation::ObservedCpu>>,
 ) -> bool {
     let events: Vec<_> = snap
         .events
@@ -1494,6 +1532,8 @@ fn hand_over(
         _ => began,
     });
     h.snap = Some(Arc::clone(snap));
+    h.sampled_at = Some(began);
+    h.cpu_leases = leases;
     h.words = words;
     let moved = !events.is_empty();
     h.job_events.extend(events);
@@ -3923,7 +3963,8 @@ impl crate::App {
                 .values()
                 .filter(|ws| crate::stats_deck::stats_drawn_on(ws))
         };
-        let in_view = self.deck_in_view()
+        let in_view = self.allocation_visible()
+            || self.deck_in_view()
             || (self.tabs_page_shown() && self.windows.values().any(|ws| !ws.occluded));
         // A resting window reads as one in the background ([`crate::window_rest`]).
         let focused = self
@@ -4029,6 +4070,11 @@ impl crate::App {
         }
         self.vitals.asked_at = Some(now);
         self.vitals.next_due = Some(now + period);
+        // Age is a UI fact even if the worker is delayed or its queue is full.
+        // Reuse this visible cadence; do not start a separate polling timer.
+        if self.allocation_visible() {
+            self.publish_allocation();
+        }
         self.ask_reading(now, period, machine_only, false);
         if self.tabs_page_shown() && self.harness_screen.fleet_sweep_due(now) {
             self.start_harness_stats_refresh_at(now);
@@ -4288,6 +4334,9 @@ impl crate::App {
         self.record_job_events();
         if !adopted {
             return false;
+        }
+        if self.allocation_visible() {
+            self.publish_allocation();
         }
         self.vitals.landed_period = audience
             .cadence(self.any_stats_lens_open())
@@ -4692,6 +4741,7 @@ impl crate::App {
         let now = aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(i64::MAX));
         let grant = self.vitals_grant(&tabs);
         Request {
+            allocation: self.allocation_visible(),
             self_pid: std::process::id(),
             tabs,
             ttys,

@@ -305,7 +305,8 @@ impl App {
                     | crate::native_app::AppViewState::SystemState(_)
                     | crate::native_app::AppViewState::Editor(_)
                     | crate::native_app::AppViewState::Recovery(_)
-                    | crate::native_app::AppViewState::Workers(_) => false,
+                    | crate::native_app::AppViewState::Workers(_)
+                    | crate::native_app::AppViewState::Allocation(_) => false,
                 });
             if changed && let Some(window) = self.windows.get_mut(&wid) {
                 window.last_present = None;
@@ -350,7 +351,8 @@ impl App {
                     | crate::native_app::AppViewState::SystemState(_)
                     | crate::native_app::AppViewState::Editor(_)
                     | crate::native_app::AppViewState::Recovery(_)
-                    | crate::native_app::AppViewState::Workers(_) => false,
+                    | crate::native_app::AppViewState::Workers(_)
+                    | crate::native_app::AppViewState::Allocation(_) => false,
                 });
             if changed && let Some(window) = self.windows.get_mut(&wid) {
                 window.last_present = None;
@@ -394,7 +396,8 @@ impl App {
                     | crate::native_app::AppViewState::SystemState(_)
                     | crate::native_app::AppViewState::Editor(_)
                     | crate::native_app::AppViewState::Recovery(_)
-                    | crate::native_app::AppViewState::Workers(_) => false,
+                    | crate::native_app::AppViewState::Workers(_)
+                    | crate::native_app::AppViewState::Allocation(_) => false,
                 });
             if changed && let Some(window) = self.windows.get_mut(&wid) {
                 window.last_present = None;
@@ -582,7 +585,8 @@ impl App {
                     | crate::native_app::AppViewState::SystemState(_)
                     | crate::native_app::AppViewState::Editor(_)
                     | crate::native_app::AppViewState::Recovery(_)
-                    | crate::native_app::AppViewState::Workers(_) => false,
+                    | crate::native_app::AppViewState::Workers(_)
+                    | crate::native_app::AppViewState::Allocation(_) => false,
                 });
             if changed && let Some(window) = self.windows.get_mut(&wid) {
                 window.last_present = None;

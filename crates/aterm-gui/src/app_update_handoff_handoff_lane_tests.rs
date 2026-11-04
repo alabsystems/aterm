@@ -3,7 +3,8 @@
 
 use super::{
     AdmissionInputs, HandoffLaneFacts, SameImageHandoff, SessionlessFacts, SessionlessLane,
-    app_bundle_root, launch_environment_over, out_of_band_lane_refusal, sessionless_lane,
+    app_bundle_root, launch_environment_over, out_of_band_lane_refusal, reread_passing,
+    sessionless_lane,
 };
 
 /// An attempt with nothing wrong with it.
@@ -256,12 +257,14 @@ fn carried_alone() -> SessionlessFacts {
         },
         same_image: false,
         verdict: Some(true),
+        image_kept: true,
     }
 }
 
 /// The sessionless lane agrees with the lane choice row for row, names a cause the verdict
 /// cannot change before it waits for an unread verdict, and lets a failed verdict through to
-/// be reported as the attempt's own failure (never as "cannot hand over").
+/// be reported as the attempt's own failure (never as "cannot hand over") on a kept image only:
+/// a replaceable image leaves it to the cold lane.
 #[test]
 fn the_sessionless_lane_is_the_launched_lane_with_windows_to_hand_over() {
     use SessionlessLane::{Cannot, Takes, Unread};
@@ -271,7 +274,7 @@ fn the_sessionless_lane_is_the_launched_lane_with_windows_to_hand_over() {
         edit(&mut facts.lane);
         facts
     };
-    let rows: [(&str, SessionlessFacts, SessionlessLane); 14] = [
+    let rows: [(&str, SessionlessFacts, SessionlessLane); 15] = [
         ("carried", base, Takes),
         (
             "no window",
@@ -340,6 +343,19 @@ fn the_sessionless_lane_is_the_launched_lane_with_windows_to_hand_over() {
                 ..base
             },
             Takes,
+        ),
+        (
+            "failed verdict, replaceable image: the cold lane's",
+            SessionlessFacts {
+                verdict: Some(false),
+                image_kept: false,
+                lane: HandoffLaneFacts {
+                    grant_empty: false,
+                    ..base.lane
+                },
+                ..base
+            },
+            Cannot("the new build failed its pre-park verification"),
         ),
         (
             "passed verdict, no sessionless grant declared",
@@ -528,4 +544,176 @@ fn a_kept_image_with_no_live_terminal_is_handed_over_not_refused() {
          which would close its held panes"
     );
     assert!(!app.kept_image_installs_at_next_launch());
+}
+
+/// REVIEW FINDING (2026-11-03): a replaceable image (one a cold relaunch can replace) with no
+/// terminal tab and a failed pre-park verdict cached lost its cold lane: the sessionless lane
+/// took the attempt and reported the stale verdict, refusing a person's Install for up to ten
+/// minutes after its cause was fixed. Before the sessionless lane, the press relaunched and the
+/// boot apply verified the stage again; it does so again, and a kept image, which has no cold
+/// lane, still reports the verdict as the attempt's own.
+#[test]
+fn a_failed_verdict_leaves_a_replaceable_image_with_no_terminal_to_the_cold_lane() {
+    use crate::native_update_admission::ApplyLane;
+    let mut app = crate::App::headless_for_test();
+    app.launch_image_kept = false;
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+    assert!(
+        app.handoff_exited_session_ids().is_empty(),
+        "PRECONDITION: no --hold pane the cold lane would close"
+    );
+    assert!(
+        !app.capture_handoff_layout().is_empty(),
+        "PRECONDITION: windows to hand over"
+    );
+    let ticket =
+        crate::native_updater_service::ApplyAttemptTicket::for_test(7, "", &"ab".repeat(32));
+    super::PreverifyPublisher::for_attempt(&app.handoff_preverified, Some(&ticket))
+        .expect("an attempt names its artifact")
+        .publish_refusal("the install location is not writable");
+    let lane = HandoffLaneFacts {
+        sessions: 0,
+        grant_empty: false,
+        ..eligible()
+    };
+    assert_eq!(
+        admit(&mut app, lane, Some(&ticket)).ok(),
+        Some(ApplyLane::Cold),
+        "the cold lane, whose gate lets a person's press relaunch and verify again"
+    );
+    assert_eq!(app.sessionless_handoff_refused, None);
+    assert!(
+        app.cold_lane_verdict_gate(
+            crate::native_updater_service::ApplyMode::Immediate,
+            Some(&ticket)
+        )
+        .is_ok(),
+        "a person's press goes ahead on the cold lane"
+    );
+    app.launch_image_kept = true;
+    assert_eq!(
+        admit(&mut app, lane, Some(&ticket)).ok(),
+        Some(ApplyLane::Seamless),
+        "CONTROL: a kept image reports the verdict as the attempt's own"
+    );
+}
+
+/// REVIEW FINDING (2026-11-03): an attempt with no terminal session read its targeted stage
+/// again whenever its last read ended without a verdict, so a stage waiting for an update check
+/// to confirm its signer spun a person's held Install through back-to-back reads (every 20 ms)
+/// and the automatic lane through one every 500 ms. A signer wait is now held for that check,
+/// as the cold lane holds it, and any other passing cause is read again once per wait.
+#[test]
+fn a_sessionless_read_that_ends_without_a_verdict_is_never_read_again_in_a_loop() {
+    use crate::native_updater_service::{ApplyAttemptTicket, ApplyMode};
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Instant;
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let commit = "0123456789abcdef0123456789abcdef01234567";
+    let artifact = "ab".repeat(32);
+    let mut app = crate::App::headless_for_test();
+    let target = crate::running_build_number().saturating_add(1);
+    let ticket = ApplyAttemptTicket::for_test(target, commit, &artifact);
+    let roster = format!(
+        "staged update failed pre-park verification: staged build {target} has not been {} on \
+         this Mac, so a revocation of its signer could have been missed; it installs once the \
+         next update check confirms it ({})",
+        aterm_update::ROSTER_UNCONFIRMED_KEY,
+        aterm_update::PASSING_REFUSAL_KEY
+    );
+    let lock = format!(
+        "staged update failed pre-park verification: lock: could not take the apply lock \
+         within 10s (another aterm holds it) ({})",
+        aterm_update::PASSING_REFUSAL_KEY
+    );
+    assert!(aterm_update::is_roster_confirmation_wait(&roster));
+    assert!(
+        !aterm_update::is_roster_confirmation_wait(&lock)
+            && aterm_update::is_passing_refusal(&lock)
+    );
+    let ended_passing = |reason: &str| {
+        let passing = Arc::new(std::sync::OnceLock::new());
+        passing
+            .set(crate::PassingPreverification {
+                reason: reason.to_string(),
+                ended: Instant::now(),
+            })
+            .unwrap();
+        crate::PreverifyInFlight {
+            build: target,
+            commit: commit.to_string(),
+            artifact: artifact.clone(),
+            deadline: Instant::now() + crate::HANDOFF_PREVERIFY_READ_CEILING,
+            done: Arc::new(AtomicBool::new(true)),
+            passing,
+        }
+    };
+    let deadline = |app: &crate::App| {
+        app.handoff_preverify_in_flight
+            .as_ref()
+            .map(|read| read.deadline)
+    };
+
+    // The re-read rule.
+    let now = Instant::now();
+    let earlier = now
+        .checked_sub(std::time::Duration::from_secs(1))
+        .expect("a second of uptime");
+    assert!(reread_passing(&lock, now, None), "a read before any wait");
+    assert!(
+        reread_passing(&lock, earlier, Some(now)),
+        "a read before this wait"
+    );
+    assert!(
+        !reread_passing(&lock, now, Some(now)),
+        "the read this wait started"
+    );
+    assert!(
+        reread_passing(&roster, now, Some(now)),
+        "a signer wait the roster gate let through"
+    );
+
+    // A signer wait holds a person's press for the check, starting no read and arming nothing.
+    app.handoff_preverify_in_flight = Some(ended_passing(&roster));
+    let before = deadline(&app);
+    let held = app
+        .sessionless_preverify_wait(ApplyMode::Immediate, &ticket)
+        .expect("the attempt waits for the check");
+    assert!(held.is_activity_deferred(), "charged nothing: {held:?}");
+    assert!(
+        aterm_update::is_roster_confirmation_wait(&held.to_string()),
+        "and names the wait: {held}"
+    );
+    assert_eq!(deadline(&app), before, "no read started");
+    assert_eq!(app.auto_apply_intent, None, "a person's press arms nothing");
+    // The automatic lane holds for it too, due when the hold asks again.
+    let held = app
+        .sessionless_preverify_wait(ApplyMode::Automatic, &ticket)
+        .expect("the attempt waits for the check");
+    assert!(held.is_activity_deferred(), "{held:?}");
+    let wait = app.auto_apply_roster_wait.clone().expect("the lane holds");
+    assert_eq!(wait.build, target);
+    assert!(
+        app.auto_apply_intent
+            .is_some_and(|intent| intent.build == target && intent.retry_at == wait.reread_at)
+    );
+    assert_eq!(deadline(&app), before, "no read started");
+
+    // Any other passing cause of a read this wait started is the attempt's failure.
+    app.auto_apply_roster_wait = None;
+    app.auto_apply_intent = None;
+    let read = ended_passing(&lock);
+    app.preverify_read_waited = Some((target, read.deadline));
+    app.handoff_preverify_in_flight = Some(read);
+    let before = deadline(&app);
+    let failed = app
+        .sessionless_preverify_wait(ApplyMode::Immediate, &ticket)
+        .expect("the read answered the attempt");
+    assert!(
+        !failed.is_activity_deferred() && !failed.is_refused(),
+        "a Failed, tried again later: {failed:?}"
+    );
+    assert!(failed.to_string().contains("tried again later"), "{failed}");
+    assert_eq!(deadline(&app), before, "no read started");
 }

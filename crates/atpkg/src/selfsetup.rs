@@ -1899,15 +1899,23 @@ fn self_uninstall_with_acaffiene(
     }
 
     for bd in p.bin_dirs() {
-        let atpkg_link = bd.join("atpkg");
-        if let Some(t) = link_target(&atpkg_link) {
-            if t.contains("/aterm.app/Contents/MacOS/") {
-                rm_link(&mut s, p, &atpkg_link, "atpkg command");
-            } else {
-                s.skip(
-                    &atpkg_link.display().to_string(),
-                    "symlink points outside an aterm bundle",
-                );
+        // The bundle's alias links the hooks pass lays beside `aterm` (`hooks::COMMAND_LINKS`):
+        // each goes with the bundle, and a link elsewhere is someone's own.
+        for (name, what) in [
+            ("atpkg", "atpkg command"),
+            ("amacs", "amacs command"),
+            ("agh", "agh command"),
+        ] {
+            let alias_link = bd.join(name);
+            if let Some(t) = link_target(&alias_link) {
+                if t.contains("/aterm.app/Contents/MacOS/") {
+                    rm_link(&mut s, p, &alias_link, what);
+                } else {
+                    s.skip(
+                        &alias_link.display().to_string(),
+                        "symlink points outside an aterm bundle",
+                    );
+                }
             }
         }
         let bin = bd.join("aterm");

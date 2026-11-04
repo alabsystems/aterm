@@ -25,7 +25,7 @@ fn preparation_case(moving: bool, default: bool, case: i64) -> ([(&'static str, 
         // Make the selected failure precede the alternative in candidate order.
         for row in &mut roster.rows {
             if row.label == other {
-                row.class = accounts::Class::Shared;
+                row.class = accounts::Class::Pool;
             }
         }
         std::fs::write(

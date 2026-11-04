@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Recover an absent account by a retained provider key and its current profile.
+//! Recover an absent or departing account by its retained key and current profile.
 
 use super::*;
 
@@ -38,7 +38,12 @@ pub(super) fn find(
         .collect();
     let mut candidates: BTreeMap<String, Vec<Recovery>> = BTreeMap::new();
     for (from, record) in &state.accounts {
-        if existing.row(from).is_some() || moves.iter().any(|(source, _)| source == from) {
+        if moves.iter().any(|(source, _)| source == from)
+            || existing.row(from).is_some_and(|old| {
+                old.expected_identity_email().is_none()
+                    || next.rows.iter().any(|row| same_account(old, row))
+            })
+        {
             continue;
         }
         let Some(key) = record.key else {
@@ -68,13 +73,17 @@ pub(super) fn find(
         }
         let mut others = logins.clone();
         others.labels.remove(from);
-        if accounts::naming_row(
-            existing.rows.iter().filter(|old| !same_account(old, row)),
-            &dir,
-        )?
-        .is_some()
-            || accounts::retained_directory_owner(&others, &existing.rows, &row.label, &dir)?
-                .is_some()
+        // This source either already left or its declared account leaves in this sync.
+        // Only its own old row/binding may relinquish the checked directory.
+        let owners: Vec<_> = existing
+            .rows
+            .iter()
+            .filter(|old| old.label != *from)
+            .cloned()
+            .collect();
+        if accounts::naming_row(owners.iter().filter(|old| !same_account(old, row)), &dir)?
+            .is_some()
+            || accounts::retained_directory_owner(&others, &owners, &row.label, &dir)?.is_some()
             || accounts::shared_staging_retained(logins, &dir)?
         {
             continue;
@@ -115,6 +124,11 @@ pub(super) fn find(
 
 impl Recovery {
     pub(super) fn restore(&self, logins: &mut accounts::Logins, label: &str) {
+        // A canonical address can change without moving either the label or directory.
+        // Retire old parents even when move_accounts sees a same-label pair.
+        logins
+            .pending_sign_in_invalidations
+            .insert(label.to_owned());
         if let Some(binding) = logins.labels.get_mut(label) {
             binding.dir = Some(self.dir.clone());
         }

@@ -1761,7 +1761,7 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
     if !(filled("stub.port") && filled("proxy.port")) {
         eprint!(
             "{}",
-            fs::read_to_string(run.run.join("stub.out")).unwrap_or_default()
+            crate::util::read_regular_text(&run.run.join("stub.out")).unwrap_or_default()
         );
         return Err(abort(&run, &started, "the stub did not start"));
     }
@@ -1824,7 +1824,7 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
     if let Err(e) = start_instance(&mut run, o.scale.as_deref(), o.lifeline) {
         eprint!(
             "{}",
-            fs::read_to_string(run.run.join("aterm.out")).unwrap_or_default()
+            crate::util::read_regular_text(&run.run.join("aterm.out")).unwrap_or_default()
         );
         let msg = if e == "interrupted" {
             e

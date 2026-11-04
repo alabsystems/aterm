@@ -1169,7 +1169,10 @@ fn service_at(app: &mut crate::App, mono: Instant, wall: i64) {
     );
 }
 
-fn with_progress_writer<T: Send, R>(writer: &Mutex<T>, run: impl FnOnce() -> R) -> R {
+pub(in crate::harness_host) fn with_progress_writer<T: Send, R>(
+    writer: &Mutex<T>,
+    run: impl FnOnce() -> R,
+) -> R {
     std::thread::scope(|scope| {
         let (ready, held) = std::sync::mpsc::channel();
         let (release, released) = std::sync::mpsc::channel::<()>();
@@ -1266,6 +1269,19 @@ fn off_policy_reads_are_nonblocking_and_a_changed_verdict_cannot_publish() {
             assert!(model.fire("Deliver", &mut policy));
             let view =
                 crate::harness_recovery_verb::snapshot(&ctx.timeline.lock().unwrap()).unwrap();
+            assert!(
+                !view.forecasts_paused,
+                "the stale read establishes no new policy verdict"
+            );
+            assert_eq!(
+                ctx.timeline
+                    .lock()
+                    .unwrap()
+                    .claude_footer()
+                    .unwrap()
+                    .account_forecast_refusal(),
+                Some(aterm_agent::harness::outlook::Refusal::ObserverBusy)
+            );
             let (epoch, record_epoch, record_value) = {
                 let kept = kept.lock().unwrap();
                 (
@@ -1320,6 +1336,11 @@ fn off_policy_reads_are_nonblocking_and_a_changed_verdict_cannot_publish() {
         assert!(facts.account_progress_busy);
         assert_eq!(facts.account_progress, retained);
         assert_eq!(facts.account_progress_view().unwrap().next_at, None);
+        assert!(!facts.account_progress_view().unwrap().forecasts_paused);
+        assert_eq!(
+            facts.account_forecast_refusal(),
+            Some(aterm_agent::harness::outlook::Refusal::ObserverBusy)
+        );
         assert_eq!(
             app.harness_progress_next_poll,
             Some(start + Duration::from_secs(1))
@@ -1333,6 +1354,10 @@ fn off_policy_reads_are_nonblocking_and_a_changed_verdict_cannot_publish() {
             .unwrap()
             .clone();
         assert!(!facts.account_progress_busy);
+        assert_eq!(
+            facts.account_progress_view().unwrap().forecasts_paused,
+            change_policy
+        );
         assert_eq!(
             facts.account_progress_view().unwrap().phase,
             if change_policy {
@@ -1377,6 +1402,7 @@ fn off_without_a_retained_session_is_explicit_but_invents_no_account() {
     }
     let progress = read(&host).unwrap();
     assert_eq!(progress.phase, ProgressPhase::Paused);
+    assert!(progress.forecasts_paused);
     assert_eq!(
         (
             progress.observed_at,
@@ -1445,6 +1471,7 @@ fn an_off_observation_cannot_cross_a_rebound_process_or_conversation() {
         let facts = timeline.claude_footer().unwrap();
         assert_eq!(facts.account_progress, None);
         assert!(!facts.account_progress_busy);
+        assert!(!facts.account_forecasts_paused());
     }
 }
 

@@ -11,6 +11,7 @@ use aterm_json::{Value, json};
 use super::{
     DEADLINE, FLEET, PID_POLL, attach_rows, await_attach, await_note, boot_world, list_since, ms,
     ms_opt, newest_id, post, presence_subject, read_pid, sampled, served_line, stop_and_read,
+    tallies,
 };
 use crate::census;
 use crate::clock::{Clock, Heads};
@@ -60,6 +61,9 @@ struct Timed {
     took_first: bool,
     /// The gap's post visible in its recipient's inbox.
     t_seen: u64,
+    /// Its row in that inbox, and its record's offset.
+    seen: u64,
+    gap_off: u64,
 }
 
 /// One handoff: what the bench knew before it, what it timed, and the heads
@@ -144,20 +148,28 @@ fn hand_off(
         t_pid,
         took_first,
         t_seen,
+        seen: woke_at,
+        gap_off: listed[0].off,
     }
 }
 
 /// The handoff world: boot, hand the node off `rounds` times, read the log.
 pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     eprintln!("fabric bench: booting the handoff world");
-    let mut w = boot_world("fbench-ho", spec, &[QUIT_BYE]);
+    let mut w = boot_world("fbench-ho", spec, &tallies::world_env(spec, &[QUIT_BYE]));
     w.wait_ready();
     let served = served_line(&w, spec);
     let node_subject = presence_subject(&w, "node");
     eprintln!("fabric bench: handoff, {} round(s)", spec.rounds);
     let mut rounds = Vec::with_capacity(spec.rounds);
+    // A round is one handoff: the successor bridge's whole life, and the successor aterm's
+    // handlers from just before the quit to its attach's last row.
+    let mut counted = spec.tally.then(|| tallies::Tallies::of(&w));
     for n in 1..=spec.rounds {
-        let succ = w.successor_instance(n, &[QUIT_BYE]);
+        if let Some(t) = &counted {
+            t.free_handlers();
+        }
+        let succ = w.successor_instance(n, &tallies::world_env(spec, &[QUIT_BYE]));
         until("the successor's bridge to stand by on the held dir", || {
             let h = succ.fabric_status();
             (kv(&h, "state") == Some("stalled") && kv(&h, "reason") == Some("state-locked"))
@@ -180,6 +192,18 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             .as_ref()
             .expect("the world serves its own broker")
             .visible_head();
+        if let Some(t) = counted.as_mut() {
+            let mut ctl = succ.ctl();
+            let at = tallies::At {
+                bridge: old_pid,
+                through: 0,
+                sid: &to,
+                since: newest_id(&mut ctl, &to),
+            };
+            let now = t.read(&w, &mut ctl, succ.pid(), &at);
+            t.rebase(now);
+            t.free_wait();
+        }
         let (timed, heads) = sampled(&w, clock, || {
             hand_off(
                 &w,
@@ -191,6 +215,16 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
                 phase_of(n, spec.rounds),
             )
         });
+        if let Some(t) = counted.as_mut() {
+            let at = tallies::At {
+                bridge: timed.pid,
+                through: timed.gap_off,
+                sid: &to,
+                since: timed.seen,
+            };
+            let now = t.read(&w, &mut succ.ctl(), succ.pid(), &at);
+            t.round("handoff", format!("handoff {n}"), now);
+        }
         until("the old instance to exit after its quit", || {
             w.gui.as_mut()?.try_wait().ok().flatten()
         });
@@ -358,7 +392,7 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         .into_iter()
         .map(|(class, k)| (class, json!(stats::round3(k as f64 / n.max(1) as f64))))
         .collect();
-    let json = json!({
+    let mut json = json!({
         "node": w.node.clone(),
         "served": served.trim_end(),
         "handoffs": n,
@@ -378,6 +412,7 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         "fired_wills_not_counted": stats::to_json(&fired_counts),
         "rounds_detail": Value::Array(detail),
     });
+    tallies::report(counted.as_ref(), &mut json, &mut md);
     (json, md)
 }
 

@@ -3,10 +3,10 @@
 
 //! [`super::System::catch_stops`]'s and [`super::System::defer_stops`]'s live arms: catches
 //! SIGINT, SIGTERM, SIGHUP and SIGQUIT, and leaves one already ignored (`nohup`, `trap '' HUP`)
-//! ignored.
+//! ignored. [`say_on_stop`] says one line at such a stop and lets it end the process.
 
 use std::ffi::c_int;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, Ordering};
 
 const STOPS: [c_int; 4] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
 
@@ -17,6 +17,105 @@ extern "C" fn note(sig: c_int) {
     let _ = CAUGHT.compare_exchange(0, sig, Ordering::SeqCst, Ordering::SeqCst);
 }
 
+/// The line [`say_on_stop`]'s handler writes, one pointer the handler reads whole.
+static SAID: AtomicPtr<&'static str> = AtomicPtr::new(std::ptr::null_mut());
+
+/// Whether [`say_on_stop`]'s handler wrote its line since it was armed: a second stop that
+/// meets the handler before the first ends the process says nothing more.
+static SPOKEN: AtomicBool = AtomicBool::new(false);
+
+/// [`say_on_stop`]'s handler (async-signal-safe: atomics, `write`, `sigaction`, `raise` and
+/// `_exit` only): the line on standard error once, a terminal gone with its tab being no error,
+/// then the stop again. The signal's disposition goes back to its default first, so the stop
+/// sent again (held until the handler returns, as the kernel holds a signal while its own
+/// handler runs) ends the process as it would have; a default SIGQUIT would dump core and write
+/// a crash report, so it exits with the shell's status for it, as [`resend`] does.
+extern "C" fn say_then_stop(sig: c_int) {
+    let said = SAID.load(Ordering::SeqCst);
+    if !said.is_null() && !SPOKEN.swap(true, Ordering::SeqCst) {
+        // SAFETY: a non-null `SAID` is a leaked `&'static str` [`say_on_stop`] stored, never
+        // freed or written through; its bytes live as long as the process and are only read.
+        let line: &'static str = unsafe { *said };
+        // SAFETY: `write` reads `line.len()` bytes from `line`, which holds them.
+        let _ = unsafe { libc::write(libc::STDERR_FILENO, line.as_ptr().cast(), line.len()) };
+    }
+    if sig == libc::SIGQUIT {
+        // SAFETY: `_exit` takes an integer and ends the process at once.
+        unsafe { libc::_exit(128 + sig) };
+    }
+    // SAFETY: as in `arm`.
+    let mut default: libc::sigaction = unsafe { std::mem::zeroed() };
+    default.sa_sigaction = libc::SIG_DFL;
+    // SAFETY: the default disposition for `sig`; nothing reads the one it replaces.
+    let _ = unsafe { libc::sigaction(sig, &default, std::ptr::null_mut()) };
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the stop sent again to its default disposition, which for SIGINT, SIGTERM and \
+                  SIGHUP dumps no core; SIGQUIT exits above"
+    )]
+    // SAFETY: `raise` takes an integer and touches no memory of ours.
+    let _ = unsafe { libc::raise(sig) };
+}
+
+/// [`say_on_stop`]'s handle: the dispositions it replaced, put back as it drops.
+struct Saying {
+    was: [(c_int, Option<libc::sigaction>); 4],
+}
+
+impl Drop for Saying {
+    fn drop(&mut self) {
+        put_back(&self.was);
+    }
+}
+
+/// Until the returned handle drops, a stop ([`STOPS`]) writes `line` (its newline included) to
+/// standard error and then ends the process as that stop would have. A signal this process
+/// ignores already stays ignored, as [`catch`] leaves it. A catch armed inside it
+/// ([`super::System::catch_stops`], [`super::System::defer_stops`]) replaces it while it lives
+/// and puts it back as it drops, so the stop a deferral sends again says the line too.
+pub fn say_on_stop(line: &'static str) -> Box<dyn std::any::Any> {
+    // One leaked reference per arm (a process arms it once), so the handler reads the line
+    // through one atomic pointer, never a pointer and a length a second arm could split.
+    SAID.store(Box::into_raw(Box::new(line)), Ordering::SeqCst);
+    SPOKEN.store(false, Ordering::SeqCst);
+    // SAFETY: as in `arm`.
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = say_then_stop as extern "C" fn(c_int) as libc::sighandler_t;
+    action.sa_flags = libc::SA_RESTART;
+    Box::new(Saying {
+        was: STOPS.map(|sig| replace_unless_ignored(sig, &action)),
+    })
+}
+
+/// Set `sig`'s disposition to `action` unless this process ignores it: the one it replaced, or
+/// `None` where it is ignored or could not be set.
+fn replace_unless_ignored(
+    sig: c_int,
+    action: &libc::sigaction,
+) -> (c_int, Option<libc::sigaction>) {
+    // SAFETY: as in `arm`.
+    let mut was: libc::sigaction = unsafe { std::mem::zeroed() };
+    // SAFETY: reads `sig`'s action only.
+    if unsafe { libc::sigaction(sig, std::ptr::null(), &mut was) } != 0
+        || was.sa_sigaction == libc::SIG_IGN
+    {
+        return (sig, None);
+    }
+    // SAFETY: a valid disposition for `sig`; the one it replaces is `was`, read above.
+    let set = unsafe { libc::sigaction(sig, action, std::ptr::null_mut()) } == 0;
+    (sig, set.then_some(was))
+}
+
+/// Put back each disposition [`replace_unless_ignored`] replaced.
+fn put_back(was: &[(c_int, Option<libc::sigaction>)]) {
+    for (sig, was) in was {
+        if let Some(was) = was {
+            // SAFETY: puts back the whole action `replace_unless_ignored` replaced for `sig`.
+            unsafe { libc::sigaction(*sig, was, std::ptr::null_mut()) };
+        }
+    }
+}
+
 struct Catching {
     was: [(c_int, Option<libc::sigaction>); 4],
     /// Send a noted stop again once every disposition is back ([`defer`]).
@@ -25,12 +124,7 @@ struct Catching {
 
 impl Drop for Catching {
     fn drop(&mut self) {
-        for (sig, was) in &self.was {
-            if let Some(was) = was {
-                // SAFETY: puts back the whole action `arm` replaced for `sig`.
-                unsafe { libc::sigaction(*sig, was, std::ptr::null_mut()) };
-            }
-        }
+        put_back(&self.was);
         // Read once every disposition is back: a stop noted before its own came back is here,
         // and one after it met that disposition itself.
         let noted = CAUGHT.swap(0, Ordering::SeqCst);
@@ -88,20 +182,10 @@ fn arm(resend: bool) -> Box<dyn std::any::Any> {
     let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
     action.sa_sigaction = note as extern "C" fn(c_int) as libc::sighandler_t;
     action.sa_flags = libc::SA_RESTART;
-    let was = STOPS.map(|sig| {
-        // SAFETY: as above.
-        let mut was: libc::sigaction = unsafe { std::mem::zeroed() };
-        // SAFETY: reads `sig`'s action only.
-        if unsafe { libc::sigaction(sig, std::ptr::null(), &mut was) } != 0
-            || was.sa_sigaction == libc::SIG_IGN
-        {
-            return (sig, None);
-        }
-        // SAFETY: a valid disposition for `sig`; the one it replaces is `was`, read above.
-        let set = unsafe { libc::sigaction(sig, &action, std::ptr::null_mut()) } == 0;
-        (sig, set.then_some(was))
-    });
-    Box::new(Catching { was, resend })
+    Box::new(Catching {
+        was: STOPS.map(|sig| replace_unless_ignored(sig, &action)),
+        resend,
+    })
 }
 
 /// Set SIGHUP and SIGPIPE to `SIG_IGN` for good ([`super::System::ignore_hangups`]).
@@ -269,6 +353,98 @@ mod tests {
             0,
             "a deferral that noted nothing sends nothing"
         );
+    }
+
+    /// While [`say_on_stop`]'s handle lives, every stop nobody ignores meets the handler that
+    /// says its line, a hang-up this process ignores stays ignored, a deferral armed inside it
+    /// puts it back as it drops (so the stop it sends again says the line too), and the old
+    /// dispositions come back after. No stop is raised: the handler ends the process.
+    #[test]
+    fn a_stop_says_its_line_while_held_and_the_old_dispositions_come_back_after() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _default = STOPS.map(|sig| SetTo::new(sig, libc::SIG_DFL));
+        let _ignored = SetTo::new(libc::SIGHUP, libc::SIG_IGN);
+        let before = STOPS.map(disposition);
+        let says = say_then_stop as extern "C" fn(c_int) as libc::sighandler_t;
+        let caught = [libc::SIGINT, libc::SIGTERM, libc::SIGQUIT];
+        let saying = say_on_stop("stopped\n");
+        for sig in caught {
+            assert_eq!(disposition(sig), says, "{} says the line", name(sig));
+        }
+        assert_eq!(disposition(libc::SIGHUP), libc::SIG_IGN, "still ignored");
+        let held = defer();
+        for sig in caught {
+            assert_ne!(disposition(sig), says, "{} is the deferral's", name(sig));
+        }
+        drop(held);
+        for sig in caught {
+            assert_eq!(disposition(sig), says, "{} says the line again", name(sig));
+        }
+        drop(saying);
+        assert_eq!(STOPS.map(disposition), before);
+    }
+
+    /// A stop that meets [`say_on_stop`]'s handler says its line on standard error and then
+    /// ends the process as that stop would have: a forked child, its standard error on a pipe,
+    /// sends itself the stop. NEGATIVE CONTROL: with no line armed the child dies the same way
+    /// and says nothing, so the line is the handler's.
+    #[test]
+    fn a_stop_that_meets_the_handler_says_its_line_and_ends_the_process() {
+        use std::io::Read as _;
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::process::ExitStatusExt as _;
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _default = STOPS.map(|sig| SetTo::new(sig, libc::SIG_DFL));
+        let line = "stopped; setup is not finished\n";
+        for (sig, armed) in [
+            (libc::SIGINT, true),
+            (libc::SIGTERM, true),
+            (libc::SIGINT, false),
+        ] {
+            let saying = armed.then(|| say_on_stop(line));
+            let (mut said, to_said) = std::io::pipe().expect("pipe");
+            let to_said_fd = to_said.as_raw_fd();
+            // SAFETY: the child calls only async-signal-safe functions (`dup2`, `raise`, the
+            // handler's `write`, `sigaction` and `_exit`) on a descriptor opened before `fork`,
+            // and exits without unwinding.
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
+            if pid == 0 {
+                // SAFETY: as above.
+                unsafe { libc::dup2(to_said_fd, libc::STDERR_FILENO) };
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "a forked child sends itself SIGINT or SIGTERM, never a core-dump \
+                              signal"
+                )]
+                // SAFETY: as above.
+                let _ = unsafe { libc::raise(sig) };
+                // SAFETY: as above; reached only when the stop did not end the child.
+                unsafe { libc::_exit(0) };
+            }
+            drop(to_said);
+            drop(saying);
+            let mut status: c_int = 0;
+            // SAFETY: waits for the child forked above, which ends at its stop.
+            let reaped = unsafe { libc::waitpid(pid, &raw mut status, 0) };
+            assert_eq!(reaped, pid, "waitpid: {}", std::io::Error::last_os_error());
+            let mut out = String::new();
+            said.read_to_string(&mut out)
+                .expect("read the child's error");
+            let status = std::process::ExitStatus::from_raw(status);
+            assert_eq!(
+                status.signal(),
+                Some(sig),
+                "{} armed {armed}: {status:?}",
+                name(sig)
+            );
+            let want = if armed { line } else { "" };
+            assert_eq!(out, want, "{} armed {armed}", name(sig));
+        }
     }
 
     #[test]

@@ -104,7 +104,7 @@ impl AccountsHost for Host {
 fn case(custody: i64, seen: i64, kind: i64, prior: bool, legacy: bool) -> [(&'static str, i64); 7] {
     let tmp = tmp_dir("plain-login-commit");
     let env = env_at(&tmp);
-    assert_eq!(acc_quiet(add("work", Class::Dedicated), &env).0, exit(0));
+    assert_eq!(acc_quiet(add("work", Class::Preferred), &env).0, exit(0));
     let store = env.accounts_store();
     let old = tmp.path().join("previous");
     let previous = if prior {

@@ -958,14 +958,16 @@ fn toolset_reads(
 
 /// Run this executable's `aterm pkg <args>` as `base.pkg.toolset`'s pass: a child that
 /// inherits this process's environment (the store, the config and the network it reads are
-/// init's), standard input closed and its output kept, ended at `budget`. With no terminal on
-/// either, it is no person's command ([`atpkg::cli::a_person_typed_this`]), so it ends with no
-/// setup follow-up of its own. Under a private state root it carries the window's lead
-/// ([`atpkg::cli::PRIVATE_STATE_ROOT_FLAG`]), as the window's passes there do.
+/// init's), standard input closed and its output kept, ended with its process group at
+/// `budget` or once `stopped()` reads true, so no pass outlives a stop of init's. With no
+/// terminal on either, it is no person's command ([`atpkg::cli::a_person_typed_this`]), so it
+/// ends with no setup follow-up of its own. Under a private state root it carries the window's
+/// lead ([`atpkg::cli::PRIVATE_STATE_ROOT_FLAG`]), as the window's passes there do.
 #[cfg(unix)]
 fn run_pkg(
     args: &[String],
     budget: std::time::Duration,
+    stopped: &dyn Fn() -> bool,
 ) -> Result<aterm_machines::port::Ran, aterm_machines::port::RunFailed> {
     use aterm_machines::port::{Ran, RunFailed};
     let exe = std::env::current_exe()
@@ -981,10 +983,11 @@ fn run_pkg(
     let deadline = now
         .checked_add(budget)
         .unwrap_or_else(|| now + std::time::Duration::from_secs(86_400 * 365));
-    match aterm_uds::deadline::output_until_from(
+    match aterm_uds::deadline::output_until_from_unless(
         &mut child,
         aterm_uds::spawnfd::Stdio::null(),
         deadline,
+        &mut || stopped(),
     ) {
         Ok(out) => Ok(Ran {
             status: out.status.code(),
@@ -1479,22 +1482,28 @@ fn ai_accounts_claude_probe(env: &aterm_agent::harness::cli::Env) -> aterm_conve
 
 /// `base.clt` ([`aterm_machines::init_clt`]): its probe is atpkg's C toolchain probe over
 /// this process's `PATH`, which raises no Apple dialog, beside whether the git init runs is
-/// there (the tools', else Xcode's); its root half runs from this executable. `None` when this executable cannot name
-/// itself.
+/// there (the tools', else Xcode's); its root half runs from this executable, and names the Mac
+/// by the swarm label its vault's roster gave it where that is known by the time the root half
+/// runs ([`crate::converge::mac_name_label`]), so the one password also aligns the Mac's
+/// own names.
+/// `None` when this executable cannot name itself.
 #[cfg(target_os = "macos")]
 fn command_line_tools() -> Option<aterm_machines::init_clt::CommandLineTools> {
     let aterm = std::env::current_exe()
         .and_then(|exe| exe.canonicalize())
         .ok()?;
-    Some(aterm_machines::init_clt::CommandLineTools::new(
-        Box::new(|sys: &dyn aterm_machines::port::System| {
-            clt_found(
-                &atpkg::prereq::probe(std::env::var_os("PATH").as_deref()),
-                aterm_machines::init_github::git_installed(sys),
-            )
-        }),
-        aterm,
-    ))
+    Some(
+        aterm_machines::init_clt::CommandLineTools::new(
+            Box::new(|sys: &dyn aterm_machines::port::System| {
+                clt_found(
+                    &atpkg::prereq::probe(std::env::var_os("PATH").as_deref()),
+                    aterm_machines::init_github::git_installed(sys),
+                )
+            }),
+            aterm,
+        )
+        .with_name(Box::new(crate::converge::mac_name_label)),
+    )
 }
 
 /// What `base.clt` reads in a C toolchain verdict ([`atpkg::prereq::CcVerdict`]) and whether

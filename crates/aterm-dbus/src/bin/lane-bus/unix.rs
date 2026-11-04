@@ -1401,7 +1401,8 @@ fn read_small_text(path: &str) -> Result<String, String> {
                 "file exceeds 64 KiB limit",
             ));
         }
-        let mut buf = Vec::new();
+        let cap = usize::try_from(meta.len().min(MAX_MOTION_BYTES).saturating_add(1)).unwrap_or(0);
+        let mut buf = Vec::with_capacity(cap);
         file.take(MAX_MOTION_BYTES + 1).read_to_end(&mut buf)?;
         if buf.len() as u64 > MAX_MOTION_BYTES {
             return Err(std::io::Error::new(

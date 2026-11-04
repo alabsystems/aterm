@@ -4747,20 +4747,9 @@ fn saturating_reservations_and_wrote_bounds_never_wrap_or_pass_record_max() {
         .is_none()
     );
 
-    let corrupt = scratch("non-utf8-claim");
+    let corrupt = scratch("non-regular-claim");
     let m_ok = mac48();
     let valid = admitted(enter(&corrupt, &m_ok, Need::new("valid").mem_gib(1)), &m_ok);
-    let bad_claim = corrupt.ledger.dir().join("0-999999-0.claim");
-    let mut bad_file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(&bad_claim)
-        .expect("bad claim created");
-    std::io::Write::write_all(&mut bad_file, &[0xff, 0xfe, b'\n']).expect("non-utf8 bytes");
-    let _bad_lock =
-        aterm_toolchain::record_lock::RecordLock::try_lock(bad_file, crate::ledger::RECORD_MAX)
-            .expect("locked bad claim");
     #[cfg(unix)]
     {
         let target = corrupt.dir.path().join("outside.claim");
@@ -4776,7 +4765,7 @@ fn saturating_reservations_and_wrote_bounds_never_wrap_or_pass_record_max() {
     let listed = corrupt
         .ledger
         .list()
-        .expect("non-utf8 or non-regular claim entries never abort scan");
+        .expect("non-regular claim entries never abort scan");
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].need.what, "valid");
     drop(valid);

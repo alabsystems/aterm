@@ -322,17 +322,16 @@ pub fn graph_and_paths(
 
 /// A Git package's checked-out source, as reported by the resolver itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct GitPackage {
+pub struct GitPackage {
+    /// Canonical Cargo source identity, including its resolved commit.
     pub source: String,
+    /// Absolute directory containing the selected package manifest.
     pub directory: PathBuf,
 }
 
 /// Git annotations in `targo tree` are URLs, not local source directories.
 /// Read their actual directories and full source IDs from the locked graph.
-pub(crate) fn git_packages(
-    cargo: &Cargo,
-    root: &Path,
-) -> Result<BTreeMap<PkgId, GitPackage>, String> {
+pub fn git_packages(cargo: &Cargo, root: &Path) -> Result<BTreeMap<PkgId, GitPackage>, String> {
     let mut cmd = cargo.command("metadata", root);
     cmd.args(["--format-version", "1", "--locked", "--offline"]);
     let out = cmd

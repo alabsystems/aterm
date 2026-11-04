@@ -33,8 +33,8 @@ pub const SOFTWAREUPDATE: &str = "/usr/sbin/softwareupdate";
 const INSTALLER: &str = "/usr/sbin/installer";
 
 /// Whether `exe` is one of Apple's command-line installers ([`SOFTWAREUPDATE`], [`INSTALLER`]),
-/// by its exact path: compared, never run. What
-/// [`aterm_types::macos_setup::tools_install_running`] asks of `aterm init` and the root half.
+/// by its exact path: compared, never run. What [`aterm_types::macos_setup::tools_held_by`] asks
+/// of `aterm init` and the root half.
 #[must_use]
 pub fn is_install_process(exe: &Path) -> bool {
     exe == Path::new(SOFTWAREUPDATE) || exe == Path::new(INSTALLER)
@@ -49,14 +49,13 @@ pub const CATALOG: &str = "https://swscan.apple.com/";
 /// `softwareupdate -l` reads Apple's catalog; slow networks take minutes.
 pub const LIST_BUDGET: Duration = Duration::from_secs(20 * 60);
 
-/// `softwareupdate -i` downloads about half a gigabyte and installs it, given as long as a press
-/// in Apple's installer window counts as an install
-/// ([`aterm_types::macos_setup::APPLE_WINDOW_INSTALL_BOUND`]): one bound on one install of the
-/// tools, whichever installer runs it, so a slower network that needs longer moves both.
-pub const INSTALL_BUDGET: Duration = aterm_types::macos_setup::APPLE_WINDOW_INSTALL_BOUND;
+/// `softwareupdate -i` downloads about half a gigabyte and installs it: two hours, well beyond
+/// the minutes both take on a working network.
+pub const INSTALL_BUDGET: Duration = Duration::from_secs(2 * 60 * 60);
 
-/// How long a run waits for Apple's installer window ([`XCODE_SELECT`] `--install`) to finish
-/// once it is on screen: a person presses Install, and the download and install take minutes.
+/// How long a run waits for Apple's installer window ([`XCODE_SELECT`] `--install`, or the one
+/// already open) to finish once it is on screen: a person presses Install, and the download and
+/// install take minutes. A window that closes ends the wait at once.
 pub const INSTALLER_PATIENCE: Duration = Duration::from_secs(30 * 60);
 
 /// How often that wait looks for the installed tools, in this process.
@@ -197,36 +196,75 @@ impl Failure {
     }
 }
 
-/// Whether an installer of the tools runs beside the placeholder now, by the one predicate
-/// System State's page, `aterm init` and the root half share
-/// ([`aterm_types::macos_setup::tools_install_running`]), over every process with the start
-/// [`System::process_started`] reads of it, the placeholder's last change ([`System::changed`])
-/// and [`System::now`]: `softwareupdate` or `installer`, or Apple's installer window while it or
-/// the placeholder is younger than [`aterm_types::macos_setup::APPLE_WINDOW_INSTALL_BOUND`]. Each
-/// caller has found the placeholder there. `None` where the process table, or any listed
-/// process's executable, cannot be read ([`System::process_paths`]).
-#[must_use]
-pub fn installer_runs(sys: &dyn System) -> Option<bool> {
-    let processes = sys
-        .processes()?
-        .into_iter()
-        .map(|process| Some((process.pid, process.exe?)))
-        .collect::<Option<Vec<_>>>()?;
-    Some(aterm_types::macos_setup::tools_install_running(
-        true,
-        sys.changed(Path::new(PLACEHOLDER)),
-        processes,
-        is_install_process,
-        |pid| sys.process_started(pid),
-        sys.now(),
-    ))
+/// What holds an install of the tools now ([`holder`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Holder {
+    /// An install of the tools runs: `softwareupdate` or `installer` beside the on-demand
+    /// placeholder, or a run of the root half alive now that stamped it
+    /// ([`placeholder_held_by_a_live_run`]: between its steps, or waiting on Apple's installer
+    /// window). It is that install's: the root half says another install runs, `aterm init`
+    /// defers to it.
+    Install,
+    /// Apple's installer window, at any age, with the placeholder beside it or not: Apple's own
+    /// flow, which makes the placeholder as its window opens (unless one is there already) and
+    /// unlinks it when its request ends (a quit before any press unlinks only one it made),
+    /// waiting for a press or running the install a press started. The root half waits on that
+    /// window, never replacing a placeholder beside it, making one where none is there, or
+    /// running `softwareupdate`; `aterm init` defers to it, naming the person's step there.
+    AppleWindow,
+    /// Nothing: no install runs, and a placeholder there is one an install that ended left, which
+    /// the root half replaces.
+    Nothing,
+    /// The process table could not be read, and no live run stamped a placeholder: nobody can
+    /// vouch for a placeholder there, so the root half takes it from no one.
+    Unread,
 }
 
-/// Whether an install of the tools runs now ([`installer_runs`]): a placeholder that is already
-/// there is that install's, never stale. A process table that cannot be read counts as one
-/// running, so a placeholder nobody can vouch for is never taken from an install.
-fn install_running(sys: &dyn System) -> bool {
-    installer_runs(sys).unwrap_or(true)
+/// What holds an install of the tools now, with the on-demand placeholder there or not as the
+/// caller found it (`placeholder`): by the one rule System State's page, `aterm init` and the root
+/// half share ([`aterm_types::macos_setup::tools_held_by`]) over every process's executable as
+/// the kernel names it ([`System::processes`]; one it names none for is none of Apple's
+/// installers, which live on the sealed system volume), a command-line installer beside the
+/// placeholder or a live run's stamp in it first, then Apple's installer window, placeholder or
+/// not. [`Holder::Unread`] only where the process table itself cannot be read.
+#[must_use]
+pub fn holder(sys: &dyn System, placeholder: bool) -> Holder {
+    use aterm_types::macos_setup::ToolsInstaller;
+    let held = sys.processes().map(|processes| {
+        aterm_types::macos_setup::tools_held_by(
+            placeholder,
+            processes.into_iter().map(|process| process.exe),
+            is_install_process,
+        )
+    });
+    match held {
+        Some(Some(ToolsInstaller::CommandLine)) => Holder::Install,
+        _ if placeholder && placeholder_held_by_a_live_run(sys) => Holder::Install,
+        Some(Some(ToolsInstaller::AppleWindow)) => Holder::AppleWindow,
+        Some(None) => Holder::Nothing,
+        None => Holder::Unread,
+    }
+}
+
+/// Each of Apple's installers among the processes the kernel names now
+/// ([`aterm_types::macos_setup::tools_installer`]), placeholder or not; `None` where the process
+/// table cannot be read. A process it names no executable for is none of them.
+fn installers_listed(sys: &dyn System) -> Option<Vec<aterm_types::macos_setup::ToolsInstaller>> {
+    Some(
+        sys.processes()?
+            .iter()
+            .filter_map(|process| process.exe.as_deref())
+            .filter_map(|exe| aterm_types::macos_setup::tools_installer(exe, is_install_process))
+            .collect(),
+    )
+}
+
+/// Whether Apple's installer window is among the processes the kernel names now
+/// ([`installers_listed`]); not where the process table cannot be read.
+fn apple_window_listed(sys: &dyn System) -> bool {
+    installers_listed(sys).is_some_and(|listed| {
+        listed.contains(&aterm_types::macos_setup::ToolsInstaller::AppleWindow)
+    })
 }
 
 fn selected(sys: &dyn System) -> Result<Option<String>, String> {
@@ -291,14 +329,51 @@ fn stamped(sys: &dyn System) -> Option<Vec<u8>> {
     .filter(|bytes| !bytes.is_empty())
 }
 
+/// Whether Apple's installer window is over with nothing else installing, by `listed` (what
+/// [`installers_listed`] read this tick) and `seen` (the window was listed on some tick of this
+/// wait): no window and no command-line installer listed, and either the on-demand placeholder
+/// gone, which the window unlinks by its path when its request ends (Not Now, Cancel, Done),
+/// whoever made it (itself, this run, or an earlier run that kept it beside the window), just
+/// before it quits; or, the window seen, a placeholder aterm stamped still there ([`stamped`]):
+/// a window quit before Install was pressed (its menu's Quit, the Dock's, a logout) ends no
+/// request and unlinks at its exit only a file it created, never one aterm's run had made
+/// beside it ([`aterm_types::macos_setup::APPLE_TOOLS_INSTALLER`]). Until the window was seen,
+/// this run's own stamp is the one it holds while the window it asked for comes up, so it is no
+/// end; nor is an unstamped placeholder (Apple's own or an older aterm's, which only a window
+/// killed outright leaves) or a process table that cannot be read: the wait goes on to its
+/// patience.
+fn window_closed(
+    sys: &dyn System,
+    listed: Option<&[aterm_types::macos_setup::ToolsInstaller]>,
+    seen: bool,
+) -> bool {
+    listed.is_some_and(<[_]>::is_empty)
+        && match sys.stat(Path::new(PLACEHOLDER)) {
+            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+            Ok(_) => seen && stamped(sys).is_some(),
+        }
+}
+
+/// The placeholder an earlier run of aterm's kept beside Apple's window, removed once that
+/// window is gone: a stamp ([`stamped`]) of a run not alive now, with nothing installing beside
+/// it ([`Holder::Nothing`]), which would otherwise outlive the wait as a stale placeholder. One a
+/// live run holds ([`Holder::Install`]) is left, this run's own among them where its start was
+/// read (its guard removes it, [`Placeholder`]; one whose start was not read reads gone and goes
+/// here, as the guard would remove it with the window gone), and so is one with no stamp
+/// (Apple's own, an older aterm's).
+fn remove_a_gone_runs_placeholder(sys: &dyn System) {
+    if stamped(sys).is_some() && holder(sys, true) == Holder::Nothing {
+        let _ = sys.remove(Path::new(PLACEHOLDER));
+    }
+}
+
 /// Whether the placeholder is held by a run of aterm's that is alive now: its stamp names a
 /// process still running from the same start, by the one reader the window's page shares
 /// ([`aterm_types::macos_setup::placeholder_held_by_a_live_run`]; a start of `0` matches no
 /// process). Such a run started the install and alone may hold or replace the placeholder,
 /// though no installer process runs this moment (it is between two steps, or waits on Apple's
-/// installer window a person closed).
-#[must_use]
-pub fn placeholder_held_by_a_live_run(sys: &dyn System) -> bool {
+/// installer window).
+fn placeholder_held_by_a_live_run(sys: &dyn System) -> bool {
     stamped(sys).is_some_and(|bytes| {
         aterm_types::macos_setup::placeholder_held_by_a_live_run(&bytes, |pid| {
             sys.process_started(pid)
@@ -307,7 +382,15 @@ pub fn placeholder_held_by_a_live_run(sys: &dyn System) -> bool {
 }
 
 /// The placeholder this run put in place, removed when the install ends, and only while it is
-/// still this run's: one a later run took over stays.
+/// still this run's (one a later run took over stays) and Apple's installer window is not
+/// listed ([`apple_window_listed`]). A window open then came up beside this run's placeholder
+/// (`xcode-select --install`'s, or one a `git` or another stub raised meanwhile), so it made none
+/// of its own, and its install needs the file to find the tools in Apple's catalog: the
+/// placeholder stays for it, the window unlinks it when its request ends, and every reader holds
+/// the tools for that window meanwhile ([`Holder::AppleWindow`]). One the window leaves as it
+/// goes without ending its request (quit before Install was pressed, or killed outright), its
+/// run gone, is stale: a later run waiting on that window removes it as the window goes
+/// ([`remove_a_gone_runs_placeholder`]), and the next run replaces it ([`Holder::Nothing`]).
 struct Placeholder<'a> {
     sys: &'a dyn System,
     stamp: Vec<u8>,
@@ -315,7 +398,9 @@ struct Placeholder<'a> {
 
 impl Drop for Placeholder<'_> {
     fn drop(&mut self) {
-        if stamped(self.sys).as_deref() == Some(self.stamp.as_slice()) {
+        if stamped(self.sys).as_deref() == Some(self.stamp.as_slice())
+            && !apple_window_listed(self.sys)
+        {
             let _ = self.sys.remove(Path::new(PLACEHOLDER));
         }
     }
@@ -336,8 +421,9 @@ impl CommandLineTools {
     fn install(sys: &dyn System) -> Result<(), Failure> {
         // A closed tab (SIGHUP), a Ctrl-C or a Ctrl-\ reaches this run, never `softwareupdate`
         // (its own process group): deferred, it lets the running step finish and the placeholder
-        // guard remove the placeholder, which would otherwise refuse every later install, and
-        // then ends the run as it would have, so a stop meant for a whole apply is not lost.
+        // guard remove the placeholder (or leave it to Apple's window that needs it,
+        // [`Placeholder`]), and then ends the run as it would have, so a stop meant for a whole
+        // apply is not lost.
         let _stops = sys.defer_stops();
         let installed = Self::install_placeheld(sys);
         if sys.stopped().is_some() {
@@ -346,19 +432,30 @@ impl CommandLineTools {
         installed
     }
 
-    /// Put softwareupdate's on-demand placeholder in place, stamped as this run's ([`stamp`]).
-    /// One already there is an install's that runs now ([`install_running`]) or a live run's
-    /// that started one ([`placeholder_held_by_a_live_run`]), which this one leaves alone; else
-    /// it is stale, left by an install that ended without removing it, and this one takes its
-    /// place.
-    fn hold_placeholder(sys: &dyn System) -> Result<Vec<u8>, Failure> {
+    /// Put softwareupdate's on-demand placeholder in place, stamped as this run's ([`stamp`]),
+    /// and say it is this run's (`Some`, its stamp), unless Apple's installer window holds the
+    /// tools, with a placeholder beside it or none ([`Holder::AppleWindow`]: `None`, this run
+    /// makes or takes no placeholder and waits on that window). One already there is left alone
+    /// where an install holds it or nobody can tell ([`Holder::Install`], [`Holder::Unread`]:
+    /// another install runs); else it is stale, left by an install that ended without removing
+    /// it, and this one takes its place.
+    fn hold_placeholder(sys: &dyn System) -> Result<Option<Vec<u8>>, Failure> {
         let placeholder = Path::new(PLACEHOLDER);
         let held =
             |e: std::io::Error| Failure::new(Unfinished::Other, format!("{PLACEHOLDER}: {e}"));
         let stamp = stamp(sys);
+        // With no placeholder there, Apple's window holds the tools all the same: it opened
+        // beside another install's placeholder, which that install has removed since.
+        if sys
+            .stat(placeholder)
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            && holder(sys, false) == Holder::AppleWindow
+        {
+            return Ok(None);
+        }
         match sys.create_new(placeholder, &stamp, 0o644) {
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                if install_running(sys) || placeholder_held_by_a_live_run(sys) {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => match holder(sys, true) {
+                Holder::Install | Holder::Unread => {
                     return Err(Failure::new(
                         Unfinished::Busy,
                         format!(
@@ -367,17 +464,26 @@ impl CommandLineTools {
                         ),
                     ));
                 }
-                sys.remove(placeholder).map_err(held)?;
-                sys.create_new(placeholder, &stamp, 0o644).map_err(held)?;
-            }
+                Holder::AppleWindow => return Ok(None),
+                Holder::Nothing => {
+                    sys.remove(placeholder).map_err(held)?;
+                    sys.create_new(placeholder, &stamp, 0o644).map_err(held)?;
+                }
+            },
             created => created.map_err(held)?,
         }
-        Ok(stamp)
+        Ok(Some(stamp))
     }
 
-    /// The install with softwareupdate's on-demand placeholder in place, removed when it ends.
+    /// The install with softwareupdate's on-demand placeholder in place, removed when it ends
+    /// (or left to Apple's window that needs it, [`Placeholder`]); or, where Apple's installer
+    /// window holds the tools as this run begins or opens while it reads the catalog, the wait on
+    /// that window alone, which takes over no placeholder and asks `softwareupdate` for none of
+    /// the tools the window's own flow installs.
     fn install_placeheld(sys: &dyn System) -> Result<(), Failure> {
-        let stamp = Self::hold_placeholder(sys)?;
+        let Some(stamp) = Self::hold_placeholder(sys)? else {
+            return Self::through_open_window(sys);
+        };
         let _placeholder = Placeholder { sys, stamp };
         say("reading Apple's software catalog (minutes on a slow network)");
         let list = Cmd::new(SOFTWAREUPDATE).arg("-l").budget(LIST_BUDGET);
@@ -391,6 +497,16 @@ impl CommandLineTools {
                     list.display()
                 ),
             ));
+        }
+        // Apple's window raised while the catalog was read (by a `git` or another of Apple's
+        // `/usr/bin` stubs, beside this run's placeholder, so it made none of its own) is the
+        // person's install now: wait on it, the placeholder kept for it, rather than download
+        // the same tools beside it or ask `xcode-select` for another window, which it refuses
+        // while one is open. The window is looked for among the processes the kernel names, so
+        // one it names none for (its file deleted) hides no window; only a process table that
+        // cannot be read at all hides it.
+        if apple_window_listed(sys) {
+            return Self::through_open_window(sys);
         }
         let labels = parse_labels(&listed);
         let Some(label) = pick(&labels) else {
@@ -445,43 +561,67 @@ impl CommandLineTools {
         Ok(())
     }
 
-    /// Where `softwareupdate` lists no tools (`list` read the catalog): Apple's own installer
-    /// window (`xcode-select --install`, or the one already open), which a person at this run's
-    /// terminal presses Install in, then a wait in this process for the installed tools, every
-    /// [`INSTALLER_TICK`] for at most [`INSTALLER_PATIENCE`], ended early by a stop.
+    /// Where `softwareupdate` lists no tools (`list` read the catalog) and no window of Apple's
+    /// is open: Apple's own installer window (`xcode-select --install`), which a person at this
+    /// run's terminal presses Install in, then the wait on it ([`Self::wait_on_window`]).
     fn through_installer(sys: &dyn System, list: &Cmd) -> Result<(), Failure> {
-        let other = |why: String| Failure::new(Unfinished::Other, why);
         let open = Cmd::new(XCODE_SELECT).arg("--install");
         let unlisted = format!(
             "{} lists no Command Line Tools for Xcode, with the on-demand placeholder in place",
             list.display()
         );
-        // Apple's window may be open already, waiting for a press: one `git` or another of
-        // Apple's `/usr/bin` stubs raised, or one left open past `APPLE_WINDOW_INSTALL_BOUND`
-        // beside the stale placeholder this run replaced. Reuse that window: xcode-select
-        // otherwise refuses "already requested" and aborts instead of waiting for the one
-        // approval the person still owes. The window is looked for among the processes the
-        // kernel names, so one it names none for (its file deleted) hides no window; only a
-        // process table that cannot be read at all asks xcode-select for one.
-        let already_open = sys.processes().is_some_and(|processes| {
-            processes
-                .iter()
-                .filter_map(|process| process.exe.as_deref())
-                .any(|exe| {
-                    aterm_types::macos_setup::tools_installer(exe, is_install_process)
-                        == Some(aterm_types::macos_setup::ToolsInstaller::AppleWindow)
-                })
-        });
-        if !already_open {
-            run_ok(sys, &open).map_err(|why| {
-                Failure::new(Unfinished::NoneOffered, format!("{unlisted}, and {why}"))
-            })?;
-        }
+        run_ok(sys, &open).map_err(|why| {
+            Failure::new(Unfinished::NoneOffered, format!("{unlisted}, and {why}"))
+        })?;
         say(
             "Apple's software catalog lists none for this Mac, so Apple's installer window is \
              open instead: press Install there (Ctrl-C stops waiting)",
         );
+        Self::wait_on_window(
+            sys,
+            &format!(
+                "{unlisted}, and Apple's installer (`{}`) did not install them within {} \
+                 minutes: press Install in its window, then run `aterm init --only base.clt`",
+                open.display(),
+                INSTALLER_PATIENCE.as_secs() / 60
+            ),
+        )
+    }
+
+    /// Where Apple's installer window is open already ([`Holder::AppleWindow`]): as this run
+    /// began, with a placeholder beside it or none, or raised while it read the catalog beside
+    /// its placeholder. Its own flow installs the tools once the person presses Install there
+    /// (or has, perhaps hours after the window opened) and unlinks the placeholder when its
+    /// request ends, so this run takes nothing over and asks `softwareupdate` for nothing, which
+    /// would start a second download of the same tools beside the window's, and only waits on
+    /// that window ([`Self::wait_on_window`]), removing an earlier run's placeholder the window
+    /// leaves as it is quit.
+    fn through_open_window(sys: &dyn System) -> Result<(), Failure> {
+        say(
+            "Apple's installer window for the Command Line Tools is already open: finish there \
+             (press Install if you have not yet; Ctrl-C stops waiting)",
+        );
+        Self::wait_on_window(
+            sys,
+            &format!(
+                "Apple's installer window, already open, did not install them within {} minutes: \
+                 press Install in it, or quit it, then run `aterm init --only base.clt`",
+                INSTALLER_PATIENCE.as_secs() / 60
+            ),
+        )
+    }
+
+    /// The wait in this process on Apple's installer window for the installed tools, every
+    /// [`INSTALLER_TICK`] for at most [`INSTALLER_PATIENCE`] (then [`Unfinished::AppleWindow`],
+    /// saying `patience`), ended early by a stop, and by the window closing without installing
+    /// them ([`window_closed`]: Not Now, Cancel, or Done on Apple's own failure, or the window
+    /// quit before Install was pressed, each a person's act there,
+    /// [`Unfinished::WindowClosed`]). A placeholder an earlier run kept beside that window goes
+    /// with it ([`remove_a_gone_runs_placeholder`]).
+    fn wait_on_window(sys: &dyn System, patience: &str) -> Result<(), Failure> {
+        let other = |why: String| Failure::new(Unfinished::Other, why);
         let ticks = INSTALLER_PATIENCE.as_millis() / INSTALLER_TICK.as_millis();
+        let mut seen = false;
         for _ in 0..ticks {
             if installed(sys).map_err(other)? {
                 return Ok(());
@@ -490,10 +630,27 @@ impl CommandLineTools {
                 return Err(Failure::new(
                     Unfinished::Stopped,
                     format!(
-                        "stopped by signal {signal} while Apple's installer was open (`{}`); \
-                         the tools are not installed yet",
-                        open.display()
+                        "stopped by signal {signal} while Apple's installer window was open; \
+                         the tools are not installed yet"
                     ),
+                ));
+            }
+            let listed = installers_listed(sys);
+            seen |= listed.as_ref().is_some_and(|listed| {
+                listed.contains(&aterm_types::macos_setup::ToolsInstaller::AppleWindow)
+            });
+            if window_closed(sys, listed.as_deref(), seen) {
+                remove_a_gone_runs_placeholder(sys);
+                // Read once more: the window quits a moment after its install ends.
+                if installed(sys).map_err(other)? {
+                    return Ok(());
+                }
+                return Err(Failure::new(
+                    Unfinished::WindowClosed,
+                    "Apple's installer window closed without installing the Command Line Tools: \
+                     press Install\u{2026} on System State, or run `aterm init --only base.clt`, \
+                     to try again"
+                        .to_owned(),
                 ));
             }
             sys.sleep(INSTALLER_TICK);
@@ -501,15 +658,7 @@ impl CommandLineTools {
         if installed(sys).map_err(other)? {
             return Ok(());
         }
-        Err(Failure::new(
-            Unfinished::AppleWindow,
-            format!(
-                "{unlisted}, and Apple's installer (`{}`) did not install them within {} minutes: \
-                 press Install in its window, then run `aterm init --only base.clt`",
-                open.display(),
-                INSTALLER_PATIENCE.as_secs() / 60
-            ),
-        ))
+        Err(Failure::new(Unfinished::AppleWindow, patience.to_owned()))
     }
 
     /// What the probe reads: the tools installed and selected, or the change to make.
@@ -1033,29 +1182,6 @@ Software Update found the following new or updated software:\n\
             "{calls:?}"
         );
 
-        // Apple's window left open past its bound beside a placeholder an ended install left,
-        // as old: the run takes the placeholder's place and waits on that window, opening no
-        // other.
-        let existing = Fake::root();
-        let bound = aterm_types::macos_setup::APPLE_WINDOW_INSTALL_BOUND.as_secs();
-        existing
-            .file(PLACEHOLDER, b"")
-            .changed_at(PLACEHOLDER, existing.now - bound)
-            .running(&[APPLE_WINDOW])
-            .born(Fake::PIDS, existing.now - bound)
-            .on("/usr/sbin/softwareupdate -l", unlisted());
-        existing.on_sleep(|sys, _| {
-            sys.stat_of(CLT_GIT, git());
-        });
-        CommandLineTools::install(&existing).unwrap();
-        assert!(
-            existing
-                .calls()
-                .iter()
-                .all(|call| !call.contains("xcode-select --install")),
-            "reuse the existing approval instead of failing or opening another"
-        );
-
         let mut stopped = Fake::root();
         stopped.stop_after = Some(2);
         stopped
@@ -1106,45 +1232,200 @@ Software Update found the following new or updated software:\n\
         assert!(refused.calls().iter().all(|c| !c.starts_with("sleep ")));
     }
 
-    /// Apple's window already open is found among the processes the kernel names: one process
-    /// whose executable it names none for (its file deleted) hides no window, so the run waits on
-    /// that window instead of asking `xcode-select --install`, which refuses "already requested"
-    /// while one is open. (Reading the window through [`System::process_paths`], which is `None`
-    /// once any executable is unread, asks it and fails this test.)
+    /// Apple's window open with no placeholder beside it as the run begins (it opened beside
+    /// another install's, which has ended since) holds the tools all the same: the run makes no
+    /// placeholder, asks `softwareupdate` for nothing and `xcode-select --install` for no other
+    /// window, and waits on that one until the tools are there. The window is found among the
+    /// processes the kernel names, so one process whose executable it names none for (its file
+    /// deleted) hides no window. (Reading the window through [`System::process_paths`], which is
+    /// `None` once any executable is unread, misses it and fails this test.)
+    /// NEGATIVE CONTROL: with no window either, the run makes its placeholder, lists the tools
+    /// and installs them.
     #[test]
-    fn apples_window_already_open_is_found_beside_a_process_the_kernel_names_no_file_for() {
-        let sys = Fake::root();
-        sys.running(&[APPLE_WINDOW])
-            .process(
-                crate::port::Process {
-                    pid: Fake::PIDS + 1,
-                    ppid: crate::port::Process::LAUNCHD,
-                    terminal: false,
-                    exe: None,
-                    comm: "deleted".into(),
-                },
-                None,
-            )
+    fn apples_window_with_no_placeholder_is_waited_on_and_nothing_is_made_beside_it() {
+        for unnamed_beside in [false, true] {
+            let sys = Fake::root();
+            sys.running(&["/sbin/launchd", APPLE_WINDOW])
+                .on("/usr/sbin/softwareupdate -l", Ran::ok(VM_LIST));
+            if unnamed_beside {
+                sys.process(unnamed(), None);
+            }
+            assert_eq!(holder(&sys, false), Holder::AppleWindow, "{unnamed_beside}");
+            sys.on_sleep(|sys, _| {
+                if sys
+                    .calls()
+                    .iter()
+                    .filter(|c| c.starts_with("sleep "))
+                    .count()
+                    == 2
+                {
+                    sys.stat_of(CLT_GIT, git());
+                }
+            });
+            CommandLineTools::install(&sys).unwrap();
+            let calls = sys.calls();
+            assert!(
+                !calls.iter().any(|c| c.starts_with(SOFTWAREUPDATE)
+                    || c.starts_with("create ")
+                    || c.starts_with("remove ")
+                    || c.contains("xcode-select --install")),
+                "{unnamed_beside}: {calls:?}"
+            );
+            assert_eq!(
+                calls.iter().filter(|c| c.starts_with("sleep ")).count(),
+                2,
+                "{unnamed_beside}: it waited on the window: {calls:?}"
+            );
+            assert!(sys.written(PLACEHOLDER).is_none(), "{unnamed_beside}");
+        }
+
+        let control = Fake::root();
+        control
+            .running(&["/sbin/launchd"])
+            .on("/usr/sbin/softwareupdate -l", Ran::ok(VM_LIST))
             .on(
+                "/usr/sbin/softwareupdate -i 'Command Line Tools for Xcode 27.0-27.0'",
+                installed_quietly(),
+            )
+            .on(PKGUTIL, Ran::ok(RECEIPT));
+        assert_eq!(holder(&control, false), Holder::Nothing);
+        CommandLineTools::install(&control).unwrap();
+        let calls = control.calls();
+        let at = |needle: &str| calls.iter().position(|c| c.starts_with(needle));
+        let created = at(&format!("create {PLACEHOLDER}")).expect("this install's own");
+        let listed = at("/usr/sbin/softwareupdate -l").expect("the install goes on");
+        let installed = at("/usr/sbin/softwareupdate -i ").expect("and installs");
+        assert!(created < listed && listed < installed, "{calls:?}");
+    }
+
+    /// Apple's window raised while the run read the catalog (a `git` stub's, beside this run's
+    /// placeholder, so it made none of its own) is the person's install: whether the catalog
+    /// lists the tools or none, the run downloads nothing beside it and asks `xcode-select
+    /// --install` for no other window, and waits on that one until the tools are there.
+    #[test]
+    fn a_window_raised_while_the_catalog_is_read_is_waited_on_and_nothing_installs_beside_it() {
+        let unlisted =
+            "Software Update Tool\n\nFinding available software\nNo new software available.\n";
+        for catalog in [VM_LIST, unlisted] {
+            let sys = Fake::root();
+            sys.running(&["/sbin/launchd"])
+                .on("/usr/sbin/softwareupdate -l", Ran::ok(catalog))
+                .on_running(
+                    "/usr/sbin/softwareupdate -l",
+                    &["/sbin/launchd", APPLE_WINDOW],
+                );
+            sys.on_sleep(|sys, _| {
+                sys.stat_of(CLT_GIT, git());
+            });
+            CommandLineTools::install(&sys).unwrap();
+            let calls = sys.calls();
+            assert!(
+                !calls
+                    .iter()
+                    .any(|c| c.starts_with("/usr/sbin/softwareupdate -i")
+                        || c.contains("xcode-select --install")),
+                "{calls:?}"
+            );
+            assert!(
+                calls.iter().any(|c| c.starts_with("sleep ")),
+                "it waited on the window: {calls:?}"
+            );
+        }
+    }
+
+    /// The run's placeholder guard leaves its placeholder in place while Apple's window is listed
+    /// as the run ends, on each route a window comes up beside it (`xcode-select --install`'s,
+    /// or one a stub raised while the catalog was read) and however the wait ends (its patience
+    /// spent, or a stop): that window made none of its own, its install needs the file to find
+    /// the tools in Apple's catalog, and it unlinks the file when its request ends. Every reader
+    /// then holds the tools for the window, so the next run waits on it, making, removing and
+    /// asking `softwareupdate` for nothing.
+    /// NEGATIVE CONTROL: the window gone before the run ends (quit, or killed outright: either
+    /// leaves this run's placeholder, which the window did not make) ends the wait as closed and
+    /// takes the placeholder with it.
+    #[test]
+    fn the_guard_keeps_its_placeholder_while_apples_window_is_listed_as_the_run_ends() {
+        for (route, raised, stop_after, class) in [
+            ("raised", true, None, Unfinished::AppleWindow),
+            ("opened", false, None, Unfinished::AppleWindow),
+            ("stopped", false, Some(2), Unfinished::Stopped),
+        ] {
+            let mut sys = Fake::root();
+            sys.stop_after = stop_after;
+            window_comes_up(&sys, raised);
+            let failure = CommandLineTools::install(&sys).unwrap_err();
+            assert_eq!(failure.class, class, "{route}: {failure:?}");
+            let calls = sys.calls();
+            assert!(
+                !calls.iter().any(|c| c.starts_with("remove ")),
+                "{route}: {calls:?}"
+            );
+            assert_eq!(
+                sys.written(PLACEHOLDER),
+                Some(stamp(&sys)),
+                "{route}: kept for the window still open"
+            );
+            assert_eq!(holder(&sys, true), Holder::AppleWindow, "{route}");
+
+            sys.stop_after = None;
+            let next = CommandLineTools::install(&sys).unwrap_err();
+            assert_eq!(next.class, Unfinished::AppleWindow, "{route}: {next:?}");
+            let again = &sys.calls()[calls.len()..];
+            assert!(
+                !again.iter().any(|c| c.starts_with(SOFTWAREUPDATE)
+                    || c.starts_with("create ")
+                    || c.starts_with("remove ")
+                    || c.contains("xcode-select --install")),
+                "{route}: {again:?}"
+            );
+        }
+
+        for (route, raised) in [("raised", true), ("opened", false)] {
+            let gone = Fake::root();
+            window_comes_up(&gone, raised);
+            gone.on_sleep(|sys, _| {
+                sys.running(&["/sbin/launchd"]);
+            });
+            let failure = CommandLineTools::install(&gone).unwrap_err();
+            assert_eq!(
+                failure.class,
+                Unfinished::WindowClosed,
+                "{route}: {failure:?}"
+            );
+            assert!(
+                gone.written(PLACEHOLDER).is_none(),
+                "{route}: {:?}",
+                gone.calls()
+            );
+            assert!(
+                gone.calls()
+                    .iter()
+                    .any(|c| c == &format!("remove {PLACEHOLDER}")),
+                "{route}"
+            );
+        }
+    }
+
+    /// A run that lists nothing at first, where Apple's window comes up beside its placeholder:
+    /// raised by a stub while `softwareupdate -l` reads a catalog that lists the tools
+    /// (`raised`), or opened by `xcode-select --install` where the catalog lists none.
+    fn window_comes_up(sys: &Fake, raised: bool) {
+        let window = ["/sbin/launchd", APPLE_WINDOW];
+        sys.running(&["/sbin/launchd"]);
+        if raised {
+            sys.on("/usr/sbin/softwareupdate -l", Ran::ok(VM_LIST))
+                .on_running("/usr/sbin/softwareupdate -l", &window);
+        } else {
+            sys.on(
                 "/usr/sbin/softwareupdate -l",
                 Ran::ok(
                     "Software Update Tool\n\nFinding available software\nNo new software \
                      available.\n",
                 ),
-            );
-        sys.on_sleep(|sys, _| {
-            sys.stat_of(CLT_GIT, git());
-        });
-        CommandLineTools::install(&sys).unwrap();
-        let calls = sys.calls();
-        assert!(
-            calls.iter().any(|c| c.starts_with("sleep ")),
-            "it waited on the window: {calls:?}"
-        );
-        assert!(
-            calls.iter().all(|c| !c.contains("xcode-select --install")),
-            "{calls:?}"
-        );
+            )
+            .on("/usr/bin/xcode-select --install", Ran::ok(""))
+            .on_running("/usr/bin/xcode-select --install", &window);
+        }
     }
 
     /// The placeholder is removed, then the stops are restored, then the one caught is sent again.
@@ -1451,9 +1732,9 @@ Software Update found the following new or updated software:\n\
         );
     }
 
-    /// A second run (a second `aterm init` after Apple's installer window closed, while the
-    /// first still waits on it with no installer process running) takes no placeholder a live
-    /// run's stamp names: only the run that started the install holds or replaces it. One whose
+    /// A second run (a second `aterm init` while the first waits on Apple's installer window,
+    /// with no installer process running) takes no placeholder a live run's stamp names: only
+    /// the run that started the install holds or replaces it. One whose
     /// run is gone (no such process, or one started at another time) is stale and taken, as is
     /// one whose stamp names no start (`0` matches no live process: the pid alone may be any
     /// later process's), and a run's own guard removes the placeholder only while it is still
@@ -1555,27 +1836,14 @@ Software Update found the following new or updated software:\n\
     }
 
     /// A placeholder no install holds (neither `softwareupdate` nor `installer` runs, nor Apple's
-    /// installer window while it or the placeholder is younger than
-    /// [`aterm_types::macos_setup::APPLE_WINDOW_INSTALL_BOUND`]) is stale, left by an install
-    /// that ended without removing it: the install takes its place instead of failing on it, and
-    /// removes it when it ends, beside a program merely called `installer` or Apple's window left
-    /// open past that bound beside a placeholder as old too, as System State's page reads it. A
-    /// young window, an old one beside a young placeholder (a press there created it), either of
-    /// an age that cannot be read and a process table that cannot be read leave it alone.
+    /// installer window, nor a live run of the root half) is stale, left by an install that ended
+    /// without removing it: the install takes its place instead of failing on it, and removes it
+    /// when it ends, beside a program merely called `installer` too. Apple's package installer
+    /// and a process table that cannot be read leave it alone: another install, or one nobody can
+    /// rule out.
     #[test]
     fn a_stale_clt_marker_nothing_holds_is_replaced_by_the_install() {
-        let ready = || {
-            let sys = Fake::root();
-            sys.file(PLACEHOLDER, b"left by an install that ended\n")
-                .on("/usr/sbin/softwareupdate -l", Ran::ok(VM_LIST))
-                .on(
-                    "/usr/sbin/softwareupdate -i 'Command Line Tools for Xcode 27.0-27.0'",
-                    installed_quietly(),
-                )
-                .on(PKGUTIL, Ran::ok(RECEIPT));
-            sys
-        };
-        let stale = ready();
+        let stale = stale_marker();
         installers(&stale, None);
         CommandLineTools::install(&stale).unwrap();
         let calls = stale.calls();
@@ -1587,7 +1855,7 @@ Software Update found the following new or updated software:\n\
         assert!(stale.written(PLACEHOLDER).is_none(), "removed when it ends");
 
         // A program merely called `installer` holds nothing: as stale as with none.
-        let beside = ready();
+        let beside = stale_marker();
         installers(&beside, Some("lookalike"));
         CommandLineTools::install(&beside).unwrap();
         assert!(
@@ -1600,62 +1868,163 @@ Software Update found the following new or updated software:\n\
         );
 
         // Apple's package installer holds it: another install of the tools is running.
-        let package = ready();
+        let package = stale_marker();
         installers(&package, Some("installer"));
         let failure = CommandLineTools::install(&package).unwrap_err();
         assert_eq!(failure.class, Unfinished::Busy, "{failure:?}");
 
-        // Apple's installer window younger than its bound holds it: a person pressed Install
-        // there, and its install runs with no command-line installer. One whose start cannot be
-        // read is as young: nothing rules its install out. So is one left open past its bound
-        // beside a placeholder younger than it, or one whose change cannot be read: a press in
-        // that old window created the placeholder its install holds.
+        // Nothing could tell whether one runs: it is left to whoever may hold it.
+        let unread = stale_marker();
+        assert_eq!(
+            CommandLineTools::install(&unread).unwrap_err().class,
+            Unfinished::Busy
+        );
+        assert!(unread.written(PLACEHOLDER).is_some());
+    }
+
+    /// A placeholder left by an install that ended, ready for an install that lists and installs
+    /// the tools.
+    fn stale_marker() -> Fake {
+        let sys = Fake::root();
+        sys.file(PLACEHOLDER, b"left by an install that ended\n")
+            .on("/usr/sbin/softwareupdate -l", Ran::ok(VM_LIST))
+            .on(
+                "/usr/sbin/softwareupdate -i 'Command Line Tools for Xcode 27.0-27.0'",
+                installed_quietly(),
+            )
+            .on(PKGUTIL, Ran::ok(RECEIPT));
+        sys
+    }
+
+    /// A process the kernel names no executable for (one whose file a replacement deleted while
+    /// it ran) is none of Apple's installers, which live on the sealed system volume: beside a
+    /// stale placeholder whose stamped run is gone, the install takes the placeholder's place
+    /// and goes on, as it would beside named programs alone.
+    /// NEGATIVE CONTROL: the same table with `softwareupdate` named in it is another install
+    /// running, which the install leaves alone.
+    #[test]
+    fn a_process_the_kernel_names_no_file_for_holds_no_placeholder() {
+        let ready = |softwareupdate: bool| {
+            let sys = stale_marker();
+            sys.file(PLACEHOLDER, b"aterm 4242 1000\n");
+            installers(&sys, softwareupdate.then_some("softwareupdate"));
+            sys.process(unnamed(), None);
+            sys
+        };
+        let unnamed_beside = ready(false);
+        assert_eq!(holder(&unnamed_beside, true), Holder::Nothing);
+        CommandLineTools::install(&unnamed_beside).unwrap();
+        let calls = unnamed_beside.calls();
+        let at = |needle: &str| calls.iter().position(|c| c.starts_with(needle));
+        let removed = at(&format!("remove {PLACEHOLDER}")).expect("the stale marker goes");
+        let created = at(&format!("create {PLACEHOLDER}")).expect("this install's own");
+        let installed = at("/usr/sbin/softwareupdate -i ").expect("and installs");
+        assert!(removed < created && created < installed, "{calls:?}");
+
+        let control = ready(true);
+        assert_eq!(holder(&control, true), Holder::Install);
+        let failure = CommandLineTools::install(&control).unwrap_err();
+        assert_eq!(failure.class, Unfinished::Busy, "{failure:?}");
+        assert!(
+            !control
+                .calls()
+                .iter()
+                .any(|c| c.starts_with(SOFTWAREUPDATE) || c.starts_with("remove ")),
+            "{:?}",
+            control.calls()
+        );
+    }
+
+    /// A process the kernel names no executable for.
+    fn unnamed() -> crate::port::Process {
+        crate::port::Process {
+            pid: Fake::PIDS + 7,
+            ppid: crate::port::Process::LAUNCHD,
+            terminal: false,
+            exe: None,
+            comm: "deleted".into(),
+        }
+    }
+
+    /// Apple's installer window beside the placeholder is Apple's own flow at any age: it made
+    /// that placeholder as it opened (`O_EXCL`, before any press) and removes it when its request
+    /// ends, so a press hours later leaves no trace aterm reads. The install neither removes nor
+    /// replaces the placeholder, never asks `softwareupdate` for the tools (a second download of
+    /// them beside the window's own) nor `xcode-select --install` for another window, and waits
+    /// on that window until the tools are there. A command-line installer or a live run of the
+    /// root half beside the window is another install running.
+    /// NEGATIVE CONTROL: the same placeholder with no window beside it is stale, and the install
+    /// takes its place, lists the tools and installs them.
+    #[test]
+    fn apples_window_beside_the_placeholder_is_waited_on_at_any_age_and_never_replaced() {
         let window = Fake::PIDS + 1;
-        let bound = aterm_types::macos_setup::APPLE_WINDOW_INSTALL_BOUND.as_secs();
-        for (age, changed) in [
-            (Some(1), Some(bound)),
-            (Some(bound - 1), Some(bound)),
-            (None, Some(bound)),
-            (Some(bound), Some(1)),
-            (Some(bound), Some(bound - 1)),
-            (Some(bound), None),
-        ] {
-            let held = ready();
-            installers(&held, Some("apple"));
+        let day = 24 * 60 * 60;
+        for age in [Some(60), Some(3 * 60 * 60), Some(10 * day), None] {
+            let sys = stale_marker();
+            sys.file(PLACEHOLDER, b"");
+            installers(&sys, Some("apple"));
             if let Some(age) = age {
-                held.born(window, held.now - age);
+                sys.born(window, sys.now - age);
             }
-            if let Some(changed) = changed {
-                held.changed_at(PLACEHOLDER, held.now - changed);
-            }
-            let failure = CommandLineTools::install(&held).unwrap_err();
-            assert_eq!(
-                failure.class,
-                Unfinished::Busy,
-                "{age:?} {changed:?}: {failure:?}"
-            );
-            assert!(
-                held.written(PLACEHOLDER).is_some(),
-                "{age:?} {changed:?}: the other install's stays"
-            );
-            assert!(
-                !held
+            assert_eq!(holder(&sys, true), Holder::AppleWindow, "{age:?}");
+            sys.on_sleep(|sys, _| {
+                if sys
                     .calls()
                     .iter()
-                    .any(|c| c.starts_with(SOFTWAREUPDATE) || c.starts_with("remove ")),
-                "{age:?} {changed:?}: {:?}",
-                held.calls()
+                    .filter(|c| c.starts_with("sleep "))
+                    .count()
+                    == 2
+                {
+                    sys.stat_of(CLT_GIT, git());
+                }
+            });
+            CommandLineTools::install(&sys).unwrap();
+            let calls = sys.calls();
+            assert!(
+                !calls.iter().any(|c| c.starts_with(SOFTWAREUPDATE)
+                    || c.starts_with("remove ")
+                    || c.starts_with("create ")
+                    || c.contains("xcode-select --install")),
+                "{age:?}: {calls:?}"
+            );
+            assert_eq!(
+                calls.iter().filter(|c| c.starts_with("sleep ")).count(),
+                2,
+                "{age:?}: it waited on the window: {calls:?}"
+            );
+            assert_eq!(
+                sys.written(PLACEHOLDER).as_deref(),
+                Some(&b""[..]),
+                "{age:?}: the window's own stays"
             );
         }
 
-        // One left open past its bound waits for a press beside a placeholder an ended install
-        // left, as old: as stale as with none, so the install takes its place and goes on.
-        let left = ready();
-        installers(&left, Some("apple"));
-        left.born(window, left.now - bound)
-            .changed_at(PLACEHOLDER, left.now - bound);
-        CommandLineTools::install(&left).unwrap();
-        let calls = left.calls();
+        for beside in ["softwareupdate", "live run"] {
+            let sys = stale_marker();
+            sys.file(PLACEHOLDER, b"aterm 4242 1000\n");
+            if beside == "live run" {
+                installers(&sys, Some("apple"));
+                sys.born(4242, 1000);
+            } else {
+                sys.running(&["/sbin/launchd", APPLE_WINDOW, SOFTWAREUPDATE]);
+            }
+            assert_eq!(holder(&sys, true), Holder::Install, "{beside}");
+            let failure = CommandLineTools::install(&sys).unwrap_err();
+            assert_eq!(failure.class, Unfinished::Busy, "{beside}: {failure:?}");
+            assert!(
+                !sys.calls().iter().any(|c| c.starts_with(SOFTWAREUPDATE)
+                    || c.starts_with("remove ")
+                    || c.starts_with("sleep ")),
+                "{beside}: {:?}",
+                sys.calls()
+            );
+        }
+
+        let control = stale_marker();
+        control.file(PLACEHOLDER, b"");
+        installers(&control, None);
+        CommandLineTools::install(&control).unwrap();
+        let calls = control.calls();
         let at = |needle: &str| calls.iter().position(|c| c.starts_with(needle));
         let removed = at(&format!("remove {PLACEHOLDER}")).expect("the stale marker goes");
         let created = at(&format!("create {PLACEHOLDER}")).expect("this install's own");
@@ -1665,15 +2034,256 @@ Software Update found the following new or updated software:\n\
             removed < created && created < listed && listed < installed,
             "{calls:?}"
         );
-        assert!(left.written(PLACEHOLDER).is_none(), "removed when it ends");
+    }
 
-        // Nothing could tell whether one runs: it is left to whoever may hold it.
-        let unread = ready();
-        assert_eq!(
-            CommandLineTools::install(&unread).unwrap_err().class,
-            Unfinished::Busy
+    /// Apple's installer window that closes without installing the tools ends the wait on it at
+    /// once, as its own class, on every route: this run opened it where the catalog lists none, a
+    /// stub raised it while this run read the catalog, or it was open already, beside its own
+    /// placeholder, beside one an earlier run kept for it, or with none. A person pressed Not
+    /// Now, Cancel, or Done on Apple's own failure there (the window unlinks the placeholder,
+    /// whoever made it, and quits), or quit the window before pressing Install, which leaves a
+    /// placeholder aterm stamped (the window unlinks at its exit only a file it made): this run's,
+    /// which its guard removes (the wait does as the window goes where its start was not read,
+    /// which reads its run gone), or an earlier run's, which the wait removes as the window goes.
+    /// Where this run opened the window, its own placeholder with no window listed yet is no
+    /// close: the wait ends only once the window it asked for was seen and is gone.
+    /// NEGATIVE CONTROL: a window gone with Apple's own empty placeholder still there (killed
+    /// outright, so it removed nothing) is no end, and the wait runs to its patience.
+    #[test]
+    fn apples_window_closing_without_the_tools_ends_the_wait_at_once() {
+        let unlisted = || {
+            Ran::ok(
+                "Software Update Tool\n\nFinding available software\nNo new software available.\n",
+            )
+        };
+        let sleeps = |sys: &Fake| {
+            sys.calls()
+                .iter()
+                .filter(|c| c.starts_with("sleep "))
+                .count()
+        };
+        // This run opened it: nothing listed while `xcode-select --install` brings the window up
+        // (this run's own placeholder holds the wait), then the window, then its close.
+        let opened = Fake::root();
+        opened
+            .running(&["/sbin/launchd"])
+            .on("/usr/sbin/softwareupdate -l", unlisted())
+            .on("/usr/bin/xcode-select --install", Ran::ok(""));
+        opened.on_sleep(move |sys, _| {
+            let slept = sys
+                .calls()
+                .iter()
+                .filter(|c| c.starts_with("sleep "))
+                .count();
+            if slept == 1 {
+                sys.running(&["/sbin/launchd", APPLE_WINDOW]);
+            } else if slept == 3 {
+                let _ = sys.remove(Path::new(PLACEHOLDER));
+                sys.running(&["/sbin/launchd"]);
+            }
+        });
+        let failure = CommandLineTools::install(&opened).unwrap_err();
+        assert_eq!(failure.class, Unfinished::WindowClosed, "{failure:?}");
+        assert!(
+            failure.why.contains("closed without installing")
+                && failure.why.contains("`aterm init --only base.clt`"),
+            "{failure:?}"
         );
-        assert!(unread.written(PLACEHOLDER).is_some());
+        assert_eq!(sleeps(&opened), 3, "{:?}", opened.calls());
+        assert!(
+            !opened
+                .calls()
+                .iter()
+                .any(|c| c.starts_with("/usr/sbin/softwareupdate -i")),
+            "{:?}",
+            opened.calls()
+        );
+
+        // Already open beside its own placeholder when the run began.
+        let found = Fake::root();
+        found.file(PLACEHOLDER, b"");
+        installers(&found, Some("apple"));
+        found.on_sleep(|sys, _| {
+            let _ = sys.remove(Path::new(PLACEHOLDER));
+            sys.running(&["/sbin/launchd"]);
+        });
+        let failure = CommandLineTools::install(&found).unwrap_err();
+        assert_eq!(failure.class, Unfinished::WindowClosed, "{failure:?}");
+        assert_eq!(sleeps(&found), 1, "{:?}", found.calls());
+
+        // Already open with no placeholder beside it: this run made none to hold the wait.
+        let alone = Fake::root();
+        installers(&alone, Some("apple"));
+        alone.on_sleep(|sys, _| {
+            sys.running(&["/sbin/launchd"]);
+        });
+        let failure = CommandLineTools::install(&alone).unwrap_err();
+        assert_eq!(failure.class, Unfinished::WindowClosed, "{failure:?}");
+        assert_eq!(sleeps(&alone), 1, "{:?}", alone.calls());
+
+        // Raised while this run read the catalog, beside this run's placeholder, which the
+        // window unlinks as it closes.
+        let raised = Fake::root();
+        raised
+            .running(&["/sbin/launchd"])
+            .on("/usr/sbin/softwareupdate -l", Ran::ok(VM_LIST))
+            .on_running(
+                "/usr/sbin/softwareupdate -l",
+                &["/sbin/launchd", APPLE_WINDOW],
+            );
+        raised.on_sleep(|sys, _| {
+            let _ = sys.remove(Path::new(PLACEHOLDER));
+            sys.running(&["/sbin/launchd"]);
+        });
+        let failure = CommandLineTools::install(&raised).unwrap_err();
+        assert_eq!(failure.class, Unfinished::WindowClosed, "{failure:?}");
+        assert_eq!(sleeps(&raised), 1, "{:?}", raised.calls());
+
+        // Quit before Install was pressed, beside a placeholder aterm stamped, which stays: this
+        // run opened the window (nothing listed until the second tick), a stub raised it during
+        // the catalog read, or an earlier run, gone now, kept its placeholder for it. Whether
+        // this run's own start is read (its stamp then a live run's, as on a Mac) or not (a start
+        // of 0, which matches no process), the stamped placeholder is gone once the run has
+        // ended, removed once.
+        for (route, own_start) in ["opened", "raised", "kept"]
+            .into_iter()
+            .flat_map(|route| [(route, false), (route, true)])
+        {
+            let quit = Fake::root();
+            if own_start {
+                quit.born(std::process::id(), 1_000);
+            }
+            match route {
+                "opened" => {
+                    quit.running(&["/sbin/launchd"])
+                        .on("/usr/sbin/softwareupdate -l", unlisted())
+                        .on("/usr/bin/xcode-select --install", Ran::ok(""));
+                }
+                "raised" => {
+                    quit.running(&["/sbin/launchd"])
+                        .on("/usr/sbin/softwareupdate -l", Ran::ok(VM_LIST))
+                        .on_running(
+                            "/usr/sbin/softwareupdate -l",
+                            &["/sbin/launchd", APPLE_WINDOW],
+                        );
+                }
+                _ => {
+                    quit.file(PLACEHOLDER, b"aterm 4242 1000\n");
+                    installers(&quit, Some("apple"));
+                    assert_eq!(holder(&quit, true), Holder::AppleWindow);
+                }
+            }
+            let (comes_up, quit_at) = if route == "opened" {
+                (Some(1), 3)
+            } else {
+                (None, 1)
+            };
+            quit.on_sleep(move |sys, _| {
+                let slept = sys
+                    .calls()
+                    .iter()
+                    .filter(|c| c.starts_with("sleep "))
+                    .count();
+                if Some(slept) == comes_up {
+                    sys.running(&["/sbin/launchd", APPLE_WINDOW]);
+                } else if slept == quit_at {
+                    sys.running(&["/sbin/launchd"]);
+                }
+            });
+            let failure = CommandLineTools::install(&quit).unwrap_err();
+            assert_eq!(
+                failure.class,
+                Unfinished::WindowClosed,
+                "{route} {own_start}: {failure:?}"
+            );
+            let calls = quit.calls();
+            assert_eq!(sleeps(&quit), quit_at, "{route} {own_start}: {calls:?}");
+            assert!(
+                quit.written(PLACEHOLDER).is_none(),
+                "{route} {own_start}: the stamped placeholder goes with the window: {calls:?}"
+            );
+            assert_eq!(
+                calls.iter().filter(|c| c.starts_with("remove ")).count(),
+                1,
+                "{route} {own_start}: {calls:?}"
+            );
+            assert!(
+                !calls
+                    .iter()
+                    .any(|c| c.starts_with("/usr/sbin/softwareupdate -i")),
+                "{route} {own_start}: {calls:?}"
+            );
+        }
+
+        let killed = Fake::root();
+        killed.file(PLACEHOLDER, b"");
+        installers(&killed, Some("apple"));
+        killed.on_sleep(|sys, _| {
+            sys.running(&["/sbin/launchd"]);
+        });
+        let failure = CommandLineTools::install(&killed).unwrap_err();
+        assert_eq!(failure.class, Unfinished::AppleWindow, "{failure:?}");
+        assert_eq!(sleeps(&killed), 900, "every 2 s for 30 minutes");
+    }
+
+    /// A placeholder a live run of aterm's stamped stays as Apple's window goes: the wait that
+    /// ends `WindowClosed` removes only a stamp whose run is gone
+    /// ([`remove_a_gone_runs_placeholder`]). This run's own, its start read, is still there when
+    /// the wait decides the window closed (its guard removes it once the wait has returned); and
+    /// another run's, which took the stale stamp an earlier run kept in the tick after the window
+    /// went, is left, the wait removing nothing.
+    /// NEGATIVE CONTROL: that other run gone (its start matches no process), its stamp goes with
+    /// the window. The mutant `remove_a_gone_runs_placeholder` without its
+    /// `holder(sys, true) == Holder::Nothing` check removes both live stamps and fails this test.
+    #[test]
+    fn a_live_runs_placeholder_stays_as_apples_window_goes() {
+        let own = Fake::root();
+        own.born(std::process::id(), 1_000);
+        let own_stamp = stamp(&own);
+        own.file(PLACEHOLDER, &own_stamp);
+        installers(&own, Some("apple"));
+        assert_eq!(holder(&own, true), Holder::Install, "this run is alive");
+        own.on_sleep(|sys, _| {
+            sys.running(&["/sbin/launchd"]);
+        });
+        let failure = CommandLineTools::wait_on_window(&own, "patience").unwrap_err();
+        assert_eq!(failure.class, Unfinished::WindowClosed, "{failure:?}");
+        assert_eq!(
+            own.written(PLACEHOLDER).as_deref(),
+            Some(own_stamp.as_slice()),
+            "the wait leaves this run's own to its guard: {:?}",
+            own.calls()
+        );
+
+        for live in [true, false] {
+            let kept = Fake::root();
+            kept.file(PLACEHOLDER, b"aterm 4242 1000\n");
+            installers(&kept, Some("apple"));
+            kept.on_sleep(move |sys, _| {
+                sys.running(&["/sbin/launchd"]);
+                sys.file(PLACEHOLDER, b"aterm 4243 2000\n");
+                if live {
+                    sys.born(4243, 2_000);
+                }
+            });
+            let failure = CommandLineTools::install(&kept).unwrap_err();
+            assert_eq!(
+                failure.class,
+                Unfinished::WindowClosed,
+                "{live}: {failure:?}"
+            );
+            let calls = kept.calls();
+            assert_eq!(
+                calls.iter().filter(|c| c.starts_with("remove ")).count(),
+                usize::from(!live),
+                "{live}: {calls:?}"
+            );
+            assert_eq!(
+                kept.written(PLACEHOLDER).is_some(),
+                live,
+                "{live}: {calls:?}"
+            );
+        }
     }
 
     /// Each way the install falls short is named by its class ([`Item::unfinished`]), which
@@ -1754,6 +2364,17 @@ Software Update found the following new or updated software:\n\
                 installers(sys, Some("softwareupdate"));
             }),
             Some(Unfinished::Busy)
+        );
+        assert_eq!(
+            applied(&|sys| {
+                sys.file(PLACEHOLDER, b"");
+                installers(sys, Some("apple"));
+                sys.on_sleep(|sys, _| {
+                    let _ = sys.remove(Path::new(PLACEHOLDER));
+                    sys.running(&["/sbin/launchd"]);
+                });
+            }),
+            Some(Unfinished::WindowClosed)
         );
         // Apple's catalog out of reach blocks the probe: the same class as an unread catalog.
         let sys = Fake::root();

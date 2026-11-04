@@ -26,7 +26,7 @@ fn park(test: &str) -> ExitCode {
 }
 
 /// Run stand-in `args` (its mode first).
-#[must_use]
+#[must_use = "handle or propagate the agent's exit status"]
 pub fn run(args: &[OsString]) -> ExitCode {
     let args: Vec<String> = args
         .iter()

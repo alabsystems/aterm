@@ -820,12 +820,18 @@ fn link_cli(exe: &Path, bin_dir: &Path, run: &dyn Run) -> Result<Option<PathBuf>
             link.display()
         );
     }
-    let editor = exe.with_file_name("amacs");
-    if std::fs::symlink_metadata(&editor).is_ok() {
-        let link = bin_dir.join("amacs");
-        if let Some(prior) = point_link(&editor, &link)? {
+    // The bundle's other command links follow `aterm`, as atpkg's pass makes them follow it
+    // (`hooks::link_act`): a tab finds `~/.local/bin` ahead of its bundle, so a link left on
+    // the release would run the release's code in a dev tab.
+    for (name, what) in [("amacs", "editor"), ("agh", "GitHub client")] {
+        let alias = exe.with_file_name(name);
+        if std::fs::symlink_metadata(&alias).is_err() {
+            continue;
+        }
+        let link = bin_dir.join(name);
+        if let Some(prior) = point_link(&alias, &link)? {
             eprintln!(
-                "ship dev-app: {} now runs this dev build's editor (was: {})",
+                "ship dev-app: {} now runs this dev build's {what} (was: {})",
                 link.display(),
                 prior.display()
             );
@@ -1609,7 +1615,9 @@ mod tests {
             std::fs::create_dir_all(&macos).unwrap();
             std::fs::write(macos.join("aterm"), app.as_bytes()).unwrap();
             if editor {
-                std::os::unix::fs::symlink("aterm", macos.join("amacs")).unwrap();
+                for alias in ["amacs", "agh"] {
+                    std::os::unix::fs::symlink("aterm", macos.join(alias)).unwrap();
+                }
             }
             macos
         };
@@ -1617,7 +1625,7 @@ mod tests {
         let dev = bundle("aterm (dev).app", true);
         let older = bundle("older (dev).app", false);
         std::fs::create_dir_all(&bin).unwrap();
-        for name in ["aterm", "amacs"] {
+        for name in ["aterm", "amacs", "agh"] {
             std::os::unix::fs::symlink(release.join(name), bin.join(name)).unwrap();
         }
         let target = |name: &str| std::fs::read_link(bin.join(name)).ok();
@@ -1629,6 +1637,7 @@ mod tests {
         );
         assert_eq!(target("aterm"), Some(dev.join("aterm")));
         assert_eq!(target("amacs"), Some(dev.join("amacs")));
+        assert_eq!(target("agh"), Some(dev.join("agh")));
         assert_eq!(log(&fake), vec!["aterm --version".to_string()]);
 
         assert_eq!(
@@ -1641,6 +1650,7 @@ mod tests {
             Some(dev.join("amacs")),
             "no editor in the bundle, no link"
         );
+        assert_eq!(target("agh"), Some(dev.join("agh")));
 
         std::fs::remove_file(bin.join("amacs")).unwrap();
         std::fs::write(bin.join("amacs"), b"someone's own").unwrap();

@@ -163,8 +163,9 @@ pub const ANIMAL_GLYPH_IDS: &[AnimalGlyphId] = &[
     AnimalGlyphId::Zebra,
 ];
 
-/// Every species head's const drawlist, indexed by [`AnimalGlyphId`] order.
-pub const ANIMAL_GLYPHS: &[GlyphDef] = &[
+/// Every species head's drawlist, indexed by [`AnimalGlyphId`] order.
+/// A `static`, so the binary holds one copy (a `const` is copied into each crate that reads it).
+pub static ANIMAL_GLYPHS: &[GlyphDef] = &[
     // Bat (bat)
     GlyphDef { id: "bat", kind: GlyphKind::Head, aspect_x1000: 1212, eye_y: 2335, center_x: 2048, word_top: 4096, layers: &[
         Layer { role: GlyphRole::Outline, recolor: Recolor::Fixed, fill: 0x2B2333, paths: &[

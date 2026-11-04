@@ -360,7 +360,7 @@ pub fn keep_jailed(run_dir: &Path, child: std::process::Child) -> i32 {
 /// historical evidence; that list does not authorize signals.
 #[must_use]
 pub fn jailed_roots(run_dir: &Path, all: bool) -> Vec<i32> {
-    let text = std::fs::read_to_string(jailed_file(run_dir)).unwrap_or_default();
+    let text = crate::util::read_regular_text(&jailed_file(run_dir)).unwrap_or_default();
     jailed_roots_with(&text, all, start_time)
 }
 
@@ -426,7 +426,7 @@ pub fn lab_pids_ever(run: &crate::run::Run) -> Vec<i32> {
     v.extend(jail_members(run));
     v.extend(jailed_roots(&run.run, true));
     v.extend(
-        std::fs::read_to_string(run.run.join("members.txt"))
+        crate::util::read_regular_text(&run.run.join("members.txt"))
             .unwrap_or_default()
             .lines()
             .filter_map(|l| l.trim().parse::<i32>().ok()),

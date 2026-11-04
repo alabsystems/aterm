@@ -432,9 +432,9 @@ pub fn lane_mounts(repo: &str) -> Vec<String> {
 /// The repository directory a checkout's `.git` FILE points to outside it: for a linked worktree (`git worktree add`) the common directory (its gitdir's `commondir`), which holds the worktree's own `worktrees/<name>`, the objects and the refs.
 #[must_use]
 pub fn outside_git_dir(repo: &Path) -> Option<PathBuf> {
-    let file = std::fs::read_to_string(repo.join(".git")).ok()?;
+    let file = crate::util::read_regular_text(&repo.join(".git")).ok()?;
     let gitdir = repo.join(file.lines().next()?.strip_prefix("gitdir:")?.trim());
-    let common = match std::fs::read_to_string(gitdir.join("commondir")) {
+    let common = match crate::util::read_regular_text(&gitdir.join("commondir")) {
         Ok(relative) => gitdir.join(relative.trim()),
         Err(_) => gitdir,
     };
@@ -873,7 +873,7 @@ pub fn host_disk_bytes(state: &VmState) -> Option<u64> {
 /// The host agent of the lima instance in `dir` (`ha.pid`): one process per boot.
 #[must_use]
 pub fn lima_agent(dir: &Path) -> Option<u32> {
-    std::fs::read_to_string(dir.join("ha.pid"))
+    crate::util::read_regular_text(&dir.join("ha.pid"))
         .ok()
         .and_then(|t| t.trim().parse::<u32>().ok())
 }

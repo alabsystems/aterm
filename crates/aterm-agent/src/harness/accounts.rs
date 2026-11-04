@@ -139,10 +139,6 @@ pub const RESET_SOON_S: i64 = 15 * 60;
 /// A `low` account is moved into only when no account becomes usable within this long.
 pub const LOW_ONLY_AFTER_S: i64 = 15 * 60;
 
-/// A wait is for the earliest dedicated instant when that is within this long of the earliest
-/// instant of any account.
-pub const DEDICATED_WAIT_S: i64 = 15 * 60;
-
 /// An account holding a reset offer that expires within this long is not left early.
 pub const OFFER_EXPIRING_S: i64 = 24 * 3600;
 
@@ -321,32 +317,51 @@ pub const PROFILE_KEYS: &[&str] = &[
     "ANTHROPIC_CONFIG_DIR",
 ];
 
-/// Contention class (`dedicated` or `shared`) of a Claude Code account.
+/// Where a row stands in this Mac's order (`docs/DESIGN-alab-lab-model-2026-11-01.md` §0): a
+/// derived "preferred here", never a claim on the account. Any number of Macs may prefer one
+/// account and run it, so nothing reads it as "no other Mac used this account": the claims
+/// ring, not a class, keeps two Macs off one login. A sync derives it (from the lab's
+/// preferences, or on a Mac the lab does not name from the sheet or pool it reads), and
+/// `accounts.toml` keeps it as the `class` word older builds read ([`Class::legacy_word`]), so a
+/// roster read between syncs keeps the order and the installed release that shares the file
+/// still loads it. The word is a serialization only: no reader takes it as a claim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum Class {
-    /// This machine's alone.
+    /// This Mac prefers it: tried before the others.
     #[default]
-    Dedicated,
-    /// Drawn on from elsewhere too.
-    Shared,
+    Preferred,
+    /// This Mac does not prefer it (another Mac does, or none): tried after the preferred ones.
+    Pool,
 }
 
 impl Class {
-    /// Canonical `accounts.toml` string for this class.
+    /// The word a report shows for it: `preferred` or `pool`.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Class::Dedicated => "dedicated",
-            Class::Shared => "shared",
+            Class::Preferred => "preferred",
+            Class::Pool => "pool",
         }
     }
 
-    /// Parses a [`Class`] from its `accounts.toml` string.
+    /// The word files that older builds read carry for it (`dedicated` for [`Class::Preferred`],
+    /// `shared` for [`Class::Pool`]): `accounts.toml`'s and a fleet file's `class`, and the
+    /// `local-class` a shared login's approved configuration requires.
     #[must_use]
-    pub fn parse(word: &str) -> Option<Class> {
+    pub const fn legacy_word(self) -> &'static str {
+        match self {
+            Class::Preferred => "dedicated",
+            Class::Pool => "shared",
+        }
+    }
+
+    /// The order a `class` word gives ([`Self::legacy_word`]): a fleet file's, or a roster's an older
+    /// build wrote.
+    #[must_use]
+    pub fn from_written(word: &str) -> Option<Class> {
         match word {
-            "dedicated" => Some(Class::Dedicated),
-            "shared" => Some(Class::Shared),
+            "dedicated" => Some(Class::Preferred),
+            "shared" => Some(Class::Pool),
             _ => None,
         }
     }
@@ -357,7 +372,7 @@ impl Class {
 pub struct Row {
     /// The only name the account has anywhere.
     pub label: String,
-    /// Dedicated or shared.
+    /// Preferred here or not ([`Class`]): an order, never a claim.
     pub class: Class,
     /// The login's directory, as a process's [`LOGIN_ENV`] holds it; `None` is the default login.
     pub dir: Option<String>,
@@ -774,8 +789,9 @@ fn row_of(cli: Cli, item: &aterm_toml::Value, n: usize) -> Result<Row, String> {
             shown(key)
         ));
     }
+    // The order is stored as the `class` word every build reads: a serialization, never a claim.
     let class = match table.get("class") {
-        Some(aterm_toml::Value::String(word)) => Class::parse(word).ok_or_else(|| {
+        Some(aterm_toml::Value::String(word)) => Class::from_written(word).ok_or_else(|| {
             format!(
                 "{file}: row `{label}`: class `{}` is neither `dedicated` nor `shared`",
                 shown(word)
@@ -783,8 +799,7 @@ fn row_of(cli: Cli, item: &aterm_toml::Value, n: usize) -> Result<Row, String> {
         })?,
         Some(other) => {
             return Err(format!(
-                "{file}: row `{label}`: its class is a TOML {}, not `dedicated` or \
-                 `shared`",
+                "{file}: row `{label}`: its class is a TOML {}, not `dedicated` or `shared`",
                 other.type_str()
             ));
         }
@@ -980,10 +995,12 @@ pub fn row_text(row: &Row) -> Option<String> {
     if row_refusal(row).is_some() {
         return None;
     }
+    // The order is written as the `class` word older builds read, so the installed release
+    // on a Mac a newer build synced keeps loading the roster it shares.
     let mut out = format!(
         "[[account]]\nlabel = \"{}\"\nclass = \"{}\"\n",
         row.label,
-        row.class.as_str()
+        row.class.legacy_word()
     );
     let mut put = |key: &str, value: Option<&str>| {
         if let Some(value) = value {
@@ -1021,7 +1038,7 @@ fn row_inline_of(row: &Row) -> Option<String> {
     let mut out = format!(
         "{{ label = \"{}\", class = \"{}\"",
         row.label,
-        row.class.as_str()
+        row.class.legacy_word()
     );
     if let Some(dir) = &row.dir {
         out.push_str(&format!(
@@ -5398,7 +5415,7 @@ pub fn renew_next(
     me: Option<&str>,
     now: i64,
 ) -> Option<String> {
-    for class in [Class::Dedicated, Class::Shared] {
+    for class in [Class::Preferred, Class::Pool] {
         for row in roster.rows.iter().filter(|r| {
             r.held_by.is_none() && state.execution_verdict(&r.label).is_ok() && r.class == class
         }) {
@@ -5829,8 +5846,9 @@ pub fn candidates(
     out
 }
 
-/// Earliest timestamp at which any roster account becomes usable, or the earliest dedicated one's
-/// when that is within [`DEDICATED_WAIT_S`] of it.
+/// Earliest timestamp at which any roster account becomes usable. A preference orders a move and
+/// never holds one back (`docs/DESIGN-alab-lab-model-2026-11-01.md` §0), so a wait is never past
+/// a pool row's instant for a preferred row's later one.
 #[must_use]
 pub fn next_usable(
     roster: &Roster,
@@ -5881,7 +5899,7 @@ fn wait_instant(
     which: Instants<'_>,
     now: i64,
 ) -> Option<i64> {
-    let instants: Vec<(Class, i64)> = roster
+    roster
         .rows
         .iter()
         .filter_map(|r| {
@@ -5892,19 +5910,9 @@ fn wait_instant(
                 Instants::WalledOn(walled) => walled != r.label || at > now,
                 Instants::Ahead => at > now,
             };
-            counted.then_some((r.class, at))
+            counted.then_some(at)
         })
-        .collect();
-    let earliest = instants.iter().map(|(_, t)| *t).min()?;
-    let dedicated = instants
-        .iter()
-        .filter(|(class, _)| *class == Class::Dedicated)
-        .map(|(_, t)| *t)
-        .min();
-    Some(match dedicated {
-        Some(t) if t.saturating_sub(earliest) <= DEDICATED_WAIT_S => t,
-        _ => earliest,
-    })
+        .min()
 }
 
 /// Computes the seconds after its newest sample when `account`'s next `/usage` probe becomes due.
@@ -7857,11 +7865,16 @@ pub fn strike(state: &mut State, account: &str, sid: &str, why: &Strike, now: i6
     out
 }
 
-#[derive(Clone, Copy)]
-enum PinRefusal {
+/// Why [`pin`] refuses a label ([`pin_refusal`]), which `accounts use` names the way past by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PinRefusal {
+    /// The roster lists no row of that label.
     NotListed,
+    /// The row is held for preparation only, with no execution authority here.
     PreparationOnly,
+    /// No login of the row is made on this machine.
     NotEnrolled,
+    /// The row's login is known signed out.
     SignedOut,
 }
 
@@ -7881,7 +7894,9 @@ impl PinRefusal {
     }
 }
 
-fn pin_refusal(
+/// Why [`pin`] would refuse `label` in `state` (with the rows whose login is here, `enrolled`),
+/// `None` where it pins it.
+pub(crate) fn pin_refusal(
     state: &State,
     roster: &Roster,
     enrolled: &BTreeSet<String>,

@@ -270,10 +270,7 @@ pub fn names_no_daemon(bin: &Path) -> bool {
     use std::io::Read as _;
     const NEEDLE: &[u8] = b"no-daemon";
     const BLOCK: usize = 4 << 20;
-    if !fs::metadata(bin).is_ok_and(|m| m.is_file()) {
-        return false;
-    }
-    let Ok(mut file) = fs::File::open(bin) else {
+    let Ok(mut file) = crate::util::open_regular_file(bin) else {
         return false;
     };
     let mut buf = vec![0u8; BLOCK];

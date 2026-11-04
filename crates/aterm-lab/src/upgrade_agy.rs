@@ -296,7 +296,7 @@ fn transcript(run: &Run, conversation: &str) -> PathBuf {
 /// [`agy_reply_whole`] of `conversation`'s transcript; `Err` names one that could not be read.
 fn slow_reply_whole(run: &Run, conversation: &str) -> Result<bool, String> {
     let path = transcript(run, conversation);
-    std::fs::read_to_string(&path)
+    crate::util::read_regular_text(&path)
         .map(|text| agy_reply_whole(&text))
         .map_err(|e| format!("{}: {e}", path.display()))
 }
@@ -551,7 +551,7 @@ fn run_check(tag: &str) -> Result<bool, Fail> {
     // writes the spawn row as it starts one, whose model call the stub holds
     // `SUBAGENT_HOLD_MS`).
     let guard3 = wait_for(20, || {
-        let text = std::fs::read_to_string(transcript(&run, &conversation)).ok()?;
+        let text = crate::util::read_regular_text(&transcript(&run, &conversation)).ok()?;
         (open_work(&text, asked3) == Err(Open::Subagent)).then_some(())
     })?;
     println!(

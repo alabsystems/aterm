@@ -12,7 +12,7 @@ use std::process::ExitCode;
 pub const ALIAS: &str = "aterm-machines-askpass";
 
 /// `aterm-machines-askpass <prompt>`, as OpenSSH runs it.
-#[must_use]
+#[must_use = "handle or propagate the command's exit status"]
 pub fn main(args: &[OsString]) -> ExitCode {
     crate::port::no_core_dumps();
     let prompt = args

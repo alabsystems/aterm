@@ -86,7 +86,7 @@ pub struct Tally {
 
 impl Tally {
     /// The exit code.
-    #[must_use]
+    #[must_use = "handle or propagate the command's exit status"]
     pub fn code(self) -> ExitCode {
         if self.failed {
             ExitCode::FAILURE
@@ -99,7 +99,7 @@ impl Tally {
 }
 
 /// `aterm machines init [--passphrase]`: initialize controller keys, signers, and inventory.
-#[must_use]
+#[must_use = "handle or propagate the command's exit status"]
 pub fn init(env: &Env<'_>, passphrase: bool, out: &mut dyn std::io::Write) -> ExitCode {
     if passphrase && !env.tty {
         errln!(
@@ -280,7 +280,7 @@ fn controller_name(sys: &dyn System) -> String {
 }
 
 /// `aterm machines ls`: the inventory, one host per row.
-#[must_use]
+#[must_use = "handle or propagate the command's exit status"]
 pub fn ls(env: &Env<'_>) -> ExitCode {
     let inv = match load(env) {
         Ok(inv) => inv,
@@ -437,7 +437,7 @@ fn read_state(env: &Env<'_>, host: &Host, tally: &mut Tally) -> Option<HostState
 }
 
 /// `aterm machines status`: one row per host, from `state/` only.
-#[must_use]
+#[must_use = "handle or propagate the command's exit status"]
 pub fn status(env: &Env<'_>, names: &[String], all: bool, by_item: bool) -> ExitCode {
     let inv = match load(env) {
         Ok(inv) => inv,
@@ -495,7 +495,7 @@ pub fn status(env: &Env<'_>, names: &[String], all: bool, by_item: bool) -> Exit
 }
 
 /// `aterm machines rename <host> <new-name>`: set a host's display name in `machines.toml`.
-#[must_use]
+#[must_use = "handle or propagate the command's exit status"]
 pub fn rename(env: &Env<'_>, selector: &str, new_name: &str) -> ExitCode {
     match inventory::set_host_name(env.sys, &env.paths, selector, new_name) {
         Ok(tag_key) => {
@@ -905,7 +905,7 @@ fn print_host_tabs_rows(
 }
 
 /// `aterm machines monitor`: live continuous system monitoring across the fleet.
-#[must_use]
+#[must_use = "handle or propagate the command's exit status"]
 pub fn monitor(
     env: &Env<'_>,
     names: &[String],
@@ -950,7 +950,7 @@ pub fn monitor(
 }
 
 /// `aterm machines tabs`: live table of hosts, `aterm` instances, tabs, and vitals.
-#[must_use]
+#[must_use = "handle or propagate the command's exit status"]
 pub fn tabs(env: &Env<'_>, names: &[String], all: bool) -> ExitCode {
     let inv = match inventory::load(env.sys, &env.paths) {
         Ok(inv) => inv,
@@ -1329,7 +1329,7 @@ const fn outcome_word(outcome: Outcome) -> &'static str {
 }
 
 /// `aterm machines outstanding`: fleet-wide list of unreached hosts, failures, and person steps.
-#[must_use]
+#[must_use = "handle or propagate the command's exit status"]
 pub fn outstanding(env: &Env<'_>) -> ExitCode {
     let inv = match load(env) {
         Ok(inv) => inv,
@@ -1556,7 +1556,7 @@ fn fleet_hosts<'i>(
 }
 
 /// `aterm machines plan|apply`, the whole baseline.
-#[must_use]
+#[must_use = "handle or propagate the command's exit status"]
 pub fn plan_or_apply(
     env: &Env<'_>,
     names: &[String],
@@ -1568,7 +1568,7 @@ pub fn plan_or_apply(
 }
 
 /// `aterm machines plan|apply [--only <table>,…]`: plan or apply selected baseline tables.
-#[must_use]
+#[must_use = "handle or propagate the command's exit status"]
 pub fn plan_or_apply_only(
     env: &Env<'_>,
     names: &[String],
@@ -2640,7 +2640,7 @@ fn one_host<'i>(inv: &'i Inventory, name: &str, verb: &str) -> Result<&'i Host, 
 }
 
 /// `aterm machines attach <host> [<run>]`: follow a run that outlived its connection.
-#[must_use]
+#[must_use = "handle or propagate the command's exit status"]
 pub fn attach(env: &Env<'_>, name: &str, run: Option<&str>) -> ExitCode {
     let inv = match load(env) {
         Ok(inv) => inv,
@@ -2715,7 +2715,7 @@ pub fn attach(env: &Env<'_>, name: &str, run: Option<&str>) -> ExitCode {
 }
 
 /// `aterm machines run <host…|--all> [--user <u>] -- <argv>`: run one signed command.
-#[must_use]
+#[must_use = "handle or propagate the command's exit status"]
 pub fn run(
     env: &Env<'_>,
     names: &[String],
@@ -2828,7 +2828,7 @@ fn exec_body(env: &Env<'_>, host: &Host, floor: u64, exec: Exec) -> Result<Envel
 }
 
 /// `aterm machines person [<host>…|--all]`: list outstanding interactive person steps.
-#[must_use]
+#[must_use = "handle or propagate the command's exit status"]
 pub fn person(env: &Env<'_>, names: &[String], all: bool) -> ExitCode {
     let inv = match load(env) {
         Ok(inv) => inv,
@@ -3135,7 +3135,7 @@ fn tell(host: &Host, walked: &[screen::Walked], emit: &mut dyn FnMut(Said)) -> (
 }
 
 /// `aterm machines person <host> --here` and `screen <host>`: walk pending person steps.
-#[must_use]
+#[must_use = "handle or propagate the command's exit status"]
 pub fn walk(
     env: &Env<'_>,
     name: &str,
@@ -3253,7 +3253,7 @@ pub fn walk(
 }
 
 /// `aterm machines github revoke <host>`: delete the host's registered GitHub SSH keys.
-#[must_use]
+#[must_use = "handle or propagate the command's exit status"]
 pub fn github_revoke(env: &Env<'_>, name: &str) -> ExitCode {
     let inv = match load(env) {
         Ok(inv) => inv,
@@ -3312,7 +3312,7 @@ pub fn github_revoke(env: &Env<'_>, name: &str) -> ExitCode {
 }
 
 /// `aterm machines github login`: prompt for the `[github]` token and store it in Keychain.
-#[must_use]
+#[must_use = "handle or propagate the command's exit status"]
 pub fn github_login(env: &Env<'_>) -> ExitCode {
     let inv = match load(env) {
         Ok(inv) => inv,
@@ -3376,7 +3376,7 @@ pub fn github_login(env: &Env<'_>) -> ExitCode {
 }
 
 /// `aterm machines unenroll <host> [--unreachable]`: remove a host from the fleet.
-#[must_use]
+#[must_use = "handle or propagate the command's exit status"]
 pub fn unenroll(env: &Env<'_>, name: &str, unreachable: bool) -> ExitCode {
     if !env.tty {
         errln!(
@@ -3472,7 +3472,7 @@ fn public_of(env: &Env<'_>, key: &Path) -> Result<PathBuf, String> {
 }
 
 /// `aterm machines rekey`: replace the `allowed_signers` file trusted by selected hosts.
-#[must_use]
+#[must_use = "handle or propagate the command's exit status"]
 pub fn rekey(
     env: &Env<'_>,
     names: &[String],
@@ -3691,14 +3691,15 @@ pub enum HereOutput {
 
 /// `aterm machines here plan|apply <baseline.toml>`: run a baseline directly on this Mac; with
 /// [`HereOutput::Plain`], the Command Line Tools' own baseline (`baseline_path` unread).
-#[must_use]
+#[must_use = "handle or propagate the command's exit status"]
 pub fn here(
     sys: &dyn System,
     mode: Mode,
     baseline_path: Option<&Path>,
+    name: Option<&str>,
     output: HereOutput,
 ) -> ExitCode {
-    match here_report(sys, mode, baseline_path, output) {
+    match here_report(sys, mode, baseline_path, name, output) {
         Ok(Some((host, report))) => {
             print_report(
                 &Env {
@@ -3726,11 +3727,15 @@ pub fn here(
 }
 
 /// [`here`]'s run: the host and its report to print, `None` when a plain run finished, or the
-/// exit code it ends on (a plain run's class of why it did not finish).
+/// exit code it ends on (a plain run's class of why it did not finish). A plain run with `name`
+/// (a [`crate::init_clt::plain_name`]) also gives the Mac that name; whether those rows changed
+/// or failed goes to the journal, and the exit says the tools alone, so a name macOS refused
+/// never reads as tools that did not install.
 fn here_report(
     sys: &dyn System,
     mode: Mode,
     baseline_path: Option<&Path>,
+    name: Option<&str>,
     output: HereOutput,
 ) -> Result<Option<(Host, HostReport)>, ExitCode> {
     let plain = output == HereOutput::Plain;
@@ -3754,7 +3759,7 @@ fn here_report(
     // The root half trusts nothing the person's account can write: a plain run applies the
     // tools' own baseline, built in.
     let text = match (plain, baseline_path) {
-        (true, _) => crate::init_clt::CommandLineTools::baseline(),
+        (true, _) => crate::init_clt::CommandLineTools::baseline_named(name),
         (false, Some(path)) => match sys.read_file(path) {
             Ok(b) => String::from_utf8_lossy(&b).into_owned(),
             Err(e) => refuse!(
@@ -3847,6 +3852,12 @@ fn here_report(
         // whose probe was blocked, did not finish either.
         let unfinished = rows
             .iter()
+            .filter(|row| {
+                items
+                    .iter()
+                    .find(|item| item.id() == row.id)
+                    .is_none_or(|item| item.family() != "names")
+            })
             .find(|row| {
                 !matches!(
                     row.outcome,
@@ -6556,7 +6567,7 @@ mod tests {
         };
         let curl =
             "/usr/bin/curl --disable --proto =https -sSI --max-time 20 https://swscan.apple.com/";
-        let plain = |sys: &Fake| here_report(sys, Mode::Apply, None, HereOutput::Plain);
+        let plain = |sys: &Fake| here_report(sys, Mode::Apply, None, None, HereOutput::Plain);
         let class = |why: Unfinished| Some(ExitCode::from(why.code().unwrap()));
 
         // Installed and selected already: done, and nothing to print.
@@ -6612,6 +6623,7 @@ mod tests {
                 &user,
                 Mode::Apply,
                 Some(Path::new(baseline)),
+                None,
                 HereOutput::Report
             )
             .err()
@@ -6620,6 +6632,144 @@ mod tests {
         );
         let unread = Fake::root();
         assert!(plain(&unread).err() == class(Unfinished::Other));
+    }
+
+    /// `--name` gives the Mac its swarm label as Computer Name and Local hostname under the one
+    /// password the tools take, journaled; a name macOS refuses leaves the exit saying the tools
+    /// alone. NEGATIVE CONTROLS: with no name the root half runs no `scutil --set`, and with the tools
+    /// out of reach the exit is still theirs.
+    #[test]
+    fn here_apply_plain_names_the_mac_and_exits_on_the_tools_alone() {
+        use crate::init_clt::Unfinished;
+        let console = crate::port::Stat {
+            uid: 0,
+            gid: 0,
+            mode: 0o600,
+            dir: false,
+            symlink: false,
+            len: 0,
+        };
+        let tools = || {
+            let sys = Fake::root();
+            sys.stat_of("/dev/console", console)
+                .stat_of(
+                    crate::items::developer::CLT_GIT,
+                    crate::port::Stat {
+                        uid: 0,
+                        gid: 0,
+                        mode: 0o755,
+                        dir: false,
+                        symlink: false,
+                        len: 1,
+                    },
+                )
+                .on(
+                    "/usr/bin/xcode-select -p",
+                    Ran::ok("/Library/Developer/CommandLineTools\n"),
+                );
+            sys
+        };
+        let sets = |sys: &Fake| -> Vec<String> {
+            sys.calls()
+                .into_iter()
+                .filter(|call| call.contains("scutil --set"))
+                .collect()
+        };
+        let plain = |sys: &Fake, name| here_report(sys, Mode::Apply, None, name, HereOutput::Plain);
+        let journal =
+            |sys: &Fake| String::from_utf8(sys.written(Fake::JOURNAL).unwrap_or_default()).unwrap();
+
+        // Read three times each: the Mac's facts, the probe, and the check after the set.
+        let named = tools();
+        named
+            .on(
+                "/usr/sbin/scutil --get ComputerName",
+                Ran::ok("Andrew\u{2019}s MacBook Pro\n"),
+            )
+            .on(
+                "/usr/sbin/scutil --get ComputerName",
+                Ran::ok("Andrew\u{2019}s MacBook Pro\n"),
+            )
+            .on("/usr/sbin/scutil --get ComputerName", Ran::ok("m42\n"))
+            .on(
+                "/usr/sbin/scutil --get LocalHostName",
+                Ran::ok("Andrews-MacBook-Pro\n"),
+            )
+            .on(
+                "/usr/sbin/scutil --get LocalHostName",
+                Ran::ok("Andrews-MacBook-Pro\n"),
+            )
+            .on("/usr/sbin/scutil --get LocalHostName", Ran::ok("m42\n"))
+            .on("/usr/sbin/scutil --set ComputerName m42", Ran::ok(""))
+            .on("/usr/sbin/scutil --set LocalHostName m42", Ran::ok(""));
+        assert!(matches!(plain(&named, Some("m42")), Ok(None)));
+        assert_eq!(
+            sets(&named),
+            [
+                "/usr/sbin/scutil --set ComputerName m42",
+                "/usr/sbin/scutil --set LocalHostName m42"
+            ]
+        );
+        let said = journal(&named);
+        assert!(said.contains("names.computer-name"), "{said}");
+        assert!(said.contains("names.local-host-name"), "{said}");
+
+        // Already named: nothing is set again.
+        let already = tools();
+        already
+            .on("/usr/sbin/scutil --get ComputerName", Ran::ok("m42\n"))
+            .on("/usr/sbin/scutil --get LocalHostName", Ran::ok("m42\n"));
+        assert!(matches!(plain(&already, Some("m42")), Ok(None)));
+        assert_eq!(sets(&already), Vec::<String>::new());
+
+        // macOS refuses the name: the tools' exit stands.
+        let refused = tools();
+        refused
+            .on(
+                "/usr/sbin/scutil --get ComputerName",
+                Ran::ok("Andrew\u{2019}s MacBook Pro\n"),
+            )
+            .on(
+                "/usr/sbin/scutil --get LocalHostName",
+                Ran::ok("Andrews-MacBook-Pro\n"),
+            )
+            .on(
+                "/usr/sbin/scutil --set ComputerName m42",
+                Ran::exit(1, "SCPreferencesCommitChanges() failed"),
+            )
+            .on(
+                "/usr/sbin/scutil --set LocalHostName m42",
+                Ran::exit(1, "SCPreferencesCommitChanges() failed"),
+            );
+        assert!(matches!(plain(&refused, Some("m42")), Ok(None)));
+        assert_eq!(sets(&refused).len(), 2, "{:?}", refused.calls());
+
+        // NEGATIVE CONTROL: no name, no rename.
+        let unnamed = tools();
+        assert!(matches!(plain(&unnamed, None), Ok(None)));
+        assert_eq!(sets(&unnamed), Vec::<String>::new());
+
+        // NEGATIVE CONTROL: the tools out of reach still say so beside a name in place.
+        let unreached = Fake::root();
+        unreached
+            .stat_of("/dev/console", console)
+            .on(
+                "/usr/bin/xcode-select -p",
+                Ran::exit(
+                    2,
+                    "xcode-select: error: Unable to get active developer directory.",
+                ),
+            )
+            .on(
+                "/usr/bin/curl --disable --proto =https -sSI --max-time 20 https://swscan.apple.com/",
+                Ran::exit(6, "curl: (6) Could not resolve host"),
+            )
+            .on("/usr/sbin/scutil --get ComputerName", Ran::ok("m42\n"))
+            .on("/usr/sbin/scutil --get LocalHostName", Ran::ok("m42\n"));
+        assert!(
+            plain(&unreached, Some("m42")).err()
+                == Some(ExitCode::from(Unfinished::Catalog.code().unwrap()))
+        );
     }
 
     #[test]
@@ -6659,6 +6809,7 @@ mod tests {
                 &sys,
                 Mode::Apply,
                 Some(Path::new(baseline)),
+                None,
                 HereOutput::Json
             ),
             ExitCode::SUCCESS
@@ -6691,6 +6842,7 @@ mod tests {
                 &sys,
                 Mode::Apply,
                 Some(Path::new(baseline)),
+                None,
                 HereOutput::Json
             ),
             ExitCode::SUCCESS

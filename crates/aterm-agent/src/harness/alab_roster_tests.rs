@@ -85,6 +85,8 @@ fn the_lab_fleet_adds_this_macs_preferred_accounts_in_rank_order() {
             paused,
         ],
         aliases: BTreeMap::new(),
+        mailboxes: BTreeMap::new(),
+        places: Default::default(),
     };
     let existing = Roster {
         rows: vec![row(
@@ -124,9 +126,11 @@ fn a_preference_never_drops_a_row() {
             account("cy", Cli::Claude, "claude-cccccc", &[("m20", Some(1))]),
         ],
         aliases: BTreeMap::new(),
+        mailboxes: BTreeMap::new(),
+        places: Default::default(),
     };
     let mut kept = row("kept", Some(Path::new("/scratch/kept")), "dee", Cli::Claude);
-    kept.class = Class::Shared;
+    kept.class = Class::Pool;
     let existing = Roster {
         rows: vec![
             row("claude-aaaaaa", None, "ann", Cli::Claude),
@@ -151,9 +155,9 @@ fn a_preference_never_drops_a_row() {
     assert_eq!(
         got,
         [
-            ("claude-aaaaaa", Class::Dedicated, None),
-            ("kept", Class::Shared, Some("/scratch/kept")),
-            ("m20-m22", Class::Shared, Some("/scratch/m20-m22")),
+            ("claude-aaaaaa", Class::Preferred, None),
+            ("kept", Class::Pool, Some("/scratch/kept")),
+            ("m20-m22", Class::Pool, Some("/scratch/m20-m22")),
         ]
     );
 }
@@ -266,6 +270,8 @@ impl Home {
                 ),
             ],
             aliases: BTreeMap::new(),
+            mailboxes: BTreeMap::new(),
+            places: Default::default(),
         }
     }
 
@@ -464,6 +470,8 @@ fn a_label_another_account_holds_stays_with_its_row() {
             account("ann", Cli::Claude, "claude-aaaaaa", &[("m22", Some(2))]),
         ],
         aliases: BTreeMap::new(),
+        mailboxes: BTreeMap::new(),
+        places: Default::default(),
     };
     let mut work = row("work", Some(Path::new("/scratch/work")), "ann", Cli::Claude);
     work.held_by = Some("m3".into());
@@ -515,6 +523,8 @@ fn a_source_the_owner_set_wins_over_the_lab() {
             account("fay", Cli::Kimi, "kimi-ffffff", &[("m22", Some(1))]),
         ],
         aliases: BTreeMap::new(),
+        mailboxes: BTreeMap::new(),
+        places: Default::default(),
     };
     with_lab(lab, || {
         assert!(matches!(
@@ -536,6 +546,49 @@ fn a_source_the_owner_set_wins_over_the_lab() {
             ),
             "naming `alab` still reads the lab"
         );
+    });
+}
+
+/// A lab that may name this Mac but could not be read yet ([`pending`]) refuses a sync with no
+/// source named, so neither the sheet nor legacy discovery labels a row after a machine meanwhile;
+/// a source the owner named elsewhere is still read. With nothing pending and no lab, the sync
+/// reads what it always read.
+/// NEGATIVE CONTROL: with `chosen`'s `pending` refusal removed, the pending sync falls through to
+/// legacy discovery (`refused while pending`).
+#[test]
+fn a_pending_lab_refuses_a_sync_with_no_source_named() {
+    let dir = aterm_tempfile::TempDir::new().unwrap();
+    let plain = dir.path().join("plain.toml");
+    fs::write(&plain, "").unwrap();
+    let keyed = dir.path().join("keyed.toml");
+    fs::write(
+        &keyed,
+        "[fleet]\naccounts_source = \"https://fleet.example.test/accounts.csv\"\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        chosen(Cli::Claude, None, None, Some(&plain)),
+        Ok(None)
+    ));
+    while_pending(|| {
+        assert!(
+            chosen(Cli::Claude, None, None, Some(&plain)).is_err(),
+            "refused while pending"
+        );
+        assert!(chosen(Cli::Kimi, None, None, Some(&plain)).is_err());
+        assert!(matches!(
+            chosen(
+                Cli::Claude,
+                None,
+                Some("/fleet/accounts.toml"),
+                Some(&plain)
+            ),
+            Ok(None)
+        ));
+        assert!(matches!(
+            chosen(Cli::Claude, None, None, Some(&keyed)),
+            Ok(None)
+        ));
     });
 }
 
@@ -595,6 +648,8 @@ fn preference_bed(state: &aterm_spec::interp::State) -> (Lab, Roster) {
         settled: false,
         accounts: vec![x],
         aliases: BTreeMap::new(),
+        mailboxes: BTreeMap::new(),
+        places: Default::default(),
     };
     let mut rows = Vec::new();
     if state["row"] == 1 {
@@ -716,4 +771,367 @@ fn a_sync_takes_the_preference_models_steps() {
     let next = preference_project(paused, &preference_sync(&lab, &existing));
     assert_eq!(next["row"], 1);
     assert!(!model.successors("Sync", paused).contains(&next));
+}
+
+/// An account asked for by name (§0, §7) is the lab's row for it, found by its label, its legacy
+/// label or its account key, under its lab label with its address and derived order (an account
+/// another Mac prefers is a pool row here), and a sync then keeps it as it keeps every row: the
+/// request writes no preference, so the lab is as it was. A name the lab does not know is no
+/// lab row (a new label, as it always was), and so is any name where the lab names no machine for
+/// this Mac; a paused account or a name two accounts share is refused.
+/// NEGATIVE CONTROL: with `asked_row`'s `joinable` check removed, the paused account is a row
+/// (`a paused account is refused`); with its `legacy_label` match removed, the legacy name
+/// finds nothing (`by its legacy label`).
+#[test]
+fn an_account_asked_for_by_name_joins_with_no_preference() {
+    let mut paused = account("carol", Cli::Claude, "claude-cccccc", &[("m20", Some(1))]);
+    paused.joinable = false;
+    let lab = Lab {
+        me: Some("m1".into()),
+        settled: false,
+        accounts: vec![
+            legacy(
+                account("ann", Cli::Claude, "claude-aaaaaa", &[("m20", Some(1))]),
+                "m20-m1",
+            ),
+            account("gilbert", Cli::Claude, "claude-gggggg", &[]),
+            paused,
+            account("evan", Cli::Claude, "claude-dupdup", &[]),
+            account("eve", Cli::Kimi, "claude-dupdup", &[]),
+            account("eveline", Cli::Claude, "claude-dupdup", &[]),
+        ],
+        aliases: BTreeMap::new(),
+        mailboxes: BTreeMap::new(),
+        places: Default::default(),
+    };
+    let before = lab.clone();
+    with_lab(lab.clone(), || {
+        let key = format!("ac-{:0>16}", "ann".len());
+        for (name, why) in [
+            ("claude-aaaaaa", "by its label"),
+            ("m20-m1", "by its legacy label"),
+            (key.as_str(), "by its account key"),
+        ] {
+            let row = asked_row(Cli::Claude, name)
+                .unwrap_or_else(|| panic!("{why}"))
+                .unwrap();
+            assert_eq!(row.label, "claude-aaaaaa", "{why}");
+            assert_eq!(row.email.as_deref(), Some(email("ann").as_str()));
+            assert_eq!(row.class, Class::Pool, "another Mac prefers it");
+            assert_eq!(row.dir, None);
+        }
+        assert!(asked_row(Cli::Claude, "nobody").is_none());
+        assert!(
+            asked_row(Cli::Kimi, "claude-aaaaaa").is_none(),
+            "another CLI's"
+        );
+        assert!(
+            matches!(asked_row(Cli::Claude, "claude-cccccc"), Some(Err(_))),
+            "a paused account is refused"
+        );
+        assert!(
+            matches!(asked_row(Cli::Claude, "claude-dupdup"), Some(Err(_))),
+            "a name two accounts share is refused"
+        );
+        assert!(matches!(asked_row(Cli::Kimi, "claude-dupdup"), Some(Ok(_))));
+        let asked = asked_row(Cli::Claude, "claude-gggggg").unwrap().unwrap();
+        let synced = preference_sync(&lab, &Roster { rows: vec![asked] });
+        let kept = synced
+            .row("claude-gggggg")
+            .expect("the sync keeps the asked row");
+        assert_eq!(kept.class, Class::Pool);
+    });
+    assert_eq!(lab, before, "the request writes no preference");
+    with_lab(
+        Lab {
+            me: None,
+            ..lab.clone()
+        },
+        || assert!(asked_row(Cli::Claude, "claude-aaaaaa").is_none()),
+    );
+    assert!(asked_row(Cli::Claude, "claude-aaaaaa").is_none(), "no lab");
+}
+
+/// On a Mac the lab names, the lab is the source even where it prefers nothing here: [`chosen`]
+/// gives an empty fleet rather than falling back to the sheet or a discovery that labels rows
+/// after machines, and a sync of that fleet keeps every row the roster has and adds none. A Mac
+/// the lab does not name reads what it always read.
+/// NEGATIVE CONTROL: with `chosen`'s old `filter(|fleet| !fleet.accounts.is_empty())` restored,
+/// the empty lab roster is `Ok(None)` (`the lab is the source`).
+#[test]
+fn an_empty_lab_roster_stays_empty_and_keeps_every_row() {
+    let dir = aterm_tempfile::TempDir::new().unwrap();
+    let plain = dir.path().join("plain.toml");
+    fs::write(&plain, "").unwrap();
+    let lab = Lab {
+        me: Some("m1".into()),
+        settled: true,
+        accounts: vec![account(
+            "ann",
+            Cli::Claude,
+            "claude-aaaaaa",
+            &[("m20", Some(1))],
+        )],
+        aliases: BTreeMap::new(),
+        mailboxes: BTreeMap::new(),
+        places: Default::default(),
+    };
+    with_lab(lab.clone(), || {
+        let fleet = chosen(Cli::Claude, None, None, Some(&plain))
+            .unwrap()
+            .expect("the lab is the source");
+        assert!(fleet.accounts.is_empty());
+        assert_eq!(fleet.alab.as_deref(), Some("m1"));
+    });
+    let existing = Roster {
+        rows: vec![
+            row("m1", None, "zed", Cli::Claude),
+            row("m1-2", Some(Path::new("/scratch/m1-2")), "ann", Cli::Claude),
+        ],
+    };
+    let synced = preference_sync(&lab, &existing);
+    let labels: Vec<&str> = synced.rows.iter().map(|r| r.label.as_str()).collect();
+    assert_eq!(labels, ["m1", "m1-2"], "every row stays, none is added");
+    with_lab(Lab { me: None, ..lab }, || {
+        assert!(matches!(
+            chosen(Cli::Claude, None, None, Some(&plain)),
+            Ok(None)
+        ))
+    });
+}
+
+/// The upkeep's trigger under the lab reads the lab and the roster alone: a roster that already
+/// holds every account this Mac prefers, in its derived order, is not due; one the lab prefers a
+/// new account for, one whose row stands in another order, one with an old pool's hold, and,
+/// once settled, one with a row to rename, are. The lab's digest moves with any account field and
+/// is none where the lab names no machine for this Mac.
+/// NEGATIVE CONTROL: with `sync_due`'s new-account clause removed, the added preference is not
+/// due (`a new preference is due`); with `fleet_digest`'s `preferred` loop removed, the digest
+/// does not move (`a preference moves the digest`).
+#[test]
+fn a_sync_is_due_only_when_the_lab_would_change_the_roster() {
+    let dir = aterm_tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("accounts.toml");
+    let write = |rows: &[Row]| {
+        fs::write(
+            &path,
+            accounts::append_rows_for(Cli::Claude, "", rows).unwrap(),
+        )
+        .unwrap();
+    };
+    let ann = account("ann", Cli::Claude, "claude-aaaaaa", &[("m1", Some(1))]);
+    let lab = Lab {
+        me: Some("m1".into()),
+        settled: true,
+        accounts: vec![
+            ann.clone(),
+            legacy(
+                account("bobby", Cli::Claude, "claude-bbbbbb", &[("m20", Some(1))]),
+                "m20-m1",
+            ),
+        ],
+        aliases: BTreeMap::new(),
+        mailboxes: BTreeMap::new(),
+        places: Default::default(),
+    };
+    let mut pool = row(
+        "claude-bbbbbb",
+        Some(Path::new("/scratch/b")),
+        "bobby",
+        Cli::Claude,
+    );
+    pool.class = Class::Pool;
+    let settled = vec![row("claude-aaaaaa", None, "ann", Cli::Claude), pool.clone()];
+    write(&settled);
+    let digest = with_lab(lab.clone(), || {
+        assert!(!sync_due(Cli::Claude, &path, |_| false), "nothing to do");
+        fleet_digest(Cli::Claude).unwrap()
+    });
+    let mut more = lab.clone();
+    more.accounts.push(account(
+        "gil",
+        Cli::Claude,
+        "claude-gggggg",
+        &[("m1", Some(2))],
+    ));
+    with_lab(more, || {
+        assert!(
+            sync_due(Cli::Claude, &path, |_| false),
+            "a new preference is due"
+        );
+    });
+    let mut moved = lab.clone();
+    moved.accounts[1].preferred.push(("m1".into(), Some(2)));
+    with_lab(moved, || {
+        assert!(
+            sync_due(Cli::Claude, &path, |_| false),
+            "a row's order changed"
+        );
+        assert_ne!(
+            fleet_digest(Cli::Claude).unwrap(),
+            digest,
+            "a preference moves the digest"
+        );
+    });
+    let mut held = pool.clone();
+    held.held_by = Some("m9".into());
+    write(&[row("claude-aaaaaa", None, "ann", Cli::Claude), held]);
+    with_lab(lab.clone(), || {
+        assert!(
+            sync_due(Cli::Claude, &path, |_| false),
+            "an old hold is due"
+        );
+    });
+    let mut old = pool;
+    old.label = "m20-m1".into();
+    write(&[row("claude-aaaaaa", None, "ann", Cli::Claude), old]);
+    with_lab(lab.clone(), || {
+        assert!(sync_due(Cli::Claude, &path, |_| false), "a rename is due");
+    });
+    with_lab(
+        Lab {
+            settled: false,
+            ..lab.clone()
+        },
+        || {
+            assert!(
+                !sync_due(Cli::Claude, &path, |_| false),
+                "an unsettled lab renames nothing"
+            )
+        },
+    );
+    with_lab(Lab { me: None, ..lab }, || {
+        assert!(fleet_digest(Cli::Claude).is_none());
+        assert!(!sync_due(Cli::Claude, &path, |_| false));
+    });
+}
+
+/// The mailbox labels come from the lab where it names this Mac: every account's lab label and
+/// the legacy label a renamed row's secrets still name; none where it does not, so that Mac reads
+/// what it always read.
+/// NEGATIVE CONTROL: with `mailbox_labels`' legacy push removed, `kimi-m16` maps to nothing.
+#[test]
+fn the_mailbox_labels_are_the_labs() {
+    let lab = Lab {
+        me: Some("m16".into()),
+        accounts: vec![legacy(
+            account("eve", Cli::Kimi, "kimi-eeeeee", &[]),
+            "kimi-m16",
+        )],
+        ..Lab::default()
+    };
+    with_lab(lab.clone(), || {
+        assert_eq!(
+            mailbox_labels(),
+            [
+                (Cli::Kimi, "kimi-eeeeee".to_owned(), email("eve")),
+                (Cli::Kimi, "kimi-m16".to_owned(), email("eve")),
+            ]
+        );
+    });
+    with_lab(Lab { me: None, ..lab }, || {
+        assert!(mailbox_labels().is_empty())
+    });
+}
+
+/// The lab's mailbox decides a route first: the entry whose login the lab names for the target
+/// wins over a route naming the target's own address; with no lab, or where the lab names no
+/// mailbox for it, the closest pattern still decides.
+/// NEGATIVE CONTROL: with `resolve_index`'s `mailbox_of` arm removed, the target resolves to its
+/// own address's route under the lab too: `` left: Some(0) right: Some(1) ``.
+#[test]
+fn the_labs_mailbox_decides_the_route_first() {
+    use super::super::mailbox_routes::{MailboxRoute, resolve_index};
+    let route = |login: &str, receives: &str| MailboxRoute {
+        login: login.to_owned(),
+        receives: vec![receives.to_owned()],
+        ..MailboxRoute::default()
+    };
+    let routes = [
+        route("own-box", &email("ann")),
+        route("Hub-Box", "*@other.example.test"),
+    ];
+    assert_eq!(resolve_index(&routes, Some(&email("ann"))), Some(0));
+    let lab = Lab {
+        mailboxes: BTreeMap::from([(email("ann"), "hub-box".to_owned())]),
+        ..Lab::default()
+    };
+    with_lab(lab, || {
+        assert_eq!(mailbox_of(&email("ANN")).as_deref(), Some("hub-box"));
+        assert_eq!(resolve_index(&routes, Some(&email("ann"))), Some(1));
+        assert_eq!(resolve_index(&routes, Some(&email("bob"))), None);
+    });
+}
+
+/// What this Mac runs that it does not prefer is reported by account key with the place row's
+/// reason: `borrow` where another Mac prefers it, `fill` where nobody does and it may be signed
+/// in, `stranded` where the lab bars it; a row this Mac prefers, a row the lab does not know and
+/// a second row of one account report nothing, and a lab that names no machine for this Mac
+/// reports nothing at all.
+/// NEGATIVE CONTROL: with `holdings` not skipping an account this Mac prefers, ann is reported
+/// (`left: 4 right: 3`); with the `borrow` arm reading `preferred` including this Mac, the
+/// account nobody else prefers reads `borrow`.
+#[test]
+fn holdings_report_each_unpreferred_account_with_its_reason() {
+    let keyed = |local: &str, preferred: &[(&str, Option<u64>)]| LabAccount {
+        pk: format!("ac-{local:0>16}"),
+        ..account(local, Cli::Claude, &format!("claude-{local}"), preferred)
+    };
+    let barred = LabAccount {
+        joinable: false,
+        ..keyed("cy", &[])
+    };
+    let lab = Lab {
+        me: Some("m22".into()),
+        accounts: vec![
+            keyed("ann", &[("m22", Some(1))]),
+            keyed("bob", &[("m3", Some(1))]),
+            keyed("dee", &[]),
+            barred,
+        ],
+        ..Lab::default()
+    };
+    let roster = Roster {
+        rows: vec![
+            row("ann", None, "ann", Cli::Claude),
+            row("bob", Some(Path::new("/scratch/bob")), "bob", Cli::Claude),
+            row(
+                "bob-2",
+                Some(Path::new("/scratch/bob2")),
+                "bob",
+                Cli::Claude,
+            ),
+            row("dee", Some(Path::new("/scratch/dee")), "dee", Cli::Claude),
+            row("cy", Some(Path::new("/scratch/cy")), "cy", Cli::Claude),
+            row("eve", Some(Path::new("/scratch/eve")), "eve", Cli::Claude),
+        ],
+    };
+    let held = holdings(&lab, Cli::Claude, &roster);
+    assert_eq!(
+        held,
+        [
+            ("ac-0000000000000bob".to_owned(), "borrow"),
+            ("ac-0000000000000dee".to_owned(), "fill"),
+            ("ac-00000000000000cy".to_owned(), "stranded"),
+        ]
+    );
+    let unbound = Lab {
+        me: None,
+        ..lab.clone()
+    };
+    assert!(holdings(&unbound, Cli::Claude, &roster).is_empty());
+    assert_eq!(
+        lab.holders(&lab.accounts[1]),
+        ["m3"],
+        "no place rows: the preferences alone"
+    );
+    let mut placed = lab.clone();
+    placed.places.by_account.insert(
+        "ac-0000000000000bob".into(),
+        vec![
+            ("m22".into(), "borrow".into()),
+            ("m3".into(), "fill".into()),
+        ],
+    );
+    assert_eq!(placed.holders(&placed.accounts[1]), ["m3", "m22"]);
 }

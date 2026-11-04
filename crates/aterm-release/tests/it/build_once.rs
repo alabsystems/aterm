@@ -289,6 +289,34 @@ fn the_records_beside_the_bundle_replace_dists() {
     assert!(!dist.join("aterm.dSYM").exists());
 }
 
+/// A record past every whole-file read bound (a release's DWARF runs to 1.7 GB) is copied
+/// whole: `place_records` streams it.
+#[test]
+fn a_record_larger_than_any_read_bound_is_placed_whole() {
+    let dir = scratch();
+    let store = dir.path().join("artifacts");
+    let complete = complete_entry(&store, &identity(7), b"built");
+    let dwarf = complete
+        .dir(&store)
+        .join("aterm.dSYM/Contents/Resources/DWARF/aterm");
+    let size = crate::durable::MAX_RELEASE_FILE_BYTES + 1;
+    fs::File::options()
+        .write(true)
+        .open(&dwarf)
+        .unwrap()
+        .set_len(size)
+        .unwrap();
+    let dist = dir.path().join("dist");
+    fs::create_dir_all(&dist).unwrap();
+    artifact::place_records(&complete.dir(&store), &dist, VERSION).unwrap();
+    assert_eq!(
+        fs::metadata(dist.join("aterm.dSYM/Contents/Resources/DWARF/aterm"))
+            .unwrap()
+            .len(),
+        size
+    );
+}
+
 /// `gates::verified` checks the verification record stored for the commit's tree against the executable SHA-256.
 #[test]
 fn the_verified_judge_reads_the_record_of_the_tree_on_these_bytes() {

@@ -394,7 +394,7 @@ pub fn parse_frame_name(name: &str) -> Option<(String, Look, Size, Option<u64>)>
 /// Whether the executable at `aterm` names the seam `seam`: a build that reads it carries its
 /// name. A file that cannot be read names nothing.
 fn names_seam(aterm: &Path, seam: &str) -> bool {
-    let Ok(bytes) = std::fs::read(aterm) else {
+    let Ok(bytes) = crate::util::read_regular_file(aterm) else {
         return false;
     };
     let needle = seam.as_bytes();
@@ -528,7 +528,7 @@ fn judge(dir: &Path, name: &str) -> Result<(Judged, Image), String> {
         parse_frame_name(name).ok_or_else(|| format!("{name}: not a gallery frame's name"))?;
     let png = dir.join(format!("{name}.png"));
     let frame = Image::read(&png)?;
-    let text = std::fs::read_to_string(dir.join(format!("{name}.layout.txt")))
+    let text = crate::util::read_regular_text(&dir.join(format!("{name}.layout.txt")))
         .map_err(|e| format!("{name}.layout.txt: {e}"))?;
     let layout: Layout = measure::parse_layout(&text).map_err(|e| format!("{name}: {e}"))?;
     let mut notes = Vec::new();
@@ -678,7 +678,7 @@ impl Gallery {
                 Err(Miss::Failed(e)) => self.miss(name.clone(), e),
             }
         }
-        if let Ok(log) = std::fs::read_to_string(&live.inst.log)
+        if let Ok(log) = crate::util::read_regular_text(&live.inst.log)
             && log.contains("names no System State scenario")
         {
             for name in &names {
@@ -1152,7 +1152,7 @@ pub fn cmd_system_state_gallery(args: &[String]) -> Res {
             return Err(usage(format!("no frames in {} to judge", out.display())));
         }
         // The run that took the frames named its aterm and motion in report.txt's head.
-        let earlier = std::fs::read_to_string(out.join("report.txt")).unwrap_or_default();
+        let earlier = crate::util::read_regular_text(&out.join("report.txt")).unwrap_or_default();
         let mut head = earlier.lines();
         let aterm = head
             .next()

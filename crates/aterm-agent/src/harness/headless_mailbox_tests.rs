@@ -396,7 +396,7 @@ fn explicit_email_secrets_do_not_create_credentials_for_other_mailboxes() {
 /// A row the lab renamed (`m22-2` to `claude-bbbbbb`) keeps the sign-in secrets its old label
 /// names: the lab's legacy label maps them to the account's address. With no lab held the old
 /// label maps nothing, as before the rename.
-/// NEGATIVE CONTROL: with `mailbox_aliases` not reading `alab_roster::legacy_labels`, the
+/// NEGATIVE CONTROL: with `mailbox_aliases` not reading `alab_roster::mailbox_labels`, the
 /// password is not found under the lab (`left: None right: Some("fixture-pw")`).
 #[test]
 fn a_renamed_rows_old_label_still_names_its_secrets() {
@@ -440,4 +440,43 @@ fn a_renamed_rows_old_label_still_names_its_secrets() {
         ..Lab::default()
     };
     assert_eq!(with_lab(lab, read).as_deref(), Some("fixture-pw"));
+}
+
+/// Where the lab names this Mac, the mailbox labels come from the lab and the sheet is not read:
+/// a `kimi-m16` password the sheet's row would name maps to its address with no lab held, and to
+/// nothing under a lab that names this Mac and does not know that label.
+/// NEGATIVE CONTROL: with `mailbox_aliases`' `names_this_mac` return removed, the sheet's label
+/// still maps under the lab (`left: Some("sheet-pw") right: None`).
+#[test]
+fn a_mac_the_lab_names_reads_no_sheet_for_its_mailbox_labels() {
+    use super::super::alab_roster::{Lab, with_lab};
+    let home = aterm_tempfile::tempdir().unwrap();
+    for (name, text) in [
+        (
+            ".secrets/ai-mailbox.toml",
+            "[passwords]\nkimi-m16 = \"sheet-pw\"\n",
+        ),
+        (
+            ".secrets/ai-accounts.csv",
+            "email,computer,claude,kimi\nkimi-sheet@example.test,m16,,global\n",
+        ),
+    ] {
+        let path = home.path().join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    let read = || {
+        discover_mailbox_config_files_raw(Some(home.path()), None, None)
+            .password_for(Some("kimi-sheet@example.test"))
+    };
+    assert_eq!(
+        read().as_deref(),
+        Some("sheet-pw"),
+        "no lab: the sheet names it"
+    );
+    let lab = Lab {
+        me: Some("m22".into()),
+        ..Lab::default()
+    };
+    assert_eq!(with_lab(lab, read), None);
 }

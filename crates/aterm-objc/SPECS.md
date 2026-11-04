@@ -117,6 +117,11 @@ Gap 8 dominates: 29 of 34 specs, because this crate is an FFI binding. Only five
 
 None: §1's `subsumes` column names every test that samples each spec.
 
+## 3. Coverage
+
+- §1 maps the 34 specs directly via `subsumes` (plus 1 non-spec parser guard in §4); the crate
+  currently holds 109 `#[test]` functions alongside its custom-harness drives.
+
 ## 4. Tests that are not spec samples
 
 `cf_sdk::the_parser_saw_every_declaration` guards the test-side parser behind the SDK probe against

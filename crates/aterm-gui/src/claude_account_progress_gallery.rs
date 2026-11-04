@@ -427,6 +427,7 @@ fn account_progress_gallery() {
         ),
     ] {
         let mut progress = AccountProgress {
+            forecasts_paused: false,
             observed_at: 1_793_040_000,
             account: Some("fixture-current".into()),
             known: Some(2),
@@ -485,6 +486,7 @@ fn account_progress_gallery() {
         let autopilot_off = name.contains("autopilot-off");
         if autopilot_off {
             // Already-derived synthetic reader output, not a policy or actor invocation.
+            progress.forecasts_paused = true;
             progress.eligible = None;
             progress.details.push(format!(
                 "{}{}",

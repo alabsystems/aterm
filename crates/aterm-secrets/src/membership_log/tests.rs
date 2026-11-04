@@ -5,6 +5,9 @@ use super::*;
 use crate::age;
 use std::sync::OnceLock;
 
+#[path = "payload_tests.rs"]
+mod payload_tests;
+
 const FOUNDING_SEED: [u8; 32] = [99; 32];
 
 /// One Mac, its keys all derived from its tag.

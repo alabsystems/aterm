@@ -660,24 +660,39 @@ impl Ctx {
     /// The most test binaries that run at once ([`Ctx::test_jobs`], at least one).
     #[must_use]
     pub fn test_jobs(&self) -> usize {
-        usize::try_from(self.test_workers().0).unwrap_or(1)
+        self.test_workers().0
     }
 
-    /// The requested libtest count, capped together with the binary count by a managed run's CPU share.
+    /// The requested libtest count, capped with the binary count by the held CPU share or host cores.
     #[must_use]
     pub fn test_threads(&self) -> u32 {
         self.test_workers().1
     }
 
-    fn test_workers(&self) -> (u32, u32) {
+    pub(crate) fn test_workers_for(
+        &self,
+        share: u32,
+        fallback_cores: impl FnOnce() -> u32,
+    ) -> (usize, u32) {
+        let (jobs, threads) = test_workers::counts(
+            self.test_jobs,
+            self.test_threads.unwrap_or_else(fallback_cores),
+            share,
+        );
+        (usize::try_from(jobs).unwrap_or(1), threads)
+    }
+
+    fn test_workers(&self) -> (usize, u32) {
         // Invalid managed input is refused before any stage runs. A context
         // inspected before that refusal still cannot advertise an unbounded pool.
-        let share = test_workers::admitted_share(&self.env).unwrap_or(Some(1));
-        test_workers::counts(
-            self.test_jobs,
-            self.test_threads.unwrap_or_else(|| self.cores()),
-            share,
-        )
+        // Host cores bound unmanaged direct concurrency; they do not prove admission
+        // or account for descendants spawned by a test.
+        let mut cores = None;
+        let mut host_cores = || *cores.get_or_insert_with(|| self.cores());
+        let share = test_workers::admitted_share(&self.env)
+            .map(|share| share.unwrap_or_else(&mut host_cores))
+            .unwrap_or(1);
+        self.test_workers_for(share, host_cores)
     }
 
     pub(crate) fn test_thread_override(&self) -> Option<u32> {

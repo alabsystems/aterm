@@ -130,7 +130,7 @@ fn codex_pids(run: &Run) -> Vec<i32> {
 /// Whether the witness saw one of `pids` (`codex[pid]`) connect to the stub.
 fn codex_talked(run: &Run, pids: &[i32]) -> bool {
     let tail = format!("] TCP conn 127.0.0.1:{}", run.port);
-    fs::read_to_string(run.run.join("sockets.log"))
+    crate::util::read_regular_text(&run.run.join("sockets.log"))
         .unwrap_or_default()
         .lines()
         .any(|l| {
@@ -395,7 +395,7 @@ fn selftest_checks(run: &Run) -> Result<Before, Fail> {
     println!(
         "== sockets of the lab's Codex processes, the tab's and codex-run's (the witness's lines for them)"
     );
-    for l in fs::read_to_string(run.run.join("sockets.log"))
+    for l in crate::util::read_regular_text(&run.run.join("sockets.log"))
         .unwrap_or_default()
         .lines()
         .filter(|l| l.contains(" codex["))
@@ -493,7 +493,7 @@ fn selftest_checks(run: &Run) -> Result<Before, Fail> {
     print!("{}", members_table(&members));
     let before = members.unwrap_or_default();
     println!("== the witness's lines for the orphan");
-    for l in fs::read_to_string(run.run.join("sockets.log"))
+    for l in crate::util::read_regular_text(&run.run.join("sockets.log"))
         .unwrap_or_default()
         .lines()
         .filter(|l| l.contains(&format!("[{orphan}]")))
@@ -509,7 +509,7 @@ fn selftest_checks(run: &Run) -> Result<Before, Fail> {
         Verdict::Unproven
     };
     let open_ok = opened.ok();
-    let egress = fs::read_to_string(run.run.join("egress.log")).unwrap_or_default();
+    let egress = crate::util::read_regular_text(&run.run.join("egress.log")).unwrap_or_default();
     let egress_ok = codex_talked(run, &pids) && !egress.contains("EXTERNAL");
     println!("== checks");
     let mut t = Tally::default();

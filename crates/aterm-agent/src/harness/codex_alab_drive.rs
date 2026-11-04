@@ -8,15 +8,16 @@ use std::time::Duration;
 
 use super::super::codex_alab as ca;
 use super::super::relaunch::{ExitCause, NO_SHELL, WAIT_HAND_LIFTS, exit_clock, hand_waits_out};
-#[cfg(all(test, unix))]
-use super::registry_vouches_for_state;
 use super::upgrade::{Agent, Dialect, Phase};
 use super::{
     Client, Hand, Kernel, Live, NoPlan, Opts, Plan, PromptLook, RelaunchLineError, Report,
-    SAME_PROGRAM, STALE_S, St, TabLife, alive, base_name, connect, cwd_of, exe_of, first_word, ids,
-    ledger, load, now_s, open_files, pause, process_in_tab, registry_graph, registry_life, roster,
-    said, save, squash, state_dir, table, type_relaunch_line_with, upgrade, wait_until,
+    SAME_PROGRAM, STALE_S, St, TabLife, alive, base_name, check_owned_plain_dir_existing,
+    check_upgrade_tree, connect, cwd_of, exe_of, first_word, ids, ledger, load, now_s, open_files,
+    pause, process_in_tab, read_upgrade_dir, registry_graph, registry_life, roster, said, save,
+    squash, table, type_relaunch_line_with, upgrade, wait_until,
 };
+#[cfg(all(test, unix))]
+use super::{registry_vouches_for_state, state_dir};
 
 /// The process facts the codex-alab path rests on, each read when asked.
 pub(super) trait AlabKernel: Kernel {
@@ -805,12 +806,17 @@ pub(super) fn prune_retired(opts: &Opts, now: u64) {
             }
         }
     };
-    let pins = state_dir(opts).join("codex-daemons");
-    sweep(&pins, &|name| name.ends_with("-pin.json"));
-    let _ = std::fs::remove_dir(&pins);
-    if let Some(root) = opts.aterm_state.as_deref() {
+    if let Ok(Some(pins)) = check_upgrade_tree(&opts.state, Some("codex-daemons")) {
+        sweep(&pins, &|name| name.ends_with("-pin.json"));
+        let _ = std::fs::remove_dir(&pins);
+    }
+    if let Some(root) = opts.aterm_state.as_deref()
+        && matches!(check_owned_plain_dir_existing(root), Ok(true))
+    {
         let drive = crate::supervise::approvals::ledger_under(root, Some("self"));
-        if let Some(drive) = drive.parent() {
+        if let Some(drive) = drive.parent()
+            && matches!(check_owned_plain_dir_existing(drive), Ok(true))
+        {
             sweep(drive, &|name| name.ends_with(".goal-hold.json"));
         }
     }
@@ -822,7 +828,7 @@ pub(super) fn in_flight_records(
     live_tabs: Option<&[super::LiveTab]>,
     k: &dyn AlabKernel,
 ) -> Vec<Report> {
-    let Ok(dir) = std::fs::read_dir(state_dir(opts)) else {
+    let Ok(dir) = read_upgrade_dir(&opts.state) else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -1019,7 +1025,7 @@ pub(super) fn prune(opts: &Opts, now: u64, life: impl Fn(&str) -> TabLife) {
     if opts.dry_run || opts.background {
         return;
     }
-    let Ok(dir) = std::fs::read_dir(state_dir(opts)) else {
+    let Ok(dir) = read_upgrade_dir(&opts.state) else {
         return;
     };
     for entry in dir.flatten() {

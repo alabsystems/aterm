@@ -566,8 +566,9 @@ aterm-cg = { workspace = true }
 # proxy clone wakes it, that it keeps the main dispatch queue drained, and that a
 # turn whose drain of user events met a send in progress says so
 # (`user_events_drained`, the lost-wake watchdog's proof) while the turn that empties
-# the queue says it did. It speaks libtest's command line for its one test
-# (`headless_event_loop`): the
+# the queue says it did, and that the watchdog, handed each turn as `about_to_wait`
+# hands it, heals only after a drain that emptied the queue. It speaks libtest's
+# command line for its one test (`headless_event_loop`): the
 # filters, `--skip`, `--exact`, `--ignored` and `--list` select and list it as
 # libtest would, `verify test` hands it the same argv as every other binary
 # (`aterm_verify::stages::test_run_args`), and an option it does

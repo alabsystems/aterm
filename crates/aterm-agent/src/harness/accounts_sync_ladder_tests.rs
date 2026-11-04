@@ -113,13 +113,13 @@ fn hand_roster(desk: &Desk, desk_browser: bool) {
     let rows = [
         accounts::Row {
             label: "main".to_owned(),
-            class: Class::Dedicated,
+            class: Class::Preferred,
             email: Some("main.m30@example.test".to_owned()),
             ..accounts::Row::default()
         },
         accounts::Row {
             label: "w3".to_owned(),
-            class: Class::Dedicated,
+            class: Class::Preferred,
             dir: Some(w3_dir.to_string_lossy().into_owned()),
             email: Some("w3.m30.3@example.test".to_owned()),
             browser: desk_browser.then(|| "Profile 1".to_owned()),

@@ -55,8 +55,17 @@ src/tests.rs	find_answers_the_id_then_the_name_shown	TP-FIND
   `validate_user_theme_name` rejects, a duplicate id or name, a name that is its row's id, a
   withdrawn id still in use or standing for no pack id or built-in, a bad appearance, an empty
   field, or a missing upstream or licence file. These are build-time checks, not tests.
+- All 8 live `#[test]` functions in `src/tests.rs` map to §1's specs in §2.
 
-## 5. Proof order (easiest, high value first)
+## 4. Tests that are not spec samples
+
+None.
+
+## 5. Implied specs that look wrong, or disagree with the code
+
+None.
+
+## 6. Proof order (easiest, high value first)
 
 1. TP-PAIRS, TP-PORTS, TP-FIND: closed-table lookups; a `const` evaluation in the build script could
    discharge them.

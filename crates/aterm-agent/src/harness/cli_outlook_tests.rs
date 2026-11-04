@@ -17,9 +17,9 @@ const D: i64 = 86_400;
 fn seeded(tmp: &Tmp, env: &Env) {
     let mut text = String::new();
     for (label, class) in [
-        ("me", Class::Dedicated),
-        ("alt1", Class::Dedicated),
-        ("pool1", Class::Shared),
+        ("me", Class::Preferred),
+        ("alt1", Class::Preferred),
+        ("pool1", Class::Pool),
     ] {
         let dir = tmp.path().join("logins").join(label);
         login_made_in(&dir);
@@ -174,6 +174,52 @@ fn the_report_says_the_cards_numbers_and_writes_nothing() {
     }
     assert!(figures >= 2, "the card shows figures for me and alt1");
     assert_eq!(before, every_file(tmp.path()), "the reports wrote nothing");
+}
+
+#[test]
+fn the_report_does_not_forecast_service_after_a_signed_out_accounts_reset() {
+    let tmp = tmp_dir("accounts-outlook-signed-out");
+    let env = env_at(&tmp);
+    seeded(&tmp, &env);
+    let mut note = None;
+    env.accounts_store()
+        .transact(env.now, &mut note, |state| {
+            let mut events = accounts::note_wall(
+                state,
+                "me",
+                accounts::WEEK_LIMIT,
+                Some(env.now + 3 * D),
+                env.now,
+                env.now,
+            );
+            for label in ["me", "alt1", "pool1"] {
+                events.extend(accounts::note_auth(
+                    state,
+                    label,
+                    accounts::Auth::SignedOut,
+                    env.now,
+                ));
+            }
+            state.proven = false;
+            Ok(events)
+        })
+        .expect("signed-out state");
+    let before = every_file(tmp.path());
+    let (code, json, _) = acc_quiet(AccountsCmd::Report { json: true }, &env);
+    assert_eq!(code, format!("{:?}", ExitCode::SUCCESS));
+    let json: Value = aterm_json::from_str(json.trim()).unwrap();
+    assert_eq!(
+        json["outlook"]["verdict"]["why"].as_str(),
+        Some("account-unavailable")
+    );
+    assert!(json["outlook"]["passes"].as_array().unwrap().is_empty());
+    let model = card_outlook(&env);
+    assert_eq!(json.get("outlook"), Some(&model.json()));
+    let (code, text, _) = acc_quiet(AccountsCmd::Report { json: false }, &env);
+    assert_eq!(code, format!("{:?}", ExitCode::SUCCESS));
+    assert!(text.contains(model.text().trim_end()));
+    assert!(text.contains(&outlook::Refusal::AccountUnavailable.words()));
+    assert_eq!(every_file(tmp.path()), before);
 }
 
 /// THE REPORT REPLAYS UNDER THE MODE THE WINDOW DOES: with the harness off (`[harness] enabled =

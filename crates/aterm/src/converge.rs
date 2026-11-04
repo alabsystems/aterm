@@ -461,9 +461,65 @@ const EARLIER: &str = "earlier";
 /// How many earlier writes the record keeps for each key.
 const EARLIER_KEPT: usize = 8;
 
+fn is_owned_plain_dir(meta: &std::fs::Metadata) -> bool {
+    if !meta.file_type().is_dir() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if meta.uid() != aterm_uds::peer::our_uid() {
+            return false;
+        }
+    }
+    true
+}
+
+fn check_existing_record_dir(dir: &Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) if is_owned_plain_dir(&meta) => Ok(true),
+        Ok(_) => Err(format!(
+            "{}: not this user's plain directory",
+            dir.display()
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("{}: {e}", dir.display())),
+    }
+}
+
+fn check_record_dirs(record: &Path, create: bool) -> Result<(), String> {
+    let Some(dir) = record.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return Ok(());
+    };
+    if dir.file_name() == Some(std::ffi::OsStr::new(aterm_converge::FileJournal::DIR))
+        && let Some(state_dir) = dir.parent().filter(|p| !p.as_os_str().is_empty())
+        && !check_existing_record_dir(state_dir)?
+        && create
+    {
+        std::fs::create_dir_all(state_dir).map_err(|e| format!("{}: {e}", state_dir.display()))?;
+        if !check_existing_record_dir(state_dir)? {
+            return Err(format!(
+                "{}: not this user's plain directory",
+                state_dir.display()
+            ));
+        }
+    }
+    if !check_existing_record_dir(dir)? && create {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        if !check_existing_record_dir(dir)? {
+            return Err(format!(
+                "{}: not this user's plain directory",
+                dir.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// What `record` says aterm wrote into each key, in [`MACHINE_KEYS`] order: its last write
 /// first, then the earlier ones newest first; `None` where there is no record.
 fn read_history(record: &Path) -> Result<Option<[Vec<String>; 2]>, String> {
+    check_record_dirs(record, false)?;
     let text = match aterm_uds::atomic_file::read_regular_text(
         record,
         aterm_uds::atomic_file::MAX_CONFIG_BYTES,
@@ -544,9 +600,7 @@ fn record_written(
     if earlier.iter().next().is_some() {
         doc.as_table_mut().insert(EARLIER, Item::Table(earlier));
     }
-    if let Some(dir) = record.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    }
+    check_record_dirs(record, true)?;
     aterm_uds::atomic_file::write(record, doc.to_string().as_bytes(), 0o600)
         .map_err(|e| format!("{}: {e}", record.display()))
 }
@@ -555,6 +609,7 @@ fn record_written(
 /// kept from before it ([`EARLIER`]) go, so only that write reads as aterm's.
 fn confirm_written(record: &Path, keys: &[&str]) -> Result<(), String> {
     use aterm_toml::edit::{DocumentMut, Item};
+    check_record_dirs(record, false)?;
     let text =
         aterm_uds::atomic_file::read_regular_text(record, aterm_uds::atomic_file::MAX_CONFIG_BYTES)
             .map_err(|e| format!("{}: {e}", record.display()))?;
@@ -574,6 +629,7 @@ fn confirm_written(record: &Path, keys: &[&str]) -> Result<(), String> {
     if earlier.is_empty() {
         doc.as_table_mut().remove(EARLIER);
     }
+    check_record_dirs(record, false)?;
     aterm_uds::atomic_file::write(record, doc.to_string().as_bytes(), 0o600)
         .map_err(|e| format!("{}: {e}", record.display()))
 }
@@ -581,6 +637,7 @@ fn confirm_written(record: &Path, keys: &[&str]) -> Result<(), String> {
 /// Put `record` back as it was (`before`, `None` where there was none) after a write it named
 /// did not land.
 fn restore_record(record: &Path, before: Option<&[u8]>) -> Result<(), String> {
+    check_record_dirs(record, before.is_some())?;
     match before {
         Some(bytes) => aterm_uds::atomic_file::write(record, bytes, 0o600),
         None => match std::fs::remove_file(record) {
@@ -630,6 +687,150 @@ fn roster_gives(paths: &aterm_secrets::client::Paths, label: Option<&str>, pair:
 struct IdentityOwed {
     read: IdentityRead,
     write: Option<(String, Vec<&'static str>)>,
+}
+
+/// The name `sync.identity` gives this Mac at `config_path` (the person's `[identity] name`, else
+/// the swarm `m<N>` label the vault's roster gave it at admission) and that label, or `None`
+/// where no name applies (swarm off, `[identity] name = false`, no label).
+fn identity_target(
+    config_path: &Path,
+    paths: &aterm_secrets::client::Paths,
+    hostnames: &[String],
+) -> Result<Option<(String, Option<String>)>, String> {
+    if swarm_disabled_at(config_path)? {
+        return Ok(None);
+    }
+    let choice = read_identity_config(config_path)?.name;
+    let label = aterm_secrets::client::resolve_local_swarm_label(paths, hostnames)
+        .map_err(|why| why.to_string())?;
+    Ok(match (choice, label) {
+        (NameChoice::Off, _) | (_, None) => None,
+        (NameChoice::Yours(name), label) => Some((name, label)),
+        (NameChoice::Roster, Some(label)) => Some((label.clone(), Some(label))),
+    })
+}
+
+/// The swarm label the root half of the one password names the Mac by
+/// ([`aterm_machines::init_clt::CommandLineTools::with_name`]): the roster's own label for this
+/// Mac (no hostname fallback, which would name the Mac by what it is called already), where the
+/// person neither turned naming off nor named the Mac themselves; `None` before admission.
+#[cfg(target_os = "macos")]
+pub(crate) fn mac_name_label() -> Option<String> {
+    let config = aterm_types::dirs::aterm_config_path()?;
+    let paths = vault_paths().ok()?;
+    match identity_target(&config, &paths, &[]) {
+        Ok(Some((target, Some(label)))) if target == label => Some(label),
+        _ => None,
+    }
+}
+
+/// This Mac's one name as `aterm status` reads it ([`mac_names`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MacName {
+    /// No name applies (why): swarm off, or `[identity] name = false`.
+    Off(String),
+    /// The vault's roster gave this Mac no label yet: it gives one at admission.
+    Unlabelled,
+    /// The name `sync.identity` gives the Mac (`target`), where its fleet name stands against it,
+    /// and what still names the Mac's own names ([`own_name_pending`]).
+    Named {
+        target: String,
+        fleet: aterm_agent::FleetName,
+        pending: Option<String>,
+    },
+}
+
+/// [`MacName`] from local state alone: `aterm.toml`, the vault's roster and the fleet name on
+/// disk, and the Mac's own names. It writes nothing and asks nothing.
+///
+/// # Errors
+/// No config path, or a reader failed.
+pub(crate) fn mac_names() -> Result<MacName, String> {
+    let config = aterm_types::dirs::aterm_config_path()
+        .ok_or("no config path: neither $XDG_CONFIG_HOME nor $HOME is set")?;
+    if swarm_disabled_at(&config)? {
+        return Ok(MacName::Off("swarm off".to_owned()));
+    }
+    if matches!(read_identity_config(&config)?.name, NameChoice::Off) {
+        return Ok(MacName::Off("[identity] name = false".to_owned()));
+    }
+    let paths = vault_paths()?;
+    let hostnames = local_hostnames();
+    let Some((target, label)) = identity_target(&config, &paths, &hostnames)? else {
+        return Ok(MacName::Unlabelled);
+    };
+    let fleet = aterm_agent::fleet_name_for(&target, &|word| {
+        roster_gives(&paths, label.as_deref(), word)
+    })?;
+    let pending = own_name_pending(&target, label.as_deref(), &hostnames)
+        .filter(|_| cfg!(target_os = "macos"));
+    Ok(MacName::Named {
+        target,
+        fleet,
+        pending,
+    })
+}
+
+/// Where the Mac's own names (`hostnames`: LocalHostName, ComputerName, …) are not yet the
+/// roster's `label` and `target` is that label: what names it. macOS lets only root set them, so
+/// the root half of a Command Line Tools install sets them under its one password (its argv
+/// carries the label when the roster gave it by the time the root half ran), and
+/// otherwise the one command a person types the password for. `None` where they are the label,
+/// or the Mac is named by the person's own `[identity] name` (never set as the Mac's own).
+pub(crate) fn own_name_pending(
+    target: &str,
+    label: Option<&str>,
+    hostnames: &[String],
+) -> Option<String> {
+    let label = label.filter(|label| *label == target)?;
+    if hostnames.iter().any(|host| host == label) {
+        return None;
+    }
+    let now = hostnames.first().map_or("unread", String::as_str);
+    Some(format!(
+        "this Mac's own name is {now}, not {label}: only root sets it, so the root half of the \
+         next Command Line Tools install sets it under its one password, or now `sudo aterm \
+         machines here apply --plain --name {label}`"
+    ))
+}
+
+/// `read` (`sync.identity`'s `aterm.toml` keys) with the fleet name beside it (`fleet`, against
+/// `target`), and, where the Mac's own names (`hostnames`: LocalHostName, ComputerName, …) are
+/// not yet the roster's `label`, the record of what names it ([`own_name_pending`]): no pass asks
+/// for a password of its own.
+fn with_fleet_name(
+    read: IdentityRead,
+    target: &str,
+    label: Option<&str>,
+    fleet: &aterm_agent::FleetName,
+    hostnames: &[String],
+) -> IdentityRead {
+    use aterm_agent::FleetName;
+    let now = match fleet {
+        FleetName::Current | FleetName::Due { .. } => format!("fleet name {target}"),
+        FleetName::Kept(name) => format!("fleet name {name} kept as you set it"),
+        FleetName::Taken(other) => format!("fleet name left as it is: {target} names {other}"),
+        FleetName::NotApplicable(why) => format!("fleet name left as it is: {why}"),
+    };
+    let host = own_name_pending(target, label, hostnames)
+        .map(|pending| format!("; {pending}"))
+        .unwrap_or_default();
+    match (read, fleet) {
+        (IdentityRead::NotApplicable(why), _) => IdentityRead::NotApplicable(why),
+        (IdentityRead::Current(keys), FleetName::Due { from }) => IdentityRead::Due {
+            from: format!("fleet name {from}"),
+            to: format!("{keys}; {now}{host}"),
+        },
+        (IdentityRead::Due { from, to }, FleetName::Due { from: was }) => IdentityRead::Due {
+            from: format!("{from}, fleet name {was}"),
+            to: format!("{to}; {now}{host}"),
+        },
+        (IdentityRead::Current(keys), _) => IdentityRead::Current(format!("{keys}; {now}{host}")),
+        (IdentityRead::Due { from, to }, _) => IdentityRead::Due {
+            from,
+            to: format!("{to}; {now}{host}"),
+        },
+    }
 }
 
 /// `sync.identity`'s read at `config_path` given `paths` and fallback `hostnames`, with what aterm
@@ -808,6 +1009,7 @@ fn write_identity_after_read(
     // The record first: a pass cut off between the two writes leaves a key aterm's record
     // names, never aterm's own write read as the person's. A write that does not land puts the
     // record back.
+    check_record_dirs(record, false)?;
     let before =
         aterm_uds::atomic_file::read_regular(record, aterm_uds::atomic_file::MAX_CONFIG_BYTES)
             .ok()
@@ -1101,12 +1303,19 @@ impl Ports for Live {
     fn identity(&self) -> Result<IdentityRead, String> {
         let config = aterm_types::dirs::aterm_config_path()
             .ok_or("no config path: neither $XDG_CONFIG_HOME nor $HOME is set")?;
-        identity_at(
-            &config,
-            &identity_record()?,
-            &vault_paths()?,
-            &local_hostnames(),
-        )
+        let paths = vault_paths()?;
+        let hostnames = local_hostnames();
+        let read = identity_at(&config, &identity_record()?, &paths, &hostnames)?;
+        let Some((target, label)) = identity_target(&config, &paths, &hostnames)? else {
+            return Ok(read);
+        };
+        let fleet = aterm_agent::fleet_name_for(&target, &|word| {
+            roster_gives(&paths, label.as_deref(), word)
+        })?;
+        // Only a Mac's own names are aterm's to align (the root half is macOS's): elsewhere
+        // the record names none.
+        let own = label.as_deref().filter(|_| cfg!(target_os = "macos"));
+        Ok(with_fleet_name(read, &target, own, &fleet, &hostnames))
     }
 
     fn sync_identity(&self) -> Result<String, String> {
@@ -1119,15 +1328,25 @@ impl Ports for Live {
             return Ok("left as it is: [identity] name = false".to_owned());
         }
         let paths = vault_paths()?;
-        let label = aterm_secrets::client::resolve_local_swarm_label(&paths, &local_hostnames())
+        let hostnames = local_hostnames();
+        let label = aterm_secrets::client::resolve_local_swarm_label(&paths, &hostnames)
             .map_err(|why| why.to_string())?;
-        write_identity_after_read(
+        let keys = write_identity_after_read(
             &config,
             &identity_record()?,
             label.as_deref(),
             &|pair| roster_gives(&paths, label.as_deref(), pair),
             || {},
-        )
+        )?;
+        // The fleet name follows the same name: the vault's roster, the fleet and (under the
+        // one password) the Mac's own names say one name (DESIGN-alab-swarm §3.2).
+        let Some((target, label)) = identity_target(&config, &paths, &hostnames)? else {
+            return Ok(keys);
+        };
+        let fleet = aterm_agent::follow_fleet_name(&target, &|word| {
+            roster_gives(&paths, label.as_deref(), word)
+        })?;
+        Ok(format!("{keys}; {fleet}"))
     }
 
     fn fleet(&self) -> Result<FleetRead, String> {
@@ -1573,6 +1792,69 @@ impl Ports for Live {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `sync.identity` reads the fleet name beside the `aterm.toml` keys: a fleet name still due
+    /// makes the row due even where the keys are current, and the Mac's own names that differ
+    /// from the roster's label are recorded, never made due (no pass asks a password of its own).
+    /// NEGATIVE CONTROLS: a fleet name in place leaves current keys current, a Mac already
+    /// called by its label records nothing about its own names, and a person's own `[identity]
+    /// name` never names the Mac's own names.
+    #[test]
+    fn the_identity_row_reads_the_fleet_name_and_records_the_macs_own_name() {
+        use aterm_agent::FleetName;
+        let keys = || IdentityRead::Current("label m42 in [ai] and [fleet] machine".to_owned());
+        let own = ["Andrews-MacBook-Pro".to_owned()];
+        let due = FleetName::Due {
+            from: "node-3fa2".to_owned(),
+        };
+        match with_fleet_name(keys(), "m42", Some("m42"), &due, &own) {
+            IdentityRead::Due { from, to } => {
+                assert_eq!(from, "fleet name node-3fa2");
+                assert!(to.contains("fleet name m42"), "{to}");
+                assert!(to.contains("--name m42"), "{to}");
+            }
+            other => panic!("{other:?}"),
+        }
+        match with_fleet_name(keys(), "m42", Some("m42"), &FleetName::Current, &own) {
+            IdentityRead::Current(now) => {
+                assert!(now.contains("fleet name m42"), "{now}");
+                assert!(
+                    now.contains("this Mac's own name is Andrews-MacBook-Pro, not m42"),
+                    "{now}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        let named = ["m42".to_owned()];
+        match with_fleet_name(keys(), "m42", Some("m42"), &FleetName::Current, &named) {
+            IdentityRead::Current(now) => assert!(!now.contains("own name"), "{now}"),
+            other => panic!("{other:?}"),
+        }
+        match with_fleet_name(keys(), "studio", Some("m42"), &FleetName::Current, &own) {
+            IdentityRead::Current(now) => assert!(!now.contains("own name"), "{now}"),
+            other => panic!("{other:?}"),
+        }
+        let keys_due = IdentityRead::Due {
+            from: "[ai] machine = unset".to_owned(),
+            to: "label m42 in [ai] machine".to_owned(),
+        };
+        match with_fleet_name(keys_due, "m42", Some("m42"), &due, &named) {
+            IdentityRead::Due { from, .. } => {
+                assert_eq!(from, "[ai] machine = unset, fleet name node-3fa2");
+            }
+            other => panic!("{other:?}"),
+        }
+        let taken = FleetName::Taken("node-77".to_owned());
+        assert!(matches!(
+            with_fleet_name(keys(), "m42", Some("m42"), &taken, &named),
+            IdentityRead::Current(_)
+        ));
+        let off = IdentityRead::NotApplicable("off: [identity] name = false".to_owned());
+        assert_eq!(
+            with_fleet_name(off.clone(), "m42", Some("m42"), &due, &own),
+            off
+        );
+    }
 
     /// `sync.awake` plans a start only where one keeps the Mac awake: never over a person's off
     /// or without an installed app that has the verb (in `/Applications` or `~/Applications`),
@@ -2407,5 +2689,47 @@ mod tests {
         let ours =
             identity_owed_in(&snapshot, &record, Some("m113"), &|label| label == "m112").unwrap();
         assert!(ours.write.is_some(), "{:?}", ours.read);
+    }
+
+    /// NEGATIVE CONTROL: `read_history`, `record_written`, `confirm_written`, `restore_record`,
+    /// and `write_identity_at` refuse symlinked `state` or `state/converge` directories without
+    /// reading, overwriting, or unlinking files in the symlink's target.
+    #[cfg(unix)]
+    #[test]
+    fn identity_record_refuses_symlinked_state_and_converge_directories() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let outside = scratch.path().join("outside");
+        std::fs::create_dir_all(outside.join("converge")).unwrap();
+        let outside_record = outside.join("converge/identity-written.toml");
+        std::fs::write(&outside_record, "ai = \"m112\"\nfleet = \"m112\"\n").unwrap();
+
+        let config = scratch.path().join("aterm.toml");
+        let linked_state = scratch.path().join("linked-state");
+        std::os::unix::fs::symlink(&outside, &linked_state).unwrap();
+        let via_state = linked_state.join("converge/identity-written.toml");
+
+        assert!(identity_owed(&config, &via_state, Some("m113")).is_err());
+        assert!(record_written(&via_state, &["ai", "fleet"], "m113", &[None, None]).is_err());
+        assert!(confirm_written(&via_state, &["ai"]).is_err());
+        assert!(restore_record(&via_state, None).is_err());
+        assert!(restore_record(&via_state, Some(b"ai = \"m999\"\n")).is_err());
+        assert!(write_identity_at(&config, &via_state, Some("m113")).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&outside_record).unwrap(),
+            "ai = \"m112\"\nfleet = \"m112\"\n"
+        );
+
+        let real_state = scratch.path().join("real-state");
+        std::fs::create_dir(&real_state).unwrap();
+        std::os::unix::fs::symlink(outside.join("converge"), real_state.join("converge")).unwrap();
+        let via_converge = real_state.join("converge/identity-written.toml");
+
+        assert!(identity_owed(&config, &via_converge, Some("m113")).is_err());
+        assert!(restore_record(&via_converge, None).is_err());
+        assert!(write_identity_at(&config, &via_converge, Some("m113")).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&outside_record).unwrap(),
+            "ai = \"m112\"\nfleet = \"m112\"\n"
+        );
     }
 }

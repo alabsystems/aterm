@@ -271,27 +271,48 @@ fn first_within(
     .next()
 }
 
-fn witnessed(
+/// What the pinned `witness` seed shows: its outcome, where `hit` takes it; else the first seed
+/// within `limit` that `hit` takes, with a note naming that seed. A change to the world's schedule
+/// moves which seed shows a rule, and the search past a stale witness runs every seed up to the
+/// one that does: thousands of worlds where one would do, unseen while the test passes. So a
+/// stale witness fails its test ([`witnessed`]), and the note says what to pin.
+fn witness_of(
     opts: &(dyn Fn(u64) -> Opts + Sync),
     witness: u64,
     limit: u64,
     hit: &(dyn Fn(&Outcome) -> bool + Sync),
-) -> Option<Outcome> {
+) -> (Option<Outcome>, Option<String>) {
     assert!(
         (1..=limit).contains(&witness),
         "witness seed {witness} is outside its search 1..={limit}: it would widen the claim"
     );
     let out = run(&opts(witness));
     if hit(&out) {
-        return Some(out);
+        return (Some(out), None);
     }
     let found = first_within(opts, limit, hit);
-    eprintln!(
-        "STALE WITNESS: seed {witness} no longer shows it; the first seed within {limit} that \
-         does is {:?}",
-        found.as_ref().map(|o| o.seed)
-    );
-    found
+    let stale = found.as_ref().map(|o| {
+        format!(
+            "witness seed {witness} no longer shows it: pin {}, the first seed within {limit} \
+             that does",
+            o.seed
+        )
+    });
+    (found, stale)
+}
+
+/// [`witness_of`], failing on a stale witness.
+fn witnessed(
+    opts: &(dyn Fn(u64) -> Opts + Sync),
+    witness: u64,
+    limit: u64,
+    hit: &(dyn Fn(&Outcome) -> bool + Sync),
+) -> Option<Outcome> {
+    let (out, stale) = witness_of(opts, witness, limit, hit);
+    if let Some(stale) = stale {
+        panic!("STALE WITNESS: {stale}");
+    }
+    out
 }
 
 fn breaking_at(
@@ -517,7 +538,7 @@ fn each_rule_switched_off_is_caught() {
                 o
             }),
             "routing:",
-            12,
+            23,
         ),
         (
             "a ghost row is swept",
@@ -583,13 +604,13 @@ fn each_rule_switched_off_is_caught() {
             "an attach delivers on a new log only once its witness is written",
             Box::new(|s| both_ways(s).with(Mutant::AttachPastAnUnwrittenWitness)),
             "dup delivery",
-            5085,
+            713,
         ),
         (
             "a run whose recovery is owed makes no clean stop",
             Box::new(|s| erring_quitting(s).with(Mutant::CleanStopOverAnOwedRecovery)),
             "mirror",
-            863,
+            7479,
         ),
         (
             "a recovery tried again moves each file once",
@@ -681,7 +702,7 @@ fn each_rule_switched_off_is_caught() {
             "a read back that meets its subject's floor reads again told",
             Box::new(|s| Opts::seed(s).with(Mutant::ReadBackWithoutTheHeld)),
             "dup post",
-            27,
+            239,
         ),
         (
             "a read of one offset below its filter's oldest reads again told (F3)",
@@ -810,14 +831,18 @@ fn each_rule_switched_off_is_caught() {
         } else {
             CONTROL_SEEDS
         };
-        let off = breaking_at(opts.as_ref(), law, *witness, limit);
+        let (off, stale) = witness_of(opts.as_ref(), *witness, limit, &|out| breaks_law(out, law));
         let on = off
             .as_ref()
             .map(|out| run(&with_every_rule(opts(out.seed))));
-        (off, on, limit)
+        (off, on, limit, stale)
     });
     let mut missed = Vec::new();
-    for ((rule, _, law, _), (off, on, limit)) in rules.iter().zip(&shown) {
+    let mut stale = Vec::new();
+    for ((rule, _, law, _), (off, on, limit, was)) in rules.iter().zip(&shown) {
+        if let Some(was) = was {
+            stale.push(format!("{rule}: {was}"));
+        }
         match (off, on) {
             (Some(out), Some(committed)) => {
                 eprintln!(
@@ -841,6 +866,11 @@ fn each_rule_switched_off_is_caught() {
         missed.is_empty(),
         "no seed caught these rules switched off:\n  {}",
         missed.join("\n  ")
+    );
+    assert!(
+        stale.is_empty(),
+        "STALE WITNESSES, each caught by another seed:\n  {}",
+        stale.join("\n  ")
     );
 }
 
@@ -3456,7 +3486,7 @@ fn a_post_the_log_lost_stays_lost_after_a_later_power_cut() {
         o
     };
     let republishing = move |s: u64| world(s).with(Mutant::RepublishInFlightOfAnEarlierBoot);
-    let out = breaking_at(&republishing, "order:", 424, RARE_SEEDS)
+    let out = breaking_at(&republishing, "order:", 1335, RARE_SEEDS)
         .expect("NEGATIVE CONTROL: the old republish puts some post out of its sender's order");
     eprintln!(
         "the old republish at seed {}: {}",

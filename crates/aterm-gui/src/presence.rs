@@ -866,6 +866,41 @@ mod tests {
         Instant::now()
     }
 
+    /// REVIEW FINDING (2026-11-03): at 20 columns Claude Code's `Claude in Chrome` intro (51
+    /// rows) is taller than the live zone ([`CLASSIFY_ROWS`]), whose rows hold neither its rule
+    /// nor its title, so a pane tall enough to show it whole published no prompt. Its cut read
+    /// sends the verdict to the whole screen, which reads it whole.
+    #[test]
+    fn a_chrome_intro_taller_than_the_live_zone_is_read_on_the_whole_screen() {
+        use aterm_phase::prompt::fixtures::{CHROME_INTRO_HEAD_OFF, CHROME_INTRO_INLINE, screen};
+        let mut rows = screen(CHROME_INTRO_INLINE[4].1);
+        let under = rows.len();
+        rows.resize(60, String::new());
+        assert!(
+            live_zone(&rows).len() < under,
+            "PRECONDITION: the zone cuts the intro"
+        );
+        let v = agent_verdict(
+            Some("claude"),
+            false,
+            None,
+            &rows,
+            Cursor::At(Some(under)),
+            t0(),
+        );
+        assert_eq!(
+            (v.word(), v.detail()),
+            ("prompt", Some("chrome-intro".to_string()))
+        );
+        // A pane too short for it publishes the intro too, read cut.
+        let short = screen(CHROME_INTRO_HEAD_OFF[0].1);
+        let v = agent_verdict(Some("claude"), false, None, &short, Cursor::Unknown, t0());
+        assert_eq!(
+            (v.word(), v.detail()),
+            ("prompt", Some("chrome-intro".to_string()))
+        );
+    }
+
     #[test]
     fn aterms_own_hand_is_no_row_and_its_turn_is_no_story() {
         let now = t0();

@@ -50,11 +50,36 @@ fn kept_off_record(p: &Paths) -> Option<PathBuf> {
         .map(|dir| dir.join(OFF_RECORD))
 }
 
+/// Whether `record` exists inside an owned real directory; `Err` when its parent directory is a
+/// symlink or owned by another user.
+fn record_in_owned_dir(record: &Path) -> io::Result<bool> {
+    let Some(dir) = record.parent() else {
+        return Ok(false);
+    };
+    match aterm_uds::private_file::check_owned_dir(dir) {
+        Ok(()) => {}
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(false);
+        }
+        Err(e) => return Err(e),
+    }
+    match std::fs::symlink_metadata(record) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// The off record that stands, in `root` or at `kept` ([`kept_off_record`]).
 fn off_recorded(root: &Path, kept: Option<&Path>) -> Option<PathBuf> {
     std::iter::once(root.join(OFF_RECORD))
         .chain(kept.map(Path::to_path_buf))
-        .find(|record| std::fs::symlink_metadata(record).is_ok())
+        .find(|record| record_in_owned_dir(record).unwrap_or(false))
 }
 
 /// The record the converge pass leaves in the fabric root before it turns the fabric on by
@@ -1027,38 +1052,6 @@ pub fn cksum(data: &[u8]) -> u32 {
     !crc
 }
 
-/// The eight grants of a node's capability ring for `node` on `fleet` (`<root>/node.cap`).
-#[must_use]
-pub fn node_grants(fleet: &str, node: &str) -> Vec<String> {
-    vec![
-        format!("rw,p={node}:/f/{fleet}/pub/{node}/>"),
-        format!("ro:/f/{fleet}/pub/>"),
-        format!("ro:/f/{fleet}/fleet/>"),
-        format!("rw,p={node}:/f/{fleet}/in/*/*/{node}/*"),
-        format!("ro:/f/{fleet}/in/{node}/>"),
-        format!("rw,p={node}:/f/{fleet}/cur/{node}/>"),
-        format!("ro:/f/{fleet}/term/{node}/>"),
-        format!("rw,p={node}:/f/{fleet}/term/{node}/*/screen"),
-    ]
-}
-
-/// The grants of a person's capability ring (`h-` human or `a-` service) on `fleet`.
-#[must_use]
-pub fn person_grants(fleet: &str, person: &str) -> Vec<String> {
-    let mut ring = Vec::with_capacity(6);
-    if person.starts_with("h-") {
-        ring.push(format!("rw,p={person}:/f/{fleet}/fleet/{person}/>"));
-    }
-    ring.extend([
-        format!("rw,p={person}:/f/{fleet}/in/*/*/{person}/*"),
-        format!("rw,p={person}:/f/{fleet}/pub/p/{person}/>"),
-        format!("ro:/f/{fleet}/in/p/{person}/>"),
-        format!("rw,p={person}:/f/{fleet}/cur/p/{person}/>"),
-        format!("ro:/f/{fleet}/pub/>"),
-    ]);
-    ring
-}
-
 /// Refuse a bridge or broker argv word containing whitespace, quotes, `\`, `%`, `$`.
 pub fn argv_safe(word: &str) -> Result<(), String> {
     let bad = word
@@ -1547,9 +1540,10 @@ pub fn is_node_id(node: &str) -> bool {
 #[derive(Debug, PartialEq, Eq)]
 struct CapMiss {
     why: String,
-    /// A ring genuine under the secret that no `on` here mints again: one for another node id
-    /// than the state dir names, or one off this fleet that is not the ring `on` mints for
-    /// another.
+    /// A ring no `on` here mints again: one under another secret that is not a ring `on` mints
+    /// for this node ([`minted_by_on`]), and, genuine under the secret, one for another node id
+    /// than the state dir names, one off this fleet that is not the ring `on` mints for another,
+    /// or one wider than the node's ceiling.
     keep: bool,
     /// The owner-only rule refused the file ([`crate::bridge::cap_refused`]), so nothing is known
     /// of the ring in it: `on` names the refusal and leaves the file, never minting over it.
@@ -1576,7 +1570,188 @@ impl From<io::Error> for CapMiss {
     }
 }
 
-/// How `ring`, as a reader of it answered, stands to this `fleet`, `node` and mint `secret`.
+/// The node ring an aterm before D08 (`49b5230d88`, which minted from the ceiling) minted for
+/// `node` on `fleet`: `ceiling`'s grants and the two `term/` grants of the drive face cut in
+/// `678ad583d5`. It is wider than the ceiling, and `on` mints the ceiling's ring over it
+/// without keeping it aside or warning of it, as it does a ring of another fleet: an `on`
+/// minted it, and every grant it holds beyond the ceiling's reaches a face nothing serves.
+fn earlier_node_grants(
+    ceiling: &astream_cap::GrantCeiling,
+    fleet: &str,
+    node: &str,
+) -> Vec<String> {
+    let mut ring = ceiling.rules();
+    ring.extend([
+        format!("ro:/f/{fleet}/term/{node}/>"),
+        format!("rw,p={node}:/f/{fleet}/term/{node}/*/screen"),
+    ]);
+    ring
+}
+
+/// Whether `held` is `grants`, in any order.
+fn same_grants(held: &[astream_cap::Capability], grants: &[String]) -> bool {
+    let mut held: Vec<&str> = held.iter().map(|c| c.filter.as_str()).collect();
+    let mut grants: Vec<&str> = grants.iter().map(String::as_str).collect();
+    held.sort_unstable();
+    grants.sort_unstable();
+    held == grants
+}
+
+/// How a ring stands to `node`'s ceiling on `fleet` (astream's
+/// [`astream_cap::GrantCeiling::aterm_node_ring`], whose rules are the grants `on` mints).
+#[derive(Debug)]
+enum Fit {
+    /// Every grant lies within a rule of the ceiling.
+    Within,
+    /// The ring an earlier aterm minted ([`earlier_node_grants`]), which `on` mints over.
+    Earlier,
+    /// Wider than the ceiling, and no ring `on` ever minted: the check's first violation.
+    Wider(astream_cap::CeilingViolation),
+}
+
+/// How `held` stands to `node`'s ceiling on `fleet`.
+///
+/// # Errors
+/// A fleet or node id the ceiling refuses (neither is one `on` makes).
+fn fit(held: &[astream_cap::Capability], fleet: &str, node: &str) -> Result<Fit, String> {
+    let ceiling = astream_cap::GrantCeiling::aterm_node_ring(fleet, node)?;
+    Ok(match ceiling.check_ring(held) {
+        Ok(()) => Fit::Within,
+        Err(_) if same_grants(held, &earlier_node_grants(&ceiling, fleet, node)) => Fit::Earlier,
+        Err(violation) => Fit::Wider(violation),
+    })
+}
+
+/// The fleet segment a grant's filter names, if it names one.
+fn fleet_of(grant: &str) -> Option<String> {
+    astream_cap::Grant::parse(grant)
+        .ok()
+        .and_then(|g| Some(g.filter.strip_prefix("/f/")?.split('/').next()?.to_string()))
+}
+
+/// Whether some grant of `held` binds `node`: the ring is one minted for it.
+fn binds(held: &[astream_cap::Capability], node: &str) -> bool {
+    held.iter().any(|c| {
+        astream_cap::Grant::parse(&c.filter).is_ok_and(|g| g.principal.as_deref() == Some(node))
+    })
+}
+
+/// Whether `held` is, grant for grant, a ring an `on` for `node` mints on a fleet its own grants
+/// name: the node's ceiling rules there, or the eight grants an aterm before D08 minted
+/// ([`earlier_node_grants`]). `on` mints over such a ring without keeping it, whatever secret
+/// minted it, because `on --fleet <it>` here mints it again; every other ring it keeps aside,
+/// since nothing else records what it held.
+fn minted_by_on(held: &[astream_cap::Capability], node: &str) -> bool {
+    let fleets: BTreeSet<String> = held.iter().filter_map(|c| fleet_of(&c.filter)).collect();
+    fleets.iter().any(|fleet| {
+        astream_cap::GrantCeiling::aterm_node_ring(fleet, node).is_ok_and(|ceiling| {
+            same_grants(held, &ceiling.rules())
+                || same_grants(held, &earlier_node_grants(&ceiling, fleet, node))
+        })
+    })
+}
+
+/// `caps` as the capabilities they are, or `None` when a grant does not parse.
+fn capabilities(caps: &[crate::bridge::Cap]) -> Option<Vec<astream_cap::Capability>> {
+    caps.iter()
+        .map(|c| {
+            astream_cap::Grant::parse(&c.grant).ok()?;
+            Some(astream_cap::Capability {
+                filter: c.grant.clone(),
+                tag: c.tag,
+            })
+        })
+        .collect()
+}
+
+/// `node`'s ring on `fleet` as `on` mints it: its ceiling's rules.
+#[cfg(test)]
+pub(crate) fn node_rules(fleet: &str, node: &str) -> Vec<String> {
+    astream_cap::GrantCeiling::aterm_node_ring(fleet, node)
+        .expect("a node's ceiling")
+        .rules()
+}
+
+/// `person`'s ring on `fleet` as `aterm fabric mint-for` mints it: its ceiling's rules.
+#[cfg(test)]
+pub(crate) fn person_rules(fleet: &str, person: &str) -> Vec<String> {
+    astream_cap::GrantCeiling::aterm_person_ring(fleet, person)
+        .expect("a person's ceiling")
+        .rules()
+}
+
+/// What `on` and `aterm fabric doctor` say of a ring wider than the node's ceiling, before the
+/// ceiling check's first violation.
+pub const WIDER_RING: &str = "wider than this node's ring";
+
+/// What `aterm fabric doctor` names of the rings a bridge attaches as `node` on `fleet`, one
+/// `(path, ring)` per `--cap-file` of its command: each file that takes the bridge past the
+/// node's ceiling, with [`WIDER_RING`] and the ceiling check's first violation in that file.
+///
+/// The bridge attaches every file as one ring ([`crate::bridge`] extends one ring with each)
+/// and answers as the node when one of them binds it; a command none of whose files binds the
+/// node is judged on other grounds, and so is a file that does not parse. In a command that
+/// does, a ring `on` mints for the node ([`minted_by_on`]: its own, the one an aterm before
+/// D08 minted, either on another fleet) is not named, since `on` mints it again. A file that
+/// binds the node is its ring, named for any grant beyond the ceiling. A file that binds no
+/// grant to it is named for its first read-write grant beyond the ceiling, by which the bridge
+/// publishes past the node's ring (an unbound one, the god cap §14 Q5 asks about, as any
+/// principal); one that only reads is a reader's ring, which publishes as no one, and is left
+/// alone. `on` gives the bridge `<root>/node.cap` alone, and keeps aside each ring it names
+/// there ([`ring_is_for`]: no ring `on` mints, whatever secret minted it).
+pub(crate) fn wider_than_ceiling<'a>(
+    rings: &[(&'a str, &[crate::bridge::Cap])],
+    fleet: &str,
+    node: &str,
+) -> Vec<(&'a str, String)> {
+    let held: Vec<(&str, Vec<astream_cap::Capability>)> = rings
+        .iter()
+        .filter_map(|(path, caps)| Some((*path, capabilities(caps)?)))
+        .collect();
+    let Ok(ceiling) = astream_cap::GrantCeiling::aterm_node_ring(fleet, node) else {
+        return Vec::new();
+    };
+    if !held.iter().any(|(_, ring)| binds(ring, node)) {
+        return Vec::new();
+    }
+    held.into_iter()
+        .filter(|(_, ring)| !minted_by_on(ring, node))
+        .filter_map(|(path, ring)| {
+            let violation = if binds(&ring, node) {
+                ceiling.check_ring(&ring).err()?
+            } else {
+                writer_beyond(&ceiling, &ring)?
+            };
+            Some((path, format!("{WIDER_RING}: {violation}")))
+        })
+        .collect()
+}
+
+/// The first read-write grant of `ring` beyond `ceiling`, as the ceiling check names it, at
+/// its index in `ring`.
+fn writer_beyond(
+    ceiling: &astream_cap::GrantCeiling,
+    ring: &[astream_cap::Capability],
+) -> Option<astream_cap::CeilingViolation> {
+    ring.iter().enumerate().find_map(|(index, c)| {
+        let grant = astream_cap::Grant::parse(&c.filter).ok()?;
+        if grant.mode != astream_cap::Mode::ReadWrite {
+            return None;
+        }
+        let kind = ceiling.check_grant(&c.filter).err()?;
+        Some(astream_cap::CeilingViolation {
+            index,
+            grant: c.filter.clone(),
+            kind,
+        })
+    })
+}
+
+/// How `ring`, as a reader of it answered, stands to this `fleet`, `node` and mint `secret`:
+/// its tags verify under the secret, then it is checked against the node's ceiling. A ring
+/// whose tags do not verify is kept aside unless `on` mints it for this node
+/// ([`minted_by_on`]), so a ring `aterm fabric doctor` names wider than the node's
+/// ([`wider_than_ceiling`]) is kept whatever secret minted it.
 fn ring_is_for(
     ring: io::Result<Vec<crate::bridge::Cap>>,
     fleet: &str,
@@ -1584,59 +1759,54 @@ fn ring_is_for(
     secret: &[u8],
 ) -> Result<usize, CapMiss> {
     let caps = ring?;
-    if !caps.iter().all(|c| {
-        if astream_cap::Grant::parse(&c.grant).is_err() {
-            return false;
-        }
-        let Ok(tag) = c.tag.as_slice().try_into() else {
-            return false;
-        };
-        astream_cap::verify(
-            secret,
-            &astream_cap::Capability {
-                filter: c.grant.clone(),
-                tag,
-            },
-        )
-    }) {
+    let Some(held) = capabilities(&caps) else {
         return Err("not minted under the current mint secret"
             .to_string()
             .into());
+    };
+    if !held.iter().all(|c| astream_cap::verify(secret, c)) {
+        return Err(CapMiss {
+            why: "not minted under the current mint secret".to_string(),
+            keep: !minted_by_on(&held, node),
+            refused: false,
+        });
     }
-    if !caps.iter().any(|c| {
-        astream_cap::Grant::parse(&c.grant).is_ok_and(|g| g.principal.as_deref() == Some(node))
-    }) {
+    if !binds(&held, node) {
         return Err(CapMiss {
             why: format!("minted for a different node id, not {node}"),
             keep: true,
             refused: false,
         });
     }
-    let fleet_of = |grant: &str| {
-        astream_cap::Grant::parse(grant)
-            .ok()
-            .and_then(|g| Some(g.filter.strip_prefix("/f/")?.split('/').next()?.to_string()))
-    };
-    if caps
+    if held
         .iter()
-        .all(|c| fleet_of(&c.grant).as_deref() == Some(fleet))
+        .all(|c| fleet_of(&c.filter).as_deref() == Some(fleet))
     {
-        return Ok(caps.len());
+        return match fit(&held, fleet, node)? {
+            Fit::Within => Ok(held.len()),
+            Fit::Earlier => Err(CapMiss {
+                why: "the ring an earlier aterm minted, with the cut drive face's two term/ \
+                      grants"
+                    .to_string(),
+                keep: false,
+                refused: false,
+            }),
+            Fit::Wider(violation) => Err(CapMiss {
+                why: format!("{WIDER_RING}: {violation}"),
+                keep: true,
+                refused: false,
+            }),
+        };
     }
     // Every tag verifies, and a tag is the secret's MAC of its grant: the ring `on` mints for
-    // another fleet comes back grant for grant from `on --fleet <it>`, any other ring would not.
-    let mut held: Vec<&str> = caps.iter().map(|c| c.grant.as_str()).collect();
-    held.sort_unstable();
-    let others: BTreeSet<String> = caps
+    // another fleet (or minted, before D08) comes back grant for grant from `on --fleet <it>`,
+    // any other ring would not.
+    let others: BTreeSet<String> = held
         .iter()
-        .filter_map(|c| fleet_of(&c.grant))
+        .filter_map(|c| fleet_of(&c.filter))
         .filter(|f| f != fleet)
         .collect();
-    let regenerable = others.iter().any(|other| {
-        let mut ring = node_grants(other, node);
-        ring.sort_unstable();
-        ring.iter().map(String::as_str).eq(held.iter().copied())
-    });
+    let regenerable = minted_by_on(&held, node);
     Err(CapMiss {
         why: if others.is_empty() {
             format!("some of its grants lie outside /f/{fleet}/")
@@ -1663,11 +1833,14 @@ fn trace(word: &str) {
     }
 }
 
-/// Mint the eight grants of [`node_grants`] into `<root>/node.cap` as one transaction.
+/// Mint `node`'s ring, the rules of its ceiling on the root's fleet (astream's
+/// [`astream_cap::GrantCeiling::aterm_node_ring`]), into `<root>/node.cap` as one transaction.
 ///
 /// # Errors
-/// A secret the reader refuses, a refused mint, or a staging/rename failure.
+/// A fleet or node id the ceiling refuses, a secret the reader refuses, a refused mint, or a
+/// staging/rename failure.
 fn mint_caps(p: &Paths, node: &str) -> Result<usize, String> {
+    let grants = astream_cap::GrantCeiling::aterm_node_ring(&p.fleet, node)?.rules();
     let secret_path = p.secret().to_string_lossy().into_owned();
     let key = crate::transport::read_mint_secret(&secret_path).map_err(|e| {
         trace("Reject");
@@ -1682,7 +1855,6 @@ fn mint_caps(p: &Paths, node: &str) -> Result<usize, String> {
     let staged = p.root.join(format!(".node.cap.{}", std::process::id()));
     let result = (|| -> Result<usize, String> {
         let mut lines = String::new();
-        let grants = node_grants(&p.fleet, node);
         for (i, grant) in grants.iter().enumerate() {
             let minted = if fail_at == Some(i + 1) {
                 Err("injected mint refusal".to_string())
@@ -1973,9 +2145,8 @@ fn record_step(p: &Paths, service: Service, out: &mut Out) -> bool {
 /// take it out where it hands the broker to launchd or systemd.
 fn hand_record_step(p: &Paths, service: Service, out: &mut Out) -> bool {
     let record = p.root.join(HAND_RECORD);
-    let there = match std::fs::symlink_metadata(&record) {
-        Ok(_) => true,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+    let there = match record_in_owned_dir(&record) {
+        Ok(there) => there,
         Err(e) => {
             out.fail("record", &format!("{}: {e}", record.display()));
             return false;
@@ -2035,9 +2206,9 @@ fn hand_record_step(p: &Paths, service: Service, out: &mut Out) -> bool {
 
 /// [`record_step`] for one record.
 fn remove_off_record(record: &Path, out: &mut Out) -> bool {
-    match std::fs::symlink_metadata(record) {
-        Ok(_) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return true,
+    match record_in_owned_dir(record) {
+        Ok(true) => {}
+        Ok(false) => return true,
         Err(e) => {
             out.fail("record", &format!("{}: {e}", record.display()));
             return false;
@@ -2055,9 +2226,14 @@ fn remove_off_record(record: &Path, out: &mut Out) -> bool {
     if out.dry_run {
         return true;
     }
-    match std::fs::remove_file(record) {
-        Ok(()) => true,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => true,
+    let Some((dir, name)) = record
+        .parent()
+        .zip(record.file_name().and_then(|n| n.to_str()))
+    else {
+        return true;
+    };
+    match aterm_uds::private_file::remove_private(dir, name) {
+        Ok(_) => true,
         Err(e) => {
             out.fail("record", &format!("{}: {e}", record.display()));
             false
@@ -2070,7 +2246,11 @@ fn remove_off_record(record: &Path, out: &mut Out) -> bool {
 /// writes, so one stopped short keeps the converge pass from turning the fabric on again too.
 fn off_record_step(p: &Paths, out: &mut Out) {
     write_off_record(&p.root.join(OFF_RECORD), Some(&p.root), out);
-    let kept = kept_off_record(p).filter(|record| record.parent().is_some_and(Path::is_dir));
+    let kept = kept_off_record(p).filter(|record| {
+        record
+            .parent()
+            .is_some_and(|dir| aterm_uds::private_file::check_owned_dir(dir).is_ok())
+    });
     if let Some(record) = kept {
         write_off_record(&record, None, out);
     }
@@ -2079,15 +2259,22 @@ fn off_record_step(p: &Paths, out: &mut Out) {
 /// [`off_record_step`] for `record`; `root` is the fabric root it is written in, made private
 /// first, where it is that record. aterm.toml's folder is left as it is (the record is empty).
 fn write_off_record(record: &Path, root: Option<&Path>, out: &mut Out) {
-    if std::fs::symlink_metadata(record).is_ok() {
-        out.already(
-            "record",
-            &format!(
-                "{} (the converge pass leaves the fabric off)",
-                record.display()
-            ),
-        );
-        return;
+    match record_in_owned_dir(record) {
+        Ok(true) => {
+            out.already(
+                "record",
+                &format!(
+                    "{} (the converge pass leaves the fabric off)",
+                    record.display()
+                ),
+            );
+            return;
+        }
+        Ok(false) => {}
+        Err(e) => {
+            out.fail("record", &format!("{}: {e}", record.display()));
+            return;
+        }
     }
     out.done(
         "record",
@@ -2103,7 +2290,11 @@ fn write_off_record(record: &Path, root: Option<&Path>, out: &mut Out) {
     let written = match root {
         Some(root) => aterm_uds::private_file::ensure_private_dir(root)
             .and_then(|_| aterm_uds::private_file::write_private(root, OFF_RECORD, b"")),
-        None => aterm_uds::atomic_file::write(record, b"", 0o600),
+        None => record
+            .parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "record has no parent"))
+            .and_then(aterm_uds::private_file::check_owned_dir)
+            .and_then(|()| aterm_uds::atomic_file::write(record, b"", 0o600)),
     };
     if let Err(e) = written {
         out.fail("record", &format!("{}: {e}", record.display()));
@@ -2153,15 +2344,20 @@ fn unset_in(root: &Path, kept: Option<&Path>, command: bool) -> Option<Unset> {
             record.display()
         )));
     }
-    let by_default = std::fs::symlink_metadata(root.join(DEFAULT_RECORD)).is_ok();
-    let left = read_node(&root.join("link-state"))
-        .map(|node| format!("node {node}"))
-        .or_else(|| {
-            [MINT_SECRET, "node.cap"]
-                .into_iter()
-                .find(|name| std::fs::symlink_metadata(root.join(name)).is_ok())
-                .map(str::to_owned)
-        });
+    let root_owned = aterm_uds::private_file::check_owned_dir(root).is_ok();
+    let by_default = root_owned && std::fs::symlink_metadata(root.join(DEFAULT_RECORD)).is_ok();
+    let left = root_owned
+        .then(|| {
+            read_node(&root.join("link-state"))
+                .map(|node| format!("node {node}"))
+                .or_else(|| {
+                    [MINT_SECRET, "node.cap"]
+                        .into_iter()
+                        .find(|name| std::fs::symlink_metadata(root.join(name)).is_ok())
+                        .map(str::to_owned)
+                })
+        })
+        .flatten();
     match left {
         Some(what) if !by_default => Some(Unset::PersonOff(format!(
             "off: {} keeps {what} beside no [fabric] command, as an earlier `aterm fabric off` \
@@ -3558,7 +3754,7 @@ fn renew_with(
         )));
     }
     let hand = found.p.root.join(HAND_RECORD);
-    if std::fs::symlink_metadata(&hand).is_ok() {
+    if record_in_owned_dir(&hand).unwrap_or(false) {
         return Ok(BrokerRenewal::Kept(format!(
             "you run the broker: `aterm fabric on --service none` recorded it ({}); `aterm \
              fabric on` hands it to launchd or systemd",
@@ -4305,7 +4501,7 @@ fn prepare_on(opts: &OnOpts) -> Result<Prepared, String> {
 }
 
 /// `aterm fabric on`.
-#[must_use]
+#[must_use = "handle or propagate the command's exit status"]
 pub fn on(opts: &OnOpts) -> ExitCode {
     let prepared = match prepare_on(opts) {
         Ok(prepared) => prepared,
@@ -4601,9 +4797,16 @@ fn on_steps(
             return Err(ExitCode::from(2));
         }
         Err(CapMiss { why, keep, .. }) => {
+            let grants = match astream_cap::GrantCeiling::aterm_node_ring(&p.fleet, &node) {
+                Ok(ceiling) => ceiling.len(),
+                Err(e) => {
+                    out.fail("cap", &e);
+                    return Err(ExitCode::from(2));
+                }
+            };
             let mint = |kept: &str| {
                 format!(
-                    "mint 8 grants for {node} into {} ({why}{kept})",
+                    "mint {grants} grants for {node} into {} ({why}{kept})",
                     cap.display()
                 )
             };
@@ -4940,7 +5143,7 @@ fn off_launchd(lc: &dyn Launchd, label: &str, plist: &Path, out: &mut Out) {
 }
 
 /// `aterm fabric off`.
-#[must_use]
+#[must_use = "handle or propagate the command's exit status"]
 pub fn off(opts: &OffOpts) -> ExitCode {
     let (p, root_from) = match Paths::resolve_for_off() {
         Ok(p) => p,
@@ -5310,6 +5513,12 @@ pub fn fix_for(warning: &str, role: &Role) -> String {
         )
     } else if s("no node id") {
         format!("{again} provisions one and mints the cap for it")
+    } else if s("cap file") && s(WIDER_RING) {
+        format!(
+            "{again} gives the bridge one cap file, <root>/node.cap, holding the node's own \
+             ring: a wider ring there it keeps aside beside it, whatever secret minted it, and \
+             any other cap file the command names it leaves where it is, no longer attached"
+        )
     } else if s("cap file") && (s("a secret file") || s("read through no link")) {
         format!(
             "the file is refused as a cap for what this warning says: do what it names (`chmod \
@@ -5318,7 +5527,9 @@ pub fn fix_for(warning: &str, role: &Role) -> String {
              must satisfy the same owner-only rule at every new start"
         )
     } else if s("cap file") {
-        format!("{again} can re-mint a missing or malformed cap file; permission-refused files are left intact, so restore access before retrying")
+        format!(
+            "{again} can re-mint a missing or malformed cap file; permission-refused files are left intact, so restore access before retrying"
+        )
     } else if s("has no bridge") {
         format!("{again} arms every running instance")
     } else if s("bridge is down") {
@@ -5805,7 +6016,7 @@ fn confirmed() -> bool {
 }
 
 /// `aterm fabric doctor`.
-#[must_use]
+#[must_use = "handle or propagate the command's exit status"]
 pub fn doctor(retire_ghosts: bool, yes: bool) -> ExitCode {
     if retire_ghosts {
         return retire_ghosts_action(yes);
@@ -5967,7 +6178,8 @@ mod tests {
     /// grants and the bus log) still reads off, and the converge pass leaves it; `aterm fabric on`
     /// removes both records. aterm.toml's folder keeps its mode (the record is empty).
     /// NEGATIVE CONTROL: with `off_recorded` reading the root's record alone, the deleted root
-    /// reads as never turned off and the pass turns the fabric on over the person's off.
+    /// reads as never turned off and the pass turns the fabric on over the person's off. A
+    /// symlinked root or config folder neither reads, writes, nor unlinks a record in its target.
     #[test]
     fn an_off_outlives_the_fabric_root_it_was_recorded_in() {
         let dir = aterm_tempfile::tempdir().expect("scratch");
@@ -6022,6 +6234,36 @@ mod tests {
         assert!(
             matches!(unset_in(&p.root, Some(&kept), false), Some(Unset::Never(_))),
             "on again: the pass may turn it on"
+        );
+
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::fs::remove_dir_all(&p.root).expect("remove root");
+        std::fs::remove_dir_all(&config_dir).expect("remove config dir");
+        std::os::unix::fs::symlink(&outside, &p.root).expect("symlink root");
+        std::os::unix::fs::symlink(&outside, &config_dir).expect("symlink config dir");
+        let mut out = Out::kept();
+        off_record_step(&p, &mut out);
+        assert!(out.failed, "symlinked root must fail: {}", out.said());
+        assert!(
+            !outside.join(OFF_RECORD).exists(),
+            "symlinked folders must not write into outside"
+        );
+        std::fs::write(outside.join(OFF_RECORD), b"keep").expect("outside off");
+        std::fs::write(outside.join(MINT_SECRET), b"keep").expect("outside secret");
+        assert!(
+            matches!(unset_in(&p.root, Some(&kept), false), Some(Unset::Never(_))),
+            "symlinked folders must not read outside state as ours"
+        );
+        let mut out = Out::kept();
+        assert!(
+            !record_step(&p, Service::Launchd, &mut out),
+            "symlinked folders must fail record_step"
+        );
+        assert!(out.failed);
+        assert!(
+            outside.join(OFF_RECORD).exists(),
+            "symlinked folders must not unlink outside record"
         );
     }
 
@@ -6718,7 +6960,9 @@ mod tests {
                  inherited environment = {{\n\t\tA => b\n\t}}\n}}\n",
                 p.label(),
                 args[0],
-                args.iter().map(|a| format!("\t\t{a}\n")).collect::<String>()
+                args.iter()
+                    .map(|a| format!("\t\t{a}\n"))
+                    .collect::<String>()
             )
         };
         assert_eq!(printed_arguments(&printed(&argv)), Some(argv.clone()));
@@ -8696,11 +8940,16 @@ mod tests {
         assert!(Rendezvous::parse("[x\n").is_err());
     }
 
+    /// THE RINGS ATERM MINTS ARE ASTREAM'S CEILINGS' RULES: a node's six grants, the eight an
+    /// earlier aterm minted being those and the cut drive face's two `term/` grants; a person's
+    /// ring is byte for byte the one `enable::person_grants` minted before it was deleted (its
+    /// output for a human and a service, spelled here), so a ring `mint-for` minted then is the
+    /// one it mints now. Every node id `on` makes is one the node ceiling takes.
     #[test]
-    fn the_eight_grants_are_the_node_ring() {
-        let g = node_grants("local", "n-a");
+    fn the_rings_are_the_ceilings_rules() {
+        let ceiling = astream_cap::GrantCeiling::aterm_node_ring("local", "n-a").expect("a node");
         assert_eq!(
-            g,
+            ceiling.rules(),
             [
                 "rw,p=n-a:/f/local/pub/n-a/>",
                 "ro:/f/local/pub/>",
@@ -8708,17 +8957,85 @@ mod tests {
                 "rw,p=n-a:/f/local/in/*/*/n-a/*",
                 "ro:/f/local/in/n-a/>",
                 "rw,p=n-a:/f/local/cur/n-a/>",
+            ]
+        );
+        assert_eq!(
+            earlier_node_grants(&ceiling, "local", "n-a")[6..],
+            [
                 "ro:/f/local/term/n-a/>",
                 "rw,p=n-a:/f/local/term/n-a/*/screen",
             ]
         );
-        let other = node_grants("lab", "n-b");
         assert_eq!(
-            other,
-            g.iter()
+            node_rules("lab", "n-b"),
+            ceiling
+                .rules()
+                .iter()
                 .map(|x| x.replace("/local/", "/lab/").replace("n-a", "n-b"))
                 .collect::<Vec<_>>()
         );
+        // `person_grants`'s output, as it was deleted.
+        let human = [
+            "rw,p=h-andrew:/f/lab/fleet/h-andrew/>",
+            "rw,p=h-andrew:/f/lab/in/*/*/h-andrew/*",
+            "rw,p=h-andrew:/f/lab/pub/p/h-andrew/>",
+            "ro:/f/lab/in/p/h-andrew/>",
+            "rw,p=h-andrew:/f/lab/cur/p/h-andrew/>",
+            "ro:/f/lab/pub/>",
+        ];
+        let service = [
+            "rw,p=a-bot:/f/lab/in/*/*/a-bot/*",
+            "rw,p=a-bot:/f/lab/pub/p/a-bot/>",
+            "ro:/f/lab/in/p/a-bot/>",
+            "rw,p=a-bot:/f/lab/cur/p/a-bot/>",
+            "ro:/f/lab/pub/>",
+        ];
+        assert_eq!(person_rules("lab", "h-andrew"), human);
+        assert_eq!(person_rules("lab", "a-bot"), service);
+        let minted = aterm_uds::rand::hex_token::<8>().expect("entropy");
+        for node in [
+            format!("n-{minted}"),
+            "n-0123456789abcdef".to_string(),
+            "n-m7".to_string(),
+            format!("n-{}", "z".repeat(crate::subject::PRINCIPAL_MAX - 2)),
+        ] {
+            assert!(is_node_id(&node), "{node}");
+            for fleet in ["local", "lab", "a", &"f".repeat(32)] {
+                assert!(
+                    crate::subject::is_fleet(fleet)
+                        && astream_cap::GrantCeiling::aterm_node_ring(fleet, &node).is_ok(),
+                    "{fleet} {node}"
+                );
+            }
+        }
+    }
+
+    /// A RING MINTED FROM A CEILING'S RULES IS WITHIN IT: a node's, a human's and a service's,
+    /// minted grant for grant and checked by astream's `check_ring` and by `on`'s own reading.
+    #[test]
+    fn a_ring_minted_from_its_rules_passes_the_ceiling_check() {
+        let secret = [7u8; 32];
+        let minted = |grants: &[String]| -> Vec<astream_cap::Capability> {
+            grants
+                .iter()
+                .map(|g| astream_cap::mint(&secret, g).expect("mint"))
+                .collect()
+        };
+        let node = "n-0123456789abcdef";
+        let ceiling = astream_cap::GrantCeiling::aterm_node_ring("lab", node).expect("a node");
+        let held = minted(&ceiling.rules());
+        assert!(ceiling.check_ring(&held).is_ok());
+        assert!(matches!(fit(&held, "lab", node), Ok(Fit::Within)));
+        for person in ["h-andrew", "a-bot"] {
+            let ceiling =
+                astream_cap::GrantCeiling::aterm_person_ring("lab", person).expect("a person");
+            assert!(
+                ceiling
+                    .check_authenticated_ring(&secret, &minted(&ceiling.rules()), 0)
+                    .is_ok(),
+                "{person}"
+            );
+        }
     }
 
     #[test]
@@ -9032,6 +9349,8 @@ mod tests {
             "no [fabric] command in /c: this report read instance 1's running bridge",
             "no node id in /s/node",
             "cap file /c: the tag is not hex",
+            "cap file /c: wider than this node's ring: ring[6] \"rw:/f/lab/>\" is an unbound \
+             read-write god capability outside ceiling (x)",
             "cap file /c: /c is mode 0644: a secret file must be readable by its owner alone \
              (0600 or tighter); run `chmod 600 /c` and treat its contents as exposed",
             "cap file /c: /c is a symlink: a private ring is read through no link, so name the \
@@ -9598,7 +9917,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch");
         let node = "n-0123456789abcdef";
-        let ring = node_grants("lab", node);
+        let ring = node_rules("lab", node);
         let cap_under = |key: &[u8], name: &str, grants: &[String]| {
             let lines: String = grants
                 .iter()
@@ -9612,7 +9931,7 @@ mod tests {
             path
         };
         let own = cap_under(&[4u8; 32], "own.cap", &ring);
-        assert_eq!(cap_is_for(&own, "lab", node, &[4u8; 32]), Ok(8));
+        assert_eq!(cap_is_for(&own, "lab", node, &[4u8; 32]), Ok(6));
         {
             use std::os::unix::fs::PermissionsExt as _;
             let at = |mode| std::fs::set_permissions(&own, std::fs::Permissions::from_mode(mode));
@@ -9638,13 +9957,22 @@ mod tests {
             "another node's ring, the last record of its id once the state dir names another"
         );
         let foreign = cap_under(&[5u8; 32], "foreign.cap", &ring);
-        assert!(cap_is_for(&foreign, "lab", node, &[4u8; 32]).is_err());
         assert_eq!(
-            cap_is_for(&foreign, "lab", "n-other", &[4u8; 32]),
+            cap_is_for(&foreign, "lab", node, &[4u8; 32]),
             Err(CapMiss::from(
                 "not minted under the current mint secret".to_string()
             )),
-            "another secret's ring is judged by its secret first"
+            "another secret's ring of this node, which `on` mints again"
+        );
+        assert_eq!(
+            cap_is_for(&foreign, "lab", "n-other", &[4u8; 32]),
+            Err(CapMiss {
+                why: "not minted under the current mint secret".to_string(),
+                keep: true,
+                refused: false,
+            }),
+            "another secret's ring is judged by its secret first, and kept: no `on` for n-other \
+             mints it"
         );
         assert!(cap_is_for(&dir.join("absent.cap"), "lab", node, &[4u8; 32]).is_err());
         assert_eq!(
@@ -9656,13 +9984,311 @@ mod tests {
             }),
             "another fleet's ring, which `on --fleet lab` mints again grant for grant"
         );
-        let by_hand = cap_under(&[4u8; 32], "hand.cap", &ring[..7]);
-        assert_eq!(cap_is_for(&by_hand, "lab", node, &[4u8; 32]), Ok(7));
+        let by_hand = cap_under(&[4u8; 32], "hand.cap", &ring[..5]);
+        assert_eq!(cap_is_for(&by_hand, "lab", node, &[4u8; 32]), Ok(5));
         assert!(
             cap_is_for(&by_hand, "work", node, &[4u8; 32]).is_err_and(|m| m.keep),
             "a ring no `on` mints is kept aside"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A RING WIDER THAN THE NODE'S CEILING IS KEPT AND NAMED; THE ONE AN EARLIER ATERM MINTED IS
+    /// MINTED OVER (DESIGN-aterm-fabric §14 Q5): the node's ring and one extra unbound
+    /// `rw:/f/lab/>`, minted under the root's own secret, is refused with the ceiling check's
+    /// first violation and kept aside; so is the node's ring with one of the cut `term/` grants.
+    /// The eight grants an aterm before D08 (`49b5230d88`) minted, on this fleet or another, are
+    /// minted over without being kept. `doctor` names the wide ring alone, with the fix `on`.
+    /// NEGATIVE CONTROL: the wide ring passes every test `on` made of a ring before the ceiling
+    /// check (each tag verifies under the secret, a grant binds the node, every grant lies in
+    /// the fleet), so without `check_ring` it is accepted as this node's, as it was (run: a
+    /// `ring_is_for` that takes `Fit::Wider` as `Within` answers `Ok(7)` and fails here).
+    #[test]
+    fn a_ring_wider_than_the_ceiling_is_kept_and_the_earlier_ring_is_minted_over() {
+        let secret = [4u8; 32];
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let node = "n-0123456789abcdef";
+        let ceiling = astream_cap::GrantCeiling::aterm_node_ring("lab", node).expect("a node");
+        let cap_under = |name: &str, grants: &[String]| -> Vec<crate::bridge::Cap> {
+            let lines: String = grants
+                .iter()
+                .map(|g| {
+                    let c = astream_cap::mint(&secret, g).expect("mint");
+                    astream_cap::capfile::format_line(&c.filter, &c.tag) + "\n"
+                })
+                .collect();
+            let path = dir.path().join(name);
+            crate::bridge::write_owner_only(&path, lines);
+            crate::bridge::read_cap_file(&path.to_string_lossy()).expect("a ring")
+        };
+        let held = |caps: &[crate::bridge::Cap]| capabilities(caps).expect("parses");
+        let named = |caps: &[crate::bridge::Cap]| {
+            wider_than_ceiling(&[("/r/node.cap", caps)], "lab", node)
+                .into_iter()
+                .map(|(_, why)| why)
+                .next()
+        };
+
+        let mut wide = ceiling.rules();
+        wide.push("rw:/f/lab/>".to_string());
+        let wide = cap_under("wide.cap", &wide);
+        let control = held(&wide);
+        assert!(
+            control.iter().all(|c| astream_cap::verify(&secret, c))
+                && binds(&control, node)
+                && control
+                    .iter()
+                    .all(|c| fleet_of(&c.filter).as_deref() == Some("lab")),
+            "NEGATIVE CONTROL: the ring passes every test before the ceiling check"
+        );
+        let miss = ring_is_for(Ok(wide.clone()), "lab", node, &secret).expect_err("wide");
+        assert!(miss.keep && !miss.refused, "{miss:?}");
+        assert!(
+            miss.why.starts_with(WIDER_RING)
+                && miss.why.contains("ring[6]")
+                && miss.why.contains("rw:/f/lab/>")
+                && miss.why.contains("god capability"),
+            "{miss:?}"
+        );
+        let named_wide = named(&wide).expect("doctor names it");
+        assert_eq!(named_wide, miss.why, "doctor and `on` say the same");
+        let warning = format!("cap file /r/node.cap: {named_wide}");
+        let fix = fix_for(&warning, &Role::default());
+        assert!(
+            fix.contains("<root>/node.cap") && fix.contains("keeps aside"),
+            "{warning}: {fix}"
+        );
+
+        let earlier = earlier_node_grants(&ceiling, "lab", node);
+        let mut one_term = ceiling.rules();
+        one_term.push(earlier[7].clone());
+        let one_term = cap_under("one-term.cap", &one_term);
+        let miss = ring_is_for(Ok(one_term.clone()), "lab", node, &secret).expect_err("wide");
+        assert!(miss.keep && miss.why.starts_with(WIDER_RING), "{miss:?}");
+        assert!(named(&one_term).is_some());
+
+        let mut shuffled = earlier.clone();
+        shuffled.reverse();
+        let earlier = cap_under("earlier.cap", &shuffled);
+        let miss = ring_is_for(Ok(earlier.clone()), "lab", node, &secret).expect_err("earlier");
+        assert!(!miss.keep && !miss.refused, "{miss:?}");
+        assert!(miss.why.contains("earlier aterm"), "{miss:?}");
+        assert_eq!(named(&earlier), None);
+        let elsewhere = cap_under(
+            "elsewhere.cap",
+            &earlier_node_grants(
+                &astream_cap::GrantCeiling::aterm_node_ring("work", node).expect("a node"),
+                "work",
+                node,
+            ),
+        );
+        let miss = ring_is_for(Ok(elsewhere.clone()), "lab", node, &secret).expect_err("other");
+        assert!(
+            !miss.keep && miss.why == "minted for fleet work, not lab",
+            "{miss:?}"
+        );
+        assert_eq!(named(&elsewhere), None);
+
+        let own = cap_under("own.cap", &ceiling.rules());
+        assert_eq!(ring_is_for(Ok(own.clone()), "lab", node, &secret), Ok(6));
+        assert_eq!(named(&own), None);
+    }
+
+    /// Each of `grants`, minted under `key`, as a cap file at `dir/name` reads back.
+    fn ring_in(
+        dir: &Path,
+        key: &[u8],
+        name: &str,
+        grants: &[String],
+    ) -> io::Result<Vec<crate::bridge::Cap>> {
+        let lines: String = grants
+            .iter()
+            .map(|g| {
+                let c = astream_cap::mint(key, g).expect("mint");
+                astream_cap::capfile::format_line(&c.filter, &c.tag) + "\n"
+            })
+            .collect();
+        let path = dir.join(name);
+        crate::bridge::write_owner_only(&path, lines);
+        crate::bridge::read_cap_file(&path.to_string_lossy())
+    }
+
+    /// A GOD CAP ALONE IN A SECOND CAP FILE IS NAMED (DESIGN-aterm-fabric §14 Q5): the bridge
+    /// attaches every `--cap-file` of its command as one ring, so the node's own ring in one
+    /// file and an unbound `rw:/f/lab/>` alone in another is a ring wider than the node's, and
+    /// `doctor` names the second file, in either order, with the violation indexed in that file;
+    /// so it does an unbound `rw:/f/work/>` there, and a read-write grant behind a read one, at
+    /// its own index. A reader's ring beside the node's (`ro:/f/lab/>`, which publishes as no
+    /// one) is not named. NEGATIVE CONTROL: judged alone, as each file was before, the second
+    /// file binds no grant to the node and is not named.
+    #[test]
+    fn a_god_cap_alone_in_a_second_cap_file_is_named() {
+        let secret = [4u8; 32];
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let node = "n-0123456789abcdef";
+        let rules = node_rules("lab", node);
+        let own = ring_in(dir.path(), &secret, "node.cap", &rules).expect("a ring");
+        let god =
+            ring_in(dir.path(), &secret, "god.cap", &["rw:/f/lab/>".to_string()]).expect("a ring");
+        assert_eq!(
+            wider_than_ceiling(&[("/r/god.cap", &god[..])], "lab", node),
+            Vec::new(),
+            "NEGATIVE CONTROL: alone, the file binds no grant to the node"
+        );
+        for files in [
+            [("/r/node.cap", &own[..]), ("/r/god.cap", &god[..])],
+            [("/r/god.cap", &god[..]), ("/r/node.cap", &own[..])],
+        ] {
+            let named = wider_than_ceiling(&files, "lab", node);
+            assert!(
+                named.len() == 1
+                    && named[0].0 == "/r/god.cap"
+                    && named[0].1.starts_with(WIDER_RING)
+                    && named[0].1.contains("ring[0]")
+                    && named[0].1.contains("rw:/f/lab/>"),
+                "{named:?}"
+            );
+        }
+        let beside = |name: &str, grants: &[&str]| {
+            let grants: Vec<String> = grants.iter().map(|g| (*g).to_string()).collect();
+            let ring = ring_in(dir.path(), &secret, name, &grants).expect("a ring");
+            wider_than_ceiling(&[("/r/node.cap", &own[..]), (name, &ring[..])], "lab", node)
+                .into_iter()
+                .map(|(path, why)| format!("{path}: {why}"))
+                .collect::<Vec<_>>()
+        };
+        let work = beside("work.cap", &["rw:/f/work/>"]);
+        assert!(
+            work.len() == 1 && work[0].starts_with("work.cap: ") && work[0].contains("ring[0]"),
+            "another fleet's god cap: {work:?}"
+        );
+        let behind = beside("behind.cap", &["ro:/f/lab/>", "rw:/f/lab/>"]);
+        assert!(
+            behind.len() == 1 && behind[0].contains("ring[1]") && behind[0].contains("rw:/f/lab/>"),
+            "a write behind a read: {behind:?}"
+        );
+        assert_eq!(
+            beside("reader.cap", &["ro:/f/lab/>"]),
+            Vec::<String>::new(),
+            "a reader's ring"
+        );
+    }
+
+    /// WHAT `doctor` NAMES OF `<root>/node.cap`, `on` KEEPS ASIDE, so the fix `doctor` offers
+    /// holds: over rings of each shape `on` judges (the node's own, wide, with one cut `term/`
+    /// grant, the earlier eight, another fleet's, another node's, another node's made wide, a
+    /// god cap alone, a partial ring), each under the root's secret and under another, and each
+    /// alone or beside a second cap file holding the node's own ring, every ring `doctor` names
+    /// is one `ring_is_for` refuses with `keep`. CONTROL: the matrix names rings under each
+    /// secret, the second file's among them, so the implication is not vacuous.
+    #[test]
+    fn every_ring_doctor_names_on_keeps_aside() {
+        let (root, other) = ([4u8; 32], [5u8; 32]);
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let node = "n-0123456789abcdef";
+        let ceiling = astream_cap::GrantCeiling::aterm_node_ring("lab", node).expect("a node");
+        let rules = ceiling.rules();
+        let earlier = earlier_node_grants(&ceiling, "lab", node);
+        let god = "rw:/f/lab/>".to_string();
+        let with = |ring: &[String], extra: &str| {
+            let mut ring = ring.to_vec();
+            ring.push(extra.to_string());
+            ring
+        };
+        let work = astream_cap::GrantCeiling::aterm_node_ring("work", node).expect("a node");
+        let another = node_rules("lab", "n-other");
+        let shapes: [(&str, Vec<String>); 9] = [
+            ("own", rules.clone()),
+            ("wide", with(&rules, &god)),
+            ("one-term", with(&rules, &earlier[7])),
+            ("earlier", earlier.clone()),
+            ("work", earlier_node_grants(&work, "work", node)),
+            ("another", another.clone()),
+            ("another-wide", with(&another, &god)),
+            ("god", vec![god.clone()]),
+            ("partial", rules[..5].to_vec()),
+        ];
+        let beside = ring_in(dir.path(), &root, "beside.cap", &rules).expect("a ring");
+        let mut named = Vec::new();
+        for (secret, under) in [(&root, "root"), (&other, "other")] {
+            for (shape, grants) in &shapes {
+                let caps = ring_in(dir.path(), secret, &format!("{shape}-{under}.cap"), grants)
+                    .expect("a ring");
+                for second in [false, true] {
+                    let mut files = vec![("/r/node.cap", &caps[..])];
+                    if second {
+                        files.push(("/r/beside.cap", &beside[..]));
+                    }
+                    if !wider_than_ceiling(&files, "lab", node)
+                        .iter()
+                        .any(|(path, _)| *path == "/r/node.cap")
+                    {
+                        continue;
+                    }
+                    named.push(format!("{shape}/{under}/{second}"));
+                    let miss = ring_is_for(Ok(caps.clone()), "lab", node, &root)
+                        .expect_err("a ring doctor names is not the node's");
+                    assert!(
+                        miss.keep && !miss.refused,
+                        "{shape} under the {under} secret (second file: {second}): {miss:?}"
+                    );
+                }
+            }
+        }
+        for want in ["wide/root/false", "wide/other/false", "god/other/true"] {
+            assert!(
+                named.iter().any(|n| n == want),
+                "CONTROL: {want} named: {named:?}"
+            );
+        }
+    }
+
+    /// A RING NO `on` MINTS IS KEPT ASIDE WHATEVER SECRET MINTED IT (DESIGN-aterm-fabric §14 Q5):
+    /// the node's ring and an unbound `rw:/f/lab/>`, minted under a secret other than the
+    /// root's, is a ring `doctor` names wider than the node's, and `on` keeps it aside before it
+    /// mints the node's own in its place, as it keeps one minted under the root's secret. A ring
+    /// `on` mints grant for grant (the node's own, or the eight grants an aterm before D08
+    /// minted) under another secret is minted over without being kept: `on` mints it again.
+    /// NEGATIVE CONTROL: that ring under the root's secret is kept for being wide, so it is the
+    /// secret alone that the check must look past.
+    #[test]
+    fn a_wide_ring_under_another_secret_is_kept_aside() {
+        let (root, other) = ([4u8; 32], [5u8; 32]);
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let node = "n-0123456789abcdef";
+        let ceiling = astream_cap::GrantCeiling::aterm_node_ring("lab", node).expect("a node");
+        let ring_under = |key: &[u8], name: &str, grants: &[String]| {
+            let lines: String = grants
+                .iter()
+                .map(|g| {
+                    let c = astream_cap::mint(key, g).expect("mint");
+                    astream_cap::capfile::format_line(&c.filter, &c.tag) + "\n"
+                })
+                .collect();
+            let path = dir.path().join(name);
+            crate::bridge::write_owner_only(&path, lines);
+            crate::bridge::read_cap_file(&path.to_string_lossy())
+        };
+        let mut wide = ceiling.rules();
+        wide.push("rw:/f/lab/>".to_string());
+        let control = ring_is_for(ring_under(&root, "root.cap", &wide), "lab", node, &root)
+            .expect_err("NEGATIVE CONTROL: wide");
+        assert!(control.keep, "NEGATIVE CONTROL: {control:?}");
+
+        let miss = ring_is_for(ring_under(&other, "other.cap", &wide), "lab", node, &root)
+            .expect_err("another secret");
+        assert!(
+            miss.keep && !miss.refused && miss.why.contains("not minted under"),
+            "a wide ring under another secret is kept aside: {miss:?}"
+        );
+        for (name, grants) in [
+            ("own.cap", ceiling.rules()),
+            ("earlier.cap", earlier_node_grants(&ceiling, "lab", node)),
+        ] {
+            let miss = ring_is_for(ring_under(&other, name, &grants), "lab", node, &root)
+                .expect_err("another secret");
+            assert!(!miss.keep, "{name}: `on` mints it again: {miss:?}");
+        }
     }
 
     #[test]

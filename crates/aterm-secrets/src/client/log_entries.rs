@@ -1572,11 +1572,12 @@ fn held_draft_file(paths: &Paths) -> PathBuf {
 /// # Errors
 /// The file cannot be written.
 pub(super) fn hold_drafted(paths: &Paths, drafted: &Drafted) -> crate::Result<()> {
-    fsx::write_atomic(
-        &held_draft_file(paths),
-        &encode_records(&drafted.records),
-        0o600,
-    )
+    super::write_record_file(&held_draft_file(paths), |writer| {
+        for record in &drafted.records {
+            writer.write_all(record.bytes())?;
+        }
+        Ok(())
+    })
 }
 
 /// Forget the held draft: kept in the records store, or refused by every server.
@@ -1614,7 +1615,7 @@ pub(super) fn adopt_held_draft(
     if store.ingest(held.as_slice()).is_err() || !stamp.iter().all(|id| store.contains(id)) {
         return Ok(false);
     }
-    fsx::write_atomic(&paths.records_file(), &store.encode(), 0o600)?;
+    super::write_records(paths, &store)?;
     forget_held_draft(paths);
     Ok(true)
 }
@@ -2699,7 +2700,7 @@ pub(super) fn commit_authored_records(
         ));
     }
     if added > 0 {
-        fsx::write_atomic(&paths.records_file(), &current.encode(), 0o600)?;
+        super::write_records(paths, current)?;
     }
     Ok(())
 }
@@ -5252,7 +5253,7 @@ fn wrap_gaps_pass(
         seen.remove(&(gap.epoch, gap.recipient.to_bech32()));
     }
     store.ingest(&encode_records(&signed))?;
-    fsx::write_atomic(&paths.records_file(), &store.encode(), 0o600)?;
+    super::write_records(paths, &store)?;
     // The digest changed with the new records, so the next pass looks again, with first sight
     // kept for the gaps still open.
     write_gap_mark(paths, &digest, next_due.unwrap_or(0), &seen)?;

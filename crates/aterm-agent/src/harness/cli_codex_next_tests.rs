@@ -1007,11 +1007,12 @@ fn with_no_row_active_next_is_the_row_a_launch_takes() {
     }
 }
 
-/// A ROW THAT CANNOT SERVE IS NOT NEXT FOR ITS OWN CONDITION, EVEN WHERE IT IS THE ROW IN USE:
+/// A ROW THAT CANNOT SERVE IS NOT NEXT FOR ITS OWN CONDITION, EVEN WHERE IT IS THE ACTIVE ROW:
 /// for Codex (on a program that keeps `CODEX_AUTH_PATH`'s login) with no row active, `main`
 /// signed out or walled is not next as such, never as "the account in use" under `active: none`;
-/// with `main` the active row, signed out, it is not next as `signed-out`, and only while it can
-/// serve is it "the account in use". With the owner's pin on `work` and no login of it here, the
+/// with `main` the active row, signed out, it is not next as `signed-out`, and while it can serve
+/// a launch takes it, so it is next, never "the account in use". With the owner's pin on `work`
+/// and no login of it here, the
 /// pin refuses every launch, so no row is next, and `next:` says why in text and JSON (CONTROL:
 /// with its login here, `next:` names a row). Claude Code, whose session on this machine's own login
 /// rotates off it, says `main`'s own condition too, and "the account in use" while it serves.
@@ -1066,11 +1067,8 @@ fn a_row_that_cannot_serve_is_not_next_for_its_own_condition() {
     let pool = Pool::new("own-condition-active");
     pool.state(|state| state.active = Some("main".to_string()));
     let (text, _) = pool.report(Some(&pool.new));
-    assert_eq!(
-        not_next(&text)["main"],
-        "the account in use",
-        "CONTROL: {text}"
-    );
+    assert_eq!(next_line(&text), "next: main", "CONTROL: {text}");
+    assert!(!not_next(&text).contains_key("main"), "CONTROL: {text}");
     signed_out(&pool);
     let (text, _) = pool.report(Some(&pool.new));
     assert_eq!(not_next(&text)["main"], "signed-out", "{text}");
@@ -1241,9 +1239,10 @@ fn every_codex_judge_reads_the_program_a_launch_runs() {
 /// (signed in here and usable), a launch takes `work` (`accounts_pool::launch_env_for`) and no
 /// rotation leaves it, so for Codex on a program that keeps `CODEX_AUTH_PATH`'s login (and with
 /// no program known), Grok Build and Kimi Code CLI, `next:` names `work`, as the JSON's `to` does,
-/// and `work` is not "the account in use" under `not next:`. CONTROL: with `work` active but no
-/// pin, `next:` is the row a rotation would move to, `main`, past `work` in use; with the pin on
-/// `work` leased by another Mac, a launch does not take it, and `next:` stays `main`.
+/// and `work` is not "the account in use" under `not next:`. CONTROL: with `work` active and
+/// walled but no pin, a launch passes it, so `next:` is `main`, and `work` is not next for its
+/// wall; with the pin on `work` leased by another Mac, a launch does not take it, `next:` is
+/// `main`, and `work` is not next for that claim.
 #[test]
 fn under_a_pin_a_launch_takes_next_is_the_pinned_row() {
     for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
@@ -1259,13 +1258,19 @@ fn under_a_pin_a_launch_takes_next_is_the_pinned_row() {
             let pool = Pool::of(cli, "next-pin");
             let program = known.then(|| pool.new.clone());
             let at = format!("{} on {program:?}", cli.id());
+            let until = pool.wall("work", pool.env.now + 7200);
             pool.state(|state| state.active = Some("work".to_string()));
             let (text, _) = pool.report(program.as_deref());
             assert_eq!(next_line(&text), "next: main", "{at}: CONTROL: {text}");
-            assert!(
-                not_next(&text).contains_key("work"),
+            assert_eq!(
+                not_next(&text)["work"],
+                format!("limited until {}", rfc3339_utc(until)),
                 "{at}: CONTROL: {text}"
             );
+            // The wall's record goes, so `work` is usable again.
+            pool.state(|state| {
+                state.accounts.remove("work");
+            });
             pool.pin("work");
             assert_eq!(
                 pool.launch_on(program.as_deref()),
@@ -1290,6 +1295,11 @@ fn under_a_pin_a_launch_takes_next_is_the_pinned_row() {
             );
             let (text, _) = pool.report(program.as_deref());
             assert_eq!(next_line(&text), "next: main", "{at}: CONTROL: {text}");
+            assert_eq!(
+                not_next(&text)["work"],
+                format!("leased elsewhere until {}", rfc3339_utc(now + 3600)),
+                "{at}: CONTROL: {text}"
+            );
         }
     }
 }
@@ -1720,7 +1730,7 @@ fn not_ours_cases() -> [NotOurs; 3] {
 /// A PIN ON A ROW THIS MAC MAY NOT USE NOW IS RECORDED WITH WHAT A LAUNCH DOES INSTEAD (another
 /// Mac's claim holds it, this Mac cannot record a claim on it, or the warm set names another
 /// Mac): where a launch takes another row, the line names it and why the pin's is not taken
-/// (`not_this_macs`); where it takes the pin all the same, the line is the one before; where it
+/// (`why_not_words`); where it takes the pin all the same, the line is the one before; where it
 /// is refused, the line carries that refusal, and where the pin's end ends the refusal it names
 /// that way back (`accounts_pool::unpin_line`), else it says what `use --auto` says. Codex (on a
 /// build that keeps `CODEX_AUTH_PATH`'s login), Grok Build and Kimi Code CLI, under rotation and
@@ -1756,7 +1766,7 @@ fn a_pin_on_a_row_this_mac_may_not_use_records_what_a_launch_does_instead() {
                     Ok(Some(row)) if row == "work" => assert_eq!(said, control, "{at}"),
                     Ok(Some(row)) => {
                         assert!(said.contains(&format!("`{row}`")), "{at}: {said}");
-                        assert!(said.contains(&not_this_macs(why)), "{at}: {said}");
+                        assert!(said.contains(&why_not_words(why)), "{at}: {said}");
                     }
                     Err(refused) => {
                         assert!(said.contains(without_no_worker(&refused)), "{at}: {said}");
@@ -1815,4 +1825,523 @@ fn kimi_walled_default_and_pinned_use_report_the_overlay_refusal_where_aterm_mak
     let host = CodexProgram(None);
     let said = pool.recorded("work", &host);
     assert!(said.contains(without_no_worker(&refused)), "{said}");
+}
+
+/// How many programs a [`Pool`] of `cli` is judged on ([`program_of`]).
+fn programs(cli: Cli) -> usize {
+    if cli == Cli::Codex { 2 } else { 1 }
+}
+
+/// The `n`th program `pool` is judged on: none known, then for Codex a codex-alab that keeps
+/// `CODEX_AUTH_PATH`'s login.
+fn program_of(pool: &Pool, n: usize) -> Option<PathBuf> {
+    (n > 0).then(|| pool.new.clone())
+}
+
+/// `label` in `pool`'s roster held for another Mac's warm set (`held_by`), as `accounts sync`
+/// records it.
+fn hold(pool: &Pool, label: &str) {
+    let mut roster = pool.roster();
+    for row in &mut roster.rows {
+        if row.label == label {
+            row.held_by = Some("other-mac".into());
+        }
+    }
+    pool.rows(&roster.rows);
+}
+
+/// FOR EVERY CLI BUT CLAUDE CODE, `next:` IS THE ROW A LAUNCH TAKES, AS `accounts use` SAYS:
+/// once `use --auto` ends a pin on `work`, `work` stays the active row with nothing running on
+/// it, and a launch takes it while it is fresh (`accounts_pool::launch_env_for`), so `use --auto`
+/// names it and `next:` names it too, as the JSON's `to` does, never calling a row "the account
+/// in use"; so too with `main` held for another Mac's warm set, where no row past `work` can
+/// serve and the report once said none could. Codex (with no program known and on a build that
+/// keeps `CODEX_AUTH_PATH`'s login), Grok Build and Kimi Code CLI. CONTROL: with `work` walled a
+/// launch takes `main`, and `next:` names it.
+#[test]
+fn next_is_the_row_a_launch_takes_as_accounts_use_says() {
+    let cases: [Case; 3] = [
+        ("work active", |_| {}),
+        ("work active, main held for another Mac", |pool| {
+            hold(pool, "main");
+        }),
+        ("CONTROL: work active and walled", |pool| {
+            pool.wall("work", pool.env.now + 7200);
+        }),
+    ];
+    for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
+        for (case, set) in cases {
+            for n in 0..programs(cli) {
+                let pool = Pool::of(cli, "next-use");
+                let program = program_of(&pool, n);
+                let at = format!("{} on {program:?}, {case}", cli.id());
+                let host = CodexProgram(program.clone());
+                set(&pool);
+                pool.recorded("work", &host);
+                let auto = pool.recorded("--auto", &host);
+                let launch = pool
+                    .launch_on(program.as_deref())
+                    .unwrap_or_else(|why| panic!("{at}: {why}"))
+                    .unwrap_or_else(|| panic!("{at}: a launch takes a row"));
+                assert!(auto.contains(&format!("`{launch}`")), "{at}: {auto}");
+                let (text, doc) = pool.report(program.as_deref());
+                assert_eq!(next_line(&text), format!("next: {launch}"), "{at}: {text}");
+                assert_eq!(
+                    doc["next"]["to"],
+                    Value::from(launch.as_str()),
+                    "{at}: {doc}"
+                );
+                assert!(!text.contains("the account in use"), "{at}: {text}");
+                assert!(!not_next(&text).contains_key(&launch), "{at}: {text}");
+                assert_eq!(
+                    not_next_json(&doc),
+                    not_next(&text),
+                    "{at}: JSON matches text"
+                );
+            }
+        }
+    }
+}
+
+/// A PIN ON A ROW THIS MAC MAY NOT USE NOW IS NOT NEXT FOR WHAT KEEPS IT FROM THIS MAC, IN THE
+/// WORDS `accounts use` GIVES IT: with rotation on and the owner's pin on `work`, held for another
+/// Mac's warm set, claimed by another Mac, or past a claim this Mac cannot record, `not next:`
+/// says that of `work` (`why_not_words`), in text and JSON, never "the account in use" nor the
+/// pool's `held-elsewhere` or `leased-elsewhere` slug (`WhyNot::as_str`), and the pin's
+/// `accounts use` line says the same; `next:` names the row a launch takes instead where it
+/// takes one, else none. Codex (with no program known and on a build that keeps
+/// `CODEX_AUTH_PATH`'s login), Grok Build and Kimi Code CLI.
+#[test]
+fn a_pin_this_mac_may_not_use_is_not_next_for_what_keeps_it_from_this_mac() {
+    for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
+        for (case, not_ours) in not_ours_cases() {
+            for n in 0..programs(cli) {
+                let pool = Pool::of(cli, "next-held");
+                let program = program_of(&pool, n);
+                let at = format!("{} on {program:?}, {case}", cli.id());
+                let host = CodexProgram(program.clone());
+                pool.recorded("work", &host);
+                let verdict = not_ours(&pool);
+                let why = why_not_words(verdict);
+                let said = pool.recorded("work", &host);
+                let (text, doc) = pool.report(program.as_deref());
+                // The report and `accounts use` give a claim on the pin in words, never as the
+                // pool's slug for it.
+                if matches!(
+                    verdict,
+                    accounts::WhyNot::HeldElsewhere | accounts::WhyNot::LeasedElsewhere { .. }
+                ) {
+                    let slug = verdict.as_str();
+                    for (surface, words) in [
+                        ("text", text.clone()),
+                        ("JSON", doc.to_string()),
+                        ("use", said.clone()),
+                    ] {
+                        assert!(
+                            !words.contains(slug),
+                            "{at}: {surface} says {slug}: {words}"
+                        );
+                    }
+                }
+                assert_eq!(not_next(&text).get("work"), Some(&why), "{at}: {text}");
+                assert_eq!(
+                    not_next_json(&doc),
+                    not_next(&text),
+                    "{at}: JSON matches text"
+                );
+                assert!(!text.contains("the account in use"), "{at}: {text}");
+                match pool.launch_on(program.as_deref()) {
+                    Ok(Some(row)) => {
+                        assert_ne!(row, "work", "{at}: PRECONDITION: the pin is passed");
+                        assert_eq!(next_line(&text), format!("next: {row}"), "{at}: {text}");
+                        assert!(said.contains(&why), "{at}: {said}");
+                    }
+                    other => assert!(
+                        next_line(&text).starts_with("next: none"),
+                        "{at}: {other:?}: {text}"
+                    ),
+                }
+            }
+        }
+    }
+}
+
+/// A LOW PIN A LAUNCH TAKES IS NEXT, AND NOT ALSO NOT NEXT: under rotation a launch takes the
+/// owner's pin while its row's login is here, low or not (`accounts::launch_row`), though the
+/// pool's ranking passes a low row over while another opens within `LOW_ONLY_AFTER_S`; with the
+/// pin on `work`, its session at 95%, and `main` at a limit that ends in ten minutes, `next:`
+/// names `work`, as the JSON's `to` does, and neither lists `work` under `not next:`. Codex (with
+/// no program known and on a build that keeps `CODEX_AUTH_PATH`'s login), Grok Build and Kimi
+/// Code CLI. CONTROL: before `work` is low, `next:` names the pin too.
+#[test]
+fn a_low_pin_a_launch_takes_is_next_and_not_also_not_next() {
+    for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
+        for n in 0..programs(cli) {
+            let pool = Pool::of(cli, "next-low-pin");
+            let program = program_of(&pool, n);
+            let at = format!("{} on {program:?}", cli.id());
+            let host = CodexProgram(program.clone());
+            pool.recorded("work", &host);
+            pool.wall("main", pool.env.now + 600);
+            let (text, _) = pool.report(program.as_deref());
+            assert_eq!(next_line(&text), "next: work", "{at}: CONTROL: {text}");
+            let now = pool.env.now;
+            pool.state(|state| {
+                accounts::note_sample(
+                    state,
+                    "work",
+                    accounts::Sample {
+                        session_pct: Some(95),
+                        session_reset: Some(now + 3600),
+                        at: now,
+                        ..accounts::Sample::default()
+                    },
+                    now,
+                );
+            });
+            assert_eq!(
+                pool.launch_on(program.as_deref()),
+                Ok(Some("work".to_string())),
+                "{at}: PRECONDITION: a launch takes the low pin"
+            );
+            let (text, doc) = pool.report(program.as_deref());
+            assert_eq!(next_line(&text), "next: work", "{at}: {text}");
+            assert_eq!(doc["next"]["to"], Value::from("work"), "{at}: {doc}");
+            assert!(!not_next(&text).contains_key("work"), "{at}: {text}");
+            assert_eq!(
+                not_next_json(&doc),
+                not_next(&text),
+                "{at}: JSON matches text"
+            );
+        }
+    }
+}
+
+/// UNDER ROTATION OFF, A PIN ON A ROW ANOTHER MAC'S WARM SET HOLDS IS REFUSED, AS A PIN ANOTHER
+/// MAC'S CLAIM HOLDS IS: rotation on passes such a pin (`accounts::launch_row`), and rotation off
+/// starts on nothing but the pin, so a launch is refused (`accounts_pool::launch_env_for`), its
+/// refusal naming the warm set and the pin's end (`accounts_pool::unpin_line`); `accounts use`
+/// records that refusal, and `next:` names no row and gives it. Codex (with no program known and
+/// on a build that keeps `CODEX_AUTH_PATH`'s login), Grok Build and Kimi Code CLI. CONTROL: before
+/// the hold, a launch takes the pin and `next:` names it.
+#[test]
+fn under_rotation_off_a_pin_held_for_another_macs_warm_set_is_refused() {
+    use crate::harness::accounts_pool::unpin_line;
+    for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
+        for n in 0..programs(cli) {
+            let pool = Pool::of(cli, "off-held");
+            pool.mode("off");
+            let program = program_of(&pool, n);
+            let at = format!("{} on {program:?}", cli.id());
+            let host = CodexProgram(program.clone());
+            pool.recorded("work", &host);
+            assert_eq!(
+                pool.launch_on(program.as_deref()),
+                Ok(Some("work".to_string())),
+                "{at}: CONTROL: a launch takes the pin"
+            );
+            let (text, _) = pool.report(program.as_deref());
+            assert_eq!(next_line(&text), "next: work", "{at}: CONTROL: {text}");
+            hold(&pool, "work");
+            let refused = pool
+                .launch_on(program.as_deref())
+                .expect_err("a launch under a held pin is refused");
+            let refused = without_no_worker(&refused).to_string();
+            assert!(
+                refused.contains("held for another Mac's warm set"),
+                "{at}: {refused}"
+            );
+            assert!(refused.contains(&unpin_line(cli)), "{at}: {refused}");
+            let said = pool.recorded("work", &host);
+            assert!(said.contains(&refused), "{at}: {said}");
+            let (text, doc) = pool.report(program.as_deref());
+            let none = doc["next"]["none"].as_str().expect("why no row is next");
+            assert!(none.contains(&refused), "{at}: {none}");
+            assert_eq!(
+                next_line(&text),
+                format!("next: none ({none})"),
+                "{at}: {text}"
+            );
+            assert_eq!(doc["next"]["to"], Value::Null, "{at}: {doc}");
+        }
+    }
+}
+
+/// A host whose launch of a Grok Build or Kimi Code CLI pool runs the program
+/// `worker::pooled_launch_program_in` names in the atpkg layout `layout`, and whose launch's
+/// shell reads `path`.
+struct PooledLaunch {
+    layout: atpkg::store::Layout,
+    path: OsString,
+}
+
+impl AccountsHost for PooledLaunch {
+    fn stdin_is_terminal(&self) -> bool {
+        false
+    }
+    fn auth_status(&self, _: &str) -> Result<Captured, String> {
+        panic!("no Claude probe")
+    }
+    fn unaskable(&self) -> Option<String> {
+        None
+    }
+    fn login(&self, _: Option<&str>) -> Result<i32, String> {
+        panic!("no login")
+    }
+    fn now(&self) -> i64 {
+        0
+    }
+    fn launch_program(&self, cli: Cli) -> Option<PathBuf> {
+        (cli != Cli::Claude && cli != Cli::Codex)
+            .then(|| crate::harness::worker::pooled_launch_program_in(cli, Some(&self.layout)))
+    }
+    fn launch_path(&self) -> Option<OsString> {
+        Some(self.path.clone())
+    }
+}
+
+/// WITH NO GROK BUILD OR KIMI CODE CLI A LAUNCH CAN START, `accounts use` AND `next:` SAY IT IS
+/// NOT INSTALLED, WITH THE DOCTOR'S FIX, AS FOR CODEX: with atpkg's layout holding no copy, a
+/// launch runs the program word (`worker::pooled_launch_program_in`), which no directory of the
+/// `PATH` its shell reads holds, so the pin's `accounts use` line names no row and gives `aterm
+/// pkg install <id>`, and `next:` is none with the same fix, in text and JSON. CONTROL: with
+/// atpkg's managed copy laid (and still none on `PATH`), a launch runs that copy, `accounts use`
+/// says a launch takes the pin and `next:` names it.
+#[test]
+fn with_no_grok_or_kimi_a_launch_can_start_use_and_next_say_not_installed() {
+    for cli in [Cli::Grok, Cli::Kimi] {
+        let at = cli.id();
+        let pool = Pool::of(cli, "pooled-uninstalled");
+        let prefix = pool.tmp.path().join("pkg");
+        let layout = atpkg::store::Layout {
+            prefix: prefix.clone(),
+        };
+        std::fs::create_dir_all(layout.agents_dir()).expect("atpkg's agents directory");
+        let empty = pool.tmp.path().join("path-empty");
+        std::fs::create_dir_all(&empty).expect("an empty PATH directory");
+        let host = PooledLaunch {
+            layout,
+            path: std::env::join_paths([&empty]).expect("a PATH"),
+        };
+        let fix = format!("`aterm pkg install {}`", cli.id());
+        let said = pool.recorded("work", &host);
+        assert!(said.contains(&fix), "{at}: {said}");
+        assert!(said.contains("not installed"), "{at}: {said}");
+        assert!(!said.contains("`work`"), "{at}: {said}");
+        let (text, doc) = pool.report_on(&host);
+        let none = doc["next"]["none"].as_str().expect("why no row is next");
+        assert!(none.contains(&fix), "{at}: {none}");
+        assert_eq!(
+            next_line(&text),
+            format!("next: none ({none})"),
+            "{at}: {text}"
+        );
+        assert_eq!(doc["next"]["to"], Value::Null, "{at}: {doc}");
+
+        let managed = host.layout.agents_dir().join(cli.id());
+        std::fs::write(&managed, "#!/bin/sh\n").expect("atpkg's managed copy");
+        assert_eq!(
+            crate::harness::worker::pooled_launch_program_in(cli, Some(&host.layout)),
+            managed,
+            "{at}: CONTROL: a launch runs atpkg's managed copy"
+        );
+        let said = pool.recorded("work", &host);
+        assert!(said.contains("`work`"), "{at}: CONTROL: {said}");
+        assert!(!said.contains(&fix), "{at}: CONTROL: {said}");
+        let (text, _) = pool.report_on(&host);
+        assert_eq!(next_line(&text), "next: work", "{at}: CONTROL: {text}");
+        assert_eq!(
+            crate::harness::worker::pooled_launch_program_in(cli, None),
+            Path::new(cli.id()),
+            "{at}: CONTROL: with no atpkg layout, the program word"
+        );
+    }
+}
+
+/// `accounts use` OF A ROW IT CANNOT PIN NAMES THE STEP THAT ENDS THE REFUSAL, BY ITS KIND: for
+/// Codex (on a build that keeps `CODEX_AUTH_PATH`'s login), Grok Build and Kimi Code CLI, a row
+/// with no login made here (`work`, its login directory emptied) and a row known signed out
+/// (`main`) are each refused with that row's sign-in at a terminal, in the verb `accounts add`
+/// names for it (`Cli::sign_in_verb`), and a label the roster does not list with `accounts add`.
+/// On a Codex build that keeps no row's login its own, the row on this machine's own login is
+/// signed in by Codex's own sign-in (`codex_alab::DEFAULT_SIGN_IN`), which `accounts login|renew`
+/// refuses there. CONTROL: before `main` is signed out, its pin is recorded.
+#[test]
+fn accounts_use_names_the_sign_in_that_ends_its_refusal() {
+    for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
+        let id = cli.id();
+        let pool = Pool::of(cli, "use-refused");
+        let host = CodexProgram((cli == Cli::Codex).then(|| pool.new.clone()));
+        let refused = |label: &str, host: &dyn AccountsHost| {
+            let (code, out, err) = pool.run_on(&format!("accounts use {label} --cli {id}"), host);
+            assert_eq!(code, ExitCode::from(1), "{id}: {label}: {out}{err}");
+            err
+        };
+        pool.recorded("main", &host);
+        let store = cli.connector().stores.first().copied().unwrap_or("login");
+        let work = pool.tmp.path().join("logins").join(id).join("work");
+        std::fs::remove_file(work.join(store)).expect("work's login");
+        let err = refused("work", &host);
+        let login = format!(
+            "`aterm harness accounts {} work --cli {id}`",
+            cli.sign_in_verb(false)
+        );
+        assert!(err.contains(&login), "{id}: {err}");
+        let now = pool.env.now;
+        pool.state(|state| {
+            let _ = accounts::note_auth(state, "main", accounts::Auth::SignedOut, now);
+        });
+        let err = refused("main", &host);
+        let renew = format!(
+            "`aterm harness accounts {} main --cli {id}`",
+            cli.sign_in_verb(true)
+        );
+        assert!(err.contains(&renew), "{id}: {err}");
+        if cli == Cli::Codex {
+            let err = refused("main", &CodexProgram(Some(pool.old.clone())));
+            let own = format!("`{}`", crate::harness::codex_alab::DEFAULT_SIGN_IN);
+            assert!(err.contains(&own), "{id}: {err}");
+            assert!(!err.contains(&renew), "{id}: {err}");
+        }
+        let err = refused("nobody", &host);
+        let add = format!("`aterm harness accounts add <label> --cli {id}`");
+        assert!(err.contains(&add), "{id}: {err}");
+    }
+}
+
+/// A host whose launch runs `program` (a bare word its shell looks for, or a path) and whose
+/// launch's shell reads `path`.
+struct OnPath {
+    program: PathBuf,
+    path: OsString,
+}
+
+impl AccountsHost for OnPath {
+    fn stdin_is_terminal(&self) -> bool {
+        false
+    }
+    fn auth_status(&self, _: &str) -> Result<Captured, String> {
+        panic!("no Claude probe")
+    }
+    fn unaskable(&self) -> Option<String> {
+        None
+    }
+    fn login(&self, _: Option<&str>) -> Result<i32, String> {
+        panic!("no login")
+    }
+    fn now(&self) -> i64 {
+        0
+    }
+    fn codex_launch_program(&self) -> Option<PathBuf> {
+        Some(self.program.clone())
+    }
+    fn launch_path(&self) -> Option<OsString> {
+        Some(self.path.clone())
+    }
+}
+
+/// WITH NO CODEX A LAUNCH CAN START, NO ROW IS NOT NEXT FOR WHAT A BUILD WOULD RUN: the bare word
+/// `codex` a worker types, which no directory of its shell's `PATH` holds, starts nothing, so
+/// `next:` is none with the doctor's `not installed` and its fix, and neither the text (no `this
+/// Codex build:` line, no row not next for the build) nor the JSON (no `only_default`) judges a
+/// build, with or without the owner's pin on `work`. CONTROL: with a `codex` on that `PATH`, a
+/// build aterm cannot read before it runs, the build's rule stands: `next:` is `main`, `work` is
+/// not next for the build, and the JSON names why.
+#[test]
+fn with_no_codex_installed_no_row_is_not_next_for_a_build() {
+    let pool = Pool::new("codex-uninstalled");
+    let dir = pool.tmp.path().join("path-dir");
+    std::fs::create_dir_all(&dir).expect("a PATH directory");
+    let host = OnPath {
+        program: PathBuf::from("codex"),
+        path: std::env::join_paths([&dir]).expect("a PATH"),
+    };
+    for pinned in [false, true] {
+        if pinned {
+            pool.pin("work");
+        }
+        let (text, doc) = pool.report_on(&host);
+        let none = doc["next"]["none"].as_str().expect("why no row is next");
+        assert!(
+            none.contains("`aterm pkg install codex`"),
+            "{pinned}: {none}"
+        );
+        assert_eq!(next_line(&text), format!("next: none ({none})"), "{text}");
+        assert!(!text.contains("this Codex build"), "{pinned}: {text}");
+        assert_eq!(doc["next"]["only_default"], Value::Null, "{pinned}: {doc}");
+        assert_eq!(not_next_json(&doc), not_next(&text), "JSON matches text");
+    }
+
+    let pool = Pool::new("codex-on-path");
+    let dir = pool.tmp.path().join("path-dir");
+    std::fs::create_dir_all(&dir).expect("a PATH directory");
+    std::fs::write(dir.join("codex"), "#!/bin/sh\n").expect("a codex on PATH");
+    let host = OnPath {
+        program: PathBuf::from("codex"),
+        path: std::env::join_paths([&dir]).expect("a PATH"),
+    };
+    let (text, doc) = pool.report_on(&host);
+    assert_eq!(next_line(&text), "next: main", "CONTROL: {text}");
+    assert!(
+        not_next(&text)["work"].contains("this Codex build runs only"),
+        "CONTROL: {text}"
+    );
+    assert!(
+        doc["next"]["only_default"].as_str().is_some(),
+        "CONTROL: {doc}"
+    );
+}
+
+/// THE `active:` LINE SAYS WHEN A LAUNCH WOULD NOT TAKE THE ACTIVE ROW: for Codex (on a build that
+/// keeps `CODEX_AUTH_PATH`'s login), Grok Build and Kimi Code CLI, with `work` the recorded
+/// active row, no session on it and no pin, a wall on `work` has a launch take `main`, and the
+/// line names `main`, as `next:` does; under rotation off with no pin a launch takes no row, and
+/// the line says a launch does not take `work`. CONTROL: with `work` usable a launch takes it,
+/// and the line is the active row's alone.
+#[test]
+fn the_active_line_says_when_a_launch_takes_another_row() {
+    let header = |text: &str| {
+        text.lines()
+            .find(|line| line.starts_with("active: "))
+            .unwrap_or_else(|| panic!("an active line: {text}"))
+            .to_string()
+    };
+    let plain = "active: work, 0 of 0 sessions on it";
+    for cli in [Cli::Codex, Cli::Grok, Cli::Kimi] {
+        let at = cli.id();
+        let pool = Pool::of(cli, "active-line");
+        let program = (cli == Cli::Codex).then(|| pool.new.clone());
+        pool.state(|state| state.active = Some("work".to_string()));
+        assert_eq!(
+            pool.launch_on(program.as_deref()),
+            Ok(Some("work".to_string())),
+            "{at}: CONTROL"
+        );
+        let (text, _) = pool.report(program.as_deref());
+        assert_eq!(header(&text), plain, "{at}: CONTROL: {text}");
+
+        pool.wall("work", pool.env.now + 7200);
+        assert_eq!(
+            pool.launch_on(program.as_deref()),
+            Ok(Some("main".to_string())),
+            "{at}"
+        );
+        let (text, _) = pool.report(program.as_deref());
+        assert_eq!(next_line(&text), "next: main", "{at}: {text}");
+        let line = header(&text);
+        assert!(
+            line.starts_with(plain) && line.contains("takes `main`"),
+            "{at}: {text}"
+        );
+
+        pool.mode("off");
+        assert_eq!(pool.launch_on(program.as_deref()), Ok(None), "{at}");
+        let (text, _) = pool.report(program.as_deref());
+        assert!(next_line(&text).starts_with("next: none"), "{at}: {text}");
+        let line = header(&text);
+        assert!(
+            line.starts_with(plain) && line != plain && !line.contains("takes `"),
+            "{at}: {text}"
+        );
+    }
 }

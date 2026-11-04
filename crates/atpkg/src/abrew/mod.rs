@@ -374,6 +374,7 @@ fn native_args(
     cmd: &str,
     rest: &[String],
 ) -> Result<Option<Vec<bundle::BrewfileEntry>>, InstallError> {
+    let typed_rest = rest;
     let canonical = canonical_kind_switches(rest);
     let rest: &[String] = &canonical;
     // Brew warns on its deprecated wrapper envs, then reads
@@ -715,6 +716,45 @@ fn native_args(
             ("--no-wait", "switch", &["stop"]),
             ("--keep", "switch", &["stop"]),
         ];
+        // Token-level parser errors fire left-to-right ahead
+        // of subcommand resolution (brew OptionParser).
+        const SERVICE_SWITCHES: &[&str] = &["--all", "--json", "--no-wait", "--keep"];
+        const SERVICE_FLAGS: &[&str] = &["--file", "--max-wait", "--sudo-service-user"];
+        {
+            let mut args = rest
+                .iter()
+                .take_while(|arg| arg.as_str() != "--")
+                .peekable();
+            while let Some(arg) = args.next() {
+                if !arg.starts_with('-') || arg.as_str() == "-" {
+                    continue;
+                }
+                let (name, has_value) = match arg.split_once('=') {
+                    Some((name, _)) => (name, true),
+                    None => (arg.as_str(), false),
+                };
+                if SERVICE_SWITCHES.contains(&name) {
+                    if has_value {
+                        return Err(InstallError::Failed(format!(
+                            "Error: needless argument: {arg}"
+                        )));
+                    }
+                } else if SERVICE_FLAGS.contains(&name) {
+                    if !has_value && args.next_if(|_| true).is_none() {
+                        return Err(InstallError::Failed(format!(
+                            "Error: missing argument: {name}"
+                        )));
+                    }
+                } else if !matches!(
+                    arg.as_str(),
+                    "--verbose" | "-v" | "--quiet" | "-q" | "--debug" | "-d"
+                ) {
+                    return Err(InstallError::Failed(format!(
+                        "Error: invalid option: {arg}"
+                    )));
+                }
+            }
+        }
         let mut first_positional = None;
         {
             let mut args = rest.iter().take_while(|arg| arg.as_str() != "--");
@@ -750,6 +790,52 @@ fn native_args(
                      the `{display}` {kind}."
                 )));
             }
+        }
+        // Named arguments after the subcommand (flag values
+        // skipped; everything after `--` is named too).
+        let mut named: Vec<&str> = Vec::new();
+        {
+            let mut seen_sub = first_positional.is_none();
+            let mut literal = false;
+            let mut args = rest.iter();
+            while let Some(arg) = args.next() {
+                if literal {
+                    if seen_sub {
+                        named.push(arg);
+                    } else {
+                        seen_sub = true;
+                    }
+                } else if arg == "--" {
+                    literal = true;
+                } else if matches!(
+                    arg.as_str(),
+                    "--file" | "--max-wait" | "--sudo-service-user"
+                ) {
+                    args.next();
+                } else if !arg.starts_with('-') {
+                    if seen_sub {
+                        named.push(arg);
+                    } else {
+                        seen_sub = true;
+                    }
+                }
+            }
+        }
+        if matches!(subcommand, "list" | "cleanup") && !named.is_empty() {
+            return Err(InstallError::Failed(
+                "Error: Invalid usage: This command does not take named arguments.".to_string(),
+            ));
+        }
+        if matches!(
+            subcommand,
+            "info" | "kill" | "restart" | "run" | "start" | "stop"
+        ) && named.is_empty()
+            && !has_flag_eq(rest, "--all")
+        {
+            return Err(InstallError::Failed(
+                "Error: Invalid usage: Formula(e) missing, please provide a formula name or use `--all`."
+                    .to_string(),
+            ));
         }
     }
     if cmd == "trust" {
@@ -1582,11 +1668,94 @@ fn native_args(
             )));
         }
     }
-    if rest
+    if let Some(offender_at) = rest
         .iter()
         .take_while(|arg| arg.as_str() != "--")
-        .any(|arg| arg.starts_with('-') && !flag_ok(arg))
+        .position(|arg| arg.starts_with('-') && arg.len() > 1 && !flag_ok(arg))
     {
+        // brew reports the token as typed (before abrew's
+        // kind-switch canonicalization).
+        let typed_offender = typed_rest[offender_at].as_str();
+        // An option brew itself does not know for this command
+        // is its OptionParser error, not a native refusal.
+        // Known = abrew's tables plus the flags in brew's own
+        // recorded help for the command; unique long-prefix
+        // abbreviations count as known (OptionParser).
+        let mut known_longs: Vec<String> = Vec::new();
+        let mut known_shorts: Vec<char> = Vec::new();
+        let note = |tok: &str, longs: &mut Vec<String>, shorts: &mut Vec<char>| {
+            if let Some(long) = tok.strip_prefix("--") {
+                let long = long.split(['=', '[']).next().unwrap_or(long);
+                if !long.is_empty() && !longs.iter().any(|k| k == long) {
+                    longs.push(long.to_string());
+                }
+            } else if tok.len() == 2 && tok.starts_with('-') {
+                let c = tok.chars().nth(1).unwrap();
+                if !shorts.contains(&c) {
+                    shorts.push(c);
+                }
+            }
+        };
+        for tok in flags.iter().copied().chain(value_flags.iter().copied()) {
+            note(tok, &mut known_longs, &mut known_shorts);
+        }
+        for group in conflict_groups {
+            for (name, alts) in *group {
+                note(name, &mut known_longs, &mut known_shorts);
+                for alt in *alts {
+                    note(alt, &mut known_longs, &mut known_shorts);
+                }
+            }
+        }
+        if let Some((_, text)) = help_texts::TEXTS
+            .iter()
+            .find(|(name, _)| *name == disabled_cmd || *name == cmd)
+        {
+            for line in text.lines() {
+                let line = line.trim_start();
+                if !line.starts_with('-') {
+                    continue;
+                }
+                for tok in line.split(|c: char| c == ',' || c.is_whitespace()) {
+                    if tok.starts_with('-') {
+                        note(tok, &mut known_longs, &mut known_shorts);
+                    }
+                }
+            }
+        }
+        for tok in ["--verbose", "--quiet", "--debug", "--help"] {
+            note(tok, &mut known_longs, &mut known_shorts);
+        }
+        for tok in ["-v", "-q", "-d", "-h"] {
+            note(tok, &mut known_longs, &mut known_shorts);
+        }
+        let offender = rest[offender_at].as_str();
+        if let Some(long) = offender.strip_prefix("--") {
+            let name = long.split('=').next().unwrap_or(long);
+            if !known_longs.iter().any(|k| k == name) {
+                let expansions = known_longs.iter().filter(|k| k.starts_with(name)).count();
+                let typed_name = typed_offender
+                    .strip_prefix("--")
+                    .and_then(|t| t.split('=').next())
+                    .unwrap_or(name);
+                if expansions > 1 {
+                    return Err(InstallError::Failed(format!(
+                        "Error: ambiguous option: --{typed_name}"
+                    )));
+                }
+                if expansions == 0 {
+                    return Err(InstallError::Failed(format!(
+                        "Error: invalid option: {typed_offender}"
+                    )));
+                }
+            }
+        } else if let Some(cluster) = offender.strip_prefix('-') {
+            for c in cluster.chars() {
+                if !known_shorts.contains(&c) {
+                    return Err(InstallError::Failed(format!("Error: invalid option: -{c}")));
+                }
+            }
+        }
         return Err(unsupported());
     }
     if cmd == "cleanup" {
@@ -3963,14 +4132,18 @@ mod admission_tests {
         );
         let once = canonical_kind_switches(&argv(&["--formula", "--hide=--casks", "casks"]));
         assert_eq!(canonical_kind_switches(&once), once);
-        assert!(matches!(
+        assert_eq!(
             native_args("tap", &argv(&["--formulae"])),
-            Err(InstallError::Unsupported(_))
-        ));
-        assert!(matches!(
+            Err(InstallError::Failed(
+                "Error: invalid option: --formulae".to_string()
+            ))
+        );
+        assert_eq!(
             native_args("doctor", &argv(&["--casks"])),
-            Err(InstallError::Unsupported(_))
-        ));
+            Err(InstallError::Failed(
+                "Error: invalid option: --casks".to_string()
+            ))
+        );
     }
 
     #[test]
@@ -4302,10 +4475,12 @@ mod admission_tests {
         assert!(native_args("link", &argv(&["--force", "acl"])).is_ok());
         assert!(native_args("unlink", &argv(&["--formula", "-n", "acl"])).is_ok());
         assert!(native_args("link", &argv(&["--overwrite", "acl"])).is_ok());
-        assert!(matches!(
+        assert_eq!(
             native_args("unlink", &argv(&["--overwrite", "acl"])),
-            Err(InstallError::Unsupported(_))
-        ));
+            Err(InstallError::Failed(
+                "Error: invalid option: --overwrite".to_string()
+            ))
+        );
         assert!(matches!(
             native_args("link", &argv(&["--HEAD", "acl"])),
             Err(InstallError::Unsupported(_))

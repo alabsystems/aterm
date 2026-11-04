@@ -255,20 +255,33 @@ struct Delta {
 impl Delta {
     /// Count `gpu` against `cpu` (`w` px wide): every byte's distance, and every pixel off whose
     /// CPU byte is an opaque colour in `opaque` with its eight neighbours the same (an interior).
+    /// A row whose bytes all match passes whole (a slice compare is one `memcmp`, even
+    /// unoptimized): its bytes are off by none and it holds no miss. A test build's walk of
+    /// every byte and pixel was most of the sweep's time.
     fn add(&mut self, cpu: &[u8], gpu: &[u8], w: usize, opaque: &[[u8; 4]]) {
         assert_eq!(cpu.len(), gpu.len(), "the GPU card is the CPU card's size");
-        for (c, g) in cpu.iter().zip(gpu) {
-            let d = c.abs_diff(*g);
-            self.bytes += 1;
-            self.off_by[usize::from(d.min(3))] += 1;
-            self.max = self.max.max(d);
+        let row = w.max(1) * 4;
+        for (c, g) in cpu.chunks(row).zip(gpu.chunks(row)) {
+            self.bytes += c.len() as u64;
+            if c == g {
+                self.off_by[0] += c.len() as u64;
+                continue;
+            }
+            for (c, g) in c.iter().zip(g) {
+                let d = c.abs_diff(*g);
+                self.off_by[usize::from(d.min(3))] += 1;
+                self.max = self.max.max(d);
+            }
         }
-        let h = cpu.len() / 4 / w.max(1);
+        let h = cpu.len() / row;
         let px = |buf: &[u8], x: usize, y: usize| {
             let i = (y * w + x) * 4;
             [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]
         };
         for y in 1..h.saturating_sub(1) {
+            if cpu[y * row..(y + 1) * row] == gpu[y * row..(y + 1) * row] {
+                continue;
+            }
             for x in 1..w.saturating_sub(1) {
                 let c = px(cpu, x, y);
                 if c[3] != 255 || px(gpu, x, y) == c || !opaque.contains(&c) {

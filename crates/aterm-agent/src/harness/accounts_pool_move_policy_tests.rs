@@ -167,7 +167,7 @@ fn run_case(cli: Cli, follows: bool, case: i64) -> (bool, i64) {
     edit_roster(&world, cli, |roster| {
         roster.rows.push(Row {
             label: "spare".into(),
-            class: accounts::Class::Shared,
+            class: accounts::Class::Pool,
             dir: Some(spare.to_str().unwrap().into()),
             ..Row::default()
         });

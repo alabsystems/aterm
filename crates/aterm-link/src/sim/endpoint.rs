@@ -759,9 +759,12 @@ impl Endpoint {
                     },
                     ["meta"] if s.session_by_sid(sid).is_some() => "OK\n".to_string(),
                     ["status"] => match s.session_by_sid(sid) {
-                        Some(session) => {
-                            format!("OK hold={}\n", u8::from(session.fleet_hold.is_some()))
-                        }
+                        // The screen's generation last, as aterm's `status` says it: this
+                        // endpoint's sessions draw nothing, so it never moves.
+                        Some(session) => format!(
+                            "OK hold={} gen=1.1\n",
+                            u8::from(session.fleet_hold.is_some())
+                        ),
                         None => "ERR no such session\n".to_string(),
                     },
                     _ => "ERR denied\n".to_string(),

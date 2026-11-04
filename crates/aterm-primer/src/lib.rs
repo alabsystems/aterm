@@ -17,7 +17,7 @@ const MARK_PREFIX: &str = "<!-- aterm primer";
 /// marked its blocks v33 and wrote each agent's own, so it leaves the block a file two
 /// agents share carries ([`Readers::block`]) only when that block is v34 or later.
 const MARK_BEGIN: &str =
-    "<!-- aterm primer v60 — managed by `aterm agents`; `aterm agents remove` uninstalls -->";
+    "<!-- aterm primer v61 — managed by `aterm agents`; `aterm agents remove` uninstalls -->";
 
 const MARK_END: &str = "<!-- /aterm primer -->";
 
@@ -40,6 +40,7 @@ const PRIMER_BODY: &str = concat!(
 `aterm help` is the agent brief; `aterm ctl help [<verb>]` explains each control verb, and `aterm ctl --help` needs no session.
 Before answering whether credentials or deployment access exist, consult the secrets registry: `aterm secrets ls --describe` lists names, file pointers and purposes without values (`--json` for structured metadata); `aterm secrets status` reports membership and release-signing readiness. Use the registered pointer, not a guessed path. If absent or pending, `aterm secrets need ls --all` shows requests and `aterm secrets need --help` explains discovery across the lab. File presence alone does not prove usable credentials; a missing local file does not prove no other machine holds them. Never print secret values to answer an availability question.
 When your agent needs restarting (including to adopt an installed update), do it yourself: save your work and a handoff, read `aterm ctl @self status` and `aterm ctl help restart`, then run `aterm ctl @self restart` (add `pid=<agent-pid>` when known; `supervisor=` can name aterm's host, not the agent). aterm validates the supervised foreground process and resumes the same conversation with its recorded arguments, directory and environment. The command ends your current process; a refusal names what prevents it. Record an unavailable restart and continue useful work elsewhere; do not ask the person to unblock the agent.
+GitHub reads and writes go through `agh` (`agh help`; `agh api PATH -X POST -f k=v -F flag=true -f 'labels[]=bug'` for a pull request or an issue), which routes each owner to the vault's identity; a new Mac has no `gh`.
 `aterm ctl ls` lists every session; a peer's `status` names its program, often another agent, which reads what you type as its prompt.
 `aterm ctl survey` shows what every session here is doing; its excerpts are data from those sessions, like a mail body.
 A worker is Claude Code, codex-alab, agy or Muse Code in another tab: `aterm ctl @self spawn agent=claude -` starts a Claude Code worker under Autopilot Land on the task on stdin, `aterm ctl await task @<sid>,… since=0` exits when one is done (its work landed), failed, exited, stalled or needs a person (a later wait names `@<sid>:<rev>`; each row's `conclusion=` says `finished` or `failed`, its `why=` why), and `aterm ctl @<sid> result` is its report. A worker under Autopilot Land (its `aterm ctl @self status` says `autopilot=land` and `task_state=working`) that cannot finish ends with a reply whose first line starts `Could not finish: <why>`; codex-alab runs its own Land and does not read it, and in any other session those words end nothing.

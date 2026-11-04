@@ -211,52 +211,67 @@ impl InFlightEchoQueue {
 
     /// Record an in-flight PTY write `(in_offset, client_seq, bytes)`.
     ///
-    /// Escape sequences (`ESC ...`) produce no direct line-discipline echo and are skipped;
-    /// if the queue reaches `self.cap`, the oldest un-echoed prefix is dropped so memory
-    /// stays strictly bounded (`echo_queue_within_cap(self.len(), self.cap)`).
+    /// Escape sequences (`ESC ...`) produce no direct line-discipline echo and are skipped
+    /// wherever they appear in `bytes`; if the queue reaches `self.cap`, the oldest un-echoed
+    /// prefix is dropped so memory stays strictly bounded (`echo_queue_within_cap(self.len(), self.cap)`).
     pub fn push_input(&mut self, in_offset: u64, client_seq: u64, bytes: &[u8]) -> usize {
-        if bytes.is_empty() || bytes.first() == Some(&0x1b) {
+        if bytes.is_empty() {
             return 0;
         }
         let mut echoable_count = 0usize;
-        let mut scan = bytes;
-        while let &[b, ref tail @ ..] = scan {
+        let mut scan_idx = 0usize;
+        while let Some(&b) = bytes.get(scan_idx) {
+            if b == 0x1b {
+                scan_idx = skip_input_escape(bytes, scan_idx.saturating_add(1));
+                continue;
+            }
             let exp = ExpectedEcho::cooked_for_byte(b);
             if exp.len > 0 {
                 echoable_count = echoable_count.saturating_add(1);
             }
-            scan = tail;
+            scan_idx = scan_idx.saturating_add(1);
         }
         if echoable_count == 0 {
             return 0;
         }
         // Keep only the suffix that fits in `self.cap` if a single burst exceeds `self.cap`.
+        let skip_echoable = echoable_count.saturating_sub(self.cap);
+        let to_add = echoable_count.saturating_sub(skip_echoable);
+        let max_keep = self.cap.saturating_sub(to_add);
+        if self.entries.len() > max_keep {
+            let drop_n = self.entries.len().saturating_sub(max_keep);
+            let mut trimmed = Vec::new();
+            if let Some(tail) = self.entries.get(drop_n..) {
+                trimmed.extend_from_slice(tail);
+            }
+            self.entries = trimmed;
+        }
         let mut added = 0usize;
         let mut seen_echoable = 0usize;
-        let skip_echoable = echoable_count.saturating_sub(self.cap);
-        let mut rest = bytes;
-        while let &[b, ref tail @ ..] = rest {
+        let mut idx = 0usize;
+        while let Some(&b) = bytes.get(idx) {
+            if b == 0x1b {
+                idx = skip_input_escape(bytes, idx.saturating_add(1));
+                continue;
+            }
             let exp = ExpectedEcho::cooked_for_byte(b);
             if exp.len > 0 {
                 seen_echoable = seen_echoable.saturating_add(1);
-                if seen_echoable > skip_echoable {
-                    if self.entries.len() >= self.cap && !self.entries.is_empty() {
-                        let _ = self.entries.remove(0);
-                    }
-                    if echo_queue_within_cap(self.entries.len().saturating_add(1), self.cap) {
-                        self.entries.push(InFlightByte {
-                            in_offset,
-                            client_seq,
-                            input_byte: b,
-                            expected: exp,
-                            matched_echo_pos: 0,
-                            is_last_of_write: seen_echoable == echoable_count,
-                        });
-                        added = added.saturating_add(1);
-                    }
+                if seen_echoable > skip_echoable
+                    && echo_queue_within_cap(self.entries.len().saturating_add(1), self.cap)
+                {
+                    self.entries.push(InFlightByte {
+                        in_offset,
+                        client_seq,
+                        input_byte: b,
+                        expected: exp,
+                        matched_echo_pos: 0,
+                        is_last_of_write: seen_echoable == echoable_count,
+                    });
+                    added = added.saturating_add(1);
                 }
             }
-            rest = tail;
+            idx = idx.saturating_add(1);
         }
         added
     }
@@ -392,6 +407,55 @@ impl InFlightEchoQueue {
     }
 }
 
+fn skip_input_escape(slice: &[u8], after_esc: usize) -> usize {
+    let Some(&intro) = slice.get(after_esc) else {
+        return after_esc;
+    };
+    if intro == b'[' {
+        let mut p = after_esc.saturating_add(1);
+        while let Some(&c) = slice.get(p) {
+            if matches!(c, 0x40..=0x7e) {
+                return p.saturating_add(1);
+            }
+            if matches!(c, 0x20..=0x3f) {
+                p = p.saturating_add(1);
+            } else {
+                return p;
+            }
+        }
+        return p;
+    }
+    if intro == b']' || intro == b'P' || intro == b'X' || intro == b'^' || intro == b'_' {
+        let mut p = after_esc.saturating_add(1);
+        while let Some(&c) = slice.get(p) {
+            if c == 0x07 {
+                return p.saturating_add(1);
+            }
+            if c == 0x1b {
+                if slice.get(p.saturating_add(1)) == Some(&b'\\') {
+                    return p.saturating_add(2);
+                }
+                return p;
+            }
+            p = p.saturating_add(1);
+        }
+        return p;
+    }
+    let mut p = after_esc;
+    while let Some(&c) = slice.get(p) {
+        if matches!(c, 0x20..=0x2f) {
+            p = p.saturating_add(1);
+        } else {
+            break;
+        }
+    }
+    if matches!(slice.get(p), Some(&(0x30..=0x7e))) {
+        p.saturating_add(1)
+    } else {
+        p
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -460,6 +524,38 @@ mod tests {
         assert_eq!(a3.echoed_out_bytes, 1);
         assert_eq!(a3.spans[0].completed_input_bytes, 1);
         assert!(a3.spans[0].write_completed);
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn embedded_escape_sequences_are_skipped_without_polluting_echo_queue() {
+        let mut q = InFlightEchoQueue::new();
+        assert_eq!(q.push_input(1, 1, b"\x1b[A"), 0);
+        assert_eq!(q.push_input(2, 2, b"ls\x1b[D!"), 3);
+        let att = q.attribute_output(b"ls!");
+        assert_eq!(att.echoed_out_bytes, 3);
+        assert_eq!(att.spans.len(), 1);
+        assert!(att.spans[0].write_completed);
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn capacity_cap_evicts_oldest_prefix_without_remove_panics() {
+        let mut q = InFlightEchoQueue::with_capacity_cap(4);
+        assert_eq!(q.push_input(1, 1, b"abc"), 3);
+        assert_eq!(q.push_input(2, 2, b"de"), 2);
+        assert_eq!(q.len(), 4);
+        let att = q.attribute_output(b"bcde");
+        assert_eq!(att.echoed_out_bytes, 4);
+        assert_eq!(att.earliest_in_offset, Some(1));
+        assert_eq!(att.highest_in_offset, Some(2));
+        assert!(q.is_empty());
+
+        assert_eq!(q.push_input(3, 3, b"uvwxyz"), 4);
+        assert_eq!(q.len(), 4);
+        let att2 = q.attribute_output(b"wxyz");
+        assert_eq!(att2.echoed_out_bytes, 4);
+        assert!(att2.spans[0].write_completed);
         assert!(q.is_empty());
     }
 }

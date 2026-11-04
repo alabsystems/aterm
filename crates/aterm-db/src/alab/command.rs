@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! `aterm db alab …` (docs/DESIGN-alab-lab-model-2026-11-01.md §0, §8, §9): `import`, `check`,
-//! `adopt`, `roll`, `prefer` and `unprefer` over `alab/registry`. Every report names keys, columns, counts
+//! `adopt`, `roll`, `export`, `prefer` and `unprefer` over `alab/registry`. Every report names keys, columns, counts
 //! and source coordinates, never a value; addresses are masked unless `--show-addresses` is
 //! given. A sheet's note crosses into its row's `note` only past the note guard. The import's
 //! review (`--review`: a private `$TMPDIR/.ubd/alab-import-*.noindex/` folder opened in amacs and
@@ -144,9 +144,9 @@ fn parse(verb: &str, words: &[String]) -> Result<Args> {
                 .ok_or_else(|| Error::new(&format!("{name} needs a value")))
         };
         match (verb, word.as_str()) {
-            ("import" | "adopt" | "roll", "--apply") => args.apply = true,
+            ("import" | "adopt" | "roll" | "export", "--apply") => args.apply = true,
             ("import", "--first") => args.first = true,
-            ("import" | "adopt" | "roll", "--dry-run") => args.dry_run = true,
+            ("import" | "adopt" | "roll" | "export", "--dry-run") => args.dry_run = true,
             ("import", "--review") => args.review = true,
             ("import", "--no-review") => args.review = false,
             ("import" | "adopt", "--findings") => args.findings = true,
@@ -237,7 +237,7 @@ pub fn run(
         .ok_or_else(|| Error::new("missing alab verb"))?;
     if !matches!(
         verb,
-        "import" | "check" | "adopt" | "prefer" | "unprefer" | "roll"
+        "import" | "check" | "adopt" | "prefer" | "unprefer" | "roll" | "export"
     ) {
         return Err(Error::new("unknown alab verb (see `aterm db alab --help`)"));
     }
@@ -284,6 +284,8 @@ pub fn run(
             let journal = super::journal::Spool::local().map(|spool| {
                 super::journal::status(&spool, aterm_types::dirs::aterm_config_path().as_deref())
             });
+            // The generated exports against what this Mac's `~/.secrets` holds (design §7).
+            let exports = super::export::check(paths, vendors, now_ms / 1000);
             let table = handle.compiled().table;
             let mut findings: Vec<Value> = generic.iter().map(att::command::finding_json).collect();
             findings.extend(
@@ -302,10 +304,12 @@ pub fn run(
                 "findings": findings,
                 "registration": registration,
                 "journal": journal,
+                "exports": exports,
             }))
         }
         "adopt" => adopt(paths, &args, now_ms),
         "roll" => roll(paths, &args, now_ms),
+        "export" => super::export::run(paths, vendors, args.apply, now_ms / 1000),
         "prefer" | "unprefer" => prefer(paths, &args, verb == "prefer", now_ms),
         _ => Err(Error::new("unknown alab verb (see `aterm db alab --help`)")),
     }
@@ -423,7 +427,12 @@ fn harness_sheets(
 /// The harness files found and not read, each with its kind.
 type Unread = Vec<(SheetKind, String)>;
 
-pub(super) fn read_keys(paths: &Paths) -> Result<MailboxKeys> {
+/// The importer's mailbox keys ([`MAILBOX_KEYS`]) beside the vault state at `paths`, empty
+/// where this Mac never imported.
+///
+/// # Errors
+/// The file is there and is not one this build reads.
+pub fn read_keys(paths: &Paths) -> Result<MailboxKeys> {
     match aterm_uds::private_file::read_private(&paths.dir, MAILBOX_KEYS, 1024 * 1024) {
         Ok(bytes) => {
             let value = aterm_json::from_slice(&bytes)

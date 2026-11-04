@@ -148,7 +148,7 @@ fn fetch(up: &Up, remote: &str, results: &Path, name: &str) -> Result<String, St
     if !got.ok() {
         return Err(format!("{remote} did not copy back: {}", got.tail(2)));
     }
-    std::fs::read_to_string(&local).map_err(|e| format!("{}: {e}", local.display()))
+    crate::util::read_regular_text(&local).map_err(|e| format!("{}: {e}", local.display()))
 }
 
 /// A point on the primary monitor off the window `w`, in the half beside it with more room.
@@ -323,7 +323,7 @@ fn arch_rows(
         rows.push((name("recorded"), wrote));
         return rows;
     }
-    let held = std::fs::read_to_string(&committed)
+    let held = crate::util::read_regular_text(&committed)
         .map_err(|e| {
             format!(
                 "no committed record {} to hold it to ({e}; record one with --record)",

@@ -193,6 +193,8 @@ aterm-dirfd = { workspace = true }
 aterm-secrets = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
+# Native agy sign-in uses the controlling-terminal spawn seam; no raw PTY operations here.
+aterm-pty = { workspace = true }
 # Signed-service activation shares the updater's native signature, complete-image store and
 # durable revocation-floor policy with the dev acceptance lab.
 aterm-update = { workspace = true }

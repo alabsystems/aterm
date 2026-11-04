@@ -191,6 +191,193 @@ fn giving_a_node_better_names_keeps_its_temporary_alias() {
     );
 }
 
+/// The fleet name follows the name `sync.identity` gives the Mac (its swarm label) where it is
+/// unset, the follow's own, or an earlier label the roster gives this Mac, once: a second follow
+/// writes nothing. A name the person set, and an `m<N>` the person set that the roster does not
+/// give this Mac (NEGATIVE CONTROL: the same name with `earlier` saying yes is followed), are
+/// kept.
+#[test]
+fn the_fleet_name_follows_the_swarm_label_once_and_keeps_a_persons_name() {
+    let yes = |_: &str| true;
+    let no = |_: &str| false;
+    let world = World::new("follow-label");
+    assert!(matches!(
+        fleet_name_at(&world.places, "m42", &no).unwrap(),
+        FleetName::Due { .. }
+    ));
+    follow_fleet_name_at(&world.places, "m42", &no).unwrap();
+    let file = world.places.state.join(member::NAME_FILE);
+    let written = std::fs::metadata(&file).unwrap().modified().unwrap();
+    assert_eq!(
+        member::read_primary_name(&world.places.state)
+            .unwrap()
+            .as_deref(),
+        Some("m42")
+    );
+    assert_eq!(
+        fleet_name_at(&world.places, "M42", &no).unwrap(),
+        FleetName::Current
+    );
+    follow_fleet_name_at(&world.places, "m42", &no).unwrap();
+    assert_eq!(
+        std::fs::metadata(&file).unwrap().modified().unwrap(),
+        written,
+        "an aligned name is not written again"
+    );
+
+    // The roster relabelled this Mac m42 -> m100: the label aterm wrote itself follows.
+    follow_fleet_name_at(&world.places, "m100", &no).unwrap();
+    assert_eq!(
+        member::read_primary_name(&world.places.state)
+            .unwrap()
+            .as_deref(),
+        Some("m100")
+    );
+
+    // A label the person set follows only when the roster gives it to this Mac as an earlier
+    // label of its own.
+    name_machine(&world.places, &args(&["set", "m42"])).unwrap();
+    assert_eq!(
+        fleet_name_at(&world.places, "m100", &no).unwrap(),
+        FleetName::Kept("m42".to_owned())
+    );
+    follow_fleet_name_at(&world.places, "m100", &no).unwrap();
+    assert_eq!(
+        member::read_primary_name(&world.places.state)
+            .unwrap()
+            .as_deref(),
+        Some("m42")
+    );
+    follow_fleet_name_at(&world.places, "m100", &yes).unwrap();
+    assert_eq!(
+        member::read_primary_name(&world.places.state)
+            .unwrap()
+            .as_deref(),
+        Some("m100")
+    );
+
+    // A person's own name is theirs, whatever the roster says.
+    name_machine(&world.places, &args(&["set", "studio"])).unwrap();
+    assert_eq!(
+        fleet_name_at(&world.places, "m100", &yes).unwrap(),
+        FleetName::Kept("studio".to_owned())
+    );
+    follow_fleet_name_at(&world.places, "m100", &yes).unwrap();
+    assert_eq!(
+        member::read_primary_name(&world.places.state)
+            .unwrap()
+            .as_deref(),
+        Some("studio")
+    );
+    assert!(matches!(
+        fleet_name_at(&world.places, "Andrew's Mac", &yes).unwrap(),
+        FleetName::NotApplicable(_)
+    ));
+}
+
+/// A name the follow wrote stays aterm's: a later change of the name the Mac is given (the
+/// person's `[identity] name` changed, or removed so the label applies) reaches the fleet name
+/// too. NEGATIVE CONTROL: once the person sets the fleet name themselves, no follow replaces it.
+#[test]
+fn the_fleet_name_follows_a_changed_identity_name_it_wrote_itself() {
+    let no = |_: &str| false;
+    let world = World::new("follow-changed");
+    follow_fleet_name_at(&world.places, "studio", &no).unwrap();
+    let name = || member::read_primary_name(&world.places.state).unwrap();
+    assert_eq!(name().as_deref(), Some("studio"));
+    assert_eq!(
+        fleet_name_at(&world.places, "lab", &no).unwrap(),
+        FleetName::Due {
+            from: "studio".to_owned()
+        }
+    );
+    follow_fleet_name_at(&world.places, "lab", &no).unwrap();
+    assert_eq!(name().as_deref(), Some("lab"));
+    follow_fleet_name_at(&world.places, "m42", &no).unwrap();
+    assert_eq!(name().as_deref(), Some("m42"));
+
+    name_machine(&world.places, &args(&["set", "den"])).unwrap();
+    assert_eq!(
+        fleet_name_at(&world.places, "m42", &no).unwrap(),
+        FleetName::Kept("den".to_owned())
+    );
+    follow_fleet_name_at(&world.places, "m42", &no).unwrap();
+    assert_eq!(name().as_deref(), Some("den"));
+}
+
+/// A follow writes only over the fleet name it read: a name the person set between its read and
+/// its write (under the write lock) is kept. NEGATIVE CONTROL: the same follow over the name it
+/// did read writes.
+#[test]
+fn a_follow_never_writes_over_a_name_set_after_it_read() {
+    let world = World::new("follow-race");
+    name_machine(&world.places, &args(&["set", "studio"])).unwrap();
+    let said = set_primary_name(&world.places, "m42", &Writer::Follow { saw: None }).unwrap();
+    assert!(said.contains("kept"), "{said}");
+    assert_eq!(
+        member::read_primary_name(&world.places.state)
+            .unwrap()
+            .as_deref(),
+        Some("studio")
+    );
+    set_primary_name(
+        &world.places,
+        "m42",
+        &Writer::Follow {
+            saw: Some("studio"),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        member::read_primary_name(&world.places.state)
+            .unwrap()
+            .as_deref(),
+        Some("m42")
+    );
+}
+
+/// A label another machine's signed entry already carries is read as taken and left, by the
+/// follow as by `name set`, writing nothing; the same follow on a book without that entry
+/// (NEGATIVE CONTROL) takes the name.
+#[test]
+fn the_fleet_name_never_takes_a_name_another_machine_holds() {
+    let world = World::new("follow-collides");
+    member::ensure_private_dir(&world.places.state).unwrap();
+    let other = NodeIdentity::from_seed(&"7b".repeat(16), &[0x7b; 32]).unwrap();
+    let held = Peer::own(&other, ("other.local", 7300, "0.150.0"), 3)
+        .with_primary_name(&other, Some("m42"));
+    member::update_peers(&world.places.state, |book| {
+        book.push(held.clone());
+        Ok(())
+    })
+    .unwrap();
+    assert!(matches!(
+        fleet_name_at(&world.places, "m42", &|_| false).unwrap(),
+        FleetName::Taken(_)
+    ));
+    let left = follow_fleet_name_at(&world.places, "m42", &|_| false).unwrap();
+    assert!(left.contains("already names"), "{left}");
+    assert_eq!(
+        member::read_primary_name(&world.places.state).unwrap(),
+        None
+    );
+    let refused = name_machine(&world.places, &args(&["set", "m42"])).unwrap_err();
+    assert!(refused.into_text().contains("already names"));
+    assert_eq!(
+        member::read_primary_name(&world.places.state).unwrap(),
+        None
+    );
+
+    let free = World::new("follow-free");
+    follow_fleet_name_at(&free.places, "m42", &|_| false).unwrap();
+    assert_eq!(
+        member::read_primary_name(&free.places.state)
+            .unwrap()
+            .as_deref(),
+        Some("m42")
+    );
+}
+
 #[test]
 fn automatic_join_selects_its_own_port_and_delivers_the_signed_name() {
     let (issuer, code, _serving) = issuing("automatic-named-issuer");
@@ -1856,6 +2043,9 @@ fn a_leave_says_it_narrowed_an_open_state() {
     );
 }
 
+/// NEGATIVE CONTROL: when `places.state` is a symlink to another directory holding fleet
+/// files, `leave` clears `[fleet]` from `aterm.toml` without unlinking or writing `fleet-off`
+/// inside the symlink target.
 #[test]
 fn a_leave_where_no_writer_can_make_the_state_takes_the_fleet_out_of_aterm_toml() {
     let world = World::new("leave-unmade");
@@ -1899,6 +2089,33 @@ fn a_leave_where_no_writer_can_make_the_state_takes_the_fleet_out_of_aterm_toml(
         assert!(!places.state.is_dir(), "{odd}");
     }
     std::fs::set_permissions(&unwritable, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let outside = root.join("outside-target");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(outside.join(KEY_FILE), b"kept").unwrap();
+    std::fs::write(outside.join(CODE_FILE), b"kept-code").unwrap();
+    let linked = root.join("linked-state");
+    std::os::unix::fs::symlink(&outside, &linked).unwrap();
+    let linked_places = Places {
+        state: linked,
+        config: world.places.config.clone(),
+    };
+    world.write_config(&format!(
+        "[fleet]\nlisten = \"0.0.0.0:{}\"\nallow = \"facts\"\n",
+        closed_port()
+    ));
+    let left = ok(leave(&linked_places, &[]));
+    assert!(
+        left.contains("[fleet] listen, allow and drive_from removed"),
+        "linked: {left}"
+    );
+    assert_eq!(std::fs::read(outside.join(KEY_FILE)).unwrap(), b"kept");
+    assert_eq!(
+        std::fs::read(outside.join(CODE_FILE)).unwrap(),
+        b"kept-code"
+    );
+    assert!(!outside.join(member::OFF_FILE).exists());
 }
 
 #[cfg(target_os = "macos")]

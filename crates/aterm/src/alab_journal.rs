@@ -10,15 +10,20 @@
 //! step 9's provider-read door (`aterm_agent::harness::provider_read`), so each usage read is a
 //! `probe` of its account. The once-per-Mac backfill runs only in a process that starts a Commons
 //! runtime (a window, a session lane, `aterm node serve`), never in a short command, and is
-//! marked done only once every note is in the spool.
+//! marked done only once every note is in the spool. The flusher's holdings report (what this Mac
+//! runs that it does not prefer, published as `place` rows) is filled here too, from the lab this
+//! process holds and the rosters beside `aterm.toml` ([`holdings_in`]); a process that holds no
+//! lab (every test, a debug build) reports nothing, so no place row is written.
 
 use aterm_agent::harness::{
     accounts::{self, Cli, Roster},
+    alab_roster::{self, Lab},
     journal::{self, Note, Sink},
     provider_read::{self, ProbeEvent},
 };
 use aterm_db::alab::journal::{
     Appended, Event, Kind, Pk, Publishing, Res, Source, Spool, Window, Word,
+    place::{self, Holding, Why},
 };
 use std::io;
 use std::path::{Path, PathBuf};
@@ -91,10 +96,37 @@ fn glue() -> &'static Glue {
     })
 }
 
-/// Install the journal sink for this process, and fill the provider-read door with it.
+/// Install the journal sink for this process, fill the provider-read door with it, and give the
+/// flusher this Mac's holdings.
 pub(super) fn install() {
     journal::install(glue());
     let _ = provider_read::install(Box::new(probe));
+    let _ = place::install_holdings(Box::new(|| {
+        let lab = alab_roster::current()?;
+        holdings_in(&lab, &aterm_types::dirs::aterm_config_path()?)
+    }));
+}
+
+/// What this Mac runs that it does not prefer (`alab_roster::holdings`), over every pooled CLI's
+/// roster beside the `aterm.toml` at `config`: `None` where the lab names no machine for this Mac
+/// or a roster that is there does not read, so a passing failure ends no place row. A CLI with no
+/// roster holds nothing.
+fn holdings_in(lab: &Lab, config: &Path) -> Option<Vec<Holding>> {
+    lab.me.as_ref()?;
+    let mut out = Vec::new();
+    for cli in Cli::ALL {
+        let Some(path) = accounts::roster_beside_for(config, cli) else {
+            continue;
+        };
+        let roster = Roster::load_for(cli, &path).ok()?;
+        for (pk, why) in alab_roster::holdings(lab, cli, &roster) {
+            out.push(Holding {
+                account: Pk::new(&pk)?,
+                why: Why::parse(why)?,
+            });
+        }
+    }
+    Some(out)
 }
 
 /// One provider read the door reported, noted as its account's `probe`
@@ -536,5 +568,67 @@ mod tests {
                 .join(aterm_db::alab::journal::spool::SPOOL)
                 .exists()
         );
+    }
+
+    /// The flusher's holdings come from every pooled CLI's roster beside `aterm.toml`, keyed by
+    /// the lab's account key with the harness's reason; a lab that names no machine for this Mac,
+    /// or a roster that is there and does not read, reports nothing known (`None`), so no place
+    /// row ends on a passing failure; a CLI with no roster holds nothing.
+    /// NEGATIVE CONTROL: with `holdings_in` skipping a roster that does not read (`continue`
+    /// instead of `?`), the broken roster reports `Some([])` and every place row would end
+    /// (`left: Some([]) right: None`).
+    #[test]
+    fn holdings_come_from_the_rosters_beside_the_config() {
+        use aterm_agent::harness::{
+            accounts::{Row, Vendor},
+            alab_roster::LabAccount,
+        };
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let config = scratch.path().join("aterm.toml");
+        let email = "ann@example.test";
+        let key = aterm_db::typed::keys::account_pk("claude", email).unwrap();
+        let lab = Lab {
+            me: Some("m22".into()),
+            accounts: vec![LabAccount {
+                pk: key.clone(),
+                cli: Cli::Claude,
+                vendor: Vendor::default(),
+                label: "claude-aaaaaa".into(),
+                legacy_label: None,
+                email: email.into(),
+                identity: None,
+                browser: None,
+                joinable: true,
+                preferred: vec![("m3".into(), Some(1))],
+            }],
+            ..Lab::default()
+        };
+        assert_eq!(holdings_in(&lab, &config), Some(Vec::new()), "no roster");
+        let roster = accounts::roster_beside_for(&config, Cli::Claude).unwrap();
+        let row = Row {
+            label: "claude-aaaaaa".into(),
+            dir: Some("/scratch/ann".into()),
+            email: Some(email.into()),
+            ..Row::default()
+        };
+        std::fs::write(
+            &roster,
+            accounts::append_rows_for(Cli::Claude, "", &[row]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            holdings_in(&lab, &config),
+            Some(vec![Holding {
+                account: Pk::new(&key).unwrap(),
+                why: Why::Borrow,
+            }])
+        );
+        let unnamed = Lab {
+            me: None,
+            ..lab.clone()
+        };
+        assert_eq!(holdings_in(&unnamed, &config), None);
+        std::fs::write(&roster, "[[account]]\nlabel = 7\n").unwrap();
+        assert_eq!(holdings_in(&lab, &config), None, "a broken roster");
     }
 }

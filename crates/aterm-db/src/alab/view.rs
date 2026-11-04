@@ -6,9 +6,14 @@
 //! and the live preferences between them; this Mac is the machine its own facts row binds. A
 //! preference orders a pool and never limits one: nothing here answers "may this account run
 //! here", only "which accounts does this Mac prefer, in what order", "which Macs prefer this
-//! account" and "where do this address's codes arrive". No provider is called and nothing is
-//! written; the caller caches the view and projects again only when the inventory moves.
+//! account" and "where do this address's codes arrive". Beside the preferences, the journal's
+//! `place` rows ([`super::journal::place::Places`]) say what each Mac runs that it does not
+//! prefer: [`LabView::holding`] ("which Macs hold A") and [`LabView::runs_on`] ("what runs on
+//! m2") read both, and neither is a limit. No provider is called and nothing is written; the
+//! caller caches the view and projects again only when the inventory moves.
 
+#[cfg(unix)]
+use super::journal::place::{Places, Why};
 use super::{
     mail,
     registry::{self, ACCOUNT, ADDRESS, MACHINE, PREFERENCE},
@@ -73,12 +78,26 @@ pub struct Preference {
     pub rank: Option<u64>,
 }
 
+/// One live `place` row, by the machine its writer's facts row binds: `machine` runs `account`,
+/// which it does not prefer, for `why`.
+#[cfg(unix)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Placement {
+    pub machine: String,
+    pub account: String,
+    pub why: Why,
+    pub since: u64,
+}
+
 /// The registry as the harness reads it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct LabView {
     /// The machine this Mac's live facts row binds (its `merged_into` when it states one, since
     /// only a Mac's own facts row may rebind it, §4.6), when that row is live.
     pub me: Option<String>,
+    /// Each facts row's Commons uuid (32 hex) to the machine it binds, the same way, where that
+    /// machine row is live: the one path by which a journal row names a Mac (§6).
+    pub bound: BTreeMap<String, String>,
     pub machines: BTreeMap<String, Machine>,
     pub accounts: BTreeMap<String, Account>,
     /// Live preferences on live machines, by machine key then rank.
@@ -154,17 +173,22 @@ impl LabView {
                 (pk, account)
             })
             .collect::<BTreeMap<_, _>>();
-        let me = me_uuid
-            .and_then(|uuid| facts.rows.get(uuid))
-            .and_then(|row| {
+        let bound: BTreeMap<String, String> = facts
+            .rows
+            .iter()
+            .filter_map(|(uuid, row)| {
                 let value = &row.value;
-                value
+                let mac = value
                     .get("merged_into")
                     .and_then(Value::as_str)
-                    .or_else(|| value.get("mac").and_then(Value::as_str))
-                    .map(str::to_owned)
+                    .or_else(|| value.get("mac").and_then(Value::as_str))?;
+                machines
+                    .get(mac)
+                    .is_some_and(|machine| machine.live)
+                    .then(|| (uuid.clone(), mac.to_owned()))
             })
-            .filter(|mac| machines.get(mac).is_some_and(|machine| machine.live));
+            .collect();
+        let me = me_uuid.and_then(|uuid| bound.get(uuid)).cloned();
         let mut preferences: Vec<Preference> = cell::project(&PREFERENCE, cells)
             .rows
             .into_iter()
@@ -191,6 +215,7 @@ impl LabView {
         let observed = mail::observed(obs.rows.iter().map(|(key, row)| (key.as_str(), &row.value)));
         Self {
             me,
+            bound,
             machines,
             accounts,
             preferences,
@@ -235,6 +260,68 @@ impl LabView {
         rows
     }
 
+    /// The live place rows of `places` by the machine each writer's facts row binds (a row whose
+    /// writer binds no live machine names no Mac and is left out), less any whose machine prefers
+    /// the account too (its preference already says so), by account then machine label.
+    #[cfg(unix)]
+    pub fn placements(&self, places: &Places) -> Vec<Placement> {
+        let mut out: Vec<Placement> = places
+            .rows
+            .iter()
+            .filter_map(|row| {
+                let machine = self.bound.get(&row.uuid)?;
+                self.accounts.contains_key(&row.account).then_some(())?;
+                let prefers = self
+                    .preferences
+                    .iter()
+                    .any(|p| p.machine == *machine && p.account == row.account);
+                (!prefers).then(|| Placement {
+                    machine: machine.clone(),
+                    account: row.account.clone(),
+                    why: row.why,
+                    since: row.since,
+                })
+            })
+            .collect();
+        out.sort_by_key(|p| {
+            (
+                p.account.clone(),
+                label_number(self.machine_label(&p.machine)),
+                p.machine.clone(),
+            )
+        });
+        out.dedup_by(|a, b| a.account == b.account && a.machine == b.machine);
+        out
+    }
+
+    /// Which Macs hold `account` (§7): the machines that prefer it, in [`Self::preferring`]'s
+    /// order, then those whose live place rows say they run it. Neither list is a limit.
+    #[cfg(unix)]
+    pub fn holding(&self, account: &str, places: &Places) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .preferring(account)
+            .into_iter()
+            .map(|p| p.machine.clone())
+            .collect();
+        for placed in self.placements(places) {
+            if placed.account == account && !out.contains(&placed.machine) {
+                out.push(placed.machine);
+            }
+        }
+        out
+    }
+
+    /// What runs on `machine` (§7): its live preferences by rank, and its live place rows.
+    #[cfg(unix)]
+    pub fn runs_on(&self, machine: &str, places: &Places) -> (Vec<&Preference>, Vec<Placement>) {
+        let placed = self
+            .placements(places)
+            .into_iter()
+            .filter(|p| p.machine == machine)
+            .collect();
+        (self.preferred_by(machine).collect(), placed)
+    }
+
     /// Where codes for address `pk` arrive (`mail::effective`), with this Mac's `routes`.
     pub fn mailbox(
         &self,
@@ -242,6 +329,24 @@ impl LabView {
         routes: &dyn Fn(&str) -> Option<String>,
     ) -> Option<mail::Effective> {
         mail::effective(&self.addresses, &self.observed, routes, pk)
+    }
+
+    /// Every live address, lower-cased, whose codes the lab itself places in one mailbox, to
+    /// that mailbox's key: the address's `mailbox` column, through `alias_of`, or a mailbox's own
+    /// complete address list ([`mail::effective`] with no routes, a guess left out). What the
+    /// harness's mail routes take before any `receives` pattern (step 11, "a route keyed by
+    /// `mailbox`"), on a Mac that can name the mailbox's login.
+    pub fn mailboxes(&self) -> BTreeMap<String, String> {
+        self.addresses
+            .rows
+            .iter()
+            .filter(|(_, row)| row.live())
+            .filter_map(|(pk, row)| {
+                let addr = text(row, "addr")?;
+                let found = mail::effective(&self.addresses, &self.observed, &|_| None, pk)?;
+                (found.how != mail::How::Hint).then(|| (addr.to_ascii_lowercase(), found.mailbox))
+            })
+            .collect()
     }
 
     /// Every address with an `alias_of` link, lower-cased, to [`Self::alias_targets`] of it.

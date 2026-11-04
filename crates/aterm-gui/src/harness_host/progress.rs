@@ -116,6 +116,7 @@ fn pause_progress(value: &mut AccountProgress, off: bool, current_work: bool) {
         EXECUTION_HISTORY_PREFIX, RECOVERY_HISTORY_PREFIX, RECOVERY_RESUME_FINDING,
         SESSION_AUTOPILOT_OFF_FINDING,
     };
+    value.forecasts_paused = true;
     if !current_work {
         value.phase = ProgressPhase::Paused;
     }
@@ -724,6 +725,7 @@ impl HostHandle {
         let execution_active = execution.is_some();
         let execution_until = execution.and_then(|bound| bound.execution_until);
         let mut value = bound.value.clone();
+        value.forecasts_paused = off || policy_retired;
         // Prefer the gate's own roster; use a current decision only if that gate read failed.
         let activity_context = if bound.born.is_some() && bound.state.is_none() {
             normal

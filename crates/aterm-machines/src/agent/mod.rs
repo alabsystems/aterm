@@ -209,7 +209,7 @@ pub const FAMILIES: &[&str] = &[
 pub const REFUSED: u8 = 2;
 
 /// `aterm machines agent <args>`.
-#[must_use]
+#[must_use = "handle or propagate the command's exit status"]
 pub fn main(args: &[String], sys: &dyn System) -> ExitCode {
     let exe = match std::env::current_exe() {
         Ok(p) => p,

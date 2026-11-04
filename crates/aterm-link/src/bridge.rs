@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use astream_broker::Record as BrokerRecord;
 use aterm_hash::fnv1a_64;
+use aterm_types::control_verbs::ScreenGen;
 use aterm_types::fabric_grammar::{Bye, DeadReason, ANSWER_KINDS};
 
 use crate::body::{via_ok, Body};
@@ -454,14 +455,17 @@ struct StatusSample {
     detail: String,
     agent: Option<String>,
     agent_deferred: bool,
+    /// The screen's generation the read named (`gen=`), `None` for `-` (the terminal busy).
+    screen: Option<ScreenGen>,
 }
 
 impl StatusSample {
-    fn apply_presence(&self, fields: &mut Fields) {
-        fields.set_detail(Some(&self.detail));
+    fn apply_presence(&self, slot: &mut Slot) {
+        slot.fields.set_detail(Some(&self.detail));
         if !self.agent_deferred {
-            fields.set_agent(self.agent.as_deref());
+            slot.fields.set_agent(self.agent.as_deref());
         }
+        slot.saw_screen(self.screen);
     }
 }
 
@@ -482,6 +486,7 @@ fn parse_batch_status<'a>(
     let (mut sid, mut revision, mut hold, mut detail, mut agent) = (None, None, None, None, None);
     let mut origin = None;
     let mut agent_deferred = false;
+    let mut screen: Option<Option<ScreenGen>> = None;
     for tok in tokens {
         if let Some(v) = tok.strip_prefix("sid=") {
             if v.is_empty()
@@ -523,6 +528,16 @@ fn parse_batch_status<'a>(
                 return None;
             }
             agent_deferred = true;
+        } else if let Some(v) = tok.strip_prefix("gen=") {
+            // The screen's generation, `-` while the terminal was busy: said once, and
+            // nothing else.
+            let named = match v {
+                "-" => None,
+                v => Some(ScreenGen::parse(v)?),
+            };
+            if screen.replace(named).is_some() {
+                return None;
+            }
         } else {
             let v = tok.strip_prefix("detail=")?;
             if detail.replace(v.to_string()).is_some() {
@@ -547,6 +562,7 @@ fn parse_batch_status<'a>(
         detail: detail?,
         agent,
         agent_deferred,
+        screen: screen?,
     })
 }
 
@@ -2772,17 +2788,31 @@ impl Bridge {
         if self.bye == Some(Bye::Quit) && (state == "live" || self.withdrawn.contains(sid)) {
             return false;
         }
-        if state == "live"
-            && !self
-                .per_sid
-                .presence
-                .get(sid)
-                .is_some_and(|slot| slot.sampled)
-        {
-            if let Some(sample) = self.status_sample(sid) {
-                self.status_into_presence(sid, &sample);
+        // THE ROW READS NO SCREEN (critic item D03). Its `gen=` is the newest generation a status
+        // read named for the session ([`Slot::row_gen`]): the round's `sessions status` batch, the
+        // attach's ([`Bridge::presence_from_status_batch`]), an agent verdict's, or, for a slot
+        // none of those reached, the one `@<sid> status` read here. A screen read for it
+        // (`text --json`) would wait out any open DEC 2026 frame, up to the sync timeout, on
+        // the bridge's one loop, once a row. `meta` is read once a slot, here or by the round.
+        if state == "live" {
+            let slot = self.per_sid.presence.get(sid);
+            let (knows_screen, sampled) =
+                slot.map_or((false, false), |s| (s.knows_screen(), s.sampled));
+            if !knows_screen {
+                if let Some(sample) = self.status_sample(sid) {
+                    self.status_into_presence(sid, &sample);
+                }
             }
-            self.sample_meta(sid);
+            if !sampled {
+                self.sample_meta(sid);
+            }
+        }
+        #[cfg(test)]
+        if self
+            .fx
+            .mutant(crate::sim::world::Mutant::ReadTheScreenEveryRow)
+        {
+            let _ = self.ctl_request(&format!("@{sid} text --json"));
         }
         let subject = subject::session_face(&self.cfg.fleet, &self.node, sid, "presence");
         let epoch = self
@@ -2792,10 +2822,14 @@ impl Bridge {
             .cloned()
             .unwrap_or_else(|| "-".into());
         let hold = u8::from(self.halt_applied);
-        let gen = self.live_gen(sid).unwrap_or_else(|| "-".to_string());
-        let fields = self.per_sid.presence.get(sid).map_or_else(
-            || Fields::default().tokens(self.cfg.presence),
-            |slot| slot.fields.tokens(self.cfg.presence),
+        let (gen, fields) = self.per_sid.presence.get(sid).map_or_else(
+            || {
+                (
+                    crate::presence::ABSENT.to_string(),
+                    Fields::default().tokens(self.cfg.presence),
+                )
+            },
+            |slot| (slot.row_gen(), slot.fields.tokens(self.cfg.presence)),
         );
         let mut body = format!(
             "v=1 t={} inc={} epoch={epoch} gen={gen} state={state} hold={hold}{fields}",
@@ -6626,13 +6660,29 @@ impl Bridge {
     }
 
     fn status_into_presence(&mut self, sid: &str, sample: &StatusSample) {
-        let fields = &mut self
-            .per_sid
-            .presence
-            .entry(sid.to_string())
-            .or_default()
-            .fields;
-        sample.apply_presence(fields);
+        sample.apply_presence(self.per_sid.presence.entry(sid.to_string()).or_default());
+    }
+
+    /// THE ATTACH'S ONE STATUS READ (critic item D03): `sessions status` once, each row that
+    /// reads Ready folded into its session's presence slot, so the attach's rows that follow read
+    /// no `@<sid> status` each ([`Bridge::publish_session_presence`]). A session with no usable
+    /// row (stale, malformed, or a batch aterm refused) is read alone by its row's publish, as
+    /// before. Hold convergence is the roster round's ([`Bridge::sample_local_control`]), so
+    /// nothing is written here.
+    fn presence_from_status_batch(&mut self) {
+        if self.attachment == Attachment::Observer {
+            return;
+        }
+        let StatusBatch::Rows(rows) = self.batch_status_samples() else {
+            return;
+        };
+        for (local, row) in rows {
+            let (BatchSample::Ready(sample), Some(sid)) = (row, self.locals.get(&local).cloned())
+            else {
+                continue;
+            };
+            self.status_into_presence(&sid, &sample);
+        }
     }
 
     fn publish_presence_if_due(&mut self, sid: &str) {
@@ -7185,6 +7235,10 @@ impl Bridge {
                 sample.hold = EndpointHold::of(v == "1", None);
             } else if let Some(v) = tok.strip_prefix("detail=") {
                 sample.detail = v.to_string();
+            } else if let Some(v) = tok.strip_prefix("gen=") {
+                // The record's last `gen=`, the screen's generation (`-` while the terminal
+                // was busy, or a word this bridge cannot read: none named).
+                sample.screen = ScreenGen::parse(v);
             }
         }
         Some(sample)
@@ -7213,11 +7267,6 @@ impl Bridge {
         }
         self.sample_meta(sid);
         self.publish_presence_if_due(sid);
-    }
-
-    fn live_gen(&mut self, sid: &str) -> Option<String> {
-        let reply = self.ctl_request(&format!("@{sid} text --json")).ok()?;
-        gen_of_frame(reply.rows().first()?)
     }
 
     fn staged_refusal(&self, sid: &str) -> Option<io::Error> {
@@ -8235,12 +8284,14 @@ impl Bridge {
                 };
                 let sid = sid.clone();
                 let word = toks.next();
-                self.per_sid
-                    .presence
-                    .entry(sid.clone())
-                    .or_default()
-                    .fields
-                    .set_agent(word);
+                // The verdict names the screen it was judged on (`gen=`), so the row it owes
+                // says that one, read off no screen.
+                let screen = toks
+                    .find_map(|t| t.strip_prefix("gen="))
+                    .and_then(ScreenGen::parse);
+                let slot = self.per_sid.presence.entry(sid.clone()).or_default();
+                slot.fields.set_agent(word);
+                slot.saw_screen(screen);
                 self.publish_presence_if_due(&sid);
             }
             "meta" => {
@@ -8563,6 +8614,17 @@ impl Bridge {
             return false;
         }
         let sids: Vec<String> = self.locals.values().cloned().collect();
+        // A first attach knows no session's screen, so one batch read stands in for a status
+        // read per row; a re-attach whose slots all know theirs reads none.
+        if sids.iter().any(|sid| {
+            !self
+                .per_sid
+                .presence
+                .get(sid)
+                .is_some_and(Slot::knows_screen)
+        }) {
+            self.presence_from_status_batch();
+        }
         self.batched(|bridge| {
             for sid in sids {
                 bridge.publish_session_presence(&sid, "live");
@@ -10127,23 +10189,6 @@ pub(crate) fn span_of(ms: u64) -> String {
     }
 }
 
-/// Extracts the `<content_seq>:<fp16>` generation token (`serial=`) from a `text --json` frame.
-#[must_use]
-pub fn gen_of_frame(frame: &str) -> Option<String> {
-    let seq = frame
-        .split(",\"seq\":")
-        .nth(1)?
-        .split(|c: char| !c.is_ascii_digit())
-        .next()?
-        .parse::<u64>()
-        .ok()?;
-    let rows = frame
-        .strip_prefix("{\"rows\":[")?
-        .split_once("],\"cursor\":")?
-        .0;
-    Some(format!("{seq}:{:016x}", fnv1a_64(rows.as_bytes())))
-}
-
 const HALT_REASON_DEFAULT: &str = "fleet-halt";
 
 const HALT_REASON_MAX: usize = 128;
@@ -10870,8 +10915,8 @@ mod tests {
         ]);
         let rows = [
             "1 s-one a1 sid=1 revision=7 hold=1 hold_origin=local detail=Claude%20Code \
-             agent=prompt",
-            "2 s-two b2 sid=2 revision=4 hold=0 hold_origin=- detail=- agent=-",
+             agent=prompt gen=3.41",
+            "2 s-two b2 sid=2 revision=4 hold=0 hold_origin=- detail=- agent=- gen=-",
             "3 s-three NEW sid=3 revision=99 hold=0 detail=new",
         ];
         let parsed = parse_batch_rows(rows.into_iter(), &locals, &epochs);
@@ -10882,6 +10927,7 @@ mod tests {
                 detail,
                 agent: Some(agent),
                 agent_deferred: false,
+                screen: Some(ScreenGen { epoch: 3, seq: 41 }),
             })) if detail == "Claude%20Code" && agent == "prompt"
         ));
         assert!(matches!(
@@ -10891,6 +10937,7 @@ mod tests {
                 detail,
                 agent: Some(agent),
                 agent_deferred: false,
+                screen: None,
             })) if detail == "-" && agent == "-"
         ));
         assert!(matches!(parsed.get(&3), Some(BatchSample::Stale)));
@@ -10904,7 +10951,8 @@ mod tests {
     fn batch_agent_deferral_keeps_the_verdict_and_malformed_rows_retry_singly() {
         let locals = BTreeMap::from([(1, "s-one".to_string())]);
         let epochs = BTreeMap::from([("s-one".to_string(), "a1".to_string())]);
-        let row = "1 s-one a1 sid=1 revision=7 hold=1 detail=Claude%20Code agent_deferred=1";
+        let row =
+            "1 s-one a1 sid=1 revision=7 hold=1 detail=Claude%20Code agent_deferred=1 gen=1.9";
         let mut parsed = parse_batch_rows(std::iter::once(row), &locals, &epochs);
         let Some(BatchSample::Ready(sample)) = parsed.remove(&1) else {
             panic!("a deferred agent is a usable hold/detail sample");
@@ -10912,24 +10960,36 @@ mod tests {
         assert_eq!(sample.hold, EndpointHold::Unsaid);
         assert_eq!(sample.agent, None);
         assert!(sample.agent_deferred);
-        let mut fields = Fields::default();
-        fields.set_agent(Some("prompt"));
-        sample.apply_presence(&mut fields);
-        assert_eq!(fields.detail, "Claude%20Code");
-        assert_eq!(fields.phase, "prompt", "a busy writer is not agent=-");
-        StatusSample::default().apply_presence(&mut fields);
+        let named = crate::presence::gen_token(ScreenGen { epoch: 1, seq: 9 });
+        let mut slot = Slot::default();
+        slot.fields.set_agent(Some("prompt"));
+        sample.apply_presence(&mut slot);
+        assert_eq!(slot.fields.detail, "Claude%20Code");
+        assert_eq!(slot.fields.phase, "prompt", "a busy writer is not agent=-");
+        assert_eq!(slot.row_gen(), named);
+        StatusSample::default().apply_presence(&mut slot);
         assert_eq!(
-            fields.phase, "-",
+            slot.fields.phase, "-",
             "an old single-status reply without agent= still clears the phase"
+        );
+        assert_eq!(
+            slot.row_gen(),
+            named,
+            "a read that names no generation keeps the one before"
         );
 
         for malformed in [
-            "1 s-one a1 sid=1 revision=7 hold=1 detail=- agent_deferred=1 agent=idle",
-            "1 s-one a1 sid=1 revision=7 hold=1 detail=- agent_deferred=1 agent_deferred=1",
-            "1 s-one a1 sid=1 revision=7 hold=1 detail=- agent_deferred=0",
-            "1 s-one a1 sid=1 revision=7 hold=1 detail=Claude Code agent=prompt",
-            "1 s-one a1 sid=1 revision=4 hold=0 agent=idle",
-            "1 s-one a1 sid=1 revision=7 hold=1 detail=-",
+            "1 s-one a1 sid=1 revision=7 hold=1 detail=- agent_deferred=1 agent=idle gen=-",
+            "1 s-one a1 sid=1 revision=7 hold=1 detail=- agent_deferred=1 agent_deferred=1 gen=-",
+            "1 s-one a1 sid=1 revision=7 hold=1 detail=- agent_deferred=0 gen=-",
+            "1 s-one a1 sid=1 revision=7 hold=1 detail=Claude Code agent=prompt gen=-",
+            "1 s-one a1 sid=1 revision=4 hold=0 agent=idle gen=-",
+            "1 s-one a1 sid=1 revision=7 hold=1 detail=- gen=-",
+            "1 s-one a1 sid=1 revision=7 hold=1 detail=- agent=idle",
+            "1 s-one a1 sid=1 revision=7 hold=1 detail=- agent=idle gen=- gen=1.2",
+            "1 s-one a1 sid=1 revision=7 hold=1 detail=- agent=idle gen=1",
+            "1 s-one a1 sid=1 revision=7 hold=1 detail=- agent=idle gen=1.2:ab",
+            "1 s-one a1 sid=1 revision=7 hold=1 detail=- agent=idle gen=",
         ] {
             assert!(
                 parse_batch_rows(std::iter::once(malformed), &locals, &epochs).is_empty(),
@@ -10943,7 +11003,7 @@ mod tests {
         let locals = BTreeMap::from([(1, "s-one".to_string())]);
         let epochs = BTreeMap::from([("s-one".to_string(), "a1".to_string())]);
         let parse = |fields: &str| {
-            let row = format!("1 s-one a1 sid=1 revision=7 {fields} detail=- agent=-");
+            let row = format!("1 s-one a1 sid=1 revision=7 {fields} detail=- agent=- gen=-");
             match parse_batch_rows(std::iter::once(row.as_str()), &locals, &epochs).remove(&1) {
                 Some(BatchSample::Ready(sample)) => Some(sample.hold),
                 Some(BatchSample::Stale) => panic!("{row}: not a reused id"),
@@ -11004,8 +11064,8 @@ mod tests {
             assert_eq!(parse(malformed), None, "{malformed}");
         }
         let duplicate = [
-            "1 s-one a1 sid=1 revision=7 hold=1 detail=- agent=prompt",
-            "1 s-one a1 sid=1 revision=8 hold=0 detail=- agent=idle",
+            "1 s-one a1 sid=1 revision=7 hold=1 detail=- agent=prompt gen=-",
+            "1 s-one a1 sid=1 revision=8 hold=0 detail=- agent=idle gen=-",
         ];
         let parsed = parse_batch_rows(duplicate.into_iter(), &locals, &epochs);
         assert!(
@@ -12422,6 +12482,10 @@ mod tests {
         outbox_retires: Arc<std::sync::atomic::AtomicBool>,
         deliveries: Arc<std::sync::Mutex<Vec<String>>>,
         mirror: Arc<std::sync::Mutex<FakeMirror>>,
+        /// Every request line the lane answered (`AUTH` aside), in order.
+        requests: Arc<std::sync::Mutex<Vec<String>>>,
+        /// The header `@<sid> meta` answers, `None` to refuse it as before.
+        meta_answer: Arc<std::sync::Mutex<Option<String>>>,
     }
 
     #[derive(Default)]
@@ -12553,6 +12617,8 @@ mod tests {
                 outbox_retires: Arc::default(),
                 deliveries: Arc::default(),
                 mirror: Arc::default(),
+                requests: Arc::default(),
+                meta_answer: Arc::default(),
             };
             let (transcript, on_deliver) = (lane.transcript.clone(), lane.on_deliver.clone());
             let deliver_answers = lane.deliver_answers.clone();
@@ -12578,6 +12644,7 @@ mod tests {
             let (outbox_retires, deliveries) =
                 (lane.outbox_retires.clone(), lane.deliveries.clone());
             let mirror = lane.mirror.clone();
+            let (requests, meta_answer) = (lane.requests.clone(), lane.meta_answer.clone());
             let reader_state = Arc::new((
                 std::sync::Mutex::new(LaneReaderState::default()),
                 std::sync::Condvar::new(),
@@ -12620,8 +12687,18 @@ mod tests {
                     if line == "sessions bridge" {
                         roster_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     }
+                    if !line.starts_with("AUTH ") {
+                        requests.lock().unwrap().push(line.clone());
+                    }
+                    let meta = line
+                        .strip_prefix('@')
+                        .is_some_and(|l| l.ends_with(" meta"))
+                        .then(|| meta_answer.lock().unwrap().clone())
+                        .flatten();
                     let reply = if line.starts_with("AUTH ") {
                         continue;
+                    } else if let Some(header) = meta {
+                        format!("{header}\n")
                     } else if matches!(line.as_str(), "outbox" | "outbox earlier-receipts=1") {
                         match outbox.lock().unwrap().as_ref() {
                             Some(frame) => format!("OK {}{}\n{frame}", frame.len(), roster_token()),
@@ -12829,6 +12906,19 @@ mod tests {
 
         fn deliveries(&self) -> Vec<String> {
             self.deliveries.lock().unwrap().clone()
+        }
+
+        /// The requests answered since the last call, each by the tally row it counts on
+        /// ([`crate::wait_tally::lane_row`]).
+        fn take_requests(&self) -> Vec<(crate::wait_tally::Row, String)> {
+            std::mem::take(&mut *self.requests.lock().unwrap())
+                .into_iter()
+                .map(|line| (crate::wait_tally::lane_row(&line), line))
+                .collect()
+        }
+
+        fn answer_meta_with(&self, header: &str) {
+            *self.meta_answer.lock().unwrap() = Some(header.to_string());
         }
 
         fn answer_status_with(&self, rows: &[String]) {
@@ -17405,7 +17495,7 @@ mod tests {
         let mute = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         mute.set_nonblocking(true).unwrap();
         bridge.cfg.broker = socket.to_string_lossy().into_owned();
-        bridge.caps = crate::enable::node_grants("f", &bridge.node)
+        bridge.caps = crate::enable::node_rules("f", &bridge.node)
             .into_iter()
             .map(|grant| Cap {
                 grant,
@@ -17463,7 +17553,7 @@ mod tests {
         let (_server, endpoint) = serve(&broker, lane.dir.path());
         bridge.cfg.broker = endpoint.clone();
         let ring = |node: &str, keep: &dyn Fn(&str) -> bool| -> Vec<Cap> {
-            crate::enable::node_grants("f", node)
+            crate::enable::node_rules("f", node)
                 .into_iter()
                 .filter(|grant| keep(grant))
                 .map(|grant| {
@@ -23505,7 +23595,7 @@ mod tests {
         bridge.per_sid.pending_admit.clear();
         let row = |origin: &str| {
             format!(
-                "1 {SID} {:032x} sid=1 revision=1 hold=1 hold_origin={origin} detail=- agent=-",
+                "1 {SID} {:032x} sid=1 revision=1 hold=1 hold_origin={origin} detail=- agent=- gen=-",
                 1
             )
         };
@@ -23565,6 +23655,155 @@ mod tests {
         );
         bridge.on_event("EVENT 1 hold 1 reason=stop origin=fleet hold_origin=fleet,local");
         assert_eq!(writes(&lane)[before.len()..], [lift]);
+    }
+
+    /// A `sessions status` row of the scripted lane for local `local`, Ready, naming the screen
+    /// generation `1.<seq>`.
+    #[cfg(unix)]
+    fn ready_status_row(local: u64, seq: u64) -> String {
+        format!(
+            "{local} s-{local} {local:032x} sid={local} revision=1 hold=0 hold_origin=- \
+             detail=- agent=idle gen=1.{seq}"
+        )
+    }
+
+    #[cfg(unix)]
+    const META_HEADER: &str = "OK title=- user_title=worker description=- icon=- role=worker \
+                               attention=- cwd=- state=alive";
+
+    /// The `gen=` of every presence row of `sid` on the bus, oldest first.
+    #[cfg(unix)]
+    fn presence_gens(bridge: &Bridge, reader: &mut Conn, sid: &str) -> Vec<String> {
+        let face = subject::session_face(&bridge.cfg.fleet, &bridge.node, sid, "presence");
+        let (rows, _) = reader.fetch(0, &face, 256).unwrap();
+        rows.iter()
+            .filter(|(_, s, _)| *s == face)
+            .map(|(_, _, raw)| Body::decode(raw).0.gen.unwrap_or_default())
+            .collect()
+    }
+
+    /// How many of `asked` count on each of the presence reads' tally rows: the batch, a
+    /// session's `status`, its `meta`, its screen.
+    #[cfg(unix)]
+    fn presence_reads(asked: &[(crate::wait_tally::Row, String)]) -> [usize; 4] {
+        use crate::wait_tally::Row;
+        [
+            Row::LaneSessionsStatus,
+            Row::LaneStatus,
+            Row::LaneMeta,
+            Row::LaneText,
+        ]
+        .map(|row| asked.iter().filter(|(r, _)| *r == row).count())
+    }
+
+    /// THE ATTACH READS NO SCREEN, AND ITS SESSIONS' STATUS ONCE (critic item D03): a bridge
+    /// attaching N sessions whose `sessions status` rows are Ready asks that batch once and each
+    /// session's `meta` once, and no session's `status` or screen (`text --json`). Each row's
+    /// `gen=` is the token of the generation its batch row named. CONTROL
+    /// (`Mutant::ReadTheScreenEveryRow`, a screen read for every row as before D03): a
+    /// `text --json` a session.
+    #[cfg(unix)]
+    #[test]
+    fn an_attach_of_ready_sessions_reads_one_status_batch_a_meta_each_and_no_screen() {
+        const N: u64 = 4;
+        for control in [false, true] {
+            let sessions: Vec<(u64, String)> = (1..=N).map(|l| (l, format!("s-{l}"))).collect();
+            let named: Vec<(u64, &str)> = sessions.iter().map(|(l, s)| (*l, s.as_str())).collect();
+            let (lane, mut bridge) = FakeVerbLane::bridge(&named);
+            if control {
+                bridge.fx =
+                    crate::fx::Fx::os_without(crate::sim::world::Mutant::ReadTheScreenEveryRow);
+            }
+            let (socket, _broker, _server) = serve_log(&lane, "attach");
+            bridge.cfg.broker = socket;
+            lane.answer_meta_with(META_HEADER);
+            lane.answer_status_with(
+                &(1..=N)
+                    .map(|l| ready_status_row(l, 10 + l))
+                    .collect::<Vec<_>>(),
+            );
+            assert!(bridge.first_roster());
+            lane.take_requests();
+            assert!(bridge.attach_broker(), "the attach");
+            let n = usize::try_from(N).unwrap();
+            let reads = presence_reads(&lane.take_requests());
+            if control {
+                assert_eq!(reads[3], n, "the control reads a screen a row");
+                continue;
+            }
+            assert_eq!(
+                reads,
+                [1, 0, n, 0],
+                "[sessions status, @sid status, @sid meta, @sid text]"
+            );
+            let (mut reader, _) = bridge.connect().unwrap();
+            for (local, sid) in &sessions {
+                let screen = ScreenGen {
+                    epoch: 1,
+                    seq: 10 + local,
+                };
+                assert_eq!(
+                    presence_gens(&bridge, &mut reader, sid),
+                    [crate::presence::gen_token(screen)],
+                    "{sid}'s row says the generation its batch row named"
+                );
+            }
+        }
+    }
+
+    /// AN EVENT'S ROW READS NO SCREEN EITHER (critic item D03): an agent verdict's row says the
+    /// generation the verdict names and reads nothing; a meta change's row reads the session's
+    /// `meta` alone, and says the generation the batch named. CONTROL
+    /// (`Mutant::ReadTheScreenEveryRow`): a screen read each.
+    #[cfg(unix)]
+    #[test]
+    fn an_agent_or_meta_events_row_reads_no_screen() {
+        for control in [false, true] {
+            let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-1"), (2, "s-2")]);
+            if control {
+                bridge.fx =
+                    crate::fx::Fx::os_without(crate::sim::world::Mutant::ReadTheScreenEveryRow);
+            }
+            let (socket, _broker, _server) = serve_log(&lane, "events");
+            bridge.cfg.broker = socket;
+            bridge.conn = Some(bridge.connect().unwrap().0.into());
+            bridge.refresh_sessions().unwrap();
+            bridge.per_sid.pending_admit.clear();
+            lane.answer_meta_with(META_HEADER);
+            lane.answer_status_with(&[ready_status_row(1, 5), ready_status_row(2, 6)]);
+            bridge.sample_meta("s-1");
+            bridge.presence_from_status_batch();
+            lane.take_requests();
+
+            bridge.batched(|b| b.on_event("EVENT 1 agent busy rev=2 gen=1.77 fp=0"));
+            let agent = presence_reads(&lane.take_requests());
+            bridge.batched(|b| b.on_event("EVENT 2 meta"));
+            let meta = presence_reads(&lane.take_requests());
+            if control {
+                assert_eq!(
+                    (agent[3], meta[3]),
+                    (1, 1),
+                    "the control reads a screen a row"
+                );
+                continue;
+            }
+            assert_eq!(agent, [0, 0, 0, 0], "an agent verdict's row reads nothing");
+            assert_eq!(
+                meta,
+                [0, 0, 1, 0],
+                "a meta change's row reads the meta alone"
+            );
+            let (mut reader, _) = bridge.connect().unwrap();
+            assert_eq!(
+                presence_gens(&bridge, &mut reader, "s-1"),
+                [crate::presence::gen_token(ScreenGen { epoch: 1, seq: 77 })],
+                "the verdict's row says the screen it was judged on"
+            );
+            assert_eq!(
+                presence_gens(&bridge, &mut reader, "s-2"),
+                [crate::presence::gen_token(ScreenGen { epoch: 1, seq: 6 })],
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -24702,7 +24941,7 @@ mod tests {
     #[test]
     fn the_node_is_the_state_dirs_and_a_cap_for_another_node_is_refused() {
         let ring = |node: &str| -> Vec<Cap> {
-            crate::enable::node_grants("f1", node)
+            crate::enable::node_rules("f1", node)
                 .into_iter()
                 .map(|grant| Cap {
                     grant,
@@ -24710,7 +24949,7 @@ mod tests {
                 })
                 .collect()
         };
-        let person: Vec<Cap> = crate::enable::person_grants("f1", "h-x")
+        let person: Vec<Cap> = crate::enable::person_rules("f1", "h-x")
             .into_iter()
             .map(|grant| Cap {
                 grant,
@@ -25822,7 +26061,7 @@ mod tests {
     #[test]
     fn a_ring_read_again_is_taken_only_when_it_is_still_this_nodes() {
         let ring = |node: &str, tag: u8, exp: Option<&str>| -> Vec<Cap> {
-            crate::enable::node_grants("f1", node)
+            crate::enable::node_rules("f1", node)
                 .into_iter()
                 .map(|grant| Cap {
                     grant: exp.map_or_else(
@@ -25833,7 +26072,7 @@ mod tests {
                 })
                 .collect()
         };
-        let person: Vec<Cap> = crate::enable::person_grants("f1", "h-x")
+        let person: Vec<Cap> = crate::enable::person_rules("f1", "h-x")
             .into_iter()
             .map(|grant| Cap {
                 grant,

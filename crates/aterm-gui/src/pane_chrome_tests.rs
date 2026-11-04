@@ -70,14 +70,14 @@ fn a_side_by_side_split_gets_one_seam_hairline() {
         headers: vec![cell_box(0, 0, 1, 5), cell_box(0, 6, 1, 5)],
     };
     stamp_seam_lines(&mut dst, rows, cols, INKS, &layout, &[]);
-    for r in 0..rows {
-        let gap = dst.cells[r][5];
+    for (r, row) in dst.cells[..rows].iter().enumerate() {
+        let gap = row[5];
         assert_eq!(gap.ch, '│', "row {r}: a run reaching both grid edges");
         assert_eq!(gap.fg, INKS.line, "row {r}: the seam, whoever has focus");
         let ground = if r == 0 { INKS.band } else { INKS.ground };
         assert_eq!(gap.bg, ground, "row {r}");
         for c in (0..5).chain(6..11) {
-            assert_eq!(dst.cells[r][c].ch, ' ', "({r}, {c}) is a pane's");
+            assert_eq!(row[c].ch, ' ', "({r}, {c}) is a pane's");
         }
     }
 }

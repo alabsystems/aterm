@@ -11,7 +11,7 @@ use crate::error::{Error, Result, exit_rows};
 const MAX_LINE: usize = 100;
 
 const PURPOSE: &str =
-    "agh: aterm's GitHub client, for reads that route each request to the right identity";
+    "agh: aterm's GitHub client: reads and writes, each request routed to the right identity";
 
 const ROUTING: &[&str] = &[
     "With no agh.toml, agh adopts the vault's tokens, with no command run: the file",

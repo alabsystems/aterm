@@ -113,6 +113,56 @@ fn fixture() -> Vec<Record> {
 }
 
 #[test]
+fn layout_reader_keeps_unknown_large_frames_without_relaxing_known_reader() {
+    let records = fixture();
+    let known = &records[1];
+    let record = crate::membership_log::Draft {
+        network: *known.network_id(),
+        sequence: known.sequence(),
+        previous: known.previous().copied(),
+        parents: known.parents().to_vec(),
+        authored_ms: known.authored_ms(),
+        body: Body::Put {
+            audience: crate::membership_log::EpochAudience::Everyone,
+            epoch: [42; 32],
+            salt: [43; 32],
+            ciphertext: vec![44; 80 * 1024].into(),
+        },
+    }
+    .sign(&[17; 32], [18; 16])
+    .unwrap();
+    let bytes = crate::membership_log::with_kind_code(&record, 0xee);
+    let mut small = Chunks::new(&bytes, 11);
+    let mut layout = FrameReader::new();
+    let frame = match layout.read_layout(&mut small, bytes.len()) {
+        Ok(Some(frame)) => frame,
+        _ => panic!("a complete unknown-kind layout must be framed"),
+    };
+    assert_eq!(frame.wire.as_slice(), bytes);
+    assert_eq!(frame.parents, known.parents());
+    assert_eq!(small.at, bytes.len());
+    let mut known_reader = FrameReader::new();
+    assert!(matches!(
+        known_reader.read(&mut bytes.as_slice()),
+        Err(FrameReadError::Invalid(_))
+    ));
+}
+
+#[test]
+fn layout_reader_checks_remaining_budget_before_reading_the_frame_body() {
+    let record = fixture().remove(0);
+    let header = Record::frame_header_len(record.bytes()).unwrap();
+    let mut source = Chunks::new(record.bytes(), 7);
+    source.fail_at = Some(header);
+    let mut reader = FrameReader::new();
+    assert!(matches!(
+        reader.read_layout(&mut source, record.bytes().len() - 1),
+        Err(FrameReadError::Invalid(_))
+    ));
+    assert_eq!(source.at, header, "an over-budget frame body was requested");
+}
+
+#[test]
 fn rooted_file_application_rolls_back_only_new_unrooted_records() {
     let records = fixture();
     let Body::Genesis { signer, .. } = records[0].body() else {

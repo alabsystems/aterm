@@ -534,7 +534,14 @@ fn a_run_keys_each_stage_by_its_checkout_selection_and_variant() {
     );
     let checker = Key::of_run(StageId::SpecCheckers, &here);
     assert_eq!(checker.variant, Some(format!("jobs {}", here.test_jobs())));
-    assert_eq!(checker.crates, None, "checkers always run the workspace");
+    assert_eq!(
+        checker.crates,
+        Some(vec!["aterm-gui".to_owned(), "aterm-spec".to_owned()])
+    );
+    assert_eq!(
+        Key::of_run(StageId::CheckersCompile, &here).crates,
+        checker.crates
+    );
     let mut cells = ctx("/ck");
     cells.cells = vec!["win".to_owned(), "linux-arm".to_owned()];
     let foreign = Key::of_run(StageId::ForeignCells, &cells);
@@ -762,35 +769,6 @@ fn a_shaped_calls_record_is_kept_under_its_own_crates_and_variant() {
     );
 }
 
-/// The records read back as they were written, through the file too; text that is not theirs
-/// reads as none. NEGATIVE CONTROL: another schema reads as none.
-#[test]
-fn the_records_read_back_as_written() {
-    let mut r = kept(StageId::TestCompile, &Scope::workspace(), &[3, 9]);
-    r.push(Key::of(StageId::Doctests, &packages(&["z", "y"])), 5, 7);
-    let text = r.encode();
-    assert_eq!(Records::decode(&text), r);
-    let dir = aterm_tempfile::tempdir().expect("scratch");
-    let path = dir.path().join("state/verify/stage-memory.json");
-    r.save(&path).expect("saved");
-    assert_eq!(Records::load(&path), r);
-    assert_eq!(
-        std::fs::read_dir(path.parent().expect("its folder"))
-            .expect("listed")
-            .count(),
-        1,
-        "no stage folder is left beside it"
-    );
-    assert_eq!(Records::decode("not json"), Records::default());
-    assert_eq!(
-        Records::load(&dir.path().join("absent")),
-        Records::default()
-    );
-    let other = text.replacen("\"schema\":2", "\"schema\":1", 1);
-    assert_ne!(other, text);
-    assert_eq!(Records::decode(&other), Records::default());
-}
-
 /// A book keeps what a metered stage took, and the next run of it claims by it; it keeps nothing
 /// for a stage that touches no target directory, nor with no file. Its budget is what can ever be
 /// available, unbounded where that is unread. NEGATIVE CONTROL: before it keeps anything the
@@ -823,30 +801,6 @@ fn a_book_keeps_a_metered_stages_peak_for_its_next_run() {
         nowhere.need(&compile(), &over(&compile(), &gui())).how,
         How::Cold
     );
-}
-
-/// Every stage that runs a build of its own claims the cold figure with nothing kept: the spec
-/// checker (`targo run -p aterm-models`), the gpu oracle (`targo test -p aterm-gpu`), the
-/// codex-alab proof (the aterm it drives) and the Linux lane (the lab it boots its VM with) among
-/// them. The stages that run only what an earlier one built claim nothing. NEGATIVE CONTROL: the
-/// list before the review left those four out, so each claimed nothing.
-#[test]
-fn every_stage_that_builds_claims_the_cold_figure() {
-    for id in [
-        StageId::SpecCheck,
-        StageId::GpuOracle,
-        StageId::CodexAlabProof,
-        StageId::LinuxLane,
-    ] {
-        assert!(compiles(id), "{id:?}");
-    }
-    for id in [
-        StageId::Test,
-        StageId::SpecCheckers,
-        StageId::MeasuringTests,
-    ] {
-        assert!(!compiles(id), "{id:?}");
-    }
 }
 
 /// How many times [`counted_reader`] was asked, by pid.

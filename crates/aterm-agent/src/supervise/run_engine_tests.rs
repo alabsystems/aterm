@@ -13392,6 +13392,65 @@ fn the_chrome_intro_is_confirmed_once_at_safe_and_all() {
     }
 }
 
+/// REVIEW FINDING (2026-11-03): at 20 columns the intro (51 rows) is taller than the 40-row tail
+/// the loop reads, so in a pane tall enough to show it whole (20x60, the cursor under its footer)
+/// its rule and title lay above every row the loop read and nothing was pressed. Its cut read
+/// sends the loop to the whole screen, where it is read whole and confirmed once.
+#[test]
+fn a_chrome_intro_taller_than_the_tail_is_read_whole_and_confirmed() {
+    use aterm_phase::prompt::fixtures as f;
+    let mut tall = f::screen(f::CHROME_INTRO_INLINE[4].1);
+    let under = tall.len();
+    tall.resize(60, String::new());
+    assert!(
+        aterm_phase::parse_prompt_v2(&tall[tall.len() - 40..]).is_some_and(|p| p.head_off_screen),
+        "PRECONDITION: the tail cuts the intro"
+    );
+    let p = aterm_phase::parse_prompt_v2(&tall).expect("the whole intro");
+    assert!(
+        !p.head_off_screen,
+        "PRECONDITION: the screen shows it whole"
+    );
+    let footer = crate::supervise::policy::row_guard(&tall[p.options[0].row]);
+    let (dir, ledger) = ledger_file("chrome-intro-tall");
+    let mut policy = auto(30).policy;
+    policy.set("approve", "all").expect("a level");
+    let opts = SuperviseOpts { policy, ..auto(30) };
+    let mut m = fenced(vec![tall.clone(), tall.clone(), tall, idle_screen()]);
+    for i in 0..3 {
+        m.screen_cursors.insert(i, under);
+    }
+    m.human_seq = Some(3);
+    m.vanish_after = Some(2);
+    let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+        s.set_approval_env(owner_env());
+        s.set_approval_ledger(Some(ledger.clone()));
+    });
+    let presses = m.presses();
+    assert_eq!(
+        presses.len(),
+        1,
+        "one Enter: {presses:#?} {:#?}",
+        m.requests
+    );
+    assert!(
+        presses[0].ends_with(&format!(" if={footer} enter")),
+        "Enter under the footer's guard: {presses:#?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.starts_with("APPROVED seq=")
+            && l.contains("Claude in Chrome => Enter to confirm")),
+        "{lines:#?}"
+    );
+    assert!(
+        ledger_rows(&ledger)
+            .iter()
+            .any(|r| r.contains("chrome-intro@v1") && r.contains("approved")),
+        "the ledger books it"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn the_chrome_intro_waits_out_a_persons_typing() {
     let (intro, _) = intro_then_repl(aterm_phase::prompt::fixtures::CHROME_INTRO);

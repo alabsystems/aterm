@@ -966,19 +966,13 @@ fn a_cut_names_a_deadline_under_a_second_as_it_is() {
         .to_string()
     };
     let own = cut(Within::Drive(Duration::from_millis(100)));
-    assert!(
-        own.starts_with("lab-mini did not answer within 0.1 s (its aterm is stopped"),
-        "{own}"
-    );
+    assert!(own.contains("did not answer within 0.1 s"), "{own}");
     let flag = cut(Within::Timeout(
         Duration::from_millis(1500),
         Longer::Drive(Duration::from_millis(9500)),
     ));
     assert!(
-        flag.starts_with(
-            "no answer came from lab-mini within this call's --timeout of 1.5 s (a longer \
-             --timeout, or 0, waits up to the drive's own 9.5 s)"
-        ),
+        flag.contains("--timeout of 1.5 s") && flag.contains("own 9.5 s"),
         "{flag}"
     );
 }

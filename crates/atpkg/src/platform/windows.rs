@@ -580,7 +580,7 @@ pub fn wait_standing_aside(
 }
 
 /// The child's exit code as this process's (a Windows status is always a code).
-#[must_use]
+#[must_use = "handle or propagate the child process's exit status"]
 pub fn exit_code_like(status: std::process::ExitStatus) -> std::process::ExitCode {
     std::process::ExitCode::from(
         status

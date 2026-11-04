@@ -848,7 +848,7 @@ impl Instance {
     /// The last `n` lines of its log.
     #[must_use]
     pub fn log_tail(&self, n: usize) -> String {
-        let body = std::fs::read_to_string(&self.log).unwrap_or_default();
+        let body = crate::util::read_regular_text(&self.log).unwrap_or_default();
         let lines: Vec<&str> = body.lines().collect();
         lines[lines.len().saturating_sub(n)..].join("\n")
     }

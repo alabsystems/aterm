@@ -108,6 +108,47 @@ impl InspectionEnvelope<'_> {
     }
 }
 
+/// Validate a successful inspection response against its exact request.
+///
+/// Only the bounded first-line envelope is parsed here; callers validate the
+/// requested body separately. Noncanonical, duplicate or unknown fields fail closed.
+///
+/// # Errors
+/// The bounded header is malformed or does not match the requested version or subject.
+pub fn validate_inspection_response<'a>(
+    response: &str,
+    request: InspectRequest<'a>,
+) -> Result<InspectionEnvelope<'a>, ParseError> {
+    const MAX_HEADER_BYTES: usize = 512;
+    let end = response
+        .as_bytes()
+        .iter()
+        .take(MAX_HEADER_BYTES + 1)
+        .position(|byte| *byte == b'\n')
+        .unwrap_or(response.len().min(MAX_HEADER_BYTES + 1));
+    if end > MAX_HEADER_BYTES {
+        return Err(ParseError::InvalidPayload("inspection header"));
+    }
+    let header = response
+        .get(..end)
+        .ok_or(ParseError::InvalidPayload("inspection header"))?;
+    let revision = header
+        .strip_prefix("app-inspection version=app/v1 revision=")
+        .and_then(|rest| rest.split_once(' '))
+        .and_then(|(revision, _)| revision.parse::<u64>().ok())
+        .ok_or(ParseError::InvalidPayload("inspection header"))?;
+    let subject = match request {
+        InspectRequest::Tabs => InspectionSubject::Tabs,
+        InspectRequest::Network => InspectionSubject::Network,
+        InspectRequest::View { view, projection } => InspectionSubject::View { view, projection },
+    };
+    let envelope = InspectionEnvelope { revision, subject };
+    if header != envelope.header_line() {
+        return Err(ParseError::InvalidPayload("inspection header"));
+    }
+    Ok(envelope)
+}
+
 impl InspectionProjection {
     /// Return the frozen lowercase wire keyword.
     #[must_use]
@@ -137,6 +178,11 @@ pub struct ActRequest<'a> {
 /// A parsed `open app ...` request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpenAppRequest<'a> {
+    /// Open read-only Allocation, optionally beside the focused pane.
+    Allocation {
+        /// Prefer a left/right split; a narrow or shared pane opens a tab.
+        split: bool,
+    },
     /// Focus or create the native Mail view.
     Mail,
     /// Focus or create the dedicated About native view.
@@ -288,10 +334,15 @@ pub fn parse_open_app(rest: &str) -> Result<OpenAppRequest<'_>, ParseError> {
     let mut input = rest;
     if take_token(&mut input) != Some("app") {
         return Err(ParseError::Usage(
-            "open app <mail|about|system-state|workers|settings [route]|markdown <uri>|editor <uri>>",
+            "open app <allocation [split]|mail|about|system-state|workers|settings [route]|markdown <uri>|editor <uri>>",
         ));
     }
     match take_token(&mut input) {
+        Some("allocation") if matches!(remainder(input), "" | "split") => {
+            Ok(OpenAppRequest::Allocation {
+                split: remainder(input) == "split",
+            })
+        }
         Some("about") if remainder(input).is_empty() => Ok(OpenAppRequest::About),
         Some("mail") if remainder(input).is_empty() => Ok(OpenAppRequest::Mail),
         Some("system-state") if remainder(input).is_empty() => Ok(OpenAppRequest::SystemState),
@@ -441,6 +492,76 @@ mod tests {
             Err(ParseError::UnknownProjection)
         );
         assert!(parse_inspect("app/v1 view v text extra").is_err());
+    }
+
+    #[test]
+    fn inspection_response_matches_the_exact_request() {
+        for payload in [
+            "app/v1 tabs",
+            "app/v1 network",
+            "app/v1 view view-42 tree",
+            "app/v1 view view-42 audit",
+        ] {
+            let request = parse_inspect(payload).unwrap();
+            let subject = match request {
+                InspectRequest::Tabs => InspectionSubject::Tabs,
+                InspectRequest::Network => InspectionSubject::Network,
+                InspectRequest::View { view, projection } => {
+                    InspectionSubject::View { view, projection }
+                }
+            };
+            let expected = InspectionEnvelope {
+                revision: 17,
+                subject,
+            };
+            let header = expected.header_line();
+            assert_eq!(
+                validate_inspection_response(&format!("{header}\nbody"), request),
+                Ok(expected)
+            );
+            for bad in [
+                "ERR refused".to_string(),
+                header.replace("app/v1", "app/v2"),
+                header.replace("revision=17", "revision=no"),
+                header.replace("revision=17 ", ""),
+                format!("{header} revision=17"),
+                format!("{header} unknown=value"),
+                header.replace("subject=", "subject=wrong"),
+                "x".repeat(513),
+            ] {
+                assert!(
+                    validate_inspection_response(&bad, request).is_err(),
+                    "{bad}"
+                );
+            }
+        }
+        let request = parse_inspect("app/v1 view view-42 tree").unwrap();
+        for payload in [
+            "app/v1 tabs",
+            "app/v1 network",
+            "app/v1 view other tree",
+            "app/v1 view view-42 audit",
+        ] {
+            let wrong = parse_inspect(payload).unwrap();
+            let subject = match wrong {
+                InspectRequest::Tabs => InspectionSubject::Tabs,
+                InspectRequest::Network => InspectionSubject::Network,
+                InspectRequest::View { view, projection } => {
+                    InspectionSubject::View { view, projection }
+                }
+            };
+            assert!(
+                validate_inspection_response(
+                    &InspectionEnvelope {
+                        revision: 17,
+                        subject
+                    }
+                    .header_line(),
+                    request
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]

@@ -69,7 +69,8 @@ pub(super) fn read(path: &Path) -> Result<Vec<u8>> {
     if meta.nlink() != 1 || meta.len() > 1024 * 1024 {
         return Err(Error::new("probe artifact has unsafe links or size"));
     }
-    let mut bytes = Vec::new();
+    let cap = usize::try_from(meta.len().min(1024 * 1024).saturating_add(1)).unwrap_or(0);
+    let mut bytes = Vec::with_capacity(cap);
     file.take(1024 * 1024 + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| Error::new("cannot read probe artifact"))?;
@@ -100,7 +101,22 @@ fn run(
 }
 
 fn source_bytes() -> Result<Vec<u8>> {
-    let bytes = std::fs::read("/bin/echo")
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open("/bin/echo")
+        .map_err(|_| Error::new("fixed Apple probe binary is unavailable"))?;
+    let meta = file
+        .metadata()
+        .map_err(|_| Error::new("fixed Apple probe binary is unavailable"))?;
+    if !meta.is_file() || meta.len() > 1024 * 1024 {
+        return Err(Error::new("fixed Apple probe binary exceeds its bound"));
+    }
+    let cap = usize::try_from(meta.len().min(1024 * 1024).saturating_add(1)).unwrap_or(0);
+    let mut bytes = Vec::with_capacity(cap);
+    file.take(1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
         .map_err(|_| Error::new("fixed Apple probe binary is unavailable"))?;
     if bytes.len() > 1024 * 1024 {
         return Err(Error::new("fixed Apple probe binary exceeds its bound"));
@@ -183,7 +199,7 @@ pub(super) fn signature(
     let prefix = certs.path().join("certificate");
     let mut extract = certificate_command(&prefix, &app(dir));
     run(tool, &mut extract, deadline)?;
-    let cert = std::fs::read(certs.path().join("certificate0"))
+    let cert = read(&certs.path().join("certificate0"))
         .map_err(|_| Error::new("cannot read public probe certificate"))?;
     let actual = aterm_codec::hex::encode_lower(
         ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, &cert).as_ref(),

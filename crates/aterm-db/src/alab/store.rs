@@ -39,7 +39,7 @@ pub enum LabRead {
     /// projected again.
     Unchanged,
     /// The view of the registry as it is now, and the inventory it was projected from.
-    Projected(LabView, Inventory),
+    Projected(Box<LabView>, Inventory),
 }
 
 /// The declaration of the registry generation `compiled`.
@@ -560,7 +560,7 @@ impl Registry {
                     &owned(MAILBOX_OBS.name),
                     uuid.as_deref(),
                 );
-                Ok(Some(LabRead::Projected(lab, inventory)))
+                Ok(Some(LabRead::Projected(Box::new(lab), inventory)))
             },
         )?;
         Ok(seen.flatten())

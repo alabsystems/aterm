@@ -30,10 +30,11 @@ pub struct Laid {
     pub program: PathBuf,
     /// `<keys>/mint.secret` (32 bytes, 0600).
     pub secret: PathBuf,
-    /// `<keys>/node.cap` (0600): the node's ring, [`aterm_link::enable::node_grants`] in order.
+    /// `<keys>/node.cap` (0600): the node's ring, its ceiling's rules in order
+    /// ([`astream_cap::GrantCeiling::aterm_node_ring`]).
     pub cap: PathBuf,
-    /// `<keys>/observer.cap` (0600): an observer's ring, [`aterm_link::enable::person_grants`],
-    /// when one was asked for.
+    /// `<keys>/observer.cap` (0600): an observer's ring, its ceiling's rules
+    /// ([`astream_cap::GrantCeiling::aterm_person_ring`]), when one was asked for.
     pub observer: Option<PathBuf>,
     /// The live dir (0700): the broker's socket and log, the bridge's state.
     pub live: PathBuf,
@@ -102,8 +103,9 @@ impl Laid {
 }
 
 /// Lay a bus out: the keys under `keys` (the program link, a 32-byte mint secret, `node.cap`
-/// minted from [`aterm_link::enable::node_grants`] in order, and with `observer` an
-/// `observer.cap` from [`aterm_link::enable::person_grants`]), the bridge's state with its node id
+/// minted from the node ceiling's rules in order ([`astream_cap::GrantCeiling::aterm_node_ring`]),
+/// and with `observer` an `observer.cap` from its person ceiling's
+/// ([`astream_cap::GrantCeiling::aterm_person_ring`])), the bridge's state with its node id
 /// under `live`, each dir 0700 and each secret or cap 0600. Every grant goes through `mint`.
 /// Nothing is started.
 /// # Errors
@@ -191,9 +193,9 @@ pub fn lay(
         }
         Ok(caps)
     };
-    let node_caps = minted(aterm_link::enable::node_grants(FLEET, &laid.node))?;
+    let node_caps = minted(astream_cap::GrantCeiling::aterm_node_ring(FLEET, &laid.node)?.rules())?;
     let observer_caps = observer
-        .map(|who| minted(aterm_link::enable::person_grants(FLEET, who)))
+        .map(|who| minted(astream_cap::GrantCeiling::aterm_person_ring(FLEET, who)?.rules()))
         .transpose()?;
     write_private(&laid.cap, &node_caps)?;
     if let Some(caps) = observer_caps {
@@ -346,7 +348,7 @@ impl Fabric {
                     .as_mut()
                     .is_some_and(|b| matches!(b.try_wait(), Ok(Some(_))))
             },
-            || std::fs::read_to_string(&said).unwrap_or_default(),
+            || crate::util::read_regular_text(&said).unwrap_or_default(),
         );
         if let Err(e) = listened {
             let exited = fabric
@@ -354,7 +356,7 @@ impl Fabric {
                 .as_mut()
                 .and_then(|b| b.try_wait().ok().flatten())
                 .and_then(|status| status.code());
-            let said = std::fs::read_to_string(&said).unwrap_or_default();
+            let said = crate::util::read_regular_text(&said).unwrap_or_default();
             fabric.stop();
             return Err(unstarted(exited, &said, e));
         }
@@ -438,7 +440,7 @@ mod tests {
     }
 
     /// A LAB BUS LAYS THE NODE RING AND AN OBSERVER RING: the keys (program link, 32-byte secret,
-    /// `node.cap` with the node's eight grants in order, `observer.cap` with an `a-` service ring)
+    /// `node.cap` with the node's six grants in order, `observer.cap` with an `a-` service ring)
     /// in one dir and the bridge's state in another, dirs 0700 and secrets 0600; the table's
     /// command is plain words naming the live socket, the node cap, the live state and the node;
     /// the rendezvous file renders and parses back with that command. A failed mint makes no cap
@@ -462,13 +464,17 @@ mod tests {
         .unwrap();
         assert_eq!(
             grants_of(&laid.cap),
-            aterm_link::enable::node_grants(FLEET, &laid.node)
+            astream_cap::GrantCeiling::aterm_node_ring(FLEET, &laid.node)
+                .unwrap()
+                .rules()
         );
         let observer = laid.observer.clone().expect("an observer cap");
         assert_eq!(observer, keys.join("observer.cap"));
         assert_eq!(
             grants_of(&observer),
-            aterm_link::enable::person_grants(FLEET, "a-lab-observer")
+            astream_cap::GrantCeiling::aterm_person_ring(FLEET, "a-lab-observer")
+                .unwrap()
+                .rules()
         );
         assert!(
             laid.node.len() == 18
@@ -538,7 +544,9 @@ mod tests {
             &mut fake_mint(Some(3)),
         )
         .expect_err("the third grant is refused");
-        let third = &aterm_link::enable::node_grants(FLEET, "n-0")[2];
+        let third = &astream_cap::GrantCeiling::aterm_node_ring(FLEET, "n-0")
+            .unwrap()
+            .rules()[2];
         assert!(
             failed.contains(&format!("aterm link mint {third}: ")) && failed.contains("QZP6WORD1"),
             "{failed}"
@@ -550,7 +558,7 @@ mod tests {
             &root.join("run3/fabric"),
             &root.join("sock3/fabric"),
             Some("a-lab-observer"),
-            &mut fake_mint(Some(9)),
+            &mut fake_mint(Some(7)),
         )
         .expect_err("the observer's first grant is refused");
         assert!(

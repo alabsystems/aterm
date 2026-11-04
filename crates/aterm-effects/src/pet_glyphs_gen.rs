@@ -297,8 +297,9 @@ pub const PET_GLYPH_IDS: &[PetGlyphId] = &[
     PetGlyphId::PetYawn,
 ];
 
-/// Every pet pose's const drawlist, indexed by [`PetGlyphId`] order.
-pub const PET_GLYPHS: &[GlyphDef] = &[
+/// Every pet pose's drawlist, indexed by [`PetGlyphId`] order.
+/// A `static`, so the binary holds one copy (a `const` is copied into each crate that reads it).
+pub static PET_GLYPHS: &[GlyphDef] = &[
     // PetApex (pet_apex)
     GlyphDef { id: "pet_apex", kind: GlyphKind::Special, aspect_x1000: 1649, eye_y: 1393, center_x: 2048, word_top: 4096, layers: &[
         Layer { role: GlyphRole::Outline, recolor: Recolor::Fixed, fill: 0x2B2530, paths: &[

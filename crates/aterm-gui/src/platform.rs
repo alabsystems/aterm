@@ -2934,6 +2934,34 @@ mod vibrancy {
     }
 }
 
+/// Pure decision for whether CoreGraphics display lists lack an active drawable display.
+#[cfg(any(target_os = "macos", test))]
+#[must_use]
+pub(crate) fn active_display_unavailable_from(
+    online: Result<&[u32], i32>,
+    active: Result<&[u32], i32>,
+) -> Option<String> {
+    match active {
+        Ok(ids) if !ids.is_empty() => None,
+        Ok(_) => match online {
+            Ok([]) => Some(
+                "no display is online (CoreGraphics lists no online display; open the lid or connect a display)"
+                    .to_owned(),
+            ),
+            Ok(online_ids) => Some(format!(
+                "no display is online for drawing (CoreGraphics lists no active display across {} online display(s); open the lid or wake the display)",
+                online_ids.len()
+            )),
+            Err(err) => Some(format!(
+                "no display is online for drawing (CoreGraphics lists no active display; online query failed with CGError {err})"
+            )),
+        },
+        Err(err) => Some(format!(
+            "CoreGraphics could not list active displays (CGError {err})"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod surface_colorspace_tests {
     use super::{SurfaceColorspace, capture_space_after_surface_tag, resolve_surface_colorspace};
@@ -2997,6 +3025,40 @@ mod surface_colorspace_tests {
             ),
             CaptureColorSpace::DisplayP3
         );
+    }
+
+    /// NEGATIVE CONTROL: when CoreGraphics lists zero active displays (clamshell closed or no
+    /// display connected), `active_display_unavailable_from` refuses with a `Some` reason naming
+    /// the missing display instead of letting a window drive judge an empty monitor list.
+    #[test]
+    fn active_display_unavailable_names_closed_clamshell_and_passes_active_panel() {
+        assert_eq!(
+            super::active_display_unavailable_from(Ok(&[1]), Ok(&[1])),
+            None,
+            "an active display clears the gate"
+        );
+        assert_eq!(
+            super::active_display_unavailable_from(Ok(&[1, 2]), Ok(&[2])),
+            None,
+            "clamshell closed with an external active display clears the gate"
+        );
+        let closed = super::active_display_unavailable_from(Ok(&[1]), Ok(&[]))
+            .expect("clamshell closed with no external active display refuses");
+        assert!(
+            closed.contains("no display is online for drawing")
+                && closed.contains("no active display")
+                && closed.contains("1 online display"),
+            "{closed}"
+        );
+        let headless = super::active_display_unavailable_from(Ok(&[]), Ok(&[]))
+            .expect("no online display at all refuses");
+        assert!(
+            headless.contains("no display is online") && headless.contains("no online display"),
+            "{headless}"
+        );
+        let err = super::active_display_unavailable_from(Ok(&[1]), Err(1000))
+            .expect("active display query error refuses");
+        assert!(err.contains("CGError 1000"), "{err}");
     }
 }
 

@@ -227,7 +227,8 @@ fn a_scoped_uninstall_leaves_what_another_aterm_uses() {
     bundle(&home.join("Applications/aterm.app"), Some(&atpkg));
     let links = home.join(".local/bin");
     std::fs::create_dir_all(&links).expect("mkdir");
-    for tool in ["aterm", "atpkg"] {
+    let tools = ["aterm", "atpkg", "amacs", "agh"];
+    for tool in tools {
         symlink(
             home.join(format!("Applications/aterm.app/Contents/MacOS/{tool}")),
             links.join(tool),
@@ -244,7 +245,12 @@ fn a_scoped_uninstall_leaves_what_another_aterm_uses() {
         !swept.exists(),
         "the other aterm's store was not swept: {out}"
     );
-    assert!(links.join("aterm").is_symlink() && links.join("atpkg").is_symlink());
+    for tool in tools {
+        assert!(
+            links.join(tool).is_symlink(),
+            "{tool} stays for the other aterm"
+        );
+    }
     assert!(man.exists());
     let text = std::fs::read_to_string(&rc).expect("rc");
     assert_eq!(text.lines().filter(|l| *l == PATH_BLOCK_START).count(), 1);
@@ -263,7 +269,12 @@ fn a_scoped_uninstall_leaves_what_another_aterm_uses() {
         !support.join("pkg/declined").exists(),
         "the decline its sweep recorded goes with it"
     );
-    assert!(!links.join("aterm").is_symlink() && !links.join("atpkg").is_symlink());
+    for tool in tools {
+        assert!(
+            !links.join(tool).is_symlink(),
+            "{tool} goes with the bundle"
+        );
+    }
     assert!(!home.join("aterm.app").exists());
     assert!(!man.exists());
     assert!(

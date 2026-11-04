@@ -616,7 +616,9 @@ fn a_page_checkpoint_waits_for_the_last_notification_command() {
 #[test]
 fn ask_and_halt_select_the_records_they_name_and_nothing_else() {
     let fleet = Fleet::boot("notify-sel");
-    let mut grants = aterm_link::enable::person_grants(FLEET, "h-andrew");
+    let mut grants = astream_cap::GrantCeiling::aterm_person_ring(FLEET, "h-andrew")
+        .expect("a person ring")
+        .rules();
     grants.push(format!("ro:/f/{FLEET}/fleet/>"));
     let w = Watch::new(&fleet, "sel", &grants);
     let mut god = fleet.god();
@@ -668,7 +670,9 @@ fn ask_and_halt_select_the_records_they_name_and_nothing_else() {
     let node = Watch::new(
         &fleet,
         "sel-node",
-        &aterm_link::enable::node_grants(FLEET, "n-a"),
+        &astream_cap::GrantCeiling::aterm_node_ring(FLEET, "n-a")
+            .expect("a node ring")
+            .rules(),
     );
     let refused = node.once("ask:h-andrew", &[]);
     assert_eq!(refused.status.code(), Some(2), "{}", refused.stderr);

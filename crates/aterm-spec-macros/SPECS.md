@@ -80,8 +80,10 @@ tests/anchors/suite.rs	stacked_waivers_are_each_collected	macro-expansion-shape	
 tests/anchors/suite.rs	the_registry_collects_every_record_this_file_submits_exactly_once	registry-collects-each-submit-once	macro-expansion-shape
 ```
 
-`the_registry_collects_every_record_this_file_submits_exactly_once` is in neither table; it
-samples `registry-collects-each-submit-once`.
+## 3. Coverage
+
+- All 10 live `#[test]` functions across `src/lib.rs` and `tests/anchors/suite.rs` map to the 7
+  specs in §1.
 
 ## 4. Tests that are not spec samples
 

@@ -984,9 +984,9 @@ pub fn default_only_now<'a>(
 /// Why the launch is refused: the pin names no row of the roster, its row is not signed in here,
 /// on a Codex program that keeps no row's login its own
 /// ([`super::codex_alab::auth_path_unread`]) it is a row of its own, or the recorded claims keep
-/// its row from this Mac (another Mac's senior live claim, or a claim this Mac cannot record on a
-/// row that is not its home), as [`launch_env_for`] refuses it. A preparation-only hold on the
-/// default row also refuses a launch with no pin.
+/// its row from this Mac (another Mac's warm set holds it, another Mac's senior live claim, or a
+/// claim this Mac cannot record on a row that is not its home), as [`launch_env_for`] refuses it.
+/// A preparation-only hold on the default row also refuses a launch with no pin.
 pub fn off_launch<'a>(
     (cli, keyring): (Cli, bool),
     roster: &'a Roster,
@@ -1159,11 +1159,12 @@ fn off_pick<'a>(
 }
 
 /// The refusal of a rotation-off launch whose owner's pin names `label`, a row the account claims
-/// keep from this Mac (`why`: another Mac's senior live claim, or a claim this Mac could not record
-/// on a row that is not its home), with the way back: the pin's end ([`unpin_line`]), after which
-/// a launch under rotation off takes no row.
+/// keep from this Mac (`why`: another Mac's warm set holds it, another Mac's senior live claim, or
+/// a claim this Mac could not record on a row that is not its home), with the way back: the pin's
+/// end ([`unpin_line`]), after which a launch under rotation off takes no row.
 fn off_claim_refused(cli: Cli, label: &str, why: accounts::WhyNot) -> String {
     let because = match why {
+        accounts::WhyNot::HeldElsewhere => "it is held for another Mac's warm set".to_owned(),
         accounts::WhyNot::LeasedElsewhere { until } => format!(
             "another Mac's claim holds it until {}",
             super::usage::rfc3339_utc(until)

@@ -25,11 +25,15 @@
 //!   preferring an account and where an address's codes arrive, projected once and cached.
 //! - [`discover`]: what a Mac records of a Proton mailbox's address list while the mailbox is open
 //!   to read a sign-in code.
+//! - [`export`]: the files older Macs still read, generated from the registry and the journal's
+//!   place rows by the owner's one admin writer, and `check`'s drift of them.
 
 pub mod checks;
 #[cfg(unix)]
 pub mod command;
 pub mod discover;
+#[cfg(unix)]
+pub mod export;
 #[cfg(unix)]
 pub mod import;
 #[cfg(unix)]

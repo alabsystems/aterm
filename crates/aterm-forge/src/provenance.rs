@@ -5,6 +5,8 @@
 
 use std::path::{Component, Path, PathBuf};
 
+use aterm_toml::edit::{DocumentMut, Item, TableLike};
+
 /// One directory under `vendor/` that holds aterm's own code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FirstPartyVendored {
@@ -19,11 +21,12 @@ pub struct FirstPartyVendored {
     pub why: &'static str,
 }
 
-/// The roster: reviewed by a person, one row per directory.
-pub const FIRST_PARTY_VENDORED: &[FirstPartyVendored] = &[FirstPartyVendored {
-    dir: "vendor/astream",
-    upstream: "github.com/alabsystems/astream, a git submodule pinned by this tree's gitlink",
-    why: "Same owner as github.com/alabsystems/aterm — the same account, not a similar \
+/// Reviewed original first-party components, one row per directory.
+pub const FIRST_PARTY_VENDORED: &[FirstPartyVendored] = &[
+    FirstPartyVendored {
+        dir: "vendor/astream",
+        upstream: "github.com/alabsystems/astream, a git submodule pinned by this tree's gitlink",
+        why: "Same owner as github.com/alabsystems/aterm — the same account, not a similar \
           name — so this is aterm's own code, not a redistribution. It is under vendor/ for a \
           BUILD reason: crates/aterm-link path-depended on a sibling checkout most clones do \
           not have, so cargo build never built the fabric bridge and no release ever shipped \
@@ -37,7 +40,18 @@ pub const FIRST_PARTY_VENDORED: &[FirstPartyVendored] = &[FirstPartyVendored {
           since astream-cap's SHA-256 became astream-digest and the sealed transport, with \
           its astream-aead, was removed, 2026-10-15) are unaffected by this row and stay on \
           the ratchet.",
-}];
+    },
+    FirstPartyVendored {
+        dir: "vendor/trust-build-cpu",
+        upstream: "Trust crates/trust-build-cpu; the manifest records its exact source commit",
+        why: "Original Andrew Yates code shared with the Trust compiler. Its Rust sources and \
+          README are byte-identical to the recorded Trust commit; vendor/README-trust-build-cpu.md \
+          records their hashes and the retained licences. The standalone manifest materializes \
+          upstream workspace properties. A path dependency keeps hermetic releases and public \
+          clones complete without fetching an unpublished Git commit. This does not exempt \
+          its registry dependencies from the third-party ratchet.",
+    },
+];
 
 /// The roster row whose directory contains `rel`, if any.
 #[must_use]
@@ -61,10 +75,15 @@ pub fn is_first_party(root: &Path, dir: &Path) -> bool {
     dir.starts_with(root.join("crates")) || is_first_party_vendored(root, dir)
 }
 
-/// A resolved Git source from this workspace's repository owner, pinned to its
-/// full commit. Directory names and a dependency's self-reported author are not
-/// provenance. The source is supplied by the locked resolver, not the checkout.
-pub(crate) fn is_first_party_git(root: &Path, source: &str) -> bool {
+// Reviewed original components, not arbitrary repositories under the same
+// account. trust-build-cpu is original Trust code shared by the compiler and
+// aterm; a same-account mirror or fork retains its upstream authorship.
+const FIRST_PARTY_GIT_COMPONENTS: &[(&str, &str)] = &[("trust-build-cpu", "trust")];
+
+/// A reviewed original component from this workspace's repository owner,
+/// pinned to its full commit. Account ownership alone does not establish code
+/// authorship. The source is supplied by the locked resolver, not the checkout.
+pub(crate) fn is_first_party_git(root: &Path, package: &str, source: &str) -> bool {
     let Some(repository) = crate::read_regular_text(root.join("Cargo.toml"))
         .ok()
         .and_then(|text| text.parse::<aterm_toml::edit::DocumentMut>().ok())
@@ -78,11 +97,11 @@ pub(crate) fn is_first_party_git(root: &Path, source: &str) -> bool {
     else {
         return false;
     };
-    pinned_git_same_owner(&repository, source)
+    pinned_first_party_git(&repository, package, source)
 }
 
-fn pinned_git_same_owner(repository: &str, source: &str) -> bool {
-    fn owner(repository: &str) -> Option<&str> {
+fn pinned_first_party_git(repository: &str, package: &str, source: &str) -> bool {
+    fn parts(repository: &str) -> Option<(&str, &str)> {
         let path = repository.strip_prefix("https://github.com/")?;
         let (owner, project) = path.split_once('/')?;
         let valid = |part: &str| {
@@ -91,7 +110,8 @@ fn pinned_git_same_owner(repository: &str, source: &str) -> bool {
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
         };
-        (valid(owner) && valid(project) && project != "." && project != "..").then_some(owner)
+        (valid(owner) && valid(project) && project != "." && project != "..")
+            .then_some((owner, project.strip_suffix(".git").unwrap_or(project)))
     }
     let Some((url, query)) = source
         .strip_prefix("git+")
@@ -111,8 +131,13 @@ fn pinned_git_same_owner(repository: &str, source: &str) -> bool {
     {
         return false;
     }
-    match (owner(repository), owner(url)) {
-        (Some(workspace), Some(dependency)) => workspace.eq_ignore_ascii_case(dependency),
+    match (parts(repository), parts(url)) {
+        (Some((workspace, _)), Some((dependency, project))) => {
+            workspace.eq_ignore_ascii_case(dependency)
+                && FIRST_PARTY_GIT_COMPONENTS
+                    .iter()
+                    .any(|&(name, repo)| name == package && repo == project)
+        }
         _ => false,
     }
 }
@@ -142,11 +167,14 @@ pub fn stale_rows(root: &Path) -> Vec<&'static FirstPartyVendored> {
         .collect()
 }
 
-/// Workspace members under `crates/` whose manifest carries a `path = …` dependency resolving
-/// inside `rel_root`, sorted and deduplicated.
+/// Consumers under `crates/` whose dependency resolves inside `rel_root`,
+/// including paths inherited from the workspace, sorted and deduplicated.
 #[must_use]
 pub fn path_dependants(root: &Path, rel_root: &str) -> Vec<String> {
-    let target = root.join(rel_root);
+    let target = normalize(&root.join(rel_root));
+    let workspace = crate::read_regular_text(root.join("Cargo.toml"))
+        .ok()
+        .and_then(|text| text.parse::<DocumentMut>().ok());
     let mut out: Vec<String> = Vec::new();
     let Ok(entries) = std::fs::read_dir(root.join("crates")) else {
         return out;
@@ -157,9 +185,12 @@ pub fn path_dependants(root: &Path, rel_root: &str) -> Vec<String> {
         let Ok(text) = crate::read_regular_text(&manifest) else {
             continue;
         };
-        if !path_deps(&text)
+        let Ok(doc) = text.parse::<DocumentMut>() else {
+            continue;
+        };
+        if !dependency_paths(&doc, workspace.as_ref(), root, &member)
             .iter()
-            .any(|p| normalize(&member.join(p)).starts_with(&target))
+            .any(|path| path.starts_with(&target))
         {
             continue;
         }
@@ -171,34 +202,45 @@ pub fn path_dependants(root: &Path, rel_root: &str) -> Vec<String> {
     out
 }
 
-const fn is_toml_key_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
-}
-
-fn path_deps(manifest: &str) -> Vec<String> {
-    let bytes = manifest.as_bytes();
-    let mut out = Vec::new();
-    for (i, _) in manifest.match_indices("path") {
-        if i > 0 && is_toml_key_byte(bytes[i - 1]) {
-            continue;
+fn dependency_paths(
+    manifest: &DocumentMut,
+    workspace: Option<&DocumentMut>,
+    root: &Path,
+    member: &Path,
+) -> Vec<PathBuf> {
+    let kinds = ["dependencies", "dev-dependencies", "build-dependencies"];
+    let mut tables: Vec<&dyn TableLike> = kinds
+        .iter()
+        .filter_map(|key| manifest.get(key).and_then(Item::as_table_like))
+        .collect();
+    if let Some(targets) = manifest.get("target").and_then(Item::as_table_like) {
+        for (_, target) in targets.iter() {
+            for kind in kinds {
+                if let Some(table) = target.get(kind).and_then(Item::as_table_like) {
+                    tables.push(table);
+                }
+            }
         }
-        let line_prefix = manifest[..i].rsplit('\n').next().unwrap_or("");
-        if line_prefix.contains('#') {
-            continue;
-        }
-        let rest = &manifest[i + "path".len()..];
-        let rest = rest.trim_start();
-        let Some(rest) = rest.strip_prefix('=') else {
-            continue;
-        };
-        let rest = rest.trim_start();
-        let Some(rest) = rest.strip_prefix('"') else {
-            continue;
-        };
-        let Some(end) = rest.find('"') else { continue };
-        out.push(rest[..end].to_string());
     }
-    out
+    tables
+        .into_iter()
+        .flat_map(TableLike::iter)
+        .filter_map(|(alias, entry)| {
+            let spec = entry.as_table_like()?;
+            let (base, path) = if spec.get("workspace").and_then(Item::as_bool) == Some(true) {
+                let path = workspace?
+                    .get("workspace")?
+                    .get("dependencies")?
+                    .get(alias)?
+                    .get("path")?
+                    .as_str()?;
+                (root, path)
+            } else {
+                (member, spec.get("path")?.as_str()?)
+            };
+            Some(normalize(&base.join(path)))
+        })
+        .collect()
 }
 
 fn normalize(path: &Path) -> PathBuf {
@@ -220,14 +262,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn git_ownership_requires_the_same_account_and_an_immutable_resolved_pin() {
+    fn git_ownership_requires_a_reviewed_component_and_an_immutable_resolved_pin() {
         let repository = "https://github.com/our-account/aterm";
         let hash = "1234567890123456789012345678901234567890";
         let source = |owner: &str, query: &str, resolved: &str| {
-            format!("git+https://github.com/{owner}/core.git?{query}#{resolved}")
+            format!("git+https://github.com/{owner}/trust.git?{query}#{resolved}")
         };
-        assert!(pinned_git_same_owner(
+        assert!(pinned_first_party_git(
             repository,
+            "trust-build-cpu",
+            &source("our-account", &format!("rev={hash}"), hash)
+        ));
+        let ring_fork = format!("git+https://github.com/our-account/ring.git?rev={hash}#{hash}");
+        assert!(!pinned_first_party_git(repository, "ring", &ring_fork));
+        assert!(!pinned_first_party_git(
+            repository,
+            "trust-build-cpu",
+            &ring_fork
+        ));
+        assert!(!pinned_first_party_git(
+            repository,
+            "ring",
             &source("our-account", &format!("rev={hash}"), hash)
         ));
         for candidate in [
@@ -244,7 +299,7 @@ mod tests {
             format!("git+https://our-account@github.com/other/core?rev={hash}#{hash}"),
         ] {
             assert!(
-                !pinned_git_same_owner(repository, &candidate),
+                !pinned_first_party_git(repository, "trust-build-cpu", &candidate),
                 "accepted {candidate}"
             );
         }
@@ -252,10 +307,19 @@ mod tests {
 
     #[test]
     fn path_values_are_read_out_of_a_manifest_and_relative_parts_resolve() {
-        let m = "[dependencies]\nastream-broker = { path = \"../../vendor/astream/crates/astream-broker\", features = [\"cap\"] }\nother.workspace = true\n";
+        let paths = |manifest: &str| {
+            dependency_paths(
+                &manifest.parse().unwrap(),
+                None,
+                Path::new("/w"),
+                Path::new("/w/crates/member"),
+            )
+        };
         assert_eq!(
-            path_deps(m),
-            vec!["../../vendor/astream/crates/astream-broker".to_string()]
+            paths(
+                "[dependencies]\nastream-broker = { path = \"../../vendor/astream/crates/astream-broker\", features = [\"cap\"] }\nother.workspace = true\n"
+            ),
+            vec![PathBuf::from("/w/vendor/astream/crates/astream-broker")]
         );
         assert_eq!(
             normalize(Path::new(
@@ -264,10 +328,79 @@ mod tests {
             PathBuf::from("/w/vendor/astream/crates/x")
         );
         assert_eq!(
-            path_deps(
+            paths(
                 "[dependencies]\nx = \"1\"\nxpath = \"vendor/fake\"\n# path = \"vendor/commented\"\n"
             ),
-            Vec::<String>::new()
+            Vec::<PathBuf>::new()
         );
+    }
+
+    #[test]
+    fn inherited_paths_follow_aliases_and_workspace_relative_paths() {
+        let workspace = "[workspace.dependencies]\ncpu = { package = 'trust-build-cpu', path = 'vendor/trust-build-cpu' }\nunused = { path = 'vendor/unused' }\nregistry = '1'\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+        let manifest = "[dependencies]\ncpu.workspace = true\nregistry.workspace = true\nmissing.workspace = true\n[build-dependencies.cpu]\nworkspace = true\n[target.'cfg(unix)'.dev-dependencies]\ncpu = { workspace = true }\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            dependency_paths(
+                &manifest,
+                Some(&workspace),
+                Path::new("/w"),
+                Path::new("/w/crates/member"),
+            ),
+            vec![PathBuf::from("/w/vendor/trust-build-cpu"); 3]
+        );
+        assert!(
+            dependency_paths(
+                &manifest,
+                None,
+                Path::new("/w"),
+                Path::new("/w/crates/member"),
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn only_dependency_tables_establish_consumers() {
+        let manifest = "[package]\nname = 'member'\n[package.metadata]\npath = '../../vendor/fake'\n[lib]\npath = '../../vendor/not-a-dependency/lib.rs'\n[dependencies.direct]\npath = '../../vendor/direct'\n[target.'cfg(unix)'.build-dependencies]\nplatform = { path = '../../vendor/platform' }\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            dependency_paths(
+                &manifest,
+                None,
+                Path::new("/w"),
+                Path::new("/w/crates/member"),
+            ),
+            vec![
+                PathBuf::from("/w/vendor/direct"),
+                PathBuf::from("/w/vendor/platform")
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unused_workspace_path_is_not_a_consumer() {
+        let temp = aterm_tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let member = root.join("crates/member");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace.dependencies]\ncpu = { path = 'vendor/trust-build-cpu' }\n",
+        )
+        .unwrap();
+        let manifest = member.join("Cargo.toml");
+        std::fs::write(&manifest, "[dependencies]\ncpu.workspace = true\n").unwrap();
+        assert_eq!(path_dependants(root, "vendor/trust-build-cpu"), ["member"]);
+        std::fs::write(
+            &manifest,
+            "[package.metadata]\npath = '../../vendor/trust-build-cpu'\n",
+        )
+        .unwrap();
+        assert!(path_dependants(root, "vendor/trust-build-cpu").is_empty());
     }
 }

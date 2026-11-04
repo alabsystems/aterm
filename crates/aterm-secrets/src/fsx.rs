@@ -385,6 +385,19 @@ pub fn read_public(path: &Path, max: usize) -> crate::Result<Option<Vec<u8>>> {
 
 /// Writes `bytes` atomically to `path` with permissions `mode`.
 pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> crate::Result<()> {
+    write_atomic_with(path, mode, |writer| writer.write_all(bytes))
+}
+
+/// Produce a file atomically with [`write_atomic`]'s parent and durability rules.
+/// The producer must flush any buffer it owns before returning success.
+///
+/// # Errors
+/// As [`write_atomic`], or the producer fails before the temporary is committed.
+pub fn write_atomic_with(
+    path: &Path,
+    mode: u32,
+    produce: impl FnOnce(&mut dyn Write) -> io::Result<()>,
+) -> crate::Result<()> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())
         && kind(parent)? != Kind::Dir
     {
@@ -393,7 +406,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> crate::Result<()> {
             parent.display()
         )));
     }
-    aterm_uds::atomic_file::write(path, bytes, mode)
+    aterm_uds::atomic_file::write_with(path, mode, produce)
         .map_err(|e| Error::new(format!("{}: {e}", path.display())))
 }
 
@@ -515,6 +528,28 @@ pub fn stamp(path: &Path) -> Option<FileStamp> {
 /// write cut short leaves part of `bytes` on the end of the file; its writer replaces the file
 /// whole then.
 pub fn append_at(path: &Path, expected: &FileStamp, bytes: &[u8]) -> crate::Result<FileStamp> {
+    append_at_with(path, expected, bytes.len(), |writer| {
+        writer.write_all(bytes)
+    })
+}
+
+/// Append exactly `length` produced bytes under [`append_at`]'s file-identity rules.
+/// The producer must flush its buffers before returning. An oversized write is refused
+/// before any byte of that write reaches the file; a short or failed producer is not durable.
+///
+/// # Errors
+/// As [`append_at`], or production is short, exceeds `length`, or overflows the file length.
+pub fn append_at_with(
+    path: &Path,
+    expected: &FileStamp,
+    length: usize,
+    produce: impl FnOnce(&mut dyn Write) -> io::Result<()>,
+) -> crate::Result<FileStamp> {
+    let added = u64::try_from(length).map_err(|_| Error::new("append length is out of range"))?;
+    let _end = expected
+        .len
+        .checked_add(added)
+        .ok_or_else(|| Error::new("append length is out of range"))?;
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())
         && kind(parent)? != Kind::Dir
     {
@@ -540,11 +575,54 @@ pub fn append_at(path: &Path, expected: &FileStamp, bytes: &[u8]) -> crate::Resu
             {
                 return Err(io::Error::other("not the file this writer last left"));
             }
-            file.write_all(bytes)?;
+            {
+                let mut exact = ExactWriter {
+                    writer: &mut file,
+                    remaining: length,
+                };
+                produce(&mut exact)?;
+                exact.finish()?;
+            }
             aterm_durable::durable_data(&file)?;
             file.metadata().map(|after| FileStamp::of(&after))
         });
     appended.map_err(|e| Error::new(format!("{}: {e}", path.display())))
+}
+
+struct ExactWriter<'a> {
+    writer: &'a mut dyn Write,
+    remaining: usize,
+}
+
+impl ExactWriter<'_> {
+    fn finish(&self) -> io::Result<()> {
+        if self.remaining == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "append producer wrote too few bytes",
+            ))
+        }
+    }
+}
+
+impl Write for ExactWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > self.remaining {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "append producer exceeded its length",
+            ));
+        }
+        let written = self.writer.write(bytes)?;
+        self.remaining -= written;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
 }
 
 /// [`write_atomic`], returning the [`FileStamp`] of the file it placed: the one an `lstat` of
@@ -561,30 +639,45 @@ pub fn write_atomic_stamped(
     bytes: &[u8],
     mode: u32,
 ) -> crate::Result<Option<FileStamp>> {
-    let (tmp, mut file) = temp_beside(path, mode)?;
-    let placed = file
-        .write_all(bytes)
-        .and_then(|()| file.set_permissions(std::fs::Permissions::from_mode(mode)))
-        .and_then(|()| aterm_durable::durable(&file))
-        .and_then(|()| file.metadata())
-        .and_then(|meta| {
-            drop(file);
-            std::fs::rename(&tmp, path).map(|()| (meta.dev(), meta.ino()))
-        });
-    let (dev, ino) = placed.map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        Error::new(format!("{}: {e}", path.display()))
-    })?;
-    let dir = match path.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => dir,
-        _ => Path::new("."),
-    };
-    // A directory whose entries cannot be flushed here is accepted, as `write_atomic` accepts it.
-    let _flushed_or_unavailable =
-        aterm_durable::DirFlushed::classify(aterm_durable::Flush::Durable.dir(dir))
-            .map_err(|e| Error::new(format!("{}: {e}", dir.display())))?;
-    Ok(stamp(path).filter(|placed| placed.dev == dev && placed.ino == ino))
+    write_atomic_stamped_with(path, mode, |writer| writer.write_all(bytes))
 }
+
+/// [`write_atomic_stamped`] with a producer instead of a complete byte buffer.
+/// The producer must flush any buffering before it returns.
+///
+/// # Errors
+/// As [`write_atomic_stamped`], or the producer fails before the temporary is committed.
+pub fn write_atomic_stamped_with(
+    path: &Path,
+    mode: u32,
+    produce: impl FnOnce(&mut dyn Write) -> io::Result<()>,
+) -> crate::Result<Option<FileStamp>> {
+    write_atomic_stamped_after(path, mode, produce, || {})
+}
+
+fn write_atomic_stamped_after(
+    path: &Path,
+    mode: u32,
+    produce: impl FnOnce(&mut dyn Write) -> io::Result<()>,
+    after: impl FnOnce(),
+) -> crate::Result<Option<FileStamp>> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())
+        && kind(parent)? != Kind::Dir
+    {
+        return Err(Error::new(format!(
+            "{}: no such directory",
+            parent.display()
+        )));
+    }
+    let written = aterm_uds::atomic_file::write_with_metadata(path, mode, produce)
+        .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+    after();
+    Ok(stamp(path).filter(|placed| placed.dev == written.dev() && placed.ino == written.ino()))
+}
+
+#[cfg(test)]
+#[path = "fsx_stream_tests.rs"]
+mod stream_tests;
 
 /// [`write_atomic`] for one of many files a pass writes: the temporary file's bytes ordered
 /// before its rename ([`aterm_durable::ordered`]) and no flush of the directory, which the

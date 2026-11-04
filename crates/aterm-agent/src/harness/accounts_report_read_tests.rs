@@ -255,7 +255,7 @@ fn only_the_supplied_roster_target_can_complete_its_pending_report() {
         })
         .unwrap();
     let path = root.path().join("accounts.toml");
-    let target = append_row("", "main", Class::Dedicated, Some(at!("/old"))).unwrap();
+    let target = append_row("", "main", Class::Preferred, Some(at!("/old"))).unwrap();
     pause(&store, || {
         let held = store.acquire().unwrap();
         store.transact_sync_held(

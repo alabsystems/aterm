@@ -644,6 +644,7 @@ impl App {
         match app.kind() {
             crate::native_app::AppKind::Mail => Some(restore::NativeTabRestore::Mail),
             crate::native_app::AppKind::About => Some(restore::NativeTabRestore::About),
+            crate::native_app::AppKind::Allocation => Some(restore::NativeTabRestore::Allocation),
             crate::native_app::AppKind::SystemState => Some(restore::NativeTabRestore::SystemState),
             crate::native_app::AppKind::Settings => {
                 let crate::native_app::AppViewState::Settings(state) =
@@ -666,6 +667,7 @@ impl App {
                     crate::native_app::AppKind::Mail
                     | crate::native_app::AppKind::About
                     | crate::native_app::AppKind::Settings
+                    | crate::native_app::AppKind::Allocation
                     | crate::native_app::AppKind::SystemState => unreachable!(),
                     crate::native_app::AppKind::Recovery => unreachable!(),
                     crate::native_app::AppKind::Workers => unreachable!(),
@@ -874,6 +876,10 @@ impl App {
                 }
                 let mut descriptor = match (app.kind(), state) {
                     (
+                        crate::native_app::AppKind::Allocation,
+                        crate::native_app::AppViewState::Allocation(_),
+                    ) => restore::NativeLeafRestore::allocation(),
+                    (
                         crate::native_app::AppKind::Mail,
                         crate::native_app::AppViewState::Mail(_),
                     ) => restore::NativeLeafRestore::mail(),
@@ -912,6 +918,7 @@ impl App {
                 match state {
                     crate::native_app::AppViewState::About(_)
                     | crate::native_app::AppViewState::Mail(_)
+                    | crate::native_app::AppViewState::Allocation(_)
                     | crate::native_app::AppViewState::Workers(_)
                     | crate::native_app::AppViewState::SystemState(_) => {}
                     crate::native_app::AppViewState::Settings(settings) => {
@@ -991,6 +998,7 @@ impl App {
             crate::native_app::AppViewState::About(_)
             | crate::native_app::AppViewState::Mail(_)
             | crate::native_app::AppViewState::Settings(_)
+            | crate::native_app::AppViewState::Allocation(_)
             | crate::native_app::AppViewState::Workers(_)
             | crate::native_app::AppViewState::SystemState(_) => true,
             crate::native_app::AppViewState::Markdown(markdown) => {
@@ -3734,6 +3742,10 @@ impl App {
         let mut reads_harness = false;
         let mut reads_lab = false;
         match descriptor.restore_tag.as_str() {
+            "allocation" => {
+                self.stage_allocation_tab(wid)
+                    .map_err(|why| format!("Allocation could not be reopened: {why:?}"))?;
+            }
             "mail" => {
                 self.stage_mail_tab(wid)?;
             }
@@ -4053,6 +4065,7 @@ impl App {
             | crate::native_app::AppKind::Settings
             | crate::native_app::AppKind::SystemState
             | crate::native_app::AppKind::Recovery
+            | crate::native_app::AppKind::Allocation
             | crate::native_app::AppKind::Workers => {
                 return Err("restore descriptor is not a document app".to_string());
             }
@@ -4396,6 +4409,10 @@ impl App {
         descriptor: &restore::NativeTabRestore,
     ) -> Option<crate::tab_model::TabId> {
         let result = match descriptor {
+            restore::NativeTabRestore::Allocation => self
+                .stage_allocation_tab(wid)
+                .map(|_| ())
+                .map_err(|why| format!("Allocation could not be restored: {why:?}")),
             restore::NativeTabRestore::Mail => self.stage_mail_tab(wid).map(|_| ()),
             restore::NativeTabRestore::About => self
                 .open_about_tab_in_window(wid)

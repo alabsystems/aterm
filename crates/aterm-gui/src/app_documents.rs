@@ -5502,6 +5502,7 @@ impl App {
             | AppKind::Settings
             | AppKind::SystemState
             | AppKind::Recovery
+            | AppKind::Allocation
             | AppKind::Workers => {
                 return Err("requested app is not a document app".to_string());
             }
@@ -5526,6 +5527,7 @@ impl App {
                     | AppKind::Settings
                     | AppKind::SystemState
                     | AppKind::Recovery
+                    | AppKind::Allocation
                     | AppKind::Workers => {
                         return Err("requested app is not a document app".to_string());
                     }
@@ -5665,6 +5667,7 @@ impl App {
             | AppKind::Settings
             | AppKind::SystemState
             | AppKind::Recovery
+            | AppKind::Allocation
             | AppKind::Workers => Err("requested app is not a document app".to_string()),
         }
     }

@@ -29,13 +29,20 @@ pub fn fresh() -> io::Result<Key> {
 /// the key's sector first, [`DISK_BYTES`] long and sparse.
 ///
 /// # Errors
-/// It could not be removed, made or written.
+/// `path`'s parent directory is not this user's plain directory, or the disk could not be
+/// removed, made or written.
 pub fn write_disk(path: &Path, key: &Key) -> io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt as _;
     let parent = path
         .parent()
         .filter(|dir| !dir.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
+    if !crate::record::owned_plain_dir(parent) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{}: not this user's plain directory", parent.display()),
+        ));
+    }
     let stage = aterm_tempfile::Builder::new()
         .prefix(".key-")
         .tempdir_in(parent)?;
@@ -50,6 +57,12 @@ pub fn write_disk(path: &Path, key: &Key) -> io::Result<()> {
     f.set_len(DISK_BYTES)?;
     aterm_durable::durable(&f)?;
     drop(f);
+    if !crate::record::owned_plain_dir(parent) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{}: not this user's plain directory", parent.display()),
+        ));
+    }
     std::fs::rename(&staged, path)?;
     aterm_durable::durable_dir(parent)
 }
@@ -95,5 +108,20 @@ mod tests {
         let _fail = aterm_durable::seam::FailingDirs::with(aterm_durable::seam::EIO);
         let err = write_disk(&path, &key).expect_err("parent dir EIO must fail write_disk");
         assert_eq!(err.raw_os_error(), Some(aterm_durable::seam::EIO));
+    }
+
+    /// NEGATIVE CONTROL: `write_disk` refuses a symlinked parent directory without staging or
+    /// renaming the boot's secret key into the symlink's target.
+    #[test]
+    fn write_disk_refuses_symlinked_parent_directory() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let linked = dir.path().join("run");
+        std::os::unix::fs::symlink(&outside, &linked).unwrap();
+        let key = fresh().unwrap();
+
+        assert!(write_disk(&linked.join("key.img"), &key).is_err());
+        assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
     }
 }

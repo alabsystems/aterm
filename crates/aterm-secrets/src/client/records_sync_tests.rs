@@ -426,6 +426,83 @@ fn bounded_member_records_pull_retains_verified_records_without_reposting() {
     fixture.host.end();
 }
 
+#[test]
+fn an_empty_past_does_not_consume_another_servers_post_verdict() {
+    struct StopHost(Option<RecordsHost>);
+    impl std::ops::Deref for StopHost {
+        type Target = RecordsHost;
+        fn deref(&self) -> &Self::Target {
+            self.0.as_ref().unwrap()
+        }
+    }
+    impl Drop for StopHost {
+        fn drop(&mut self) {
+            if let Some(host) = self.0.take() {
+                host.end();
+            }
+        }
+    }
+
+    let _answering = ServersAnswering::set();
+    let root = aterm_tempfile::tempdir().unwrap();
+    let Lacking { host, member, .. } = lacking(root.path(), 400);
+    let primary = StopHost(Some(host));
+    let status = Arc::new(AtomicUsize::new(500));
+    let reply_status = Arc::clone(&status);
+    let peer = StopHost(Some(RecordsHost::start_with(
+        Box::new(|_| (Vec::new(), true)),
+        Box::new(move |_| reply_status.load(Ordering::SeqCst) as u16),
+    )));
+    let primary_url = primary.url("team");
+    let peer_url = peer.url("team");
+    let store = load_records(&member).unwrap();
+    let frontier = sha256(&store.frontier().concat());
+    // This server previously judged every current record but a different frontier marker.
+    // Its Past is empty, while the other server still needs the Whole selection.
+    Reposted::posted(
+        &member,
+        &primary_url,
+        &[0; 32],
+        store.have(),
+        Posting::Whole { boot_reset: false },
+        None,
+    );
+    let peers = vec![peer_url.clone()];
+    let found = PeerDiscovery::selected(&peers);
+    let first = sync_records_inner(&member, None, &[], Some(&found), None);
+    let primary_judged = Reposted::due(&member, &primary_url, &frontier, None).is_none();
+    let peer_unjudged = matches!(
+        Reposted::due(&member, &peer_url, &frontier, None),
+        Some(Repost::Whole { .. })
+    );
+    let first_posts = (primary.posts(), peer.posts());
+
+    // A transport/storage failure did not judge the peer's post. A definite400 does, even
+    // though it refused the records, and the empty primary still consumes no answer.
+    status.store(400, Ordering::SeqCst);
+    Reposted::posted(
+        &member,
+        &primary_url,
+        &[0; 32],
+        store.have(),
+        Posting::Whole { boot_reset: false },
+        None,
+    );
+    let second = sync_records_inner(&member, None, &[], Some(&found), None);
+    let peer_judged = Reposted::due(&member, &peer_url, &frontier, None).is_none();
+    let final_posts = (primary.posts(), peer.posts());
+    drop(peer);
+    drop(primary);
+
+    assert_eq!(first.unwrap(), 0);
+    assert_eq!(second.unwrap(), 0);
+    assert!(primary_judged, "the empty Past was not recorded");
+    assert!(peer_unjudged, "a500 response judged the nonempty post");
+    assert!(peer_judged, "a400 response did not judge the retry");
+    assert_eq!(first_posts, (0, 1));
+    assert_eq!(final_posts, (0, 2));
+}
+
 /// A records pass that waits on nothing asks the vault's peers beside its source, not after it:
 /// a source that answers nothing must not spend a bounded pass's deadline (a member's freshness
 /// read before it lets a Mac in, `readmit::FRESH_WITHIN`, inside the fleet listener's handshake

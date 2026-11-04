@@ -232,7 +232,7 @@ fn answered(path: &Path, kept: &str) -> bool {
     }
     let mut twin = path.as_os_str().to_owned();
     twin.push(".stderr");
-    std::fs::read_to_string(PathBuf::from(twin)).is_ok_and(|h| h.starts_with("OK"))
+    crate::util::read_regular_text(&PathBuf::from(twin)).is_ok_and(|h| h.starts_with("OK"))
 }
 
 /// Read the frame at `png` from its sidecars; `Ok(None)` when it has no `trail status` sidecar.

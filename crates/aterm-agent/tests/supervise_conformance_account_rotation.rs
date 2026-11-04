@@ -77,7 +77,7 @@ const SEEN: [&str; 13] = [
 const DEFECTS: [&str; 10] = [
     "RotatesIntoALimited",
     "WallUnread",
-    "SharedFirst",
+    "PoolFirst",
     "LowFirst",
     "FollowsUnproven",
     "WaitsOnTheWall",
@@ -109,9 +109,9 @@ impl World {
         };
         let roster = Roster {
             rows: vec![
-                row("main", Class::Dedicated, None),
-                row("work-2", Class::Dedicated, Some("/logins/work-2")),
-                row("pool-a", Class::Shared, Some("/logins/pool-a")),
+                row("main", Class::Preferred, None),
+                row("work-2", Class::Preferred, Some("/logins/work-2")),
+                row("pool-a", Class::Pool, Some("/logins/pool-a")),
             ],
         };
         let enrolled = roster.rows.iter().map(|r| r.label.clone()).collect();
@@ -694,7 +694,7 @@ fn decision(action: &str, before: &State, after: &State) -> Option<(usize, Ask, 
         "Leave1" => moved(0, Ask::TurnEnd, true),
         "Leave2" => moved(1, Ask::TurnEnd, true),
         "RotatesIntoALimited"
-        | "SharedFirst"
+        | "PoolFirst"
         | "LowFirst"
         | "MovesEarlyUnderAPin"
         | "RotatesPastTheBreaker" => moved(0, Ask::ItsPoint, false),
@@ -1590,7 +1590,7 @@ fn mirror(
             accounts::note_wall(real, w.named(2), WINDOW, until, now, now);
         }
         "RotatesIntoALimited"
-        | "SharedFirst"
+        | "PoolFirst"
         | "LowFirst"
         | "FollowsUnproven"
         | "WaitsOnTheWall"

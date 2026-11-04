@@ -23,6 +23,9 @@ use crate::triple::{
     X86_64_UNKNOWN_LINUX_GNU,
 };
 
+mod git_macos;
+mod git_text;
+
 /// `pack-bottle`'s usage synopsis.
 pub const SYNOPSIS: &str = "pack-bottle <program> --archive <path> --version <ver> --build <N> \
      [--triple T] [--strip-components K] [--dep-bottle PATH]… [--donor-root DIR]… \
@@ -32,6 +35,7 @@ pub const SYNOPSIS: &str = "pack-bottle <program> --archive <path> --version <ve
 const GIT_WRAPPER: &str = "#!/bin/sh\n\
 __atpkg_bin_dir=$(CDPATH='' cd -- \"$(dirname -- \"$0\")\" && pwd -P) || exit 1\n\
 __atpkg_root=$(dirname -- \"$__atpkg_bin_dir\")\n\
+export ATERM_GIT_ROOT=\"$__atpkg_root\"\n\
 export GIT_EXEC_PATH=\"${GIT_EXEC_PATH:-$__atpkg_root/libexec/git-core}\"\n\
 if [ -d \"$__atpkg_root/share/git-core/templates\" ]; then\n\
   export GIT_TEMPLATE_DIR=\"${GIT_TEMPLATE_DIR:-$__atpkg_root/share/git-core/templates}\"\n\
@@ -633,6 +637,7 @@ pub fn install_git_wrapper(program: &str, stage: &Path) -> Result<bool> {
 }
 
 fn check_stage_tree(
+    program: &str,
     stage: &Path,
     triple: Triple,
     exposes: &[&str],
@@ -661,6 +666,12 @@ fn check_stage_tree(
             break;
         }
         if arch::read(&path).is_some() {
+            if program == "git" {
+                let bytes = crate::identity::read_regular_bytes(&path, 64 * 1024 * 1024)
+                    .map_err(|error| Error::io(format!("read {}", path.display()), &error))?;
+                git_macos::check(&bytes)
+                    .map_err(|why| Error::refused(format!("{}: {why}", rel.display())))?;
+            }
             if backend.is_native_object(&path) {
                 let refs = backend.read_refs(&path).map_err(Error::refused)?;
                 let has_hb = refs
@@ -785,6 +796,9 @@ pub fn pack_bottle_with(
 
     materialize_symlinks(&stage)?;
     rewrite_bottle_text(&stage)?;
+    if program == "git" {
+        git_text::rewrite(&stage, &version)?;
+    }
     let _wrapped = install_git_wrapper(program, &stage)?;
     let mut all_vendored = rewrite_bottle_objects(&stage, &all_donors, backend)?;
     let report =
@@ -795,7 +809,7 @@ pub fn pack_bottle_with(
             all_vendored.push(lib.clone());
         }
     }
-    let objects = check_stage_tree(&stage, request.triple, bottle_def.exposes, backend)?;
+    let objects = check_stage_tree(program, &stage, request.triple, bottle_def.exposes, backend)?;
     eprintln!(
         "atpkg-publish: bottle stage OK — {program} {version} ({}) gated {objects} object(s), \
          vendored {} lib(s)",
@@ -1597,7 +1611,14 @@ mod tests {
             },
         );
         assert!(
-            check_stage_tree(&bad_stage, AARCH64_APPLE_DARWIN, &["gh"], &bad_backend).is_err(),
+            check_stage_tree(
+                "gh",
+                &bad_stage,
+                AARCH64_APPLE_DARWIN,
+                &["gh"],
+                &bad_backend
+            )
+            .is_err(),
             "leftover @@HOMEBREW_*@@ load command on native object must fail closed"
         );
 

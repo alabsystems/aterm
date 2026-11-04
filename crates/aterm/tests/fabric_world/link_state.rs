@@ -11,7 +11,7 @@ use std::os::unix::net::UnixListener;
 use std::time::{Duration, Instant};
 
 use astream_broker::Broker;
-use harness::{FLEET, SECRET, World, cap_line, kv, node_grants, until};
+use harness::{FLEET, SECRET, World, cap_line, kv, until};
 
 /// `status`'s header for the boot session.
 fn status(w: &World) -> String {
@@ -297,7 +297,9 @@ fn a_broker_that_accepts_but_never_acks_is_stalled_no_ack() {
 fn review_a_bridge_that_cannot_finish_its_attach_never_reads_connected() {
     let fleet_face = format!(":/f/{FLEET}/fleet/>");
     let w = World::boot_with_grants("r13-nofleet", &|node| {
-        node_grants(node)
+        astream_cap::GrantCeiling::aterm_node_ring(FLEET, node)
+            .expect("a node ring")
+            .rules()
             .into_iter()
             .filter(|g| !g.ends_with(&fleet_face))
             .collect()
@@ -343,7 +345,9 @@ fn review_a_bridge_that_cannot_finish_its_attach_never_reads_connected() {
 #[test]
 fn a_renewed_cap_is_attached_at_the_next_redial_without_a_restart() {
     let w = World::boot_with_grants("cap-renew", &|node| {
-        node_grants(node)
+        astream_cap::GrantCeiling::aterm_node_ring(FLEET, node)
+            .expect("a node ring")
+            .rules()
             .into_iter()
             .map(|g| g.replacen(':', ",exp=1:", 1))
             .collect()
@@ -353,7 +357,12 @@ fn a_renewed_cap_is_attached_at_the_next_redial_without_a_restart() {
         (kv(&fs, "state") == Some("stalled") && kv(&fs, "reason") == Some("expired")).then_some(())
     });
     let pid = w.bridge_pid();
-    let renewed: String = node_grants(&w.node).iter().map(|g| cap_line(g)).collect();
+    let renewed: String = astream_cap::GrantCeiling::aterm_node_ring(FLEET, &w.node)
+        .expect("a node ring")
+        .rules()
+        .iter()
+        .map(|g| cap_line(g))
+        .collect();
     let staged = w.tmp.join("node.cap.renewed");
     harness::write_cap(&staged, renewed);
     std::fs::rename(&staged, w.tmp.join("node.cap")).expect("install it over node.cap");

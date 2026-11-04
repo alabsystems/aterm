@@ -1531,7 +1531,7 @@ pub(crate) struct Frame {
 
 impl Frame {
     fn read(png: &Path) -> Option<Frame> {
-        let bytes = std::fs::read(png).ok()?;
+        let bytes = crate::util::read_regular_file(png).ok()?;
         let (rgba, w, h) = aterm_png::decode_rgba8(&bytes, 1 << 15)?;
         Some(Frame { rgba, w, h })
     }

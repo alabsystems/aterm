@@ -1238,22 +1238,35 @@ fn seam() -> Option<String> {
     aterm_types::dev_seam!("ATERM_WATCHDOG").map(|v| v.to_string_lossy().trim().to_string())
 }
 
-fn enabled() -> bool {
-    !seam().is_some_and(|v| {
+fn enabled_for(seam: Option<&str>) -> bool {
+    !seam.is_some_and(|v| {
+        let v = v.trim();
         v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("0") || v.is_empty()
     })
 }
 
-fn threshold() -> Duration {
-    if cfg!(debug_assertions) || seam().is_some() {
+fn enabled() -> bool {
+    enabled_for(seam().as_deref())
+}
+
+const fn threshold_for(debug_assertions: bool, seam_present: bool) -> Duration {
+    if debug_assertions || seam_present {
         STALL_THRESHOLD
     } else {
         RELEASE_STALL_THRESHOLD
     }
 }
 
+fn threshold() -> Duration {
+    threshold_for(cfg!(debug_assertions), seam().is_some())
+}
+
+fn abort_on_stall_for(seam: Option<&str>) -> bool {
+    seam.is_some_and(|v| v.trim().eq_ignore_ascii_case("abort"))
+}
+
 fn abort_on_stall() -> bool {
-    seam().is_some_and(|v| v.eq_ignore_ascii_case("abort"))
+    abort_on_stall_for(seam().as_deref())
 }
 
 /// Spawn the background stall sampler; call once, just before `run_app`.
@@ -1815,18 +1828,33 @@ mod tests {
         }
     }
 
+    /// NEGATIVE CONTROL: `"off"`, `"0"`, and blank seam values disarm the watchdog, while `None` (including every shipped build) keeps it armed.
     #[test]
     fn the_watchdog_is_armed_unless_explicitly_switched_off() {
-        // `enabled()` reads the environment, which is process-global and shared
-        // with every other test in this binary, so assert the decision, not by
-        // mutating the env. With nothing set, it must be on.
-        if seam().is_none() {
-            assert!(
-                enabled(),
-                "a shipped build must arm the stall watchdog: silence is what \
-                 cost five hours on 2026-08-30"
-            );
+        assert!(
+            enabled_for(None),
+            "a shipped build must arm the stall watchdog: silence is what \
+             cost five hours on 2026-08-30"
+        );
+        for on in ["1", "on", "ON", "abort", "ABORT", "custom"] {
+            assert!(enabled_for(Some(on)), "seam `{on}` must stay armed");
         }
+        for off in ["off", "OFF", "Off", "0", "", "   "] {
+            assert!(!enabled_for(Some(off)), "seam `{off}` must disarm");
+        }
+
+        assert_eq!(threshold_for(false, false), RELEASE_STALL_THRESHOLD);
+        assert_eq!(threshold_for(true, false), STALL_THRESHOLD);
+        assert_eq!(threshold_for(false, true), STALL_THRESHOLD);
+        assert_eq!(threshold_for(true, true), STALL_THRESHOLD);
+        assert!(STALL_THRESHOLD < RELEASE_STALL_THRESHOLD);
+        assert!(RELEASE_STALL_THRESHOLD < Duration::from_secs(30));
+
+        assert!(!abort_on_stall_for(None));
+        assert!(!abort_on_stall_for(Some("1")));
+        assert!(!abort_on_stall_for(Some("off")));
+        assert!(abort_on_stall_for(Some("abort")));
+        assert!(abort_on_stall_for(Some(" ABORT ")));
     }
 
     #[test]

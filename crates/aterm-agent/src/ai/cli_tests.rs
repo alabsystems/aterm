@@ -1375,6 +1375,156 @@ fn under_a_pin_on_a_row_of_its_own_a_signed_out_default_row_signs_codex_out() {
     );
 }
 
+/// A runner whose terminal runs exit 0 and whose `codex login status` reads signed in with
+/// ChatGPT, as a Codex sign-in that worked leaves it: by then `b`'s default home holds a login
+/// naming `main`'s email (`own@example.com`), which the pool's check of the account it signed in
+/// reads.
+fn codex_signs_in(b: &Box3) -> FakeRunner {
+    let home = b.home.join(".codex");
+    FakeRunner::with(move |call| {
+        Ok(if call.args == ["login", "status"] {
+            let token = crate::harness::codex_app_login::tests::make_chatgpt_jwt(
+                Some("own@example.com"),
+                "plus",
+                1_800_000_000 + 3600,
+            );
+            std::fs::create_dir_all(&home).expect("Codex's default home");
+            std::fs::write(
+                home.join("auth.json"),
+                aterm_json::json!({"tokens": {"access_token": token}}).to_string(),
+            )
+            .expect("the login Codex's sign-in wrote");
+            ran(0, "Logged in using ChatGPT\n", "")
+        } else {
+            ran(0, "", "")
+        })
+    })
+}
+
+/// AT A TERMINAL, A SIGN-IN THAT LEAVES EVERY LAUNCH REFUSED SAYS THE STEP THAT ENDS IT: on a
+/// Codex build that keeps no row's login its own, under the owner's pin on `work` (a row of its
+/// own) with `main` signed out, the doctor's step is `main`'s sign-in and then its pin; a person
+/// at a terminal runs `aterm ai login codex`, Codex's own login runs and its status reads signed
+/// in, and the run says so, then that a launch is still refused, with the pin that ends it
+/// (`aterm harness accounts use main --cli codex`), and exits 1. CONTROL: with no pin, the same
+/// sign-in says it signed in, names no pin, and exits 0.
+#[test]
+fn at_a_terminal_a_sign_in_that_leaves_every_launch_refused_names_the_pin() {
+    use crate::harness::codex_alab::unread_fix;
+    let now = 1_800_000_000;
+    let signed_in = "codex: signed in (chatgpt)";
+    let b = codex_default_only("");
+    pin_codex(&b, "work", now);
+    sign_main_out(&b, now);
+    let env = pooled_env(&b, &[], true);
+    let (_, f, _) = codex_look(&env);
+    assert_eq!(
+        state::sign_in_then_pin(&f),
+        Some(("main", true)),
+        "PRECONDITION: the step is `main`'s sign-in, then its pin"
+    );
+    let runner = codex_signs_in(&b);
+    let (code, out, err) = run_cli(&env, &runner, &["login", "codex"]);
+    assert!(
+        runner
+            .calls()
+            .iter()
+            .any(|c| c.terminal && c.program == "codex" && c.args == ["login"]),
+        "PRECONDITION: Codex's own login ran: {:?}",
+        runner.calls()
+    );
+    assert!(out.lines().any(|l| l == signed_in), "{out}{err}");
+    let pin = format!("`{}`", unread_fix(Some("main")));
+    let refused = out
+        .lines()
+        .find(|l| l.starts_with("codex: its launches stay refused"))
+        .unwrap_or_else(|| panic!("the refusal that stays: {out}{err}"));
+    assert!(refused.contains(&pin), "{refused}");
+    assert_eq!(code, 1, "{out}{err}");
+
+    let b = codex_default_only("");
+    sign_main_out(&b, now);
+    let env = pooled_env(&b, &[], true);
+    let (code, out, err) = run_cli(&env, &codex_signs_in(&b), &["login", "codex"]);
+    assert!(out.lines().any(|l| l == signed_in), "CONTROL: {out}{err}");
+    assert!(!out.contains("stay refused"), "CONTROL: {out}");
+    assert!(!out.contains(&pin), "CONTROL: {out}");
+    assert_eq!(code, 0, "CONTROL: {out}{err}");
+}
+
+/// CODEX'S OWN SIGN-IN SAYS IT REVOKES CODEX'S CURRENT LOGIN ONLY WHERE ONE IS STORED: on a Codex
+/// build that keeps no row's login its own, with `main` (the row on this machine's own login)
+/// signed out and no login left in Codex's default home, `aterm ai login codex` at a terminal
+/// runs Codex's own login and says nothing of a login it signs out first. CONTROL: with a login
+/// still stored there, the same run says it signs that login out (revokes it) first.
+#[test]
+fn codexs_own_sign_in_warns_of_a_revoke_only_where_a_login_is_stored() {
+    let now = 1_800_000_000;
+    for stored in [false, true] {
+        let b = codex_default_only("");
+        sign_main_out(&b, now);
+        if !stored {
+            std::fs::remove_file(b.home.join(".codex/auth.json")).expect("the default login");
+        }
+        let env = pooled_env(&b, &[], true);
+        let runner = codex_signs_in(&b);
+        let (_, out, err) = run_cli(&env, &runner, &["login", "codex"]);
+        assert!(
+            runner
+                .calls()
+                .iter()
+                .any(|c| c.terminal && c.program == "codex" && c.args == ["login"]),
+            "{stored}: PRECONDITION: Codex's own login ran: {out}{err}"
+        );
+        assert_eq!(
+            out.contains(crate::ai::connector::SIGNS_OUT_FIRST),
+            stored,
+            "{stored}: {out}{err}"
+        );
+    }
+}
+
+/// WHERE ATERM CANNOT SEE WHETHER CODEX IS SIGNED IN, `aterm ai login codex` DOES NOT SAY IT IS:
+/// with Codex keeping its login in the OS keyring (`cli_auth_credentials_store = "keyring"`),
+/// which aterm does not inspect, the doctor's row is unproven, and at a terminal `aterm ai login
+/// codex` starts nothing (Codex's own login would revoke any current login first), never says
+/// Codex is signed in, and names Codex's own `codex login`. CONTROL: with a login file in Codex's
+/// home on the file store, the refusal says Codex is signed in.
+#[test]
+fn a_codex_login_aterm_cannot_see_is_not_called_signed_in() {
+    let signed_in = "Codex CLI is signed in;";
+    let b = machine(&["codex"]);
+    std::fs::create_dir_all(b.home.join(".codex")).expect("Codex's home");
+    std::fs::write(
+        b.home.join(".codex/config.toml"),
+        "cli_auth_credentials_store = \"keyring\"\n",
+    )
+    .expect("config.toml");
+    let env = env_of(&b, ONLY_CODEX, &[], true);
+    let (row, _, _) = codex_look(&env);
+    assert_eq!(row.state, State::Unproven, "PRECONDITION: {}", row.fact);
+    let runner = FakeRunner::quiet();
+    let (code, out, err) = run_cli(&env, &runner, &["login", "codex"]);
+    assert!(runner.calls().is_empty(), "{:?}", runner.calls());
+    assert_eq!(code, 2, "{out}{err}");
+    let said = format!("{out}{err}");
+    assert!(!said.contains(signed_in), "{said}");
+    assert!(said.contains("`codex login`"), "{said}");
+
+    let b = machine(&["codex"]);
+    std::fs::create_dir_all(b.home.join(".codex")).expect("Codex's home");
+    std::fs::write(b.home.join(".codex/auth.json"), "{}").expect("a login");
+    let env = env_of(&b, ONLY_CODEX, &[], true);
+    let runner = FakeRunner::quiet();
+    let (code, out, err) = run_cli(&env, &runner, &["login", "codex"]);
+    assert!(runner.calls().is_empty(), "CONTROL: {:?}", runner.calls());
+    assert_eq!(code, 2, "CONTROL: {out}{err}");
+    assert!(
+        format!("{out}{err}").contains(signed_in),
+        "CONTROL: {out}{err}"
+    );
+}
+
 /// ON A CODEX BUILD THAT KEEPS NO ROW'S LOGIN ITS OWN, THE ROW ON THIS MACHINE'S OWN LOGIN WITH
 /// NO LOGIN STORED HERE IS NOT SIGNED IN "AGAIN": whether none was ever made or one the pool
 /// recorded signed out was removed since, the doctor's pool words say no login of it is stored

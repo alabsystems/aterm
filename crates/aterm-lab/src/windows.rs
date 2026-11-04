@@ -19,6 +19,9 @@ use crate::paths::paths;
 use crate::windows_guest::{self as guest, Arch};
 use crate::{Fail, LAB, Res};
 
+#[path = "windows_observe.rs"]
+mod observe;
+
 /// The VM's name (QEMU's `-name`).
 pub const VM: &str = "aterm-windows";
 
@@ -35,6 +38,19 @@ pub const SNAPSHOT: &str = "provisioned";
 pub const NOT_RUN: i32 = 3;
 
 const PREFIXES: [&str; 2] = ["/opt/homebrew", "/usr/local"];
+
+fn tool_prefixes(native: Option<&Path>) -> Vec<PathBuf> {
+    native
+        .into_iter()
+        .map(Path::to_path_buf)
+        .chain(PREFIXES.map(PathBuf::from))
+        .fold(Vec::new(), |mut roots, root| {
+            if !roots.contains(&root) {
+                roots.push(root);
+            }
+            roots
+        })
+}
 
 /// Microsoft's download page for Windows 11 on Arm64.
 pub const ISO_PAGE: &str = "https://www.microsoft.com/en-us/software-download/windows11arm64";
@@ -96,6 +112,11 @@ one-shot run that booted it died is stopped as `down` stops it, and booted afres
                            without building or changing desktop scaling. App source binding requires retained build
                            evidence; supplied executable hashes are checked. Geometry/pixels needing review remain
                            observations, not an automatic declaration that the library layout laws passed.
+                           Instead of exec: get C:/absolute/file --out ABSOLUTE-NEW-DIRECTORY retains one regular
+                           guest file and before/after SHA-256 receipts without copying source or running a workload.
+                           Instead of exec: observe reports bounded process identities and cumulative CPU/I/O facts.
+                           Read-only observe takes no lane lock, admission or desktop custody; requires existing SSH
+                           host trust and exact held/guest identity before and after, under one minute total.
   smoke [--arch aarch64|x86_64]...
                            the lane's acceptance per arch (both unless named): aterm, aterm-gui and aterm-ctl built,
                            `aterm --version` printing this checkout's build number, and one aterm-gui --headless driven over
@@ -305,7 +326,7 @@ impl Layout {
     }
 }
 
-/// QEMU, `qemu-img`, swtpm and the firmware, from the person's own install ([`PREFIXES`]).
+/// QEMU, `qemu-img`, swtpm and the firmware, from the native package prefix or an existing install.
 #[derive(Clone, Debug)]
 pub struct Tools {
     pub qemu: PathBuf,
@@ -319,7 +340,7 @@ pub struct Tools {
 }
 
 impl Tools {
-    /// QEMU and swtpm under the first of [`PREFIXES`] that has them.
+    /// QEMU and swtpm from the native package prefix, then existing install prefixes.
     /// # Errors
     /// Not Apple silicon, or a tool missing: the lane cannot run here, and the NOT RUN
     /// names what is missing and where it was looked for.
@@ -329,13 +350,29 @@ impl Tools {
                 "the lane needs Apple silicon (QEMU's hvf accelerator runs an arm64 Windows)",
             ));
         }
-        Tools::find_in(&PREFIXES.map(Path::new))
+        let native = atpkg::abrew::prefix::Prefix::resolve();
+        let enabled = native.root.is_absolute() && !native.is_disabled();
+        let prefixes = tool_prefixes(enabled.then_some(native.root.as_path()));
+        Tools::find_in(&prefixes.iter().map(PathBuf::as_path).collect::<Vec<_>>())
     }
 
     /// [`Tools::find`] under `prefixes` (the first that has each tool), on any architecture.
     /// # Errors
     /// As [`Tools::find`], past its architecture check.
     pub fn find_in(prefixes: &[&Path]) -> Result<Tools, Fail> {
+        let tools = Self::locate_in(prefixes)?;
+        let tpm = run(
+            &tools.qemu,
+            &strings(&["-device", "tpm-tis-device,help"]),
+            None,
+        );
+        Ok(Tools {
+            tpm_ppi: tpm.text.contains("ppi="),
+            ..tools
+        })
+    }
+
+    fn locate_in(prefixes: &[&Path]) -> Result<Tools, Fail> {
         let ok = |p: &Path| crate::sys::executable(&p.to_string_lossy());
         let prefix = prefixes
             .iter()
@@ -364,15 +401,7 @@ impl Tools {
         if !ok(&tools.qemu_img) {
             return Err(not_run(format!("no {}", tools.qemu_img.display())));
         }
-        let tpm = run(
-            &tools.qemu,
-            &strings(&["-device", "tpm-tis-device,help"]),
-            None,
-        );
-        Ok(Tools {
-            tpm_ppi: tpm.text.contains("ppi="),
-            ..tools
-        })
+        Ok(tools)
     }
 }
 
@@ -618,7 +647,7 @@ fn iso_record(l: &Layout) -> PathBuf {
 /// The cached Windows ISO and its digest, when there is one.
 #[must_use]
 pub fn cached_iso(l: &Layout) -> Option<(PathBuf, String)> {
-    let text = std::fs::read_to_string(iso_record(l)).ok()?;
+    let text = crate::util::read_regular_text(&iso_record(l)).ok()?;
     let mut lines = text.lines();
     let (name, sha) = (lines.next()?, lines.next()?);
     let path = l.cache.join(name);
@@ -951,7 +980,7 @@ fn observe_daemon(l: &Layout, kind: Daemon, pid: i32) -> Result<Option<DaemonPro
 
 fn daemon(l: &Layout, kind: Daemon) -> Result<Option<DaemonProcess>, String> {
     let file = kind.pid_file(l);
-    let text = match std::fs::read_to_string(&file) {
+    let text = match crate::util::read_regular_text(&file) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("{}: {e}", file.display())),
@@ -995,7 +1024,11 @@ fn free_port() -> Result<u16, String> {
 }
 
 fn read_port(l: &Layout) -> Option<u16> {
-    std::fs::read_to_string(l.port()).ok()?.trim().parse().ok()
+    crate::util::read_regular_text(&l.port())
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 fn start(l: &Layout, t: &Tools, boot: &Boot) -> Result<(), String> {
@@ -1142,7 +1175,11 @@ impl Ssh {
     }
 
     fn options(&self) -> Vec<String> {
-        vec![
+        self.options_for(false)
+    }
+
+    fn options_for(&self, existing_host: bool) -> Vec<String> {
+        let mut options = vec![
             "-F".into(),
             "/dev/null".into(),
             "-i".into(),
@@ -1152,7 +1189,12 @@ impl Ssh {
             "-o".into(),
             format!("UserKnownHostsFile={}", lossy(&self.known_hosts)),
             "-o".into(),
-            "StrictHostKeyChecking=accept-new".into(),
+            if existing_host {
+                "StrictHostKeyChecking=yes"
+            } else {
+                "StrictHostKeyChecking=accept-new"
+            }
+            .into(),
             "-o".into(),
             "BatchMode=yes".into(),
             "-o".into(),
@@ -1163,7 +1205,16 @@ impl Ssh {
             "ServerAliveCountMax=8".into(),
             "-o".into(),
             "LogLevel=ERROR".into(),
-        ]
+        ];
+        if existing_host {
+            options.extend([
+                "-o".into(),
+                "UpdateHostKeys=no".into(),
+                "-o".into(),
+                "GlobalKnownHostsFile=/dev/null".into(),
+            ]);
+        }
+        options
     }
 
     /// `ssh`'s argv for `command` (a cmd.exe line in the guest).
@@ -1402,7 +1453,7 @@ fn revert(l: &Layout, t: &Tools) -> Result<(), String> {
 }
 
 fn snapshot_plan(l: &Layout) -> Option<String> {
-    std::fs::read_to_string(l.provisioned())
+    crate::util::read_regular_text(&l.provisioned())
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
@@ -1435,12 +1486,12 @@ fn lane_key(l: &Layout) -> Result<String, String> {
             return Err(format!("ssh-keygen failed: {}", out.tail(3)));
         }
     }
-    std::fs::read_to_string(l.key().with_extension("pub"))
+    crate::util::read_regular_text(&l.key().with_extension("pub"))
         .map_err(|e| format!("the lane's public key: {e}"))
 }
 
 fn lane_password(l: &Layout) -> Result<String, String> {
-    if let Ok(p) = std::fs::read_to_string(l.password())
+    if let Ok(p) = crate::util::read_regular_text(&l.password())
         && !p.trim().is_empty()
     {
         return Ok(p.trim().to_string());
@@ -1857,6 +1908,37 @@ mod held_vm_tests {
     use super::*;
 
     #[test]
+    fn artifact_get_requires_a_literal_absolute_file_and_new_absolute_output() {
+        let args = |remote: &str, out: &str| vec![remote.into(), "--out".into(), out.into()];
+        assert_eq!(
+            parse_get(&args(
+                r"C:\lane\artifacts\test.exe",
+                "/private/artifacts/new"
+            ))
+            .unwrap(),
+            (
+                "C:/lane/artifacts/test.exe".into(),
+                PathBuf::from("/private/artifacts/new")
+            )
+        );
+        for remote in [
+            "relative.exe",
+            "C:relative.exe",
+            "//server/share/file",
+            "C:/lane/*.exe",
+            "C:/lane/file\n.exe",
+            "C:/lane/file:stream",
+        ] {
+            assert!(
+                parse_get(&args(remote, "/private/artifacts/new")).is_err(),
+                "{remote}"
+            );
+        }
+        assert!(parse_get(&args("C:/lane/file", "relative")).is_err());
+        assert!(parse_get(&[]).is_err());
+    }
+
+    #[test]
     fn held_identity_requires_every_observed_component() {
         let held = HeldVm {
             pid: 42,
@@ -1957,14 +2039,7 @@ fn attach_existing(l: Layout, held: &HeldVm) -> Result<Up, Fail> {
     let port = read_port(&l).ok_or_else(|| not_run("held VM recorded no SSH port; preserved"))?;
     let admin = Ssh::new(&l, port);
     let ssh = admin.runner();
-    let identity = ssh.ps(&format!(
-        "$ErrorActionPreference='Stop'; if ($env:USERNAME -ine {}) {{ exit 125 }}; \
-         if ((Get-Content -Raw {}).Trim() -cne {}) {{ exit 125 }}; {}",
-        guest::ps_quote(guest::RUNNER),
-        guest::ps_quote(guest::STAMP),
-        guest::ps_quote(&held.plan),
-        guest::desktop_check()
-    ));
+    let identity = ssh.ps(&guest_identity_script(&held.plan, true));
     if !identity.ok() || !identity.text.lines().any(|s| s.trim() == guest::DESKTOP_UP) {
         return Err(not_run(format!(
             "held guest runner, plan or interactive desktop is unavailable; preserved: {}",
@@ -1992,10 +2067,27 @@ fn attach_existing(l: Layout, held: &HeldVm) -> Result<Up, Fail> {
     })
 }
 
+/// The fixed runner and provisioned-plan check shared by held operations. Observation does
+/// not need an interactive desktop; mutative attachment retains that additional requirement.
+fn guest_identity_script(plan: &str, desktop: bool) -> String {
+    format!(
+        "$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; try {{ if ($env:USERNAME -ine {}) {{ exit 125 }}; \
+         if ((Get-Content -Raw {}).Trim() -cne {}) {{ exit 125 }}; {} }} catch {{ exit 125 }}",
+        guest::ps_quote(guest::RUNNER),
+        guest::ps_quote(guest::STAMP),
+        guest::ps_quote(plan),
+        if desktop {
+            guest::desktop_check()
+        } else {
+            "'lane-identity-ok'".into()
+        }
+    )
+}
+
 fn parse_attach(args: &[String]) -> Result<(HeldVm, &[String]), Fail> {
     let usage = || {
         Fail::usage(
-            "windows attach --pid N --birth SECONDS:MICROSECONDS --plan HEX exec|settings ...",
+            "windows attach --pid N --birth SECONDS:MICROSECONDS --plan HEX exec|settings|get|observe ...",
         )
     };
     let [pid_flag, pid, birth_flag, birth, plan_flag, plan, rest @ ..] = args else {
@@ -2038,13 +2130,20 @@ fn cmd_attach(args: &[String]) -> Res {
     let [verb, args @ ..] = rest else {
         unreachable!()
     };
-    if !matches!(verb.as_str(), "exec" | "settings") {
-        return Err(Fail::usage("windows attach supports exec|settings"));
+    if !matches!(verb.as_str(), "exec" | "settings" | "get" | "observe") {
+        return Err(Fail::usage(
+            "windows attach supports exec|settings|get|observe",
+        ));
+    }
+    if verb == "observe" {
+        return observe::run(&held, args);
     }
     if verb == "exec" {
         let _ = parse_exec(args)?;
-    } else {
+    } else if verb == "settings" {
         crate::windows_settings::validate_args(args)?;
+    } else {
+        let _ = parse_get(args)?;
     }
     let l = Layout::find()?;
     if !l.home.is_dir() {
@@ -2056,9 +2155,189 @@ fn cmd_attach(args: &[String]) -> Res {
     held.check(&up.layout)?;
     if verb == "exec" {
         exec_on(up, parse_exec(args)?)
-    } else {
+    } else if verb == "settings" {
         crate::windows_settings::run(&up, &held, args)
+    } else {
+        let (remote, out) = parse_get(args)?;
+        get_held_artifact(&up, &held, &remote, &out)
+            .map(|()| 0)
+            .map_err(Fail::die)
     }
+}
+
+fn parse_get(args: &[String]) -> Result<(String, PathBuf), Fail> {
+    let usage = || {
+        Fail::usage("windows attach <custody> get C:/absolute/file --out NEW-ABSOLUTE-DIRECTORY")
+    };
+    let [remote, flag, out] = args else {
+        return Err(usage());
+    };
+    // SCP receives one literal drive-absolute path, never a wildcard or shell expression.
+    let remote = remote.replace('\\', "/");
+    let bytes = remote.as_bytes();
+    if flag != "--out"
+        || !Path::new(out).is_absolute()
+        || bytes.len() < 4
+        || !bytes[0].is_ascii_alphabetic()
+        || &bytes[1..3] != b":/"
+        || remote
+            .chars()
+            .any(|c| c.is_control() || "*?[]`$\"'<>|;".contains(c))
+        || remote[3..].contains(':')
+    {
+        return Err(usage());
+    }
+    Ok((remote, out.into()))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct GuestArtifact {
+    path: String,
+    bytes: u64,
+    sha256: String,
+}
+
+fn artifact_metadata(
+    up: &Up,
+    held: &HeldVm,
+    remote: &str,
+    out: &Path,
+    label: &str,
+) -> Result<GuestArtifact, String> {
+    held.check(&up.layout).map_err(|e| format!("{e:?}"))?;
+    let raw = up.ssh.ps(&format!(
+        "$ErrorActionPreference='Stop'; $p={}; $f=Get-Item -LiteralPath $p -Force; if($f.PSIsContainer -or ($f.Attributes -band [IO.FileAttributes]::ReparsePoint)){{throw 'not a regular artifact'}}; [ordered]@{{path=$p;bytes=[uint64]$f.Length;sha256=(Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant()}} | ConvertTo-Json -Compress",
+        guest::ps_quote(remote)
+    ));
+    artifact_receipt(
+        out,
+        label,
+        &format!("ok={} code={:?}\n{}", raw.ok(), raw.code, raw.text),
+    )?;
+    let value: aterm_json::Value = aterm_json::from_str(raw.text.trim())
+        .map_err(|e| format!("artifact metadata: {e}; {}", raw.tail(3)))?;
+    let object = value
+        .as_object()
+        .filter(|v| v.len() == 3)
+        .ok_or("artifact metadata is not a three-field object")?;
+    let metadata = GuestArtifact {
+        path: object
+            .get("path")
+            .and_then(aterm_json::Value::as_str)
+            .ok_or("artifact path absent")?
+            .into(),
+        bytes: object
+            .get("bytes")
+            .and_then(aterm_json::Value::as_u64)
+            .ok_or("artifact size absent")?,
+        sha256: object
+            .get("sha256")
+            .and_then(aterm_json::Value::as_str)
+            .ok_or("artifact hash absent")?
+            .into(),
+    };
+    if !raw.ok() || metadata.path != remote || !aterm_codec::hex::is_lower(&metadata.sha256, 64) {
+        return Err(format!("invalid guest artifact metadata: {}", raw.tail(3)));
+    }
+    Ok(metadata)
+}
+
+fn artifact_receipt(out: &Path, name: &str, text: &str) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(out.join(name))
+        .map_err(|e| e.to_string())?;
+    file.write_all(text.as_bytes())
+        .and_then(|()| aterm_durable::durable(&file))
+        .and_then(|()| aterm_durable::Flush::Durable.dir(out))
+        .map_err(|e| e.to_string())
+}
+
+fn get_held_artifact(up: &Up, held: &HeldVm, remote: &str, out: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(out)
+        .map_err(|e| format!("new private artifact directory: {e}"))?;
+    aterm_durable::Flush::Durable
+        .dir(out.parent().ok_or("artifact directory has no parent")?)
+        .map_err(|e| e.to_string())?;
+    let result = (|| {
+        held.check(&up.layout).map_err(|e| format!("{e:?}"))?;
+        artifact_receipt(
+            out,
+            "custody.json",
+            &aterm_json::json!({
+                "pid": held.pid, "birth_seconds": held.birth.seconds,
+                "birth_microseconds": held.birth.microseconds, "plan": held.plan,
+                "guest_path": remote, "source_sync": false
+            })
+            .to_string(),
+        )?;
+        let before = artifact_metadata(up, held, remote, out, "before.txt")?;
+        let dest = out.join("artifact");
+        // Reserve a private new file before the transport opens it. The enclosing directory is new.
+        let reserved = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&dest)
+            .map_err(|e| e.to_string())?;
+        drop(reserved);
+        held.check(&up.layout).map_err(|e| format!("{e:?}"))?;
+        let copied = up.ssh.get(remote, &dest);
+        artifact_receipt(
+            out,
+            "transport.txt",
+            &format!("ok={} code={:?}\n{}", copied.ok(), copied.code, copied.text),
+        )?;
+        if !std::fs::symlink_metadata(&dest)
+            .map_err(|e| e.to_string())?
+            .file_type()
+            .is_file()
+        {
+            return Err("transport destination is not a regular artifact".into());
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&dest)
+            .map_err(|e| e.to_string())?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| e.to_string())?;
+        aterm_durable::durable(&file)
+            .and_then(|()| aterm_durable::Flush::Durable.dir(out))
+            .map_err(|e| e.to_string())?;
+        if !copied.ok() {
+            return Err(format!("artifact copy failed: {}", copied.tail(3)));
+        }
+        held.check(&up.layout).map_err(|e| format!("{e:?}"))?;
+        let after = artifact_metadata(up, held, remote, out, "after.txt")?;
+        let bytes = file.metadata().map_err(|e| e.to_string())?.len();
+        let sha256 = sha256_file(&dest)?;
+        if before != after || bytes != before.bytes || sha256 != before.sha256 {
+            return Err("artifact changed or copied bytes differ from guest metadata".into());
+        }
+        held.check(&up.layout).map_err(|e| format!("{e:?}"))?;
+        artifact_receipt(
+            out,
+            "VERIFIED.json",
+            &aterm_json::json!({"path":before.path,"bytes":before.bytes,"sha256":before.sha256})
+                .to_string(),
+        )?;
+        println!(
+            "windows: retained {bytes} bytes sha256={sha256} at {} (held VM identity rechecked; no source sync)",
+            dest.display()
+        );
+        Ok(())
+    })();
+    if let Err(reason) = &result {
+        artifact_receipt(out, "REFUSED.txt", reason)?;
+    }
+    result
 }
 
 impl Up {
@@ -2976,6 +3255,70 @@ mod tests {
             Admit::Wait,
             "the lane alone no longer sees the flag"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_tools_keep_qemu_image_and_firmware_in_the_selected_family() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let native = tmp.path().join("native prefix");
+        let existing = tmp.path().join("existing");
+        let candidates = tool_prefixes(Some(&native));
+        assert_eq!(candidates[0], native);
+        assert_eq!(candidates[1..], PREFIXES.map(PathBuf::from));
+        assert_eq!(tool_prefixes(None), PREFIXES.map(PathBuf::from));
+        assert_eq!(tool_prefixes(Some(Path::new(PREFIXES[0]))).len(), 2);
+        let put = |root: &Path, name: &str, executable: bool| {
+            let path = root.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            // Resolution must never execute these deliberately invalid programs.
+            std::fs::write(&path, b"not an executable image").unwrap();
+            std::fs::set_permissions(
+                path,
+                std::fs::Permissions::from_mode(if executable { 0o700 } else { 0o600 }),
+            )
+            .unwrap();
+        };
+        for root in [&native, &existing] {
+            for name in ["bin/qemu-system-aarch64", "bin/qemu-img", "bin/swtpm"] {
+                put(root, name, true);
+            }
+            for name in [
+                "share/qemu/edk2-aarch64-code.fd",
+                "share/qemu/edk2-arm-vars.fd",
+            ] {
+                put(root, name, false);
+            }
+        }
+        let roots = [native.as_path(), existing.as_path()];
+        let tools = Tools::locate_in(&roots).unwrap();
+        assert_eq!(tools.qemu, native.join("bin/qemu-system-aarch64"));
+        assert_eq!(tools.qemu_img, native.join("bin/qemu-img"));
+        assert_eq!(tools.code, native.join("share/qemu/edk2-aarch64-code.fd"));
+        assert_eq!(tools.vars, native.join("share/qemu/edk2-arm-vars.fd"));
+        assert_eq!(tools.swtpm, native.join("bin/swtpm"));
+        std::fs::remove_file(&tools.vars).unwrap();
+        let fail = Tools::locate_in(&roots).unwrap_err();
+        assert!(
+            fail.msg
+                .unwrap()
+                .contains(&tools.vars.display().to_string())
+        );
+        put(&native, "share/qemu/edk2-arm-vars.fd", false);
+        std::fs::remove_file(&tools.qemu_img).unwrap();
+        let fail = Tools::locate_in(&roots).unwrap_err();
+        assert!(
+            fail.msg
+                .unwrap()
+                .contains(&tools.qemu_img.display().to_string())
+        );
+        // A root with no selected QEMU can yield to the complete existing family.
+        std::fs::remove_file(&tools.qemu).unwrap();
+        let tools = Tools::locate_in(&roots).unwrap();
+        assert_eq!(tools.qemu, existing.join("bin/qemu-system-aarch64"));
+        assert_eq!(tools.qemu_img, existing.join("bin/qemu-img"));
+        assert_eq!(tools.vars, existing.join("share/qemu/edk2-arm-vars.fd"));
     }
 
     /// A missing QEMU or swtpm is named with where the lane looked, never with an install

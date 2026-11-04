@@ -2125,7 +2125,10 @@ pub const VERBS: &[VerbSpec] = &[
          effective=<on|off>`. Owner-only `recovery` reads the account menu's cached, current-foreground \
          observation without probing or retrying: `OK recovery version=1 available=0` when absent; \
          otherwise `available=1 phase= account= target= route= known= eligible= wall= observed_at= \
-         next_at= detail_count= detail_0= ...`. Text is percent-encoded; `-` means unknown or absent, \
+         next_at= forecasts_paused= detail_count= detail_0= ...`. `forecasts_paused=1` means the \
+         session policy withdrew future recovery promises independently of current work; 0 \
+         grants no authority when the observation is unknown or busy. \
+         Text is percent-encoded; `-` means unknown or absent, \
          counts may be zero, times are Unix seconds from the observation (not read time), and a \
          retained next_at may be past. Phases: unknown, paused, watching, disabled, limited, waiting, probing, \
          ready, switching, verifying, signing-in. This read never refreshes credentials.",
@@ -4095,7 +4098,9 @@ pub const VERBS: &[VerbSpec] = &[
          main-thread or terminal locks, under `OK <n> roster=<seq>`, the roster's generation \
          (it moves when a session comes, goes or changes its row). `sessions status` returns `<local> <sid> <nonce> \
          sid=<local> revision=<n> hold=<0|1> hold_origin=<person|remote|fleet|local, \
-         comma-joined, or -> detail=<pct|-> agent=<word|->`.",
+         comma-joined, or -> detail=<pct|-> agent=<word|->` (`agent_deferred=1` in its place \
+         while the session's timeline is busy) `gen=<epoch>.<seq>|-` (the screen's generation, \
+         as `status gen=`, `-` while the terminal is busy).",
     )
     .input(Input::NONE),
     va(

@@ -573,7 +573,8 @@ pub fn mach_timebase() -> Option<(u32, u32)> {
 /// # Errors
 /// The file cannot be read.
 pub fn digest_file(path: &std::path::Path, domain: &[u8]) -> Result<Digest, String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let bytes = crate::util::read_regular_file(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     Ok(Digest::of(domain, &[&bytes]))
 }
 
@@ -1255,8 +1256,11 @@ fn fstat_of(fd: RawFd) -> io::Result<(libc::mode_t, u32, u64)> {
     Ok((st.st_mode & libc::S_IFMT, st.st_uid, u64::from(st.st_nlink)))
 }
 
-/// Open this user's single-link regular file at `path` with `O_NOFOLLOW_ANY`.
-pub fn scratch_file(path: &std::path::Path) -> io::Result<Option<std::fs::File>> {
+/// Open this user's single-link regular file at `path` with `O_NOFOLLOW_ANY` and return its metadata.
+pub fn scratch_file_with_meta(
+    path: &std::path::Path,
+) -> io::Result<Option<(std::fs::File, std::fs::Metadata)>> {
+    use std::os::unix::fs::MetadataExt as _;
     let c = cpath(path)?;
     // SAFETY: `c` is a valid NUL-terminated path; the descriptor is owned below.
     let fd = unsafe {
@@ -1276,15 +1280,20 @@ pub fn scratch_file(path: &std::path::Path) -> io::Result<Option<std::fs::File>>
             ))
         };
     }
-    let owned = own_fd(fd);
-    let (kind, uid, nlink) = fstat_of(fd)?;
-    if kind != libc::S_IFREG || uid != getuid() || nlink != 1 {
+    let file = std::fs::File::from(own_fd(fd));
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.uid() != getuid() || meta.nlink() != 1 {
         return Err(io::Error::other(format!(
             "not reading {}: not the lab user's regular file with one name",
             path.display()
         )));
     }
-    Ok(Some(std::fs::File::from(owned)))
+    Ok(Some((file, meta)))
+}
+
+/// Open this user's single-link regular file at `path` with `O_NOFOLLOW_ANY`.
+pub fn scratch_file(path: &std::path::Path) -> io::Result<Option<std::fs::File>> {
+    scratch_file_with_meta(path).map(|opt| opt.map(|(file, _)| file))
 }
 
 /// Directory entry kind returned by [`scratch_dir`].
@@ -1371,13 +1380,29 @@ pub fn scratch_dir(
     Ok(Some(out))
 }
 
-/// Read the contents of [`scratch_file`] at `path`.
+/// Read the contents of [`scratch_file`] at `path` (bounded at 256 MiB).
 pub fn scratch_read(path: &std::path::Path) -> io::Result<Option<Vec<u8>>> {
-    let Some(mut f) = scratch_file(path)? else {
+    use io::Read as _;
+    const MAX_SCRATCH_FILE_BYTES: u64 = 256 << 20;
+    let Some((f, meta)) = scratch_file_with_meta(path)? else {
         return Ok(None);
     };
-    let mut buf = Vec::new();
-    io::Read::read_to_end(&mut f, &mut buf)?;
+    if meta.len() > MAX_SCRATCH_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "scratch file exceeds 256 MiB limit",
+        ));
+    }
+    let cap =
+        usize::try_from(meta.len().min(MAX_SCRATCH_FILE_BYTES).saturating_add(1)).unwrap_or(0);
+    let mut buf = Vec::with_capacity(cap);
+    f.take(MAX_SCRATCH_FILE_BYTES + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > MAX_SCRATCH_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "scratch file grew past 256 MiB limit while reading",
+        ));
+    }
     Ok(Some(buf))
 }
 

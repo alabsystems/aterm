@@ -160,7 +160,7 @@ pub fn hello(system: &dyn system::System, exe: &Path, key: key::Key) -> io::Resu
 
 /// Speak the watch connection `watch` on its own thread and serve `listener`'s commands
 /// on this one, until the listener fails.
-#[must_use]
+#[must_use = "handle or propagate the agent's exit status"]
 pub fn serve_with_watch<L: serve::Listener, W: serve::Stream>(
     listener: &L,
     watch: W,
@@ -199,7 +199,7 @@ const USAGE: &str = "aterm-vz-agent --listen <unix socket> --watch <unix socket>
 // code is linted on stable by `verify cells --cell linux-arm` (the vz design's §6).
 /// The bin: in the guest, the agent ([`linux::run`]), which takes no argument.
 #[cfg(target_os = "linux")]
-#[must_use]
+#[must_use = "handle or propagate the agent's exit status"]
 pub fn main(args: &[std::ffi::OsString]) -> ExitCode {
     if !args.is_empty() {
         eprintln!("aterm-vz-agent: takes no argument (its unit starts it)");
@@ -210,7 +210,7 @@ pub fn main(args: &[std::ffi::OsString]) -> ExitCode {
 
 /// The bin: off Linux, the unix-socket seam ([`seam::run`]).
 #[cfg(not(target_os = "linux"))]
-#[must_use]
+#[must_use = "handle or propagate the agent's exit status"]
 pub fn main(args: &[std::ffi::OsString]) -> ExitCode {
     let (mut listen, mut watch, mut key, mut tick) = (None, None, None, watch::TICK);
     let mut it = args.iter();

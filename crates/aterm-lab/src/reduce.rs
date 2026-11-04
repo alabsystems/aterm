@@ -2226,8 +2226,8 @@ fn reduce_verb(args: &[String], by: fn(&str, Program) -> Result<Reduction, Strin
     let (Some(file), Some(program)) = (file, program) else {
         return Err(usage());
     };
-    let source =
-        std::fs::read_to_string(&file).map_err(|e| Fail::die(format!("reduce: {file}: {e}")))?;
+    let source = crate::util::read_regular_text(std::path::Path::new(&file))
+        .map_err(|e| Fail::die(format!("reduce: {file}: {e}")))?;
     let r = by(&source, program).map_err(|e| Fail::die(format!("reduce: {file}: {e}")))?;
     check_written(&source, &r, program)
         .map_err(|e| Fail::die(format!("reduce: {file}: its reduction: {e}")))?;

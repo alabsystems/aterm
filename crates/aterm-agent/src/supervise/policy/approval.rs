@@ -5118,6 +5118,12 @@ fn chrome_intro(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decisi
         );
     }
     let Some(confirm) = prompt.chrome_intro_confirm() else {
+        if prompt.head_off_screen {
+            return Decision::escalate(format!(
+                "the Claude in Chrome intro's title row is not on the screen (a box taller than \
+                 the pane); {UNREAD}"
+            ));
+        }
         return Decision::escalate("a Claude in Chrome intro not read whole");
     };
     // The title's first row: a narrow pane wraps the title under it.

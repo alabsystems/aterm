@@ -514,8 +514,8 @@ impl Buffer {
         }
         let mut end = end;
         let mut cluster = self.info[start].cluster;
-        for i in start + 1..end {
-            cluster = cluster.min(self.info[i].cluster);
+        for info in &self.info[start + 1..end] {
+            cluster = cluster.min(info.cluster);
         }
         if cluster != self.info[end - 1].cluster {
             while end < self.len && self.info[end - 1].cluster == self.info[end].cluster {
@@ -530,8 +530,8 @@ impl Buffer {
                 i -= 1;
             }
         }
-        for i in start..end {
-            self.info[i].cluster = cluster;
+        for info in &mut self.info[start..end] {
+            info.cluster = cluster;
         }
     }
 

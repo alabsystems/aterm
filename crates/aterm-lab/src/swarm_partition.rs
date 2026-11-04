@@ -1410,7 +1410,7 @@ fn vault_macs() -> impl Iterator<Item = &'static Spec> {
 fn in_partition<T>(cut_file: &Path, send: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     #[cfg(debug_assertions)]
     {
-        let cut = std::fs::read_to_string(cut_file)
+        let cut = crate::util::read_regular_text(cut_file)
             .map_err(|e| format!("the cut file {}: {e}", cut_file.display()))?;
         aterm_uds::partition::cut_here(&cut, send)
     }
@@ -1690,7 +1690,7 @@ impl Lane {
     /// `mac`'s vault state from its `state.toml`, read with no lock (a torn read reads as none).
     fn held(&self, mac: &str) -> Held {
         let file = self.home(mac).join(".config/aterm/secrets/state.toml");
-        let Ok(text) = std::fs::read_to_string(file) else {
+        let Ok(text) = crate::util::read_regular_text(&file) else {
             return Held {
                 membership: "none".to_owned(),
                 head: None,
@@ -1717,11 +1717,13 @@ impl Lane {
             .map(str::to_owned);
         let head = match (seq, digest) {
             (Some(seq), Some(digest)) if seq > 0 => {
-                let parents = std::fs::read(self.home(mac).join(".config/aterm/secrets/vault"))
-                    .ok()
-                    .and_then(|b| aterm_secrets::envelope::parse(&b).ok())
-                    .filter(|e| hex(&e.digest()) == digest)
-                    .map_or(0, |e| e.parents.len());
+                let parents = crate::util::read_regular_file(
+                    &self.home(mac).join(".config/aterm/secrets/vault"),
+                )
+                .ok()
+                .and_then(|b| aterm_secrets::envelope::parse(&b).ok())
+                .filter(|e| hex(&e.digest()) == digest)
+                .map_or(0, |e| e.parents.len());
                 Some(Head {
                     seq,
                     digest,
@@ -2108,7 +2110,7 @@ impl Lane {
     /// Whether `mac`'s `~/.secrets/<name>` holds the fixture `name` was set to.
     fn holds_value(&self, mac: &str, name: &str) -> bool {
         let file = self.home(mac).join(".secrets").join(name);
-        match (std::fs::read(file), self.values.get(name)) {
+        match (crate::util::read_regular_file(&file), self.values.get(name)) {
             (Ok(bytes), Some(want)) => bytes == *want,
             _ => false,
         }
@@ -2116,7 +2118,8 @@ impl Lane {
 
     /// The converge runner starts `mac`'s subscriber made: (before the cut, during, after).
     fn runners(&self, mac: &str, cut_ms: u64, heal_ms: u64, t0_ms: u64) -> [usize; 3] {
-        let text = std::fs::read_to_string(self.home(mac).join(RUNNERS_FILE)).unwrap_or_default();
+        let text =
+            crate::util::read_regular_text(&self.home(mac).join(RUNNERS_FILE)).unwrap_or_default();
         let mut out = [0; 3];
         for line in text.lines() {
             let Some(at) = line
@@ -2348,7 +2351,7 @@ fn form_fleet(lane: &mut Lane) -> Result<(), Fail> {
     )?;
     let issuer = &lane.world.insts[lane.insts["a1"]];
     lane.world.await_listening(issuer).map_err(Fail::die)?;
-    lane.code = std::fs::read_to_string(lane.root("a1").join("state/fleet-join-code"))
+    lane.code = crate::util::read_regular_text(&lane.root("a1").join("state/fleet-join-code"))
         .map_err(|e| Fail::die(format!("the fleet's join code: {e}")))?;
     let mut joined = Vec::new();
     for s in MACS.iter().filter(|s| s.instance && !s.late) {

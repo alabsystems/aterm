@@ -549,7 +549,7 @@ fn log_path(
     let (admit, label, signed) = signed;
     if !signed.is_empty() {
         store.ingest(&encode_records(&signed))?;
-        fsx::write_atomic(&paths.records_file(), &store.encode(), 0o600)?;
+        super::write_records(paths, &store)?;
     }
     Ok(ByLog::Admitted(LogAdmission {
         admit,
@@ -843,7 +843,7 @@ pub fn write_from_log_bundle(paths: &Paths, bundle: &Bundle) -> crate::Result<Re
         digest,
     } = checked_log_bundle(paths, bundle)?;
     save_config(paths, &config)?;
-    fsx::write_atomic(&paths.records_file(), &store.encode(), 0o600)?;
+    super::write_records(paths, &store)?;
     let report = apply_entries(paths, &mut state, &entries)?;
     state.membership = Stored::In;
     state.failed = apply_failed(&report);

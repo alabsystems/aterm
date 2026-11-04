@@ -228,11 +228,47 @@ impl WindowShell {
     }
 }
 
+fn read_config_text(path: &std::path::Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+    const MAX_CONFIG_BYTES: u64 = 1 << 20;
+    if !std::fs::symlink_metadata(path)?.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    let file = std::fs::File::open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    if meta.len() > MAX_CONFIG_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "config exceeds 1 MiB limit",
+        ));
+    }
+    let mut buf = Vec::with_capacity(
+        usize::try_from(meta.len().min(MAX_CONFIG_BYTES).saturating_add(1)).unwrap_or(0),
+    );
+    file.take(MAX_CONFIG_BYTES + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "config grew past 1 MiB limit while reading",
+        ));
+    }
+    String::from_utf8(buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
 fn config_shell() -> ConfigShell {
     let Some(path) = aterm_types::dirs::aterm_config_path() else {
         return ConfigShell::Absent;
     };
-    match std::fs::read_to_string(&path) {
+    match read_config_text(&path) {
         Ok(text) => config_shell_from_text(&text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => ConfigShell::Absent,
         Err(e) => ConfigShell::Unusable(format!("unreadable: {e}")),
@@ -258,7 +294,7 @@ pub(crate) fn config_shell_from_text(text: &str) -> ConfigShell {
 /// Read `aterm.toml`'s top-level `conpty` setting, or `None` when absent or unreadable.
 pub(crate) fn config_conpty() -> Option<String> {
     let path = aterm_types::dirs::aterm_config_path()?;
-    crate::config_conpty_from_text(&std::fs::read_to_string(path).ok()?)
+    crate::config_conpty_from_text(&read_config_text(&path).ok()?)
 }
 
 struct RawGuard {

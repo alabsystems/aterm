@@ -70,12 +70,13 @@ pub fn split_test_findings(
 /// The variables a rerun of a test child's failures must set.
 #[must_use]
 pub fn rerun_env(cmd: &Cmd, test_threads: Option<u32>) -> Vec<(OsString, OsString)> {
-    const PLACEMENT: [&str; 5] = [
+    const PLACEMENT: [&str; 6] = [
         "CARGO_TARGET_DIR",
         "CARGO_BUILD_JOBS",
         "RUSTDOC",
         crate::docdriver::DRIVER_ENV,
         crate::docdriver::SKIP_ENV,
+        crate::testrun::SUBPROCESS_SLOTS_ENV,
     ];
     let mut env: Vec<(OsString, OsString)> = cmd
         .envs
@@ -436,6 +437,7 @@ mod tests {
             .env("RUSTDOC", "/s/trustdoc")
             .env(crate::docdriver::DRIVER_ENV, "/s/trustdoc")
             .env(crate::docdriver::SKIP_ENV, "plain")
+            .env(crate::testrun::SUBPROCESS_SLOTS_ENV, "/s/slots")
             .env("ATERM_PAINT_BIN", "/b/My App/aterm");
         let env = rerun_env(&cmd, Some(3));
         let log = failed_log("laws::full_grid", "boom");

@@ -674,7 +674,7 @@ fn only_default_in(
              machine's default login while the pool counts them as `{label}`'s"
         ),
         None => format!(
-            "This Codex build runs only this machine's own login, since {why}, so no other Codex \
+            "this Codex build runs only this machine's own login, since {why}, so no other Codex \
              account is started on it"
         ),
     };

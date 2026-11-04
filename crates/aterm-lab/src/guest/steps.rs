@@ -119,6 +119,30 @@ pub(crate) fn transcript(dir: &Path, service: &str) -> PathBuf {
     dir.join(format!("heard{service}.txt"))
 }
 
+pub(crate) fn read_regular_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(16 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > 16 * 1024 * 1024 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "file exceeds 16 MiB limit",
+        ));
+    }
+    Ok(bytes)
+}
+
 /// `arrivals SEED JOINER FILE...` (the module docs), written to `out`.
 ///
 /// # Errors
@@ -136,8 +160,8 @@ pub(crate) fn arrivals(args: &[String], out: &mut dyn std::io::Write) -> Result<
         let line = match std::fs::metadata(&landed).and_then(|m| m.modified()) {
             Ok(at) => {
                 let held = match (
-                    std::fs::read(&landed),
-                    std::fs::read(Path::new(seed).join(file)),
+                    read_regular_file(&landed),
+                    read_regular_file(&Path::new(seed).join(file)),
                 ) {
                     (Ok(theirs), Ok(seeds)) if theirs == seeds => "same",
                     _ => "differs",

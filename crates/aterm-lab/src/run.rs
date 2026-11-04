@@ -259,7 +259,7 @@ impl Run {
     /// No lab of that tag is up.
     pub fn read(tag: &str) -> Result<Run, String> {
         let file = paths().run_dir(tag).join("env.sh");
-        let text = std::fs::read_to_string(&file).map_err(|_| {
+        let text = crate::util::read_regular_text(&file).map_err(|_| {
             format!("no lab '{tag}' is up ({LAB} up {tag}; {LAB} ps lists the labs there are)")
         })?;
         Ok(Run::parse(&text))

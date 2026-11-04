@@ -818,8 +818,8 @@ fn parse(rows: &[String]) -> Option<(Prompt, PromptV2)> {
         return Some((v1, v2));
     }
     // Claude Code's `Claude in Chrome` intro: no answers, so no reader below sees a box there.
-    // Read whole, or not at all.
-    if let Some(v2) = crate::chrome_intro::intro_box(rows) {
+    // Read whole, or cut (its head off the rows, never pressed).
+    if let Some(v2) = crate::chrome_intro::intro_on(rows) {
         let v1 = Prompt {
             kind: v2.kind,
             command: v2.command.clone(),
@@ -1538,7 +1538,7 @@ fn reads_as_prose(row: &str) -> bool {
 pub fn prompt_box_span(rows: &[String]) -> Option<(usize, usize)> {
     if let Some(offer) = crate::autocompact::offer_box(rows)
         .or_else(|| crate::auto_mode::offer_box(rows))
-        .or_else(|| crate::chrome_intro::intro_box(rows))
+        .or_else(|| crate::chrome_intro::intro_on(rows))
     {
         return Some(offer.span);
     }
@@ -1557,7 +1557,7 @@ pub fn title_row<'a>(p: &PromptV2, rows: &'a [String]) -> Option<&'a str> {
 pub fn prompt_box_first_row(rows: &[String]) -> Option<usize> {
     if let Some(offer) = crate::autocompact::offer_box(rows)
         .or_else(|| crate::auto_mode::offer_box(rows))
-        .or_else(|| crate::chrome_intro::intro_box(rows))
+        .or_else(|| crate::chrome_intro::intro_on(rows))
     {
         return Some(offer.span.0);
     }

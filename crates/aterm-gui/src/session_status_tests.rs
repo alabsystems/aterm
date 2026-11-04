@@ -1840,7 +1840,7 @@ fn fabric_batch_matches_single_status_fields_for_each_session() {
             let prefix = format!("{local} {} {} ", h.sid.as_str(), h.nonce.to_hex());
             let fields = row.strip_prefix(&prefix).expect("stable sid and nonce");
             let single = app.session_status_record(local).expect("live session");
-            for key in ["sid=", "revision=", "hold=", "detail=", "agent="] {
+            for key in ["sid=", "revision=", "hold=", "detail=", "agent=", "gen="] {
                 let batch_value = fields
                     .split_whitespace()
                     .find(|part| part.starts_with(key))
@@ -1858,7 +1858,19 @@ fn fabric_batch_matches_single_status_fields_for_each_session() {
     let locked_term = app.pool.get(0).unwrap().term.clone();
     let guard = locked_term.lock().unwrap();
     assert_same(&app);
+    let busy = app.fabric_status_fields(0).unwrap();
+    assert!(
+        busy.ends_with(" gen=-"),
+        "a busy terminal names no generation: {busy}"
+    );
     drop(guard);
+    let free = app.fabric_status_fields(0).unwrap();
+    assert!(
+        free.rsplit_once(" gen=")
+            .and_then(|(_, g)| crate::control::ScreenGen::parse(g))
+            .is_some(),
+        "a free terminal names its generation: {free}"
+    );
     assert!(
         app.fabric_status_fields(0)
             .unwrap()

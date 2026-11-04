@@ -20,6 +20,7 @@ pub mod wait_tally;
 pub mod argv0;
 pub mod channel;
 pub mod cli_path;
+pub mod clt_mark;
 pub mod clt_shim;
 
 pub mod fleet_name;

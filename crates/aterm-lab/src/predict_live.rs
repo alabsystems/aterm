@@ -608,7 +608,7 @@ fn read_takes(dir: &Path) -> Vec<(PathBuf, Vec<Chunk>)> {
                 .map(|e| e.path())
                 .filter(|p| p.extension().is_some_and(|x| x == "take"))
                 .map(|p| {
-                    let lines = parse_take(&std::fs::read_to_string(&p).unwrap_or_default());
+                    let lines = parse_take(&crate::util::read_regular_text(&p).unwrap_or_default());
                     (p, lines)
                 })
                 .collect()
@@ -777,7 +777,7 @@ impl Run<'_> {
     }
 
     fn log_len(&self) -> usize {
-        std::fs::read_to_string(&self.log).map_or(0, |s| s.len())
+        crate::util::read_regular_text(&self.log).map_or(0, |s| s.len())
     }
 
     /// One phase: settle, read the oracle's start, reset the metrics, type,
@@ -810,7 +810,7 @@ impl Run<'_> {
             if start_ok { "yes" } else { "NO" },
             if end_ok { "yes" } else { "NO" }
         );
-        let log = std::fs::read_to_string(&self.log).unwrap_or_default();
+        let log = crate::util::read_regular_text(&self.log).unwrap_or_default();
         let events = parse_trace(log.get(log_offset..).unwrap_or(""));
         let presses: Vec<Press> = events
             .iter()

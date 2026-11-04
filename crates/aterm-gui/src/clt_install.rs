@@ -11,13 +11,16 @@
 //! design §3.3). Until they exist the shim keeps Apple's own dialog away from everything aterm
 //! starts ([`crate::clt_shim`]).
 //!
-//! aterm opens the tab by itself once per account and build on this Mac ([`Mark`]: a person who
-//! closed it without installing is not asked again by a later launch of that build, and an update
-//! retries unfinished setup once), once no macOS dialog is up, no installer is up, the keyboard
-//! was quiet for 2.5 s, Low Data Mode is not holding the download back (a tab that found it on
-//! spends no opening, and the next opens once it is off), and the account is one of the Mac's
-//! administrators, whom alone macOS lets install them. Which window has focus, and what it shows,
-//! holds nothing back. A pass that finds the tools missing later (they were there at launch) asks
+//! aterm opens the tab by itself once per account and build on this Mac ([`Mark`], the record of
+//! aterm's own ask the package follow-up's `aterm init` shares: a person who closed it without
+//! installing is not asked again by a later launch of that build, nor by that build's follow-up,
+//! and an update retries unfinished setup once), once no macOS dialog is up, no installer is up,
+//! no tab an earlier aterm opened runs on with no custody here, the keyboard was quiet for 2.5 s,
+//! Low Data Mode is not holding the download back (a tab that found it on spends no opening, and
+//! the next opens once it is off), and the account is one of the Mac's administrators, whom alone
+//! macOS lets install them, while the tools are still missing: their arrival by any route ends
+//! the request. Which window has focus, and what it shows, holds nothing back. A pass that finds
+//! the tools missing later (they were there at launch) asks
 //! too, under its run's admission. The GitHub repositories row's Install… opens it on a person's
 //! press at any time ([`App::press_developer_tools_install`]); a press while a macOS dialog aterm
 //! opened is up is kept, and the tab opens once that dialog closes ([`Install::PressedQueued`]).
@@ -41,8 +44,9 @@ mod probe;
 mod receipt;
 
 /// The "revision" of the want a launch that found the tools missing makes itself: newer than any
-/// pass, so only a person's Stop withdraws it, as a pass that no longer waits on the tools for its
-/// own Repositories (packaged git serves them) says nothing of the tools themselves.
+/// pass, so only a person's Stop or the tools' arrival ([`App::developer_tools_watch`]) withdraws
+/// it, as a pass that no longer waits on the tools for its own Repositories (packaged git serves
+/// them) says nothing of the tools themselves.
 pub(crate) const LAUNCH_WANT: u64 = u64::MAX;
 
 /// Where this launch's install stands.
@@ -132,50 +136,52 @@ pub(crate) const ARGS: [&str; 3] = ["init", "--only", "base.clt"];
 /// The tab's fixed title, which the page names ([`crate::system_state::TOOLS_PASSWORD_HEADLINE`]).
 pub(crate) const TAB_TITLE: &str = "Command Line Tools";
 
-/// How long the page keeps the GitHub repositories row calm after the tab's program said the
-/// tools are installed, while the row's next reading has not landed ([`Settling`]): a reading
-/// that says the same as before past it is the truth again.
+/// How long the page keeps the GitHub repositories row calm after the tools were found installed
+/// (the tab's program said so, or the watch found them), while the row's next reading has not
+/// landed ([`Settling`]): a reading that says the same as before past it is the truth again.
 const SETTLE_BOUND: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// The mark that the Command Line Tools tab has opened for this account on this Mac, and on which
-/// builds of aterm: a small file beside this account's aterm config, so each account on the Mac
-/// keeps its own, written as the tab lands, one `opened <build>` line per build that opened it
-/// ([`aterm_types::version::build_id`]), the newest [`MARK_BUILDS`] kept. A build it names never
-/// opens the tab by itself again, so a person who closed it without installing is not asked again
-/// by a later launch of that build, nor by another build that shares this account's config and
-/// opened it already (a release beside a dev build); a build it does not name, an update's, opens
-/// it by itself once more, so updating aterm retries unfinished setup once. A bare `opened`, the
-/// mark an aterm that kept no builds wrote, names none. The GitHub repositories row's Install…
-/// still opens it on their press. A tab whose program found Low Data Mode holding the download
-/// back, or said its install failed (its exit 1: a password macOS refused, a download that broke),
-/// takes its build's line back ([`Mark::forget`]): that opening installed nothing, and no person
-/// chose that. A stop the tab's program caught (a person's Ctrl-C, at the password prompt or later,
-/// [`aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_STOPPED`]) keeps it, as a closed tab does:
-/// both are a person's decline.
+/// This launch's reading of the account's record of aterm's own Command Line Tools ask
+/// ([`aterm_types::clt_mark`]: a small file in this account's aterm state, one `opened
+/// <build>` line per build that asked, which `aterm init` reads and writes too where aterm decided
+/// its run, the follow-up of a person's own package install or update), claimed as the tab lands
+/// ([`Mark::claim`]). A build it names never opens the tab by itself again, so a person who closed
+/// it without installing is not asked again by a later launch of that build, nor by another build
+/// that shares this account's state and asked already (a release beside a dev build), nor after
+/// that build's follow-up asked; a build it does not name, an update's, opens it by itself once
+/// more, so updating aterm retries unfinished setup once. The automatic tab lands only where its
+/// claim added the line, so of it and a follow-up of the same build only one asks. The GitHub
+/// repositories row's Install… still opens it on their press. A tab whose program found Low Data
+/// Mode holding the download back, said its install failed (its exit 1: a password macOS refused,
+/// a download that broke), or never started (the window could not save its recovery record, or
+/// `/usr/bin/env` could not run it) takes its build's line back ([`Mark::forget`]) where its
+/// landing's claim added it (or, for a live tab a launch adopted, that adoption's claim, or the
+/// tab's own claim under this build, its landing's or an earlier adoption's, as its recovery
+/// record says): that opening installed nothing, and no person chose that. A stop the tab's
+/// program caught (a person's Ctrl-C, at the password prompt or later,
+/// [`aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_STOPPED`]) keeps it, as a closed tab does,
+/// and so does Apple's installer window closed without installing them
+/// ([`aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_WINDOW_CLOSED`]: Not Now, Cancel, or Done
+/// on Apple's own failure): each is a person's press.
 #[derive(Debug, Default)]
 pub(crate) struct Mark {
     path: Option<std::path::PathBuf>,
     opened: bool,
 }
 
-/// The mark's file name, beside aterm's config.
-#[cfg(not(test))]
-const MARK: &str = "command-line-tools-tab";
-
-/// The builds a [`Mark`] names: past them the oldest build's line goes, so an account that runs
-/// more builds than this (a dev build per commit) may see an old one retry once more.
-const MARK_BUILDS: usize = 8;
-
-/// The longest build id a [`Mark`] line names; aterm's are far shorter (a version, `+g` and a
-/// commit).
-const MARK_BUILD_BYTES: usize = 96;
-
-/// The longest [`Mark`] a launch reads or writes: [`MARK_BUILDS`] `opened <build>` lines.
-const MARK_BYTES: usize = MARK_BUILDS * ("opened ".len() + MARK_BUILD_BYTES + 1);
+/// Whether the tab's exit `code` says its program never started the install: its own word for a
+/// go line that never came or came behind other typing
+/// ([`aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_NOT_STARTED`]), and `/usr/bin/env`'s own
+/// when it cannot run the tab's `aterm` (126: found but not runnable, 127: not found), which
+/// `aterm init` never exits with.
+fn never_ran(code: i32) -> bool {
+    code == i32::from(aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_NOT_STARTED)
+        || matches!(code, 126 | 127)
+}
 
 impl Mark {
-    /// This account's mark, read once at launch for this build
-    /// ([`aterm_types::version::build_id`]). A mark that cannot be read counts as naming it:
+    /// This account's record, read once at launch for this build
+    /// ([`aterm_types::version::build_id`]). A record that cannot be read counts as naming it:
     /// aterm asks no one twice for want of a reading. Tests read none.
     pub(crate) fn for_launch() -> Self {
         #[cfg(test)]
@@ -184,149 +190,92 @@ impl Mark {
         }
         #[cfg(not(test))]
         {
-            let path = crate::app_config::config_path()
-                .and_then(|config| config.parent().map(|dir| dir.join(MARK)));
-            let opened = path
-                .as_deref()
-                .is_some_and(|path| Self::opened_on_build(path, &aterm_types::version::build_id()));
+            let path = aterm_types::clt_mark::path();
+            let opened = path.as_deref().is_some_and(Self::names_this_build);
             Self { path, opened }
         }
     }
 
-    /// A mark kept at `path`, as a launch of this build reads it (a test's).
+    /// A record kept at `path`, as a launch of this build reads it (a test's).
     #[cfg(all(test, unix))]
     pub(crate) fn at(path: std::path::PathBuf) -> Self {
-        let opened = Self::opened_on_build(&path, &aterm_types::version::build_id());
+        let opened = Self::names_this_build(&path);
         Self {
             path: Some(path),
             opened,
         }
     }
 
-    /// Whether the tab has opened for this account on this build.
+    /// Whether aterm asked for the tools by itself for this account on this build.
     pub(crate) const fn opened(&self) -> bool {
         self.opened
     }
 
-    /// Whether the mark at `path` names `build`, as a launch reads it: no mark, a bare `opened`
-    /// and one naming only other builds are no opening on `build`, so a newer build retries
-    /// unfinished setup once while repeated launches of one build do not ask again. A mark that
-    /// cannot be read, one too long or malformed to be a mark, and a `build` no mark line could
-    /// name each count as an opening.
-    fn opened_on_build(path: &std::path::Path, build: &str) -> bool {
-        if !Self::nameable(build) {
-            return true;
-        }
-        match Self::read(path) {
-            Ok(None) => false,
-            Ok(Some(text)) => Self::builds(&text).is_none_or(|builds| builds.contains(&build)),
-            Err(_) => true,
-        }
+    /// Whether the record at `path` names this build ([`aterm_types::clt_mark::opened_on_build`]).
+    fn names_this_build(path: &std::path::Path) -> bool {
+        aterm_types::clt_mark::opened_on_build(
+            &aterm_types::clt_mark::Live,
+            path,
+            &aterm_types::version::build_id(),
+        )
     }
 
-    /// The text of the mark at `path`, a regular file no longer than [`MARK_BYTES`] read without
-    /// following a link or waiting on a pipe; `None` where there is none.
-    fn read(path: &std::path::Path) -> std::io::Result<Option<String>> {
-        match aterm_effects::file_feed::read_bounded_regular_utf8(path, MARK_BYTES) {
-            Ok(text) => Ok(Some(text)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error),
-        }
-    }
-
-    /// The builds a mark's `text` names, oldest first: one `opened <build>` line each, and a bare
-    /// `opened` naming none. `None` for any other text, an empty one included, and for more
-    /// lines than a mark keeps.
-    fn builds(text: &str) -> Option<Vec<&str>> {
-        let mut lines = 0;
-        let mut builds = Vec::new();
-        for line in text.lines() {
-            lines += 1;
-            match line.split_once(' ') {
-                None if line == "opened" => {}
-                Some(("opened", build)) if Self::nameable(build) => builds.push(build),
-                _ => return None,
-            }
-        }
-        (1..=MARK_BUILDS).contains(&lines).then_some(builds)
-    }
-
-    /// Whether a mark line can name `build`: one word, no longer than [`MARK_BUILD_BYTES`].
-    fn nameable(build: &str) -> bool {
-        (1..=MARK_BUILD_BYTES).contains(&build.len()) && !build.contains(char::is_whitespace)
-    }
-
-    /// Put `build` into the mark at `path` as its newest line (`opened`), or take it out, keeping
-    /// the other builds the mark names, the newest [`MARK_BUILDS`] in all; a mark left naming none
-    /// goes. The write is durable, its directory entry included, and replaces the file whole
-    /// ([`crate::config_marker::write_marker`]). A mark that cannot be read or is malformed is left
-    /// as found, an error, as is a `build` no line could name.
-    fn record(path: &std::path::Path, build: &str, opened: bool) -> std::io::Result<()> {
-        use std::fmt::Write as _;
-        if !Self::nameable(build) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "no mark line can name this build",
-            ));
-        }
-        let text = Self::read(path)?;
-        let mut builds = match text.as_deref() {
-            None => Vec::new(),
-            Some(text) => Self::builds(text).ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "the mark is malformed and is left as found",
-                )
-            })?,
-        };
-        let before = builds.len();
-        builds.retain(|&kept| kept != build);
-        if opened {
-            builds.push(build);
-        } else if builds.len() == before {
-            return Ok(());
-        }
-        if builds.is_empty() {
-            return match std::fs::remove_file(path) {
-                Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
-                _ => Ok(()),
-            };
-        }
-        let keep = builds.len().saturating_sub(MARK_BUILDS);
-        let mut mark = String::new();
-        for named in &builds[keep..] {
-            let _ = writeln!(mark, "opened {named}");
-        }
-        crate::config_marker::write_marker(path, &mark, MARK_BYTES, crate::durable::Flush::Durable)
-    }
-
-    /// The tab landed: never by itself again on this build. That promise rests on this write
-    /// ([`Self::record`]), so it is durable, its directory entry included; it runs once per
-    /// account and build. A write that fails leaves the mark for this launch alone, and says so in
-    /// the log. `true` when this landing set the mark, which [`Mark::forget`] can then take back.
-    fn note_opened(&mut self) -> bool {
-        if std::mem::replace(&mut self.opened, true) {
+    /// Read the record again, as the automatic tab's shell is about to be booked: `true` when it
+    /// holds this build now though this launch's reading did not, because another asker of this
+    /// build asked meanwhile (the follow-up of a package install or update, or another window),
+    /// so no shell starts. The landing's claim ([`Mark::claim`]) decides; this look only spares a
+    /// shell it would refuse.
+    fn asked_since(&mut self) -> bool {
+        if self.opened {
             return false;
         }
-        if let Some(path) = &self.path
-            && let Err(error) = Self::record(path, &aterm_types::version::build_id(), true)
-        {
-            aterm_log::warn!(
-                "System State: the Command Line Tools tab's mark was not written: {error}"
-            );
-        }
-        true
+        self.opened = self.path.as_deref().is_some_and(Self::names_this_build);
+        self.opened
     }
 
-    /// The opening that set the mark installed nothing, and no person declined it: Low Data Mode
-    /// held the download back, or the install failed. This build's line goes ([`Self::record`];
-    /// the file too, when it names no other build), so aterm opens the tab by itself again (once
-    /// the mode is off, or at the next launch). A mark that cannot be rewritten or removed keeps
-    /// this build for later launches, and says so in the log.
+    /// A tab is landing: never by itself again on this build. That promise rests on this claim
+    /// ([`aterm_types::clt_mark::claim`]), made under the record's lock and durable, its directory
+    /// entry included. `true` when this claim added this build's line (or, with no place for the
+    /// record, when this launch's reading alone holds it), which [`Mark::forget`] can then take
+    /// back; `false` when the record named this build already (another asker of it, the follow-up
+    /// of a package install or update or another window, asked first) or the claim failed (a
+    /// record that cannot be read or written, or another asker holding its lock past the wait,
+    /// said in the log), and then this landing takes back nothing. Either way this launch reads
+    /// the record as naming this build from now on.
+    fn claim(&mut self) -> bool {
+        self.opened = true;
+        let Some(path) = &self.path else {
+            return true;
+        };
+        match aterm_types::clt_mark::claim(
+            &aterm_types::clt_mark::Live,
+            path,
+            &aterm_types::version::build_id(),
+        ) {
+            Ok(added) => added,
+            Err(error) => {
+                aterm_log::warn!(
+                    "System State: the Command Line Tools tab's mark was not claimed: {error}"
+                );
+                false
+            }
+        }
+    }
+
+    /// The opening whose claim added the mark installed nothing, and no person declined it: Low
+    /// Data Mode held the download back, the install failed, or it never started. This build's
+    /// line goes ([`aterm_types::clt_mark::forget`]; the file too, when it names no other build),
+    /// so aterm opens the tab by itself again (once the mode is off, or at the next launch). A
+    /// mark that cannot be rewritten or removed keeps this build for later launches, and says so
+    /// in the log.
     fn forget(&mut self) {
         self.opened = false;
         if let Some(path) = &self.path
-            && let Err(error) = Self::record(path, &aterm_types::version::build_id(), false)
+            && let Err(error) = aterm_types::clt_mark::forget(
+                &aterm_types::clt_mark::Live,
+                path,
+                &aterm_types::version::build_id(),
+            )
         {
             aterm_log::warn!(
                 "System State: the Command Line Tools tab's mark was not removed: {error}"
@@ -383,7 +332,8 @@ impl NetworkWatch {
 }
 
 /// What this Mac shows of an install of Apple's Command Line Tools now ([`probe`]): the on-demand
-/// placeholder, a live `softwareupdate` or `installer`, and Apple's own installer app and its age.
+/// placeholder, a live `softwareupdate` or `installer`, Apple's own installer app (at any age),
+/// and the stamp of a live run of aterm's root half in the placeholder.
 pub(crate) fn installing_now() -> Reading {
     probe::installing_now()
 }
@@ -405,15 +355,14 @@ pub(crate) enum Activity {
     #[default]
     Idle,
     /// Apple's own installer window (`Install Command Line Developer Tools`, which
-    /// `xcode-select --install` and the `git` and `cc` shims open) waits for the person's own
-    /// Install or Agree press: they are needed there.
+    /// `xcode-select --install` and the `git` and `cc` shims open) is open, at any age: waiting
+    /// for the person's own Install or Agree press, or running the install a press started
+    /// there, which nothing this Mac shows tells apart. The person finishes there.
     AppleWindow,
     /// An install runs: the on-demand placeholder is there and something holds it,
-    /// `softwareupdate` or `installer` (aterm's own root install, Homebrew's), Apple's installer
-    /// app while it or the placeholder is younger than
-    /// [`aterm_types::macos_setup::APPLE_WINDOW_INSTALL_BOUND`] (the app keeps the placeholder
-    /// once its install starts), or a live root run
-    /// ([`aterm_types::macos_setup::tools_install_running`], as `aterm init` reads it).
+    /// `softwareupdate` or `installer` (aterm's own root install, Homebrew's,
+    /// [`aterm_types::macos_setup::tools_held_by`], as `aterm init` reads it), or a live root
+    /// run.
     Installing,
 }
 
@@ -427,30 +376,25 @@ pub(crate) struct Reading {
     pub(crate) install_process: bool,
     /// Apple's `Install Command Line Developer Tools` app runs.
     pub(crate) apple_window: bool,
-    /// One of those apps installs by its age or the placeholder's
-    /// ([`aterm_types::macos_setup::ToolsInstaller::installs`]): it, or the placeholder, is
-    /// younger than [`aterm_types::macos_setup::APPLE_WINDOW_INSTALL_BOUND`] or of an age that
-    /// cannot be read. Beside the placeholder, that is the install a person started in its
-    /// window, whose press created the placeholder, perhaps hours after the window opened.
-    pub(crate) apple_window_young: bool,
     /// The placeholder carries the stamp of a run of aterm's root half that is alive now
     /// ([`aterm_types::macos_setup::placeholder_held_by_a_live_run`], the reader `aterm init`
-    /// shares): between two steps, or waiting on Apple's installer window a person closed, with
-    /// no installer process running this moment.
+    /// shares): between two steps, or waiting on Apple's installer window, with no installer
+    /// process running this moment.
     pub(crate) live_run: bool,
 }
 
-/// [`Activity`] for `reading`: the placeholder counts as an install only while something that
-/// installs holds it (an installer, Apple's window while it or the placeholder is younger than
-/// [`aterm_types::macos_setup::APPLE_WINDOW_INSTALL_BOUND`], or a live run of aterm's root half
-/// that stamped it), so a stale one nothing holds reads as no install, and Apple's window before
-/// its install starts (no placeholder yet), or one left open past that bound beside a leftover
-/// placeholder as old, waits for the person. `aterm init` reads the same.
+/// [`Activity`] for `reading`: the placeholder counts as an install only while an installer
+/// holds it or a live run of aterm's root half stamped it, so a stale one nothing holds reads as
+/// no install; Apple's window, beside the placeholder it made as it opened or with none (it
+/// opened beside another install's, which has ended since; its own request ends only as it
+/// quits), is where the person finishes, at any age. `aterm init` and the root half read the
+/// same ([`aterm_types::macos_setup::tools_held_by`], and a live run's stamp ahead of the
+/// window): `aterm init` defers to the first as an install under way and to the window naming
+/// the person's step there, and the root half waits on that window, never taking or making a
+/// placeholder beside it.
 #[must_use]
 pub(crate) const fn activity(reading: Reading) -> Activity {
-    if reading.placeholder
-        && (reading.install_process || reading.apple_window_young || reading.live_run)
-    {
+    if reading.placeholder && (reading.install_process || reading.live_run) {
         Activity::Installing
     } else if reading.apple_window {
         Activity::AppleWindow
@@ -473,8 +417,12 @@ pub(crate) struct Terminal {
     /// The window already wrote the tab's last line (its install never started), so its end
     /// adds none.
     told: bool,
-    /// This tab's landing set the account's [`Mark`], which an opening that installed nothing
-    /// for Low Data Mode takes back.
+    /// This build's line in the account's [`Mark`] is this tab's own: its landing's claim added
+    /// it ([`Mark::claim`]), or this launch's adoption of a live one an earlier aterm opened did,
+    /// or that tab's own claim under this same build did (its landing's, or an earlier launch's
+    /// adoption), as its recovery record says. An opening that installed nothing takes it back:
+    /// one that failed, one Low Data Mode held back, or one whose program never ran. A tab whose
+    /// line is none of these takes back nothing.
     spent_mark: bool,
 }
 
@@ -498,7 +446,7 @@ impl Terminal {
 /// What the page says of the install beyond its tab and this Mac's installers.
 #[derive(Debug, Default)]
 pub(crate) struct Aftermath {
-    /// The tab's program said the tools are installed ([`Settling`]).
+    /// The tools were found installed, by the tab's program or the watch ([`Settling`]).
     settling: Option<Settling>,
     /// Why the tab a person's Install… asked for did not open, until their next press.
     refused: Option<NotOpened>,
@@ -506,7 +454,8 @@ pub(crate) struct Aftermath {
 
 impl Aftermath {
     /// The GitHub repositories row read `reading` at `now`: a reading other than the one the
-    /// tab's program ended beside, or [`SETTLE_BOUND`] passed, ends the calm [`Settling`] kept.
+    /// page had as the tools were found installed, or [`SETTLE_BOUND`] passed, ends the calm
+    /// [`Settling`] kept.
     pub(crate) fn settle(&mut self, reading: Option<&Observation>, now: std::time::Instant) {
         if self
             .settling
@@ -518,9 +467,9 @@ impl Aftermath {
     }
 }
 
-/// The tab's program said the tools are installed: the GitHub repositories row stays calm until
-/// its next reading lands (one that differs from `reading`, the one it read when the program
-/// ended), or [`SETTLE_BOUND`] passes.
+/// The tools were found installed (the tab's program said so, or the watch found them): the
+/// GitHub repositories row stays calm until its next reading lands (one that differs from
+/// `reading`, the one the page had then), or [`SETTLE_BOUND`] passes.
 #[derive(Debug)]
 struct Settling {
     reading: Option<Observation>,
@@ -574,6 +523,16 @@ fn not_started_line() -> String {
     )
 }
 
+/// Whether `child`'s program ended as far as this window can tell: its status collected, its
+/// process reaped, or its terminal closed.
+fn child_ended(child: &crate::Session) -> bool {
+    child.child_exit.get().is_some()
+        || child
+            .child_reaped
+            .load(std::sync::atomic::Ordering::Acquire)
+        || child.pty_closed_at.get().is_some()
+}
+
 /// What a launch starts of the install ([`launch_install`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LaunchInstall {
@@ -614,9 +573,13 @@ pub(crate) const fn launch_install(
     }
 }
 
-/// Wake the window every second until the developer tools exist: their arrival by any route takes
-/// the shim off new shells, and a launch's want gets its looks with no status poll to ride. Only
-/// a Mac that lacks them runs it, and it reads with a stat and a readlink.
+/// Wake the window every second until the developer tools exist, with what this Mac shows of an
+/// installer then ([`installing_now`], a look at every process), read here on the watch's own
+/// thread so the window's loop scans no process table each second
+/// ([`App::developer_tools_watch`]): their arrival by any route takes the shim off new shells,
+/// and a launch's want gets its looks with no status poll to ride. Only a Mac that lacks them runs
+/// it; whether they exist reads with a stat and a readlink, and the second that finds them sends
+/// no reading and ends the watch.
 pub(crate) fn watch_for_tools() {
     let watch = std::thread::Builder::new()
         .name("aterm-clt-watch".to_owned())
@@ -624,7 +587,9 @@ pub(crate) fn watch_for_tools() {
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 let present = aterm_types::clt_shim::developer_git();
-                let _ = crate::workstation_setup::send_setup_wake(Wake::DeveloperToolsWatch);
+                let reading = (!present).then(installing_now);
+                let _ =
+                    crate::workstation_setup::send_setup_wake(Wake::DeveloperToolsWatch(reading));
                 if present {
                     return;
                 }
@@ -646,9 +611,21 @@ pub fn offer_developer_tools_install(revision: u64, wanted: bool) {
     }
 }
 
+/// [`crate::tab_spawn::TabSpawnThen`] for the automatic tab of `revision`'s want: its landing
+/// check ([`App::prepare_developer_tools_install_landing`]) claims this build's ask last, so a tab
+/// lands only where that claim added the line, which a landing that fails after the check takes
+/// back ([`Mark::forget`]): it asked nothing.
 fn install_tab_then(revision: u64) -> crate::tab_spawn::TabSpawnThen {
+    let claimed = std::rc::Rc::new(std::cell::Cell::new(false));
     crate::tab_spawn::TabSpawnThen::Before {
-        check: Box::new(move |app, _window| app.prepare_developer_tools_install_landing(revision)),
+        check: Box::new({
+            let claimed = std::rc::Rc::clone(&claimed);
+            move |app, _window| {
+                let lands = app.prepare_developer_tools_install_landing(revision);
+                claimed.set(lands);
+                lands
+            }
+        }),
         then: Box::new(move |app, landed| {
             // A quiet refusal restored Wanted/Unasked before this callback. Only a real
             // opening (or its failure) consumes the launch's attempt.
@@ -659,7 +636,7 @@ fn install_tab_then(revision: u64) -> crate::tab_spawn::TabSpawnThen {
                 app.workstation_setup.developer_tools = Install::Opened;
                 match landed {
                     Ok(sid) => {
-                        let spent = app.workstation_setup.developer_tools_mark.note_opened();
+                        let spent = claimed.get();
                         app.dispatch_developer_tools_install(revision, |app| {
                             app.start_developer_tools_install(&sid, spent);
                         });
@@ -667,9 +644,14 @@ fn install_tab_then(revision: u64) -> crate::tab_spawn::TabSpawnThen {
                         // shutdown must not republish the still-retained setup window.
                         app.publish_system_state_front();
                     }
-                    Err(why) => aterm_log::warn!(
-                        "System State: the Command Line Tools install tab did not open: {why}"
-                    ),
+                    Err(why) => {
+                        if claimed.get() {
+                            app.workstation_setup.developer_tools_mark.forget();
+                        }
+                        aterm_log::warn!(
+                            "System State: the Command Line Tools install tab did not open: {why}"
+                        );
+                    }
                 }
             }
             app.release_unused_access_dialog(std::time::Instant::now());
@@ -689,7 +671,9 @@ fn pressed_tab_then() -> crate::tab_spawn::TabSpawnThen {
                 app.workstation_setup.developer_tools = Install::Opened;
                 match landed {
                     Ok(sid) => {
-                        let spent = app.workstation_setup.developer_tools_mark.note_opened();
+                        // The person's press goes whatever the record says; a claim it did not
+                        // win takes back nothing later.
+                        let spent = app.workstation_setup.developer_tools_mark.claim();
                         app.start_developer_tools_install(&sid, spent);
                         app.publish_system_state_front();
                     }
@@ -714,8 +698,11 @@ impl App {
     /// Start the install in its landed tab `sid`, recording the tab first: even an immediate
     /// failure's exit must release the slot and leave its explanation in the tab. The tab takes
     /// its fixed title, which the page names, and its program its go line, once the tab's
-    /// recovery record is saved; without one the install never starts, and the tab says why.
-    /// `spent`: its landing set the account's [`Mark`].
+    /// recovery record is saved; without one the install never starts, the tab says why, and an
+    /// opening its landing spent is taken back at once ([`Mark::forget`]): it installed nothing,
+    /// and no person chose that. `spent`: its landing's claim added this build's line to the
+    /// account's [`Mark`], which the recovery record says too, so a launch of this build that
+    /// adopts the live tab takes that line back on failure as this one would.
     fn start_developer_tools_install(&mut self, sid: &str, spent: bool) {
         let session = self
             .store
@@ -729,6 +716,7 @@ impl App {
         let Some(child) = self.pool.get(session) else {
             return;
         };
+        let build = aterm_types::version::build_id();
         let recovery = self
             .workstation_setup
             .developer_tools_mark
@@ -742,6 +730,7 @@ impl App {
                             sid,
                             child.pid,
                             child.shell_identity.birth,
+                            spent.then_some(build.as_str()),
                         )
                     })
                     .flatten()
@@ -763,9 +752,12 @@ impl App {
                 (None, false)
             }
         };
+        if spent && !go {
+            self.workstation_setup.developer_tools_mark.forget();
+        }
         let mut terminal = Terminal::running(session, false, receipt);
         terminal.told = !go;
-        terminal.spent_mark = spent;
+        terminal.spent_mark = spent && go;
         self.workstation_setup.developer_tools_attempt = Some(session);
         self.workstation_setup
             .developer_tools_session
@@ -808,8 +800,18 @@ impl App {
         Ok(changed)
     }
 
-    /// Recover custody only for an adopted exact child with its own immutable record. This
-    /// restores neither setup admission nor a command: adoption never types installer bytes.
+    /// Recover custody only for an adopted exact child with its own recovery record. This
+    /// restores neither setup admission nor a command: adoption never types installer bytes. A
+    /// live one is this build's ask from now on (an update hands an earlier build's tab over):
+    /// its build is claimed in the account's [`Mark`], so a decline under this build keeps it and
+    /// a failure takes it back where this build's line is the tab's own, as for a tab this build
+    /// opened: that adoption's claim added it, or the record says the tab's own claim under this
+    /// build did (its landing's, or an earlier adoption's, which a launch of the same build adopts
+    /// after the window that adopted or opened it went, as the PTY keeper outlives a crash). An
+    /// adoption whose claim added the line rewrites the record to say so
+    /// ([`receipt::Receipt::claim`]; one that cannot says why in the log, and only this launch
+    /// then reads the line as the tab's own). A tab whose own claim added no line (a person's
+    /// Install… after this build asked) takes back none.
     pub(crate) fn recover_developer_tools_install(&mut self, local: u64) {
         if self
             .workstation_setup
@@ -825,30 +827,45 @@ impl App {
         if child.handoff_local_id.is_none() || child.pid != child.shell_identity.pid {
             return;
         }
-        let Some(receipt) = self
+        let Some(mut receipt) = self
             .workstation_setup
             .developer_tools_mark
             .path
             .as_deref()
             .and_then(|mark| {
-                receipt::Receipt::for_child(
+                receipt::Receipt::adopt(
                     mark,
                     child.ctx.self_id.as_str(),
                     child.pid,
                     child.shell_identity.birth,
                 )
             })
-            .filter(receipt::Receipt::matches)
         else {
             return;
         };
-        let finished = child.child_exit.get().is_some()
-            || child
-                .child_reaped
-                .load(std::sync::atomic::Ordering::Acquire)
-            || child.pty_closed_at.get().is_some();
+        let finished = child_ended(child);
+        let build = aterm_types::version::build_id();
+        let own_line = receipt.claimed() == Some(build.as_str());
+        let mut spent_mark = false;
+        if !finished {
+            let added = self.workstation_setup.developer_tools_mark.claim();
+            // The adoption's claim added this build's line: the receipt says so from now on, so
+            // a launch of this build that adopts the tab again (the PTY keeper outlived a crash)
+            // reads the line as the tab's own, as this one does.
+            if added
+                && !own_line
+                && let Err(error) = receipt.claim(&build)
+            {
+                aterm_log::warn!(
+                    "System State: the installer's recovery receipt does not say this build's \
+                     claim: {error}"
+                );
+            }
+            spent_mark = added || own_line;
+        }
         let mut terminal = Terminal::running(local, true, Some(receipt));
         terminal.finished = finished;
+        terminal.spent_mark = spent_mark;
         if !finished || self.workstation_setup.developer_tools_attempt.is_none() {
             self.workstation_setup.developer_tools_attempt = Some(local);
         }
@@ -882,7 +899,7 @@ impl App {
         status: &crate::SetupStatus,
     ) -> Option<ToolsInstall> {
         self.read_developer_tools_exit();
-        let reading = self.developer_tools_reading();
+        let reading = self.developer_tools_known();
         let activity = activity(reading);
         let setup = &mut self.workstation_setup;
         setup
@@ -890,8 +907,9 @@ impl App {
             .settle(status.repositories_reading(), std::time::Instant::now());
         // A program whose end is not read yet still counts as running: its exit status comes a
         // moment after its terminal closed. While it runs, Apple's own installer window is where
-        // the person finishes (the program opens it where Apple's catalog lists no tools, and
-        // asks them to press Install there), whatever placeholder is held.
+        // the person finishes (the program opens it where Apple's catalog lists no tools, or
+        // waits on the one already open, and asks them to press Install there), whatever
+        // placeholder is held.
         let mut tab = None;
         for terminal in setup
             .developer_tools_session
@@ -952,18 +970,47 @@ impl App {
         }
     }
 
-    /// What this Mac shows of an installer now ([`Reading`]): the same local evidence drives the
-    /// displayed wait and each dispatch boundary.
-    fn developer_tools_reading(&self) -> Reading {
-        self.workstation_setup
+    /// What this Mac shows of an installer now ([`Reading`]), probed live on the window's loop: the
+    /// dispatch boundaries read it (a landing's check, a person's press), so no tab lands beside
+    /// an installer that started since the last look. While the watch runs, its reading is brought
+    /// up to date with this one ([`Self::developer_tools_known`]).
+    fn developer_tools_reading(&mut self) -> Reading {
+        let reading = self
+            .workstation_setup
             .developer_tools_probe
-            .map_or_else(Reading::default, |read| read())
+            .map_or_else(Reading::default, |read| read());
+        if let Some(seen) = &mut self.workstation_setup.developer_tools_seen {
+            *seen = reading;
+        }
+        reading
     }
 
-    /// Whether an installer is up on this Mac, running or waiting in Apple's own window: no
-    /// second one opens beside it.
-    fn developer_tools_installing(&self) -> bool {
+    /// Whether an installer is up on this Mac, running or waiting in Apple's own window, as a
+    /// dispatch boundary reads it live ([`Self::developer_tools_reading`]): no second one opens
+    /// beside it.
+    fn developer_tools_installing(&mut self) -> bool {
         activity(self.developer_tools_reading()) != Activity::Idle
+    }
+
+    /// What the window knows of this Mac's installers for its looks that are no dispatch (the
+    /// page's step, the shim's word, the automatic tab's due check, a queued press's wait): the
+    /// reading the watch took on its own thread within the last second, or the newer one a
+    /// boundary read since, while the watch runs ([`watch_for_tools`]); a live probe where no watch
+    /// runs (the tools were there at launch, or arrived since), whose looks come only with events.
+    fn developer_tools_known(&self) -> Reading {
+        self.workstation_setup
+            .developer_tools_seen
+            .unwrap_or_else(|| {
+                self.workstation_setup
+                    .developer_tools_probe
+                    .map_or_else(Reading::default, |read| read())
+            })
+    }
+
+    /// Whether an installer is up on this Mac, as the window knows it
+    /// ([`Self::developer_tools_known`]).
+    fn developer_tools_installing_known(&self) -> bool {
+        activity(self.developer_tools_known()) != Activity::Idle
     }
 
     /// A person's press of the GitHub repositories row's Install… (design §3.3): the tab opens
@@ -1162,14 +1209,23 @@ impl App {
     /// The tab `session`'s program ended with `exit` (`None`: unknown). Exit 0 said the tools
     /// are installed: the GitHub repositories row is read again at once, the run waiting on it
     /// wakes, the row stays calm until that reading lands ([`Settling`]), and the shim comes off
-    /// new shells.
-    /// Exit 1 said why the install did not finish, and takes the account's [`Mark`] back, so the
-    /// next launch asks again. A stop's exit said a person stopped it, and keeps the mark, as a
-    /// closed tab does. Low Data Mode's exit takes the opening back (the mark included) and
+    /// new shells. So does any other end of the current attempt where the tools are there now,
+    /// having come another way while it ran: a tab closed at its password prompt, or one adopted
+    /// from an earlier aterm whose end gives no status, said nothing of them.
+    /// Exit 1 said why the install did not finish, and takes the account's [`Mark`] back where this
+    /// build's line is the tab's own ([`Terminal::spent_mark`]: its landing's claim added it, or
+    /// an adoption's did), so the next launch asks again; after a decline on this build, or an
+    /// ask the package follow-up made, a failed Install… leaves the build's ask spent, and Install
+    /// Command Line Tools… is the way on. A stop's exit said a person stopped it, and Apple's
+    /// window closed without the tools said a person pressed a button there; each keeps the mark,
+    /// as a closed tab does. Low Data Mode's exit takes the opening back (the mark included) and
     /// waits, calmly, for the mode to end; a non-administrator's leaves the row saying so, with
     /// no Install…. Any other end said nothing, and the tab ends on the window's line unless the
-    /// window already wrote one. Each but the last two leaves the row to Install… again. Only the
-    /// current attempt changes that state: an older terminal's delayed end keeps its own result.
+    /// window already wrote one; of those, the exits that say its program never started the
+    /// install ([`never_ran`]: its own not-started 2, `/usr/bin/env`'s 126 and 127) take back an
+    /// opening this tab spent, while the rest (a panic, a signal, a closed tab) keep the mark.
+    /// Each but the last two leaves the row to Install… again. Only the current attempt changes
+    /// that state: an older terminal's delayed end keeps its own result.
     /// A current end but 0 and Low Data Mode's leaves nothing installing the tools: the shim stays
     /// on new shells, and its line says they are missing rather than on their way until an
     /// install starts again ([`Self::settle_developer_tools_shim`]).
@@ -1196,31 +1252,20 @@ impl App {
         match exit {
             Some(aterm_pty::ChildExit::Code(0)) => {
                 aterm_log::info!("System State: the Command Line Tools tab installed them");
-                if current {
-                    self.workstation_setup.developer_tools_after.settling = Some(Settling {
-                        reading: self
-                            .system_state_host
-                            .latest_status()
-                            .repositories_reading()
-                            .cloned(),
-                        until: std::time::Instant::now() + SETTLE_BOUND,
-                    });
-                    if let Some(handlers) = self.system_state_handlers() {
-                        (handlers.tools_installed)();
-                    }
-                    // The tools arrived: the shim comes off new shells now, ahead of the next
-                    // pass's word.
-                    self.settle_developer_tools_want();
-                }
             }
             Some(aterm_pty::ChildExit::Code(1)) => {
                 aterm_log::info!("System State: the Command Line Tools tab said it did not finish");
                 // The program ran and failed (a wrong password, a download that broke), which is
-                // no person's closing the tab: the next launch asks again by itself.
+                // no person's closing the tab: the next launch asks again by itself, where the
+                // line is this tab's own (its landing's or an adoption's claim added it). One a
+                // decline kept, or another asker added (the follow-up of a package install or
+                // update, whose own ask it records), stays.
                 if current {
                     let setup = &mut self.workstation_setup;
                     setup.developer_tools_unfinished = true;
-                    setup.developer_tools_mark.forget();
+                    if spent_mark {
+                        setup.developer_tools_mark.forget();
+                    }
                 }
             }
             Some(aterm_pty::ChildExit::Code(code))
@@ -1229,6 +1274,22 @@ impl App {
                 aterm_log::info!("System State: the Command Line Tools tab was stopped");
                 // A person declined (a Ctrl-C at the password prompt or later): the opening stays
                 // spent, as for a closed tab, and Install… is the way on.
+                if current {
+                    self.workstation_setup.developer_tools_unfinished = true;
+                }
+            }
+            Some(aterm_pty::ChildExit::Code(code))
+                if code
+                    == i32::from(
+                        aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_WINDOW_CLOSED,
+                    ) =>
+            {
+                aterm_log::info!(
+                    "System State: the Command Line Tools tab said Apple's window closed without them"
+                );
+                // A person pressed a button in Apple's window (Not Now, Cancel, or Done on Apple's
+                // own failure): the opening stays spent, as for a stop, and Install… is the way
+                // on.
                 if current {
                     self.workstation_setup.developer_tools_unfinished = true;
                 }
@@ -1271,7 +1332,15 @@ impl App {
             Some(other) => {
                 aterm_log::info!("System State: the Command Line Tools tab ended: {other:?}");
                 if current {
-                    self.workstation_setup.developer_tools_unfinished = true;
+                    let setup = &mut self.workstation_setup;
+                    setup.developer_tools_unfinished = true;
+                    // Its program never ran, so nothing was installed and no person declined:
+                    // an opening its landing spent asks again at the next launch.
+                    if spent_mark
+                        && matches!(other, aterm_pty::ChildExit::Code(code) if never_ran(code))
+                    {
+                        setup.developer_tools_mark.forget();
+                    }
                 }
                 if !told {
                     let line = format!(
@@ -1284,6 +1353,18 @@ impl App {
             }
             None if current => self.workstation_setup.developer_tools_unfinished = true,
             None => {}
+        }
+        // The tools are there: exit 0 said its program installed them, or they came another way
+        // while it ran (Apple's dialog from another app, a package follow-up's install), whatever
+        // this end said. The watch left the row to this end ([`Self::developer_tools_watch`]),
+        // and a finished run polls no status, so it is read again here, once, and the shim comes
+        // off new shells now, ahead of the next pass's word.
+        if current
+            && (matches!(exit, Some(aterm_pty::ChildExit::Code(0)))
+                || self.workstation_setup.developer_tools_shim.tools_present())
+        {
+            self.read_repositories_again();
+            self.settle_developer_tools_want();
         }
         if current {
             self.settle_developer_tools_shim();
@@ -1349,15 +1430,71 @@ impl App {
         true
     }
 
-    /// The watch's second, and the launch's first look: what the want keeps
-    /// ([`Self::settle_developer_tools_want`]: the account's reading, the Low Data Mode watch, the
-    /// shim, which comes off new shells once the tools exist, however they arrived), and a want
-    /// waiting on a quiet keyboard or a free dialog slot looks again. A launch that found the tools
-    /// missing wants them from its setup host's start
+    /// The launch's first look: what the want keeps ([`Self::settle_developer_tools_want`]: the
+    /// account's reading, the Low Data Mode watch, the shim), and a want that is due opens its
+    /// tab. A launch that found the tools missing wants them from its setup host's start
     /// ([`crate::workstation_setup::Host::for_launch_marked`]).
-    pub(crate) fn developer_tools_watch(&mut self) {
+    pub(crate) fn developer_tools_first_look(&mut self) {
         self.settle_developer_tools_want();
         self.tick_developer_tools_install();
+    }
+
+    /// The watch's second ([`watch_for_tools`]), with what it read of this Mac's installers on its
+    /// own thread (`None`: the tools exist now, and the watch has ended): the window's looks read
+    /// that reading until the next second ([`Self::developer_tools_known`]), so none scans the
+    /// process table on the loop. The want is settled again ([`Self::settle_developer_tools_want`])
+    /// only where the shim's word moves (an installer started or ended, a run's admission
+    /// changed) or the tools arrived, which takes the shim off new shells however they came; a
+    /// second that moves nothing writes nothing. Their arrival also ends the automatic opening:
+    /// a request not yet opened goes ([`Install::Unasked`]), a person's press queued behind a
+    /// macOS dialog with it, and so does the launch's want ([`LAUNCH_WANT`]), which stood for the
+    /// tools alone; a pass's want stays until a later pass says it no longer waits on them. With
+    /// no install tab of this window's running, whose own end reads it however it ends
+    /// ([`Self::developer_tools_install_ended`]), the GitHub repositories row is read again at
+    /// once ([`Self::read_repositories_again`]), so a page that showed
+    /// Install… for tools that came another way (Apple's dialog from another app, a package
+    /// follow-up's install) moves on, as no status poll of a finished run would read it. A want
+    /// waiting on a quiet keyboard or a free dialog slot looks again.
+    pub(crate) fn developer_tools_watch(&mut self, reading: Option<Reading>) {
+        self.workstation_setup.developer_tools_seen = reading;
+        if reading.is_none() {
+            let setup = &mut self.workstation_setup;
+            if matches!(
+                setup.developer_tools,
+                Install::Wanted(_) | Install::PressedQueued { .. }
+            ) {
+                setup.developer_tools = Install::Unasked;
+            }
+            if setup.developer_tools_want == Some(LAUNCH_WANT) {
+                setup.developer_tools_want = None;
+            }
+            if !self.developer_tools_install_active() {
+                self.read_repositories_again();
+            }
+            self.republish_system_state_developer_tools();
+        }
+        let said = self.workstation_setup.developer_tools_shim_said.get();
+        if reading.is_none() || said != Some(self.developer_tools_on_their_way()) {
+            self.settle_developer_tools_want();
+        }
+        self.tick_developer_tools_install();
+    }
+
+    /// The tools are installed: the GitHub repositories row is read again at once and the run
+    /// waiting on them wakes (`InitialSetupHandlers::tools_installed`), the row staying calm until
+    /// that reading lands ([`Settling`]).
+    fn read_repositories_again(&mut self) {
+        self.workstation_setup.developer_tools_after.settling = Some(Settling {
+            reading: self
+                .system_state_host
+                .latest_status()
+                .repositories_reading()
+                .cloned(),
+            until: std::time::Instant::now() + SETTLE_BOUND,
+        });
+        if let Some(handlers) = self.system_state_handlers() {
+            (handlers.tools_installed)();
+        }
     }
 
     /// A setup pass ended waiting on the Command Line Tools (`wanted`), or not
@@ -1422,25 +1559,29 @@ impl App {
     /// are on their way ([`Self::developer_tools_on_their_way`]). Its directory stays for the
     /// shells that have it.
     pub(crate) fn settle_developer_tools_shim(&self) {
-        self.workstation_setup
-            .developer_tools_shim
-            .settle(self.developer_tools_on_their_way());
+        let setup = &self.workstation_setup;
+        let says = self.developer_tools_on_their_way();
+        setup.developer_tools_shim_said.set(Some(says));
+        setup.developer_tools_shim.settle(says);
     }
 
-    /// Whether an install of the tools is on its way: this account may install them, no install
-    /// of them ended unfinished since one last started
-    /// ([`crate::workstation_setup::Host::developer_tools_unfinished`]), and either an install
-    /// tab's program runs or a want stands that may open one ([`Self::developer_tools_install_authorized`]):
+    /// Whether an install of the tools is on its way: this account may install them, and either
+    /// no install of them ended unfinished since one last started
+    /// ([`crate::workstation_setup::Host::developer_tools_unfinished`]) while an install tab's
+    /// program runs or a want stands that may open one ([`Self::developer_tools_install_authorized`]:
     /// a launch's want under a hold or a durable Stop, or a pass's its run no longer admits,
-    /// installs nothing.
+    /// installs nothing), or an install of them is under way on this Mac whoever started it, as the
+    /// window knows it ([`Self::developer_tools_installing_known`]: the package follow-up's root
+    /// half, Apple's installer window, another installer).
     fn developer_tools_on_their_way(&self) -> bool {
         let setup = &self.workstation_setup;
         !setup.developer_tools_not_admin
-            && !setup.developer_tools_unfinished
-            && (self.developer_tools_install_active()
-                || setup
-                    .developer_tools_want
-                    .is_some_and(|revision| self.developer_tools_install_authorized(revision)))
+            && ((!setup.developer_tools_unfinished
+                && (self.developer_tools_install_active()
+                    || setup.developer_tools_want.is_some_and(|revision| {
+                        self.developer_tools_install_authorized(revision)
+                    })))
+                || self.developer_tools_installing_known())
     }
 
     /// The network watch read Low Data Mode `on` or off. Off, the automatic tab may open (its
@@ -1481,7 +1622,11 @@ impl App {
 
     /// [`Install::due`] for a want still authorized, once the keyboard was quiet for 2.5 s
     /// ([`crate::hands_off_keys`]): the landed tab takes the window's keys. Never once the tab has
-    /// opened on this build ([`Mark`]): Install… is the way then. A live installer, Low Data Mode
+    /// opened on this build ([`Mark`]): Install… is the way then; nor once the tools exist,
+    /// however they came (the shim's reading, [`crate::clt_shim::Shim::tools_present`]). A live
+    /// installer, as the window knows it ([`Self::developer_tools_installing_known`]; the
+    /// landing's check reads it live), an earlier aterm's tab running on with no custody here
+    /// ([`Self::developer_tools_tab_adopted`]), Low Data Mode
     /// ([`Self::developer_tools_wait_network`]) and an account that is none of the Mac's
     /// administrators hold the request, without consuming the automatic attempt.
     fn developer_tools_install_due(&self, dialog_up: bool) -> bool {
@@ -1492,7 +1637,30 @@ impl App {
             && matches!(self.workstation_setup.developer_tools, Install::Wanted(revision)
             if self.developer_tools_install_authorized(revision))
             && self.workstation_setup.developer_tools.due(dialog_up)
-            && !self.developer_tools_installing()
+            && !self.workstation_setup.developer_tools_shim.tools_present()
+            && !self.developer_tools_tab_adopted()
+            && !self.developer_tools_installing_known()
+    }
+
+    /// Whether a session adopted from an earlier aterm runs the Command Line Tools tab's program:
+    /// aterm's pin of [`TAB_TITLE`], which an adoption carries with the tab, over a child that has
+    /// not ended ([`child_ended`]). Its own `sudo` may be asking for the password now, with no
+    /// placeholder, stamp or installer yet for a probe to see, and a tab whose recovery record this
+    /// launch could not read (none, an earlier format, another place) gives this one no custody,
+    /// so the automatic tab waits for it to end rather than ask beside it. A tab this launch has
+    /// custody of holds the automatic tab already ([`Install::Opened`]).
+    fn developer_tools_tab_adopted(&self) -> bool {
+        self.pool.iter().any(|session| {
+            session.handoff_local_id.is_some()
+                && !child_ended(session)
+                && session
+                    .ctx
+                    .meta
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get("title")
+                    == Some(TAB_TITLE)
+        })
     }
 
     /// A launch's want stands on nothing but no hold and no Stop kept in the run's records: it is
@@ -1513,30 +1681,63 @@ impl App {
 
     /// Recheck before registration changes the active tab, reserving the worker's dialog
     /// slot through the installer child's lifetime. A key typed while the shell started
-    /// defers it too; a newer want survives a refused shell.
+    /// defers it too, as does an earlier aterm's tab running on
+    /// ([`Self::developer_tools_tab_adopted`]); a newer want survives a refused shell. Tools that
+    /// arrived since the shell was booked land nothing, and the request goes
+    /// ([`Install::Unasked`]). Last of all the landing claims
+    /// this build's ask in the account's record ([`Mark::claim`]): one another asker of this
+    /// build won since the shell was booked (the follow-up of a package install or update,
+    /// whose `sudo` may be asking now), or a claim that failed, lands nothing, and this launch's
+    /// automatic opening is spent ([`Self::developer_tools_asked_elsewhere`]).
     fn prepare_developer_tools_install_landing(&mut self, revision: u64) -> bool {
         let Install::Opening { wanted } = self.workstation_setup.developer_tools else {
             return false;
         };
+        let missing = !self.workstation_setup.developer_tools_shim.tools_present();
         if wanted == Some(revision)
+            && missing
             && crate::hands_off_keys(true, self.last_keystroke_at, std::time::Instant::now())
             && self.developer_tools_install_authorized(revision)
+            && !self.developer_tools_tab_adopted()
             && !self.access_dialog_up()
             && !self.developer_tools_installing()
             && self.reserve_access_dialog()
         {
-            return true;
+            if self.workstation_setup.developer_tools_mark.claim() {
+                return true;
+            }
+            self.workstation_setup.developer_tools = Install::Wanted(revision);
+            self.developer_tools_asked_elsewhere();
+            return false;
         }
-        self.workstation_setup.developer_tools = wanted.map_or(Install::Unasked, Install::Wanted);
+        let kept = wanted.filter(|_| missing);
+        self.workstation_setup.developer_tools = kept.map_or(Install::Unasked, Install::Wanted);
         aterm_log::info!(
             "System State: Command Line Tools install {}",
-            if wanted.is_some() {
+            if kept.is_some() {
                 "deferred"
-            } else {
+            } else if missing {
                 "withdrawn"
+            } else {
+                "withdrawn: the tools are installed"
             }
         );
         false
+    }
+
+    /// The account's record holds this build's ask though this launch's reading did not: another
+    /// asker of this build asked meanwhile (the follow-up of a package install or update, or
+    /// another window), or the landing's claim failed. This launch's automatic opening is spent,
+    /// as for a launch that read the record so, and Install… is the way on: nothing installs the
+    /// tools by itself, so the shim's line says they are on their way only while an install of
+    /// them is under way ([`Self::developer_tools_on_their_way`]).
+    fn developer_tools_asked_elsewhere(&mut self) {
+        aterm_log::info!(
+            "System State: this build's Command Line Tools ask is spent (asked already, or its \
+             record could not be claimed); no tab opens by itself"
+        );
+        self.workstation_setup.developer_tools_unfinished = true;
+        self.settle_developer_tools_shim();
     }
 
     /// A tab may land after Stop or a newer choice. Its old command then stays untyped.
@@ -1564,7 +1765,9 @@ impl App {
     }
 
     /// When the install is due, the window its tab opens in, how it spawns and what it does once
-    /// it lands (running this program's `aterm`, read only then), with the request now Opening.
+    /// it lands (running this program's `aterm`, read only then), with the request now Opening;
+    /// none once the account's [`Mark`], read again then, says another asker of this build asked
+    /// meanwhile ([`Mark::asked_since`]; the landing claims the ask, [`install_tab_then`]).
     /// A program that cannot name its `aterm` spends the launch's attempt and opens nothing. A
     /// person's queued press goes first, once nothing holds it, as [`Self::begin_pressed_install`]
     /// starts it; tools that arrived meanwhile let it go.
@@ -1591,7 +1794,7 @@ impl App {
             // it also waits for 2.5 s of quiet keyboard, as the automatic tab does.
             if self.developer_tools_install_active()
                 || self.access_dialog_up()
-                || self.developer_tools_installing()
+                || self.developer_tools_installing_known()
                 || !crate::hands_off_keys(true, self.last_keystroke_at, std::time::Instant::now())
             {
                 return None;
@@ -1608,6 +1811,13 @@ impl App {
             return Some((window, ask, then));
         }
         if !self.developer_tools_install_due(self.access_dialog_up()) {
+            return None;
+        }
+        // The account's record names this build now: another asker of this build (the follow-up
+        // of a package install or update) asked meanwhile, so no shell is booked. One that asks
+        // after this look loses the landing's claim instead.
+        if self.workstation_setup.developer_tools_mark.asked_since() {
+            self.developer_tools_asked_elsewhere();
             return None;
         }
         // Whichever window is frontmost, focused or not, whatever it shows.
@@ -2124,106 +2334,25 @@ mod tests {
     }
 
     /// The per-build mark is written durably, the file and then its directory entry, so a
-    /// power loss right after the tab landed never opens it again on that build; a second landing
-    /// writes nothing.
+    /// power loss right after the tab landed never opens it again on that build; a second
+    /// landing's claim writes nothing and adds nothing it could take back.
     #[test]
     #[cfg(unix)]
     fn the_per_build_mark_is_written_durably_with_its_directory() {
-        let dir = aterm_tempfile::tempdir().expect("a config directory");
+        let dir = aterm_tempfile::tempdir().expect("a state directory");
         let path = dir.path().join("command-line-tools-tab");
         let mut mark = Mark::at(path.clone());
         assert!(!mark.opened());
         let recording = aterm_durable::seam::Recording::start();
-        mark.note_opened();
+        assert!(mark.claim());
         assert_eq!(
             recording.take(),
             [aterm_durable::Flush::Durable, aterm_durable::Flush::Durable],
             "the mark's file, then its directory"
         );
         assert!(mark.opened() && path.is_file());
-        mark.note_opened();
+        assert!(!mark.claim(), "named already");
         assert!(recording.take().is_empty(), "written once");
-    }
-
-    /// The mark names each build that opened the tab, the newest [`MARK_BUILDS`]: a later launch
-    /// of a build it names asks no more, nor do two builds sharing the account launched in turn,
-    /// while a build it does not name (an update) retries unfinished setup once. A bare `opened`
-    /// (an older aterm's mark) names no build. A mark that cannot be read or is malformed, and a
-    /// build no line could name, hold, and such a mark is left as found.
-    #[test]
-    fn each_build_opens_the_tab_by_itself_at_most_once() {
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let path = dir.path().join("command-line-tools-tab");
-        let opened = |build: &str| Mark::opened_on_build(&path, build);
-        let text = || std::fs::read_to_string(&path).unwrap();
-        assert!(!opened("release"), "no mark");
-        Mark::record(&path, "release", true).unwrap();
-        assert!(opened("release"), "a later launch of that build");
-        assert!(!opened("dev"), "another build retries once");
-        Mark::record(&path, "dev", true).unwrap();
-        assert!(
-            opened("release") && opened("dev"),
-            "builds launched in turn"
-        );
-        assert_eq!(text(), "opened release\nopened dev\n");
-
-        for build in 1..MARK_BUILDS {
-            Mark::record(&path, &format!("update-{build}"), true).unwrap();
-        }
-        assert!(!opened("release"), "the oldest gives way");
-        assert!(opened("dev") && opened(&format!("update-{}", MARK_BUILDS - 1)));
-        assert_eq!(text().lines().count(), MARK_BUILDS);
-
-        // Low Data Mode takes one build's opening back and keeps the others'; the file goes
-        // with the last one.
-        let before = text();
-        Mark::record(&path, "release", false).unwrap();
-        assert_eq!(text(), before, "a build it does not name changes nothing");
-        Mark::record(&path, "dev", false).unwrap();
-        assert!(!opened("dev") && opened("update-1"));
-        let only = dir.path().join("only");
-        Mark::record(&only, "release", true).unwrap();
-        Mark::record(&only, "release", false).unwrap();
-        assert!(!only.exists());
-
-        std::fs::write(&path, "opened\n").unwrap();
-        assert!(
-            !opened("release"),
-            "an older aterm's bare mark names no build"
-        );
-        Mark::record(&path, "release", true).unwrap();
-        assert_eq!(text(), "opened release\n");
-
-        let too_many = "opened again\n".repeat(MARK_BUILDS + 1);
-        for malformed in [
-            "",
-            "\n",
-            "opened two words\n",
-            "closed\n",
-            too_many.as_str(),
-        ] {
-            std::fs::write(&path, malformed).unwrap();
-            assert!(opened("release"), "{malformed:?} holds");
-            assert!(
-                Mark::record(&path, "release", true).is_err(),
-                "{malformed:?}"
-            );
-            assert!(
-                Mark::record(&path, "release", false).is_err(),
-                "{malformed:?}"
-            );
-            assert_eq!(text(), malformed, "left as found");
-        }
-        assert!(
-            Mark::opened_on_build(dir.path(), "release"),
-            "unreadable holds"
-        );
-        let unnameable = "x".repeat(MARK_BUILD_BYTES + 1);
-        assert!(
-            Mark::opened_on_build(&dir.path().join("none"), &unnameable),
-            "a build no line could name holds"
-        );
-        assert!(Mark::record(&dir.path().join("none"), &unnameable, true).is_err());
     }
 
     /// The tab's own program is the install item alone, which asks the one password, under the
@@ -2246,11 +2375,10 @@ mod tests {
         );
     }
 
-    /// A placeholder counts as an install only while something that installs holds it (an
-    /// installer, Apple's window while it or the placeholder is younger than its bound, or a live
-    /// run of aterm's root half that stamped it), and Apple's own window before its install
-    /// starts, or left open past that bound beside a leftover placeholder as old, waits for the
-    /// person (design §3.3).
+    /// A placeholder counts as an install only while an installer holds it or a live run of
+    /// aterm's root half stamped it, and Apple's own window, beside the placeholder it made as it
+    /// opened or with none (it opened beside another install's, ended since), is where the person
+    /// finishes, at any age (design §3.3).
     #[test]
     fn the_placeholder_is_an_install_only_while_something_installs() {
         let read = |placeholder, install_process, apple_window| {
@@ -2261,24 +2389,6 @@ mod tests {
                 ..Reading::default()
             })
         };
-        let young_window = |placeholder| {
-            activity(Reading {
-                placeholder,
-                apple_window: true,
-                apple_window_young: true,
-                ..Reading::default()
-            })
-        };
-        assert_eq!(
-            young_window(true),
-            Activity::Installing,
-            "the install a person started in Apple's window"
-        );
-        assert_eq!(
-            young_window(false),
-            Activity::AppleWindow,
-            "its window before the press"
-        );
         let stamped = |placeholder| {
             activity(Reading {
                 placeholder,
@@ -2304,14 +2414,19 @@ mod tests {
         );
         assert_eq!(read(true, true, false), Activity::Installing);
         assert_eq!(
+            read(true, true, true),
+            Activity::Installing,
+            "an install under way beside the window"
+        );
+        assert_eq!(
             read(false, false, true),
             Activity::AppleWindow,
-            "waiting for a press"
+            "with no placeholder beside it"
         );
         assert_eq!(
             read(true, false, true),
             Activity::AppleWindow,
-            "a window left open past its bound beside a leftover placeholder as old"
+            "beside the placeholder it made as it opened, pressed or not, at any age"
         );
         assert_eq!(read(false, false, false), Activity::Idle);
     }

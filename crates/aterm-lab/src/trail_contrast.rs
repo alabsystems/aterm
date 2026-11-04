@@ -188,8 +188,8 @@ impl Image {
     /// # Errors
     /// The file cannot be read, is not a PNG, or does not decode.
     pub fn read(path: &Path) -> Result<Image, String> {
-        let bytes =
-            std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let bytes = crate::util::read_regular_file(path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         Image::decode(path, &bytes)
     }
 
@@ -1097,7 +1097,7 @@ pub fn sidecar(png: &Path, suffix: &str, per_frame: bool) -> Option<PathBuf> {
 }
 
 pub(crate) fn read_text(path: &Path) -> Result<String, String> {
-    std::fs::read(path)
+    crate::util::read_regular_file(path)
         .map(|b| String::from_utf8_lossy(&b).into_owned())
         .map_err(|e| format!("cannot read {}: {e}", path.display()))
 }

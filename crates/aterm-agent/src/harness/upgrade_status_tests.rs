@@ -3104,6 +3104,7 @@ fn planted_temporary_records_do_not_block_or_redirect_a_save() {
     }
 }
 
+/// NEGATIVE CONTROL: an unlistable or symlinked `<state>/upgrade` directory is refused on read and write.
 #[test]
 fn records_that_cannot_be_read_whole_hand_the_window_nothing() {
     let dir = aterm_tempfile::Builder::new()
@@ -3311,6 +3312,28 @@ fn records_that_cannot_be_read_whole_hand_the_window_nothing() {
     let (status, whole) = status_rows_with(&o, NOW, &held, &Aside::default);
     assert!(status.is_empty());
     assert!(whole, "a missing directory means there are no records");
+    let outside = aterm_tempfile::Builder::new()
+        .prefix("aterm-upgrade-outside-records-")
+        .tempdir()
+        .expect("outside dir");
+    std::fs::write(outside.path().join("aaa.json"), &saved).expect("outside record");
+    std::os::unix::fs::symlink(outside.path(), state_dir(&o)).expect("symlinked upgrade dir");
+    let (status, whole) = status_rows_with(&o, NOW, &held, &Aside::default);
+    assert!(status.is_empty(), "symlinked upgrade dir reads no records");
+    assert!(!whole, "symlinked upgrade dir is not whole");
+    assert!(
+        crate::harness::upgrade_drive::set_models(&o, "claude-opus-5-5").is_err(),
+        "symlinked upgrade dir refused on set_models"
+    );
+    assert!(
+        crate::harness::upgrade_drive::save_checked(&o, "bbb", &St::default()).is_err(),
+        "symlinked upgrade dir refused on save_checked"
+    );
+    assert!(
+        !outside.path().join("models.json").exists() && !outside.path().join("bbb.json").exists(),
+        "nothing written into symlink target"
+    );
+    std::fs::remove_file(state_dir(&o)).expect("remove symlink");
     std::fs::write(state_dir(&o), b"").expect("a file in the directory's place again");
     view.refresh_with(&o, &tabs, NOW, &held, &mut |rows| sent.push(rows.to_vec()));
     assert!(view.unlisted().is_some());

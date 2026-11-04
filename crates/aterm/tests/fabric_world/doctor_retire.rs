@@ -219,7 +219,9 @@ fn a_ghost_nodes_rows_are_retired_as_that_node_beside_a_live_bridge() {
     std::fs::create_dir_all(&ghost_state).expect("the ghost's state dir");
     std::fs::write(ghost_state.join("node"), format!("{ghost_node}\n")).expect("its node id");
     let ghost_cap = w.tmp.join("ghost.cap");
-    let caps: String = harness::node_grants(ghost_node)
+    let caps: String = astream_cap::GrantCeiling::aterm_node_ring(FLEET, ghost_node)
+        .expect("a node ring")
+        .rules()
         .iter()
         .map(|g| harness::cap_line(g))
         .collect();

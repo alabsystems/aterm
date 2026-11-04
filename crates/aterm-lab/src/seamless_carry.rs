@@ -66,7 +66,7 @@ pub(crate) struct Kept {
 /// The kept attempt in `folder`: its `index` read (`dir <mode> <path>`, `file <mode> <len>
 /// <name>`, `skip <name>`, modes in octal), and each file it lists read beside it.
 pub(crate) fn read_kept(folder: &Path) -> Result<Kept, String> {
-    let index = std::fs::read_to_string(folder.join("index"))
+    let index = crate::util::read_regular_text(&folder.join("index"))
         .map_err(|e| format!("{}: {e}", folder.join("index").display()))?;
     let mut kept = Kept::default();
     for row in index.lines() {
@@ -95,7 +95,7 @@ pub(crate) fn read_kept(folder: &Path) -> Result<Kept, String> {
                         "the index row `{row}` is not mode, length and name"
                     ));
                 };
-                let bytes = std::fs::read(folder.join(name))
+                let bytes = crate::util::read_regular_file(&folder.join(name))
                     .map_err(|e| format!("the kept {name}: {e}"))?;
                 if len.parse::<usize>().ok() != Some(bytes.len()) {
                     return Err(format!(

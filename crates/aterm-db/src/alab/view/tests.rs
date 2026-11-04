@@ -173,3 +173,114 @@ fn an_alias_names_the_addresses_its_codes_arrive_at() {
     assert_eq!(view.alias_targets(&addr("la")), [addr("lb")]);
     assert!(view.alias_targets(&addr("nobody")).is_empty());
 }
+
+/// The mailboxes the lab itself places an address in: its `mailbox` column, and an alias the
+/// mailbox of the address it is linked with; a `mailbox_hint` is a guess and decides nothing, and
+/// an address the lab places nowhere is not listed.
+/// NEGATIVE CONTROL: with `mailboxes` keeping a `How::Hint`, the hinted address is listed
+/// (`left: 3 right: 2`).
+#[test]
+fn the_lab_places_an_address_in_a_mailbox_only_by_its_own_rows() {
+    let pk = |local: &str| keys::address_pk(&format!("{local}@example.test")).unwrap();
+    let addr = |local: &str| format!("{local}@example.test");
+    let mut all = Vec::new();
+    for local in ["ann", "al", "hinted", "plain"] {
+        all.push(put(&ADDRESS, &pk(local), "addr", json!(addr(local))));
+        all.push(put(&ADDRESS, &pk(local), "row", json!("live")));
+    }
+    all.push(put(&ADDRESS, &pk("ann"), "mailbox", json!("mb-hub")));
+    all.push(put(&ADDRESS, &pk("al"), "alias_of", json!(pk("ann"))));
+    all.push(put(
+        &ADDRESS,
+        &pk("hinted"),
+        "mailbox_hint",
+        json!("mb-guess"),
+    ));
+    let view = LabView::read(
+        &cells(all),
+        &OwnedRead::default(),
+        &OwnedRead::default(),
+        None,
+    );
+    let placed = view.mailboxes();
+    assert_eq!(placed.len(), 2, "{placed:?}");
+    assert_eq!(placed.get(&addr("ann")).map(String::as_str), Some("mb-hub"));
+    assert_eq!(placed.get(&addr("al")).map(String::as_str), Some("mb-hub"));
+}
+
+/// `place` rows read beside the preferences (unix: the journal is).
+#[cfg(unix)]
+mod placements {
+    use super::*;
+    use crate::alab::journal::place::{Placed, Places, Why};
+
+    /// Facts rows of two uuids: `ME` binds `mine`, `OTHER` binds `theirs`.
+    fn two_facts(mine: &str, theirs: &str) -> OwnedRead {
+        let mut read = facts(mine, None);
+        read.rows.insert(
+            OTHER.to_owned(),
+            OwnedRow {
+                machine: [2; 16],
+                actor: [2; 48],
+                value: json!({"n": 1, "mac": theirs}),
+                rank: (0, 1, 1),
+                operation: [0; 32],
+            },
+        );
+        read
+    }
+
+    const OTHER: &str = "fedcba9876543210fedcba9876543210";
+
+    fn placed(uuid: &str, account: &str, why: Why) -> Placed {
+        Placed {
+            uuid: uuid.to_owned(),
+            account: account.to_owned(),
+            why,
+            since: 10,
+            until: 1_000,
+        }
+    }
+
+    /// "Which Macs hold A" and "what runs on m2" read the place rows beside the preferences (§7): a
+    /// Mac holding an account it does not prefer is listed after the Macs that prefer it; a place row
+    /// of a Mac that prefers the account too says nothing more; a row whose writer no facts row binds
+    /// names no Mac.
+    /// NEGATIVE CONTROL: with `placements` not dropping a row whose machine prefers the account,
+    /// `runs_on(m3)` lists `ann` twice (`left: 2 right: 1`); with `holding` reading preferences only,
+    /// `bob` is held by nobody (`left: [] right: ["mc-…"]`).
+    #[test]
+    fn which_macs_hold_an_account_reads_place_rows_beside_preferences() {
+        let (m22, mut all) = machine("m22");
+        let (m3, more) = machine("m3");
+        all.extend(more);
+        let (ann, more) = account("ann", "claude");
+        all.extend(more);
+        let (bob, more) = account("bob", "claude");
+        all.extend(more);
+        all.extend(prefer(&m3, &ann, Some(1)));
+        let view = LabView::read(
+            &cells(all),
+            &two_facts(&m3, &m22),
+            &OwnedRead::default(),
+            Some(ME),
+        );
+        let places = Places {
+            rows: vec![
+                placed(ME, &ann, Why::Fill),
+                placed(OTHER, &ann, Why::Borrow),
+                placed(ME, &bob, Why::Fill),
+                placed("00000000000000000000000000000001", &bob, Why::Fill),
+            ],
+        };
+        assert_eq!(view.holding(&ann, &places), [m3.clone(), m22.clone()]);
+        assert_eq!(view.holding(&bob, &places), std::slice::from_ref(&m3));
+        let (preferred, running) = view.runs_on(&m3, &places);
+        assert_eq!(preferred.len(), 1);
+        let ran: Vec<&str> = running.iter().map(|p| p.account.as_str()).collect();
+        assert_eq!(ran, [bob.as_str()], "ann is m3's preference already");
+        let (_, theirs) = view.runs_on(&m22, &places);
+        assert_eq!(theirs.len(), 1);
+        assert_eq!(theirs[0].why, Why::Borrow);
+    }
+}

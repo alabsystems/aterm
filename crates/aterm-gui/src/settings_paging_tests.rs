@@ -3647,6 +3647,7 @@ fn a_choice_taller_than_its_list_takes_its_short_words() {
                         node.rect,
                         node.clip,
                         button.spec.visual_label.clone(),
+                        button.spec.trailing_icon,
                         heard.clone(),
                     ));
                     if node.clip == node.rect {

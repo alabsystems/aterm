@@ -3698,6 +3698,55 @@ pub(super) struct ScrollRecord {
     place: Option<Box<(ScrollPlan, usize)>>,
 }
 
+/// The actual inputs read by the scroll solver, apart from its pinned input plan. A render's
+/// status height is not one: its coverage has already been incorporated into that plan.
+#[derive(Clone, PartialEq)]
+struct SeatInputs {
+    record: Option<ScrollRecord>,
+    context: ScrollContext,
+    scroll: usize,
+    reveal: Option<UiKey>,
+    reveal_as: Reveal,
+    focus: Option<UiKey>,
+    carried: Option<UiKey>,
+    first_beside: Option<(UiKey, Option<UiKey>)>,
+    let_go: bool,
+}
+
+/// One actual solver evaluation, shared by a render's probes and final materialization.
+/// Plans keep their row arrays in shared storage; these copies retain that storage. Equality
+/// still checks the complete geometry and can traverse rows when their storage differs.
+pub(super) struct MemoSeat {
+    input: ScrollPlan,
+    state: SeatInputs,
+    plan: ScrollPlan,
+    view: Range<usize>,
+    record: Option<ScrollRecord>,
+    window: Option<usize>,
+    result_limit: Option<usize>,
+}
+
+/// Install one render's seating memo, restoring an enclosing render's slot on return.
+pub(super) struct SeatsShared<'a> {
+    state: &'a SettingsViewState,
+    previous: Option<Vec<MemoSeat>>,
+}
+
+impl<'a> SeatsShared<'a> {
+    pub(super) fn open(state: &'a SettingsViewState) -> Self {
+        Self {
+            state,
+            previous: state.scroll_seats.replace(Some(Vec::new())),
+        }
+    }
+}
+
+impl Drop for SeatsShared<'_> {
+    fn drop(&mut self) {
+        self.state.scroll_seats.replace(self.previous.take());
+    }
+}
+
 impl ScrollRecord {
     /// The stop the list's screen started at.
     pub(super) const fn top(&self) -> usize {
@@ -3759,6 +3808,61 @@ impl ScrollRecord {
 }
 
 impl SettingsViewState {
+    pub(super) fn forget_shared_seats(&self) {
+        if let Some(seats) = self.scroll_seats.borrow_mut().as_mut() {
+            seats.clear();
+        }
+    }
+
+    /// Evaluate or apply the exact same scroll solver evaluation within this render. A press's
+    /// status can mutate its held press during evaluation, so such evaluations are never shared.
+    /// Independent test cross-checks bypass both reads and writes of the memo.
+    fn seat_shared(&self, plan: &mut ScrollPlan) -> Range<usize> {
+        #[cfg(test)]
+        let counted = crate::work_counts::page_work_counted();
+        #[cfg(not(test))]
+        let counted = true;
+        if !counted || self.pressed_at.borrow().is_some() || self.scroll_seats.borrow().is_none() {
+            return self.seat_scroll(plan);
+        }
+        let state = SeatInputs {
+            record: self.scroll_record.borrow().clone(),
+            context: self.scroll_context(),
+            scroll: self.page_scroll,
+            reveal: self.page_reveal.clone(),
+            reveal_as: self.reveal_as,
+            focus: self.common.last_focus.clone(),
+            carried: self.list_carried.clone(),
+            first_beside: self.first_beside.clone(),
+            let_go: self.start_let_go.get(),
+        };
+        if let Some(known) = self.scroll_seats.borrow().as_ref().and_then(|seats| {
+            seats
+                .iter()
+                .find(|seat| seat.input == *plan && seat.state == state)
+        }) {
+            plan.clone_from(&known.plan);
+            self.scroll_record.replace(known.record.clone());
+            self.page_window.set(known.window);
+            self.result_page_limit.set(known.result_limit);
+            return known.view.clone();
+        }
+        let input = plan.clone();
+        let view = self.seat_scroll(plan);
+        if let Some(seats) = self.scroll_seats.borrow_mut().as_mut() {
+            seats.push(MemoSeat {
+                input,
+                state,
+                plan: plan.clone(),
+                view: view.clone(),
+                record: self.scroll_record.borrow().clone(),
+                window: self.page_window.get(),
+                result_limit: self.result_page_limit.get(),
+            });
+        }
+        view
+    }
+
     fn scroll_now(&self) -> usize {
         let context = self.scroll_context();
         self.scroll_record
@@ -5275,6 +5379,16 @@ impl SettingsViewState {
         if self.reveal_as != Reveal::Keep || self.press_holds_place() {
             return None;
         }
+        if !self.focused_control_needs_name() {
+            return None;
+        }
+        self.page_reveal
+            .as_ref()
+            .filter(|key| self.common.last_focus.as_ref() == Some(*key))
+    }
+
+    /// Whether the focused control can need a separate name, independent of scroll input.
+    pub(super) fn focused_control_needs_name(&self) -> bool {
         // The declared control kind identifies switches and possible segments without
         // laying out a candidate just to discover that a card or text field owes no span.
         // Candidate geometry still decides the name span and any self-naming exemption.
@@ -5282,12 +5396,7 @@ impl SettingsViewState {
             .focused_setting_key()
             .and_then(|key| self.field_by_key(key))
             .is_some_and(|field| matches!(field.kind, super::EditKind::Bool));
-        if !switch && self.focused_segment().is_none() {
-            return None;
-        }
-        self.page_reveal
-            .as_ref()
-            .filter(|key| self.common.last_focus.as_ref() == Some(*key))
+        switch || self.focused_segment().is_some()
     }
 
     /// Whether the stop holding the control the list keeps in view ([`Self::page_reveal`])
@@ -5491,7 +5600,7 @@ impl SettingsViewState {
             self.page_window.get(),
             self.result_page_limit.get(),
         );
-        let _ = self.seat_scroll(&mut plan);
+        let _ = self.seat_shared(&mut plan);
         let told = self.scroll_record.replace(was.0);
         self.page_window.set(was.1);
         self.result_page_limit.set(was.2);
@@ -7493,7 +7602,7 @@ impl SeatedList {
         room: f32,
     ) -> Self {
         state.note_status_room(&plan, room);
-        let view = state.seat_scroll(&mut plan);
+        let view = state.seat_shared(&mut plan);
         let drawn = drawn_stops(&plan, &view);
         Self {
             plan,
@@ -7674,6 +7783,92 @@ mod tests {
         }
         plan.set_room(room);
         plan
+    }
+
+    #[test]
+    fn a_told_scroll_is_applied_to_paint_only_at_its_exact_solver_inputs() {
+        let state = SettingsViewState::new(&crate::app_config::Config::default());
+        let seats = SeatsShared::open(&state);
+        let input = cards(&[40.0, 60.0, 80.0], 90.0, 4.0);
+        let _ = crate::work_counts::take_settings_page_work();
+        let told = state.seated_under(input.clone(), None);
+        assert_eq!(crate::work_counts::take_settings_page_work().seats, 1);
+        assert!(state.scroll_record.borrow().is_none());
+        {
+            let _nested = SeatsShared::open(&state);
+            assert!(state.scroll_seats.borrow().as_ref().unwrap().is_empty());
+        }
+        assert_eq!(state.scroll_seats.borrow().as_ref().unwrap().len(), 1);
+        let painted = SeatedList::seated(&state, input.clone(), Vec::new(), input.room());
+        assert_eq!(crate::work_counts::take_settings_page_work().seats, 0);
+        assert_eq!(*state.scroll_record.borrow(), told);
+        assert_eq!(painted.plan, told.as_ref().unwrap().plan);
+        assert_eq!(
+            painted.view,
+            painted.plan.screen(told.as_ref().unwrap().top).view
+        );
+        assert_eq!(
+            state.page_window.get(),
+            Some(painted.plan.shown(0).len().max(1))
+        );
+        assert_eq!(state.result_page_limit.get(), Some(painted.plan.limit()));
+
+        // A different prior record is itself a solver input, even for the same list.
+        let _ = state.seat_shared(&mut input.clone());
+        assert_eq!(crate::work_counts::take_settings_page_work().seats, 1);
+        state.scroll_record.replace(None);
+        let mut changed = input.clone();
+        changed.pin_keyboard(Some((40.0, 20.0)));
+        let _ = state.seat_shared(&mut changed);
+        assert_eq!(crate::work_counts::take_settings_page_work().seats, 1);
+        state.scroll_record.replace(None);
+        drop(seats);
+        state.start_let_go.set(true);
+        let _seats = SeatsShared::open(&state);
+        let _ = state.seat_shared(&mut input.clone());
+        state.scroll_record.replace(None);
+        state.start_let_go.set(false);
+        let _ = state.seat_shared(&mut input.clone());
+        assert_eq!(crate::work_counts::take_settings_page_work().seats, 2);
+    }
+
+    #[test]
+    fn independent_scroll_checks_and_held_presses_do_not_share_seats() {
+        let state = SettingsViewState::new(&crate::app_config::Config::default());
+        let seats = SeatsShared::open(&state);
+        let input = cards(&[40.0, 60.0, 80.0], 90.0, 4.0);
+        let _ = state.seated_under(input.clone(), None);
+        // An impossible cached answer proves an uncounted check cannot read the memo.
+        state.scroll_seats.borrow_mut().as_mut().unwrap()[0].view = usize::MAX..usize::MAX;
+        let mut checked = input.clone();
+        let view = crate::work_counts::page_work_uncounted(|| state.seat_shared(&mut checked));
+        assert_eq!(view, checked.screen(0).view);
+        assert_eq!(state.scroll_seats.borrow().as_ref().unwrap().len(), 1);
+        state.scroll_record.replace(None);
+        state.forget_shared_seats();
+        let _ = crate::work_counts::page_work_uncounted(|| state.seat_shared(&mut input.clone()));
+        assert!(state.scroll_seats.borrow().as_ref().unwrap().is_empty());
+        state.scroll_record.replace(None);
+        state.pressed_at.replace(Some(PressedAt {
+            context: state.scroll_context(),
+            key: UiKey::new("pressed"),
+            bottom: 40.0,
+            before: None,
+            status: None,
+            awaits: false,
+            top: 0.0,
+            side: None,
+            band_gone: false,
+            scrolled: false,
+            list_top: None,
+            segment: None,
+        }));
+        let _ = crate::work_counts::take_settings_page_work();
+        let _ = state.seat_shared(&mut input.clone());
+        assert_eq!(crate::work_counts::take_settings_page_work().seats, 1);
+        assert!(state.scroll_seats.borrow().as_ref().unwrap().is_empty());
+        drop(seats);
+        assert!(state.scroll_seats.borrow().is_none());
     }
 
     #[test]
@@ -8996,6 +9191,65 @@ mod tests {
         assert!(
             plan.named_control_fits(&key),
             "a self-naming button needs no extra row name"
+        );
+    }
+
+    #[test]
+    fn a_name_only_cut_remains_visible_to_the_chrome_fit() {
+        let key = UiKey::new("settings/control/copy_on_select");
+        let row = UiKey::new("settings/row/copy_on_select");
+        let mut plan = ScrollPlan::new(4.0);
+        let group = plan.group(0.0, 0.0);
+        // Two distinct stops: a 24pt name line and its 4pt gap, then a 48pt switch.
+        // Each stop fits 72pt; their shortest identifying span needs 76pt.
+        plan.row(
+            group,
+            28.0,
+            vec![UiKey::new("settings/label/copy_on_select")],
+        );
+        plan.set_ink(24.0);
+        plan.set_control_rows(Vec::new());
+        plan.set_names(RowNames {
+            lines: vec![(row.clone(), 0.0, 24.0)],
+            ..RowNames::default()
+        });
+        plan.row(group, 48.0, vec![key.clone()]);
+        plan.set_control_spans(vec![(key.clone(), 0.0, 48.0)]);
+        plan.set_names(RowNames {
+            controls: vec![(key.clone(), row)],
+            ..RowNames::default()
+        });
+        let mut state = SettingsViewState::new(&crate::app_config::Config::default());
+        state.common.last_focus = Some(key.clone());
+        state.reveal_control(key);
+        assert!(
+            state.keyboard_name_reveal().is_some(),
+            "the declared Bool owes its name"
+        );
+
+        plan.set_room(72.0);
+        let short = super::super::PageFit::of(&state, &plan);
+        assert_eq!(short.cuts, (0, 0), "physical stops are whole");
+        assert!(
+            !short.complete(),
+            "zero physical cuts cannot hide the missing name"
+        );
+        assert!(!short.name_complete);
+
+        plan.set_room(76.0);
+        let named = super::super::PageFit::of(&state, &plan);
+        assert!(named.complete());
+        assert!(
+            named.better_than(short, true),
+            "a toolbar alternative can supply the name without changing physical cuts"
+        );
+        assert!(!short.better_than(named, true));
+
+        state.reveal_as = Reveal::Hold;
+        plan.set_room(72.0);
+        assert!(
+            super::super::PageFit::of(&state, &plan).complete(),
+            "a held place does not acquire a new keyboard-name obligation"
         );
     }
 

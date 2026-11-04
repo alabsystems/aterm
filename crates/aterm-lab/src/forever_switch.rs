@@ -412,7 +412,7 @@ fn tapes_in(dir: &Path) -> Option<Vec<show::Tape>> {
         if path.extension().is_none_or(|x| x != "atape") {
             continue;
         }
-        if let Some(tape) = std::fs::read(&path)
+        if let Some(tape) = crate::util::read_regular_file(&path)
             .ok()
             .and_then(|raw| show::open(&raw, true).ok())
         {

@@ -113,16 +113,16 @@ pub fn plan(scene: char) -> Plan {
     };
     let alt1 = |pct: u32| week(pct, 4 * D + 18 * H + 30 * M, -3 * H);
     let pace = vec![(-24 * H, 420), (-16 * H, 473), (-8 * H, 527), (0, 580)];
-    let two = vec![("me", Class::Dedicated), ("alt1", Class::Dedicated)];
+    let two = vec![("me", Class::Preferred), ("alt1", Class::Preferred)];
     match scene {
         'A' | 'G' => {
             let aged = if scene == 'G' { 16 * M } else { 0 };
             Plan {
                 rows: vec![
-                    ("me", Class::Dedicated),
-                    ("alt1", Class::Dedicated),
-                    ("alt2", Class::Dedicated),
-                    ("pool1", Class::Shared),
+                    ("me", Class::Preferred),
+                    ("alt1", Class::Preferred),
+                    ("alt2", Class::Preferred),
+                    ("pool1", Class::Pool),
                 ],
                 seen: vec![
                     ("me", me(580, 380, -aged)),
@@ -142,9 +142,9 @@ pub fn plan(scene: char) -> Plan {
         },
         'C' => Plan {
             rows: vec![
-                ("me", Class::Dedicated),
-                ("alt1", Class::Dedicated),
-                ("pool1", Class::Shared),
+                ("me", Class::Preferred),
+                ("alt1", Class::Preferred),
+                ("pool1", Class::Pool),
             ],
             seen: vec![("me", me(580, 380, 0)), ("alt1", alt1(920))],
             series: pace,
@@ -552,7 +552,7 @@ fn shoot(o: &Opts, aterm: &Path, scene: char, look: Look, scale: u8) -> Result<V
 /// A frame of the window: its width in pixels and its pixels.
 fn frame(inst: &Instance, scratch: &Path) -> Result<(usize, Vec<u8>), Fail> {
     image(inst, scratch)?;
-    let bytes = std::fs::read(scratch)
+    let bytes = crate::util::read_regular_file(scratch)
         .map_err(|e| Fail::die(format!("cannot read {}: {e}", scratch.display())))?;
     let (rgba, w, _) = aterm_png::decode_rgba8(&bytes, 1 << 15)
         .ok_or_else(|| Fail::die(format!("{}: not a png", scratch.display())))?;
@@ -881,7 +881,7 @@ fn full_series(
             text.push_str(&line);
             text.push('\n');
         }
-        text.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
+        text.push_str(&crate::util::read_regular_text(&path).unwrap_or_default());
         std::fs::write(&path, text)
             .map_err(|e| Fail::die(format!("cannot write {}: {e}", path.display())))?;
     }

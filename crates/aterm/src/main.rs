@@ -12,6 +12,8 @@ use std::process::ExitCode;
 
 #[cfg(target_os = "macos")]
 mod compact_zone;
+#[cfg(unix)]
+mod machine_status;
 #[cfg(test)]
 mod macho_order;
 #[cfg(unix)]
@@ -31,10 +33,12 @@ aterm_secrets::memoized_x25519_in_tests!();
 aterm_db::admission_waits_in_tests!(aterm_spec::wait::MUST_HAPPEN);
 
 /// `aterm pkg` and its `atpkg` alias: the package pass, then, after an install or update that
-/// succeeded and that a person typed at a terminal ([`a_person_at_their_own_account`],
-/// [`atpkg::cli::pass_finishes_setup`]), setup's follow-up ([`InitEntry::PackageFollowUp`]) in
-/// this process. The pass's store lock is [`atpkg::cli::main_entry`]'s own and is let go as it
-/// returns, before the follow-up starts.
+/// ended settled and that a person typed at a terminal ([`a_person_at_their_own_account`],
+/// [`atpkg::cli::pass_finishes_setup`], [`atpkg::cli::pass_ended_settled`]), setup's follow-up
+/// ([`InitEntry::PackageFollowUp`]) in this process. The pass's store lock is
+/// [`atpkg::cli::main_entry`]'s own and is let go as it returns, before the follow-up starts.
+/// A stop during the follow-up says [`FOLLOW_UP_STOPPED`] and ends the command as that stop
+/// would have ([`aterm_machines::port::say_on_stop`]).
 fn package_entry(args: Vec<OsString>) -> ExitCode {
     package_entry_with(
         args,
@@ -44,11 +48,13 @@ fn package_entry(args: Vec<OsString>) -> ExitCode {
             if aterm_machines::cli::pkg_retires(&args) {
                 aterm_machines::cli::retire_lan_agent();
             }
-            atpkg::cli::main_entry(args)
+            let code = atpkg::cli::main_entry(args);
+            (code, atpkg::cli::pass_ended_settled(code))
         },
         || {
             #[cfg(unix)]
             {
+                let _says = aterm_machines::port::say_on_stop(FOLLOW_UP_STOPPED);
                 run_init(InitEntry::PackageFollowUp)
             }
             #[cfg(not(unix))]
@@ -59,21 +65,26 @@ fn package_entry(args: Vec<OsString>) -> ExitCode {
     )
 }
 
-/// Whether a person runs this command at a terminal ([`atpkg::cli::a_person_typed_this`]: its
-/// standard input and standard error both are), as themselves (not as root, which `aterm init`
-/// refuses) and in their own login's home ([`aterm_machines::sessions::is_live_account`], which
-/// no private state root is). A pass a program runs with its input or its error elsewhere (the
-/// window's package lanes and Settings ▸ Packages, a worker's admission, a detached pass,
-/// init's own toolset pass, the machines items) is no person's. A pass a command runs on the
-/// person's terminal as one step of its own work (`aterm ai doctor`'s and `aterm ai login`'s
-/// installs, the AI screen's Install tab) reads as theirs here, and says itself that no setup
-/// follows it ([`atpkg::cli::NO_INIT_FLAG`]).
+/// What the package follow-up says when a stop (a Ctrl-C, a closed tab, a `kill`) ends it.
+#[cfg(unix)]
+const FOLLOW_UP_STOPPED: &str =
+    "aterm pkg: stopped; setup after this pass is not finished: `aterm init` finishes it\n";
+
+/// What the package follow-up says when it ends on a panic: the pass's status stands.
+const FOLLOW_UP_UNFINISHED: &str =
+    "aterm pkg: setup after this pass did not finish; `aterm init` finishes it";
+
+/// Whether a person runs this command at a terminal, as themselves in their own login's home,
+/// outside CI ([`a_person_at_their_own_account_from`] of this process).
 fn a_person_at_their_own_account() -> bool {
     #[cfg(unix)]
     {
-        atpkg::cli::a_person_typed_this()
-            && aterm_uds::peer::our_uid() != 0
-            && aterm_machines::sessions::is_live_account()
+        a_person_at_their_own_account_from(
+            atpkg::cli::a_person_typed_this(),
+            aterm_uds::peer::our_uid(),
+            aterm_machines::sessions::is_live_account(),
+            |name| std::env::var_os(name),
+        )
     }
     #[cfg(not(unix))]
     {
@@ -81,23 +92,49 @@ fn a_person_at_their_own_account() -> bool {
     }
 }
 
-/// [`package_entry`] with whether a person runs it (`person`), the package pass (`packages`) and
-/// the follow-up (`setup`). The follow-up runs only after a pass a person ran whose words
-/// setup follows ([`atpkg::cli::pass_finishes_setup`]), and only once that pass succeeded. The
-/// command's exit status is always the pass's.
+/// Whether a person runs this command: at a terminal (`typed`, [`atpkg::cli::a_person_typed_this`]:
+/// its standard input and standard error both are), as themselves (`uid` not root, which
+/// `aterm init` refuses), in their own login's home (`live`,
+/// [`aterm_machines::sessions::is_live_account`], which no private state root is), and not
+/// under CI (`CI` set, as `var` reads it), where aterm makes no setup decision of its own, as
+/// it makes no LAN look or fleet dial there. A typed `aterm init` under CI still runs: the CI
+/// job asked for it. A pass a program runs with its input or its error elsewhere (the window's
+/// package lanes and Settings ▸ Packages, a worker's admission, a detached pass, init's own
+/// toolset pass, the machines items) is no person's. A pass a command runs on the person's
+/// terminal as one step of its own work (`aterm ai doctor`'s and `aterm ai login`'s installs,
+/// the AI screen's Install tab) reads as theirs here, and says itself that no setup follows it
+/// ([`atpkg::cli::NO_INIT_FLAG`]).
+#[cfg(any(unix, test))]
+fn a_person_at_their_own_account_from(
+    typed: bool,
+    uid: u32,
+    live: bool,
+    var: impl Fn(&str) -> Option<OsString>,
+) -> bool {
+    typed && uid != 0 && live && var("CI").is_none()
+}
+
+/// [`package_entry`] with whether a person runs it (`person`), the package pass (`packages`,
+/// which answers its status and whether it ended settled, [`atpkg::cli::pass_ended_settled`])
+/// and the follow-up (`setup`). The follow-up runs only after a pass a person ran whose words
+/// setup follows ([`atpkg::cli::pass_finishes_setup`]), and only once that pass ended settled.
+/// The command's exit status is the pass's, unless a stop ends the follow-up: a follow-up that
+/// panics says [`FOLLOW_UP_UNFINISHED`] and the pass's status stands.
 fn package_entry_with(
     args: Vec<OsString>,
     person: bool,
-    packages: impl FnOnce(Vec<OsString>) -> ExitCode,
+    packages: impl FnOnce(Vec<OsString>) -> (ExitCode, bool),
     setup: impl FnOnce() -> ExitCode,
 ) -> ExitCode {
     let finish = person && atpkg::cli::pass_finishes_setup(&args);
-    let code = packages(args);
-    if finish && code == ExitCode::SUCCESS {
+    let (code, settled) = packages(args);
+    if finish && settled {
         // The follow-up's rows and summary on the person's terminal, and its line in aterm.log,
         // say what it left unfinished. Its status (75, 77, 69 or 1 for an unfinished run) would
         // read as the pass's own store contention, offline or failure.
-        let _ = setup();
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(setup)).is_err() {
+            let _ = aterm_uds::stdout::stderr_line(format_args!("{FOLLOW_UP_UNFINISHED}"));
+        }
     }
     code
 }
@@ -113,10 +150,10 @@ enum InitEntry {
     /// is aterm's decision, not theirs ([`aterm_machines::init::Decider::Aterm`]), so it puts no
     /// question of macOS's on the screen: its words leave out the sign-outs and the workstation
     /// preferences ([`aterm_machines::init::PACKAGE_FOLLOW_UP`]), at this Mac's console its look
-    /// for the ALab vault waits until macOS has answered aterm's Local Network question (over
-    /// SSH, where macOS asks none, it looks as a typed `aterm init` there does), Rust in
-    /// Spotlight searches no folder of the person's, and it hands no grant to the permission
-    /// walk.
+    /// for the ALab vault, and its reach of a vault at a URL this Mac is in, wait until macOS has
+    /// answered aterm's Local Network question (over SSH, where macOS asks none, it looks as a
+    /// typed `aterm init` there does), Rust in Spotlight searches no folder of the person's, and
+    /// it hands no grant to the permission walk.
     PackageFollowUp,
 }
 
@@ -573,6 +610,10 @@ fn front_door_main() -> ExitCode {
             aterm_cli::macos_doctor::LocalNetworkFirstUse::Answered
         )
     });
+    // What this process's looks and vault syncs at a `.local` address hear of the switch is kept
+    // as the window's own looks keep it, where the question macOS puts it is aterm's own.
+    #[cfg(target_os = "macos")]
+    aterm_machines::init_secrets::on_lan_heard(aterm_cli::macos_doctor::LAN_KEEPER);
     // The fixed collector runs before GUI initialization or any per-user state is read.
     #[cfg(target_os = "macos")]
     let early_args: Vec<_> = std::env::args_os().skip(1).collect();
@@ -762,6 +803,13 @@ fn front_door_main() -> ExitCode {
             #[cfg(not(unix))]
             aterm_cli::Verb::Init => {
                 eprintln!("aterm init: not available on this platform (Unix only)");
+                ExitCode::from(2)
+            }
+            #[cfg(unix)]
+            aterm_cli::Verb::Status => machine_status::main_entry(&forwarded),
+            #[cfg(not(unix))]
+            aterm_cli::Verb::Status => {
+                eprintln!("aterm status: not available on this platform (Unix only)");
                 ExitCode::from(2)
             }
             #[cfg(unix)]
@@ -7083,9 +7131,10 @@ fn access_step_recorded(
     access_fact_observed(access, outcome);
 }
 
-/// System State's Command Line Tools tab said Apple's Command Line Tools are installed
-/// ([`aterm_gui::InitialSetupHandlers::tools_installed`]): the GitHub repositories row is read
-/// again at once, and a run parked on them wakes to go on (System State design §3.3).
+/// Apple's Command Line Tools are installed, as System State's Command Line Tools tab said or the
+/// window found them ([`aterm_gui::InitialSetupHandlers::tools_installed`]): the GitHub
+/// repositories row is read again at once, and a run parked on them wakes to go on (System State
+/// design §3.3).
 #[cfg(target_os = "macos")]
 fn command_line_tools_installed() {
     use aterm_types::macos_setup::{Setting, Subject};
@@ -14349,41 +14398,55 @@ mod startup_scope_tests;
 
 #[cfg(test)]
 mod tests {
-    /// The command exits with the package pass's own status whatever the follow-up's, and the
-    /// follow-up runs after the pass, only for a person's pass that succeeded and whose words
-    /// setup follows ([`atpkg::cli::pass_finishes_setup`] holds the grammar).
+    /// The command exits with the package pass's own status whatever the follow-up's, a panic
+    /// included, and the follow-up runs after the pass, only for a person's pass whose words
+    /// setup follows ([`atpkg::cli::pass_finishes_setup`] holds the grammar) and that ended
+    /// settled ([`atpkg::cli::pass_ended_settled`] holds what each exit means): a success, or a
+    /// whole update's 2 that found nothing installable here, never a usage error's 2.
     #[test]
-    fn a_package_pass_keeps_its_status_and_setup_follows_only_a_persons_finished_pass() {
+    fn a_package_pass_keeps_its_status_and_setup_follows_only_a_persons_settled_pass() {
         use std::cell::RefCell;
         use std::ffi::OsString;
         use std::process::ExitCode;
-        for (words, person, package_code, follows) in [
-            (&["install", "trust"][..], true, ExitCode::SUCCESS, true),
-            (&["update"], true, ExitCode::SUCCESS, true),
-            (&["update"], true, ExitCode::FAILURE, false),
-            (&["update"], true, ExitCode::from(75), false),
-            (&["update"], false, ExitCode::SUCCESS, false),
+        let ok = (ExitCode::SUCCESS, true);
+        let nothing_here = (ExitCode::from(2), true);
+        for (words, person, (package_code, settled), follows) in [
+            (&["install", "trust"][..], true, ok, true),
+            (&["update"], true, ok, true),
+            (&["update"], true, nothing_here, true),
+            (
+                &["update", "--bogus"],
+                true,
+                (ExitCode::from(2), false),
+                false,
+            ),
+            (&["update"], true, (ExitCode::from(2), false), false),
+            (&["update"], true, (ExitCode::FAILURE, false), false),
+            (&["update"], true, (ExitCode::from(75), false), false),
+            (&["update"], false, ok, false),
+            (&["update"], false, nothing_here, false),
             (
                 &["update", "claude", "--wait-lock", "1800"],
                 true,
-                ExitCode::SUCCESS,
+                ok,
                 false,
             ),
-            (&["install", "--help"], true, ExitCode::SUCCESS, false),
-            (&["install", "clt"], true, ExitCode::SUCCESS, false),
+            (&["install", "--help"], true, ok, false),
+            (&["install", "clt"], true, ok, false),
             (
                 &["install", "claude", atpkg::cli::NO_INIT_FLAG],
                 true,
-                ExitCode::SUCCESS,
+                ok,
                 false,
             ),
         ] {
             for setup_code in [
-                ExitCode::SUCCESS,
-                ExitCode::from(75),
-                ExitCode::from(77),
-                ExitCode::from(69),
-                ExitCode::FAILURE,
+                Some(ExitCode::SUCCESS),
+                Some(ExitCode::from(75)),
+                Some(ExitCode::from(77)),
+                Some(ExitCode::from(69)),
+                Some(ExitCode::FAILURE),
+                None,
             ] {
                 let events = RefCell::new(Vec::new());
                 let code = super::package_entry_with(
@@ -14392,12 +14455,12 @@ mod tests {
                     |args| {
                         assert_eq!(args, words.iter().map(OsString::from).collect::<Vec<_>>());
                         events.borrow_mut().push("packages");
-                        package_code
+                        (package_code, settled)
                     },
                     || {
                         assert_eq!(*events.borrow(), ["packages"]);
                         events.borrow_mut().push("setup");
-                        setup_code
+                        setup_code.unwrap_or_else(|| panic!("setup panicked"))
                     },
                 );
                 let want: &[&str] = if follows {
@@ -14408,6 +14471,30 @@ mod tests {
                 assert_eq!(events.borrow().as_slice(), want, "{words:?}");
                 assert_eq!(code, package_code, "{words:?} then {setup_code:?}");
             }
+        }
+    }
+
+    /// The follow-up's person ([`super::a_person_at_their_own_account_from`]): typed at a
+    /// terminal, not root, in their own login's home, and not under CI, whatever `CI` says.
+    #[test]
+    fn setup_follows_no_pass_under_ci_root_or_another_home() {
+        use std::ffi::OsString;
+        fn env(ci: Option<&'static str>) -> impl Fn(&str) -> Option<OsString> {
+            move |name| ci.filter(|_| name == "CI").map(OsString::from)
+        }
+        for (typed, uid, live, ci, person) in [
+            (true, 501, true, None, true),
+            (true, 501, true, Some("true"), false),
+            (true, 501, true, Some(""), false),
+            (false, 501, true, None, false),
+            (true, 0, true, None, false),
+            (true, 501, false, None, false),
+        ] {
+            assert_eq!(
+                super::a_person_at_their_own_account_from(typed, uid, live, env(ci)),
+                person,
+                "typed {typed}, uid {uid}, live {live}, CI {ci:?}"
+            );
         }
     }
 

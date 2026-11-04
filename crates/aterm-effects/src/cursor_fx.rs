@@ -1387,6 +1387,15 @@ impl CursorFx {
 
     /// The frame step: the aurora, then every block body off the aurora's post-tick state, then
     /// the comet, then the caret's one owner.
+    ///
+    /// `#[inline]` on wasm32 alone, as is [`CursorGlow::tick`] under it. The page reaches this
+    /// step only through `#[inline]` `EffectsPipeline::apply` and the generic
+    /// `step_cursor_family`, which both compile in the binding crate, so there the whole step
+    /// compiles in that crate, which the release profile builds at opt-level `z`, not in this
+    /// crate at 3: 560 KB off each web module (decision 5 of
+    /// `docs/DESIGN-host-boundary-2026-08-30.md`). Natively neither stepper is `#[inline]`, so a
+    /// caller's test build carries no unoptimized copy of either.
+    #[cfg_attr(target_arch = "wasm32", inline)]
     pub fn tick(
         &mut self,
         f: &CursorFxInput,

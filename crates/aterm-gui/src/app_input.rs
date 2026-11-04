@@ -7447,6 +7447,7 @@ impl App {
                 crate::native_app::AppViewState::About(_)
                 | crate::native_app::AppViewState::Markdown(_)
                 | crate::native_app::AppViewState::Recovery(_)
+                | crate::native_app::AppViewState::Allocation(_)
                 | crate::native_app::AppViewState::Workers(_),
             )
             | None => false,
@@ -7532,6 +7533,7 @@ impl App {
             Some(
                 crate::native_app::AppViewState::About(_)
                 | crate::native_app::AppViewState::Recovery(_)
+                | crate::native_app::AppViewState::Allocation(_)
                 | crate::native_app::AppViewState::Workers(_),
             )
             | None => None,
@@ -9597,6 +9599,7 @@ impl App {
             | crate::native_app::AppKind::Settings
             | crate::native_app::AppKind::SystemState
             | crate::native_app::AppKind::Recovery
+            | crate::native_app::AppKind::Allocation
             | crate::native_app::AppKind::Workers => return,
         };
         if self.headless {
@@ -9965,6 +9968,11 @@ impl App {
                 self.open_settings_tab(crate::native_settings::SettingsRoute::Messages);
             }
             MenuAction::SystemState => self.open_system_state_from_menu(),
+            MenuAction::Allocation => {
+                if let Err(error) = self.open_allocation(true) {
+                    self.pending_action_refusal = Some(error);
+                }
+            }
             MenuAction::Workers => self.open_workers_from_menu(),
             MenuAction::Mail => {
                 self.open_mail_tab();

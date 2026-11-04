@@ -288,40 +288,261 @@ fn name_machine(places: &Places, args: &[String]) -> Result<String, Failure> {
             if !member::valid_primary_name(&name) {
                 return Err(Failure::Usage("name set takes a name of 1–63 lowercase letters, digits and internal hyphens; node- is reserved for permanent temporary aliases".into()));
             }
-            let mut notice = String::new();
-            private_state(places, &mut notice)?;
-            let me = member::node_identity(&places.state).map_err(failed)?;
-            let identities = roster_identities(places);
-            if identities.iter().any(|identity| {
-                identity.node.as_deref() != Some(me.node())
-                    && (identity
-                        .label
-                        .as_deref()
-                        .is_some_and(|label| label.eq_ignore_ascii_case(&name))
-                        || identity
-                            .aliases
-                            .iter()
-                            .any(|alias| alias.eq_ignore_ascii_case(&name)))
-            }) {
-                return Err(failed(format!(
-                    "{name} already names another registered machine"
-                )));
-            }
-            member::write_held(&places.state, Began::Here, |_held| {
-                let book = member::read_peers(&places.state).map_err(|e| failed(e.to_string()))?;
-                let others = others_listed(places, &book);
-                if let Some(other) = member::all_named_with(&book, &others, &identities, &name)
-                    .into_iter().find(|peer| peer.node.as_deref() != Some(me.node())) {
-                    return Err(failed(format!("{name} already names {}; use its node alias to disambiguate", other.node.as_deref().unwrap_or(&other.host))));
-                }
-                aterm_uds::private_file::write_private(&places.state, member::NAME_FILE, format!("{name}\n").as_bytes())
-                    .map_err(|e| failed(e.to_string()))?;
-                Ok(format!("{notice}name={name} alias={} node={}; the next fleet heartbeat publishes the signed name", member::temporary_name(me.node()), me.node()))
-            }).map_err(|e| failed(format!("cannot write fleet name: {e}")))?
+            set_primary_name(places, &name, &Writer::Person)
         }
         _ => Err(Failure::Usage(
             "name takes no arguments, or: name set <name>".into(),
         )),
+    }
+}
+
+/// Who writes the fleet name, and so what the write records.
+enum Writer<'a> {
+    /// The person (`aterm fleet name set`): the name is theirs, and no follow replaces it.
+    Person,
+    /// `sync.identity`'s follow, which read the fleet name as `saw`: it writes only if the name
+    /// is still that once the write lock is held, and records the name as its own
+    /// ([`FOLLOWED_FILE`]).
+    Follow { saw: Option<&'a str> },
+}
+
+/// The name `sync.identity`'s follow last wrote as this machine's fleet name, beside
+/// [`member::NAME_FILE`] in the fleet state: a fleet name that still reads as it is aterm's own,
+/// which follows the Mac's name again; any other is the person's.
+const FOLLOWED_FILE: &str = "fleet-name-followed";
+
+/// The name the follow last wrote ([`FOLLOWED_FILE`]), `None` when it wrote none or the record
+/// cannot be read as a name.
+fn followed_name(state: &Path) -> Option<String> {
+    let bytes = member::read_private(state, FOLLOWED_FILE, 64).ok()?;
+    let name = std::str::from_utf8(&bytes).ok()?.trim();
+    member::valid_primary_name(name).then(|| name.to_owned())
+}
+
+/// Write `name` (a valid primary name) as this machine's signed fleet name, refusing one the
+/// swarm roster or the book gives another machine ([`taken_by`]). A follow (`writer`) that finds
+/// the name changed under the write lock since it read it writes nothing and says so.
+fn set_primary_name(places: &Places, name: &str, writer: &Writer<'_>) -> Result<String, Failure> {
+    let mut notice = String::new();
+    private_state(places, &mut notice)?;
+    let me = member::node_identity(&places.state).map_err(failed)?;
+    let identities = roster_identities(places);
+    if let Some(Taken::Registered) = taken_by(places, Some(me.node()), &identities, &[], name) {
+        return Err(failed(format!(
+            "{name} already names another registered machine"
+        )));
+    }
+    member::write_held(&places.state, Began::Here, |_held| {
+        if let Writer::Follow { saw } = writer {
+            let now = member::read_primary_name(&places.state).map_err(failed)?;
+            if now.as_deref() != *saw {
+                let now = now.unwrap_or_else(|| "unset".to_owned());
+                return Ok(format!(
+                    "fleet name {now} kept: it changed while aterm read it"
+                ));
+            }
+        }
+        let book = member::read_peers(&places.state).map_err(|e| failed(e.to_string()))?;
+        if let Some(Taken::Listed(other)) =
+            taken_by(places, Some(me.node()), &identities, &book, name)
+        {
+            return Err(failed(format!(
+                "{name} already names {other}; use its node alias to disambiguate"
+            )));
+        }
+        aterm_uds::private_file::write_private(
+            &places.state,
+            member::NAME_FILE,
+            format!("{name}\n").as_bytes(),
+        )
+        .map_err(|e| failed(e.to_string()))?;
+        match writer {
+            Writer::Person => {
+                aterm_uds::private_file::remove_private(&places.state, FOLLOWED_FILE)
+                    .map_err(|e| failed(e.to_string()))?;
+            }
+            Writer::Follow { .. } => aterm_uds::private_file::write_private(
+                &places.state,
+                FOLLOWED_FILE,
+                format!("{name}\n").as_bytes(),
+            )
+            .map_err(|e| failed(e.to_string()))?,
+        }
+        Ok(format!(
+            "{notice}name={name} alias={} node={}; the next fleet heartbeat publishes the signed name",
+            member::temporary_name(me.node()),
+            me.node()
+        ))
+    })
+    .map_err(|e| failed(format!("cannot write fleet name: {e}")))?
+}
+
+/// Who else `name` already names, beside the machine whose node is `me`.
+#[derive(Debug)]
+enum Taken {
+    /// The swarm roster gives it to another registered machine as its label or an alias.
+    Registered,
+    /// A peer in the book (or beside it) answers to it: its node, else its host.
+    Listed(String),
+}
+
+/// Whether `name` already names another machine than `me`: in the swarm roster's `identities`,
+/// else among `book` and the peers listed beside it.
+fn taken_by(
+    places: &Places,
+    me: Option<&str>,
+    identities: &[member::PeerIdentity],
+    book: &[Peer],
+    name: &str,
+) -> Option<Taken> {
+    if identities.iter().any(|identity| {
+        identity.node.as_deref() != me
+            && (identity
+                .label
+                .as_deref()
+                .is_some_and(|label| label.eq_ignore_ascii_case(name))
+                || identity
+                    .aliases
+                    .iter()
+                    .any(|alias| alias.eq_ignore_ascii_case(name)))
+    }) {
+        return Some(Taken::Registered);
+    }
+    let others = others_listed(places, book);
+    member::all_named_with(book, &others, identities, name)
+        .into_iter()
+        .find(|peer| peer.node.as_deref() != me)
+        .map(|other| Taken::Listed(other.node.clone().unwrap_or_else(|| other.host.clone())))
+}
+
+/// Where this machine's signed fleet name stands against the name `sync.identity` gives the Mac
+/// (the person's `[identity] name`, else its swarm `m<N>` label), so one name reads in the
+/// vault's roster, the fleet and the Mac's own names (`docs/DESIGN-alab-swarm-2026-10-27.md`
+/// §3.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FleetName {
+    /// The fleet name is that name already.
+    Current,
+    /// The fleet name follows it: unset (the machine answers only to its `node-` alias), the
+    /// name aterm's own follow last wrote ([`FOLLOWED_FILE`]), or an earlier swarm label the
+    /// roster gives this Mac.
+    Due {
+        /// What the fleet name reads as now.
+        from: String,
+    },
+    /// The person named this machine in the fleet themselves (`aterm fleet name set`), or a name
+    /// aterm did not write: kept.
+    Kept(String),
+    /// Another machine already answers to that name (which): the fleet name is left as it is.
+    Taken(String),
+    /// That name is no fleet name (why): the fleet name is left as it is.
+    NotApplicable(String),
+}
+
+/// [`FleetName`] for `wanted` in this account's fleet state, where `earlier` says whether the
+/// swarm roster gives a word to this Mac as one of its earlier labels.
+///
+/// # Errors
+/// There is no state directory, or the fleet name on disk cannot be read.
+pub fn fleet_name_for(wanted: &str, earlier: &dyn Fn(&str) -> bool) -> Result<FleetName, String> {
+    let places = Places::here().map_err(Failure::into_text)?;
+    fleet_name_at(&places, wanted, earlier)
+}
+
+/// Make this account's fleet name follow `wanted` where [`fleet_name_for`] says it is due, by
+/// the one write `aterm fleet name set` makes, refused as it is for a name another registered
+/// machine holds. A name already in place, or one the person chose, is left as it is.
+///
+/// # Errors
+/// As [`fleet_name_for`], or the name is another machine's, or it could not be written.
+pub fn follow_fleet_name(wanted: &str, earlier: &dyn Fn(&str) -> bool) -> Result<String, String> {
+    let places = Places::here().map_err(Failure::into_text)?;
+    follow_fleet_name_at(&places, wanted, earlier)
+}
+
+fn fleet_name_at(
+    places: &Places,
+    wanted: &str,
+    earlier: &dyn Fn(&str) -> bool,
+) -> Result<FleetName, String> {
+    fleet_name_read(places, wanted, earlier).map(|(name, _)| name)
+}
+
+/// [`fleet_name_at`], with the fleet name it read (`None`: unset), which a follow writes over
+/// only while it still reads so ([`Writer::Follow`]).
+fn fleet_name_read(
+    places: &Places,
+    wanted: &str,
+    earlier: &dyn Fn(&str) -> bool,
+) -> Result<(FleetName, Option<String>), String> {
+    let wanted = wanted.to_ascii_lowercase();
+    let saw = member::read_primary_name(&places.state)?;
+    if !member::valid_primary_name(&wanted) {
+        return Ok((
+            FleetName::NotApplicable(format!(
+                "{wanted:?} is no fleet name (1–63 lowercase letters, digits and internal hyphens)"
+            )),
+            saw,
+        ));
+    }
+    let read = match saw.as_deref() {
+        Some(now) if now == wanted => return Ok((FleetName::Current, saw)),
+        None => FleetName::Due {
+            from: own_node(places)
+                .map_or_else(|| "unset".to_owned(), |node| member::temporary_name(&node)),
+        },
+        Some(now) if followed_name(&places.state).as_deref() == Some(now) => FleetName::Due {
+            from: now.to_owned(),
+        },
+        Some(now)
+            if aterm_secrets::swarm_roster::leading_m_label(now)
+                .is_some_and(|(_, canonical)| canonical == now)
+                && earlier(now) =>
+        {
+            FleetName::Due {
+                from: now.to_owned(),
+            }
+        }
+        Some(now) => return Ok((FleetName::Kept(now.to_owned()), saw)),
+    };
+    let book = member::read_peers(&places.state).map_err(|e| e.to_string())?;
+    let me = own_node(places);
+    let name = match taken_by(
+        places,
+        me.as_deref(),
+        &roster_identities(places),
+        &book,
+        &wanted,
+    ) {
+        Some(Taken::Registered) => FleetName::Taken("another registered machine".to_owned()),
+        Some(Taken::Listed(other)) => FleetName::Taken(other),
+        None => read,
+    };
+    Ok((name, saw))
+}
+
+fn follow_fleet_name_at(
+    places: &Places,
+    wanted: &str,
+    earlier: &dyn Fn(&str) -> bool,
+) -> Result<String, String> {
+    let wanted = wanted.to_ascii_lowercase();
+    let (name, saw) = fleet_name_read(places, &wanted, earlier)?;
+    match name {
+        FleetName::Current => Ok(format!("fleet name {wanted} already")),
+        FleetName::Kept(now) => Ok(format!("fleet name {now} kept as you set it")),
+        FleetName::NotApplicable(why) => Ok(format!("fleet name left as it is: {why}")),
+        FleetName::Taken(other) => Ok(format!(
+            "fleet name left as it is: {wanted} already names {other}"
+        )),
+        FleetName::Due { .. } => set_primary_name(
+            places,
+            &wanted,
+            &Writer::Follow {
+                saw: saw.as_deref(),
+            },
+        )
+        .map_err(Failure::into_text),
     }
 }
 
@@ -829,6 +1050,11 @@ fn init(places: &Places, args: &[String]) -> Result<String, Failure> {
 /// Whether `name` is in the state directory; a read that fails other than for its absence
 /// refuses.
 fn in_state(places: &Places, name: &str) -> Result<bool, Failure> {
+    match aterm_uds::private_file::check_owned_dir(&places.state) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(failed(e.to_string())),
+    }
     let path = places.state.join(name);
     match std::fs::symlink_metadata(&path) {
         Ok(_) => Ok(true),
@@ -840,6 +1066,7 @@ fn in_state(places: &Places, name: &str) -> Result<bool, Failure> {
 /// On an issuer, when it last wrote its join code (its `init`, or its latest `init --rotate`), in
 /// ms since the epoch: `None` on a member, which holds none.
 fn code_minted(places: &Places) -> Option<u64> {
+    aterm_uds::private_file::check_owned_dir(&places.state).ok()?;
     let written = std::fs::symlink_metadata(places.state.join(CODE_FILE))
         .and_then(|meta| meta.modified())
         .ok()?;
@@ -5505,6 +5732,18 @@ pub enum FleetCheck {
 pub fn check_from_cache() -> Result<FleetCheck, String> {
     let places = Places::here().map_err(Failure::into_text)?;
     check_with(&places, || vault_code(Fetch::Cache)).map_err(Failure::into_text)
+}
+
+/// How many peers this machine knows, from its book and `aterm.toml`'s `[[fleet.peers]]` alone
+/// (the list `aterm fleet peers` dials), read without a dial or a write.
+///
+/// # Errors
+/// There is no state directory or config path, or the book or `aterm.toml` cannot be read.
+pub fn known_peer_count() -> Result<usize, String> {
+    let places = Places::here().map_err(Failure::into_text)?;
+    known_peers(&places)
+        .map(|known| known.peers.len())
+        .map_err(Failure::into_text)
 }
 
 /// [`check_from_cache`] over `places`, `vault` naming the default fleet's code.

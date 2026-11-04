@@ -121,9 +121,12 @@ PEOPLE
 ON A HOST
     here plan|apply <baseline.toml> [--json]
                               run a baseline on this Mac directly (apply under sudo)
-    here apply --plain        install Apple's Command Line Tools from aterm's own
-                              baseline, reading no file; prints no report and exits
-                              with why it did not finish (`aterm init`'s root half)
+    here apply --plain [--name m<N>]
+                              install Apple's Command Line Tools from aterm's own
+                              baseline, reading no file, and with --name give the Mac
+                              its swarm label as Computer Name and Local hostname;
+                              prints no report and exits with why the tools did not
+                              finish (`aterm init`'s root half)
     agent <cmd>               the host agent, which the controller runs over SSH
 
 <host> is a host's name, uuid or address. --parallel N (1 to 64) reaches N hosts at once
@@ -306,7 +309,7 @@ fn sweep_retired_dir(sys: &dyn System, home: &Path, below: &Path) {
 }
 
 /// `aterm machines <args>`.
-#[must_use]
+#[must_use = "handle or propagate the command's exit status"]
 pub fn main_entry(args: Vec<OsString>) -> ExitCode {
     let args: Vec<String> = args
         .iter()
@@ -582,10 +585,31 @@ fn here(sys: &dyn System, args: &[String]) -> ExitCode {
     } else {
         commands::HereOutput::Report
     };
-    let rest: Vec<&String> = args
-        .iter()
-        .filter(|a| *a != "--json" && *a != "--plain")
-        .collect();
+    // `--name <m<N>>` rides the root half alone: the swarm label the Mac is named by under the
+    // one password that installs the tools.
+    let mut name = None;
+    let mut rest: Vec<&String> = Vec::new();
+    let mut words = args.iter();
+    while let Some(arg) = words.next() {
+        match arg.as_str() {
+            "--json" | "--plain" => {}
+            "--name" => match words
+                .next()
+                .map(String::as_str)
+                .and_then(crate::init_clt::plain_name)
+            {
+                Some(label) if name.is_none() => name = Some(label),
+                Some(_) => return refuse("here: --name is given once"),
+                None => {
+                    return refuse("here: --name takes a swarm label: m and a number (m42)");
+                }
+            },
+            _ => rest.push(arg),
+        }
+    }
+    if name.is_some() && !plain {
+        return refuse("here: --name rides --plain alone");
+    }
     if let Some(flag) = rest.iter().find(|a| a.starts_with('-')) {
         return refuse(&format!("here: unknown option {flag}"));
     }
@@ -598,14 +622,14 @@ fn here(sys: &dyn System, args: &[String]) -> ExitCode {
     // account could write, and applies the Command Line Tools' own baseline.
     if plain {
         return match rest.as_slice() {
-            [_] if mode == Mode::Apply => commands::here(sys, mode, None, output),
+            [_] if mode == Mode::Apply => commands::here(sys, mode, None, name.as_deref(), output),
             _ => refuse("here: --plain takes apply alone, with no baseline file"),
         };
     }
     let [_, path] = rest.as_slice() else {
         return refuse("here: takes plan|apply <baseline.toml>");
     };
-    commands::here(sys, mode, Some(Path::new(path.as_str())), output)
+    commands::here(sys, mode, Some(Path::new(path.as_str())), None, output)
 }
 
 fn refuse(why: &str) -> ExitCode {
@@ -1110,6 +1134,35 @@ mod tests {
             here(&user, &args(&["apply", "/b/clt.toml"])),
             ExitCode::from(2)
         );
+        assert!(user.calls().is_empty(), "{:?}", user.calls());
+    }
+
+    /// `--name` takes a bare swarm label beside `--plain` alone (it reaches the plain run, which
+    /// without root ends on the other class); free text, a second `--name`, or `--name` on a
+    /// baseline file's run is the usage refusal, before anything runs.
+    #[test]
+    fn here_takes_name_with_plain_alone_and_only_a_bare_swarm_label() {
+        let args = |words: &[&str]| words.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
+        let mut user = Fake::default();
+        user.euid = 501;
+        let other = ExitCode::from(crate::init_clt::Unfinished::Other.code().unwrap());
+        for words in [
+            &["apply", "--plain", "--name", "m42"][..],
+            &["--name", "m7", "apply", "--plain"],
+        ] {
+            assert_eq!(here(&user, &args(words)), other, "{words:?}");
+        }
+        for words in [
+            &["apply", "--plain", "--name"][..],
+            &["apply", "--plain", "--name", "M42"],
+            &["apply", "--plain", "--name", "m042"],
+            &["apply", "--plain", "--name", "m42-studio"],
+            &["apply", "--plain", "--name", "Mac-mini-M4"],
+            &["apply", "--plain", "--name", "m4", "--name", "m5"],
+            &["apply", "/b/clt.toml", "--name", "m42"],
+        ] {
+            assert_eq!(here(&user, &args(words)), ExitCode::from(2), "{words:?}");
+        }
         assert!(user.calls().is_empty(), "{:?}", user.calls());
     }
 }

@@ -2779,6 +2779,17 @@ fn keg_time(dir: &std::path::Path) -> Option<u64> {
 }
 
 fn enrich_formula_json(prefix: &Prefix, api: &Api, value: &mut aterm_json::Value) {
+    // brew's API loader substitutes the generation
+    // placeholders in the whole record (Formula.deep_remove_placeholders);
+    // `$APPDIR` is cask-only, left as-is here.
+    let home = std::env::var("HOME").unwrap_or_default();
+    deep_remove_placeholders(
+        value,
+        &home,
+        &prefix.root.to_string_lossy(),
+        &prefix.cellar().to_string_lossy(),
+        "$APPDIR",
+    );
     let aterm_json::Value::Object(map) = value else {
         return;
     };
@@ -2786,7 +2797,14 @@ fn enrich_formula_json(prefix: &Prefix, api: &Api, value: &mut aterm_json::Value
     // these raw-API fields (analytics is its own opt-in report), and
     // its bottle `files` holds only the bottle this machine would
     // pour: brew's per-tag API file ships just that tag (or `all`).
-    for key in ["analytics", "executables", "generated_date", "variations"] {
+    for key in [
+        "analytics",
+        "executables",
+        "generated_date",
+        "github_packages_downloads",
+        "variations",
+        "vulnerabilities",
+    ] {
         map.remove(key);
     }
     // An API-loaded formula's own `requirements` serialize empty in
@@ -3068,14 +3086,12 @@ fn enrich_cask_json(prefix: &Prefix, value: &mut aterm_json::Value) {
     for key in [
         "analytics",
         "generated_date",
+        "language_variations",
         "supported_platforms",
         "variations",
     ] {
         map.remove(key);
     }
-    // Brew's API struct collapses language variations into the one
-    // it selected; `to_hash` reports the key as null.
-    map.insert("language_variations".to_string(), aterm_json::Value::Null);
     let Some(token) = map
         .get("token")
         .and_then(aterm_json::Value::as_str)
@@ -3142,7 +3158,14 @@ fn info_json(
 ) -> Result<String, String> {
     let v2 = has_flag(rest, "--json=v2", "");
     let want_cask = has_flag(rest, "--cask", "");
-    let want_formula = has_flag(rest, "--formula", "");
+    // brew's v1 (and bare `--json`) branch is formulae-only:
+    // `--cask` is a usage error and names resolve as formulae.
+    if !v2 && want_cask {
+        return Err(
+            "Error: Invalid usage: Cannot specify `--cask` when using `--json=v1`!".to_string(),
+        );
+    }
+    let want_formula = has_flag(rest, "--formula", "") || !v2;
     let installed = has_flag(rest, "--installed", "");
     let mut formulae = Vec::new();
     let mut casks = Vec::new();
@@ -16465,15 +16488,23 @@ mod tests {
         let mut rich = aterm_json::json!({
             "name": "demo",
             "requirements": [{"name": "macos", "version": "12"}],
+            "github_packages_downloads": {"source": "https://example.invalid/x"},
+            "service": {"run": ["$HOMEBREW_PREFIX/opt/demo/bin/demo"], "working_dir": "$HOMEBREW_PREFIX"},
             "patches": [{"strip": "p1", "url": "https://x/y.diff", "type": "backport"}]
         });
         enrich_formula_json(&prefix, &api, &mut rich);
         assert_eq!(rich.get("requirements"), Some(&aterm_json::json!([])));
+        assert!(rich.get("github_packages_downloads").is_none());
+        let run0 = rich.pointer("/service/run/0").unwrap().as_str().unwrap();
+        assert!(
+            !run0.contains("$HOMEBREW_PREFIX") && run0.ends_with("/opt/demo/bin/demo"),
+            "{run0}"
+        );
         assert!(
             rich.get("patches").unwrap()[0].get("type").is_none(),
             "patch type dropped like brew's API loader"
         );
-        // Cask side: placeholders expand, language variations null out.
+        // Cask side: placeholders expand, raw-API-only keys drop.
         let mut cask = aterm_json::json!({
             "token": "demo-cask",
             "version": "1",
@@ -16481,9 +16512,9 @@ mod tests {
             "artifacts": [{"binary": ["$APPDIR/Demo.app/tool"], "target": "$HOMEBREW_PREFIX/bin/tool"}]
         });
         enrich_cask_json(&prefix, &mut cask);
-        assert_eq!(
-            cask.get("language_variations"),
-            Some(&aterm_json::Value::Null)
+        assert!(
+            cask.get("language_variations").is_none(),
+            "brew's cask to_h has no language_variations key"
         );
         let arts = cask.get("artifacts").unwrap().to_string();
         assert!(

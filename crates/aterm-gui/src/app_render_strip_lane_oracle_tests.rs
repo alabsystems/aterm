@@ -533,9 +533,9 @@ fn a_strip_frames_retained_rows_match_a_full_re_extract_over_the_corpus() {
                         rows + step.strip,
                         "{what}: a live lane must cover the COMPOSED rows"
                     );
-                    for r in 0..step.strip {
+                    for (r, &revision) in composed.row_rev[..step.strip].iter().enumerate() {
                         assert_eq!(
-                            composed.row_rev[r], 0,
+                            revision, 0,
                             "{what}: chrome row {r} must read as UNKNOWN, never as a stamp"
                         );
                     }

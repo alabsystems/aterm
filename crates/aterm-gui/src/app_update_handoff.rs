@@ -539,13 +539,31 @@ const fn out_of_band_lane_refusal(facts: HandoffLaneFacts) -> Option<&'static st
 )]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SessionlessLane {
-    /// The overlap handoff takes it: the launched lane carries it, or the attempt reports its
-    /// failed pre-park verdict as its own failure.
+    /// The overlap handoff takes it: the launched lane carries it, or, on a kept image, the
+    /// attempt reports its failed pre-park verdict as its own failure.
     Takes,
     /// The targeted artifact's pre-park verification has not been read.
     Unread,
     /// The launched lane cannot carry it, for this reason.
     Cannot(&'static str),
+}
+
+/// The sessionless lane's refusal when no window is open ([`held_by_the_desk`]).
+#[cfg(target_os = "macos")]
+const NO_WINDOW: &str = "no window is open to hand over";
+
+/// The sessionless lane's refusal when no open tab is one the successor restores
+/// ([`held_by_the_desk`]).
+#[cfg(target_os = "macos")]
+const NO_RESTORABLE_TAB: &str = "no open tab is one the new build can restore";
+
+/// Whether a sessionless refusal's cause is the person's desk (no window, or no tab the new
+/// build restores), which clears as they work, rather than a fact of this process or machine
+/// (a launched-lane guard, an unread or failed verdict), which nothing at the desk clears.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub(crate) fn held_by_the_desk(reason: &str) -> bool {
+    reason == NO_WINDOW || reason == NO_RESTORABLE_TAB
 }
 
 /// What [`sessionless_lane`] reads: the windows handed over, the launched lane's facts with no
@@ -563,19 +581,23 @@ struct SessionlessFacts {
     same_image: bool,
     /// The targeted artifact's cached pre-park verdict, `None` while unread.
     verdict: Option<bool>,
+    /// The image is kept (`App::launch_image_kept`): no cold lane replaces it.
+    image_kept: bool,
 }
 
 /// Whether the launched lane carries an attempt with no live terminal session, exactly as the
 /// lane choice ([`out_of_band_lane_refusal`]) will judge it. A cause the verdict cannot change
-/// is named before an unread verdict is waited for.
+/// is named before an unread verdict is waited for. A failed verdict is the attempt's own
+/// failure only on a kept image; a replaceable image leaves it to the cold lane, which lets a
+/// person's press relaunch and verify the stage again.
 #[cfg(target_os = "macos")]
 #[must_use]
 const fn sessionless_lane(facts: SessionlessFacts) -> SessionlessLane {
     if !facts.window {
-        return SessionlessLane::Cannot("no window is open to hand over");
+        return SessionlessLane::Cannot(NO_WINDOW);
     }
     if !facts.layout {
-        return SessionlessLane::Cannot("no open tab is one the new build can restore");
+        return SessionlessLane::Cannot(NO_RESTORABLE_TAB);
     }
     let reachable = HandoffLaneFacts {
         grant_empty: true,
@@ -587,7 +609,10 @@ const fn sessionless_lane(facts: SessionlessFacts) -> SessionlessLane {
     if !facts.same_image {
         match facts.verdict {
             None => return SessionlessLane::Unread,
-            Some(false) => return SessionlessLane::Takes,
+            Some(false) if facts.image_kept => return SessionlessLane::Takes,
+            Some(false) => {
+                return SessionlessLane::Cannot("the new build failed its pre-park verification");
+            }
             Some(true) => {}
         }
     }
@@ -595,6 +620,23 @@ const fn sessionless_lane(facts: SessionlessFacts) -> SessionlessLane {
         Some(reason) => SessionlessLane::Cannot(reason),
         None => SessionlessLane::Takes,
     }
+}
+
+/// Whether a pre-park read that ended without a verdict, for the passing `reason`, is read again
+/// before an attempt with no live terminal session is classified
+/// (`App::sessionless_preverify_wait`). A signer wait is read again whenever it gets this far,
+/// since the roster gate before it lets it through only once a check reported since its read;
+/// any other passing cause only when its read began before the current wait (`wait_began`), so
+/// a read the wait started itself is never read again in a loop.
+#[cfg(unix)]
+#[must_use]
+fn reread_passing(
+    reason: &str,
+    read_started: std::time::Instant,
+    wait_began: Option<std::time::Instant>,
+) -> bool {
+    aterm_update::is_roster_confirmation_wait(reason)
+        || wait_began.is_none_or(|began| read_started < began)
 }
 
 /// What [`crate::App::admit_update_handoff`] reads beside the live sessions.
@@ -3949,25 +3991,36 @@ fn run_handoff_decision(
 #[cfg(unix)]
 pub(crate) const MAX_HANDOFF_CAPTURE_BUDGET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
+/// Take a parked session's `lock` by `deadline`: at once when it is free, else as a waiter
+/// registered on `ui_waiting`, which a holder that hands over between its batches (the compress
+/// worker) hands it to, asleep between tries (`crate::pause_for_handover`).
 #[cfg(unix)]
-fn try_lock_by<T>(
-    lock: &std::sync::Mutex<T>,
+fn try_lock_by<'a, T>(
+    lock: &'a std::sync::Mutex<T>,
+    ui_waiting: &std::sync::atomic::AtomicU32,
     deadline: std::time::Instant,
-) -> Option<std::sync::MutexGuard<'_, T>> {
-    loop {
-        match lock.try_lock() {
-            Ok(guard) => return Some(guard),
-            Err(std::sync::TryLockError::Poisoned(poison)) => return Some(poison.into_inner()),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                if std::time::Instant::now() >= deadline {
-                    #[cfg(test)]
-                    park_budget_for_test::gave_up(lock);
-                    return None;
-                }
-                std::thread::yield_now();
-            }
-        }
+) -> Option<std::sync::MutexGuard<'a, T>> {
+    let take = || match lock.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::Poisoned(poison)) => Some(poison.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    };
+    if let Some(guard) = take() {
+        return Some(guard);
     }
+    ui_waiting.fetch_add(1, std::sync::atomic::Ordering::Release);
+    let guard = loop {
+        if let Some(guard) = take() {
+            break Some(guard);
+        }
+        if !crate::pause_for_handover(ui_waiting, deadline) {
+            #[cfg(test)]
+            park_budget_for_test::gave_up(lock);
+            break None;
+        }
+    };
+    ui_waiting.fetch_sub(1, std::sync::atomic::Ordering::Release);
+    guard
 }
 
 /// The wall-clock window the park and capture must fit in, from the readers' park.
@@ -5038,8 +5091,9 @@ impl App {
         let preverified = apply_attempt
             .as_ref()
             .and_then(|attempt| self.cached_handoff_preverification(attempt));
-        // An attempt with no session reports its failed verdict whoever pressed: only the
-        // launched lane carries it, to a successor this verdict did not pass.
+        // An attempt with no session reaches the overlap lane with a failed verdict only on a
+        // kept image ([`sessionless_lane`]), whose launched lane would carry it to a successor
+        // this verdict did not pass: it reports that verdict whoever pressed.
         if preverified == Some(false) && (mode.is_automatic() || live.is_empty()) {
             let reason = apply_attempt
                 .as_ref()
@@ -5827,7 +5881,7 @@ impl App {
         sessions.extend(self.pool.iter().filter(|session| handed(session.id)));
         sessions.sort_unstable_by_key(|session| session.id);
         for session in sessions.iter().copied() {
-            let terminal = match try_lock_by(&session.term, deadline) {
+            let terminal = match try_lock_by(&session.term, &session.ctx.ui_waiting, deadline) {
                 Some(guard) => guard,
                 None => {
                     cells_reserve = u64::MAX;
@@ -5847,7 +5901,8 @@ impl App {
                 capture_failed = Some(CaptureFailure::Deadline { freeze_ms });
                 break;
             }
-            let Some(terminal) = try_lock_by(&session.term, deadline) else {
+            let Some(terminal) = try_lock_by(&session.term, &session.ctx.ui_waiting, deadline)
+            else {
                 capture_failed = Some(CaptureFailure::EngineBusy);
                 break;
             };
@@ -8489,12 +8544,18 @@ impl App {
             lane,
             same_image: same_image.is_some(),
             verdict: attempt.and_then(|attempt| self.cached_handoff_preverification(attempt)),
+            image_kept: self.launch_image_kept,
         })
     }
 
     /// The wait for the targeted artifact's pre-park read before an attempt with no live
-    /// terminal session is classified, or `None` when there is nothing left to wait for. A read
-    /// that ended without a verdict (a passing error, which no cache keeps) is read again.
+    /// terminal session is classified, or `None` when there is nothing left to wait for.
+    ///
+    /// A stage that waits for an update check to confirm its signer is held for that check, as
+    /// the cold lane holds it ([`Self::cold_lane_verdict_gate`]), and read again only once a
+    /// check reported since its last read. A read that ended without a verdict for any other
+    /// passing cause (which no cache keeps) is read again once per wait: a read this wait
+    /// started that ends so is the attempt's failure, tried again later, never a re-read loop.
     #[cfg(unix)]
     fn sessionless_preverify_wait(
         &mut self,
@@ -8503,17 +8564,45 @@ impl App {
     ) -> Option<crate::UpdateHandoffStartError> {
         let now = std::time::Instant::now();
         let target_build = attempt.target_build();
+        if let Some(known) = self.known_roster_wait(attempt, now) {
+            if !known.held
+                && let Some(dmg_sha256) =
+                    crate::app_native::decode_dmg_sha256(attempt.target_dmg_sha256())
+            {
+                let _ = self.hold_for_roster_confirmation(
+                    target_build,
+                    dmg_sha256,
+                    &known.reason,
+                    known.answered_at,
+                    mode.is_automatic(),
+                    true,
+                );
+            }
+            return Some(crate::UpdateHandoffStartError::activity(format!(
+                "{}; the update was not handed over",
+                known.reason
+            )));
+        }
+        let wait_began = self
+            .preverify_read_waited
+            .filter(|&(target, _)| target == target_build)
+            .and_then(|(_, until)| until.checked_sub(crate::HANDOFF_PREVERIFY_READ_CEILING));
         let passing = self
             .handoff_preverify_in_flight
             .as_ref()
             .filter(|read| read.reads(attempt))
-            .and_then(|read| read.ended_passing(now))
-            .map(str::to_string);
-        if let Some(reason) = passing {
-            let started = crate::app_native::decode_dmg_sha256(attempt.target_dmg_sha256())
-                .is_some_and(|dmg_sha256| {
-                    self.start_fresh_preverification(target_build, dmg_sha256)
-                });
+            .and_then(|read| {
+                let reason = read.ended_passing(now)?;
+                Some((
+                    reason.to_string(),
+                    reread_passing(reason, read.started(), wait_began),
+                ))
+            });
+        if let Some((reason, again)) = passing {
+            let started = again
+                && crate::app_native::decode_dmg_sha256(attempt.target_dmg_sha256()).is_some_and(
+                    |dmg_sha256| self.start_fresh_preverification(target_build, dmg_sha256),
+                );
             if !started {
                 return Some(crate::UpdateHandoffStartError::failed(format!(
                     "{reason}; the update is tried again later"

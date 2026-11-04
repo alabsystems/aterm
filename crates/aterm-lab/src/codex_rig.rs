@@ -286,7 +286,7 @@ impl ApiLog {
     /// A journal cannot be read or contains malformed JSON.
     pub fn snapshot(&self) -> std::io::Result<(Vec<J>, Vec<J>)> {
         let read = |path: &Path| {
-            let text = match std::fs::read_to_string(path) {
+            let text = match crate::util::read_regular_text(path) {
                 Ok(text) => text,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
                 Err(e) => return Err(e),

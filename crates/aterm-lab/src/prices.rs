@@ -4,6 +4,7 @@
 //! `prices [<claude-bin>] [--codex <codex-bin>]`.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use aterm_agent::harness::spend::{ModelPrice, PRICES_TOML, PriceTable, Rates};
 
@@ -514,8 +515,8 @@ fn check_codex(table: &PriceTable, slugs: &[String]) -> CodexCheck {
 /// The OpenAI half of `prices`: the table's rows against `bin`'s model
 /// catalog, printed; an error when the build cannot be read.
 fn codex_prices(table: &PriceTable, bin: &str) -> Result<(), Fail> {
-    let bytes =
-        std::fs::read(bin).map_err(|e| Fail::exit(2, format!("prices: cannot read {bin}: {e}")))?;
+    let bytes = crate::util::read_regular_file(Path::new(bin))
+        .map_err(|e| Fail::exit(2, format!("prices: cannot read {bin}: {e}")))?;
     let slugs = codex_catalog(&bytes).map_err(|e| Fail::exit(2, format!("prices: {bin}: {e}")))?;
     let c = check_codex(table, &slugs);
     for line in &c.lines {
@@ -551,7 +552,7 @@ pub fn cmd_prices(args: &[String]) -> Res {
     };
     let table = PriceTable::from_toml(PRICES_TOML)
         .map_err(|e| Fail::exit(2, format!("prices: the shipped table: {e}")))?;
-    let bytes = std::fs::read(&bin)
+    let bytes = crate::util::read_regular_file(Path::new(&bin))
         .map_err(|e| Fail::exit(2, format!("prices: cannot read {bin}: {e}")))?;
     let build = catalog(&bytes).map_err(|e| Fail::exit(2, format!("prices: {bin}: {e}")))?;
     let c = check(&table, &build);

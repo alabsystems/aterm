@@ -246,6 +246,11 @@ tests/red_fixtures.rs	an_unpatched_sibling_version_reds_the_forge_verb	check-ver
 - No test is a regression of a removed bug with no general property: each regression-shaped test is an
   instance of one of the §1 specs.
 
+## 4. Tests that are not spec samples
+
+None remaining from the 2026-10-16 pass: the 25 non-spec tests were retired, and the crate currently
+holds 101 `#[test]` functions (57 secondary/multi-spec rows in §2 alongside §1's `subsumes` column).
+
 ## 5. Implied specs that look wrong, or disagree with the code
 
 1. **Fixed (2026-10-28): `semver-row-scope` is sound for `0` and `0.0`.** `semver_class("0")` now returns

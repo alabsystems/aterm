@@ -213,7 +213,7 @@ pub(crate) fn admit(build: &str, committed: &[Reduction]) -> Result<Option<Strin
 /// # Errors
 /// KEY: the package names no build.
 pub(crate) fn package_build(pkg: &Path) -> Result<String, Refusal> {
-    let manifest = std::fs::read_to_string(pkg.join(PACKAGE_JSON)).unwrap_or_default();
+    let manifest = crate::util::read_regular_text(&pkg.join(PACKAGE_JSON)).unwrap_or_default();
     let exe = package_entrypoint(&manifest).map(|e| pkg.join(e));
     exe.as_deref().and_then(alab_build).ok_or_else(|| {
         Refusal::new(
@@ -318,7 +318,7 @@ fn reduce_legs(world: &Path, build: &str) -> Result<Vec<Leg>, Refusal> {
     for leg in LEGS {
         let home = world.join("legs").join(leg).join("codex-home");
         let from = one_rollout(leg, &home)?;
-        let source = std::fs::read_to_string(&from).map_err(|e| {
+        let source = crate::util::read_regular_text(&from).map_err(|e| {
             Refusal::new(Class::Rollouts, format!("{leg}: {}: {e}", from.display()))
         })?;
         let text = reduce_leg(&CODEX, leg, &source, build, &reduce_checked(Program::Codex))?;
@@ -386,7 +386,7 @@ fn admitted_by(build: &str, judged: &Judged, run2: &Run) -> Result<Vec<String>, 
 
 /// The package record's line in the note.
 fn package_line(pkg: &Path) -> String {
-    let record = std::fs::read_to_string(pkg.join(ALAB_BUILD_JSON))
+    let record = crate::util::read_regular_text(&pkg.join(ALAB_BUILD_JSON))
         .ok()
         .and_then(|t| aterm_json::from_str::<Value>(&t).ok())
         .unwrap_or_default();

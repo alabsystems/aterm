@@ -744,6 +744,15 @@ const OPTIONS: &[OptSpec] = &[
                most 545)",
     },
     OptSpec {
+        flag: "--tally",
+        value: None,
+        lanes: &[Lane::Fabric],
+        help: "boot the messaging, attach, handoff and ask worlds with the bridge's wait tally \
+               and aterm's handler tally on, and report both tallies' rows for every round \
+               (default off: the tallies' own writes move what they measure; the ping-pong \
+               world counts with both in every run)",
+    },
+    OptSpec {
         flag: "--mix-every",
         value: Some("N"),
         lanes: &[Lane::Fabric],

@@ -109,7 +109,8 @@ pub struct FleetAccount {
     pub label: String,
     /// Normalized machine IDs (`m8`, `m106`, `m38`, …) that own or share this row.
     pub machines: Vec<String>,
-    /// `Dedicated` when assigned to a single machine, `Shared` across multiple.
+    /// Its order on the machines that run it ([`Class`]): from a sheet or fleet file, `Pool`
+    /// where it names several machines; from the lab, `Preferred` where this Mac prefers it.
     pub class: Class,
     /// Account email address (`name@domain`).
     pub email: String,
@@ -138,6 +139,10 @@ pub struct FleetRoster {
     /// ([`super::alab_roster::fleet_for`]): a sync then keeps every row it has
     /// ([`super::alab_roster::retain`]) and writes no fleet file beside the roster.
     pub alab: Option<String>,
+    /// The lab's other accounts of this CLI that may join, which this Mac does not prefer, each
+    /// under its lab label ([`super::alab_roster::fleet_for`]): never added unasked, only the name the
+    /// default login's account takes ([`build_machine_roster`]). Never written or said.
+    pub(crate) known: Vec<FleetAccount>,
 }
 
 impl FleetRoster {
@@ -215,7 +220,10 @@ impl FleetRoster {
             out.push_str(&format!("label = {}\n", toml_quote(&acct.label)));
             let machines: Vec<String> = acct.machines.iter().map(|m| toml_quote(m)).collect();
             out.push_str(&format!("machines = [{}]\n", machines.join(", ")));
-            out.push_str(&format!("class = {}\n", toml_quote(acct.class.as_str())));
+            out.push_str(&format!(
+                "class = {}\n",
+                toml_quote(acct.class.legacy_word())
+            ));
             out.push_str(&format!("email = {}\n", toml_quote(&acct.email)));
             if let Some(browser) = &acct.browser {
                 out.push_str(&format!("browser = {}\n", toml_quote(browser)));
@@ -231,11 +239,12 @@ impl FleetRoster {
         out
     }
 
-    /// Parse `fleet-accounts.toml` text back into a [`FleetRoster`].
+    /// Parse `fleet-accounts.toml` text back into a [`FleetRoster`]. A row's order is the one its
+    /// machine list derives ([`fleet_assignment`]); a `class` word the file stores is not read.
     /// # Errors
     /// Returns a human-readable error if the TOML is invalid, `account` is not an array of tables,
-    /// or any row is missing required fields, carries a refused label or email, has a
-    /// malformed machine assignment, or names an invalid explicit class.
+    /// or any row is missing required fields, carries a refused label or email, or has a
+    /// malformed machine assignment.
     pub fn from_toml(text: &str, source: &str) -> Result<Self, String> {
         Self::from_toml_for(Cli::Claude, text, source)
     }
@@ -310,8 +319,10 @@ impl FleetRoster {
     }
 }
 
-// An explicit assignment is admitted whole. Normalize before stable deduplication:
-// repeated spellings of one host cannot change its inferred contention class.
+/// Row `n`'s machine list, admitted whole or refused, normalized before stable deduplication so
+/// repeated spellings of one host cannot change its order, and the order the list derives:
+/// [`Class::Preferred`] for one machine, [`Class::Pool`] for several. An order alone, never a
+/// limit, and never read from a `class` word (design §0; `FleetMachineAssignment`'s file area).
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -340,7 +351,7 @@ impl FleetRoster {
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
         machine = "FleetMachineAssignment",
-        action = "InvalidClass",
+        action = "StoredClass",
         project = "aterm_agent::harness::accounts_sync::fleet_assignment_tests::assignment_transition"
     )
 )]
@@ -365,14 +376,6 @@ impl FleetRoster {
     aterm_spec_anchor::refines(
         machine = "FleetMachineAssignment",
         action = "Duplicate",
-        project = "aterm_agent::harness::accounts_sync::fleet_assignment_tests::assignment_transition"
-    )
-)]
-#[cfg_attr(
-    any(test, debug_assertions),
-    aterm_spec_anchor::refines(
-        machine = "FleetMachineAssignment",
-        action = "Override",
         project = "aterm_agent::harness::accounts_sync::fleet_assignment_tests::assignment_transition"
     )
 )]
@@ -406,12 +409,12 @@ fn fleet_assignment(
             machines.push(machine);
         }
     }
-    let class = match row.get("class") {
-        None if machines.len() > 1 => Class::Shared,
-        None => Class::Dedicated,
-        Some(value) => value.as_str().and_then(Class::parse).ok_or_else(|| {
-            format!("fleet roster row {n} ({label}): `class` must be `dedicated` or `shared`")
-        })?,
+    // The order is the list's, as every legacy reader infers it with no `class` written; a
+    // `class` word in the file is an older writer's and is not read (design §0: no class).
+    let class = if machines.len() > 1 {
+        Class::Pool
+    } else {
+        Class::Preferred
     };
     Ok((machines, class))
 }
@@ -1279,9 +1282,9 @@ fn parse_sheet(csv_text: &str, source: &str, cli: Cli) -> Result<Sheet, String> 
         }
 
         let class = if machines.len() > 1 {
-            Class::Shared
+            Class::Pool
         } else {
-            Class::Dedicated
+            Class::Preferred
         };
 
         let (vendor, into) = match member {
@@ -1305,6 +1308,7 @@ fn parse_sheet(csv_text: &str, source: &str, cli: Cli) -> Result<Sheet, String> 
             conflicts: conflicting.values().cloned().collect(),
             conflicting,
             alab: None,
+            known: Vec::new(),
         },
         held,
     })
@@ -2240,7 +2244,7 @@ fn local_account(email: &str, machine: &str, used: &BTreeSet<String>) -> Option<
         .then(|| FleetAccount {
             label,
             machines,
-            class: Class::Dedicated,
+            class: Class::Preferred,
             email: email.to_owned(),
             browser: None,
             vendor: accounts::Vendor::default(),
@@ -2332,7 +2336,8 @@ pub fn build_machine_roster(
     default_email: Option<&str>,
 ) -> Roster {
     let mut fleet_rows = fleet.accounts_for_machine(machine);
-    if fleet_rows.is_empty() {
+    // Under the lab a Mac that prefers nothing here still lists its default login's account.
+    if fleet_rows.is_empty() && fleet.alab.is_none() {
         return existing.cloned().unwrap_or_default();
     }
     let default_email = default_identity_hint(existing, default_email);
@@ -2348,6 +2353,27 @@ pub fn build_machine_roster(
                 && fleet_rows.len() < accounts::MAX_ACCOUNTS
         })
         .and_then(|de| {
+            let kept = existing.and_then(|ex| {
+                ex.rows.iter().find(|r| {
+                    r.expected_identity_email()
+                        .is_some_and(|re| accounts::email_matches(re, de))
+                })
+            });
+            if fleet.alab.is_some() {
+                // A dirless row that names no address (the first `add`'s `main`) already lists
+                // the default login: retain keeps it as it is, and the account is not listed
+                // beside it as a second row with no login directory (a roster nobody can parse).
+                // No address is written into it either: what is on record under it may be
+                // another account's (`check_new_labels` refuses that assignment).
+                let listed = kept.is_none()
+                    && existing
+                        .and_then(|ex| ex.row_for_login(None))
+                        .is_some_and(|row| row.expected_identity_email().is_none());
+                if listed {
+                    return None;
+                }
+                return alab_default_account(fleet, existing, kept, de, &matches_identity);
+            }
             fleet
                 .accounts
                 .iter()
@@ -2388,8 +2414,11 @@ pub fn build_machine_roster(
     if let Some(acct) = &unlisted {
         fleet_rows.push(acct);
     }
+    if fleet_rows.is_empty() {
+        return existing.cloned().unwrap_or_default();
+    }
 
-    let default_label: String = default_email
+    let default_label: Option<String> = default_email
         .and_then(|de| {
             fleet_rows
                 .iter()
@@ -2402,12 +2431,16 @@ pub fn build_machine_roster(
                 .filter(|r| fleet_rows.iter().any(|fr| fr.label == r.label))
                 .map(|r| r.label.clone())
         })
-        .unwrap_or_else(|| fleet_rows[0].label.clone());
+        // Under the lab no row is made the default login unasked: a row that has a login
+        // directory keeps it (taking it away would leave that login behind, signed out), and a
+        // Mac whose default login the lab does not name has no dirless row. The sheet path makes
+        // its first row the default login, as it always did.
+        .or_else(|| fleet.alab.is_none().then(|| fleet_rows[0].label.clone()));
 
     let mut rows = Vec::with_capacity(fleet_rows.len());
     for acct in &fleet_rows {
         let existing_row = existing.and_then(|ex| ex.row(&acct.label));
-        let dir = if acct.label == default_label {
+        let dir = if default_label.as_deref() == Some(acct.label.as_str()) {
             None
         } else if let Some(prev_dir) = existing_row.and_then(|r| r.dir.clone()) {
             Some(prev_dir)
@@ -2437,6 +2470,59 @@ pub fn build_machine_roster(
     rows.sort_by_key(|r| (r.dir.is_some(), r.class, r.label.clone()));
 
     Roster { rows }
+}
+
+/// The row the default login (address `de`) takes under the lab's `fleet` where none of this
+/// Mac's preferred accounts is it: the label `kept`, the existing row of that account, gives it
+/// (a sync never renames; [`super::alab_roster::migrate`] does), else the lab's label for the
+/// account ([`FleetRoster::known`]); none where the lab does not know the account and no row
+/// names it, or another account's row or fleet row holds that label, since the lab is what names
+/// an account here and a label is never taken from the row that holds it. Never a label with a
+/// machine in it, and never a slot read from an address ([`local_account`] is the sheet path's
+/// alone).
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "FleetMachineAssignment",
+        action = "SyncLabels",
+        project = "aterm_agent::harness::alab_roster::assignment_tests::labels_transition"
+    )
+)]
+fn alab_default_account(
+    fleet: &FleetRoster,
+    existing: Option<&Roster>,
+    kept: Option<&Row>,
+    de: &str,
+    matches_identity: &dyn Fn(&FleetAccount, &str) -> bool,
+) -> Option<FleetAccount> {
+    let machine = fleet.alab.clone()?;
+    let known = fleet.known.iter().find(|a| matches_identity(a, de));
+    let label_free = |label: &str| {
+        !fleet.accounts.iter().any(|a| a.label == label)
+            && !existing.is_some_and(|roster| {
+                roster.rows.iter().any(|row| {
+                    row.label == label
+                        && !row
+                            .expected_identity_email()
+                            .is_some_and(|held| accounts::email_matches(held, de))
+                })
+            })
+    };
+    match (kept.filter(|row| label_free(&row.label)), known) {
+        (Some(row), known) => Some(FleetAccount {
+            label: row.label.clone(),
+            machines: vec![machine],
+            class: known.map_or(row.class, |known| known.class),
+            email: row.email.clone().unwrap_or_else(|| de.to_owned()),
+            browser: row
+                .browser
+                .clone()
+                .or_else(|| known.and_then(|k| k.browser.clone())),
+            vendor: accounts::Vendor::default(),
+        }),
+        (None, Some(known)) if label_free(&known.label) => Some(known.clone()),
+        _ => None,
+    }
 }
 
 /// `fleet` with each row of `existing` whose address the sheet's rows give conflicting
@@ -2717,7 +2803,7 @@ pub fn fleet_origin(home: Option<&Path>, config: Option<&Path>, roster: &Path) -
     let sheet = secrets
         .as_ref()
         .map(|secrets| secrets.join(ACCOUNTS_CSV_FILE))
-        .filter(|sheet| source_entry_present(sheet));
+        .filter(|sheet| sheet_read_here() && source_entry_present(sheet));
     if let Some((home, vault)) = home
         .zip(
             secrets
@@ -2861,8 +2947,12 @@ fn vault_delivered(home: &Path) -> Option<BTreeSet<PathBuf>> {
 
 /// Whether the sheet at `sheet` gives this machine rows, the machine a sync from init takes them
 /// for ([`machine_for`]: an explicit local configuration, else this host's id). An unreadable
-/// or refused sheet counts as giving them, so the sync that reads it says why.
+/// or refused sheet counts as giving them, so the sync that reads it says why. Where the lab
+/// names this Mac the sheet is not read ([`sheet_read_here`]) and gives it nothing.
 fn sheet_names_this_machine(config: Option<&Path>, sheet: &Path) -> bool {
+    if !sheet_read_here() {
+        return false;
+    }
     let Ok(fleet) = read_local_source_text(sheet)
         .map_err(|why| why.to_string())
         .and_then(|text| parse_accounting_csv(&text, ACCOUNTS_CSV_FILE))
@@ -2913,6 +3003,35 @@ fn fleet_takes_discovered(
     }
 }
 
+/// Whether the harness may read the vault's sheet (`ai-accounts.csv`) on this Mac: only where
+/// the lab does not name it (§0: the sheet is the lab importer's input,
+/// `crates/aterm/src/alab_sheet.rs`; where the lab names this Mac its rows, labels, mail and
+/// upkeep come from the lab). A Mac without the registry keeps reading it, so it keeps its rows;
+/// one whose registry could not be read yet ([`super::alab_roster::pending`]) reads it only once
+/// a read shows the lab does not name it.
+fn sheet_read_here() -> bool {
+    !super::alab_roster::names_this_mac() && !super::alab_roster::pending()
+}
+
+/// The refusal of a sheet named as a source on a Mac the lab names ([`sheet_read_here`]).
+fn sheet_refused(source: &str) -> String {
+    format!(
+        "{source} is an accounts sheet, which the lab registry's importer reads (`aterm db alab \
+         import`): the lab names this Mac, so its accounts come from the lab (`aterm harness \
+         accounts sync alab`); nothing was read"
+    )
+}
+
+/// Whether a sync of `cli` with no source named reads the lab ([`super::alab_roster::chosen`]):
+/// the lab names this Mac, and for Claude Code no `[fleet] accounts_source` in `config` names
+/// another source.
+fn lab_chosen(cli: Cli, roster: &Path, config: &Path) -> bool {
+    matches!(
+        super::alab_roster::chosen(cli, Some(roster), None, Some(config)),
+        Ok(Some(_))
+    )
+}
+
 pub(super) fn source_key(config: &Path) -> Option<String> {
     let text = super::ai_pool::read_bounded_text(config, 2 * 1024 * 1024)?;
     let table: aterm_toml::Table = aterm_toml::from_str(&text).ok()?;
@@ -2929,7 +3048,7 @@ pub(super) fn source_key(config: &Path) -> Option<String> {
 type Fetch<'f> = dyn Fn(&Env, &str) -> Result<String, String> + Sync + 'f;
 
 #[derive(Debug, Clone)]
-struct PoolSyncCtx {
+pub(super) struct PoolSyncCtx {
     pool: super::ai_pool::Pool,
     identity: super::ai_pool::LocalPoolIdentity,
 }
@@ -3078,8 +3197,10 @@ fn load_fleet_source_for_machine(
         || raw.contains("[[account]]");
     let fleet = if toml {
         FleetRoster::from_toml(&raw, &chosen)
-    } else {
+    } else if sheet_read_here() {
         parse_accounting_csv(&raw, &chosen)
+    } else {
+        Err(sheet_refused(&chosen))
     }?;
     // A discovered fleet stays discovery's through every sync of the local file that holds it.
     let opt_in = if opt_in == OptIn::Named
@@ -3333,9 +3454,9 @@ fn discovered_fleet(env: &Env, shown: &Shown, min_accounts: usize) -> Option<Fle
         }
         used_labels.insert(label.clone());
         let class = if machines.len() > 1 {
-            Class::Shared
+            Class::Pool
         } else {
-            Class::Dedicated
+            Class::Preferred
         };
         accounts.push(FleetAccount {
             label,
@@ -3657,9 +3778,8 @@ fn pool_entry_present(path: &Path) -> bool {
 
 fn has_fleet_source(dir: &Path) -> bool {
     pool_entry_present(&dir.join(super::ai_pool::AI_POOL_FILE))
-        || [FLEET_ROSTER_FILE, ACCOUNTS_CSV_FILE]
-            .into_iter()
-            .any(|name| source_entry_present(&dir.join(name)))
+        || source_entry_present(&dir.join(FLEET_ROSTER_FILE))
+        || (sheet_read_here() && source_entry_present(&dir.join(ACCOUNTS_CSV_FILE)))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4285,6 +4405,58 @@ fn chosen_dirs(
     Ok(())
 }
 
+/// The roster a sync writes for `machine` from `fleet` over the roster `existing` it replaces:
+/// the fleet with this Mac's conflicting rows carried, built ([`build_machine_roster`]), the pool's
+/// holders applied, then, under the lab (`fleet.alab`), every row this Mac has kept and ordered by
+/// this Mac's preference alone (`alab_roster::retain` with `lab`, the lab the sync holds), and the
+/// locally retained shared rows held to what they were. A sync and the `FleetMachineAssignment`
+/// conformance test run this one composition.
+///
+/// # Errors
+/// The store's logins could not be read, or a locally retained shared row would change or has no
+/// room ([`retain_shared_rows`]).
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "FleetMachineAssignment",
+        action = "Sync",
+        project = "aterm_agent::harness::alab_roster::assignment_tests::order_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "FleetMachineAssignment",
+        action = "SyncLabels",
+        project = "aterm_agent::harness::alab_roster::assignment_tests::labels_transition"
+    )
+)]
+pub(super) fn compose_roster(
+    fleet: &FleetRoster,
+    (machine, default_email): (&str, Option<&str>),
+    (store, existing): (&accounts::Store, &Roster),
+    pool_ctx: Option<&PoolSyncCtx>,
+    lab: Option<&super::alab_roster::Lab>,
+    now: i64,
+) -> Result<Roster, String> {
+    let carried = carry_conflicting(fleet, machine, existing);
+    let mut roster = build_machine_roster(&carried, machine, store, Some(existing), default_email);
+    if let Some(ctx) = pool_ctx {
+        roster = apply_pool_to_claude_roster(roster, existing, store, ctx);
+    }
+    // The lab's preferences order a pool and never limit it: every row this Mac has stays.
+    if fleet.alab.is_some() {
+        roster = super::alab_roster::retain(roster, existing, lab, Cli::Claude, machine);
+    }
+    retain_shared_rows(
+        &mut roster,
+        existing,
+        &store.load_logins(now)?.0,
+        fleet.alab.is_some(),
+    )?;
+    Ok(roster)
+}
+
 fn apply_pool_to_claude_roster(
     mut roster: Roster,
     existing: &Roster,
@@ -4476,30 +4648,55 @@ fn persist_accounts_sync_with_pool(
             roster_path.display()
         )
     })?;
-    let carried = carry_conflicting(fleet, machine, &existing);
-    let mut roster = build_machine_roster(&carried, machine, store, Some(&existing), default_email);
-    if let Some(ctx) = pool_ctx {
-        roster = apply_pool_to_claude_roster(roster, &existing, store, ctx);
-    }
-    // The lab's preferences order a pool and never limit it: every row this Mac has stays.
-    if fleet.alab.is_some() {
-        let lab = super::alab_roster::current();
-        roster =
-            super::alab_roster::retain(roster, &existing, lab.as_deref(), Cli::Claude, machine);
-    }
-    retain_shared_rows(
-        &mut roster,
-        &existing,
-        &store.load_logins(now)?.0,
-        fleet.alab.is_some(),
+    let lab = fleet
+        .alab
+        .is_some()
+        .then(super::alab_roster::current)
+        .flatten();
+    let mut roster = compose_roster(
+        fleet,
+        (machine, default_email),
+        (store, &existing),
+        pool_ctx,
+        lab.as_deref(),
+        now,
     )?;
+    // Under the lab a default login neither the lab nor a row of this Mac names gets no row
+    // (`alab_default_account`): nothing is lost, since the roster never listed it.
+    let unnamed_here = |expected: &str| {
+        fleet.alab.is_some()
+            && !fleet
+                .accounts
+                .iter()
+                .chain(&fleet.known)
+                .any(|a| accounts::email_matches(&a.email, expected))
+            && !existing.rows.iter().any(|row| row.matches_email(expected))
+    };
+    // Under the lab a dirless row that names no address (the first `add`'s `main`) is kept as
+    // the default login's, as it was (`build_machine_roster`): it still lists it.
+    let listed_bare = fleet.alab.is_some()
+        && roster
+            .row_for_login(None)
+            .is_some_and(|row| row.expected_identity_email().is_none());
     if let Some(expected) = default_identity_hint(Some(&existing), default_email)
+        && !unnamed_here(expected)
+        && !listed_bare
         && !roster
             .row_for_login(None)
             .and_then(Row::expected_identity_email)
             .is_some_and(|actual| accounts::email_matches(actual, expected))
     {
         return Err("the generated roster cannot represent the known default login; retain that account or free a row; no new sync was published".into());
+    }
+    // A lab that prefers nothing here and knows no default login leaves an empty roster as it is.
+    if roster.rows.is_empty() && fleet.alab.is_some() {
+        return Ok(SyncedAccounts {
+            fleet_path,
+            note: Some(
+                "the lab prefers no account of this Mac's yet; nothing was written".to_owned(),
+            ),
+            changed: recovered,
+        });
     }
     if roster.rows.is_empty() {
         return Err(with_conflicts(
@@ -4710,9 +4907,10 @@ fn persist_accounts_sync_with_pool(
             }
             // What a departed account left at a move's destination is forgotten first, binding
             // and all, so the move is not refused for retaining it and no row is served its
-            // login; the directory itself stays where it is, unnamed.
+            // login; the directory itself stays where it is, unnamed. A checked source that
+            // leaves in the same move set must survive until the simultaneous move takes it.
             for (_, to) in &moves {
-                if departed.contains(to) {
+                if departed.contains(to) && !moves.iter().any(|(from, _)| from == to) {
                     accounts::forget_account(state, logins, to);
                     logins.labels.remove(to);
                 }
@@ -5606,7 +5804,9 @@ fn default_login_unlisted(
     now: i64,
     rediscovery: &std::sync::Mutex<Rediscovery>,
 ) -> bool {
-    if configured_source(Some(config), Some(roster_path)).is_none() {
+    if configured_source(Some(config), Some(roster_path)).is_none()
+        && !lab_chosen(Cli::Claude, roster_path, config)
+    {
         return false;
     }
     let Ok(roster) = Roster::load(roster_path) else {
@@ -6503,6 +6703,19 @@ pub fn accounts_sync_off(config: Option<&Path>) -> bool {
         == accounts::Mode::Off
 }
 
+/// Whether a sync of `cli` from the lab would change the roster at `roster_path`
+/// ([`super::alab_roster::sync_due`]), a rename judged against the records `store` keeps under
+/// each label, as the migration judges it; an unreadable store asks for the sync, which says why.
+fn lab_sync_due(cli: Cli, store: &accounts::Store, roster_path: &Path, now: i64) -> bool {
+    let records = store.load(now).ok().zip(store.load_logins(now).ok());
+    let Some(((state, _), (logins, _))) = records else {
+        return true;
+    };
+    super::alab_roster::sync_due(cli, roster_path, |label| {
+        accounts::label_is_retained(&state, &logins, label)
+    })
+}
+
 /// THE ONE RULE OF WHEN A PERIODIC CALLER SYNCS a roster that stands (a window's upkeep, the
 /// setup pass's [`resync_for_setup`]): when its inputs changed or need revalidation. That is
 /// `~/.secrets` holding a fleet, a sheet or a mailbox where no source is configured yet; a vault
@@ -6522,6 +6735,22 @@ fn sync_called_for(
 ) -> bool {
     if accounts::Store::at(state_dir).sync_needs_recovery() {
         return true;
+    }
+    // Where the lab is the source, its projection and this Mac's own default login are what
+    // move a roster: read in memory, with no sheet, fleet or pool file.
+    if lab_chosen(Cli::Claude, roster_path, config) {
+        return lab_sync_due(
+            Cli::Claude,
+            &accounts::Store::at(state_dir),
+            roster_path,
+            now,
+        ) || default_login_unlisted(
+            home,
+            state_dir,
+            (roster_path, config),
+            now,
+            rediscovery,
+        );
     }
     let secrets = home.join(".secrets");
     let configured = configured_source(Some(config), Some(roster_path));
@@ -6628,11 +6857,35 @@ fn sync_inputs(home: &Path, state_dir: &Path, roster_path: &Path, now: i64) -> [
             hash.update(value);
         }
     };
+    // Where the lab is the source, what it holds stands for the vault's files: no sheet, fleet
+    // or pool file is read.
+    if lab_chosen(Cli::Claude, roster_path, &config) {
+        field(
+            super::alab_roster::fleet_digest(Cli::Claude)
+                .as_ref()
+                .map(<[u8; 32]>::as_slice),
+        );
+        for path in [roster_path.to_path_buf(), config.clone()] {
+            field(
+                read_local_source_text(&path)
+                    .ok()
+                    .as_deref()
+                    .map(str::as_bytes),
+            );
+        }
+        field(
+            read_default_profile_email(&env)
+                .as_deref()
+                .map(str::as_bytes),
+        );
+        return hash.finalize();
+    }
     let secrets_pool = secrets.join(super::ai_pool::AI_POOL_FILE);
+    let sheet = sheet_read_here().then(|| secrets.join(ACCOUNTS_CSV_FILE));
     for path in [
         Some(secrets_pool.clone()),
         Some(secrets.join(FLEET_ROSTER_FILE)),
-        Some(secrets.join(ACCOUNTS_CSV_FILE)),
+        sheet,
         Some(secrets.join(super::headless_oauth::SECRETS_MAILBOX_TOML_FILE)),
         Some(secrets.join(super::headless_oauth::MAILBOX_TOML_FILE)),
         Some(roster_path.to_path_buf()),
@@ -6843,7 +7096,9 @@ pub fn has_init_accounts_source(
         .parent()
         .map(|p| p.join("aterm.toml"))
         .unwrap_or_else(|| PathBuf::from("aterm.toml"));
-    if configured_source(Some(&config_path), Some(roster_path)).is_some() {
+    if configured_source(Some(&config_path), Some(roster_path)).is_some()
+        || lab_chosen(Cli::Claude, roster_path, &config_path)
+    {
         return true;
     }
     let secrets = home.join(".secrets");
@@ -6924,6 +7179,14 @@ fn init_sync_needed(
     now: i64,
     discover: bool,
 ) -> bool {
+    if lab_chosen(Cli::Claude, roster_path, &config_beside(roster_path)) {
+        return lab_sync_due(
+            Cli::Claude,
+            &accounts::Store::at(state_dir),
+            roster_path,
+            now,
+        );
+    }
     let secrets = home.join(".secrets");
     let Some(fb) = fleet_file_beside(roster_path) else {
         return false;
@@ -6937,7 +7200,7 @@ fn init_sync_needed(
     let has_secrets_pool = pool_entry_present(&secrets_pool);
     let has_secrets_fleet =
         source_entry_present(&secrets_fleet) && !superseded_secrets_copy(home, &secrets_fleet, &fb);
-    let has_secrets_csv = source_entry_present(&secrets_csv);
+    let has_secrets_csv = sheet_read_here() && source_entry_present(&secrets_csv);
     let config_path = config_beside(roster_path);
     if has_secrets_pool && source_key(&config_path).is_none() {
         let Ok(existing_text) = read_local_source_text(&fb) else {
@@ -7249,6 +7512,27 @@ fn sync_accounts_for_init_with(
         claude_tmp: None,
         claude_running: None,
     };
+    // Where the lab is the source nothing in `~/.secrets` is captured or read.
+    if lab_chosen(Cli::Claude, roster_path, &config_beside(roster_path)) {
+        before_sync();
+        let report = sync_accounts_with(
+            &env,
+            None,
+            None,
+            &SyncHow {
+                fetch: fetch_uncaptured,
+                ladder: &sync_lock_ladder(),
+                fleet_snapshots: &[],
+                heal: None,
+                allow_empty_pool: true,
+            },
+        );
+        let synced = report?.into_init(recovered_commit);
+        if synced.changed {
+            let _ = accounts::Store::at(state_dir).touch_wake();
+        }
+        return Ok(synced);
+    }
     let fleet_path = roster_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -7263,6 +7547,7 @@ fn sync_accounts_for_init_with(
     // gives this machine rows, and the sync that reads the sheet removes that copy, so a sheet
     // edited later reaches the roster. Where it gives none, the copy stays this Mac's own list.
     let own_copy = source_entry_present(&secrets_fleet)
+        && sheet_read_here()
         && source_entry_present(&secrets_sheet)
         && own_secrets_copy(home, &secrets_fleet, &fleet_path)
         && sheet_names_this_machine(env.config.as_deref(), &secrets_sheet);
@@ -7273,6 +7558,7 @@ fn sync_accounts_for_init_with(
             [&secrets_fleet, &secrets_sheet]
                 .into_iter()
                 .filter(|path| !((own_copy || superseded) && *path == &secrets_fleet))
+                .filter(|path| sheet_read_here() || *path != &secrets_sheet)
                 .find(|path| source_entry_present(path))
         })
         .map(|path| path.to_string_lossy().into_owned());
@@ -7890,7 +8176,7 @@ fn load_cli_fleet_source(
                 (toml.display().to_string(), read(&toml)?)
             } else if let Some(path) = claude_fleet.filter(|p| source_entry_present(p)) {
                 (path.display().to_string(), read(&path)?)
-            } else if source_entry_present(&csv) {
+            } else if sheet_read_here() && source_entry_present(&csv) {
                 let text = read(&csv)?;
                 if !csv_names_column(cli, &text) {
                     return Ok(None);
@@ -7929,8 +8215,10 @@ fn load_cli_fleet_source(
             roster: FleetRoster::from_toml_for(cli, &raw, &chosen)?,
             held: Vec::new(),
         }
-    } else {
+    } else if sheet_read_here() {
         parse_accounting_csv_for(cli, &raw, &chosen)?
+    } else {
+        return Err(sheet_refused(&chosen));
     };
     let machine = machine_for(env.config.as_deref(), machine_override);
     Ok(Some((fleet, None, machine)))
@@ -8218,9 +8506,18 @@ fn sync_cli_with_replan(
             }
         } else if fleet.roster.alab.is_some() {
             // Under the lab nothing limits who runs an account: a hold an old pool file set
-            // would otherwise outlive its source.
+            // would otherwise outlive its source. A row the lab knows takes its derived order.
+            let lab = super::alab_roster::current();
             for row in &mut merged_existing {
                 held_changed |= row.held_by.take().is_some();
+                if let Some(class) = lab
+                    .as_deref()
+                    .and_then(|lab| Some(lab.class_of(lab.account_of(cli, row)?)))
+                    .filter(|class| *class != row.class)
+                {
+                    row.class = class;
+                    held_changed = true;
+                }
             }
         }
         let mut total = merged_existing.len() + rows.len();
@@ -8888,6 +9185,20 @@ fn cli_sync_inputs(cli: Cli, home: &Path, config: &Path) -> [u8; 32] {
     let mut hash = aterm_digest::Sha256::new();
     hash.update(b"aterm-cli-sync-inputs-v1");
     hash.update(cli.id().as_bytes());
+    // Where the lab names this Mac its projection stands for the vault's files ([`sync_cli_with`]
+    // reads the lab), and no sheet or fleet file is read.
+    if let Some(lab) = super::alab_roster::fleet_digest(cli) {
+        hash.update(lab);
+        match super::ai_pool::read_bounded_bytes(config, 2 * 1024 * 1024) {
+            Some(bytes) => {
+                hash.update([1]);
+                hash.update((bytes.len() as u64).to_be_bytes());
+                hash.update(&bytes);
+            }
+            None => hash.update([0]),
+        }
+        return hash.finalize();
+    }
     let fleet = [
         secrets_pool.clone(),
         secrets.join(cli_fleet_file(cli)),
@@ -10879,8 +11190,8 @@ fn rank_renewal_candidates(
     for row in roster
         .rows
         .iter()
-        .filter(|r| r.class == Class::Dedicated)
-        .chain(roster.rows.iter().filter(|r| r.class == Class::Shared))
+        .filter(|r| r.class == Class::Preferred)
+        .chain(roster.rows.iter().filter(|r| r.class == Class::Pool))
         .filter(|row| {
             state.sessions.values().any(|s| s.account == row.label)
                 && wants_sign_in(row)
@@ -10909,8 +11220,8 @@ fn rank_renewal_candidates(
             for next_row in roster
                 .rows
                 .iter()
-                .filter(|r| r.class == Class::Dedicated)
-                .chain(roster.rows.iter().filter(|r| r.class == Class::Shared))
+                .filter(|r| r.class == Class::Preferred)
+                .chain(roster.rows.iter().filter(|r| r.class == Class::Pool))
                 .filter(|row| me != Some(row.label.as_str()))
                 .filter(|row| wants_sign_in(row) && !is_limited(&row.label))
             {
@@ -10946,8 +11257,8 @@ fn rank_renewal_candidates(
     for next_row in roster
         .rows
         .iter()
-        .filter(|r| r.class == Class::Dedicated)
-        .chain(roster.rows.iter().filter(|r| r.class == Class::Shared))
+        .filter(|r| r.class == Class::Preferred)
+        .chain(roster.rows.iter().filter(|r| r.class == Class::Pool))
         .filter(|row| wants_sign_in(row))
     {
         let tier = if is_limited(&next_row.label) {
@@ -15022,14 +15333,14 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         assert_eq!(m8.len(), 2);
         assert_eq!(m8[0].label, "m8");
         assert_eq!(m8[0].email, "alpha@example.test");
-        assert_eq!(m8[0].class, Class::Dedicated);
+        assert_eq!(m8[0].class, Class::Preferred);
         assert_eq!(m8[1].label, "m8-2");
         assert_eq!(m8[1].email, "bravo.m8@example.test");
-        assert_eq!(m8[1].class, Class::Dedicated);
+        assert_eq!(m8[1].class, Class::Preferred);
 
         let m38 = fleet.accounts_for_machine("m38");
         assert_eq!(m38.len(), 2);
-        assert!(m38.iter().all(|a| a.class == Class::Shared));
+        assert!(m38.iter().all(|a| a.class == Class::Pool));
         let m106 = fleet.accounts_for_machine("m106");
         assert_eq!(m106.len(), 2);
 
@@ -17515,7 +17826,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             store.machine_id("0123456789abcdef").unwrap();
             let row = Row {
                 label: "m27".into(),
-                class: Class::Dedicated,
+                class: Class::Preferred,
                 dir: None,
                 was: Vec::new(),
                 vendor: Default::default(),
@@ -17672,7 +17983,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                 .into_iter()
                 .map(|(label, email)| Row {
                     label: label.into(),
-                    class: Class::Dedicated,
+                    class: Class::Preferred,
                     dir: Some(store.login_dir(label).unwrap().to_str().unwrap().into()),
                     was: Vec::new(),
                     vendor: Default::default(),
@@ -17839,7 +18150,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             rows: vec![
                 Row {
                     label: "m27".to_owned(),
-                    class: Class::Dedicated,
+                    class: Class::Preferred,
                     dir: Some(
                         store
                             .logins_dir()
@@ -17856,7 +18167,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                 },
                 Row {
                     label: "m27-2".to_owned(),
-                    class: Class::Dedicated,
+                    class: Class::Preferred,
                     dir: Some(
                         store
                             .logins_dir()
@@ -18337,7 +18648,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             .into_iter()
             .map(|(label, email)| Row {
                 label: label.into(),
-                class: Class::Dedicated,
+                class: Class::Preferred,
                 dir: Some(store.logins_dir().join(label).to_str().unwrap().into()),
                 was: Vec::new(),
                 vendor: Default::default(),
@@ -19128,7 +19439,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             rows: vec![
                 Row {
                     label: "m27".to_owned(),
-                    class: Class::Dedicated,
+                    class: Class::Preferred,
                     dir: Some(m27_dir.to_string_lossy().into_owned()),
                     was: Vec::new(),
                     vendor: Default::default(),
@@ -19139,7 +19450,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                 },
                 Row {
                     label: "m27-2".to_owned(),
-                    class: Class::Dedicated,
+                    class: Class::Preferred,
                     dir: Some(
                         store
                             .logins_dir()
@@ -19156,7 +19467,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
                 },
                 Row {
                     label: "m27-3".to_owned(),
-                    class: Class::Dedicated,
+                    class: Class::Preferred,
                     dir: Some(
                         store
                             .logins_dir()
@@ -19820,21 +20131,21 @@ totp = "JBSWY3DPEHPK3PXP"
                 accounts::Row {
                     label: "m27".to_owned(),
                     email: Some("m27@example.test".to_owned()),
-                    class: Class::Dedicated,
+                    class: Class::Preferred,
                     ..accounts::Row::default()
                 },
                 accounts::Row {
                     label: "m27-2".to_owned(),
                     dir: Some(m27_2_dir.display().to_string()),
                     email: Some("m27-2@example.test".to_owned()),
-                    class: Class::Dedicated,
+                    class: Class::Preferred,
                     ..accounts::Row::default()
                 },
                 accounts::Row {
                     label: "m27-3".to_owned(),
                     dir: Some(m27_3_dir.display().to_string()),
                     email: Some("m27-3@example.test".to_owned()),
-                    class: Class::Dedicated,
+                    class: Class::Preferred,
                     ..accounts::Row::default()
                 },
             ],
@@ -19937,7 +20248,7 @@ totp = "JBSWY3DPEHPK3PXP"
             label: label.to_owned(),
             dir,
             email: Some(format!("{label}@example.test")),
-            class: Class::Dedicated,
+            class: Class::Preferred,
             ..accounts::Row::default()
         };
         let roster = Roster {
@@ -20028,7 +20339,7 @@ totp = "JBSWY3DPEHPK3PXP"
         let w = World::new();
         let row = Row {
             label: "m2".to_owned(),
-            class: Class::Dedicated,
+            class: Class::Preferred,
             email: Some("m2@example.test".to_owned()),
             ..Row::default()
         };
@@ -20640,7 +20951,7 @@ totp = "JBSWY3DPEHPK3PXP"
         for label in ["m2", "m2-2"] {
             let row = Row {
                 label: label.to_owned(),
-                class: Class::Dedicated,
+                class: Class::Preferred,
                 dir: Some(
                     store
                         .logins_dir()
@@ -20870,7 +21181,7 @@ totp = "JBSWY3DPEHPK3PXP"
         let store = accounts::Store::at(&w.state);
         let row = Row {
             label: "m29".to_owned(),
-            class: Class::Dedicated,
+            class: Class::Preferred,
             dir: Some(
                 store
                     .logins_dir()

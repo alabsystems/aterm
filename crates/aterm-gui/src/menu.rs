@@ -266,6 +266,8 @@ pub(crate) enum MenuAction {
     Messages,
     /// Aterm ▸ System State…: focus or create the System State tab in the front window.
     SystemState,
+    /// Open the read-only Allocation pane beside the focused view, or in a tab when space is tight.
+    Allocation,
     /// Open the native email client.
     Mail,
     /// Toggle the command palette overlay (`App::toggle_palette`).
@@ -377,6 +379,7 @@ impl MenuAction {
             MenuAction::RenameSession => 48,
             MenuAction::Overview => 54,
             MenuAction::Workers => 99,
+            MenuAction::Allocation => 100,
             MenuAction::NextKitty => 57,
             MenuAction::HarnessLog => 60,
             MenuAction::TakeOver => 61,
@@ -464,6 +467,7 @@ impl MenuAction {
             48 => MenuAction::RenameSession,
             54 => MenuAction::Overview,
             99 => MenuAction::Workers,
+            100 => MenuAction::Allocation,
             57 => MenuAction::NextKitty,
             60 => MenuAction::HarnessLog,
             61 => MenuAction::TakeOver,
@@ -1039,6 +1043,7 @@ impl MenuAction {
             }
             MenuAction::Overview
             | MenuAction::Workers
+            | MenuAction::Allocation
             | MenuAction::HarnessLog
             | MenuAction::ReadThisMac
             | MenuAction::NetworkState
@@ -1154,6 +1159,7 @@ impl MenuAction {
             | MenuAction::HarnessSettings
             | MenuAction::Messages
             | MenuAction::SystemState
+            | MenuAction::Allocation
             | MenuAction::Mail
             | MenuAction::OpenPalette
             | MenuAction::ChooseTheme
@@ -1241,6 +1247,7 @@ impl MenuAction {
             MenuAction::SystemState => {
                 "Open System State: this Mac's setup and secrets vault, and what each step needs."
             }
+            MenuAction::Allocation => "Show this computer's CPU lease and resource observations.",
             MenuAction::Mail => "Open Mail: accounts, folders, messages and drafts.",
             MenuAction::HarnessSettings => {
                 "Open Settings at Harness: the coding agent harness and its Autopilot."
@@ -1406,6 +1413,7 @@ impl MenuAction {
             "Packages" => Some(MenuAction::Packages),
             "Messages" => Some(MenuAction::Messages),
             "SystemState" => Some(MenuAction::SystemState),
+            "Allocation" => Some(MenuAction::Allocation),
             "Mail" => Some(MenuAction::Mail),
             "HarnessSettings" => Some(MenuAction::HarnessSettings),
             "RenameSession" => Some(MenuAction::RenameSession),
@@ -1552,6 +1560,12 @@ const APP_MENU: &[MenuEntry] = &[
     Item {
         label: "System State…",
         action: MenuAction::SystemState,
+        key: "",
+        mods: MenuMods::None,
+    },
+    Item {
+        label: "Allocation…",
+        action: MenuAction::Allocation,
         key: "",
         mods: MenuMods::None,
     },
@@ -4284,6 +4298,46 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn allocation_is_a_read_only_native_app_action_on_every_platform() {
+        let app = MENU_MODEL
+            .iter()
+            .find(|section| section.title == "aterm")
+            .unwrap();
+        let rows: Vec<_> = app
+            .entries
+            .iter()
+            .flat_map(MenuEntry::items)
+            .filter(|(_, action, _, _)| *action == MenuAction::Allocation)
+            .collect();
+        assert_eq!(
+            rows,
+            [(
+                "Allocation…",
+                MenuAction::Allocation,
+                "",
+                super::MenuMods::None
+            )]
+        );
+        assert!(MenuAction::Allocation.offered_on_this_platform());
+        assert_eq!(MenuAction::Allocation.tag(), 100);
+        assert_eq!(MenuAction::Workers.tag(), 99);
+        assert_eq!(MenuAction::from_tag(100), Some(MenuAction::Allocation));
+        assert_eq!(
+            MenuAction::from_invoke_name("Allocation"),
+            Some(MenuAction::Allocation)
+        );
+        assert_eq!(
+            MenuAction::Allocation.invoke_authority(),
+            super::InvokeAuthority::OwnerOnly
+        );
+        assert!(!MenuAction::Allocation.writes_pty_input());
+        assert!(!super::requires_terminal_tab(MenuAction::Allocation));
+        let mut palette = crate::palette::PaletteState::new();
+        palette.resolve(&crate::palette::PaletteLive::default());
+        assert!(palette.action_by_name("Allocation").is_ok());
     }
 
     #[test]

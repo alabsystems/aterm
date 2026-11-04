@@ -80,8 +80,9 @@ pub mod vault_join;
 /// driven over it.
 #[cfg(unix)]
 pub use fleet_member::{
-    FleetCheck, FleetSync, FleetSyncError, check_from_cache, drive_fleet, drive_fleet_proven,
-    survey_fleet, sync_from_cache, try_sync_from_cache,
+    FleetCheck, FleetName, FleetSync, FleetSyncError, check_from_cache, drive_fleet,
+    drive_fleet_proven, fleet_name_for, follow_fleet_name, known_peer_count, survey_fleet,
+    sync_from_cache, try_sync_from_cache,
 };
 /// The harness core.
 pub mod harness;

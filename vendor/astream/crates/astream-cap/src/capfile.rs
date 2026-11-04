@@ -444,12 +444,7 @@ pub fn refusal_of(error: &std::io::Error) -> Option<Refusal> {
 }
 
 /// [`refused`] for the clause `clause`, which [`refusal_of`] then reads back.
-fn refused_by(
-    path: &Path,
-    kind: std::io::ErrorKind,
-    why: &str,
-    clause: Refusal,
-) -> std::io::Error {
+fn refused_by(path: &Path, kind: std::io::ErrorKind, why: &str, clause: Refusal) -> std::io::Error {
     let said = format!("{}{why}", path.display());
     std::io::Error::new(kind, RuleRefused { said, clause })
 }
@@ -645,17 +640,24 @@ pub fn read_private_ring(path: impl AsRef<Path>) -> std::io::Result<Vec<Line>> {
     let path = path.as_ref();
     let (file, _meta) = open_private_as(path, path, astream_sys::Links::Refuse, RING_NO_LINK)?;
     let bytes = read_judged(path, file)?;
-    let text = core::str::from_utf8(&bytes).map_err(|e| {
-        let line = 1 + bytes
-            .iter()
-            .take(e.valid_up_to())
-            .filter(|b| **b == b'\n')
-            .count();
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("{}:{line}: {e}", path.display()),
-        )
-    })?;
+    let text = match core::str::from_utf8(&bytes) {
+        Ok(t) => t,
+        Err(e) => {
+            let prefix = bytes.get(..e.valid_up_to()).unwrap_or(&bytes);
+            let mut line: usize = 1;
+            let mut idx: usize = 0;
+            while idx < prefix.len() {
+                if prefix.get(idx) == Some(&b'\n') {
+                    line = line.saturating_add(1);
+                }
+                idx = idx.saturating_add(1);
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{}:{line}: {e}", path.display()),
+            ));
+        }
+    };
     parse_text(&path.display().to_string(), text)
         .map_err(|m| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string()))
 }

@@ -60,7 +60,7 @@ pub(crate) fn read_regular_file(path: &Path) -> std::io::Result<Vec<u8>> {
             "file exceeds 256 MiB limit",
         ));
     }
-    let cap = usize::try_from(meta.len().min(MAX_ORACLE_FILE_BYTES)).unwrap_or(0);
+    let cap = usize::try_from(meta.len().min(MAX_ORACLE_FILE_BYTES).saturating_add(1)).unwrap_or(0);
     let mut buf = Vec::with_capacity(cap);
     file.take(MAX_ORACLE_FILE_BYTES + 1).read_to_end(&mut buf)?;
     if buf.len() as u64 > MAX_ORACLE_FILE_BYTES {

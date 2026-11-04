@@ -163,7 +163,7 @@ pub(crate) fn usage_source_transition(
                 18 => std::fs::write(
                     &path,
                     row_text(&Row {
-                        class: Class::Shared,
+                        class: Class::Pool,
                         ..row
                     })
                     .unwrap(),

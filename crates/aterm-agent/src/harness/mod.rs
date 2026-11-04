@@ -24,9 +24,12 @@ pub mod agent_image;
 pub mod agents;
 pub mod agy_quota;
 pub mod agy_quota_store;
+#[cfg(unix)]
+pub mod agy_signin;
 pub mod ai_pool;
 #[cfg(unix)]
 pub mod ai_signin;
+pub mod alab_exports;
 pub mod alab_roster;
 pub mod align;
 mod auth_deadline;
@@ -51,6 +54,17 @@ pub mod first_exec;
 pub mod flight;
 pub mod footer;
 pub mod goal;
+#[cfg(unix)]
+pub mod google_browser;
+#[cfg(unix)]
+mod google_browser_store;
+pub mod google_credentials;
+#[cfg(unix)]
+pub mod google_direct;
+#[cfg(unix)]
+pub(crate) mod google_federation;
+pub mod google_identity;
+pub mod google_profile;
 pub mod grok_signin;
 pub mod headless_fetch;
 pub mod headless_oauth;

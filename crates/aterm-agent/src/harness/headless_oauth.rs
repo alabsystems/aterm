@@ -156,6 +156,11 @@ pub struct MailboxConfig {
     /// Where set, the earliest a mail may be dated (unix seconds): a vendor sign-in's start, so
     /// a code mailed before it is never taken ([`MailFilter`]).
     pub since: Option<i64>,
+    /// When set by an authentication flow, the full message must name this exact account.
+    /// This separates codes for different accounts sharing a recovery inbox.
+    pub required_account: Option<String>,
+    /// Require a message dated at or after `since`, without the legacy clock-skew allowance.
+    pub strict_since: bool,
     /// Labels (lowercased, `.` and `_` read as `-`) that rows of two pools, or a pool and a fleet, give
     /// to different emails: their `<label>` secrets are Claude Code's own rows' alone, and
     /// [`MailboxConfig::alias_label_to_email`] maps them onto no other pool's email.
@@ -344,6 +349,8 @@ impl MailboxConfig {
             seen_file: self.seen_file.clone(),
             senders: self.senders.clone(),
             since: self.since,
+            required_account: self.required_account.clone(),
+            strict_since: self.strict_since,
             contested_labels: self.contested_labels.clone(),
             relay_enabled: self.relay_enabled,
             relay_home: self.relay_home.clone(),
@@ -358,10 +365,13 @@ impl MailboxConfig {
         })
     }
 
-    /// Why `target_email`'s mailbox is never tried: its `[[mailboxes]]` entry has no password
-    /// (or no login) yet, as `mailbox ab…@… has no password yet`.
+    /// Why a password-backed mailbox cannot be tried. A native Google route is separately
+    /// judged by its saved authorization, so its absence of an app password is not a refusal.
     #[must_use]
     pub fn unready_words(&self, target_email: Option<&str>) -> Option<&'static str> {
+        if self.has_native_google_route(target_email) {
+            return None;
+        }
         if self.routed {
             return self.unready;
         }
@@ -423,11 +433,14 @@ impl MailboxConfig {
             || !self.mailboxes.is_empty()
     }
 
-    /// True when a mailbox source is configured that can serve `target_email`: for an address a
-    /// `[[mailboxes]]` entry receives, that entry with its password (or the local folder or the
-    /// relay), never the top-level mailbox.
+    /// True when a mailbox source is configured for `target_email`: its route with a password,
+    /// a native Google OAuth route, the local folder or the relay. A configured route is not
+    /// proof of live authentication. An explicit route never inherits another mailbox login.
     #[must_use]
     pub fn is_configured_for(&self, target_email: Option<&str>) -> bool {
+        if self.has_native_google_route(target_email) {
+            return true;
+        }
         if let Some(route) = self.route_for(target_email) {
             return self.dir.is_some()
                 || (self.relay_enabled && target_email.is_some())
@@ -451,6 +464,21 @@ impl MailboxConfig {
             || self.password_for(target_email).is_some()
             || (target_email.is_none() && !self.passwords.is_empty())
             || (self.relay_enabled && target_email.is_some())
+    }
+
+    /// A configured Gmail endpoint can use a saved OAuth grant without an app password.
+    /// This is route admission only; the native reader must still load and validate a grant.
+    #[must_use]
+    pub fn has_native_google_route(&self, target_email: Option<&str>) -> bool {
+        #[cfg(unix)]
+        {
+            native_mail::managed_google_target(self, target_email).is_some()
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = target_email;
+            false
+        }
     }
 
     /// Look up the password for `target_email` (checking email, local-part, and derived account
@@ -1565,9 +1593,15 @@ fn mailbox_aliases(
             }
         }
     }
-    // A row the lab renamed keeps the secrets its old label names (`alab_roster::renames`).
-    for (cli, label, email) in super::alab_roster::legacy_labels() {
-        note(cli == super::accounts::Cli::Claude, &label, Some(&email));
+    // Where the lab names this Mac it names every label: each account's lab label, and the
+    // legacy label a renamed row's secrets still name (`alab_roster::renames`). No sheet or
+    // fleet file is read then (§0: the sheet is the importer's input alone).
+    let labels = super::alab_roster::mailbox_labels();
+    if super::alab_roster::names_this_mac() {
+        for (cli, label, email) in labels {
+            note(cli == super::accounts::Cli::Claude, &label, Some(&email));
+        }
+        return aliases;
     }
     for path in claude_fleets {
         if let Ok(Some(text)) = super::accounts::read_bounded(path, 256 * 1024)
@@ -3278,6 +3312,10 @@ pub struct MailFilter<'a> {
     pub senders: &'a [String],
     /// The earliest date a mail may carry (unix seconds).
     pub since: Option<i64>,
+    /// Exact account the decoded message must mention, independently of its recipient.
+    pub required_account: Option<&'a str>,
+    /// Whether the earliest message date has no clock-skew allowance.
+    pub strict_since: bool,
 }
 
 /// How far a mail's `Date:` may run behind the sign-in's start and still be taken (clock skew).
@@ -3290,6 +3328,8 @@ impl MailFilter<'_> {
         MailFilter {
             senders: &cfg.senders,
             since: cfg.since,
+            required_account: cfg.required_account.as_deref(),
+            strict_since: cfg.strict_since,
         }
     }
 
@@ -3297,6 +3337,16 @@ impl MailFilter<'_> {
     /// credential.
     #[must_use]
     pub fn admits(&self, raw: &str) -> bool {
+        self.admits_envelope(raw)
+            && self
+                .required_account
+                .is_none_or(|account| mail_mentions_account(raw, account))
+    }
+
+    /// Sender and date check before fetching a message body. Account correlation is checked
+    /// only by [`Self::admits`] on the complete message.
+    #[must_use]
+    pub fn admits_envelope(&self, raw: &str) -> bool {
         if self.senders.is_empty() && self.since.is_none() {
             return true;
         }
@@ -3308,11 +3358,48 @@ impl MailFilter<'_> {
         {
             return false;
         }
-        match self.since {
+        match self.earliest() {
             None => true,
-            Some(since) => date.is_some_and(|at| at >= since.saturating_sub(MAIL_CLOCK_SLACK_S)),
+            Some(since) => date.is_some_and(|at| at >= since),
         }
     }
+
+    fn earliest(&self) -> Option<i64> {
+        self.since.map(|since| {
+            since.saturating_sub(if self.strict_since {
+                0
+            } else {
+                MAIL_CLOCK_SLACK_S
+            })
+        })
+    }
+}
+
+fn mail_mentions_account(raw: &str, account: &str) -> bool {
+    if super::accounts::email_refusal(account).is_some() {
+        return false;
+    }
+    let mut decoded = decode_mime_base64_parts(raw);
+    if let Ok(doc) = aterm_json::from_str::<Value>(raw) {
+        super::open_url::extract_json_email_fields(
+            &doc,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut decoded,
+        );
+    }
+    for text in [raw, decoded.as_str()] {
+        let plain = decode_html_amp(&strip_html_tags(&super::open_url::decode_rfc2047_words(
+            &super::open_url::decode_qp_mime_parts(text),
+        )));
+        if emails_in(&plain)
+            .iter()
+            .any(|email| email.eq_ignore_ascii_case(account))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Whether the mail domain `domain` names the sender word `word` as whole labels: `word` is the
@@ -4927,8 +5014,8 @@ fn json_summary_allows_filter(raw_item: &str, filter: &MailFilter<'_>) -> bool {
     {
         return false;
     }
-    if let (Some(since), Some(at)) = (filter.since, date)
-        && at < since.saturating_sub(MAIL_CLOCK_SLACK_S)
+    if let (Some(since), Some(at)) = (filter.earliest(), date)
+        && at < since
     {
         return false;
     }
@@ -8318,7 +8405,7 @@ fn another_account(page: &Page, gate: &Gate<'_>) -> bool {
 /// words beside the email, [`SIGNED_IN_WORDS`]), and no other: the page's proof of the row's
 /// account. A page that only echoes the email aterm typed (`we sent a code to …`) proves
 /// nothing.
-fn shows_email(page: &Page, gate: &Gate<'_>) -> bool {
+pub(super) fn shows_email(page: &Page, gate: &Gate<'_>) -> bool {
     let Some(want) = gate.email.map(exact_email) else {
         return false;
     };
@@ -9380,6 +9467,8 @@ fn in_profile(
 /// that email, its inbox rows chosen by the vendor's senders.
 #[derive(Debug, Clone)]
 pub struct VendorApprover {
+    /// Exact native account route, retained separately from the browser profile key.
+    pub google_account: (super::accounts::Cli, String),
     /// Claude Code's store directory (`accounts::Store::shared_dir`).
     pub shared_dir: PathBuf,
     /// The profile's key where the row names no email.
@@ -9423,6 +9512,7 @@ impl VendorApprover {
         let senders = cli.accounts().mail_senders;
         mailbox.senders = senders.iter().map(|sender| (*sender).to_owned()).collect();
         Self {
+            google_account: (cli, label.to_owned()),
             shared_dir: shared_dir.to_owned(),
             label_key: vendor_label_key(cli, label),
             sign_in_once: None,
@@ -9465,6 +9555,7 @@ impl VendorApprover {
         let mailbox_source = found.clone();
         let mailbox = found.filter(|cfg| cfg.is_configured_for(email));
         VendorApprover {
+            google_account: (cli, label.to_owned()),
             shared_dir: shared_dir.to_path_buf(),
             label_key,
             sign_in_once: cli
@@ -9498,6 +9589,9 @@ impl super::login_drive::Approver for VendorApprover {
         handoff: &super::login_drive::Handoff<'_>,
     ) -> super::login_drive::Approval {
         use super::login_drive::Approval;
+        if let Some(result) = super::google_federation::configured(self, handoff) {
+            return result;
+        }
         let bound = match FlowBound::of(handoff.url) {
             Ok(bound) => bound,
             Err(why) => return Approval::Refused(why.to_owned()),

@@ -1580,7 +1580,9 @@ impl<C: Ctl> Session<'_, C> {
 
     /// A break of the agent's own background work as the host's step there is told it
     /// ([`IdleHost::at_background_on`]): the guards a host's fact is judged by, from what the loop
-    /// holds, and a task landed under Land, as at an idle point. With no policy to read a person's
+    /// holds, a line held in custody ([`IdlePoint::line_held`]: the break's look,
+    /// `Session::custody_at_break`, ran on this read first), and a task landed under Land, as at
+    /// an idle point. With no policy to read a person's
     /// grace by, any key the loop saw holds it. The person is the loop's last read: a host's step
     /// that types reads the screen's own key time too (the upgrade's
     /// [`crate::harness::upgrade::person_seen`]).
@@ -1607,6 +1609,7 @@ impl<C: Ctl> Session<'_, C> {
                 && self.turn_end.concluded(),
             held: guards.held_host_fact(),
             theirs: guards.theirs(),
+            line_held: self.custody_line_held(),
             ..IdlePoint::default()
         }
     }

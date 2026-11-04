@@ -500,3 +500,65 @@ fn a_ticking_box_taller_than_the_pane_is_joined_through_its_countdowns_tick() {
     assert_eq!(presses.len(), 1, "{r:?}: {:#?}", m.requests);
     assert!(presses[0].ends_with(" 1"), "{presses:?}");
 }
+
+/// THE CLAUDE IN CHROME INTRO TALLER THAN ITS PANE (20 columns, its own capture and the form drawn
+/// once the extension is found), cut at every row: the cut alone is held as a box taller than the
+/// pane, and its head in the history joins it whole, the confirm on the footer read whole; the
+/// loop still holds it, as it holds every joined box whose answer is no digit
+/// ([`whole_box_decision`]): a pane that shows it whole confirms it (`run_engine_tests.rs`'s
+/// `a_chrome_intro_taller_than_the_tail_is_read_whole_and_confirmed`).
+#[test]
+fn a_chrome_intro_taller_than_its_pane_joins_whole_and_is_held() {
+    let ctx = full_power();
+    for (name, fixture) in [
+        ("inline", fx::CHROME_INTRO_INLINE[4].1),
+        ("extension found", fx::CHROME_INTRO_EXTENSION_FOUND[1].1),
+    ] {
+        let (rows, rule) = the_box(fixture);
+        assert!(
+            matches!(
+                policy::decide_screen(Some("claude"), &rows, &ctx),
+                Some(Decision::Approve {
+                    rule_id: policy::RULE_CHROME_INTRO,
+                    ..
+                })
+            ),
+            "PRECONDITION: {name} whole is confirmed"
+        );
+        let mut cuts = 0;
+        for k in rule + 1..rows.len() {
+            let screen = &rows[k..];
+            let cut = cut_at(&rows, k);
+            let Some(p) = cut.prompt.as_ref().filter(|p| p.head_off_screen) else {
+                continue;
+            };
+            cuts += 1;
+            let held = policy::decide(&cut, screen, &ctx);
+            let Decision::Escalate { reason } = &held else {
+                panic!("{name} cut at {k}: the cut alone is pressed: {held:?}");
+            };
+            assert!(
+                reason.contains("taller than the pane"),
+                "{name} cut at {k}: {reason}"
+            );
+            let (joined, reading) = joined_box(&rows[rule..k], screen, p, 2)
+                .unwrap_or_else(|| panic!("{name} cut at {k}: no join"));
+            assert_eq!(joined, rows[rule..], "{name} cut at {k}");
+            assert!(
+                reading
+                    .prompt
+                    .as_ref()
+                    .is_some_and(|p| p.chrome_intro_confirm().is_some()),
+                "{name} cut at {k}: joined whole"
+            );
+            let d = whole_box_decision(
+                policy::decide(&reading, &joined, &ctx),
+                &joined,
+                screen,
+                || held.clone(),
+            );
+            assert_eq!(d, held, "{name} cut at {k}: held as the cut");
+        }
+        assert!(cuts >= 8, "{name}: only {cuts} cuts read as cut boxes");
+    }
+}

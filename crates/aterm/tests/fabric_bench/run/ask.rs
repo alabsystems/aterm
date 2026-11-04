@@ -26,7 +26,7 @@ use super::pingpong::{describe, ns_ms};
 use super::{
     DEADLINE, FLEET, Ruler, World, await_durable, await_kinds, boot_world, bystanders, calibrate,
     consume_kinds, flushes_between, flushes_json, fmt_x, list_since, ms, ms_opt, newest_id,
-    per_unit, post, request, sampled, served_line, spawn, stop_and_read, tally, wait_live,
+    per_unit, post, request, sampled, served_line, spawn, stop_and_read, tallies, tally, wait_live,
     yardstick, yardstick_json, yardstick_rows,
 };
 use crate::census;
@@ -109,9 +109,12 @@ pub(super) fn blocks(n: usize, arms: usize) -> Vec<(usize, usize)> {
         .collect()
 }
 
+/// Tally records have fixed rows and histogram buckets; cap each producer observation.
+pub(super) const TALLY_BYTES: u64 = 64 * 1024;
+
 /// The bridge `pid`'s tally at `path`, read now.
-fn read_tally(path: &Path, pid: i32) -> Result<Tally, String> {
-    let text = std::fs::read_to_string(path)
+pub(super) fn read_tally(path: &Path, pid: i32) -> Result<Tally, String> {
+    let text = aterm_uds::runs::read_bounded_regular_text(path, TALLY_BYTES)
         .map_err(|e| format!("no tally at {}: {e}", path.display()))?;
     let tally = Tally::parse(&text)?;
     if i64::from(tally.pid) != i64::from(pid) {
@@ -247,7 +250,10 @@ fn fmt3(v: Option<f64>) -> String {
 /// rows either counted, and the loop's own clock.
 pub(super) fn steps_rows(columns: &[(&str, &Spent, usize)]) -> Vec<String> {
     let diff = columns.len() == 2;
-    let mut head = "| the loop's step (wait tally v=2) | partitions |".to_string();
+    let mut head = format!(
+        "| the loop's step (`{}`) | partitions |",
+        wait_tally::FORMAT
+    );
     let mut rule = "|---|---|".to_string();
     for (name, _, _) in columns {
         head.push_str(&format!(" {name}: count / post | {name}: ms / post |"));
@@ -791,7 +797,9 @@ impl Pager {
         let dir = w.tmp.join("pager");
         std::fs::create_dir_all(&dir).expect("the pager's state dir");
         let cap = dir.join("person.cap");
-        let caps: String = aterm_link::enable::person_grants(FLEET, PERSON)
+        let caps: String = astream_cap::GrantCeiling::aterm_person_ring(FLEET, PERSON)
+            .expect("a person ring")
+            .rules()
             .iter()
             .map(|g| harness::cap_line(g))
             .collect();
@@ -1108,7 +1116,9 @@ impl NeedPager {
         let dir = w.tmp.join(format!("need-pager-{k}"));
         std::fs::create_dir_all(&dir).expect("the need pager's state dir");
         let cap = dir.join("person.cap");
-        let caps: String = aterm_link::enable::person_grants(FLEET, PERSON)
+        let caps: String = astream_cap::GrantCeiling::aterm_person_ring(FLEET, PERSON)
+            .expect("a person ring")
+            .rules()
             .iter()
             .map(|g| harness::cap_line(g))
             .collect();
@@ -1381,7 +1391,11 @@ fn tables_text(tables: &[(&str, (usize, usize))]) -> String {
 /// The ask world: boot with the tally on, run legs (a)-(d), read the log.
 pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     eprintln!("fabric bench: booting the ask world");
-    let mut w = boot_world("fbench-ask", spec, &[(wait_tally::SEAM, "1")]);
+    let mut w = boot_world(
+        "fbench-ask",
+        spec,
+        &tallies::world_env(spec, &[(wait_tally::SEAM, "1")]),
+    );
     w.wait_ready();
     let served = served_line(&w, spec);
     let (a, b) = w.two_sessions();
@@ -1424,6 +1438,23 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         let mut ctl = w.ctl();
         let mut a_since = newest_id(&mut ctl, &a);
         let mut b_since = newest_id(&mut ctl, &b);
+        // The rounds are the legs; the handler fence waits on A's inbox. A leg's first window
+        // starts from the Mark the leg before it ended on, and under `tally=on` from the probe's
+        // reading after that leg instead: its wait-tally line, past its fence record, and the
+        // broker's flushes after the record's publish. So a leg's windows hold nothing of a
+        // reading but the bridge's park from its line to the leg's first post, as without the
+        // probe they hold the bench's own pause between legs, and the fence record's take when
+        // another record reached the bridge ahead of it.
+        let mut probe = spec.tally.then(|| tallies::Probe::of(&w, broker, &a));
+        if let Some(p) = probe.as_mut() {
+            p.start();
+        }
+        let mut leg_ends = |leg: &str| {
+            probe.as_mut().map(|p| Mark {
+                tally: p.round("asks", leg),
+                flushes: broker.flush_counts(),
+            })
+        };
         eprintln!(
             "fabric bench: asks, idle: {} of each kind ({} warm-up)",
             spec.asks, spec.warmup
@@ -1432,6 +1463,7 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         let before = table_rows(&state);
         let mut tables = vec![("the idle leg", before)];
         let (idle, m) = idle(&s, spec, &mut ctl, &mut b_since);
+        let m = leg_ends("the idle leg").unwrap_or(m);
         let after = table_rows(&state);
         tables_grew(before, after, spec.asks).unwrap_or_else(|e| panic!("the idle leg: {e}"));
         tables.push(("the busy senders", after));
@@ -1440,20 +1472,24 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             spec.asks
         );
         let (busy, m) = busy_senders(&s, spec.asks, &senders, &mut b_since, m);
+        let m = leg_ends("the busy senders").unwrap_or(m);
         tables.push(("the busy ping-pong", table_rows(&state)));
         eprintln!("fabric bench: asks, busy: {} ask/task rounds", spec.asks);
         let (rounds, rounds_spent, m) =
             busy_pingpong(&s, spec, &mut ctl, (&mut a_since, &mut b_since), m);
+        let m = leg_ends("the busy ping-pong").unwrap_or(m);
         tables.push(("the receipts", table_rows(&state)));
         eprintln!("fabric bench: asks, receipts: {}", spec.asks);
         let (receipts, receipts_spent, m) =
             receipts(&s, spec, &mut ctl, (&mut a_since, &mut b_since), m);
+        let m = leg_ends("the receipts").unwrap_or(m);
         tables.push(("the person lane", table_rows(&state)));
         eprintln!(
             "fabric bench: asks, person lane: {} without a pager and {} with one",
             spec.asks, spec.asks
         );
         let (persons, m) = person(&s, spec, &mut ctl, m);
+        let m = leg_ends("the person lane").unwrap_or(m);
         tables.push(("the mix", table_rows(&state)));
         eprintln!(
             "fabric bench: asks, the escalated mix: {} plain and {} mixed, one person-lane post \
@@ -1461,6 +1497,7 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             spec.samples, spec.samples, spec.mix_every
         );
         let (mix, _) = mix(&s, spec, &mut ctl, &c, &mut b_since, m);
+        leg_ends("the mix");
         tables.push(("the end", table_rows(&state)));
         eprintln!(
             "fabric bench: asks, a need pager: {} session-event rows without one and {} with",
@@ -1468,8 +1505,10 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             spec.samples * NEED_ROWS_PER_SAMPLE
         );
         let need = need_leg(&s, spec);
+        leg_ends("the need pager");
         await_durable(broker);
         Legs {
+            counted: probe.map(tallies::Probe::into_tallies),
             idle,
             busy,
             rounds,
@@ -1570,12 +1609,15 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         fields.insert("escalated_mix".to_string(), mix_json);
         fields.insert("need_pager".to_string(), need_json);
     }
+    tallies::report(legs.counted.as_ref(), &mut json, &mut md);
     drop(ruler);
     (json, md)
 }
 
 /// Every leg's raw numbers.
 struct Legs {
+    /// Both tallies over each leg, with `tally=on`.
+    counted: Option<tallies::Tallies>,
     idle: Idle,
     busy: Busy,
     rounds: Vec<Round>,

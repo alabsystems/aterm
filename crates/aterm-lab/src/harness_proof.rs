@@ -232,7 +232,7 @@ fn build_tool(
 /// build of a newer version, for its own re-exec), each in its own `*.noindex` target under
 /// `target`.
 fn build_harness(s: &Subject, repo: &Path, target: &Path) -> Result<Built, Fail> {
-    let toml = std::fs::read_to_string(repo.join("Cargo.toml"))
+    let toml = crate::util::read_regular_text(&repo.join("Cargo.toml"))
         .map_err(|e| not_run(format!("{}: {e}", repo.join("Cargo.toml").display())))?;
     let version = package_version(&toml)
         .ok_or_else(|| not_run(format!("{} names no package version", repo.display())))?;

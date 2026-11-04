@@ -30,7 +30,8 @@ pub(crate) const NO_MDNS: &str = "this system resolves .local names over mDNS on
 /// Whether `host` is a local DNS name (`.local`, or `.local.`), the one kind of
 /// name Local Network privacy gates (TN3179: a non-local name resolves through
 /// the system resolver without it).
-pub(crate) fn is_local_name(host: &str) -> bool {
+#[must_use]
+pub fn is_local_name(host: &str) -> bool {
     let name = host.strip_suffix('.').unwrap_or(host);
     name.len() > ".local".len()
         && name.is_char_boundary(name.len() - ".local".len())

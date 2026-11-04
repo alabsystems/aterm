@@ -153,7 +153,7 @@ src/tests_pwsh_keys.rs	test_powershell_readline_layer_honours_the_opt_out_and_st
 src/tests_pwsh_keys.rs	test_powershell_ctrl_e_accepts_a_suggestion_only_at_the_end_of_the_line	sh-pwsh-keys	
 ```
 
-## 3. Open findings
+## 3. Coverage
 
 - The biggest collapses are `sh-nonce-capture` (17 primary), `sh-live-managed` (12), `sh-typed-upgrade` (8),
   `injection-shape` (7), `sh-body-pointer` (7), `sh-tty-sanity` (7), `script-const-lints` (6) and
@@ -171,11 +171,6 @@ src/tests_pwsh_keys.rs	test_powershell_ctrl_e_accepts_a_suggestion_only_at_the_e
 ## 4. Tests that are not spec samples
 
 Status 2026-10-16: deleted `test_scripts_contain_prompt_override`, `test_spawned_shells_never_read_the_developers_home`, `test_bash_fallback_unnonced_when_env_missing`, `test_powershell_script_references_shell_nonce_env`, `test_bash_prompt_command_guard_prevents_spurious_capture`, and `test_bash_default_mode_embeds_133b_in_ps1`; 0 non-spec tests remain.
-
-| test | why | action |
-|---|---|---|
-
-Actions: 6 delete, 0 become-spec, 0 keep.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 

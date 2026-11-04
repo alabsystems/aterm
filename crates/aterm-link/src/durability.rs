@@ -1417,9 +1417,9 @@ mod tests {
     /// Whose caps a [`Write`] goes under.
     #[derive(Clone, Copy, Debug)]
     enum Who {
-        /// The person `h-x`, bound by their ring ([`crate::enable::person_grants`]).
+        /// The person `h-x`, bound by their ring ([`crate::enable::person_rules`]).
         Person,
-        /// The node's bridge, bound by its ring ([`crate::enable::node_grants`]).
+        /// The node's bridge, bound by its ring ([`crate::enable::node_rules`]).
         Node,
         /// The fleet root's god cap: unbound, so no principal rule sees it.
         God,
@@ -1519,8 +1519,8 @@ mod tests {
             }
             c
         };
-        let mut person = client(crate::enable::person_grants(TABLE_FLEET, TABLE_PERSON));
-        let mut node = client(crate::enable::node_grants(TABLE_FLEET, TABLE_NODE));
+        let mut person = client(crate::enable::person_rules(TABLE_FLEET, TABLE_PERSON));
+        let mut node = client(crate::enable::node_rules(TABLE_FLEET, TABLE_NODE));
         let mut god = client(vec![format!("/f/{TABLE_FLEET}/>")]);
         let mut seq = 0;
         let mut out = Vec::new();

@@ -107,6 +107,12 @@ pub struct Spec {
     /// session's snapshot, as an agent's delivery does. 0 (the default) is none; at most
     /// [`PACED_NOTES_MAX`].
     pub paced_notes: usize,
+    /// Both tallies in the messaging, attach, handoff and ask worlds (D02): each boots with the
+    /// bridge's wait tally (`aterm_link::wait_tally::SEAM`) and aterm's handler tally
+    /// (`aterm_types::wait_tally::HANDLER_SEAM`) on, reads both at each round's end and reports
+    /// every round's rows. Off (the default) boots those worlds as before, since the tally's own
+    /// idle writes move what they measure; the ping-pong world counts with both always.
+    pub tally: bool,
 }
 
 /// The scenarios measured in one run.
@@ -188,14 +194,12 @@ impl Log {
     }
 }
 
-/// `on` or `off`, for `retention=`. Pure (unit-tested through [`parse`]).
-fn on_off(word: &str) -> Result<bool, String> {
+/// `on` or `off`, for the switch `key=`. Pure (unit-tested through [`parse`]).
+fn on_off(key: &str, word: &str) -> Result<bool, String> {
     match word {
         "on" => Ok(true),
         "off" => Ok(false),
-        _ => Err(format!(
-            "{ENV}: `retention=` is `on` or `off`, not `{word}`"
-        )),
+        _ => Err(format!("{ENV}: `{key}=` is `on` or `off`, not `{word}`")),
     }
 }
 
@@ -294,6 +298,9 @@ impl Spec {
         if self.paced_notes > 0 {
             words.push_str(&format!(" paced_notes={}", self.paced_notes));
         }
+        if self.tally {
+            words.push_str(" tally=on");
+        }
         if self.scenario != Scenario::All {
             words.push_str(&format!(" scenario={}", self.scenario.word()));
         }
@@ -316,7 +323,8 @@ impl Spec {
 /// a bystander count past [`ATTACH_MAX`], a backlog past [`backlog_max`] for
 /// its attach sizes or on a run that measures no attach, an asked prefill past
 /// [`ASKED_PREFILL_MAX`] or on a run that measures no ask, paced notes past
-/// [`PACED_NOTES_MAX`] or on a run that measures no messaging, or no `out=`.
+/// [`PACED_NOTES_MAX`] or on a run that measures no messaging, `tally=on` on a run that measures
+/// only the ping-pong world (which counts with both tallies anyway), or no `out=`.
 pub fn parse(raw: &str) -> Result<Spec, String> {
     let mut out = None;
     let mut spec = Spec {
@@ -341,6 +349,7 @@ pub fn parse(raw: &str) -> Result<Spec, String> {
         backlog: 0,
         asked_prefill: 0,
         paced_notes: 0,
+        tally: false,
     };
     let count = |key: &str, v: &str, zero_ok: bool| -> Result<usize, String> {
         match v.parse::<usize>() {
@@ -371,8 +380,9 @@ pub fn parse(raw: &str) -> Result<Spec, String> {
             "asked_prefill" => spec.asked_prefill = count(key, v, true)?,
             "paced_notes" => spec.paced_notes = count(key, v, true)?,
             "durability" => spec.durability = Tier::parse(v)?,
-            "retention" => spec.retention = on_off(v)?,
-            "at_rest" => spec.at_rest = on_off(v)?,
+            "retention" => spec.retention = on_off(key, v)?,
+            "at_rest" => spec.at_rest = on_off(key, v)?,
+            "tally" => spec.tally = on_off(key, v)?,
             "log" => spec.log = Log::parse(v)?,
             "retention_interval_ms" => {
                 spec.retention_interval_ms = Some(count(key, v, false)? as u64);
@@ -462,6 +472,12 @@ pub fn parse(raw: &str) -> Result<Spec, String> {
         return Err(format!(
             "{ENV}: asked_prefill= is the ask world's, and this run measures {}",
             spec.scenario.word()
+        ));
+    }
+    if spec.tally && spec.scenario == Scenario::Pingpong {
+        return Err(format!(
+            "{ENV}: tally=on is the messaging, attach, handoff and ask worlds' knob; the \
+             ping-pong world counts with both tallies on in every run"
         ));
     }
     Ok(spec)

@@ -793,7 +793,7 @@ fn present_once(aterm: &Path, keep: bool) -> Result<Figures, Fail> {
 }
 
 fn bridge_pid(state: &Path) -> Option<i32> {
-    std::fs::read_to_string(state.join("pid"))
+    crate::util::read_regular_text(&state.join("pid"))
         .ok()?
         .trim()
         .parse()
@@ -932,7 +932,7 @@ fn legs(
         )));
     };
     let parent_gone = until(HANG, || (!crate::sys::alive(parent)).then_some(()))?.is_some();
-    let said = std::fs::read_to_string(&inst.log).unwrap_or_default();
+    let said = crate::util::read_regular_text(&inst.log).unwrap_or_default();
     let handed = said
         .lines()
         .filter(|l| l.contains("SEAMLESS update") || l.contains("handed off"))
@@ -1507,7 +1507,7 @@ fn topic_verdict(
 }
 
 fn bridge_holds(state: &Path, sid: &str, topic: &str) -> bool {
-    std::fs::read_to_string(state.join(format!("topics/{sid}")))
+    crate::util::read_regular_text(&state.join(format!("topics/{sid}")))
         .unwrap_or_default()
         .lines()
         .any(|l| l.split(' ').next() == Some(topic))
@@ -1530,7 +1530,7 @@ fn slow_readers(
     let said_gaps = || {
         broker_log
             .as_ref()
-            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|p| crate::util::read_regular_file(p).ok())
             .map_or(0, |bytes| count_of(&bytes, b"events-dropped="))
     };
     let gaps_before = said_gaps();

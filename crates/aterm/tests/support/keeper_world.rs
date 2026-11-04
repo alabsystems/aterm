@@ -118,7 +118,7 @@ pub struct Proc {
     pub child: Child,
     /// The instant just before it was spawned.
     pub spawned: Instant,
-    _lifeline: Option<aterm_uds::lifeline::Lifeline>,
+    _lifeline: Option<launch_isolation::Lifeline>,
 }
 
 impl Drop for Proc {
@@ -381,6 +381,7 @@ pub fn boot(root: &Path, tag: &str, seams: &[(&str, &str)]) -> (Proc, String) {
     cmd.env(LEDGER_SEAM, &ledger);
     let lifeline = launch_isolation::lifeline(&mut cmd, root);
     let mut ready = headless_boot::arm_ready(&mut cmd, root);
+    let _boot = aterm_spec::subprocess_lane::acquire_boot_permit();
     let spawned = Instant::now();
     let child = match cmd.spawn() {
         Ok(child) => child,

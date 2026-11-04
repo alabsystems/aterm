@@ -463,14 +463,17 @@ fn step(label: &'static str, argv: &[&str], stdin: Option<&str>) -> Step {
 /// The provisioning plan, in order, with this Mac's [`WEB2`] when it reads ([`provision_plan`]).
 #[must_use]
 pub fn provision_steps() -> Vec<Step> {
-    provision_plan(std::fs::read_to_string(WEB2).ok())
+    provision_plan(crate::util::read_regular_text(std::path::Path::new(WEB2)).ok())
 }
 
 /// [`provision_steps`], with the x86_64 half (the amd64 sources, architecture and libraries, and
 /// the x86_64 std) only when `x86_64`: a guest with no Rosetta (the GPU instance's) runs none.
 #[must_use]
 pub fn provision_steps_for(x86_64: bool) -> Vec<Step> {
-    provision_plan_for(std::fs::read_to_string(WEB2).ok(), x86_64)
+    provision_plan_for(
+        crate::util::read_regular_text(std::path::Path::new(WEB2)).ok(),
+        x86_64,
+    )
 }
 
 /// The provisioning plan, in order, laying `web2` at [`WEB2`] when it is given.

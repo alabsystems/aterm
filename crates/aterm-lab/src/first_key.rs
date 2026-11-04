@@ -270,7 +270,7 @@ type Row = std::collections::BTreeMap<String, String>;
 pub fn read_rows(paths: &[PathBuf]) -> Result<Vec<Row>, String> {
     let mut rows = Vec::new();
     for path in paths {
-        let text = std::fs::read_to_string(path)
+        let text = crate::util::read_regular_text(path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         let mut lines = text.lines();
         let head: Vec<&str> = lines

@@ -1976,9 +1976,9 @@ pub(super) fn repair_half_done_revokes_with_log(
                     .claimed_label
                     .as_deref()
                     .filter(|c| crate::membership_log::is_label(c))
-                    .is_some_and(&is_label_denied)
-                || member.node_id.as_deref().is_some_and(&is_node_denied)
-                || member.node_key.as_deref().is_some_and(&is_node_denied)
+                    .is_some_and(is_label_denied)
+                || member.node_id.as_deref().is_some_and(is_node_denied)
+                || member.node_key.as_deref().is_some_and(is_node_denied)
                 || log.is_some_and(|l| {
                     Recipient::parse(&member.recipient).is_ok_and(|rec| {
                         l.recipient_is_removed(&rec)

@@ -15,7 +15,7 @@
 //!
 //! Why naming the heads hides nothing the store could take. A pass offers the store every frame
 //! of a stream it reads: the whole stream when it verifies, and otherwise the frames this build
-//! reads that descend from none it cannot read ([`super::store::readable_part`]). A frame counts
+//! reads that descend from none it cannot read ([`super::store::readable_mask`]). A frame counts
 //! when the store does not hold it complete after the pass, and then it can never be taken:
 //! - this build cannot read it ([`Record::decode`] is a function of its bytes), or it descends
 //!   from a frame this build cannot read;
@@ -36,9 +36,13 @@
 //! was first made (extending it does not renew it) and with the process, which is when an
 //! upgraded build could take the records, and it never applies to a store with no genesis.
 
-use super::store::{Frame, frames, readable_part};
-use super::{RecordId, Store};
+use super::store::framed::{FrameReadError, FrameReader, LayoutFrame};
+#[cfg(test)]
+use super::store::frames;
+use super::store::{Frame, readable_mask};
+use super::{MAX_RECORDS, MAX_RECORDS_STREAM, Record, RecordId, Store};
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{self, Read};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -64,21 +68,15 @@ const _: () = assert!(UNTAKEN_HEADS * 65 < aterm_http::uri::MAX_URI_LEN / 2);
 pub(crate) const UNTAKEN_URLS: usize = 256;
 const _: () = assert!(UNTAKEN_URLS >= 8 * (crate::discover::MAX_CANDIDATES + 1));
 
-/// What one server sent a pull, frame by frame ([`frames`]). A stream this layout cannot frame
+/// What one server sent a pull, frame by frame. A stream this layout cannot frame
 /// (truncated, another layout version) names nothing.
 pub(crate) struct Sent(Vec<Frame>);
 
 impl Sent {
     /// `bytes`, as a server sent them.
+    #[cfg(test)]
     pub(crate) fn read(bytes: &[u8]) -> Self {
         Self(frames(bytes).unwrap_or_default())
-    }
-
-    /// What a pass offers the store of `bytes`, which these frames were read from, when the
-    /// stream does not verify as a whole: the frames this build reads that descend from none it
-    /// cannot read ([`readable_part`]).
-    pub(crate) fn readable(&self, bytes: &[u8]) -> Vec<u8> {
-        readable_part(bytes, &self.0)
     }
 
     /// Whether `store` does not hold every frame of what the server sent complete.
@@ -87,6 +85,158 @@ impl Sent {
             .iter()
             .any(|frame| store.complete_bytes(&frame.id).is_none())
     }
+}
+
+/// One response's complete-framing result, with each record decoded at most once.
+/// Layout failure retains no prefix; unreadable kinds/signatures still retain their frame ids.
+pub(crate) struct ReceivedFrames {
+    sent: Sent,
+    decoded: Vec<Option<Record>>,
+    byte_len: usize,
+    complete: bool,
+}
+
+impl ReceivedFrames {
+    pub(crate) fn empty() -> Self {
+        Self {
+            sent: Sent(Vec::new()),
+            decoded: Vec::new(),
+            byte_len: 0,
+            complete: true,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read(bytes: &[u8]) -> Self {
+        if bytes.len() > MAX_RECORDS_STREAM {
+            let mut received = Self::empty();
+            received.complete = false;
+            received.byte_len = bytes.len();
+            return received;
+        }
+        Self::read_from(&mut io::Cursor::new(bytes))
+            .expect("an in-memory membership stream has no I/O failures")
+    }
+
+    /// Consume the actual input to EOF, preserving I/O failures even after layout refusal.
+    /// The reader supplies transport deadlines and bounds; no artificial EOF is introduced.
+    #[cfg(test)]
+    pub(crate) fn read_from<R: Read + ?Sized>(reader: &mut R) -> io::Result<Self> {
+        Self::read_from_with_known(reader, |_| None)
+    }
+
+    /// Reuse an already verified immutable owner only after hashing the complete frame.
+    /// The lookup must not refresh files or retain a lock across another reader call.
+    pub(crate) fn read_from_with_known<R: Read + ?Sized>(
+        reader: &mut R,
+        mut known: impl FnMut(&RecordId) -> Option<Record>,
+    ) -> io::Result<Self> {
+        let mut input = Counted { reader, bytes: 0 };
+        let mut received = Self::empty();
+        let mut frames = FrameReader::new();
+        loop {
+            if received.sent.0.len() == MAX_RECORDS || input.bytes == MAX_RECORDS_STREAM {
+                let mut extra = [0];
+                if read_once(&mut input, &mut extra)? == 0 {
+                    break;
+                }
+                received.invalidate();
+                drain(&mut input)?;
+                break;
+            }
+            let start = input.bytes;
+            match frames.read_layout(&mut input, MAX_RECORDS_STREAM - start) {
+                Ok(None) => break,
+                Ok(Some(frame)) => {
+                    received.push(frame, start..input.bytes, &mut known);
+                }
+                Err(FrameReadError::Invalid(_)) => {
+                    received.invalidate();
+                    drain(&mut input)?;
+                    break;
+                }
+                Err(FrameReadError::Read(error)) => return Err(error),
+            }
+        }
+        received.byte_len = input.bytes;
+        Ok(received)
+    }
+
+    fn invalidate(&mut self) {
+        self.sent.0.clear();
+        self.decoded.clear();
+        self.complete = false;
+    }
+
+    fn push(
+        &mut self,
+        frame: LayoutFrame,
+        _range: std::ops::Range<usize>,
+        known: &mut impl FnMut(&RecordId) -> Option<Record>,
+    ) {
+        let id = aterm_digest::Sha256::digest(&frame.wire);
+        let decoded = known(&id).or_else(|| Record::decode(&frame.wire).ok());
+        self.sent.0.push(Frame {
+            id,
+            parents: frame.parents,
+            #[cfg(test)]
+            range: _range,
+        });
+        self.decoded.push(decoded);
+    }
+
+    pub(crate) const fn byte_len(&self) -> usize {
+        self.byte_len
+    }
+
+    pub(crate) fn whole(&self) -> Option<Vec<Record>> {
+        if !self.complete {
+            return None;
+        }
+        self.decoded.iter().cloned().collect()
+    }
+
+    pub(crate) fn readable(&self) -> Vec<Record> {
+        let readable = readable_mask(&self.sent.0, |i, _| self.decoded[i].is_some());
+        self.decoded
+            .iter()
+            .zip(readable)
+            .filter(|(_, readable)| *readable)
+            .filter_map(|(record, _)| record.clone())
+            .collect()
+    }
+
+    pub(crate) fn into_sent(self) -> Sent {
+        self.sent
+    }
+}
+
+struct Counted<'a, R: ?Sized> {
+    reader: &'a mut R,
+    bytes: usize,
+}
+
+impl<R: Read + ?Sized> Read for Counted<'_, R> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        let read = self.reader.read(bytes)?;
+        self.bytes = self.bytes.saturating_add(read);
+        Ok(read)
+    }
+}
+
+fn read_once(reader: &mut impl Read, bytes: &mut [u8]) -> io::Result<usize> {
+    loop {
+        match reader.read(bytes) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            result => return result,
+        }
+    }
+}
+
+fn drain(reader: &mut impl Read) -> io::Result<()> {
+    let mut bytes = [0; 16 * 1024];
+    while read_once(reader, &mut bytes)? != 0 {}
+    Ok(())
 }
 
 /// What a pull names ([`Untaken::have`]): `ids`, of which the first `heads` are a memo's.

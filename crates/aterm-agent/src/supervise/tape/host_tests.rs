@@ -645,6 +645,7 @@ fn a_break_line_an_earlier_build_taped_reads_back_as_the_notice() {
 
 #[test]
 fn a_request_names_each_argument() {
+    use crate::supervise::LineHeld;
     assert!(request(&[]).is_empty());
     let point = IdlePoint {
         done_under_land: true,
@@ -675,6 +676,16 @@ fn a_request_names_each_argument() {
         String::from_utf8(request(&[("point", &theirs)])).expect("utf-8"),
         "point=IdlePoint { done_under_land: true, held: Exchange, theirs: Exchange }"
     );
+    for (held, spelled) in [(LineHeld::Stands, "Stands"), (LineHeld::Lost, "Lost")] {
+        let line = IdlePoint {
+            line_held: Some(held),
+            ..point
+        };
+        assert_eq!(
+            String::from_utf8(request(&[("point", &line)])).expect("utf-8"),
+            format!("point=IdlePoint {{ done_under_land: true, line_held: {spelled} }}")
+        );
+    }
 }
 
 /// AN ACT'S REQUEST IS THE ACT ALONE (the second review of the post-landing fixes, 2026-11-01):

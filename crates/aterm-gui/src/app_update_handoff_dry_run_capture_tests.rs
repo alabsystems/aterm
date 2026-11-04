@@ -34,7 +34,7 @@ fn a_dry_run_times_the_parks_own_capture_and_parks_nothing() {
         .get_mut(&0)
         .expect("session 0")
         .session
-        .reader_join = Some(std::thread::spawn(|| {}));
+        .reader_join = Some(crate::spawn::ReaderJoin::for_test(|| {}));
     let handed = app.handoff_live_sessions().len();
 
     let dry = app.dry_run_handoff_capture(caps());
@@ -984,6 +984,51 @@ fn a_policy_without_scrollback_withholds_the_launched_lanes_history_carry() {
         release_pty(&mut app, pty);
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// The capture's take of a busy screen waits asleep, registered on the session's `ui_waiting`:
+/// this holder hands the engine over (as the compress worker does between its batches) only to
+/// a registered waiter that has slept for it, which a take that never registers, or that yields
+/// between its tries, never is.
+#[test]
+fn the_captures_take_of_a_busy_screen_sleeps_registered_for_the_handover() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
+    let term = Arc::new(Mutex::new(aterm_core::terminal::Terminal::new(2, 10)));
+    let waiting = Arc::new(AtomicU32::new(0));
+    let watch = crate::handover_pauses_for_test::watch(&waiting);
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let holder = {
+        let (term, waiting) = (Arc::clone(&term), Arc::clone(&waiting));
+        std::thread::spawn(move || {
+            let guard = crate::term_lock(&term);
+            held_tx.send(()).expect("the test waits");
+            let slept =
+                aterm_spec::wait::within(aterm_spec::wait::MUST_HAPPEN, Duration::ZERO, || {
+                    (waiting.load(Ordering::Acquire) > 0 && watch.pauses() > 0).then_some(())
+                });
+            drop(guard);
+            crate::yield_to_ui_waiter(&waiting);
+            slept.is_some()
+        })
+    };
+    held_rx.recv().expect("the engine is held");
+    let taken = super::try_lock_by(
+        &term,
+        &waiting,
+        std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+    )
+    .is_some();
+    assert!(
+        holder.join().expect("the holder"),
+        "timed out waiting for the take to sleep as a registered waiter"
+    );
+    assert!(taken, "the take had the handed-over engine by its deadline");
+    assert_eq!(
+        waiting.load(Ordering::Acquire),
+        0,
+        "and left no registration"
+    );
 }
 
 /// Hold `term`'s engine from another thread until the park's bounded take times out.

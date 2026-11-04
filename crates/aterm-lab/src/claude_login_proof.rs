@@ -1193,18 +1193,31 @@ pub(crate) fn hang_wait_capped<T>(
     mut found: impl FnMut() -> Option<T>,
 ) -> Result<Result<T, String>, Fail> {
     let start = Instant::now();
-    let (mut moved, mut last) = (Instant::now(), (String::new(), 0usize, 0usize));
+    let (mut moved, mut last) = (Instant::now(), (String::new(), 0usize, 0u64));
+    let (mut journal_cursor, mut journal_len) = (crate::util::LineTailCursor::default(), 0usize);
+    let jpath = journal_path(run, sid);
     let log = aterm_log(run);
     loop {
         if let Some(t) = found() {
             return Ok(Ok(t));
         }
+        let (j_reset, j_delta) = journal_cursor.poll_scratch_text(&jpath).unwrap_or_default();
+        if j_reset {
+            journal_len = 0;
+        }
+        if !j_delta.is_empty() {
+            journal_len += journal_of(&j_delta).len();
+        }
+        let log_len = crate::sys::scratch_file_with_meta(&log)
+            .ok()
+            .flatten()
+            .map_or(0, |(_, m)| m.len());
         let now = (
             on(door, sid, &["text"])
                 .map(|r| r.stdout)
                 .unwrap_or_default(),
-            read_journal(run, sid).len(),
-            scratch_text(&log).len(),
+            journal_len,
+            log_len,
         );
         if now != last {
             (moved, last) = (Instant::now(), now);
@@ -1449,7 +1462,7 @@ pub(crate) fn tape_acts(drive: &Path, sid: &str) -> String {
     tapes.sort();
     let mut out = String::new();
     for p in tapes {
-        let Ok(tape) = fs::read(&p)
+        let Ok(tape) = crate::util::read_regular_file(&p)
             .map_err(|e| e.to_string())
             .and_then(|b| show::open(&b, true))
         else {
@@ -1499,7 +1512,7 @@ struct Evidence {
 impl Evidence {
     /// The logs `down` kept in `kept`.
     fn kept(kept: &Path, ledger: String) -> Evidence {
-        let text = |f: &str| fs::read_to_string(kept.join(f)).unwrap_or_default();
+        let text = |f: &str| crate::util::read_regular_text(&kept.join(f)).unwrap_or_default();
         Evidence {
             drive: kept.join("drive"),
             messages: text("state-logs/messages.log"),
@@ -1542,7 +1555,7 @@ struct Ran<'a> {
 /// One verdict row per judge, in the table's order.
 fn judge_run(ev: &Evidence, ran: &Ran<'_>) -> Vec<(&'static str, Judged)> {
     let (marks, drive) = (ran.marks, &ev.drive);
-    let text = |p: &Path| fs::read_to_string(p).unwrap_or_default();
+    let text = |p: &Path| crate::util::read_regular_text(p).unwrap_or_default();
     let journal = |sid: &str| journal_of(&text(&drive.join(format!("{sid}.journal.jsonl"))));
     let decisions = |sid: &str| decisions_of(&text(&drive.join(format!("{sid}.jsonl"))));
     let acts = |sid: &str| {

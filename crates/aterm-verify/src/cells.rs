@@ -18,6 +18,9 @@ use aterm_forge::model::{Cell, Graph, PkgId};
 
 use crate::Ctx;
 
+#[cfg(test)]
+#[path = "cells_unitgraph_tests.rs"]
+mod unit_graph_tests;
 #[path = "cells_units.rs"]
 mod units;
 use crate::exec::{self, Cmd};
@@ -133,6 +136,31 @@ pub fn dependents_in_graph(
         .filter(|(_, nodes)| nodes.iter().any(|id| seeds.contains(&id.name)))
         .map(|(root, _)| root.clone())
         .collect()
+}
+
+/// Keep an explicit package selection narrow; close a change cone over this cell's complete
+/// build inputs, including host tools that are absent from its normal library graph.
+#[must_use]
+pub fn wanted_in_cell(
+    normal: &BTreeSet<String>,
+    inputs: Option<&BTreeMap<String, BTreeSet<PkgId>>>,
+    scope: &crate::scope::Scope,
+) -> BTreeSet<String> {
+    let mut wanted = selected_in(normal, scope)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    if matches!(scope, crate::scope::Scope::Changed(_))
+        && let Some(inputs) = inputs
+    {
+        let seeds = inputs
+            .values()
+            .flat_map(|nodes| nodes.iter())
+            .filter(|id| scope.includes_crate(&id.name))
+            .map(|id| id.name.clone())
+            .collect();
+        wanted.extend(dependents_in_graph(inputs, &seeds));
+    }
+    wanted
 }
 
 /// The crates a [`narrows`] lint names: of `own`, the `wanted` members this cell compiles for its
@@ -407,7 +435,12 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
                 r.raw(detail.join("\n"));
             }
             CellOutcome::CouldNotRun { status, detail } => {
-                r.cannot_run(format!("{label} — {status}"));
+                let reason = detail
+                    .first()
+                    .and_then(|s| s.lines().next())
+                    .map(|s| format!(": {}", s.chars().take(240).collect::<String>()))
+                    .unwrap_or_default();
+                r.cannot_run(format!("{label} — {status}{reason}"));
                 r.raw(took);
                 r.raw(detail.join("\n"));
             }
@@ -586,7 +619,7 @@ fn audit_policy(ctx: &Ctx, r: &mut Report, policy: &[Shim], ran: &[Cell]) {
                 let tests = members
                     .get_or_insert_with(|| member_names(ctx))
                     .clone()
-                    .and_then(|m| test_graph(ctx, cell, &m.names, &names));
+                    .and_then(|m| test_graph(ctx, cell, &m, &names));
                 match tests {
                     Ok(t) => {
                         if let Some(why) = dead_shim(shim, library, &t.nodes) {
@@ -660,14 +693,13 @@ fn dead_shim(shim: &Shim, library: &BTreeSet<PkgId>, tests: &BTreeSet<PkgId>) ->
     })
 }
 
-/// What the all-targets pass compiles: the members it selects and excludes, and their target
-/// dependencies, dev-dependencies included.
+/// A member selection's target packages and complete build inputs.
 #[derive(Debug, Default)]
-pub struct TestGraph {
+pub struct MemberGraph {
     pub nodes: BTreeSet<PkgId>,
     pub selected: Vec<String>,
     pub excluded: Vec<String>,
-    /// Each root's target dependencies, for [`dependents_in_graph`].
+    /// Each root's complete build inputs, for [`dependents_in_graph`].
     pub dependencies: BTreeMap<String, BTreeSet<PkgId>>,
 }
 
@@ -677,14 +709,32 @@ pub struct TestGraph {
 fn test_graph(
     ctx: &Ctx,
     cell: &Cell,
-    members: &BTreeSet<String>,
+    members: &Members,
     normal: &BTreeSet<String>,
-) -> Result<TestGraph, String> {
+) -> Result<MemberGraph, String> {
+    member_graph(ctx, cell, members, normal, true)
+}
+
+fn member_graph(
+    ctx: &Ctx,
+    cell: &Cell,
+    members: &Members,
+    normal: &BTreeSet<String>,
+    all_targets: bool,
+) -> Result<MemberGraph, String> {
     let patched = patched_crates(&ctx.root)?;
-    let (selected, excluded) = test_selection(members, normal, &patched);
+    let (selected, excluded) = if all_targets {
+        test_selection(&members.names, normal, &patched)
+    } else {
+        let selected: BTreeSet<String> = std::iter::once(cell.package.clone())
+            .chain(members.roots_of(cell))
+            .collect();
+        let excluded = members.names.difference(&selected).cloned().collect();
+        (selected.into_iter().collect(), excluded)
+    };
     if selected.is_empty() {
         return Err(format!(
-            "no workspace member is in cell `{}`'s graph, so its all-targets pass would \
+            "no workspace member is in cell `{}`'s graph, so its member pass would \
              compile nothing",
             cell.name
         ));
@@ -697,31 +747,35 @@ fn test_graph(
     );
     let out = exec::bounded(ctx.child_ceiling, {
         let excluded = excluded.clone();
-        move || test_units(&targo, &path, &root, &triple, &excluded)
+        move || member_units(&targo, &path, &root, &triple, &excluded, all_targets)
     })
     .unwrap_or_else(|why| Err(format!("`targo check --unit-graph` {}", why.sentence())))?;
     let excluded_set: BTreeSet<String> = excluded.iter().cloned().collect();
-    let roots: BTreeSet<String> = members.difference(&excluded_set).cloned().collect();
+    let roots: BTreeSet<String> = members.names.difference(&excluded_set).cloned().collect();
     let dependencies = units::read(&out, &cell.triple, &roots)?;
-    Ok(TestGraph {
+    Ok(MemberGraph {
         nodes: dependencies
+            .targets
             .values()
             .flat_map(|nodes| nodes.iter().cloned())
             .collect(),
         selected,
         excluded,
-        dependencies,
+        dependencies: dependencies.inputs,
     })
 }
 
-/// Resolve all target kinds over the workspace less `excluded`, without compiling or running
-/// build scripts. The compact unit graph retains host/target and feature distinctions.
-fn test_units(
+/// Resolve selected target kinds without compiling or running build scripts. The compact
+/// unit graph retains host/target and feature distinctions.
+/// The pinned Trust Cargo resolves this graph, as it does for the existing test shaper;
+/// the later stock rustup compiler is never substituted for this resolver.
+fn member_units(
     targo: &Path,
     path: &std::ffi::OsStr,
     root: &Path,
     triple: &str,
     excluded: &[String],
+    all_targets: bool,
 ) -> Result<String, String> {
     let mut cmd = aterm_uds::spawnfd::command(targo);
     cmd.env("PATH", path)
@@ -729,9 +783,12 @@ fn test_units(
         .args(["--unverified", "check"])
         .arg("--manifest-path")
         .arg(root.join("Cargo.toml"))
-        .args(["--all-targets", "--workspace", "--locked", "--offline"])
+        .args(["--workspace", "--locked", "--offline"])
         .args(crate::stages::UNIT_GRAPH)
         .args(["--target", triple]);
+    if all_targets {
+        cmd.arg("--all-targets");
+    }
     for name in excluded {
         cmd.arg("--exclude").arg(name);
     }
@@ -740,7 +797,7 @@ fn test_units(
         .map_err(|e| format!("could not run {} check --unit-graph: {e}", targo.display()))?;
     if !out.status.success() {
         return Err(format!(
-            "`targo check --unit-graph` for {triple}'s test targets failed: {}",
+            "{triple} requires pinned Trust Cargo's check --unit-graph -Z unstable-options capability; resolution failed without compiling: {}",
             String::from_utf8_lossy(&out.stderr).trim_end()
         ));
     }
@@ -863,7 +920,8 @@ fn check_cell(
         .map(|id| id.name.clone())
         .collect();
     let selects = ctx.cells_pulled || matches!(ctx.scope, crate::scope::Scope::Packages(_));
-    if selects && selected_in(&own, &ctx.scope).is_empty() {
+    let changed = matches!(ctx.scope, crate::scope::Scope::Changed(_));
+    if selects && !changed && selected_in(&own, &ctx.scope).is_empty() {
         return CellOutcome::Unselected;
     }
     let proc_macros: BTreeSet<String> = graph
@@ -884,23 +942,29 @@ fn check_cell(
     let tests = if cell.triple.starts_with("wasm32") {
         None
     } else {
-        match test_graph(ctx, cell, &members.names, &graph_names) {
+        match test_graph(ctx, cell, members, &graph_names) {
             Ok(t) => Some(t),
             Err(e) => return could_not("NO-TEST-GRAPH", vec![e]),
         }
     };
     let test_nodes = tests.as_ref().map(|t| t.nodes.clone()).unwrap_or_default();
-
-    let mut wanted: BTreeSet<String> = graph_names
-        .iter()
-        .filter(|name| ctx.scope.includes_crate(name))
-        .cloned()
-        .collect();
-    if matches!(ctx.scope, crate::scope::Scope::Changed(_))
-        && let Some(tests) = &tests
-    {
-        let dependents = dependents_in_graph(&tests.dependencies, &wanted);
-        wanted.extend(dependents);
+    // Browser cells do not check test targets, but their ordinary build still consumes host
+    // tools. Resolve only their default target kinds when closing a change cone.
+    let impact = if tests.is_none() && changed {
+        match member_graph(ctx, cell, members, &graph_names, false) {
+            Ok(graph) => Some(graph),
+            Err(error) => return could_not("NO-IMPACT-GRAPH", vec![error]),
+        }
+    } else {
+        None
+    };
+    let inputs = tests
+        .as_ref()
+        .or(impact.as_ref())
+        .map(|graph| &graph.dependencies);
+    let wanted = wanted_in_cell(&graph_names, inputs, &ctx.scope);
+    if selects && wanted.is_disjoint(&own) {
+        return CellOutcome::Unselected;
     }
     // A patched crate's name can stand for two packages (the windows-sys facades), so neither `-p`
     // nor a read by name could say which was compiled: that selection takes the whole graph.
@@ -969,6 +1033,10 @@ fn check_cell(
         target_dir: &target_dir,
         shim_args: &shim_args,
     };
+    let discovery = match GitDiscovery::load(ctx, &cwd) {
+        Ok(discovery) => discovery,
+        Err(error) => return could_not("NO-SOURCE-CONTEXT", vec![error]),
+    };
 
     let packages = if narrow {
         package_args(&judged, &ctx.scope)
@@ -977,7 +1045,14 @@ fn check_cell(
     };
     let lint = exec::run(&cargo.lint(&packages), ctx.exec_env());
     let mut red = Red::default();
-    let read = match read_cargo_run(&lint, &cell.triple, &graph_names, false, &mut red) {
+    let read = match read_cargo_run_with_discovery(
+        &lint,
+        &cell.triple,
+        &graph_names,
+        false,
+        &mut red,
+        Some(&discovery),
+    ) {
         Ok(read) => read,
         Err(outcome) => return outcome,
     };
@@ -1055,7 +1130,14 @@ fn check_cell(
             test_cargo.all_targets(&tests.excluded)
         };
         let run = exec::run(&check, ctx.exec_env());
-        let read = match read_cargo_run(&run, &cell.triple, &graph_names, true, &mut red) {
+        let read = match read_cargo_run_with_discovery(
+            &run,
+            &cell.triple,
+            &graph_names,
+            true,
+            &mut red,
+            Some(&discovery),
+        ) {
             Ok(read) => read,
             Err(outcome) => return outcome,
         };
@@ -1103,6 +1185,12 @@ fn check_cell(
             owed.len()
         ));
     }
+    if !red.discovery.is_empty() {
+        summary.push_str(&format!(
+            "; non-selected Git manifest diagnostics: {}",
+            red.discovery.join("; ")
+        ));
+    }
     match red.status {
         None => CellOutcome::Checked(summary),
         Some(status) => CellOutcome::Failed {
@@ -1117,6 +1205,7 @@ fn check_cell(
 struct Red {
     status: Option<String>,
     detail: Vec<String>,
+    discovery: Vec<String>,
 }
 
 impl Red {
@@ -1126,13 +1215,115 @@ impl Red {
     }
 }
 
-/// One compiler pass's diagnostics, shared by the lint and all-targets pass.
+/// One compiler pass with no source-discovery context (unit fixtures).
+#[cfg(test)]
 fn read_cargo_run(
     run: &exec::Run,
     triple: &str,
     graph: &BTreeSet<String>,
     tests: bool,
     red: &mut Red,
+) -> Result<CargoRead, CellOutcome> {
+    read_cargo_run_with_discovery(run, triple, graph, tests, red, None)
+}
+
+/// Canonical selected manifests and their actual Git checkout boundaries.
+/// Cargo may report errors from other manifests it discovers in a Git tree
+/// while successfully compiling every selected package.
+#[derive(Default)]
+struct GitDiscovery {
+    cwd: PathBuf,
+    manifests: BTreeSet<PathBuf>,
+    roots: BTreeSet<PathBuf>,
+}
+
+impl GitDiscovery {
+    fn load(ctx: &Ctx, cwd: &Path) -> Result<Self, String> {
+        let cargo = aterm_forge::resolve::Cargo::pinned(
+            ctx.tools.targo.as_os_str(),
+            ctx.path_env.as_os_str(),
+        );
+        let packages = aterm_forge::resolve::git_packages(&cargo, &ctx.root)?;
+        let mut out = Self {
+            cwd: cwd.to_path_buf(),
+            ..Self::default()
+        };
+        for package in packages.values() {
+            let manifest = package
+                .directory
+                .join("Cargo.toml")
+                .canonicalize()
+                .map_err(|error| format!("cannot identify Git package manifest: {error}"))?;
+            out.manifests.insert(manifest);
+            if let Some(root) = package
+                .directory
+                .ancestors()
+                .find(|path| path.join(".git").exists() && path.join(".cargo-ok").is_file())
+            {
+                // Ancestor manifests may supply inherited workspace inputs.
+                // They are never classified as unrelated discovery fixtures.
+                for ancestor in package.directory.ancestors() {
+                    let inherited = ancestor.join("Cargo.toml");
+                    if inherited.is_file() {
+                        out.manifests.insert(
+                            inherited
+                                .canonicalize()
+                                .map_err(|error| error.to_string())?,
+                        );
+                    }
+                    if ancestor == root {
+                        break;
+                    }
+                }
+                out.roots
+                    .insert(root.canonicalize().map_err(|error| error.to_string())?);
+            }
+        }
+        Ok(out)
+    }
+
+    fn unselected_manifest(&self, location: &str) -> Option<PathBuf> {
+        let mut parts = location.trim().strip_prefix("--> ")?.rsplitn(3, ':');
+        if parts.next()?.parse::<u32>().ok()? == 0 || parts.next()?.parse::<u32>().ok()? == 0 {
+            return None;
+        }
+        let path = self.cwd.join(parts.next()?).canonicalize().ok()?;
+        if path.file_name()? != "Cargo.toml" || self.manifests.contains(&path) {
+            return None;
+        }
+        self.roots
+            .iter()
+            .any(|root| path.starts_with(root))
+            .then_some(path)
+    }
+}
+
+/// Positive Cargo completion is required before any diagnostic can be a
+/// nonfatal discovery note. An exit code alone is insufficient evidence.
+fn cargo_finished_successfully(output: &str) -> bool {
+    let mut finished = false;
+    for line in output.lines().filter(|line| line.starts_with('{')) {
+        let Ok(value) = aterm_json::from_str::<aterm_json::Value>(line) else {
+            continue;
+        };
+        if value.get("reason").and_then(aterm_json::Value::as_str) == Some("build-finished") {
+            if value.get("success").and_then(aterm_json::Value::as_bool) != Some(true) {
+                return false;
+            }
+            finished = true;
+        }
+    }
+    finished
+}
+
+/// One compiler pass's diagnostics, shared by the lint and all-targets pass.
+fn read_cargo_run_with_discovery(
+    run: &exec::Run,
+    triple: &str,
+    graph: &BTreeSet<String>,
+    tests: bool,
+    red: &mut Red,
+    discovery: Option<&GitDiscovery>,
 ) -> Result<CargoRead, CellOutcome> {
     if let Some(why) = run.environment_failure() {
         return Err(CellOutcome::CouldNotRun {
@@ -1174,7 +1365,18 @@ fn read_cargo_run(
             format!("in `{pkg}`:\n{}", rendered.trim_end()),
         );
     }
-    for line in cargo_level_errors(&run.output) {
+    let lines: Vec<_> = run.output.lines().collect();
+    let completed = run.ok && cargo_finished_successfully(&run.output);
+    for (index, line) in lines.iter().enumerate().filter(|(_, line)| {
+        line.starts_with("error") && !line.starts_with("error: could not compile")
+    }) {
+        if completed
+            && let Some(path) =
+                discovery.and_then(|context| context.unselected_manifest(lines.get(index + 1)?))
+        {
+            red.discovery.push(format!("{}: {line}", path.display()));
+            continue;
+        }
         red.note(
             if tests {
                 "TESTS-CARGO-ERROR"
@@ -1182,7 +1384,7 @@ fn read_cargo_run(
                 "CARGO-ERROR"
             }
             .to_string(),
-            line,
+            (*line).to_owned(),
         );
     }
     if !run.ok && red.status.is_none() {
@@ -2105,7 +2307,11 @@ mod tests {
             (
                 "app",
                 "[dependencies]\ndecoder={path='../decoder'}\npm={path='../pm'}\n\
-                 [build-dependencies]\nbuild-only={path='../build-only'}\n",
+                 [target.'cfg(windows)'.dependencies]\nforeign={path='../foreign',features=['generated']}\n",
+            ),
+            (
+                "foreign",
+                "[features]\ngenerated=['dep:build-only']\n[build-dependencies]\nbuild-only={path='../build-only',optional=true}\n",
             ),
             ("decoder", "[dev-dependencies]\noracle={path='../oracle'}\n"),
             (
@@ -2150,9 +2356,10 @@ mod tests {
         std::fs::write(
             root.join("Cargo.lock"),
             "version=4\n\
-             [[package]]\nname='app'\nversion='1.0.0'\ndependencies=['build-only','decoder','pm']\n\
+             [[package]]\nname='app'\nversion='1.0.0'\ndependencies=['decoder','foreign','pm']\n\
              [[package]]\nname='build-only'\nversion='1.0.0'\n\
              [[package]]\nname='decoder'\nversion='1.0.0'\ndependencies=['oracle']\n\
+             [[package]]\nname='foreign'\nversion='1.0.0'\ndependencies=['build-only']\n\
              [[package]]\nname='host-only'\nversion='1.0.0'\n\
              [[package]]\nname='ignored'\nversion='1.0.0'\ndependencies=['ignored-sys']\n\
              [[package]]\nname='ignored-sys'\nversion='1.0.0'\n\
@@ -2160,34 +2367,102 @@ mod tests {
              [[package]]\nname='pm'\nversion='1.0.0'\ndependencies=['host-only']\n",
         )
         .expect("locked local dependency graph");
-        let normal: BTreeSet<String> = ["app", "decoder", "pm", "host-only"]
+        let normal: BTreeSet<String> = ["app", "decoder", "foreign", "pm", "host-only"]
             .into_iter()
             .map(str::to_string)
             .collect();
         let (selected, excluded) = test_selection(&members, &normal, &BTreeSet::new());
-        assert_eq!(selected, ["app", "decoder", "pm"]);
+        assert_eq!(selected, ["app", "decoder", "foreign", "pm"]);
         assert_eq!(excluded, ["build-only", "ignored", "ignored-sys", "oracle"]);
         std::fs::write(
-            root.join("app/build.rs"),
+            root.join("foreign/build.rs"),
             "fn main() { panic!(\"graph query executed a build script\"); }",
         )
         .expect("build script that must never run during resolution");
+        for kind in ["examples", "benches"] {
+            std::fs::create_dir_all(root.join("decoder").join(kind)).unwrap();
+            std::fs::write(
+                root.join("decoder").join(kind).join("probe.rs"),
+                "fn main() {}\n",
+            )
+            .unwrap();
+        }
         let targo = PathBuf::from(env!("CARGO"));
         let path = std::env::var_os("PATH").unwrap_or_default();
-        let graph = test_units(&targo, &path, root, "x86_64-pc-windows-msvc", &excluded)
-            .expect("resolve the actual test member selection without compiling");
+        let graph = member_units(
+            &targo,
+            &path,
+            root,
+            "x86_64-pc-windows-msvc",
+            &excluded,
+            true,
+        )
+        .expect("resolve the actual test member selection without compiling");
         let roots: BTreeSet<String> = members
             .difference(&excluded.iter().cloned().collect())
             .cloned()
             .collect();
         let dependencies = units::read(&graph, "x86_64-pc-windows-msvc", &roots)
             .expect("the selected members' graph");
+        let typed =
+            crate::unitgraph::Graph::read(&graph, &mut crate::unitgraph::Interner::default())
+                .unwrap();
+        for kind in ["bench", "example"] {
+            assert!(
+                typed
+                    .roots
+                    .iter()
+                    .any(|&r| typed.units[r].target_kinds.iter().any(|k| k == kind)),
+                "all-targets resolution must include {kind} roots"
+            );
+        }
+        assert_eq!(
+            dependents_in_graph(&dependencies.inputs, &BTreeSet::from(["oracle".to_owned()])),
+            BTreeSet::from(["decoder".to_owned()]),
+            "decoder's own dev oracle is not app's normal dependency"
+        );
         let nodes: BTreeSet<PkgId> = dependencies
+            .targets
             .values()
             .flat_map(|nodes| nodes.iter().cloned())
             .collect();
         let names: Vec<_> = nodes.iter().map(|id| id.name.as_str()).collect();
-        assert_eq!(names, ["app", "decoder", "oracle"]);
+        assert_eq!(names, ["app", "decoder", "foreign", "oracle"]);
+        let changed = crate::scope::Scope::changed("main", vec!["build-only".into()], true);
+        assert_eq!(
+            wanted_in_cell(&normal, Some(&dependencies.inputs), &changed),
+            BTreeSet::from(["app".into(), "foreign".into()])
+        );
+        for seed in ["pm", "host-only"] {
+            let changed = crate::scope::Scope::changed("main", vec![seed.into()], true);
+            assert!(wanted_in_cell(&normal, Some(&dependencies.inputs), &changed).contains("app"));
+        }
+        assert!(
+            wanted_in_cell(
+                &normal,
+                Some(&dependencies.inputs),
+                &crate::scope::Scope::crate_only("build-only")
+            )
+            .is_empty()
+        );
+        let browser = member_units(
+            &targo,
+            &path,
+            root,
+            "wasm32-unknown-unknown",
+            &excluded,
+            false,
+        )
+        .expect("default browser targets resolve without test targets");
+        let browser =
+            units::read(&browser, "wasm32-unknown-unknown", &roots).expect("browser inputs");
+        assert!(wanted_in_cell(&normal, Some(&browser.inputs), &changed).is_empty());
+        assert!(
+            !browser
+                .targets
+                .values()
+                .any(|nodes| nodes.iter().any(|id| id.name == "oracle"))
+        );
         let one: BTreeSet<String> = ["app".to_string()].into_iter().collect();
         assert!(units::read("", "x86_64-pc-windows-msvc", &one).is_err());
         assert!(units::read(&graph, "x86_64-pc-windows-msvc", &one).is_err());
@@ -2246,16 +2521,21 @@ mod tests {
         .expect("locked local dependency graph");
         let targo = PathBuf::from(env!("CARGO"));
         let path = std::env::var_os("PATH").unwrap_or_default();
-        let graph = test_units(&targo, &path, root, "x86_64-pc-windows-msvc", &[])
+        let graph = member_units(&targo, &path, root, "x86_64-pc-windows-msvc", &[], true)
             .expect("resolve the fixture without compiling");
         let dependencies = units::read(&graph, "x86_64-pc-windows-msvc", &members)
             .expect("a member's host copy is not a second target root");
         let nodes: BTreeSet<PkgId> = dependencies
+            .targets
             .values()
             .flat_map(|nodes| nodes.iter().cloned())
             .collect();
         let found: Vec<_> = nodes.iter().map(|id| id.name.as_str()).collect();
         assert_eq!(found, ["app", "shared", "win-only"]);
+        assert!(
+            dependencies.targets["pm"].is_empty(),
+            "host roots cannot activate target shims"
+        );
     }
 
     #[test]
@@ -2492,6 +2772,80 @@ mod tests {
                 assert!(red.status.is_none());
             }
         }
+    }
+
+    #[test]
+    fn only_successful_unselected_git_manifest_diagnostics_are_nonfatal() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let git = dir.path().join("checkout");
+        let selected = git.join("selected/Cargo.toml");
+        let inherited = git.join("Cargo.toml");
+        let unused = git.join("fixture/Cargo.toml");
+        let outside = dir.path().join("outside/Cargo.toml");
+        for path in [&selected, &inherited, &unused, &outside] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "fixture").unwrap();
+        }
+        let context = GitDiscovery {
+            cwd: dir.path().to_owned(),
+            roots: BTreeSet::from([git.canonicalize().unwrap()]),
+            manifests: BTreeSet::from([
+                selected.canonicalize().unwrap(),
+                inherited.canonicalize().unwrap(),
+            ]),
+        };
+        let graph = names(&["app"]);
+        let artifact = r#"{"reason":"compiler-artifact","package_id":"path+file:///r/app#app@1","profile":{"test":false},"filenames":["/t/aarch64-unknown-linux-gnu/app.rmeta"]}"#;
+        let diagnostic = |path: &Path| {
+            format!(
+                "error: invalid float, expected `inf`\n --> {}:9:7\n",
+                path.display()
+            )
+        };
+        let finish = "{\"reason\":\"build-finished\",\"success\":true}";
+        let evaluate = |ok: bool, path: &Path, tail: &str| {
+            let run = exec::Run {
+                ok,
+                code: Some(if ok { 0 } else { 101 }),
+                spawn_error: None,
+                output: format!("{}{artifact}\n{tail}\n", diagnostic(path)),
+            };
+            let mut red = Red::default();
+            let read = read_cargo_run_with_discovery(
+                &run,
+                "aarch64-unknown-linux-gnu",
+                &graph,
+                false,
+                &mut red,
+                Some(&context),
+            )
+            .unwrap();
+            (read, red)
+        };
+        let (read, red) = evaluate(true, &unused, finish);
+        assert_eq!(read.checked, graph);
+        assert!(red.status.is_none());
+        assert_eq!(red.discovery.len(), 1);
+        assert!(red.discovery[0].contains("fixture/Cargo.toml"));
+        for (ok, path, tail) in [
+            (false, &unused, finish),
+            (true, &selected, finish),
+            (true, &inherited, finish),
+            (true, &outside, finish),
+            (true, &unused, ""),
+            (
+                true,
+                &unused,
+                "{\"reason\":\"build-finished\",\"success\":false}",
+            ),
+        ] {
+            assert!(evaluate(ok, path, tail).1.status.is_some());
+        }
+        let compiler_error = format!(
+            "{finish}\n{}",
+            r#"{"reason":"compiler-message","package_id":"path+file:///r/app#app@1","message":{"level":"error","rendered":"error[E0001]: real error"}}"#
+        );
+        assert!(evaluate(true, &unused, &compiler_error).1.status.is_some());
     }
 
     #[test]

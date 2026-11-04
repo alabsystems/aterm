@@ -349,15 +349,54 @@ impl Record {
     /// never part of either.
     ///
     /// # Errors
-    /// The write or the rename failed.
+    /// `path`'s parent directory is not this user's plain directory, or the write or the rename
+    /// failed.
     pub fn write(&self, path: &Path) -> std::io::Result<()> {
+        ensure_owned_plain_parent(path)?;
         aterm_uds::atomic_file::write(path, self.json().as_bytes(), 0o600)
     }
 
-    /// The record at `path`, where one is whole.
+    /// The record at `path`, where one is whole and its parent is this user's plain directory.
     #[must_use]
     pub fn read(path: &Path) -> Option<Self> {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())
+            && !owned_plain_dir(parent)
+        {
+            return None;
+        }
         Self::parse(&crate::read_small_text(path, 64 * 1024)?)
+    }
+}
+
+pub(crate) fn owned_plain_dir(dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    std::fs::symlink_metadata(dir)
+        .is_ok_and(|meta| meta.file_type().is_dir() && meta.uid() == aterm_uds::peer::our_uid())
+}
+
+fn ensure_owned_plain_parent(path: &Path) -> std::io::Result<()> {
+    let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return Ok(());
+    };
+    match std::fs::symlink_metadata(parent) {
+        Ok(_) if owned_plain_dir(parent) => Ok(()),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{}: not this user's plain directory", parent.display()),
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(parent)?;
+            if owned_plain_dir(parent) {
+                Ok(())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{}: not this user's plain directory", parent.display()),
+                ))
+            }
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -482,7 +521,7 @@ pub fn holder(paths: &Paths, pids: &dyn Pids) -> Holder {
     )
 )]
 pub fn remove_leftovers(paths: &Paths, dead: &Record) {
-    if Record::read(&paths.record()).as_ref() == Some(dead) {
+    if Record::read(&paths.record()).as_ref() == Some(dead) && owned_plain_dir(&paths.run_dir()) {
         let _ = std::fs::remove_file(paths.record());
         let _ = std::fs::remove_file(paths.socket());
         let _ = std::fs::remove_file(paths.key_disk());
@@ -974,5 +1013,38 @@ mod tests {
                 .is_symlink()
         );
         assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+    }
+
+    /// NEGATIVE CONTROL: `Record::read`, `Record::write`, `holder`, and `remove_leftovers`
+    /// refuse a symlinked `run/` directory without reading, overwriting, or unlinking files in
+    /// the symlink's target.
+    #[test]
+    fn record_io_and_leftover_cleanup_refuse_symlinked_run_directory() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let victim = record(4242, 77);
+        let outside_record = outside.join("aterm-linux.json");
+        let outside_sock = outside.join("aterm-linux.sock");
+        let outside_key = outside.join("key.img");
+        std::fs::write(&outside_record, victim.json()).unwrap();
+        std::fs::write(&outside_sock, b"sock").unwrap();
+        std::fs::write(&outside_key, b"key").unwrap();
+
+        let paths = Paths::at(dir.path().join("state"));
+        std::fs::create_dir_all(paths.root()).unwrap();
+        std::os::unix::fs::symlink(&outside, paths.run_dir()).unwrap();
+
+        assert_eq!(Record::read(&paths.record()), None);
+        assert_eq!(holder(&paths, &Script::of([(4242, 77)])), Holder::None);
+        assert!(record(9999, 1).write(&paths.record()).is_err());
+        remove_leftovers(&paths, &victim);
+
+        assert_eq!(
+            std::fs::read_to_string(&outside_record).unwrap(),
+            victim.json()
+        );
+        assert_eq!(std::fs::read(&outside_sock).unwrap(), b"sock");
+        assert_eq!(std::fs::read(&outside_key).unwrap(), b"key");
     }
 }

@@ -82,7 +82,7 @@ file `fabric.toml` that `on` writes, else in a running instance's bridge command
                    over the last --window records (default 65536); `@<sid>[@<node>]`
                    picks one session
   on               provision (idempotently) the fabric root `~/.local/share/aterm-fabric`
-                   (0700), node id, mint secret and the node's 8 grants; install and start
+                   (0700), node id, mint secret and the node's 6 grants; install and start
                    the broker under launchd (macOS) or systemd --user (Linux); write
                    `[fabric] command` to aterm.toml (keeping `.bak`) and `fabric.toml`
                    (0600); attach running instances; prove delivery with a note a session
@@ -430,7 +430,7 @@ pub fn parse_args(args: &[String]) -> Result<Cmd, String> {
 }
 
 /// `aterm fabric …`, the entry for both `aterm fabric` and `aterm-link fabric`.
-#[must_use]
+#[must_use = "handle or propagate the command's exit status"]
 pub fn main(args: &[String]) -> ExitCode {
     match parse_args(args) {
         Ok(Cmd::Help) => aterm_uds::stdout::answer_exit("aterm fabric", &usage(), 0),
@@ -1581,10 +1581,10 @@ pub fn summary_of(b: &BrokerView) -> DoctorSummary {
     if let Some(skew) = b.protocol {
         return warn(
             format!(
-            "the broker at {at} speaks astream protocol {} and this aterm speaks {}: no record \
+                "the broker at {at} speaks astream protocol {} and this aterm speaks {}: no record \
              lands and none is delivered — {fix}",
-            skew.broker, skew.client
-        ),
+                skew.broker, skew.client
+            ),
             false,
         );
     }
@@ -1624,9 +1624,9 @@ pub fn summary_of(b: &BrokerView) -> DoctorSummary {
     if !b.read_ok() {
         return warn(
             format!(
-            "the broker at {at} answers and {served}, but the bus could not be read ({}) — {fix}",
-            safe(b.error.as_deref().unwrap_or("unknown"), b.error_words())
-        ),
+                "the broker at {at} answers and {served}, but the bus could not be read ({}) — {fix}",
+                safe(b.error.as_deref().unwrap_or("unknown"), b.error_words())
+            ),
             true,
         );
     }
@@ -1730,9 +1730,10 @@ fn mirrored_traffic(fleet: &str, off: u64, subject: &str, raw: &[u8]) -> Option<
 /// THE BODY OF A RECORD WITH NO `text=` (fix unit E5, E2E-10): when `raw`'s first line (its
 /// bytes before the first newline) carries no `text=` token, the body `tail --bodies` prints is
 /// that whole first line, read as UTF-8 lossily, and `len` its bytes: a presence row's fields,
-/// a halt's `state=`, an `ev` record's session-log line, a `term/in` header. `None` when the
-/// first line carries `text=`, whose decoded text is the body. Never a byte after the first
-/// newline: a `term/in` body's payload past it is keystrokes.
+/// a halt's `state=`, an `ev` record's session-log line. `None` when the first line carries
+/// `text=`, whose decoded text is the body. Never a byte after the first newline: what a body
+/// carries past its header line is a payload (keystrokes, in a drive record a log from before
+/// the drive face's cut may still hold).
 fn first_line_body(raw: &[u8]) -> Option<(String, usize)> {
     let head = raw.split(|b| *b == b'\n').next().unwrap_or_default();
     if head
@@ -1766,18 +1767,6 @@ pub(crate) fn traffic_of_body(fleet: &str, off: u64, subject: &str, body: Body) 
             "fleet".to_string(),
             seg(5),
             trust_of(segs[4], relayed),
-        ),
-        ("term", 8) if segs[6] == "in" => (
-            seg(7),
-            format!("{}@{}", seg(5), seg(4)),
-            "term/in".to_string(),
-            SCREEN,
-        ),
-        ("term", n) if n >= 7 => (
-            format!("{}@{}", seg(5), seg(4)),
-            "-".to_string(),
-            format!("term/{}", safe(&segs[6..].join("/"), 64)),
-            SCREEN,
         ),
         ("pub", 8) if segs[6] == "say" => (
             format!("{}@{}", seg(5), seg(4)),
@@ -2652,6 +2641,10 @@ pub struct Report {
     pub node: Option<String>,
     /// `(path, grant count or error)` per cap file.
     pub caps: Vec<(String, Result<usize, String>)>,
+    /// `(path, why)` per cap file wider than the node's ceiling, the command's files judged as
+    /// the one ring the bridge attaches ([`crate::enable::wider_than_ceiling`]): `aterm fabric
+    /// on` keeps a wide `<root>/node.cap` aside and attaches no other file.
+    pub wide_caps: Vec<(String, String)>,
     pub broker: BrokerView,
     /// Every local instance that answered or should have.
     pub instances: Vec<InstanceView>,
@@ -2777,15 +2770,24 @@ pub fn gather() -> Result<Report, Off> {
         receipts_from_config()
     };
     let node = crate::enable::read_node(Path::new(&cfg.state_dir));
-    let caps = cfg
+    let rings: Vec<(&String, std::io::Result<Vec<crate::bridge::Cap>>)> = cfg
         .cap_files
         .iter()
-        .map(|p| {
-            (
-                p.clone(),
-                read_cap_file(p).map(|c| c.len()).map_err(|e| e.to_string()),
-            )
-        })
+        .map(|p| (p, read_cap_file(p)))
+        .collect();
+    let attached: Vec<(&str, &[crate::bridge::Cap])> = rings
+        .iter()
+        .filter_map(|(path, ring)| Some((path.as_str(), ring.as_ref().ok()?.as_slice())))
+        .collect();
+    let wide_caps = node.as_deref().map_or_else(Vec::new, |node| {
+        crate::enable::wider_than_ceiling(&attached, &cfg.fleet, node)
+            .into_iter()
+            .map(|(path, why)| (path.to_string(), why))
+            .collect()
+    });
+    let caps = rings
+        .into_iter()
+        .map(|(p, ring)| (p.clone(), ring.map(|c| c.len()).map_err(|e| e.to_string())))
         .collect();
 
     let (broker, conn) = probe_broker(&cfg);
@@ -2804,6 +2806,7 @@ pub fn gather() -> Result<Report, Off> {
         receipts,
         node,
         caps,
+        wide_caps,
         broker,
         instances,
         discovery_error,
@@ -3176,6 +3179,9 @@ fn warnings(
                 safe(e, CAP_REFUSAL_WORDS)
             ));
         }
+    }
+    for (path, why) in &r.wide_caps {
+        w.push(format!("cap file {}: {}", safe(path, 256), safe(why, 512)));
     }
 
     if let Some(skew) = r.broker.protocol {
@@ -4921,16 +4927,16 @@ fn traffic_json(t: &Traffic) -> Vec<(&'static str, J)> {
     ]
 }
 
-/// The node and session a record's subject names: `/f/<F>/pub|in|term/<node>/<sid>/…`, the
-/// node an `n-` principal and the sid an `s-` one (a node's own face, a person's lane and the
-/// fleet's lanes name no session).
+/// The node and session a record's subject names: `/f/<F>/pub|in/<node>/<sid>/…`, the node an
+/// `n-` principal and the sid an `s-` one (a node's own face, a person's lane and the fleet's
+/// lanes name no session).
 fn subject_session<'a>(fleet: &str, subject: &'a str) -> (Option<&'a str>, Option<&'a str>) {
     let segs: Vec<&str> = subject.split('/').collect();
     let faced = segs.len() >= 6
         && segs[0].is_empty()
         && segs[1] == "f"
         && segs[2] == fleet
-        && matches!(segs[3], "pub" | "in" | "term");
+        && matches!(segs[3], "pub" | "in");
     let named = |seg: &'a str, class: &str| {
         Some(seg).filter(|s| s.starts_with(class) && crate::subject::is_principal(s))
     };
@@ -6182,8 +6188,8 @@ mod tests {
 
     /// `tail --json` UNDER A NODE CAP PRINTS OFFSETS STRICTLY INCREASING, SO A RESUME FROM THE
     /// LAST ONE PLUS ONE MISSES NOTHING (audit findings BUS2-5 and LOOP2-3): on a guarded broker
-    /// a node's cap (`enable::node_grants`) does not grant the fleet's root, so the tail reads
-    /// each of its seven faces apart. 250 records cycle over subjects on four faces (one on two,
+    /// a node's cap (its ceiling's rules) does not grant the fleet's root, so the tail reads
+    /// each of its five faces apart. 250 records cycle over subjects on four faces (one on two,
     /// `pub/>` and `pub/n-a/>`) and one the node cannot read. A tail from 0 stopped after 100
     /// lines and one resumed from its last offset plus one print, between them, every record the
     /// node reads, once, in offset order, and the resumed tail then prints each record published
@@ -6214,7 +6220,7 @@ mod tests {
         let all = astream_cap::mint(&secret, "/f/f1/>").expect("mint the fleet's cap");
         god.attach(&all.filter, &all.tag).expect("attach it");
         let cap = dir.path().join("node.cap");
-        let lines: String = crate::enable::node_grants("f1", "n-a")
+        let lines: String = crate::enable::node_rules("f1", "n-a")
             .iter()
             .map(|g| {
                 let c = astream_cap::mint(&secret, g).expect("mint");
@@ -6226,7 +6232,7 @@ mod tests {
             ("/f/f1/pub/n-b/s-x/presence", true),
             ("/f/f1/in/n-a/s-y/n-b/note", true),
             ("/f/f1/pub/n-a/s-y/presence", true),
-            ("/f/f1/term/n-a/s-y/screen", true),
+            ("/f/f1/fleet/h-andrew/halt", true),
             ("/f/f1/in/n-b/s-z/n-c/note", false),
         ];
         let mut seq = 0u64;
@@ -7191,7 +7197,8 @@ mod tests {
         assert!(!tail_json("lab", subject, &p, false).contains("QZP7WORD1"));
         assert!(tail_line(&p, 0, 0, true).ends_with("text=v=1 t=2 state=live attention=QZP7WORD1"));
         assert!(tail_json("lab", subject, &p, true).contains("attention=QZP7WORD1"));
-        // Never a byte past the first newline: a `term/in` body's payload is keystrokes.
+        // Never a byte past the first newline: a drive record's payload (one a log from before
+        // the face's cut may hold) is keystrokes.
         // NEGATIVE CONTROL (scratch): taking the whole raw body prints them.
         let keys: &[u8] = b"v=1 t=1 gen=1:ab len=9\nQZP7KEYS1";
         let k = traffic_of("lab", 13, "/f/lab/term/n-a/s-w/in/h-andrew", keys);
@@ -7235,10 +7242,16 @@ mod tests {
         );
         let odd = traffic_of("lab", 9, "/f/lab/pub/h-andrew/say/note", b"v=1 t=2");
         assert_eq!((odd.to.as_str(), odd.kind.as_str()), ("-", "note"));
+        // The drive face is cut: its record reads as any face nothing serves, by its subject.
         let key = traffic_of("lab", 10, "/f/lab/term/n-a/s-w/in/h-andrew", b"v=1");
         assert_eq!(
-            (key.from.as_str(), key.kind.as_str(), key.trust),
-            ("h-andrew", "term/in", SCREEN)
+            (
+                key.from.as_str(),
+                key.to.as_str(),
+                key.kind.as_str(),
+                key.trust
+            ),
+            ("-", "/f/lab/term/n-a/s-w/in/h-andrew", "term", SCREEN)
         );
         let odd = traffic_of("lab", 11, "/f/lab/zzz/q", b"");
         assert_eq!((odd.kind.as_str(), odd.trust), ("zzz", SCREEN));
@@ -7276,7 +7289,8 @@ mod tests {
             presence: crate::presence::Mode::Meta,
             receipts: false,
             node: Some("n-a".to_string()),
-            caps: vec![("/c/node.cap".to_string(), Ok(8))],
+            caps: vec![("/c/node.cap".to_string(), Ok(6))],
+            wide_caps: Vec::new(),
             broker: BrokerView {
                 endpoint: "/tmp/b.sock".to_string(),
                 reachable: true,
@@ -7316,6 +7330,44 @@ mod tests {
 
     fn warned(r: &Report) -> Vec<String> {
         warnings(r, &BTreeMap::new(), &[])
+    }
+
+    /// A RING WIDER THAN THE NODE'S IS NAMED ON DEMAND (DESIGN-aterm-fabric §14 Q5): `doctor` and
+    /// `status` warn of each cap file `gather` found wider than the node's ceiling, naming the
+    /// ceiling check's first violation, with `on`'s keep-aside as the fix; a healthy report,
+    /// whose rings are within it, warns of none.
+    #[test]
+    fn a_ring_wider_than_the_nodes_is_a_warning_whose_fix_is_on() {
+        let violation = format!(
+            "{}: ring[6] \"rw:/f/lab/>\" is an unbound read-write god capability outside \
+             ceiling (x)",
+            crate::enable::WIDER_RING
+        );
+        assert!(
+            !warned(&healthy())
+                .iter()
+                .any(|w| w.contains(crate::enable::WIDER_RING)),
+            "CONTROL: a healthy report"
+        );
+        let mut r = healthy();
+        r.wide_caps = vec![("/c/node.cap".to_string(), violation.clone())];
+        let w = warned(&r);
+        let wide: Vec<&String> = w
+            .iter()
+            .filter(|l| l.contains(crate::enable::WIDER_RING))
+            .collect();
+        assert_eq!(
+            wide,
+            [&format!("cap file /c/node.cap: {violation}")],
+            "{w:#?}"
+        );
+        let fix = crate::enable::fix_for(wide[0], &crate::enable::Role::default());
+        assert!(
+            fix.contains("<root>/node.cap")
+                && fix.contains("keeps aside")
+                && fix.contains("no longer attached"),
+            "{fix}"
+        );
     }
 
     /// A ring this report may not read is one warning, whose fix is the file's and not a re-mint
@@ -8026,7 +8078,8 @@ mod tests {
             row(&r).as_deref(),
             Some(
                 "5 record(s) in 2.0 KiB, 3 subject(s), 0 pending will(s), 0 group commit(s); 4 \
-                 connection(s), 0 parked tail(s) (astream's <log>.health, written 1m ago)"
+                 connection(s), 0 parked tail(s); 0 full, 0 barrier and 0 plain flush(es) by its \
+                 process since it started (astream's <log>.health, written 1m ago)"
             )
         );
         assert!(r.broker.snapshot_now().is_some());
@@ -8143,7 +8196,7 @@ mod tests {
         let mut cfg = unix_config(&socket);
         cfg.cap_files = vec![cap.to_string_lossy().into_owned()];
         let probe = |key: &[u8], exp: &str| {
-            let lines: String = crate::enable::node_grants("f", "n-a")
+            let lines: String = crate::enable::node_rules("f", "n-a")
                 .iter()
                 .map(|g| {
                     let c = astream_cap::mint(key, &g.replacen(':', exp, 1)).expect("mint");
@@ -8257,7 +8310,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("atfab-faces-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("scratch");
         let cap = dir.join("node.cap");
-        let lines: String = crate::enable::node_grants("lab", "n-a")
+        let lines: String = crate::enable::node_rules("lab", "n-a")
             .iter()
             .chain(std::iter::once(&"ro:/f/other/pub/>".to_string()))
             .map(|g| format!("{g} {}\n", "00".repeat(32)))
@@ -8272,8 +8325,6 @@ mod tests {
                 "/f/lab/in/n-a/>",
                 "/f/lab/pub/>",
                 "/f/lab/pub/n-a/>",
-                "/f/lab/term/n-a/*/screen",
-                "/f/lab/term/n-a/>",
             ],
             "no cur/ group names and no other fleet's face"
         );
@@ -8629,15 +8680,20 @@ mod tests {
         let own: Vec<&String> = w.iter().filter(|l| l.starts_with("@s-one ")).collect();
         assert_eq!(
             own,
-            ["@s-one (instance 100): the broker's retention gave up records of its own before it \
+            [
+                "@s-one (instance 100): the broker's retention gave up records of its own before it \
               handled them: its mail lane @50..@60 (`inbox` lane_given_up=); topic deploy \
-              @70..@80, topic news @81..@90 (4 records) (`topic ls` given_up=)"],
+              @70..@80, topic news @81..@90 (4 records) (`topic ls` given_up=)"
+            ],
             "{w:#?}"
         );
         assert!(fix(own[0]).starts_with("nothing brings those records back"));
         assert_eq!(w.len(), 2, "the node's range is its own line: {w:#?}");
         r.instances[0].sessions[0].lane_given_up = None;
-        one(&r, "@s-one (instance 100): the broker's retention gave up records of its own before it handled them: topic deploy");
+        one(
+            &r,
+            "@s-one (instance 100): the broker's retention gave up records of its own before it handled them: topic deploy",
+        );
         r.instances[0].sessions[0].topic_given_up.clear();
         assert_eq!(warned(&r).len(), 1, "only the node's: {:#?}", warned(&r));
     }
@@ -8730,7 +8786,7 @@ mod tests {
         now: u64,
         /// The bus head after the cut.
         head: u64,
-        /// The node cap's faces (`enable::node_grants`), its group grant left out as
+        /// The node cap's faces (`enable::node_rules`), its group grant left out as
         /// `readable_faces` leaves it.
         node_faces: Vec<String>,
     }
@@ -8818,7 +8874,7 @@ mod tests {
             .retention_tick_at(broker.now_ms())
             .expect("the retention tick");
         let (_, (_, head)) = writer.fetch(0, "/f/lab/>", 0).expect("the head");
-        let node_faces: Vec<String> = crate::enable::node_grants("lab", "n-a")
+        let node_faces: Vec<String> = crate::enable::node_rules("lab", "n-a")
             .iter()
             .filter_map(|g| astream_cap::Grant::parse(g).ok())
             .map(|g| g.filter)
@@ -8978,7 +9034,7 @@ mod tests {
             floor.is_some_and(|floor| floor > ask + 1),
             "PRECONDITION: the cut gave up the answer above the ask: {floor:?}"
         );
-        let node_faces: Vec<String> = crate::enable::node_grants("lab", "n-a")
+        let node_faces: Vec<String> = crate::enable::node_rules("lab", "n-a")
             .iter()
             .filter_map(|g| astream_cap::Grant::parse(g).ok())
             .map(|g| g.filter)
@@ -9518,7 +9574,7 @@ mod tests {
             let (mut conn, _) =
                 transport::connect(&socket.to_string_lossy(), Duration::from_secs(60))
                     .expect("connect");
-            for grant in crate::enable::node_grants("lab", node) {
+            for grant in crate::enable::node_rules("lab", node) {
                 let cap = astream_cap::mint(&secret, &grant).expect("mint");
                 conn.attach(&cap.filter, &cap.tag).expect("attach");
             }

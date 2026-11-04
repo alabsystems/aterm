@@ -102,6 +102,27 @@ fn the_classifier_claims_for_compiling_verbs_and_nothing_else() {
     }
 }
 
+#[test]
+fn package_verification_claims_but_archive_only_and_list_do_not() {
+    let build = classify(
+        &words(&["--unverified", "package", "-p", "leaf"]),
+        Tool::Targo,
+    )
+    .unwrap();
+    assert_eq!(build.stage, "targo package");
+    assert_eq!(
+        stage(&["package"], Tool::Cargo).as_deref(),
+        Some("cargo package")
+    );
+    for args in [
+        vec!["--unverified", "package", "--no-verify", "-p", "leaf"],
+        vec!["--unverified", "package", "--list"],
+        vec!["--unverified", "package", "--help"],
+    ] {
+        assert!(classify(&words(&args), Tool::Targo).is_none());
+    }
+}
+
 /// A CALL THAT ONLY RESOLVES WHAT IT WOULD BUILD NEVER CLAIMS: verify's unit-graph probe, the test
 /// compile's own command with `--unit-graph -Z unstable-options` (`aterm_verify::stages::UNIT_GRAPH`),
 /// and a `--build-plan`, build nothing. NEGATIVE CONTROL: the same command without the flag claims

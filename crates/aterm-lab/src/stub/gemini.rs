@@ -738,7 +738,7 @@ impl Stub {
                 .args
                 .tool_file
                 .as_ref()
-                .and_then(|p| std::fs::read_to_string(p).ok())
+                .and_then(|p| crate::util::read_regular_text(p).ok())
                 .and_then(|t| J::parse(&t).ok());
             if let Some((reply, ms)) = script.as_ref().and_then(|s| held_reply(body, s)) {
                 sleep_secs(ms / 1000.0);

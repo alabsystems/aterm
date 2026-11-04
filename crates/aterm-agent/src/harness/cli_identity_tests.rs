@@ -487,7 +487,7 @@ fn plain_claude_login_refuses_stale_policy_and_binding_for_every_auth_outcome() 
         for outcome in ["signed-in", "signed-out", "failed", "during-status"] {
             let tmp = tmp_dir("plain-login-policy");
             let env = env_at(&tmp);
-            assert_eq!(acc_quiet(add("work", Class::Dedicated), &env).0, exit(0));
+            assert_eq!(acc_quiet(add("work", Class::Preferred), &env).0, exit(0));
             let store = env.accounts_store();
             let path = env.accounts_roster().unwrap();
             let original = std::fs::read_to_string(&path).unwrap();

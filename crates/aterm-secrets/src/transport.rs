@@ -11,13 +11,35 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(any(unix, test))]
+mod records_body;
+
 /// Where a vault is.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Source {
     /// `http://` or `https://` URL, without its fragment.
     Url(String),
     /// A local path (absolute, or `~/…` expanded by the caller).
     Path(PathBuf),
+}
+
+impl std::fmt::Debug for Source {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Url(url) => f.debug_tuple("Url").field(&describe(url)).finish(),
+            Self::Path(path) => f.debug_tuple("Path").field(path).finish(),
+        }
+    }
+}
+
+/// What an actual request to a `.local` vault heard of this process's Local Network switch.
+/// This is an observation, independent of the vault's signature or the sync's later result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalNetworkHeard {
+    /// HTTP status and headers arrived, even if the response body or vault later failed.
+    Reached,
+    /// This Mac's resolver explicitly refused this process the `.local` name.
+    Refused,
 }
 
 /// What a fetch got.
@@ -616,24 +638,84 @@ pub(crate) fn fetch_as_observed(
     wait: Duration,
     subscriber: Option<&str>,
 ) -> crate::Result<ObservedFetch> {
+    fetch_as_observed_hearing(source, after, wait, subscriber).0
+}
+
+/// The same single fetch, with an endpoint-free observation of its actual transport result.
+pub(crate) fn fetch_as_observed_hearing(
+    source: &Source,
+    after: Option<u64>,
+    wait: Duration,
+    subscriber: Option<&str>,
+) -> (crate::Result<ObservedFetch>, Option<LocalNetworkHeard>) {
     match source {
-        Source::Url(url) => get_observed_via_with(
-            &client(wait.saturating_add(FETCH_MARGIN)),
-            url,
-            after,
+        Source::Url(url) => {
+            let client = client(wait.saturating_add(FETCH_MARGIN));
+            let (sent, heard) = with_local_network_heard(source, || {
+                get_request(&client, url, after, None, subscriber, false, false)
+                    .limit(MAX_ENVELOPE)
+                    .send_phased(&[])
+            });
+            let fetched = classify_get_response(
+                sent,
+                url,
+                after,
+                #[cfg(any(unix, test))]
+                subscriber,
+            )
+            .map_err(|unheard| unheard.why)
+            .and_then(ObservedAnswer::fetched);
+            (fetched, heard)
+        }
+        Source::Path(path) => (
+            read_path(path).map(|bytes| ObservedFetch {
+                fetched: bytes.map_or(Fetched::Missing, Fetched::Body),
+                #[cfg(any(unix, test))]
+                http204: None,
+            }),
             None,
-            subscriber,
-            false,
-        )
-        .map_err(|unheard| unheard.why)?
-        .fetched(),
-        Source::Path(path) => Ok(ObservedFetch {
-            fetched: read_path(path)?.map_or(Fetched::Missing, Fetched::Body),
-            #[cfg(any(unix, test))]
-            http204: None,
-        }),
+        ),
     }
 }
+
+/// Observe only the request to this original source, without rereading configuration or
+/// starting another request. HTTP errors cannot quote themselves into a resolver refusal.
+fn with_local_network_heard<T>(
+    source: &Source,
+    send: impl FnOnce() -> Result<T, aterm_http::SendError>,
+) -> (Result<T, aterm_http::SendError>, Option<LocalNetworkHeard>) {
+    let sent = send();
+    let local = match source {
+        Source::Url(url) => {
+            Uri::parse(base(url)).is_some_and(|uri| aterm_http::is_local_name(uri.host()))
+        }
+        Source::Path(_) => false,
+    };
+    let heard = local
+        .then(|| match &sent {
+            Ok(_)
+            | Err(aterm_http::SendError {
+                phase: aterm_http::Phase::Answered,
+                ..
+            }) => Some(LocalNetworkHeard::Reached),
+            Err(aterm_http::SendError {
+                phase: aterm_http::Phase::NotSent,
+                error: aterm_http::Error::Io(error),
+            }) if error
+                .to_string()
+                .contains(aterm_http::LOCAL_NETWORK_REFUSED) =>
+            {
+                Some(LocalNetworkHeard::Refused)
+            }
+            Err(_) => None,
+        })
+        .flatten();
+    (sent, heard)
+}
+
+#[cfg(test)]
+#[path = "transport/local_network_observation_tests.rs"]
+mod local_network_observation_tests;
 
 /// [`fetch`] of the vault at `url` as one try of a bounded wait: the whole request, lookup to
 /// last byte, within `total`, with no [`FETCH_MARGIN`], so a long-poll the server holds for its
@@ -1207,7 +1289,7 @@ pub fn fetch_records(
     not(unix),
     expect(
         dead_code,
-        reason = "only the unix records pass (`client::sync_records_inner`) reads `needs` and `boot`"
+        reason = "only the unix record transport reads `needs` and `boot`"
     )
 )]
 pub(crate) struct RecordsAnswer {
@@ -1230,6 +1312,100 @@ impl RecordsAnswer {
     }
 }
 
+/// A completely received records response whose valid frames already own their wire bytes.
+#[cfg(unix)]
+pub(crate) struct ReceivedRecordsAnswer {
+    pub(crate) received: crate::membership_log::untaken::ReceivedFrames,
+    pub(crate) needs: bool,
+    pub(crate) boot: Option<String>,
+}
+
+#[cfg(unix)]
+impl ReceivedRecordsAnswer {
+    fn none() -> Self {
+        Self {
+            received: crate::membership_log::untaken::ReceivedFrames::empty(),
+            needs: false,
+            boot: None,
+        }
+    }
+}
+
+fn records_exchange(
+    url: &str,
+    have: &[crate::membership_log::RecordId],
+    wait: Option<Duration>,
+    total: Duration,
+    subscriber: Option<&str>,
+    limit: usize,
+) -> Result<aterm_http::Exchange, aterm_http::SendError> {
+    let deadline = wait.map_or(total, |wait| wait.saturating_add(FETCH_MARGIN).max(total));
+    let http = client(deadline);
+    records_request(&http, url, have, wait, total, subscriber, limit)
+        .exchange(aterm_http::Body::Empty)
+}
+
+fn completed_records<T>(
+    response: Result<T, aterm_http::SendError>,
+    url: &str,
+    wait: Option<Duration>,
+) -> crate::Result<Option<T>> {
+    match response {
+        Ok(response) => Ok(Some(response)),
+        Err(failed) if wait.is_some() && held_past_deadline(&failed) => Ok(None),
+        Err(aterm_http::SendError { error, .. }) => {
+            Err(transport_error("fetching records from", url, &error))
+        }
+    }
+}
+
+#[cfg(unix)]
+enum RecordReception {
+    Received(ReceivedRecordsAnswer),
+    Other(aterm_http::Response),
+}
+
+#[cfg(unix)]
+impl RecordReception {
+    fn read(exchange: aterm_http::Exchange) -> Result<Self, aterm_http::SendError> {
+        Self::read_with_known(exchange, |_| None)
+    }
+
+    fn read_with_known(
+        exchange: aterm_http::Exchange,
+        known: impl FnMut(&crate::membership_log::RecordId) -> Option<crate::membership_log::Record>,
+    ) -> Result<Self, aterm_http::SendError> {
+        if exchange.status() != 200 {
+            return exchange.collect().map(Self::Other);
+        }
+        let (needs, boot) = records_headers(
+            exchange.header(RECORDS_NEED_HEADER),
+            exchange.header(RECORDS_BOOT_HEADER),
+        );
+        let received = exchange.consume_body(|reader| {
+            crate::membership_log::untaken::ReceivedFrames::read_from_with_known(reader, known)
+        })?;
+        Ok(Self::Received(ReceivedRecordsAnswer {
+            received,
+            needs,
+            boot,
+        }))
+    }
+
+    fn into_answer(self, url: &str) -> crate::Result<ReceivedRecordsAnswer> {
+        match self {
+            Self::Received(answer) => Ok(answer),
+            Self::Other(response) => {
+                records_answer(response, url).map(|answer| ReceivedRecordsAnswer {
+                    received: crate::membership_log::untaken::ReceivedFrames::empty(),
+                    needs: answer.needs,
+                    boot: answer.boot,
+                })
+            }
+        }
+    }
+}
+
 /// [`fetch_records`], also returning whether the server signaled [`RECORDS_NEED_HEADER`] (`"1"`)
 /// because it lacks at least one record named in `have`, and the boot id it sent.
 pub(crate) fn fetch_records_sync(
@@ -1239,30 +1415,59 @@ pub(crate) fn fetch_records_sync(
     total: Duration,
     subscriber: Option<&str>,
 ) -> crate::Result<RecordsAnswer> {
-    let deadline = match wait {
-        Some(w) => w.saturating_add(FETCH_MARGIN).max(total),
-        None => total,
-    };
-    let http = client(deadline);
-    let request = records_request(
-        &http,
+    let response = records_exchange(
         url,
         have,
         wait,
         total,
         subscriber,
         crate::membership_log::MAX_RECORDS_STREAM,
-    );
-    match request.send_phased(&[]) {
-        Ok(response) => records_answer(response, url),
-        Err(failed) if wait.is_some() && held_past_deadline(&failed) => Ok(RecordsAnswer::none()),
-        Err(aterm_http::SendError { error, .. }) => {
-            Err(transport_error("fetching records from", url, &error))
-        }
+    )
+    .and_then(aterm_http::Exchange::collect);
+    match completed_records(response, url, wait)? {
+        Some(response) => records_answer(response, url),
+        None => Ok(RecordsAnswer::none()),
     }
 }
 
-/// [`fetch_records_sync`] of a server that does not wait ([`NO_WAIT_HEADER`]), reading a body of at
+/// The ordinary client records pull, staging frames while the response is read.
+#[cfg(unix)]
+pub(crate) fn fetch_record_frames_sync(
+    url: &str,
+    have: &[crate::membership_log::RecordId],
+    wait: Option<Duration>,
+    total: Duration,
+    subscriber: Option<&str>,
+) -> crate::Result<ReceivedRecordsAnswer> {
+    fetch_record_frames_with_known(url, have, wait, total, subscriber, |_| None)
+}
+
+/// A records pull that can reuse exact immutable owners already held in memory.
+#[cfg(unix)]
+pub(crate) fn fetch_record_frames_with_known(
+    url: &str,
+    have: &[crate::membership_log::RecordId],
+    wait: Option<Duration>,
+    total: Duration,
+    subscriber: Option<&str>,
+    known: impl FnMut(&crate::membership_log::RecordId) -> Option<crate::membership_log::Record>,
+) -> crate::Result<ReceivedRecordsAnswer> {
+    let response = records_exchange(
+        url,
+        have,
+        wait,
+        total,
+        subscriber,
+        crate::membership_log::MAX_RECORDS_STREAM,
+    )
+    .and_then(|exchange| RecordReception::read_with_known(exchange, known));
+    match completed_records(response, url, wait)? {
+        Some(response) => response.into_answer(url),
+        None => Ok(ReceivedRecordsAnswer::none()),
+    }
+}
+
+/// [`fetch_record_frames_sync`] of a server that does not wait ([`NO_WAIT_HEADER`]), reading a body of at
 /// most `limit` bytes (and never more than [`crate::membership_log::MAX_RECORDS_STREAM`]): a longer
 /// one is [`Pulled::Larger`] (past [`crate::membership_log::MAX_RECORDS_STREAM`], where
 /// [`fetch_records_sync`] fails as [`past_any_records_stream`] says). A records pass reads its
@@ -1274,11 +1479,11 @@ pub(crate) fn fetch_records_within(
     total: Duration,
     subscriber: Option<&str>,
     limit: usize,
-) -> crate::Result<Pulled<RecordsAnswer>> {
-    let http = client(total);
-    let request = records_request(&http, url, have, None, total, subscriber, limit);
-    match request.send_phased(&[]) {
-        Ok(response) => records_answer(response, url).map(Pulled::Fetched),
+) -> crate::Result<Pulled<ReceivedRecordsAnswer>> {
+    match records_exchange(url, have, None, total, subscriber, limit)
+        .and_then(RecordReception::read)
+    {
+        Ok(response) => response.into_answer(url).map(Pulled::Fetched),
         Err(aterm_http::SendError {
             error: aterm_http::Error::TooLarge { .. },
             ..
@@ -1334,11 +1539,10 @@ fn records_request<'a>(
 
 /// What `response`, `url`'s to a records GET ([`records_request`]), says.
 fn records_answer(response: aterm_http::Response, url: &str) -> crate::Result<RecordsAnswer> {
-    let needs = response.header(RECORDS_NEED_HEADER) == Some("1");
-    let boot = response
-        .header(RECORDS_BOOT_HEADER)
-        .filter(|id| id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
-        .map(str::to_owned);
+    let (needs, boot) = records_headers(
+        response.header(RECORDS_NEED_HEADER),
+        response.header(RECORDS_BOOT_HEADER),
+    );
     match response.status() {
         200 => Ok(RecordsAnswer {
             bytes: response.into_body(),
@@ -1358,6 +1562,13 @@ fn records_answer(response: aterm_http::Response, url: &str) -> crate::Result<Re
             response.body(),
         )),
     }
+}
+
+fn records_headers(needs: Option<&str>, boot: Option<&str>) -> (bool, Option<String>) {
+    let boot = boot
+        .filter(|id| id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+        .map(str::to_owned);
+    (needs == Some("1"), boot)
 }
 
 /// What `GET <url>/heard` names a subscriber by: lowercase hex of SHA-256 over a domain tag and
@@ -1518,8 +1729,40 @@ pub(crate) fn post_records_answered_until(
     records: &[u8],
     deadline: Option<std::time::Instant>,
 ) -> crate::Result<crate::Result<()>> {
+    post_records_body_answered_until(url, aterm_http::Body::Bytes(records), deadline)
+}
+
+/// Post immutable selected records without collecting their wire stream.
+#[cfg(unix)]
+pub(crate) fn post_record_selection_answered_until(
+    url: &str,
+    records: &[crate::membership_log::Record],
+    deadline: Option<std::time::Instant>,
+) -> crate::Result<crate::Result<()>> {
+    let mut reader = records_body::RecordsReader::new(records)?;
+    let len = reader.len() as u64;
+    post_records_body_answered_until(
+        url,
+        aterm_http::Body::Reader {
+            len,
+            reader: &mut reader,
+        },
+        deadline,
+    )
+}
+
+fn post_records_body_answered_until(
+    url: &str,
+    body: aterm_http::Body<'_>,
+    deadline: Option<std::time::Instant>,
+) -> crate::Result<crate::Result<()>> {
     let max = crate::membership_log::MAX_RECORDS_STREAM;
-    if records.len() > max {
+    let len = match &body {
+        aterm_http::Body::Empty => 0,
+        aterm_http::Body::Bytes(bytes) => bytes.len() as u64,
+        aterm_http::Body::Reader { len, .. } => *len,
+    };
+    if len > max as u64 {
         return Err(Error::new(format!(
             "the record batch is larger than {max} bytes"
         )));
@@ -1545,7 +1788,7 @@ pub(crate) fn post_records_answered_until(
         .post(&target)
         .header("Content-Type", "application/octet-stream")
         .limit(REASON_BODY)
-        .send(records)
+        .send_body(body)
         .map_err(|e| transport_error("posting records to", url, &e))?;
     if response.is_success() {
         return Ok(Ok(()));
@@ -2514,6 +2757,48 @@ mod tests {
         assert_eq!(
             describe("http://h:7484/v1/a?token=secret#pin"),
             "http://h:7484/v1/a"
+        );
+    }
+
+    #[test]
+    fn source_debug_omits_url_credentials_including_nested_config() {
+        let query = "synthetic-vault-query-credential";
+        let fragment = "synthetic-vault-fragment-credential";
+        for url in [
+            format!("https://vault.example/v1/alab?token={query}#{fragment}"),
+            format!("https://{query}@vault.example/v1/alab#{fragment}"),
+        ] {
+            let source = Source::Url(url);
+            #[cfg(unix)]
+            let config = crate::client::Config {
+                source: source.clone(),
+                name: "alab".to_owned(),
+                signer: None,
+                followed: Vec::new(),
+                host: "test-machine".to_owned(),
+            };
+            for shown in [
+                format!("{source:?}"),
+                format!("{source:#?}"),
+                #[cfg(unix)]
+                format!("{config:?}"),
+                #[cfg(unix)]
+                format!("{config:#?}"),
+            ] {
+                assert!(!shown.contains(query));
+                assert!(!shown.contains(fragment));
+            }
+        }
+        assert_eq!(
+            format!(
+                "{:?}",
+                Source::Url("https://vault.example/v1/alab?token=x".to_owned())
+            ),
+            "Url(\"https://vault.example/v1/alab\")"
+        );
+        assert_eq!(
+            format!("{:?}", Source::Path(PathBuf::from("/vault/alab"))),
+            "Path(\"/vault/alab\")"
         );
     }
 

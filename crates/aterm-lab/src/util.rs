@@ -391,18 +391,166 @@ pub fn scratch_text(path: &Path) -> String {
     }
 }
 
+/// Maximum size (256 MiB) accepted when reading a regular file in the lab.
+pub const MAX_LAB_FILE_BYTES: u64 = 256 << 20;
+
+/// Opens a regular file at `path` with `O_NONBLOCK | O_CLOEXEC | flags` and returns its metadata.
+fn open_regular_with_meta(
+    path: &Path,
+    flags: libc::c_int,
+) -> io::Result<(std::fs::File, std::fs::Metadata)> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | flags)
+        .open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok((file, meta))
+}
+
+/// Opens a regular file at `path` with `O_NONBLOCK | O_CLOEXEC`.
+pub fn open_regular_file(path: &Path) -> io::Result<std::fs::File> {
+    open_regular_with_meta(path, 0).map(|(file, _)| file)
+}
+
+fn read_regular_with_meta(
+    file: std::fs::File,
+    meta: std::fs::Metadata,
+) -> io::Result<(Vec<u8>, std::fs::Metadata)> {
+    use io::Read as _;
+    if meta.len() > MAX_LAB_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file exceeds 256 MiB limit",
+        ));
+    }
+    let cap = usize::try_from(meta.len().min(MAX_LAB_FILE_BYTES).saturating_add(1)).unwrap_or(0);
+    let mut buf = Vec::with_capacity(cap);
+    file.take(MAX_LAB_FILE_BYTES + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > MAX_LAB_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file grew past 256 MiB limit while reading",
+        ));
+    }
+    Ok((buf, meta))
+}
+
+/// Reads a regular file at `path` up to [`MAX_LAB_FILE_BYTES`] and returns its metadata.
+pub fn read_regular_file_with_meta(path: &Path) -> io::Result<(Vec<u8>, std::fs::Metadata)> {
+    let (file, meta) = open_regular_with_meta(path, 0)?;
+    read_regular_with_meta(file, meta)
+}
+
+/// Reads a regular file at `path` up to [`MAX_LAB_FILE_BYTES`].
+pub fn read_regular_file(path: &Path) -> io::Result<Vec<u8>> {
+    read_regular_file_with_meta(path).map(|(buf, _)| buf)
+}
+
+/// Reads a retained regular artifact without following a linked final entry.
+pub fn read_artifact(path: &Path) -> io::Result<Vec<u8>> {
+    let (file, meta) = open_regular_with_meta(path, libc::O_NOFOLLOW)?;
+    read_regular_with_meta(file, meta).map(|(buf, _)| buf)
+}
+
+/// Reads UTF-8 text from a regular file at `path` up to [`MAX_LAB_FILE_BYTES`].
+pub fn read_regular_text(path: &Path) -> io::Result<String> {
+    String::from_utf8(read_regular_file(path)?)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// Incremental `(dev, ino, offset)` tail cursor for append-only newline-delimited files.
+///
+/// Tracks the file's `(st_dev, st_ino)` identity and the byte offset after the last complete
+/// `\n`-terminated line read so far. When `st_size == offset` on the same `(dev, ino)`, polling
+/// performs zero `read(2)` syscalls and zero allocations. When the file is replaced or truncated,
+/// `reset` is returned as `true` and reading restarts from byte `0`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LineTailCursor {
+    id: Option<(u64, u64)>,
+    offset: u64,
+}
+
+impl LineTailCursor {
+    fn poll_opened(
+        &mut self,
+        mut file: std::fs::File,
+        meta: &std::fs::Metadata,
+    ) -> io::Result<(bool, String)> {
+        use io::{Read as _, Seek as _, SeekFrom};
+        use std::os::unix::fs::MetadataExt as _;
+
+        let len = meta.len();
+        if len > MAX_LAB_FILE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "file exceeds 256 MiB limit",
+            ));
+        }
+        let id = (meta.dev(), meta.ino());
+        let reset = self.id != Some(id) || len < self.offset;
+        if reset {
+            self.id = Some(id);
+            self.offset = 0;
+        }
+        if len == self.offset {
+            return Ok((reset, String::new()));
+        }
+        if self.offset > 0 {
+            file.seek(SeekFrom::Start(self.offset))?;
+        }
+        let rem = MAX_LAB_FILE_BYTES - self.offset;
+        let cap = usize::try_from((len - self.offset).min(rem).saturating_add(1)).unwrap_or(0);
+        let mut buf = Vec::with_capacity(cap);
+        file.take(rem + 1).read_to_end(&mut buf)?;
+        if buf.len() as u64 > rem {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "file grew past 256 MiB limit while reading",
+            ));
+        }
+        let complete_len = buf.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        buf.truncate(complete_len);
+        self.offset += complete_len as u64;
+        Ok((reset, String::from_utf8_lossy(&buf).into_owned()))
+    }
+
+    /// Polls newly appended complete lines from a scratch file via [`crate::sys::scratch_file_with_meta`].
+    pub fn poll_scratch_text(&mut self, path: &Path) -> io::Result<(bool, String)> {
+        let Some((file, meta)) = crate::sys::scratch_file_with_meta(path)? else {
+            let reset = self.id.take().is_some() || self.offset != 0;
+            self.offset = 0;
+            return Ok((reset, String::new()));
+        };
+        self.poll_opened(file, &meta)
+    }
+}
+
 /// Copies a scratch file through a checked descriptor, preserving mode and mtime.
 pub fn keep_file(from: &Path, to: &Path) {
+    use io::Read as _;
     use std::os::unix::fs::PermissionsExt as _;
 
-    let Ok(Some(mut source)) = crate::sys::scratch_file(from) else {
+    let Ok(Some((source, meta))) = crate::sys::scratch_file_with_meta(from) else {
         return;
     };
-    let Ok(meta) = source.metadata() else {
+    if meta.len() > MAX_LAB_FILE_BYTES {
         return;
-    };
-    let mut bytes = Vec::new();
-    if io::Read::read_to_end(&mut source, &mut bytes).is_err() {
+    }
+    let cap = usize::try_from(meta.len().min(MAX_LAB_FILE_BYTES).saturating_add(1)).unwrap_or(0);
+    let mut bytes = Vec::with_capacity(cap);
+    if source
+        .take(MAX_LAB_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.len() as u64 > MAX_LAB_FILE_BYTES
+    {
         return;
     }
     if crate::sys::put(
@@ -874,5 +1022,85 @@ mod tests {
         assert_eq!(py_repr("it's"), "\"it's\"");
         assert_eq!(py_repr("a\nb"), "'a\\nb'");
         assert_eq!(py_repr("❯\u{a0}hi\u{80}\u{2028}"), "'❯\\xa0hi\\x80\\u2028'");
+    }
+
+    #[test]
+    fn read_regular_file_and_text_refuse_non_regular_entries() {
+        let dir = std::fs::canonicalize(
+            crate::sys::make_temp_dir("/tmp/lab-regular-read.XXXXXX").unwrap(),
+        )
+        .unwrap();
+        let file = dir.join("ok.txt");
+        std::fs::write(&file, "hello\n").unwrap();
+        assert_eq!(read_regular_text(&file).unwrap(), "hello\n");
+        assert_eq!(read_regular_file(&file).unwrap(), b"hello\n");
+        assert_eq!(read_artifact(&file).unwrap(), b"hello\n");
+        let linked = dir.join("linked.txt");
+        std::os::unix::fs::symlink(&file, &linked).unwrap();
+        assert_eq!(read_regular_text(&linked).unwrap(), "hello\n");
+        assert!(read_artifact(&linked).is_err());
+        let err = read_regular_file(&dir).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let fifo = dir.join("fifo");
+        assert!(
+            aterm_uds::spawnfd::command("/usr/bin/mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let err = read_regular_file(&fifo).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn line_tail_cursor_reads_deltas_holds_partial_lines_and_resets_on_replace() {
+        use std::io::Write as _;
+        let dir = std::fs::canonicalize(
+            crate::sys::make_temp_dir("/tmp/lab-tail-cursor.XXXXXX").unwrap(),
+        )
+        .unwrap();
+        let file = dir.join("journal.jsonl");
+        let mut cursor = LineTailCursor::default();
+        assert_eq!(
+            cursor.poll_scratch_text(&file).unwrap(),
+            (false, String::new())
+        );
+
+        std::fs::write(&file, "line-1\npartial").unwrap();
+        assert_eq!(
+            cursor.poll_scratch_text(&file).unwrap(),
+            (true, "line-1\n".to_string())
+        );
+        // Idle poll with only the un-terminated trailing line reads 0 complete lines.
+        assert_eq!(
+            cursor.poll_scratch_text(&file).unwrap(),
+            (false, String::new())
+        );
+
+        // Completing the partial line + adding a second line yields both without re-reading line-1.
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file)
+            .unwrap();
+        f.write_all(b"-2\nline-3\n").unwrap();
+        drop(f);
+        assert_eq!(
+            cursor.poll_scratch_text(&file).unwrap(),
+            (false, "partial-2\nline-3\n".to_string())
+        );
+        assert_eq!(
+            cursor.poll_scratch_text(&file).unwrap(),
+            (false, String::new())
+        );
+
+        // Atomic replacement (new inode / shorter length) triggers reset = true.
+        atomic_write(&file, b"replaced-1\n").unwrap();
+        assert_eq!(
+            cursor.poll_scratch_text(&file).unwrap(),
+            (true, "replaced-1\n".to_string())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

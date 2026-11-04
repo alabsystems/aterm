@@ -214,7 +214,7 @@ fn follow(file: &std::path::Path) -> i32 {
 /// The mode word `file` holds, trimmed; a missing, unreadable or unknown word is [`Mode::Idle`].
 #[must_use]
 pub fn followed_mode(file: &std::path::Path) -> Mode {
-    std::fs::read_to_string(file)
+    crate::util::read_regular_text(file)
         .ok()
         .and_then(|word| Mode::of(word.trim()))
         .unwrap_or(Mode::Idle)

@@ -498,6 +498,20 @@ pub fn apply_kept_off(
     params: BloomParams,
     mask: Option<&LetterMask>,
 ) -> Result<(), String> {
+    bloom_kept_off(frame, glow, rows, params, mask, Some(1.0))
+}
+
+/// [`apply_kept_off`], passing over a pixel no lit half-res texel lies within `quiet` of the
+/// taps' reach of (`None`: none passed over). Only a share below 1 can change a pixel: the
+/// negative control of `a_quiet_pixel_passed_over_takes_no_light`.
+fn bloom_kept_off(
+    frame: &mut Frame,
+    glow: &[GlowQuad],
+    rows: usize,
+    params: BloomParams,
+    mask: Option<&LetterMask>,
+    quiet: Option<f32>,
+) -> Result<(), String> {
     check_frame(frame)?;
     if !params.strength.is_finite() || !params.radius.is_finite() || params.radius < 0.0 {
         return Err("bloom requires finite strength and a finite nonnegative radius".to_string());
@@ -621,10 +635,33 @@ pub fn apply_kept_off(
         let (oi, oj) = (fi * tu, fj * tv);
         *tap = (oi * rw, oj * rw, oi * rc, oj * rc, weight);
     }
+    // A pixel's taps read the half-res texels within twice the wider radius of its own centre
+    // and each one's bilinear neighbour (a texel more of slack covers rounding). Where none of
+    // those is lit, every sample is zero and so is the pixel's light: it is passed over without
+    // its 50 samples, as is a pixel its mask keeps whole off. Most of a trail's box is such.
+    let lit = quiet
+        .map(|share| lit_table(&half, bw, bh).map(|t| (t, 2.0 * rw.max(rc) * share + 1.0)))
+        .transpose()?;
+    let span = |c: f32, reach: f32, n: usize| {
+        let clamp = |x: f32| (x.max(0.0) as usize).min(n - 1);
+        (clamp((c - reach).floor()), clamp((c + reach).floor() + 1.0))
+    };
     for py in sy0..sy1 {
         let v = (py as f32 + 0.5) / h as f32;
+        let ys = lit
+            .as_ref()
+            .map(|(_, reach)| span(v * bh as f32 - 0.5, *reach, bh));
         for px in sx0..sx1 {
             let u = (px as f32 + 0.5) / w as f32;
+            if let (Some((table, reach)), Some(ys)) = (&lit, ys)
+                && lit_in(table, bw, span(u * bw as f32 - 0.5, *reach, bw), ys) == 0
+            {
+                continue;
+            }
+            let kept = mask.map_or(1.0, |m| m.weight(px as f32 + 0.5, py as f32 + 0.5));
+            if kept <= 0.0 {
+                continue;
+            }
             let mut white = 0.0f32;
             let mut chroma = [0.0f32; 3];
             for &(du_w, dv_w, du_c, dv_c, weight) in &taps {
@@ -635,10 +672,6 @@ pub fn apply_kept_off(
                 for k in 0..3 {
                     chroma[k] += (sc[k] - wc) * weight;
                 }
-            }
-            let kept = mask.map_or(1.0, |m| m.weight(px as f32 + 0.5, py as f32 + 0.5));
-            if kept <= 0.0 {
-                continue;
             }
             let src = [
                 (white + chroma[0]) / wsum * params.strength * kept,
@@ -653,6 +686,34 @@ pub fn apply_kept_off(
         }
     }
     Ok(())
+}
+
+/// The summed-area table of `half`'s lit texels (`bw` x `bh`): entry `(x, y)` of its
+/// `(bw + 1) x (bh + 1)` counts those above and left of texel `(x, y)`.
+fn lit_table(half: &[u32], bw: usize, bh: usize) -> Result<Vec<u32>, String> {
+    let stride = bw + 1;
+    let len = stride
+        .checked_mul(bh + 1)
+        .ok_or_else(|| "bloom lit table overflow".to_string())?;
+    let mut table = Vec::new();
+    table
+        .try_reserve_exact(len)
+        .map_err(|e| format!("cannot reserve bloom lit table: {e}"))?;
+    table.resize(len, 0u32);
+    for y in 0..bh {
+        let mut run = 0u32;
+        for x in 0..bw {
+            run += u32::from(half[y * bw + x] != 0);
+            table[(y + 1) * stride + x + 1] = table[y * stride + x + 1] + run;
+        }
+    }
+    Ok(table)
+}
+
+/// The lit texels of [`lit_table`]'s `table` in columns `xs` and rows `ys`, both inclusive.
+fn lit_in(table: &[u32], bw: usize, xs: (usize, usize), ys: (usize, usize)) -> u32 {
+    let at = |x: usize, y: usize| table[y * (bw + 1) + x];
+    (at(xs.1 + 1, ys.1 + 1) + at(xs.0, ys.0)) - (at(xs.0, ys.1 + 1) + at(xs.1 + 1, ys.0))
 }
 
 /// How far past a lettered cell's box a frame whose bloom spares its letters
@@ -1157,6 +1218,62 @@ mod tests {
         let mut bare = frame(80, 40, 0);
         apply(&mut bare, &[], 3, BloomParams::default()).unwrap();
         assert!(bare.pixels.iter().all(|&p| p == 0));
+    }
+
+    /// A pixel passed over for no lit texel within its taps' reach takes no light: over lights
+    /// apart, in both modes, at every radius, the frame is the one each pixel's 50 samples make.
+    /// NEGATIVE CONTROL: judged over a quarter of the reach, a pixel the light reaches is passed
+    /// over, so the comparison sees a reach too short.
+    #[test]
+    fn a_quiet_pixel_passed_over_takes_no_light() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move |n: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % u64::from(n)) as u16
+        };
+        let (w, h) = (160, 96);
+        let mut short_differs = false;
+        for case in 0..48usize {
+            let glow: Vec<GlowQuad> = (0..1 + case % 4)
+                .map(|_| {
+                    let (x, y) = (next(150), next(88));
+                    GlowQuad {
+                        row: y / 16,
+                        x,
+                        y,
+                        w: 1 + next(9),
+                        h: 1 + next(7),
+                        color: (u32::from(next(0xFFFF)) << 8) | u32::from(next(256)),
+                        alpha: [0, 255, 128][usize::from(next(3))],
+                        color2: u32::from(next(0xFFFF)) << 8,
+                        alpha2: next(256) as u8,
+                    }
+                })
+                .collect();
+            let params = BloomParams {
+                radius: [0.0, 0.6, 1.7, 3.0, 6.0, 12.0][case % 6],
+                strength: [0.4, 1.0, 1.8][case % 3],
+            };
+            let ground = u32::from(next(0xFFFF)) * 0x101;
+            let run = |quiet| {
+                let mut f = frame(w, h, ground);
+                bloom_kept_off(&mut f, &glow, 6, params, None, quiet).unwrap();
+                f.pixels
+            };
+            let all = run(None);
+            assert_eq!(
+                run(Some(1.0)),
+                all,
+                "case {case}: a passed-over pixel took light"
+            );
+            short_differs |= run(Some(0.25)) != all;
+        }
+        assert!(
+            short_differs,
+            "a quarter of the reach passed over no lit pixel"
+        );
     }
 
     /// A row of 10 cells 8x16 at the frame's origin, `x` standing in cells `3..5`.

@@ -84,7 +84,14 @@ fn path_and_query(
     Ok((path, pairs))
 }
 
-fn fields(inv: &Invocation) -> Result<Vec<(String, String)>> {
+/// One `-f` or `-F` pair; `magic` when `-F` typed it ([`field_value`]).
+struct Field {
+    key: String,
+    value: String,
+    magic: bool,
+}
+
+fn fields(inv: &Invocation) -> Result<Vec<Field>> {
     let mut pairs = Vec::new();
     for (name, value) in &inv.flags {
         let flag = match *name {
@@ -99,7 +106,11 @@ fn fields(inv: &Invocation) -> Result<Vec<(String, String)>> {
         if flag == "-F" && value.starts_with('@') {
             return Err(inv.usage("-F k=@file is not supported: agh api reads no file"));
         }
-        pairs.push((key.to_string(), value.to_string()));
+        pairs.push(Field {
+            key: key.to_string(),
+            value: value.to_string(),
+            magic: flag == "-F",
+        });
     }
     Ok(pairs)
 }
@@ -219,7 +230,11 @@ pub(crate) fn api(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     let typed = inv.require(0, "PATH")?;
     let gh = ctx.github()?;
     let (path, mut query) = path_and_query(inv, typed, gh.endpoints().api())?;
-    query.extend(fields(inv)?);
+    query.extend(
+        fields(inv)?
+            .into_iter()
+            .map(|field| (field.key, field.value)),
+    );
     let (route_target, named, path_id) = target(inv, &path, gh.router())?;
     let route = RouteRequest::read(route_target)
         .with_anonymous(inv.global.anonymous)
@@ -322,17 +337,143 @@ fn answer_value(answer: RawAnswer) -> Value {
     }
 }
 
-/// The `-f` and `-F` pairs as a write's JSON body: one object of strings, the last value of
-/// a key kept; `None` when no field was given.
-fn body_of(pairs: Vec<(String, String)>) -> Option<Value> {
-    if pairs.is_empty() {
-        return None;
+/// A field's JSON value. `-f` is always a string. `-F` reads `true`, `false`, `null` and an
+/// integer as their JSON types, as `gh api -F` does, because a REST body such as a pull
+/// request's `draft` refuses the string `"true"`; any other `-F` value is a string.
+fn field_value(value: String, magic: bool) -> Value {
+    if magic {
+        match value.as_str() {
+            "true" => return Value::Bool(true),
+            "false" => return Value::Bool(false),
+            "null" => return Value::Null,
+            text => {
+                if let Ok(number) = text.parse::<i64>() {
+                    return Value::from(number);
+                }
+            }
+        }
     }
-    let object: Map = pairs
-        .into_iter()
-        .map(|(key, value)| (key, Value::String(value)))
-        .collect();
-    Some(Value::Object(object))
+    Value::String(value)
+}
+
+/// One step of a field's key past its name: `[k]` a member of an object, `[]` an array's
+/// next element.
+enum Step {
+    Member(String),
+    Append,
+}
+
+/// A field's key split as `gh api` reads it: `name`, then any `[k]` and `[]` steps, so
+/// `labels[]` is an array element and `required_status_checks[strict]` an object's member.
+fn key_steps(key: &str) -> std::result::Result<(String, Vec<Step>), String> {
+    let (name, mut rest) = match key.find('[') {
+        Some(at) => (&key[..at], &key[at..]),
+        None => (key, ""),
+    };
+    if name.is_empty() {
+        return Err(format!("field key {key:?} has no name before its brackets"));
+    }
+    let mut steps = Vec::new();
+    while !rest.is_empty() {
+        let Some(inner) = rest.strip_prefix('[') else {
+            return Err(format!(
+                "field key {key:?} has text after a bracket: {rest:?}"
+            ));
+        };
+        let Some(close) = inner.find(']') else {
+            return Err(format!("field key {key:?} has an unclosed bracket"));
+        };
+        let member = &inner[..close];
+        if member.contains('[') {
+            return Err(format!("field key {key:?} nests a bracket in a bracket"));
+        }
+        steps.push(if member.is_empty() {
+            Step::Append
+        } else {
+            Step::Member(member.to_string())
+        });
+        rest = &inner[close + 1..];
+    }
+    Ok((name.to_string(), steps))
+}
+
+/// Puts `leaf` at `key` then `steps` inside `map`: a plain key's last value wins, a `[k]`
+/// step opens (or reuses) an object, and a `[]` step an array.
+fn put(map: &mut Map, key: String, steps: &[Step], leaf: Value) -> std::result::Result<(), String> {
+    let Some((step, more)) = steps.split_first() else {
+        map.insert(key, leaf);
+        return Ok(());
+    };
+    match step {
+        Step::Member(member) => {
+            let child = map
+                .entry(key.clone())
+                .or_insert_with(|| Value::Object(Map::new()));
+            let Value::Object(object) = child else {
+                return Err(format!("field {key} is both a value and an object"));
+            };
+            put(object, member.clone(), more, leaf)
+        }
+        Step::Append => {
+            let child = map
+                .entry(key.clone())
+                .or_insert_with(|| Value::Array(Vec::new()));
+            let Value::Array(items) = child else {
+                return Err(format!("field {key} is both a value and an array"));
+            };
+            append(items, &key, more, leaf)
+        }
+    }
+}
+
+/// Appends to an array as `gh api` does: `a[]=v` pushes `v`; `a[][k]=v` sets `k` in the
+/// last element when that element is an object still without `k` (or `k` leads deeper), and
+/// otherwise starts the next object, so `a[][path]=x a[][line]=1 a[][path]=y` is two objects.
+fn append(
+    items: &mut Vec<Value>,
+    key: &str,
+    steps: &[Step],
+    leaf: Value,
+) -> std::result::Result<(), String> {
+    match steps.split_first() {
+        None => {
+            items.push(leaf);
+            Ok(())
+        }
+        Some((Step::Member(member), more)) => {
+            let reuse = matches!(
+                items.last(),
+                Some(Value::Object(last)) if !more.is_empty() || !last.contains_key(member)
+            );
+            if !reuse {
+                items.push(Value::Object(Map::new()));
+            }
+            let Some(Value::Object(object)) = items.last_mut() else {
+                return Err(format!("field {key}[] mixes values and objects"));
+            };
+            put(object, member.clone(), more, leaf)
+        }
+        Some((Step::Append, _)) => Err(format!("field {key}[][] nests an array in an array")),
+    }
+}
+
+/// The `-f` and `-F` pairs as a write's JSON body, each key read by [`key_steps`];
+/// `None` when no field was given.
+///
+/// # Errors
+///
+/// A usage error for a key whose brackets do not parse, or one that makes a field both a
+/// value and an object or array.
+fn body_of(inv: &Invocation, pairs: Vec<Field>) -> Result<Option<Value>> {
+    if pairs.is_empty() {
+        return Ok(None);
+    }
+    let mut object = Map::new();
+    for Field { key, value, magic } in pairs {
+        let (name, steps) = key_steps(&key).map_err(|why| inv.usage(why))?;
+        put(&mut object, name, &steps, field_value(value, magic)).map_err(|why| inv.usage(why))?;
+    }
+    Ok(Some(Value::Object(object)))
 }
 
 /// The journal as `Raw::send` writes it, keeping the id its `begin` returned: the report names
@@ -412,7 +553,7 @@ fn api_write(ctx: &mut Ctx, inv: &Invocation, method: Method) -> Result<Outcome>
     }
     let gh = ctx.github()?;
     let (path, query) = path_and_query(inv, typed, gh.endpoints().api())?;
-    let body = body_of(fields(inv)?);
+    let body = body_of(inv, fields(inv)?)?;
     let (route_target, named, path_id) = target(inv, &path, gh.router())?;
     let slug = match (&route_target, path_id) {
         (RouteTarget::Repo(slug), None) => slug.clone(),

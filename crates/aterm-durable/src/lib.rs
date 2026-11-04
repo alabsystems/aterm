@@ -2,10 +2,23 @@
 // Copyright 2026 Andrew Yates
 
 //! File and directory flush primitives.
+//!
+//! Every flush this crate makes is astream-sys's, so `astream_sys::flush_tally` counts each
+//! one, by the call it is: [`primitive::full`] and [`primitive::full_data`] are `full_sync` and
+//! `full_sync_data` (a `full` each), [`primitive::barrier`] is `barrier_sync` on Apple targets
+//! (a `barrier`, and a `full` more when the volume refuses it) and `full_sync` elsewhere, and
+//! `primitive::fsync` (Unix) is `plain_fsync` (a `plain`). The `seam` records what each write
+//! asked for ([`Flush`]); the tally counts the calls that answered it.
 
 use std::fs::File;
 use std::io;
 use std::path::Path;
+
+/// Which of this crate's flushes `astream_sys::flush_tally` counts, as one word a reading of
+/// that tally names beside its counts (aterm-link's wait tally does): `all`, on every target,
+/// since every flush here goes through astream-sys (the crate's doc says which call each is).
+/// A flush that called the OS here instead would escape the tally and change this word.
+pub const ASTREAM_COUNTS: &str = "all";
 
 /// Which flush finished a write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -143,7 +156,7 @@ pub fn refusal_accepted(flushed: io::Result<()>) -> io::Result<()> {
 pub fn durable(file: &File) -> io::Result<()> {
     #[cfg(any(test, debug_assertions, feature = "test-support"))]
     seam::note(Flush::Durable);
-    full_or_fsync(file, primitive::full)
+    primitive::full(file)
 }
 
 /// [`durable`] for `file`'s data and size metadata, without its timestamps.
@@ -152,34 +165,17 @@ pub fn durable(file: &File) -> io::Result<()> {
 pub fn durable_data(file: &File) -> io::Result<()> {
     #[cfg(any(test, debug_assertions, feature = "test-support"))]
     seam::note(Flush::Durable);
-    full_or_fsync(file, primitive::full_data)
-}
-
-/// The durable flush `full` ([`primitive::full`] or [`primitive::full_data`]), or a plain
-/// `fsync(2)` in a test binary on Apple targets that asked ([`plain_durable_flushes_in_tests!`]).
-#[inline]
-fn full_or_fsync(file: &File, full: fn(&File) -> io::Result<()>) -> io::Result<()> {
-    #[cfg(all(any(test, debug_assertions), target_vendor = "apple"))]
-    if durable_flushes_are_plain() {
-        return primitive::fsync(file);
-    }
-    full(file)
+    primitive::full_data(file)
 }
 
 /// Whether this process's durable flushes are plain `fsync(2)`s, not the full flushes
 /// (`F_FULLFSYNC`) aterm ships: a test binary that asked, and every process it starts, in a
-/// debug build on Apple targets ([`plain_durable_flushes_in_tests!`]). Always `false` in a
-/// release build and off Apple targets.
+/// debug build on Apple targets ([`plain_durable_flushes_in_tests!`]), where astream-sys's
+/// `full_sync` and `full_sync_data` take one (`astream_sys::test_plain_fsync`, which decides it
+/// for them and for this). Always `false` in a release build and off Apple targets.
 #[must_use]
 pub fn durable_flushes_are_plain() -> bool {
-    #[cfg(all(any(test, debug_assertions), target_vendor = "apple"))]
-    {
-        cfg!(test) || astream_sys::test_plain_fsync()
-    }
-    #[cfg(not(all(any(test, debug_assertions), target_vendor = "apple")))]
-    {
-        false
-    }
+    astream_sys::test_plain_fsync()
 }
 
 /// What a line that counts or times durable flushes ends with where they are plain
@@ -276,29 +272,26 @@ pub mod primitive {
     use std::fs::File;
     use std::io;
 
-    /// The full flush: [`File::sync_all`].
+    /// The full flush: `astream_sys::full_sync` ([`File::sync_all`], `F_FULLFSYNC` on Apple
+    /// targets; a plain `fsync(2)` in a test's process tree there), counted `full` by
+    /// `astream_sys::flush_tally`.
     /// # Errors
     /// The flush's own error.
     pub fn full(file: &File) -> io::Result<()> {
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "the workspace's one full flush: aterm_durable::durable"
-        )]
-        file.sync_all()
+        astream_sys::full_sync(file)
     }
 
-    /// The full flush of the data and the size.
+    /// The full flush of the data and the size: `astream_sys::full_sync_data`
+    /// ([`File::sync_data`], as [`full`] says), counted `full`.
     /// # Errors
     /// The flush's own error.
     pub fn full_data(file: &File) -> io::Result<()> {
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "the workspace's one full data flush: aterm_durable::durable_data"
-        )]
-        file.sync_data()
+        astream_sys::full_sync_data(file)
     }
 
-    /// The ordering flush: `fcntl(F_BARRIERFSYNC)` on Apple targets.
+    /// The ordering flush: `astream_sys::barrier_sync` (`fcntl(F_BARRIERFSYNC)`) on Apple
+    /// targets, counted `barrier`, and [`full`] after it when the volume refused it; [`full`]
+    /// elsewhere.
     /// # Errors
     /// The barrier's own error when it failed.
     pub fn barrier(file: &File) -> io::Result<()> {
@@ -344,28 +337,15 @@ pub mod primitive {
         pub(crate) static FSYNCS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     }
 
-    /// A plain `fsync(2)`, retried on `EINTR` as std retries its `F_FULLFSYNC`.
+    /// A plain `fsync(2)`: `astream_sys::plain_fsync`, retried on `EINTR` there, counted
+    /// `plain`.
     /// # Errors
     /// The flush's own error.
     #[cfg(unix)]
     pub fn fsync(file: &File) -> io::Result<()> {
-        use std::os::fd::AsRawFd as _;
         #[cfg(test)]
         FSYNCS.with(|fsyncs| fsyncs.set(fsyncs.get() + 1));
-        // SAFETY: `fsync(2)` takes a descriptor by value and dereferences no pointer; for a
-        // descriptor that is not open it fails with `EBADF`.
-        unsafe extern "C" {
-            safe fn fsync(fd: std::ffi::c_int) -> std::ffi::c_int;
-        }
-        loop {
-            if fsync(file.as_raw_fd()) == 0 {
-                return Ok(());
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error);
-            }
-        }
+        astream_sys::plain_fsync(file)
     }
 }
 

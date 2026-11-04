@@ -108,7 +108,11 @@ pub(crate) fn gate_deck(record: bool) -> LaneRun {
     run
 }
 
-/// Run `deck_frame_cost` optimized and alone, its table written into `dir`.
+/// The bench's test, run by its exact path: an ordinary test (four live frames a case) that
+/// takes 400 samples a case and writes its table only when `ATERM_DECK_COST` names a file.
+const BENCH: &str = "stats_deck::live_paint_tests::deck_frame_cost";
+
+/// Run [`BENCH`] optimized and alone, its table written into `dir`.
 fn bench(dir: &Path) -> Result<String, super::floors::MeasureError> {
     let driver = super::driver::cargo_driver()?;
     let out = dir.join("deck_frame_cost.tsv");
@@ -147,15 +151,9 @@ fn bench(dir: &Path) -> Result<String, super::floors::MeasureError> {
         "lib",
     )?;
     let mut run = aterm_uds::spawnfd::command(&executable);
-    run.args([
-        "--ignored",
-        "deck_frame_cost",
-        "--nocapture",
-        "--test-threads",
-        "1",
-    ])
-    .env("ATERM_DECK_COST", &out)
-    .current_dir(workspace_root());
+    run.args([BENCH, "--exact", "--nocapture", "--test-threads", "1"])
+        .env("ATERM_DECK_COST", &out)
+        .current_dir(workspace_root());
     let _entry = super::measurement_entry().map_err(super::floors::MeasureError::Timing)?;
     let ran = run
         .output()
@@ -171,8 +169,16 @@ fn bench(dir: &Path) -> Result<String, super::floors::MeasureError> {
         )
         .into());
     }
-    crate::read_regular_text(&out)
-        .map_err(|e| super::floors::MeasureError::Failed(format!("the bench wrote no table: {e}")))
+    crate::read_regular_text(&out).map_err(|e| {
+        let said = String::from_utf8_lossy(&ran.stdout);
+        let said = said
+            .lines()
+            .rfind(|line| line.starts_with("test result:"))
+            .unwrap_or("no test result line");
+        super::floors::MeasureError::Failed(format!(
+            "the bench wrote no table ({e}); {BENCH} said `{said}`"
+        ))
+    })
 }
 
 /// Build aterm release with its dev seams, then take `deck-motion idle` of it; its summary.

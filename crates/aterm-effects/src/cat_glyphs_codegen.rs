@@ -565,10 +565,13 @@ fn emit(glyphs: &[Glyph]) -> String {
     }
     s.push_str("];\n\n");
 
-    s.push_str("/// Every roster glyph's const drawlist, indexed by [`CatGlyphId`] order.\n");
-    s.push_str("pub const GLYPHS: &[GlyphDef] = &[\n");
-    emit_glyph_rows(&mut s, glyphs);
-    s.push_str("];\n\n");
+    emit_drawlist(
+        &mut s,
+        "GLYPHS",
+        "Every roster glyph's drawlist, indexed by [`CatGlyphId`] order.",
+        glyphs,
+    );
+    s.push('\n');
 
     s.push_str("/// The head variants (the roster the genome's `variant` field indexes, §3).\n");
     s.push_str("pub const HEADS: &[CatGlyphId] = &[\n");
@@ -614,10 +617,12 @@ fn emit_pet(glyphs: &[Glyph]) -> String {
     }
     s.push_str("];\n\n");
 
-    s.push_str("/// Every pet pose's const drawlist, indexed by [`PetGlyphId`] order.\n");
-    s.push_str("pub const PET_GLYPHS: &[GlyphDef] = &[\n");
-    emit_glyph_rows(&mut s, glyphs);
-    s.push_str("];\n");
+    emit_drawlist(
+        &mut s,
+        "PET_GLYPHS",
+        "Every pet pose's drawlist, indexed by [`PetGlyphId`] order.",
+        glyphs,
+    );
 
     s
 }
@@ -652,10 +657,13 @@ fn emit_dog(glyphs: &[Glyph]) -> String {
     }
     s.push_str("];\n\n");
 
-    s.push_str("/// Every breed head's const drawlist, indexed by [`DogGlyphId`] order.\n");
-    s.push_str("pub const DOG_GLYPHS: &[GlyphDef] = &[\n");
-    emit_glyph_rows(&mut s, glyphs);
-    s.push_str("];\n\n");
+    emit_drawlist(
+        &mut s,
+        "DOG_GLYPHS",
+        "Every breed head's drawlist, indexed by [`DogGlyphId`] order.",
+        glyphs,
+    );
+    s.push('\n');
 
     s.push_str("/// The breed variants the typed-summon picker draws from, uniformly.\n");
     s.push_str("pub const DOG_HEADS: &[DogGlyphId] = &[\n");
@@ -701,10 +709,13 @@ fn emit_animal_roster(glyphs: &[Glyph]) -> String {
     }
     s.push_str("];\n\n");
 
-    s.push_str("/// Every species head's const drawlist, indexed by [`AnimalGlyphId`] order.\n");
-    s.push_str("pub const ANIMAL_GLYPHS: &[GlyphDef] = &[\n");
-    emit_glyph_rows(&mut s, glyphs);
-    s.push_str("];\n\n");
+    emit_drawlist(
+        &mut s,
+        "ANIMAL_GLYPHS",
+        "Every species head's drawlist, indexed by [`AnimalGlyphId`] order.",
+        glyphs,
+    );
+    s.push('\n');
 
     s.push_str("/// Resolve a lexicon `species` key (`ANIMAL_GLYPHS[i].id`) to its roster id.\n");
     s.push_str("/// Linear over a few dozen species; called at rescan, not per frame.\n");
@@ -717,6 +728,19 @@ fn emit_animal_roster(glyphs: &[Glyph]) -> String {
     s.push_str("}\n");
 
     s
+}
+
+/// Emits one drawlist table, `doc` its first doc line. The table is a `static`: as a `const`, each
+/// crate whose code read it held a copy of its own, and the web page's module (whose binding crate
+/// compiles the effect step) carried the outlines twice.
+fn emit_drawlist(s: &mut String, name: &str, doc: &str, glyphs: &[Glyph]) {
+    let _ = writeln!(s, "/// {doc}");
+    s.push_str(
+        "/// A `static`, so the binary holds one copy (a `const` is copied into each crate that reads it).\n",
+    );
+    let _ = writeln!(s, "pub static {name}: &[GlyphDef] = &[");
+    emit_glyph_rows(s, glyphs);
+    s.push_str("];\n");
 }
 
 fn emit_glyph_rows(s: &mut String, glyphs: &[Glyph]) {

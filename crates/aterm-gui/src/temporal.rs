@@ -8,7 +8,7 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, Weak};
 use std::time::Instant;
 
 use aterm_aos::Digest;
@@ -537,6 +537,16 @@ struct QueueState {
     demands: Arc<urgency::Demands>,
     drain_armed: AtomicBool,
     drain_demand: Mutex<Option<RecordingDemand>>,
+    /// Rung each time `in_flight` falls to zero, for a park waiting out the queue
+    /// (`TemporalDrain::written_by`). Its own lock, never `drain_demand`: a writer that empties
+    /// the queue while a drain request holds that lock rings without waiting for it.
+    emptied: (Mutex<()>, Condvar),
+    /// How many times a waiter went to sleep on `emptied`.
+    #[cfg(test)]
+    sleeps: AtomicUsize,
+    /// How many of those sleeps lasted to the waiter's deadline instead of ending at a ring.
+    #[cfg(test)]
+    slept_out: AtomicUsize,
 }
 
 struct QueuedCounts {
@@ -560,6 +570,11 @@ impl QueueState {
             demands,
             drain_armed: AtomicBool::new(false),
             drain_demand: Mutex::new(None),
+            emptied: (Mutex::new(()), Condvar::new()),
+            #[cfg(test)]
+            sleeps: AtomicUsize::new(0),
+            #[cfg(test)]
+            slept_out: AtomicUsize::new(0),
         }
     }
 
@@ -594,9 +609,8 @@ impl QueueState {
     fn written(&self, weight: usize) {
         self.pool.queued.fetch_sub(weight, Ordering::AcqRel);
         self.bytes.fetch_sub(weight, Ordering::AcqRel);
-        if self.in_flight.fetch_sub(1, Ordering::AcqRel) == 1
-            && self.drain_armed.load(Ordering::Acquire)
-        {
+        let last = self.in_flight.fetch_sub(1, Ordering::AcqRel) == 1;
+        if last && self.drain_armed.load(Ordering::Acquire) {
             let mut demand = self
                 .drain_demand
                 .lock()
@@ -605,6 +619,12 @@ impl QueueState {
                 drop(demand.take());
                 self.drain_armed.store(false, Ordering::Release);
             }
+        }
+        if last {
+            // Under the lock, so a waiter between its look and its sleep cannot miss the ring.
+            let (lock, emptied) = &self.emptied;
+            let _held = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            emptied.notify_all();
         }
     }
 
@@ -726,6 +746,31 @@ impl TemporalDrain {
         self.0.in_flight.load(Ordering::Acquire) == 0
     }
 
+    /// Sleep until nothing queued is unwritten or `deadline` passes: whether the queue emptied.
+    /// The writer's last write wakes the sleeper (`QueueState::written`).
+    #[cfg(any(unix, test))]
+    pub(crate) fn written_by(&self, deadline: Instant) -> bool {
+        let (lock, emptied) = &self.0.emptied;
+        let mut held = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        while !self.is_finished() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            #[cfg(test)]
+            self.0.sleeps.fetch_add(1, Ordering::AcqRel);
+            let woken = emptied
+                .wait_timeout(held, left)
+                .unwrap_or_else(PoisonError::into_inner);
+            #[cfg(test)]
+            if woken.1.timed_out() {
+                self.0.slept_out.fetch_add(1, Ordering::AcqRel);
+            }
+            held = woken.0;
+        }
+        true
+    }
+
     /// Wait until every queued message is written, or the writer is gone.
     pub(crate) fn wait(&self) {
         let _waiting = self.waiting();
@@ -761,6 +806,12 @@ impl TemporalDrain {
         self.0.demands.snapshot().counts
     }
 
+    /// How many of this queue's waiters slept to their deadline instead of being rung awake.
+    #[cfg(test)]
+    pub(crate) fn slept_out_for_test(&self) -> usize {
+        self.0.slept_out.load(Ordering::Acquire)
+    }
+
     #[cfg(test)]
     pub(crate) fn capture_complete_for_test(&self) -> bool {
         self.0.completion_snapshot() == (0, 0, false)
@@ -775,6 +826,11 @@ pub(crate) struct HeldDrain(Arc<QueueState>);
 impl HeldDrain {
     pub(crate) fn abandon(self) {
         self.0.abandoned.store(true, Ordering::Release);
+    }
+
+    /// How many times a waiter went to sleep on the held queue's emptying.
+    pub(crate) fn sleeps(&self) -> usize {
+        self.0.sleeps.load(Ordering::Acquire)
     }
 }
 

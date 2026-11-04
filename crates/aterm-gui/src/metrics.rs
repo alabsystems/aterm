@@ -518,10 +518,13 @@ pub(crate) fn pin_host_clock(at: Option<Instant>) {
 #[inline]
 pub(crate) fn host_clock_pinned() -> bool {
     #[cfg(all(any(test, all(unix, feature = "bench-support")), debug_assertions))]
-    if HOST_CLOCK.with(std::cell::Cell::get).is_some() {
-        return true;
+    {
+        HOST_CLOCK.with(std::cell::Cell::get).is_some()
     }
-    false
+    #[cfg(not(all(any(test, all(unix, feature = "bench-support")), debug_assertions)))]
+    {
+        false
+    }
 }
 
 /// Now: the host's clock read where no frame or event instant reaches the code (this clock's

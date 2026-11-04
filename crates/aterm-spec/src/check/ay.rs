@@ -91,10 +91,7 @@ pub(crate) fn obligations(root: &Path) -> (Vec<Obligation>, Vec<String>) {
     }
     let (mut found, mut faults) = (Vec::new(), Vec::new());
     for path in files {
-        match std::fs::read_to_string(&path)
-            .map_err(|e| e.to_string())
-            .and_then(|text| declared(&text))
-        {
+        match read_smt2_text(&path).and_then(|text| declared(&text)) {
             Ok((want, minutes)) => found.push(Obligation {
                 path,
                 want,
@@ -104,6 +101,45 @@ pub(crate) fn obligations(root: &Path) -> (Vec<Obligation>, Vec<String>) {
         }
     }
     (found, faults)
+}
+
+fn read_smt2_text(path: &Path) -> Result<String, String> {
+    use std::io::Read as _;
+    const MAX_SMT2_BYTES: u64 = 32 << 20;
+    let go = || -> std::io::Result<String> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
+        }
+        let file = opts.open(path)?;
+        let meta = file.metadata()?;
+        if !meta.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "not a regular file",
+            ));
+        }
+        if meta.len() > MAX_SMT2_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "file exceeds 32 MiB limit",
+            ));
+        }
+        let cap = usize::try_from(meta.len().min(MAX_SMT2_BYTES).saturating_add(1)).unwrap_or(0);
+        let mut buf = Vec::with_capacity(cap);
+        file.take(MAX_SMT2_BYTES + 1).read_to_end(&mut buf)?;
+        if buf.len() as u64 > MAX_SMT2_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "file grew past 32 MiB limit while reading",
+            ));
+        }
+        String::from_utf8(buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    };
+    go().map_err(|e| e.to_string())
 }
 
 /// One solve's outcome: what it answered and which build answered it.

@@ -45,7 +45,7 @@ fn signed_out_row(desk: &Desk) -> Roster {
     let roster = Roster {
         rows: vec![accounts::Row {
             label: "work".into(),
-            class: Class::Dedicated,
+            class: Class::Preferred,
             dir: Some(dir.to_str().unwrap().into()),
             email: Some("work@example.test".into()),
             ..accounts::Row::default()

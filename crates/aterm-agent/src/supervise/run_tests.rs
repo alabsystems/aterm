@@ -392,6 +392,9 @@ struct Mock {
     /// When, on the run's clock ([`run_now`]), the last `status` said the worker's input was
     /// unread (`input=pending|typeahead`).
     input_unread_at: Option<Instant>,
+    /// When, on the run's clock, each `status` said the worker's input was clear
+    /// (`input=clear`), in order.
+    clear_reads: Vec<Instant>,
     /// When, on the run's clock, the first `send` arrived.
     first_send_at: Option<Instant>,
     /// Every `text` read, on the run's clock: the script's screen it served and when.
@@ -1222,6 +1225,7 @@ impl Mock {
             input: INPUT_CLEAR,
             input_after: Vec::new(),
             input_unread_at: None,
+            clear_reads: Vec::new(),
             first_send_at: None,
             read_times: Vec::new(),
             key_times: Vec::new(),
@@ -1448,6 +1452,9 @@ impl Mock {
             None if self.input.is_empty() => String::new(),
             None => format!(" {}", self.input),
         };
+        if input.split_whitespace().any(|t| t == "input=clear") {
+            self.clear_reads.push(run_now(self.waits.as_deref()));
+        }
         let after_read = self
             .status_human_from
             .range(..=self.reads.len())

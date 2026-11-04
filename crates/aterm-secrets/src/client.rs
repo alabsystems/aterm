@@ -7,6 +7,7 @@ use crate::age::{self, Identity, Recipient};
 use crate::envelope::{self, Envelope, Floor, Locker, Pin, Retired, Unsigned, Verdict};
 use crate::materialize::{self, Manifest, Report};
 use crate::text::{self, Audience, Document, Entry};
+pub use crate::transport::LocalNetworkHeard;
 use crate::transport::{self, Fetched, Source};
 use crate::{Error, SecretBytes, fsx, join};
 use std::collections::{BTreeMap, BTreeSet};
@@ -160,6 +161,8 @@ mod own_head_tests;
 mod peer_candidates_tests;
 #[cfg(test)]
 mod probe_reads_tests;
+#[cfg(test)]
+mod received_records_tests;
 #[cfg(test)]
 mod records_push_tests;
 #[cfg(test)]
@@ -2922,6 +2925,21 @@ pub fn sync(paths: &Paths, wait: Option<Duration>) -> crate::Result<SyncOutcome>
     sync_repairing(paths, wait, None)
 }
 
+/// [`sync`], reporting what each actual request to its captured `.local` source heard of
+/// this process's Local Network switch. Observation asks no additional network question and
+/// does not reread a changed configuration to choose a different source. A recursive retry
+/// reports only its own request; a failure before transport reports nothing.
+///
+/// # Errors
+/// The same configuration, network, verification and materialization failures as [`sync`].
+pub fn sync_observing_local_network(
+    paths: &Paths,
+    wait: Option<Duration>,
+    mut hear: impl FnMut(LocalNetworkHeard),
+) -> crate::Result<SyncOutcome> {
+    sync_repairing_hearing(paths, wait, None, &[], true, None, None, &mut hear)
+}
+
 /// [`sync`] of a subscriber's pass: a source that fails or holds nothing newer gives way to the
 /// highest verified seq among the vault servers `found` (`docs/DESIGN-fluid-swarm-2026-10-28.md`
 /// F5), the source still its first choice. It keeps in `said` what the source itself said.
@@ -3026,10 +3044,37 @@ pub(crate) fn save_records_unlocked(paths: &Paths, records: &[u8]) -> crate::Res
     let mut store = load_records(paths)?;
     let added = store.ingest(records)?;
     if added > 0 {
-        fsx::write_atomic(&paths.records_file(), &store.encode(), 0o600)?;
+        write_records(paths, &store)?;
     }
     Ok(added)
 }
+
+/// Buffer small signed records without collecting the complete stream. Flush before the
+/// atomic writer can make the temporary durable or publish it.
+fn write_record_file(
+    path: &Path,
+    produce: impl FnOnce(&mut dyn std::io::Write) -> std::io::Result<()>,
+) -> crate::Result<()> {
+    fsx::write_atomic_with(path, 0o600, |writer| write_record_buffered(writer, produce))
+}
+
+fn write_record_buffered(
+    writer: &mut dyn std::io::Write,
+    produce: impl FnOnce(&mut dyn std::io::Write) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut buffered = std::io::BufWriter::with_capacity(64 * 1024, writer);
+    produce(&mut buffered)?;
+    buffered.flush()
+}
+
+fn write_records(paths: &Paths, store: &crate::membership_log::Store) -> crate::Result<()> {
+    write_record_file(&paths.records_file(), |writer| store.write_encoded(writer))
+}
+
+#[cfg(test)]
+#[path = "client/record_persistence_tests.rs"]
+mod record_persistence_tests;
 
 /// Retain verified membership records offered over Commons control repair for `(network,
 /// authority)`, returning one durable acknowledgement per wire.
@@ -3115,7 +3160,7 @@ pub fn retain_records_for_commons(
         return Ok(vec![false; wires.len()]);
     }
     if store.inventory() != before {
-        fsx::write_atomic(&paths.records_file(), &store.encode(), 0o600)?;
+        write_records(paths, &store)?;
     } else if decoded.iter().any(|r| {
         r.as_ref()
             .is_some_and(|rec| store.complete_bytes(rec.id()).is_some())
@@ -3138,6 +3183,18 @@ pub fn retain_records_for_commons(
 /// Vault configuration is missing, no candidate server answers cleanly, or persisting fails.
 pub fn sync_records(paths: &Paths, wait: Option<Duration>) -> crate::Result<usize> {
     sync_records_inner(paths, wait, &[], None, None)
+}
+
+/// Run the ordinary records pass with an empty discovery source.
+/// Configured peers and the complete read, write and repost paths remain active.
+///
+/// # Errors
+/// As [`sync_records`].
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub fn test_sync_records_without_discovery(paths: &Paths) -> crate::Result<usize> {
+    let discovery = PeerDiscovery::empty();
+    sync_records_inner(paths, None, &[], Some(&discovery), None)
 }
 
 /// [`sync_records`] with explicit `candidates` probed alongside policy and discovered peers when
@@ -3186,25 +3243,55 @@ const TAKE_RESERVE: Duration = Duration::from_millis(300);
 struct RecordsJudged {
     stream: crate::membership_log::untaken::Sent,
     whole: bool,
-    batch: Option<Vec<u8>>,
+    batch: Option<Vec<crate::membership_log::Record>>,
+}
+
+/// Judge the whole decoded stream, or its readable descendant-closed subset, against the
+/// same initial Store and fresh-vault alternatives used by the records pass.
+fn judge_received_records(
+    local_store: &crate::membership_log::Store,
+    vault_name: &str,
+    received: crate::membership_log::untaken::ReceivedFrames,
+) -> RecordsJudged {
+    let batch_valid = |records: &[crate::membership_log::Record]| {
+        local_store.clone().ingest_records(records.to_vec()).is_ok()
+            || crate::membership_log::Store::for_vault(vault_name)
+                .and_then(|mut store| store.ingest_records(records.to_vec()))
+                .is_ok()
+    };
+    let (batch, whole) = match received.whole() {
+        Some(records) if batch_valid(&records) => (Some(records), true),
+        _ => {
+            let part = received.readable();
+            let part_len: usize = part.iter().map(|record| record.bytes().len()).sum();
+            let part = (!part.is_empty() && part_len < received.byte_len() && batch_valid(&part))
+                .then_some(part);
+            (part, false)
+        }
+    };
+    RecordsJudged {
+        stream: received.into_sent(),
+        whole,
+        batch,
+    }
 }
 
 /// What a records pass holds of a peer's answer once every pull has ended.
 struct PeerRecords {
     /// The records it sent.
     records: Brought,
-    /// Whether it lacks a record the pull named ([`transport::RecordsAnswer::needs`]).
+    /// Whether it lacks a record the pull named ([`transport::ReceivedRecordsAnswer::needs`]).
     needs: bool,
-    /// Its boot id ([`transport::RecordsAnswer::boot`]).
+    /// Its boot id ([`transport::ReceivedRecordsAnswer::boot`]).
     boot: Option<String>,
 }
 
 /// The records a peer sent, as a records pass holds them once every pull has ended.
 enum Brought {
-    /// No longer than [`fan_out::RECORDS`]' peek (none, for a `204` or a `404`): judged then.
-    Read(Vec<u8>),
+    /// No longer than [`fan_out::RECORDS`]' peek (empty for a `204` or a `404`): judged later.
+    Unjudged(crate::membership_log::untaken::ReceivedFrames),
     /// Longer: judged once its whole read ended, while that read still held its slot, so no
-    /// more such bodies that nothing has verified are held at once than
+    /// more such large responses awaiting Store judgment are held at once than
     /// [`fan_out::reads_within`] reads whole at once.
     Judged(RecordsJudged),
 }
@@ -3212,12 +3299,19 @@ enum Brought {
 impl PeerRecords {
     /// What a pass holds of `answer`, `judge` judging its records when they are longer than the
     /// peek.
-    fn of(answer: transport::RecordsAnswer, judge: impl Fn(Vec<u8>) -> RecordsJudged) -> Self {
-        let transport::RecordsAnswer { bytes, needs, boot } = answer;
-        let records = if bytes.len() > fan_out::RECORDS.peek {
-            Brought::Judged(judge(bytes))
+    fn of(
+        answer: transport::ReceivedRecordsAnswer,
+        judge: impl Fn(crate::membership_log::untaken::ReceivedFrames) -> RecordsJudged,
+    ) -> Self {
+        let transport::ReceivedRecordsAnswer {
+            received,
+            needs,
+            boot,
+        } = answer;
+        let records = if received.byte_len() > fan_out::RECORDS.peek {
+            Brought::Judged(judge(received))
         } else {
-            Brought::Read(bytes)
+            Brought::Unjudged(received)
         };
         Self {
             records,
@@ -3279,8 +3373,9 @@ fn sync_records_until(
     )?;
     let primary_named = named(primary_url);
     let sub_ref = subscriber.as_deref();
-    let fetch_primary =
-        || transport::fetch_records_sync(primary_url, &primary_named.ids, wait, total, sub_ref);
+    let fetch_primary = || {
+        transport::fetch_record_frames_sync(primary_url, &primary_named.ids, wait, total, sub_ref)
+    };
     // A bounded pass browses for peers by its own deadline, not a fixed probe of its own.
     let bounded_browse = PeerDiscovery::direct(pulls_by);
     let browsed = browsed.or_else(|| pulls_by.map(|_| &bounded_browse));
@@ -3301,31 +3396,12 @@ fn sync_records_until(
     } else {
         ""
     };
-    let batch_valid = |bytes: &[u8]| {
-        local_store.clone().ingest(bytes).is_ok()
-            || crate::membership_log::Store::decode(vault_name, bytes).is_ok()
-    };
     // What a non-empty answer brings: the whole stream as its batch when it verifies, else the
     // records of it this build reads that descend from none it cannot read, when those verify.
     // A server of a newer build sends a record of a kind this build does not know beside records
     // it reads, and refusing the whole stream kept those records from every server that holds
     // it.
-    let judge = |bytes: Vec<u8>| -> RecordsJudged {
-        let stream = Sent::read(&bytes);
-        let (batch, whole) = if batch_valid(&bytes) {
-            (Some(bytes), true)
-        } else {
-            let part = stream.readable(&bytes);
-            let part = (!part.is_empty() && part.len() < bytes.len() && batch_valid(&part))
-                .then_some(part);
-            (part, false)
-        };
-        RecordsJudged {
-            stream,
-            whole,
-            batch,
-        }
-    };
+    let judge = |received| judge_received_records(&local_store, vault_name, received);
     // Each answer with whether the pull that asked for it named a memo's heads ([`UNTAKEN`]).
     type PeerRecordsFetch = (String, bool, crate::Result<PeerRecords>);
     let fetch_peers = |peers: &[String]| -> Vec<PeerRecordsFetch> {
@@ -3410,18 +3486,23 @@ fn sync_records_until(
     // with whether the pass offered the store all of it.
     let mut sent: Vec<(String, Sent, bool)> = Vec::new();
     // The batch what `url` sent brings, once `sent` notes it.
-    let mut offered = |url: &str, judged: RecordsJudged| -> Option<Vec<u8>> {
-        sent.push((url.to_owned(), judged.stream, judged.whole));
-        judged.batch
-    };
-    let mut verified_batches: Vec<Vec<u8>> = Vec::new();
+    let mut offered =
+        |url: &str, judged: RecordsJudged| -> Option<Vec<crate::membership_log::Record>> {
+            sent.push((url.to_owned(), judged.stream, judged.whole));
+            judged.batch
+        };
+    let mut verified_batches = Vec::new();
     // Each server that lacks this Mac's frontier, with the boot id its answer carried.
     let mut push_urls: Vec<(String, Option<String>)> = Vec::new();
     let mut any_answered = false;
     let mut primary_err = None;
     let mut primary_refused = false;
     match primary {
-        Ok(transport::RecordsAnswer { bytes, needs, boot }) => {
+        Ok(transport::ReceivedRecordsAnswer {
+            received,
+            needs,
+            boot,
+        }) => {
             any_answered = true;
             if primary_named.heads > 0 {
                 UNTAKEN.heard(&records_file, primary_url, needs, now);
@@ -3429,11 +3510,11 @@ fn sync_records_until(
             if !needs {
                 Reposted::satisfied(paths, primary_url);
             }
-            if bytes.is_empty() {
+            if received.byte_len() == 0 {
                 if needs {
                     push_urls.push((primary_url.clone(), boot));
                 }
-            } else if let Some(batch) = offered(primary_url, judge(bytes)) {
+            } else if let Some(batch) = offered(primary_url, judge(received)) {
                 verified_batches.push(batch);
                 if needs {
                     push_urls.push((primary_url.clone(), boot));
@@ -3460,8 +3541,8 @@ fn sync_records_until(
             Reposted::satisfied(paths, &url);
         }
         let judged = match records {
-            Brought::Read(bytes) if bytes.is_empty() => None,
-            Brought::Read(bytes) => Some(judge(bytes)),
+            Brought::Unjudged(received) if received.byte_len() == 0 => None,
+            Brought::Unjudged(received) => Some(judge(received)),
             Brought::Judged(judged) => Some(judged),
         };
         match judged {
@@ -3517,8 +3598,8 @@ fn sync_records_until(
         let rooted = store.log().is_some();
         let mut any_ingested = false;
         let mut last_ingest_err = None;
-        for batch in &verified_batches {
-            match store.ingest(batch) {
+        for batch in verified_batches {
+            match store.ingest_records(batch) {
                 Ok(_) => any_ingested = true,
                 Err(err) => last_ingest_err = Some(err),
             }
@@ -3551,7 +3632,7 @@ fn sync_records_until(
             0
         };
         if added > 0 {
-            fsx::write_atomic(&paths.records_file(), &store.encode(), 0o600)?;
+            write_records(paths, &store)?;
         }
         // Against the store the lock holds, which is the file now: never a store read after the
         // lock, which another writer may have shrunk since. A store not kept is the file as the
@@ -3570,7 +3651,6 @@ fn sync_records_until(
     {
         // Complete records only: a server keeps the records it holds waiting on a parent in
         // memory only and serves none of them (F23, rule 7), so they bought nothing on the wire.
-        let wire = store.encode_held();
         let frontier = sha256(&store.frontier().concat());
         let have = store.have();
         let due: Vec<Due<'_>> = push_urls
@@ -3579,12 +3659,7 @@ fn sync_records_until(
                 let boot = boot.as_deref();
                 let (past, posting) = match Reposted::due(paths, url, &frontier, boot)? {
                     Repost::Whole { boot_reset } => (None, Posting::Whole { boot_reset }),
-                    Repost::Past(judged) => (
-                        Some(crate::membership_log::encode_records(
-                            &store.missing(&judged),
-                        )),
-                        Posting::Past,
-                    ),
+                    Repost::Past(judged) => (Some(store.missing(&judged)), Posting::Past),
                 };
                 Some(Due {
                     url,
@@ -3594,20 +3669,27 @@ fn sync_records_until(
                 })
             })
             .collect();
-        // Every server due records is posted them at once ([`fan_out::post_records`]), all by one
+        // Whole selections share this immutable snapshot. Do not collect it until one is due:
+        // an unchanged frontier that every server judged needs no record owners or wire buffer.
+        let whole = if due.iter().any(|due| due.past.is_none()) {
+            store.missing(&[])
+        } else {
+            Vec::new()
+        };
+        // Every server due records is posted them at once ([`fan_out::post_record_selections`]), all by one
         // deadline: one that takes the post and never reads it holds this pass, and the publish
         // that ran it, for one exchange, not one each. A server due nothing past what it judged
         // is judged at once.
-        let posts: Vec<(&str, &[u8])> = due
+        let posts: Vec<(&str, &[crate::membership_log::Record])> = due
             .iter()
-            .map(|due| (due.url, due.past.as_deref().unwrap_or(&wire)))
+            .map(|due| (due.url, due.past.as_deref().unwrap_or(&whole)))
             .filter(|(_, body)| !body.is_empty())
             .collect();
         let by = posts_by.unwrap_or_else(fan_out::one_exchange);
-        let mut answers = fan_out::post_records(&posts, by).into_iter();
+        let mut answers = fan_out::post_record_selections(&posts, by).into_iter();
         for due in &due {
             // `answers` holds one answer for each non-empty body, in order.
-            if due.past.as_deref().unwrap_or(&wire).is_empty()
+            if due.past.as_deref().unwrap_or(&whole).is_empty()
                 || answers.next().is_some_and(|answer| answer.is_ok())
             {
                 Reposted::posted(
@@ -3659,7 +3741,7 @@ struct Due<'a> {
     /// The boot id the pass heard from it.
     boot: Option<&'a str>,
     /// The records past what it last judged; `None` for the whole store.
-    past: Option<Vec<u8>>,
+    past: Option<Vec<crate::membership_log::Record>>,
     posting: Posting,
 }
 
@@ -4036,11 +4118,38 @@ fn sync_repairing(
 fn sync_repairing_inner(
     paths: &Paths,
     wait: Option<Duration>,
+    repaired: Option<&mut Repaired>,
+    extra_peers: &[String],
+    allow_mirror: bool,
+    subscribing: Option<(Found<'_>, &std::cell::Cell<SourceSaid>)>,
+    posts_by: Option<Instant>,
+) -> crate::Result<SyncOutcome> {
+    sync_repairing_hearing(
+        paths,
+        wait,
+        repaired,
+        extra_peers,
+        allow_mirror,
+        subscribing,
+        posts_by,
+        &mut |_| {},
+    )
+}
+
+/// Keep the observer with the actual pass through its recursive source retries.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the transport observer accompanies the existing sync context through recursive passes"
+)]
+fn sync_repairing_hearing(
+    paths: &Paths,
+    wait: Option<Duration>,
     mut repaired: Option<&mut Repaired>,
     extra_peers: &[String],
     allow_mirror: bool,
     subscribing: Option<(Found<'_>, &std::cell::Cell<SourceSaid>)>,
     posts_by: Option<Instant>,
+    hear: &mut dyn FnMut(LocalNetworkHeard),
 ) -> crate::Result<SyncOutcome> {
     let config = configured(paths)?;
     let before = load_state(paths)?;
@@ -4066,20 +4175,25 @@ fn sync_repairing_inner(
         let http204_request =
             http204_observation::Request::start(paths, &config, after, subscriber.as_deref());
         let asked = Instant::now();
-        let observed = match (&config.source, wait) {
-            (Source::Url(_), Some(wait)) if !pending_records => transport::fetch_as_observed(
-                &config.source,
-                after,
-                wait.saturating_add(Duration::from_secs(10)),
-                subscriber.as_deref(),
-            ),
-            _ => transport::fetch_as_observed(
+        let (observed, heard) = match (&config.source, wait) {
+            (Source::Url(_), Some(wait)) if !pending_records => {
+                transport::fetch_as_observed_hearing(
+                    &config.source,
+                    after,
+                    wait.saturating_add(Duration::from_secs(10)),
+                    subscriber.as_deref(),
+                )
+            }
+            _ => transport::fetch_as_observed_hearing(
                 &config.source,
                 None,
                 Duration::from_secs(30),
                 subscriber.as_deref(),
             ),
         };
+        if let Some(heard) = heard {
+            hear(heard);
+        }
         refresh.observed(&observed);
         let http204 = observed.as_ref().ok().and_then(|observed| observed.http204);
         let mut primary_result = observed.map(|observed| observed.fetched);
@@ -4171,7 +4285,7 @@ fn sync_repairing_inner(
                         mirror_urls.extend(peers.iter().cloned());
                         if log_entries::mirror_log_to_servers(paths, &mirror_urls)?.is_some() {
                             refresh.delegated();
-                            return sync_repairing_inner(
+                            return sync_repairing_hearing(
                                 paths,
                                 None,
                                 repaired,
@@ -4179,6 +4293,7 @@ fn sync_repairing_inner(
                                 false,
                                 subscribing,
                                 posts_by,
+                                hear,
                             );
                         }
                     }
@@ -4229,7 +4344,7 @@ fn sync_repairing_inner(
             mirror_urls.extend(peer_urls().iter().cloned());
             if let Ok(Some(_)) = log_entries::mirror_log_to_servers(paths, &mirror_urls) {
                 refresh.delegated();
-                return sync_repairing_inner(
+                return sync_repairing_hearing(
                     paths,
                     None,
                     repaired,
@@ -4237,6 +4352,7 @@ fn sync_repairing_inner(
                     false,
                     subscribing,
                     posts_by,
+                    hear,
                 );
             }
         }
@@ -4267,7 +4383,7 @@ fn sync_repairing_inner(
             mirror_urls.extend(peer_urls().iter().cloned());
             if let Ok(Some(_)) = log_entries::mirror_log_to_servers(paths, &mirror_urls) {
                 refresh.delegated();
-                return sync_repairing_inner(
+                return sync_repairing_hearing(
                     paths,
                     None,
                     repaired,
@@ -4275,6 +4391,7 @@ fn sync_repairing_inner(
                     false,
                     subscribing,
                     posts_by,
+                    hear,
                 );
             }
             // A carry that could not complete (a head whose records no server has, every server
@@ -4318,7 +4435,7 @@ fn sync_repairing_inner(
                     mirror_urls.extend(peers.iter().cloned());
                     if log_entries::mirror_log_to_servers(paths, &mirror_urls)?.is_some() {
                         refresh.delegated();
-                        return sync_repairing_inner(
+                        return sync_repairing_hearing(
                             paths,
                             None,
                             repaired,
@@ -4326,6 +4443,7 @@ fn sync_repairing_inner(
                             false,
                             subscribing,
                             posts_by,
+                            hear,
                         );
                     }
                 }

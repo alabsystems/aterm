@@ -2551,6 +2551,9 @@ impl CursorGlow {
 
     /// Advance one frame: observe the cursor at `cur` (`Some(row, col)` visible, `None` hidden),
     /// spawn on a move, decay, and emit the current light quads into `out`.
+    ///
+    /// `#[inline]` on wasm32 alone, for the reason [`crate::cursor_fx::CursorFx::tick`] gives.
+    #[cfg_attr(target_arch = "wasm32", inline)]
     pub fn tick(
         &mut self,
         cur: Option<(u16, u16)>,

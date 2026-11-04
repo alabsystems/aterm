@@ -10,6 +10,8 @@ use aterm_json::Value;
 
 use super::accounts;
 use super::upgrade::{self, Dialect, SessionFile, Version};
+#[cfg(test)]
+use super::upgrade_drive::state_dir;
 use super::upgrade_drive::{
     Client, Hand, Job, Kernel, Live, Opts, Records, Report, SAME_PROGRAM, Screen,
     SessionRosterCache, St, TAIL_BYTES, Targets, Terminated, Typed, WhereWritten, alive,
@@ -18,8 +20,8 @@ use super::upgrade_drive::{
     finished_where_written, first_word, foreground_shell, held, home_carried, host_roster, ids,
     is_our_ancestor, kept_move, kernel_start, launch_kept, ledger, left_to_person, line_model_of,
     live_background, load, model_and_mark, native_root, note_stuck, now_s, owned_by_aterm,
-    process_in_tab, record_asked, restart_models, restore, roster, said, save, save_checked,
-    screen, since, squash, state_dir, sweep_lock, table, tail_to_end, take_back_ask, terminate,
+    process_in_tab, read_upgrade_dir, record_asked, restart_models, restore, roster, said, save,
+    save_checked, screen, since, squash, sweep_lock, table, tail_to_end, take_back_ask, terminate,
     turn_fenced, type_line, typing_fence, under_hand, unique_tab_for_group,
 };
 use crate::supervise::approvals;
@@ -5627,7 +5629,7 @@ fn restart_record(opts: &Opts, agent: upgrade::Agent, pid: Option<u32>) -> Optio
 }
 
 fn record_where(opts: &Opts, ours: impl Fn(&St) -> bool) -> Option<(String, St)> {
-    let dir = std::fs::read_dir(state_dir(opts)).ok()?;
+    let dir = read_upgrade_dir(&opts.state).ok()?;
     dir.flatten().find_map(|e| {
         let path = e.path();
         if path.extension().is_none_or(|x| x != "json") {
@@ -6003,7 +6005,7 @@ pub fn carry_stands(step: &str) -> bool {
 
 fn owed_record(opts: &Opts, only: Option<upgrade::Agent>) -> Option<(String, St)> {
     let tab = opts.only_sid.as_deref()?;
-    let dir = std::fs::read_dir(state_dir(opts)).ok()?;
+    let dir = read_upgrade_dir(&opts.state).ok()?;
     dir.flatten().find_map(|e| {
         let path = e.path();
         if path.extension().is_none_or(|x| x != "json") {
@@ -6049,7 +6051,7 @@ pub fn agent_resumed(opts: &Opts, snap: &Snapshot) -> bool {
     }
     let snap_start = squash(&snap.start);
     let snap_began = super::upgrade_models::parse_lstart(&snap_start);
-    let Ok(dir) = std::fs::read_dir(state_dir(opts)) else {
+    let Ok(dir) = read_upgrade_dir(&opts.state) else {
         return false;
     };
     dir.flatten().any(|e| {

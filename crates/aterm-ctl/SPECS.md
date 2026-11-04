@@ -432,9 +432,9 @@ src/verb_first_tests.rs	help_after_a_verb_first_read_is_its_entry_with_no_dial	v
 src/remote_tests.rs	a_drive_hears_a_reads_session_in_front_of_its_verb	verb-first-rewrite	
 ```
 
-## 3. Proof order
+## 3. Coverage
 
-- 236 tests read. 233 map to one of the 89 specs; 3 are not spec samples (§4).
+- 236 tests originally read (233 mapped to one of 89 specs; 3 not spec samples in §4). After subsequent deletions and additions, §1–§2 hold 92 specs and 171 mapped test rows, and the crate currently has 355 live `#[test]` functions in the tree.
 - The biggest collapses: `redial-relay-subscription` (21), `lib-exchange-reply-routing` (12), `lib-connect-phase` (8), `redial-replacement-notes` (8), `lib-terminal-safe-output` (7), `lib-client-help-reply` (7), `lib-discovery-report` (7), `redial-resume-request` (7).
 - Two tests are sampled by two specs: `src/lib_tests.rs::stream_count_ignores_incomplete_marker` (primary `lib-header-counts`, also `lib-search-incomplete-note`) and `src/redial_tests.rs::a_cut_since_less_await_log_says_to_wait_again_from_status` (primary `redial-replacement-notes`, also `redial-request-classes`). Each is deleted only when both are proved.
 - Six tests drive the shipped binary on a pty or without a socket (`tests/terminal_output.rs`, `tests/verb_help_offline.rs`) and six drive it against a fake server (`tests/inbox_metadata.rs`). Their specs have a pure half and a binary half; the binary half needs gap 8 and stays a test until then.
@@ -442,8 +442,6 @@ src/remote_tests.rs	a_drive_hears_a_reads_session_in_front_of_its_verb	verb-firs
 ## 4. Tests that are not spec samples
 
 None (`src/redial_tests.rs::serve_as_a_child_successor_if_asked` now enters as a plain helper from `a_fallen_back_stream_asks_the_next_successor_for_its_new_sessions_anchors_only`, not as a standalone `#[test]`).
-
-## 5. Open findings
 
 ## 5. Implied specs that look wrong, or tests that disagree with their names
 

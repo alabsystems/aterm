@@ -635,9 +635,7 @@ pub const fn check(bytes: &[u8]) -> Result<ParamsView<'_>, ParamsError> {
     while oi < ordered.len() {
         let mut oj = oi;
         while oj > 0 && ordered[oj - 1].0 > ordered[oj].0 {
-            let tmp = ordered[oj - 1];
-            ordered[oj - 1] = ordered[oj];
-            ordered[oj] = tmp;
+            ordered.swap(oj - 1, oj);
             oj -= 1;
         }
         oi += 1;

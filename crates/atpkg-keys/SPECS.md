@@ -283,7 +283,7 @@ tests/roster_redo_model.rs	stale_snapshot_and_clean_read_only_decisions_refine_t
 tests/roster_redo_model.rs	the_pre_redo_torn_pair_is_the_model_s_mutant_and_nothing_can_replay_it	roster-redo-refines-model	
 ```
 
-## 3. Proof order
+## 3. Coverage
 
 Dependencies: `master-seed-decode`, `master-base32-roundtrip` (pure core), `scrub-zeroes`,
 `phrase-error-message`, `vet-key-contract`, `fingerprint-format` → `master-parse-contract` →

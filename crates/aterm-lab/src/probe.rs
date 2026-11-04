@@ -1326,7 +1326,10 @@ fn run_inside(w: &World, checks: &[Check], spec_dir: &Path) -> Result<Vec<String
 /// Entry point for `aterm-lab probe-inside <spec>`.
 #[must_use]
 pub fn inside_main(args: &[String]) -> i32 {
-    let Some(text) = args.first().and_then(|p| fs::read_to_string(p).ok()) else {
+    let Some(text) = args
+        .first()
+        .and_then(|p| crate::util::read_regular_text(std::path::Path::new(p)).ok())
+    else {
         return 2;
     };
     let mut out = std::io::stdout().lock();

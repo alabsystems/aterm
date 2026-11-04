@@ -93,12 +93,16 @@ pub fn in_band(h: &astream_broker::HelloHealth) -> String {
 /// Prefix of [`in_band`] for a poisoned log.
 pub const POISONED_ROW_WORD: &str = "POISONED";
 
-/// Format what the log holds and who is attached.
+/// Format what the log holds, who is attached, and the flushes the broker's process has made
+/// (astream's `process_flushes`, `astream_sys::flush_tally` as the snapshot took it: calls, so
+/// a refused barrier and the full flush that answered it are one of each).
 #[must_use]
 pub fn holds(h: &astream_broker::BrokerHealth) -> String {
+    let flushed = &h.process_flushes;
     format!(
         "{} record(s) in {}, {} subject(s), {} pending will(s), {} group commit(s); {} \
-         connection(s), {} parked tail(s)",
+         connection(s), {} parked tail(s); {} full, {} barrier and {} plain flush(es) by its \
+         process since it started",
         h.retained_records,
         bytes(h.retained_bytes),
         h.distinct_subjects,
@@ -106,6 +110,9 @@ pub fn holds(h: &astream_broker::BrokerHealth) -> String {
         h.group_commits,
         h.active_conns,
         h.parked_tails,
+        flushed.full,
+        flushed.barrier,
+        flushed.plain,
     )
 }
 
@@ -615,6 +622,11 @@ mod tests {
         health.pid = 7;
         health.written_at_ms = 1_000;
         health.retained_records = 3;
+        health.process_flushes = astream_sys::FlushTally {
+            full: 11,
+            barrier: 13,
+            plain: 2,
+        };
         let read = |writer| HealthRead {
             health: health.clone(),
             writer,
@@ -627,7 +639,9 @@ mod tests {
             unknown,
             "- (astream's <log>.health is pid 7's, and this host cannot tell whether it still \
              serves the log, written 1m ago: 3 record(s) in 0 B, 0 subject(s), 0 pending \
-             will(s), 0 group commit(s); 0 connection(s), 0 parked tail(s))"
+             will(s), 0 group commit(s); 0 connection(s), 0 parked tail(s); 11 full, 13 \
+             barrier and 2 plain flush(es) by its process since it started)",
+            "the broker process's flushes, each kind its own count"
         );
         let other = snapshot_row(&read(HealthWriter::Serving), Some(8), 1_000);
         assert!(

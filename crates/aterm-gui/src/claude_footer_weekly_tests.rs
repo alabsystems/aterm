@@ -538,7 +538,7 @@ fn a_named_logins_tap_figure_is_its_own_and_its_restart_taps_the_login_every_rel
         Some(accounts::Roster {
             rows: vec![accounts::Row {
                 label: "main".into(),
-                class: accounts::Class::Dedicated,
+                class: accounts::Class::Preferred,
                 dir: Some(LOGIN.into()),
                 email: Some("tap@example.test".into()),
                 ..accounts::Row::default()
@@ -582,7 +582,7 @@ fn a_named_logins_tap_figure_is_its_own_and_its_restart_taps_the_login_every_rel
         let mut roster = one_row()?;
         roster.rows.push(accounts::Row {
             label: "work".into(),
-            class: accounts::Class::Dedicated,
+            class: accounts::Class::Preferred,
             dir: Some("/logins/work-2".into()),
             email: Some("work@example.test".into()),
             ..accounts::Row::default()
@@ -1233,7 +1233,7 @@ fn a_process_outside_the_default_home_reads_none_of_the_stores_week() {
         Some(accounts::Roster {
             rows: vec![accounts::Row {
                 label: aterm_agent::harness::cli::ACCOUNTS_OWN_LABEL.into(),
-                class: accounts::Class::Dedicated,
+                class: accounts::Class::Preferred,
                 dir: Some("/logins/main".into()),
                 email: Some("tap@example.test".into()),
                 ..accounts::Row::default()
@@ -1254,7 +1254,7 @@ fn a_process_outside_the_default_home_reads_none_of_the_stores_week() {
         Some(accounts::Roster {
             rows: vec![accounts::Row {
                 label: "personal".into(),
-                class: accounts::Class::Dedicated,
+                class: accounts::Class::Preferred,
                 dir: None,
                 email: Some("tap@example.test".into()),
                 ..accounts::Row::default()
@@ -1297,14 +1297,14 @@ fn a_pane_whose_gate_refused_shows_no_glance() {
             rows: vec![
                 accounts::Row {
                     label: "personal".into(),
-                    class: accounts::Class::Dedicated,
+                    class: accounts::Class::Preferred,
                     dir: None,
                     email: email.map(str::to_owned),
                     ..accounts::Row::default()
                 },
                 accounts::Row {
                     label: "alt1".into(),
-                    class: accounts::Class::Dedicated,
+                    class: accounts::Class::Preferred,
                     dir: Some("/logins/alt1".into()),
                     email: Some("alt1@example.test".into()),
                     ..accounts::Row::default()

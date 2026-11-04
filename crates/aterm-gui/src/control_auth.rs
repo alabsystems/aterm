@@ -1444,17 +1444,15 @@ fn valid_instance_component(instance: &str) -> bool {
 }
 
 fn metadata_is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
-    if metadata.file_type().is_symlink() {
-        return true;
-    }
+    let is_symlink = metadata.file_type().is_symlink();
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt as _;
-        metadata.file_attributes() & 0x400 != 0
+        is_symlink || metadata.file_attributes() & 0x400 != 0
     }
     #[cfg(not(windows))]
     {
-        false
+        is_symlink
     }
 }
 

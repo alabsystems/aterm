@@ -3585,7 +3585,8 @@ fn a_records_file_past_the_stream_cap_keeps_what_it_holds_and_records_go_on() {
                     audience: crate::membership_log::EpochAudience::Everyone,
                     epoch: [0x44; 32],
                     salt: [0x33; 32],
-                    ciphertext: vec![0x5a; crate::membership_log::entries::MAX_PUT_CIPHERTEXT],
+                    ciphertext: vec![0x5a; crate::membership_log::entries::MAX_PUT_CIPHERTEXT]
+                        .into(),
                 },
             }
             .sign(&w9, inc9)

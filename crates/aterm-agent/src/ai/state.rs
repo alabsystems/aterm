@@ -141,8 +141,9 @@ pub struct Bar {
 /// What keeps aterm's own sign-in of `f`'s row, a ladder's renewal (accounts v2's of a Claude row
 /// with an email, a pool's `renew` of its row), from running with nobody at this Mac, where
 /// something does, so the
-/// sign-in is a person's ([`sign_in_actor`]): a switch that keeps aterm's sign-ins off here,
-/// for which the step is the person's own `aterm ai login <id>`; a Claude row no route signs in
+/// sign-in is a person's ([`sign_in_actor`]): a switch that keeps aterm's unattended sign-ins off
+/// here, for which the step is the person's own `aterm ai login <id>` (which may still run that
+/// renewal at a terminal); a Claude row no route signs in
 /// unattended ([`super::facts::ClaudeAccounts::unattended`]), for which it is the row's own
 /// browser profile signed in once (`aterm harness accounts browser <label>`), after which its
 /// renewals run headless; or a pool row whose last renewal stopped for a person
@@ -160,7 +161,7 @@ pub fn bar(f: &Facts) -> Option<Bar> {
         .or_else(|| f.login_pool().and_then(|p| p.off));
     if let Some(switch) = off {
         return Some(Bar {
-            why: format!("{switch} keeps aterm's own sign-ins off here"),
+            why: format!("{switch} keeps aterm's unattended sign-ins off here"),
             step: format!("aterm ai login {id}"),
         });
     }
@@ -1065,8 +1066,10 @@ impl Health {
     /// aterm runs itself: `aterm ai doctor`, which tries aterm's own fixes, at a terminal or
     /// none and under an agent too (its installs, and its sign-ins through accounts v2's or a
     /// pool's ladder), and promises none of them, since a vendor's page or the network can stop
-    /// any; then the sign-ins no route of aterm's makes, each with the verb a person
-    /// starts it by, then what a person does where a sign-in starts nothing until then
+    /// any; then the sign-ins aterm does not make unattended (where a switch keeps its own
+    /// sign-ins off, the person's `aterm ai login` at a terminal may still run one of its routes
+    /// for them), each with the verb a person starts it by, then what a person does where a
+    /// sign-in starts nothing until then
     /// ([`Health::mends`]); `None` where no row needs an act.
     #[must_use]
     pub fn next(&self) -> Option<String> {
@@ -1089,7 +1092,7 @@ impl Health {
             .then(|| format!("`aterm ai doctor` tries {} itself", and_list(&untried)));
         let person = (!self.by_person.is_empty()).then(|| {
             format!(
-                "a person signs {} in once at this Mac ({}): no route of aterm's does",
+                "a person signs {} in once at this Mac ({}), which aterm does not do unattended",
                 and_list(&self.by_person),
                 self.logins()
             )
@@ -1104,8 +1107,8 @@ impl Health {
     }
 
     /// The `NEEDS YOU:` line for what only a person can give ([`Health::by_person`],
-    /// [`Health::mends`]): each sign-in no route of aterm's makes, once, and what a person does
-    /// where a sign-in starts nothing until then; `None` where aterm makes every fix itself.
+    /// [`Health::mends`]): each sign-in aterm does not make unattended, once, and what a person
+    /// does where a sign-in starts nothing until then; `None` where aterm makes every fix itself.
     #[must_use]
     pub fn needs_you(&self) -> Option<String> {
         let signs = (!self.by_person.is_empty()).then(|| {

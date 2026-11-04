@@ -25,6 +25,9 @@ use aterm_capacity::{
 };
 use aterm_json::{Map, Value};
 
+#[path = "capacity_cpu.rs"]
+mod cpu;
+
 /// The verb: `aterm pkg capacity [--json] [<path>]`, the volume the one holding `<path>` (the working directory by default).
 pub(crate) fn verb(rest: &[String]) -> ExitCode {
     let mut json = false;
@@ -65,17 +68,18 @@ pub(crate) fn verb(rest: &[String]) -> ExitCode {
     };
     let now = aterm_time::unix_millis().unwrap_or(0);
     let dir = ledger.as_ref().map(Ledger::dir);
+    let cpu = cpu::Report::read(dir);
     if json {
         println!(
             "{}",
-            json_of(&reading, &volumes, dir, &claims, trees.as_ref(), now)
+            json_of(&reading, &volumes, dir, &claims, trees.as_ref(), now, &cpu)
         );
     } else {
-        for line in lines(&reading, &volumes, dir, &claims, trees.as_ref(), now) {
+        for line in lines(&reading, &volumes, dir, &claims, trees.as_ref(), now, &cpu) {
             println!("{line}");
         }
     }
-    if claims.is_err() {
+    if claims.is_err() || cpu.failed() {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
@@ -151,6 +155,7 @@ fn lines(
     claims: &Result<Vec<Record>, String>,
     trees: Option<&HashMap<u32, TreeUse>>,
     now: u64,
+    cpu: &cpu::Report,
 ) -> Vec<String> {
     let mut out = vec![
         format!(
@@ -188,6 +193,7 @@ fn lines(
             .map_or_else(|| "disk     unknown".to_owned(), disk_line),
     );
     out.extend(volumes.iter().map(disk_line));
+    out.extend(cpu.lines());
     let at = dir.map_or_else(|| "the ledger".to_owned(), |d| d.display().to_string());
     match claims {
         Err(e) => out.push(format!("claims   {at}: unreadable: {e}")),
@@ -324,9 +330,11 @@ fn json_of(
     claims: &Result<Vec<Record>, String>,
     trees: Option<&HashMap<u32, TreeUse>>,
     now: u64,
+    cpu: &cpu::Report,
 ) -> String {
     let mut o = Map::new();
     o.insert("cores".to_owned(), Value::from(r.cores));
+    o.insert("build_cpu".to_owned(), cpu.json());
     o.insert("load1".to_owned(), Value::from(r.load1));
     o.insert("load5".to_owned(), Value::from(r.load5));
     o.insert("idle_cores".to_owned(), Value::from(r.idle_cores()));

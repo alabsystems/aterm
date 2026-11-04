@@ -80,7 +80,7 @@ impl System for Seam {
 /// Serve commands on the unix socket `listen` (bound before the dial, as the guest binds
 /// its vsock port) and speak the watch connection to the unix socket `watch`, its `Hello`
 /// carrying the key the key disk file `key_disk` holds (as the guest reads its device).
-#[must_use]
+#[must_use = "handle or propagate the agent's exit status"]
 pub fn run(listen: &Path, watch: &Path, key_disk: &Path, tick: Duration) -> ExitCode {
     let say = |what: String| eprintln!("aterm-vz-agent (seam): {what}");
     let listener = match UnixListener::bind(listen) {

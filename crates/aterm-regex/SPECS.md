@@ -5,8 +5,8 @@
 
 Each §1 row states a property of `crates/aterm-regex` that its unit tests sample, to be proved through
 Trust/Clean against the compiled function; a proved spec retires the tests it subsumes. §2 maps each
-test to its specs, §3 orders the proofs, §4 names the tests that sample no spec, and §5 lists where the
-code and the intended spec disagree.
+test to its specs, §3 summarises coverage, §4 names the tests that sample no spec, §5 lists where the
+code and the intended spec disagree, and §6 orders the proofs.
 
 ## 0. Notation used in the statements
 
@@ -179,37 +179,9 @@ tests/differential.rs	zero_width_matches_are_pinned	find-iter-advance-rule	asser
 tests/fuzz.rs	generated_patterns_are_pinned	regex-reference-semantics	api-consistency
 ```
 
-## 3. Proof order
+## 3. Coverage
 
-Start with the specs that need the fewest gaps beyond 0 and 1 and unblock others:
-
-1. **`classset-byte-size`** (gaps 3): straight-line `usize` arithmetic over `size_of` constants and
-   two `Vec::len` calls, and the class term of `cost`, which `compile-size-ceiling` builds on.
-2. **`range-tables-well-formed`** (gaps 5, 7): no function body, decidable by evaluating the three
-   static range tables and `FOLD`. It is the precondition of `in_ranges` and `fold_next`, under every
-   class, fold and perl spec.
-3. **`builder-knobs`** (gaps 2, 3) with **`regex-metadata`** (gaps 3, 11): by-value field updates
-   with no loops, which the `step_limit` plumbing of `step-budget-contract` and
-   `find-iter-shared-budget` depends on.
-4. **`assertion-semantics`** and **`parse-error-render`** (gaps 3, 5; loop-free `&str` work), then
-   **`thread-list-generation`**, the lemma that lets `pikevm-refines-backtracker` quantify over every
-   cache state.
-
-The rest follows the dependency chain. Table properties (`range-tables-well-formed`, the table half of
-`fold-orbit-structure`) and the leaf contracts (`classset-byte-size`, `builder-knobs`,
-`assertion-semantics`, `thread-list-generation`, `nullable-predicate`, `complement-exact`) →
-`classset-normalize`, `fold-range-closure`, `literal-fold` → `class-denotation`,
-`ascii-bitmap-agrees` → the parser contracts (`parse-quantifier`, `parse-flag-scoping`,
-`parse-nesting-cap`, `parse-refusals`, `parse-error-render`) → the compiler contracts
-(`compile-inst-count` → `compile-size-ceiling`, `compile-terminates-linearly`,
-`compile-greed-arm-swap`, `start-anchored-exact`, `prefilter-sets`) → the VM
-(`pikevm-refines-backtracker` with `prefilter-transparent`; then `earliest-preserves-existence`,
-`step-budget-contract`, `pikevm-linear-cost`, `step-cost-lower-bound`) → the API
-(`fail-closed-wrappers`, `find-iter-advance-rule`, `find-iter-shared-budget`,
-`cut-short-sticky-shared`, `match-offsets-and-accessors`, `api-consistency`) → the refinements
-(`parse-grammar-denotation`, `compile-refines-reference`) → `regex-reference-semantics`.
-`no-panic-total`, `escape-literal`, `perl-class-tables` and `fold-table-derivation` sit beside the
-chain; the last two need a UCD model (gap 8).
+- 86 `#[test]` functions across `src/` and `tests/`: 84 spec samples in §2 + 2 non-spec bench candidates in §4.
 
 ## 4. Tests that are not spec samples
 
@@ -253,27 +225,34 @@ checks `find-iter-shared-budget` directly against `4 * one_search` without asser
 8. *(Resolved)* **Test-only `RegexBuilder::get_step_limit` removed.** `the_step_limit_is_the_thing_that_decides`
    now observes builder step limits through `build()?.step_limit()`, matching the shipped API.
 
-- **2. The table well-formedness test skips entries.** `src/unicode.rs::range_tables_are_well_formed`
-  checks `w[0].0 <= w[0].1` over `table.windows(2)`, so the last range's `lo ≤ hi`, a one-entry
-  table and `hi ≤ 0x10FFFF` go unchecked. `range-tables-well-formed` states all three.
-- **3. A pinned builtin rule differs from the shipped one.** The `file_path` rule in
-  `tests/differential.rs`'s `BUILTIN` (the corpus of `builtin_selection_patterns_are_pinned`) is not
-  `FILE_PATH_PATTERN` in `crates/aterm-selection/src/builtin_patterns.rs`, which the
-  `step_budget_tests` in `src/lib.rs` carry. Re-derive `BUILTIN` from the shipped list when the digest
-  becomes a conformance test.
-- **5. Half of a prefilter test is vacuous for most inputs.**
-  `src/compile.rs::the_prefilter_byte_map_marks_lead_bytes_only` checks that a pattern's possible
-  first code points have their lead bytes marked only when `re.is_match(one code point)`, which is
-  false for most of its patterns, so for them only the continuation-byte half runs. `prefilter-sets`
-  states the lead-byte half over every consuming pc in `K`.
-- **6. Golden digests cannot be retired by a proof alone.** The digests in `tests/differential.rs`
-  and `PINNED` in `tests/fuzz.rs` are FNV hashes recorded when the outputs agreed with the regex
-  crate. `Ref`'s agreement with the regex crate is empirical, so they become the `Ref` `ty_model!`'s
-  conformance test with a negative control, not tests to delete.
-- **7. One test mixes a spec with calibration.**
-  `src/lib.rs::a_find_iter_is_held_to_one_budget_not_one_per_match` checks a spec (one shared budget
-  truncates the iteration, `find-iter-shared-budget`) and a calibration (`one_search * 16 < 2^22`,
-  found by bisection), which goes to the bench (§4).
-- **8. The step-limit read-back is test-only.** `RegexBuilder::get_step_limit()` is `#[cfg(test)]`,
-  so `builder-knobs` states the field equality; the shipped build exposes it only through
-  `Regex::step_limit()`.
+## 6. Proof order
+
+Start with the specs that need the fewest gaps beyond 0 and 1 and unblock others:
+
+1. **`classset-byte-size`** (gaps 3): straight-line `usize` arithmetic over `size_of` constants and
+   two `Vec::len` calls, and the class term of `cost`, which `compile-size-ceiling` builds on.
+2. **`range-tables-well-formed`** (gaps 5, 7): no function body, decidable by evaluating the three
+   static range tables and `FOLD`. It is the precondition of `in_ranges` and `fold_next`, under every
+   class, fold and perl spec.
+3. **`builder-knobs`** (gaps 2, 3) with **`regex-metadata`** (gaps 3, 11): by-value field updates
+   with no loops, which the `step_limit` plumbing of `step-budget-contract` and
+   `find-iter-shared-budget` depends on.
+4. **`assertion-semantics`** and **`parse-error-render`** (gaps 3, 5; loop-free `&str` work), then
+   **`thread-list-generation`**, the lemma that lets `pikevm-refines-backtracker` quantify over every
+   cache state.
+
+The rest follows the dependency chain. Table properties (`range-tables-well-formed`, the table half of
+`fold-orbit-structure`) and the leaf contracts (`classset-byte-size`, `builder-knobs`,
+`assertion-semantics`, `thread-list-generation`, `nullable-predicate`, `complement-exact`) →
+`classset-normalize`, `fold-range-closure`, `literal-fold` → `class-denotation`,
+`ascii-bitmap-agrees` → the parser contracts (`parse-quantifier`, `parse-flag-scoping`,
+`parse-nesting-cap`, `parse-refusals`, `parse-error-render`) → the compiler contracts
+(`compile-inst-count` → `compile-size-ceiling`, `compile-terminates-linearly`,
+`compile-greed-arm-swap`, `start-anchored-exact`, `prefilter-sets`) → the VM
+(`pikevm-refines-backtracker` with `prefilter-transparent`; then `earliest-preserves-existence`,
+`step-budget-contract`, `pikevm-linear-cost`, `step-cost-lower-bound`) → the API
+(`fail-closed-wrappers`, `find-iter-advance-rule`, `find-iter-shared-budget`,
+`cut-short-sticky-shared`, `match-offsets-and-accessors`, `api-consistency`) → the refinements
+(`parse-grammar-denotation`, `compile-refines-reference`) → `regex-reference-semantics`.
+`no-panic-total`, `escape-literal`, `perl-class-tables` and `fold-table-derivation` sit beside the
+chain; the last two need a UCD model (gap 8).

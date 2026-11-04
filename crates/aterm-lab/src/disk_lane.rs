@@ -526,7 +526,7 @@ fn lane(inst: &Instance, home: &Path, mirror: &Path, v: &mut Verdict) -> Result<
         .join("Library/Application Support/aterm/harness")
         .join(aterm_agent::harness::cli::HARNESS)
         .join("disk.jsonl");
-    let rows = std::fs::read_to_string(&ledger).unwrap_or_default();
+    let rows = crate::util::read_regular_text(&ledger).unwrap_or_default();
     let removed: Vec<(u64, String)> = rows
         .lines()
         .filter_map(|l| aterm_json::from_str::<aterm_json::Value>(l).ok())
@@ -620,7 +620,7 @@ fn lane(inst: &Instance, home: &Path, mirror: &Path, v: &mut Verdict) -> Result<
         past.stdout.trim(),
         past.stderr.trim()
     );
-    let rows = std::fs::read_to_string(&ledger).unwrap_or_default();
+    let rows = crate::util::read_regular_text(&ledger).unwrap_or_default();
     let fresh: Vec<aterm_json::Value> = rows
         .lines()
         .skip(lines_before)

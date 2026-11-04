@@ -145,7 +145,7 @@ impl Words {
 /// An executable's first call in `main`, while it has one thread: asked for [`HOLD_VERB`], it
 /// becomes the holder (forking once so launchd adopts it, the parent exiting at once) and answers
 /// the exit code it ends with; otherwise `None`.
-#[must_use]
+#[must_use = "return a handled admission command's exit status to the caller"]
 pub fn entry() -> Option<std::process::ExitCode> {
     let mut args = std::env::args_os().skip(1);
     if args.next()? != HOLD_VERB {

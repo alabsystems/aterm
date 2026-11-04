@@ -42,7 +42,7 @@ fn row(label: &str, class: Class) -> Row {
 
 fn roster() -> Roster {
     Roster {
-        rows: vec![row("me", Class::Dedicated), row("alt1", Class::Dedicated)],
+        rows: vec![row("me", Class::Preferred), row("alt1", Class::Preferred)],
     }
 }
 
@@ -50,9 +50,9 @@ fn roster() -> Roster {
 fn pool_roster() -> Roster {
     Roster {
         rows: vec![
-            row("me", Class::Dedicated),
-            row("alt1", Class::Dedicated),
-            row("pool1", Class::Shared),
+            row("me", Class::Preferred),
+            row("alt1", Class::Preferred),
+            row("pool1", Class::Pool),
         ],
     }
 }
@@ -346,6 +346,321 @@ fn item_labels(rows: &[MenuRow]) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+#[test]
+fn unavailable_outlook_gallery() {
+    use crate::claude_footer::probe;
+    use aterm_agent::harness::outlook::{Refusal, Verdict};
+
+    let (gallery, _permit) =
+        crate::scripted_redraw_fixture::gallery_directory("ATERM_OUTLOOK_ACCESS_GALLERY");
+    let dir = seeded_stop();
+    let store = accounts::Store::at(dir.path());
+    let (mut state, _) = store.load(NOW).unwrap();
+    for label in ["me", "alt1"] {
+        accounts::note_auth(&mut state, label, accounts::Auth::SignedOut, NOW);
+    }
+    state.proven = false;
+    store.save(&state).unwrap();
+    let roster = roster();
+    let mut manifest = String::from(
+        "# Actual App account-card captures from synthetic local state; no provider or credentials.\nscene\tcolumns\trows\tfile\n",
+    );
+    for (name, mode, why) in [
+        ("unavailable", Mode::Early, Refusal::AccountUnavailable),
+        ("rotation-off", Mode::Off, Refusal::RotationOff),
+    ] {
+        let mut memo = OutlookMemo {
+            reads: Some(Reads {
+                policy: if mode == Mode::Off {
+                    || (Mode::Off, false)
+                } else {
+                    || (Mode::Early, false)
+                },
+                ..scratch_reads()
+            }),
+            ..Default::default()
+        };
+        let outlook = memo.at(Instant::now(), NOW, Some(&roster), false).unwrap();
+        assert_eq!(outlook.verdict, Verdict::Refused(why));
+        assert!(outlook.week.is_none() && outlook.working.is_none());
+        let (read, enrolled) = memo.held.as_ref().unwrap().read.clone().unwrap();
+        let worker_rows = crate::fact_menu::account_menu_rows_from(
+            &roster,
+            &read,
+            &enrolled,
+            mode != Mode::Off,
+            Some("me"),
+            Some("me@example.test"),
+            crate::fact_menu::SessionWeek::default(),
+            NOW,
+        );
+        let before_files = files(dir.path());
+        for cols in [120, 60] {
+            let (mut app, wid, session) = glass_with(&AT_REST, me_facts(None));
+            assert!(
+                app.proxy.is_none(),
+                "the fixture starts no live account reader"
+            );
+            app.config.serious_mode = Some(true);
+            app.config.cursor_trail = Some(false);
+            app.config.cursor_trail_style = Some("off".into());
+            app.recompute_sparkle();
+            app.pool
+                .get(session)
+                .unwrap()
+                .ctx
+                .timeline
+                .lock()
+                .unwrap()
+                .set_agent_reader_program_for_test(Some(aterm_phase::Program::Claude));
+            if app.windows[&wid].cols != cols {
+                assert!(app.apply_term_resize(wid, probe::ROWS, cols));
+            }
+            let mut screen = probe::screen_at(&AT_REST, probe::ROWS, cols);
+            screen[0] = format!("SYNTHETIC OUTLOOK · {name} · no live account");
+            probe::feed(&app, session, &screen);
+            probe::refill(&mut app, wid);
+            let _ = probe::pass(&mut app, wid);
+            app.hold_account_menu_reads_for_test();
+            let anchor = app
+                .fact_anchor(wid, session, Fact::Account)
+                .expect("account anchor");
+            app.open_fact_menu(wid, session, Fact::Account, anchor, true);
+            assert!(app.complete_account_menu_read_for_test(Ok(worker_rows.clone())));
+            app.on_claude_footer_changed(session);
+            let menu = app.autopilot_menu.as_ref().unwrap();
+            assert_eq!(item_labels(&menu.rows), ["me", "alt1"]);
+            assert!(menu.rows.iter().any(|row| matches!(row,
+                MenuRow::Note { text, .. } if text.contains(&why.words())
+            )));
+            let png = crate::scripted_redraw_fixture::headless(&mut app, |app| {
+                let (reply, receive) = std::sync::mpsc::channel();
+                app.render_image(crate::control::ImageReq {
+                    handoff: crate::control::ReplyRetentionPermit::from_own_budget(),
+                    target: crate::control_auth::ConfinedImage::in_memory(),
+                    clean: false,
+                    session: None,
+                    want_bytes: true,
+                    want_metadata: false,
+                    frame_metadata: Arc::new(std::sync::OnceLock::new()),
+                    cancel: crate::control::CaptureCancellation::new(),
+                    reply,
+                });
+                receive
+                    .recv_timeout(Duration::from_secs(60))
+                    .unwrap()
+                    .unwrap()
+                    .value
+                    .2
+                    .unwrap()
+            });
+            let rect = app
+                .autopilot_menu
+                .as_ref()
+                .expect("menu survives capture")
+                .rect
+                .expect("account card was painted");
+            let drawn = app.windows[&wid]
+                .input_scratch
+                .cells
+                .iter()
+                .skip(rect.row)
+                .take(rect.h)
+                .map(|row| {
+                    row.iter()
+                        .skip(rect.col)
+                        .take(rect.w)
+                        .map(|cell| cell.ch)
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            let drawn = drawn.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(drawn.contains(&why.words()), "{name} at {cols}: {drawn}");
+            let file = format!("outlook-{name}-{cols}.png");
+            std::fs::write(gallery.join(&file), png).unwrap();
+            manifest.push_str(&format!("{name}\t{cols}\t{}\t{file}\n", probe::ROWS));
+            app.close_autopilot_menu();
+        }
+        assert_eq!(files(dir.path()), before_files);
+    }
+    std::fs::write(gallery.join("manifest.tsv"), manifest).unwrap();
+    set_dir(None);
+}
+
+#[test]
+fn paused_outlook_gallery() {
+    use crate::claude_footer::probe;
+    use aterm_agent::harness::account_progress::{
+        AccountProgress, ProgressPhase, SESSION_AUTOPILOT_OFF_FINDING,
+    };
+    use aterm_agent::harness::outlook::{BarCell, Refusal};
+
+    let (gallery, _permit) =
+        crate::scripted_redraw_fixture::gallery_directory("ATERM_PAUSED_OUTLOOK_GALLERY");
+    let dir = seeded_stop();
+    let roster = roster();
+    let mut memo = OutlookMemo {
+        reads: Some(scratch_reads()),
+        ..Default::default()
+    };
+    let outlook = memo
+        .at(Instant::now(), NOW, Some(&roster), false)
+        .unwrap()
+        .clone();
+    assert!(outlook.week.is_some());
+    let glance = outlook.glance("me", Some(580), true).unwrap();
+    assert!(glance.verdict.is_some());
+    assert!(
+        glance
+            .bar
+            .as_ref()
+            .unwrap()
+            .0
+            .iter()
+            .any(|cell| { matches!(cell, BarCell::More | BarCell::Tick) })
+    );
+    let (read, enrolled) = memo.held.as_ref().unwrap().read.clone().unwrap();
+    let worker_rows = crate::fact_menu::account_menu_rows_from(
+        &roster,
+        &read,
+        &enrolled,
+        true,
+        Some("me"),
+        Some("me@example.test"),
+        crate::fact_menu::SessionWeek::default(),
+        NOW,
+    );
+    let before_files = files(dir.path());
+    let mut manifest = String::from(
+        "# Synthetic two-account observations, actual headless App/Painter; no provider or credentials.\nscene\tcolumns\trows\tfile\n",
+    );
+    for paused in [false, true] {
+        let name = if paused { "paused" } else { "permitted" };
+        for cols in [120, 60] {
+            let mut facts = me_facts(Some(glance.clone()));
+            if paused {
+                let mut progress = AccountProgress::unknown(NOW - 600);
+                progress.phase = ProgressPhase::Paused;
+                progress.forecasts_paused = true;
+                progress.account = Some("me".into());
+                progress.known = Some(2);
+                progress.details.push(SESSION_AUTOPILOT_OFF_FINDING.into());
+                facts.account_progress = Some(progress);
+            }
+            let (mut app, wid, session) = glass_with(&AT_REST, facts);
+            assert!(app.proxy.is_none(), "no live account reader");
+            app.config.serious_mode = Some(true);
+            app.config.cursor_trail = Some(false);
+            app.config.cursor_trail_style = Some("off".into());
+            app.recompute_sparkle();
+            let ctx = &app.pool.get(session).unwrap().ctx;
+            ctx.timeline
+                .lock()
+                .unwrap()
+                .set_agent_reader_program_for_test(Some(aterm_phase::Program::Claude));
+            if paused {
+                ctx.meta.lock().unwrap().set_autopilot(
+                    Some(aterm_agent::supervise::Autopilot::Off.word().into()),
+                    None,
+                );
+            }
+            if app.windows[&wid].cols != cols {
+                assert!(app.apply_term_resize(wid, probe::ROWS, cols));
+            }
+            let mut screen = probe::screen_at(&AT_REST, probe::ROWS, cols);
+            screen[0] = format!("SYNTHETIC TWO-ACCOUNT OUTLOOK · {name}");
+            probe::feed(&app, session, &screen);
+            probe::refill(&mut app, wid);
+            let _ = probe::pass(&mut app, wid);
+            let facts = app
+                .pool
+                .get(session)
+                .unwrap()
+                .ctx
+                .timeline
+                .lock()
+                .unwrap()
+                .claude_footer()
+                .unwrap()
+                .clone();
+            assert_eq!(facts.account_forecasts_paused(), paused);
+            assert_eq!(facts.glance.as_ref(), Some(&glance));
+            assert_eq!(snapshot().unwrap().outlook.as_deref(), Some(&outlook));
+            app.hold_account_menu_reads_for_test();
+            let anchor = app
+                .fact_anchor(wid, session, Fact::Account)
+                .expect("account anchor");
+            app.open_fact_menu(wid, session, Fact::Account, anchor, true);
+            assert!(app.complete_account_menu_read_for_test(Ok(worker_rows.clone())));
+            app.on_claude_footer_changed(session);
+            assert_eq!(
+                item_labels(&app.autopilot_menu.as_ref().unwrap().rows),
+                ["me", "alt1"]
+            );
+            assert_eq!(app.autopilot_menu.as_ref().unwrap().rows.iter().any(|row| {
+                matches!(row, MenuRow::Note { text, .. } if text.contains(&Refusal::SessionPaused.words()))
+            }), paused);
+            let png = crate::scripted_redraw_fixture::headless(&mut app, |app| {
+                let (reply, receive) = std::sync::mpsc::channel();
+                app.render_image(crate::control::ImageReq {
+                    handoff: crate::control::ReplyRetentionPermit::from_own_budget(),
+                    target: crate::control_auth::ConfinedImage::in_memory(),
+                    clean: false,
+                    session: None,
+                    want_bytes: true,
+                    want_metadata: false,
+                    frame_metadata: Arc::new(std::sync::OnceLock::new()),
+                    cancel: crate::control::CaptureCancellation::new(),
+                    reply,
+                });
+                receive
+                    .recv_timeout(Duration::from_secs(60))
+                    .unwrap()
+                    .unwrap()
+                    .value
+                    .2
+                    .unwrap()
+            });
+            let file = format!("outlook-{name}-{cols}.png");
+            std::fs::write(gallery.join(&file), png).unwrap();
+            let rect = app
+                .autopilot_menu
+                .as_ref()
+                .expect("menu survives capture")
+                .rect
+                .expect("account card was painted");
+            let drawn = app.windows[&wid]
+                .input_scratch
+                .cells
+                .iter()
+                .skip(rect.row)
+                .take(rect.h)
+                .map(|row| {
+                    row.iter()
+                        .skip(rect.col)
+                        .take(rect.w)
+                        .map(|cell| cell.ch)
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            let drawn = drawn.split_whitespace().collect::<Vec<_>>().join(" ");
+            if paused {
+                assert!(
+                    drawn.contains(&Refusal::SessionPaused.words()),
+                    "{cols}: {drawn}"
+                );
+            }
+            manifest.push_str(&format!("{name}\t{cols}\t{}\t{file}\n", probe::ROWS));
+            app.close_autopilot_menu();
+        }
+    }
+    assert_eq!(files(dir.path()), before_files);
+    std::fs::write(gallery.join("manifest.tsv"), manifest).unwrap();
+    set_dir(None);
 }
 
 fn box_drawing(s: &str) -> Option<char> {

@@ -1998,7 +1998,9 @@ fn watch(file: &str, out: &Out, mut kill: Option<(i32, u64)>) -> Result<(), Stri
     // `None` before the first look, so the first text (or its absence) is written too.
     let mut last: Option<Option<String>> = None;
     loop {
-        let text = std::fs::read_to_string(file).ok();
+        let text = steps::read_regular_file(std::path::Path::new(file))
+            .ok()
+            .and_then(|b| String::from_utf8(b).ok());
         if last.as_ref() != Some(&text) {
             match &text {
                 Some(t) => out.line("at", &t.split_whitespace().collect::<Vec<_>>().join(" ")),

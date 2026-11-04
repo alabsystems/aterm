@@ -4078,8 +4078,10 @@ mod tests {
 
     fn grant_disagreement(
         decide: &dyn Fn(bool, bool, usize) -> Result<GrantShape, RendezvousError>,
+        read: &dyn Fn(&str, &str, bool) -> Result<GrantBody, RendezvousError>,
     ) -> Option<String> {
         let model = aterm_models_update::native_update_rendezvous_grant_model();
+        let buggy = aterm_spec::interp::with_buggy(&model, 1);
         let bools = [false, true];
         for (capable, declared, offered, large) in bools.into_iter().flat_map(|a| {
             bools.into_iter().flat_map(move |b| {
@@ -4164,14 +4166,24 @@ mod tests {
                         ));
                     }
                 }
-                if sessionless && model.action_enabled("GrantOne", &state) {
+                if sessionless {
+                    // Where the sound parent refuses, the Buggy model's parent sends the empty
+                    // grant it never offered, so the successor's refusal of that grant is read
+                    // against the model's Refuse as its adoption of an offered one is against
+                    // Adopt.
+                    let parent = if model.action_enabled("GrantOne", &state) {
+                        &model
+                    } else {
+                        &buggy
+                    };
                     for action in ["GrantOne", "Send", "Take"] {
-                        step_grant(&model, &mut state, action);
+                        step_grant(parent, &mut state, action);
                     }
                     let reads = empty_capable && offers_empty_grant(caps.as_deref());
-                    let adopted =
-                        parse_grant_body(&format!("{TEST_NONCE}\n\n"), TEST_NONCE, reads).is_ok();
-                    if model.action_enabled("Adopt", &state) != adopted {
+                    let adopted = read(&format!("{TEST_NONCE}\n\n"), TEST_NONCE, reads).is_ok();
+                    if parent.action_enabled("Adopt", &state) != adopted
+                        || parent.action_enabled("Refuse", &state) == adopted
+                    {
                         return Some(format!(
                             "a sessionless grant to empty capable={empty_capable} \
                              offered={empty_offered}: the successor adopts={adopted}"
@@ -4185,15 +4197,30 @@ mod tests {
 
     #[test]
     fn rendezvous_grant_conformance() {
-        assert_eq!(grant_disagreement(&grant_shape), None);
+        assert_eq!(grant_disagreement(&grant_shape, &parse_grant_body), None);
         assert!(
-            grant_disagreement(&|_, empty, sessions| grant_shape(true, empty, sessions)).is_some(),
+            grant_disagreement(
+                &|_, empty, sessions| grant_shape(true, empty, sessions),
+                &parse_grant_body
+            )
+            .is_some(),
             "a parent that ignores the claim must disagree with the model"
         );
         assert!(
-            grant_disagreement(&|chunks, _, sessions| grant_shape(chunks, true, sessions))
-                .is_some(),
+            grant_disagreement(
+                &|chunks, _, sessions| grant_shape(chunks, true, sessions),
+                &parse_grant_body
+            )
+            .is_some(),
             "a parent that sends an empty grant it never offered must disagree with the model"
+        );
+        assert!(
+            grant_disagreement(&grant_shape, &|body, nonce, _| parse_grant_body(
+                body, nonce, true
+            ))
+            .is_some(),
+            "a successor that adopts an empty grant it was never offered must disagree with the \
+             model"
         );
     }
 }

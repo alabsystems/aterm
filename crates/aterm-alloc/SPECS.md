@@ -108,7 +108,7 @@ tests/panic_drop_parity.rs	array_vec_retain_drops_each_element_once_when_a_rejec
 - `av-refines-bounded-vec` is what the whole differential file samples: once it is proved, the
   per-op parity tests in `tests/arrayvec_differential.rs` have no remaining job.
 
-## 4. Tests missing from §2
+## 4. Tests that are not spec samples
 
 None: `src/lib.rs::alloc_const_helpers_round_trip` and
 `src/small_vec.rs::into_iter_keeps_the_storage_variant` (§5.1) were deleted, and all 29 live

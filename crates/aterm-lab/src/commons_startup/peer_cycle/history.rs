@@ -138,7 +138,7 @@ impl Cycle<'_> {
         self.continuing_window(pid)?;
         self.checkpoint(pid, peer, lost)?;
         let config = self.recipient.cfg.join("aterm/aterm.toml");
-        let configuration = std::fs::read_to_string(&config).map_err(fail)?;
+        let configuration = crate::util::read_regular_text(&config).map_err(fail)?;
         // A fresh launch directory keeps the first process's logs. Its data roots stay exact.
         let mut launch = World::new(&configuration).map_err(fail)?;
         super::super::keep(&mut launch);

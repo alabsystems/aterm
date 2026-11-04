@@ -538,6 +538,8 @@ fn a_vendor_mailbox_read_takes_only_the_vendors_mail_sent_after_the_sign_in_bega
     let filter = MailFilter {
         senders: &fresh.senders,
         since: Some(SINCE),
+        required_account: None,
+        strict_since: false,
     };
     assert!(filter.admits(&item("noreply@kimi.ai")) && !filter.admits(&item("x@bank.example")));
     assert!(filter.admits(&item(
@@ -2882,6 +2884,8 @@ fn plus_addressed_mail_with_base_delivered_to_and_json_vendor_filters() {
     let filter = MailFilter {
         senders: &["kimi".to_owned(), "openai".to_owned()],
         since: Some(SINCE),
+        required_account: None,
+        strict_since: false,
     };
     let commented_eml =
         format!("From: noreply@kimi.ai (Kimi AI)\r\nDate: {AFTER}\r\n\r\nCode: 123456\r\n");

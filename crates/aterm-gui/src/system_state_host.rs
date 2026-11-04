@@ -70,8 +70,9 @@ pub struct InitialSetupHandlers {
     /// A person pressed for macOS's grants: save that durably and read the Access rows again.
     /// Returns whether it was saved.
     pub ask_access: fn() -> bool,
-    /// The Command Line Tools tab said Apple's Command Line Tools are installed (design §3.3):
-    /// read the GitHub repositories row again at once and wake the run waiting on them, so the
+    /// Apple's Command Line Tools are installed (design §3.3): the Command Line Tools tab said so,
+    /// or the window found them, however they came (`clt_install`'s `read_repositories_again`).
+    /// Read the GitHub repositories row again at once and wake the run waiting on them, so the
     /// page moves on without waiting for its next look.
     pub tools_installed: fn(),
     /// The window verified its own Full Disk Access grant without durable
@@ -1076,6 +1077,7 @@ impl App {
             }
         }
         self.system_state_host.latest_status = status.clone();
+        self.refresh_pending_local_network_record();
         let (status, step) = self.project_system_state_status(status);
         // A stage running is a setup pass, whatever the window asked for last:
         // Check again and Restore never run one. A pass that took the worker

@@ -12462,7 +12462,7 @@ mod tests {
     fn two_accounts() -> accounts::Roster {
         let row = |label: &str, dir: Option<&str>| accounts::Row {
             label: label.into(),
-            class: accounts::Class::Dedicated,
+            class: accounts::Class::Preferred,
             dir: dir.map(str::to_owned),
             ..accounts::Row::default()
         };
@@ -12774,7 +12774,7 @@ mod tests {
         let mut three = two.clone();
         three.rows.push(accounts::Row {
             label: "pool-a".into(),
-            class: accounts::Class::Shared,
+            class: accounts::Class::Pool,
             dir: Some("/logins/pool-a".into()),
             ..accounts::Row::default()
         });

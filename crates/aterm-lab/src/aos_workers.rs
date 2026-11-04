@@ -268,7 +268,8 @@ fn stderr_line(line: &str) {
 /// The executable could not be found or read.
 pub fn binary(faults: &[String]) -> Result<Binary, String> {
     let exe = std::env::current_exe().map_err(|e| format!("cannot name this executable: {e}"))?;
-    let bytes = std::fs::read(&exe).map_err(|e| format!("cannot read {}: {e}", exe.display()))?;
+    let bytes = crate::util::read_regular_file(&exe)
+        .map_err(|e| format!("cannot read {}: {e}", exe.display()))?;
     Ok(Binary {
         toolchain: env!("ATERM_LAB_TOOLCHAIN").to_owned(),
         build_profile: format!(

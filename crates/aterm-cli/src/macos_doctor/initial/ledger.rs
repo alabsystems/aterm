@@ -755,6 +755,15 @@ pub(super) fn read_marking_hung(root: &Path, progress: Option<Progress>, live: L
     ledger
 }
 
+/// The ledger of the run `progress` records, as it stands: [`read_marking_hung`] for a reader
+/// that writes nothing, so a stage past the hang limit reads as running past it. An empty ledger
+/// for no progress.
+pub(super) fn read(root: &Path, progress: Option<Progress>) -> Ledger {
+    progress.map_or_else(Ledger::default, |progress| {
+        load(root, progress.revision).ledger
+    })
+}
+
 /// A person pressed Check again: lift every parked stage of the current run, so its next pass
 /// runs them. Nothing for a run with no progress or a ledger a newer aterm wrote.
 ///

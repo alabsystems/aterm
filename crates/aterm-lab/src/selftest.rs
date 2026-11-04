@@ -148,7 +148,7 @@ pub fn jail_orphan(run: &Run) -> i32 {
 /// Whether the witness logged `pid`'s connection to the stub (`cmd[pid] TCP conn 127.0.0.1:<port>`).
 fn witnessed(run: &Run, pid: i32) -> bool {
     let want = format!("[{pid}] TCP conn 127.0.0.1:{}", run.port);
-    fs::read_to_string(run.run.join("sockets.log"))
+    crate::util::read_regular_text(&run.run.join("sockets.log"))
         .unwrap_or_default()
         .lines()
         .any(|l| l.ends_with(&want))
@@ -378,7 +378,7 @@ fn checks(run: &Run) -> Result<Checks, Fail> {
     print!("{}", members_table(&members));
     let before = members.unwrap_or_default();
     println!("== the witness's lines for the orphan");
-    for l in fs::read_to_string(run.run.join("sockets.log"))
+    for l in crate::util::read_regular_text(&run.run.join("sockets.log"))
         .unwrap_or_default()
         .lines()
         .filter(|l| l.contains(&format!("[{orphan}]")))
@@ -412,8 +412,8 @@ fn checks(run: &Run) -> Result<Checks, Fail> {
         "the forced card showed, the card went, the harness dismissed it (DISMISSED journaled), the composer is empty",
         cycle == 0,
     );
-    let sockets = fs::read_to_string(run.run.join("sockets.log")).unwrap_or_default();
-    let egress = fs::read_to_string(run.run.join("egress.log")).unwrap_or_default();
+    let sockets = crate::util::read_regular_text(&run.run.join("sockets.log")).unwrap_or_default();
+    let egress = crate::util::read_regular_text(&run.run.join("egress.log")).unwrap_or_default();
     let claude_talked = sockets.lines().any(|l| {
         l.split_once(" claude[")
             .and_then(|(_, rest)| rest.split_once("] TCP conn 127.0.0.1:"))

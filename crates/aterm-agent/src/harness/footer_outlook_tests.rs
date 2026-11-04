@@ -17,6 +17,95 @@ fn cells(used: usize, more: usize, tick: bool) -> [BarCell; 10] {
     })
 }
 
+#[test]
+fn paused_recovery_keeps_observations_without_forecast_segments() {
+    use crate::harness::account_progress::{AccountProgress, ProgressPhase};
+    for name in ['A', 'F'] {
+        let mut facts = scene(name);
+        let raw = facts.glance.clone().unwrap();
+        let subscription = facts.subscription.clone();
+        assert!(
+            segments(&facts)
+                .iter()
+                .any(|segment| segment.mark == OUTLOOK_MARK)
+        );
+        for (phase, paused, busy) in [
+            (ProgressPhase::Paused, false, false),
+            (ProgressPhase::Paused, false, true),
+            (ProgressPhase::Waiting, false, true),
+            (ProgressPhase::Unknown, false, true),
+            (
+                ProgressPhase::Switching {
+                    to: "alternate".into(),
+                },
+                true,
+                false,
+            ),
+        ] {
+            let mut progress = AccountProgress::unknown(100);
+            progress.phase = phase.clone();
+            progress.forecasts_paused = paused;
+            facts.account_progress = Some(progress);
+            facts.account_progress_busy = busy;
+            let known_pause = paused || phase == ProgressPhase::Paused;
+            assert_eq!(
+                facts.account_forecasts_paused(),
+                known_pause,
+                "{phase:?}, busy={busy}"
+            );
+            assert_eq!(
+                facts.account_forecast_refusal(),
+                Some(if known_pause {
+                    crate::harness::outlook::Refusal::SessionPaused
+                } else {
+                    crate::harness::outlook::Refusal::ObserverBusy
+                })
+            );
+            let view = facts.glance_view().unwrap();
+            assert_eq!((&view.reset, &view.five), (&raw.reset, &raw.five));
+            assert!(view.verdict.is_none() && view.title_verdict.is_none());
+            assert!(view.title.is_none() && view.spoken.is_none());
+            if let (Some((ten, five)), Some((raw_ten, raw_five))) = (view.bar, raw.bar) {
+                for (shown, observed) in
+                    ten.iter().chain(&five).zip(raw_ten.iter().chain(&raw_five))
+                {
+                    assert_eq!(*shown == BarCell::Used, *observed == BarCell::Used);
+                    assert!(matches!(shown, BarCell::Used | BarCell::Left));
+                }
+            }
+            let segments = segments(&facts);
+            assert!(segments.iter().all(|segment| segment.mark != OUTLOOK_MARK));
+            assert!(
+                segments
+                    .iter()
+                    .filter_map(|segment| segment.meter.as_ref())
+                    .all(|meter| {
+                        meter
+                            .drawn()
+                            .iter()
+                            .all(|cell| matches!(cell, BarCell::Used | BarCell::Left))
+                    })
+            );
+            assert_eq!(facts.subscription, subscription);
+            assert_eq!(facts.glance.as_ref(), Some(&raw));
+        }
+        facts.account_progress_busy = false;
+        for phase in [ProgressPhase::Unknown, ProgressPhase::Disabled] {
+            let mut progress = AccountProgress::unknown(101);
+            progress.phase = phase;
+            facts.account_progress = Some(progress);
+            assert!(!facts.account_forecasts_paused());
+            assert_eq!(facts.account_forecast_refusal(), None);
+            assert_eq!(facts.glance_view().as_deref(), Some(&raw));
+            assert!(
+                segments(&facts)
+                    .iter()
+                    .any(|segment| segment.mark == OUTLOOK_MARK)
+            );
+        }
+    }
+}
+
 fn half(ten: [BarCell; 10]) -> [BarCell; 5] {
     std::array::from_fn(|i| ten[i * 2 + 1].max_by_draw(ten[i * 2]))
 }

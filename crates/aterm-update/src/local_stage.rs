@@ -455,15 +455,24 @@ mod tests {
     }
     #[test]
     fn host_binding_uses_the_actual_loaded_image_and_rejects_same_path_replacement() {
-        let dir = aterm_tempfile::TempDir::new().unwrap();
+        use aterm_uds::deadline::{KeptUntilRan, ad_hoc_copy, cat_echoes};
+        use aterm_uds::spawnfd::Stdio;
+
+        let mut dir = KeptUntilRan::new(aterm_tempfile::TempDir::new().unwrap().keep());
         let app = dir.path().join("actual.app");
         let exe = app.join("Contents/MacOS/aterm");
         std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
-        std::fs::copy("/bin/sleep", &exe).unwrap();
+        ad_hoc_copy(Path::new("/bin/cat"), &exe);
         let mut child = aterm_uds::spawnfd::Command::new(&exe)
-            .arg("60")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
             .spawn()
             .unwrap();
+        // Keep the child alive after its echo proves this copy finished its first exec.
+        // Without that proof its directory must survive a failed program assessment.
+        let _input = cat_echoes(&mut child);
+        dir.ran();
         let observed = (|| -> Result<(), String> {
             let pid = i32::try_from(child.id()).map_err(|e| e.to_string())?;
             let binding = HostBinding::capture(pid)?;

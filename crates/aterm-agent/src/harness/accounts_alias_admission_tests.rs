@@ -62,7 +62,7 @@ fn represented_sync(
     };
     let row = |label: &str, email: Option<&str>, identity: &str| Row {
         label: label.into(),
-        class: Class::Dedicated,
+        class: Class::Preferred,
         dir: Some(
             bed.home
                 .join(format!("retained-{label}"))
@@ -187,7 +187,7 @@ fn represented_sync(
         label: label.into(),
         email: email.into(),
         machines: vec!["m16".into()],
-        class: Class::Dedicated,
+        class: Class::Preferred,
         browser: None,
         vendor: accounts::Vendor {
             region: None,

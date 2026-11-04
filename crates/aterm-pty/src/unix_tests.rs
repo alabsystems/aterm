@@ -96,7 +96,23 @@ fn read_or_wake_answers_exited_when_the_shell_exits_while_the_slave_is_held() {
         .stderr(aterm_uds::spawnfd::Stdio::null())
         .spawn()
         .expect("spawn the shell");
-    let exit = aterm_uds::exitwatch::exit_fd(shell.id()).expect("a live child is watchable");
+    let exit = aterm_uds::exitwatch::exit_fd(shell.id());
+    let watch_error = std::io::Error::last_os_error();
+    if exit.is_none()
+        && cfg!(target_os = "linux")
+        && watch_error.raw_os_error() == Some(38)
+        && let Some(translator) = aterm_uds::process::translator()
+    {
+        shell.kill().expect("kill the unwatchable shell");
+        shell.wait().expect("reap the unwatchable shell");
+        close_fd(master_rd);
+        close_fd(master_wr);
+        println!(
+            "NOT RUN under {translator}: unix::tests::read_or_wake_answers_exited_when_the_shell_exits_while_the_slave_is_held: pidfd_open returned ENOSYS"
+        );
+        return;
+    }
+    let exit = exit.expect("a live child is watchable");
     let mut buf = [0u8; 16];
 
     assert!(matches!(

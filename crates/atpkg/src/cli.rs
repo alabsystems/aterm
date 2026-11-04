@@ -581,6 +581,7 @@ pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
     PRIVATE_STATE_ROOT_LEAD.with(|cell| cell.set(private_lead));
     HEAD_WATCH_PASS.with(|cell| cell.set(false));
     DEFER_BUSY_FLIP.with(|cell| cell.set(false));
+    PASS_SETTLED_EMPTY.with(|cell| cell.set(false));
     if argv.first().and_then(|v| v.to_str()) == Some(crate::build_cache::registered::REGISTER_VERB)
     {
         return crate::build_cache::registered::run_hidden(&argv[1..]);
@@ -1293,10 +1294,10 @@ fn under_private_state_root() -> bool {
         || aterm_types::dirs::runs_under_private_state_root()
 }
 
-/// Whether a successful pass of `argv` (atpkg's words, as [`main_entry`] reads them) is an
-/// install or update a person expects setup to follow (`aterm pkg`'s follow-up, which also
-/// asks [`a_person_typed_this`]): `install` or `update`, its lane flags taken out as
-/// [`main_entry`] takes them (`LaneFlags`), with none of these:
+/// Whether a pass of `argv` (atpkg's words, as [`main_entry`] reads them) that ended settled
+/// ([`pass_ended_settled`]) is an install or update a person expects setup to follow (`aterm
+/// pkg`'s follow-up, which also asks [`a_person_typed_this`]): `install` or `update`, its lane
+/// flags taken out as [`main_entry`] takes them (`LaneFlags`), with none of these:
 /// - the private window's lead ([`PRIVATE_STATE_ROOT_FLAG`]), which this crate reads as a pass
 ///   under a private state root;
 /// - `--wait-lock`, the wait a spawner puts on a pass it runs and waits behind, which this crate
@@ -1325,6 +1326,31 @@ pub fn pass_finishes_setup(argv: &[std::ffi::OsString]) -> bool {
         && !help_flag_addresses_atpkg(verb, rest)
         && built_in(verb, rest).is_none()
         && !rest.iter().any(|word| is_clt_alias(word))
+}
+
+/// A whole `update`'s exit when it installed nothing on an empty store ([`pass_ended_settled`]).
+const NOTHING_INSTALLED: u8 = 2;
+
+thread_local! {
+    /// Whether the pass [`main_entry`] last ran on this thread is a whole `update` that installed
+    /// nothing because nothing here is installable, by a verdict a retry does not change
+    /// (`run_update_pass_in`'s [`IndexServes::Unserved`] and [`IndexServes::Narrowed`]).
+    static PASS_SETTLED_EMPTY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the pass [`main_entry`] last ran on this thread, which exited `code`, ended with
+/// nothing left for a pass to do, so the setup that follows a person's install or update
+/// ([`pass_finishes_setup`]) may follow it: it succeeded, or it is a whole `update` that
+/// installed nothing because this machine has nothing installable (no build for its
+/// architecture, a `[packages].exclude` or uninstalls that leave nothing), its exit 2. Every
+/// other exit, any other 2 included (a usage error, a refused install, a pass under Rosetta,
+/// every published build refused, the index unreachable as the pass re-read it, removal
+/// decisions it could not read), is not.
+#[must_use]
+pub fn pass_ended_settled(code: ExitCode) -> bool {
+    code == ExitCode::SUCCESS
+        || (code == ExitCode::from(NOTHING_INSTALLED)
+            && PASS_SETTLED_EMPTY.with(std::cell::Cell::get))
 }
 
 fn flip_policy() -> crate::quiet::FlipPolicy {
@@ -9027,6 +9053,7 @@ fn run_recorded_update_pass(
     PASS_INDEX_RESOLVE_ATTEMPTED.with(|seen| seen.set(false));
     RESOLVED_PASS_INDEX_BUILD.with(|seen| seen.set(0));
     PASS_FAILED_ONLY_FOR_ITS_INDEX.with(|only| only.set(false));
+    PASS_SETTLED_EMPTY.with(|settled| settled.set(false));
     let code = run_update_pass(layout, cfg, fetcher, installed, complete_the_set, seams);
     let outcome = aterm_update_core::pkg_check::PassOutcome::of_pass(
         successes_stamped() != stamped_before,
@@ -9609,7 +9636,7 @@ fn run_update_pass_in<'scope, 'env>(
             eprintln!("atpkg: {said}");
             record_unbuilt(layout, "*toolset*", crate::state::TOOLSET_TRANSLATED, said);
             let reached = crate::flow::live_verifications() > live_before;
-            return finish_update_pass(layout, now, reached, offline, 2);
+            return finish_update_pass(layout, now, reached, offline, NOTHING_INSTALLED);
         }
         let serves_us = match reusable_index(pass_index.as_ref(), now) {
             Some(index) => Some(index_serves(layout, fetcher, index, cfg)),
@@ -9667,6 +9694,9 @@ fn run_update_pass_in<'scope, 'env>(
             ),
         };
         eprintln!("atpkg: {said}");
+        // Only a verdict a retry does not change leaves setup to follow
+        // ([`pass_ended_settled`]): nothing published for this machine, or narrowed to nothing.
+        PASS_SETTLED_EMPTY.with(|settled| settled.set(unusable.is_some()));
         if let Some(why) = unusable
             && !stdout_is_a_person()
         {
@@ -9674,7 +9704,7 @@ fn run_update_pass_in<'scope, 'env>(
         }
         record_unbuilt(layout, "*toolset*", state, said);
         let reached = crate::flow::live_verifications() > live_before;
-        return finish_update_pass(layout, now, reached, offline, 2);
+        return finish_update_pass(layout, now, reached, offline, NOTHING_INSTALLED);
     }
     let reached = crate::flow::live_verifications() > live_before;
     let code = u8::from(failures > 0);

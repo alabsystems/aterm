@@ -3,6 +3,8 @@
 
 use std::time::{Duration, Instant};
 
+use aterm_types::control_verbs::ScreenGen;
+
 /// Minimum time between two presence records for one session.
 pub const REPUBLISH_MIN: Duration = Duration::from_secs(2);
 
@@ -169,6 +171,18 @@ pub(crate) fn clamp_pct(raw: &str, cap: usize) -> String {
     out
 }
 
+/// A presence row's `gen=` token for the screen generation `screen`: `<content_seq>:<fp16>`, its
+/// content seq and the 16 lowercase hex digits of FNV-1a/64 over its wire spelling
+/// `<epoch>.<seq>`, so two generations of one seq in different epochs read apart.
+#[must_use]
+pub(crate) fn gen_token(screen: ScreenGen) -> String {
+    format!(
+        "{}:{:016x}",
+        screen.seq,
+        aterm_hash::fnv1a_64(screen.to_string().as_bytes())
+    )
+}
+
 /// Per-session presence state remembered by the bridge.
 #[derive(Debug, Clone, Default)]
 pub struct Slot {
@@ -176,7 +190,12 @@ pub struct Slot {
     pub fields: Fields,
     /// Whether `meta` has been read into `fields`.
     pub sampled: bool,
-    /// Newest tokens sent onto the bus (including in-flight rows) and send timestamp.
+    /// The newest screen generation aterm named for the session: a status read's (its
+    /// `sessions status` row or `@<sid> status`) or an agent verdict's. A read that named none
+    /// (`gen=-`: the terminal was busy) leaves the one before ([`Slot::saw_screen`]).
+    screen: Option<ScreenGen>,
+    /// Newest row sent onto the bus (including in-flight rows), as [`Slot::on_bus`] spells it, and
+    /// send timestamp.
     published: Option<(String, Instant)>,
     /// Newest row the broker acknowledged as landed, used as fallback on refusal.
     landed: Option<(String, Instant)>,
@@ -204,20 +223,52 @@ impl Due {
 }
 
 impl Slot {
+    /// Keeps `screen` as the session's newest generation; `None` (a read that named none) keeps
+    /// the one before.
+    pub(crate) fn saw_screen(&mut self, screen: Option<ScreenGen>) {
+        if screen.is_some() {
+            self.screen = screen;
+        }
+    }
+
+    /// Whether aterm has named a generation for the session yet.
+    #[must_use]
+    pub(crate) const fn knows_screen(&self) -> bool {
+        self.screen.is_some()
+    }
+
+    /// The row's `gen=` token: [`gen_token`] of the newest generation aterm named, [`ABSENT`]
+    /// before any.
+    #[must_use]
+    pub(crate) fn row_gen(&self) -> String {
+        self.screen.map_or_else(|| ABSENT.to_string(), gen_token)
+    }
+
+    /// What a row of this slot says that [`Slot::due`] compares: the fields' tokens in `mode`,
+    /// then ` gen=-` while no generation was named. A row sent with no generation is owed again
+    /// once one is named, and a later generation alone owes no row.
+    fn on_bus(&self, mode: Mode) -> String {
+        let mut said = self.fields.tokens(mode);
+        if self.screen.is_none() {
+            said.push_str(" gen=-");
+        }
+        said
+    }
+
     /// Whether the fields owe a record now in `mode`.
     #[must_use]
     pub fn due(&self, mode: Mode, now: Instant) -> Due {
         match &self.published {
             None => Due::First,
-            Some((on_bus, _)) if *on_bus == self.fields.tokens(mode) => Due::Unchanged,
+            Some((on_bus, _)) if *on_bus == self.on_bus(mode) => Due::Unchanged,
             Some((_, at)) if now.saturating_duration_since(*at) < republish_min() => Due::Capped,
             Some(_) => Due::Changed,
         }
     }
 
-    /// Records that current `fields` in `mode` were pipelined onto the bus at `now`.
+    /// Records that the row [`Slot::on_bus`] spells in `mode` was pipelined onto the bus at `now`.
     pub(crate) fn mark_published(&mut self, mode: Mode, now: Instant) -> Marked {
-        let sent = (self.fields.tokens(mode), now);
+        let sent = (self.on_bus(mode), now);
         self.published = Some(sent.clone());
         Marked(sent)
     }
@@ -235,7 +286,7 @@ impl Slot {
     }
 }
 
-/// One presence row as [`Slot::mark_published`] sent it: its tokens and when.
+/// One presence row as [`Slot::mark_published`] sent it: what [`Slot::on_bus`] spelled, and when.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Marked((String, Instant));
 
@@ -366,6 +417,54 @@ mod tests {
         assert_eq!(slot.due(m, t0 + REPUBLISH_MIN), Due::Unchanged);
         slot.fields.set_agent(None);
         assert_eq!(slot.due(m, t0 + REPUBLISH_MIN * 2), Due::Changed);
+    }
+
+    /// A ROW SENT BEFORE ANY GENERATION IS OWED AGAIN ONCE ONE IS NAMED, and a later generation
+    /// alone owes none: the `gen=` a row says comes from status reads, never from a screen read
+    /// of its own, so a first row whose read found the terminal busy (`gen=-`) is said again
+    /// with the next read's, and a screen that moved is not, by itself, a row.
+    #[test]
+    fn a_row_sent_with_no_generation_is_owed_once_one_is_named() {
+        let t0 = Instant::now();
+        let m = Mode::Meta;
+        let mut slot = Slot::default();
+        slot.saw_screen(None);
+        assert!(!slot.knows_screen());
+        assert_eq!(slot.row_gen(), ABSENT);
+        published(&mut slot, m, t0);
+        slot.saw_screen(None);
+        assert_eq!(slot.due(m, t0 + REPUBLISH_MIN), Due::Unchanged);
+        let first = ScreenGen { epoch: 1, seq: 7 };
+        slot.saw_screen(Some(first));
+        assert_eq!(slot.row_gen(), gen_token(first));
+        assert_eq!(slot.due(m, t0), Due::Capped);
+        assert_eq!(slot.due(m, t0 + REPUBLISH_MIN), Due::Changed);
+        published(&mut slot, m, t0 + REPUBLISH_MIN);
+        slot.saw_screen(Some(ScreenGen { epoch: 1, seq: 8 }));
+        slot.saw_screen(None);
+        assert_eq!(
+            slot.row_gen(),
+            gen_token(ScreenGen { epoch: 1, seq: 8 }),
+            "a read naming none keeps the newest"
+        );
+        assert_eq!(
+            slot.due(m, t0 + REPUBLISH_MIN * 3),
+            Due::Unchanged,
+            "a moved screen alone owes no row"
+        );
+    }
+
+    #[test]
+    fn a_generation_token_is_its_seq_and_a_fold_of_its_epoch_and_seq() {
+        let token = gen_token(ScreenGen { epoch: 2, seq: 41 });
+        let (seq, fold) = token.split_once(':').expect("<content_seq>:<fp16>");
+        assert_eq!(seq, "41");
+        assert_eq!(fold, format!("{:016x}", aterm_hash::fnv1a_64(b"2.41")));
+        assert_ne!(
+            token,
+            gen_token(ScreenGen { epoch: 3, seq: 41 }),
+            "one seq in two epochs reads apart"
+        );
     }
 
     #[test]

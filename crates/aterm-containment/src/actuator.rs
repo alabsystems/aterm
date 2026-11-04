@@ -256,12 +256,30 @@ mod tests {
         assert_ne!(applied_posture(true), applied_posture(false));
     }
 
-    /// Build the sandbox-exec argv the launcher builds: `sandbox-exec -p <sbpl>
-    /// <prog> <args...>`. Mirrors the wrap done in `aterm-pty::spawn_shell`.
+    /// Build the `sandbox-exec -p <sbpl> <prog> <args...>` command through the
+    /// production [`crate::sbpl::build_sandbox_wrap`] argv builder.
     #[cfg(target_os = "macos")]
     fn sandbox_wrap(sbpl: &str, prog: &str, args: &[&str]) -> aterm_uds::spawnfd::Command {
-        let mut cmd = aterm_uds::spawnfd::command(crate::sbpl::SANDBOX_EXEC_PATH);
-        cmd.arg("-p").arg(sbpl).arg(prog).args(args);
+        use std::ffi::{CString, OsStr};
+        use std::os::unix::ffi::OsStrExt as _;
+        let prog_c = CString::new(prog).expect("prog free of interior NUL");
+        let mut orig_argv = Vec::with_capacity(args.len() + 1);
+        orig_argv.push(prog_c.clone());
+        for arg in args {
+            orig_argv.push(CString::new(*arg).expect("arg free of interior NUL"));
+        }
+        let (target, wrapped) = crate::sbpl::build_sandbox_wrap(
+            crate::sbpl::SANDBOX_EXEC_PATH,
+            sbpl,
+            &prog_c,
+            &orig_argv,
+        )
+        .expect("sandbox-exec wrap");
+        let mut cmd = aterm_uds::spawnfd::command(OsStr::from_bytes(target.as_bytes()));
+        cmd.arg0(OsStr::from_bytes(wrapped[0].as_bytes()));
+        for arg in &wrapped[1..] {
+            cmd.arg(OsStr::from_bytes(arg.as_bytes()));
+        }
         cmd
     }
 

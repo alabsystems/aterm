@@ -66,8 +66,15 @@ impl Journal {
                 // Read each pass, so `[alab] journal = false` takes hold within a minute.
                 let off =
                     !super::journal::publishing(aterm_types::dirs::aterm_config_path().as_deref());
-                super::journal::flush::pass(&paths, &spool, &|| presence_live(&paths), off, now)
-                    .ok()
+                super::journal::flush::pass_with(
+                    &paths,
+                    &spool,
+                    &|| presence_live(&paths),
+                    &super::journal::place::holdings,
+                    off,
+                    now,
+                )
+                .ok()
             })
             .ok();
         if self.running.is_none() {

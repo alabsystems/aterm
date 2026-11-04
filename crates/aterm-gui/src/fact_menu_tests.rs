@@ -800,7 +800,7 @@ fn an_account_rows_store_figure_carries_its_age() {
     let roster = accounts::Roster {
         rows: vec![accounts::Row {
             label: "main".into(),
-            class: accounts::Class::Dedicated,
+            class: accounts::Class::Preferred,
             dir: None,
             ..accounts::Row::default()
         }],
@@ -837,18 +837,18 @@ fn an_account_rows_store_figure_carries_its_age() {
         rows[0].label.clone()
     };
     let label = |at: i64| label_with(at, None);
-    assert_eq!(label(NOW - 60), "main \u{b7} dedicated \u{b7} 61% left");
+    assert_eq!(label(NOW - 60), "main \u{b7} preferred \u{b7} 61% left");
     assert_eq!(
         label(NOW - 20 * 60),
-        "main \u{b7} dedicated \u{b7} 61% left \u{b7} 20m ago"
+        "main \u{b7} preferred \u{b7} 61% left \u{b7} 20m ago"
     );
     assert_eq!(
         label(NOW - 3 * 3600),
-        "main \u{b7} dedicated \u{b7} 61% left \u{b7} 3h ago"
+        "main \u{b7} preferred \u{b7} 61% left \u{b7} 3h ago"
     );
     assert_eq!(
         label(NOW - 2 * 86_400),
-        "main \u{b7} dedicated \u{b7} 61% left \u{b7} 2d ago",
+        "main \u{b7} preferred \u{b7} 61% left \u{b7} 2d ago",
         "a two-day-old reading whose week still runs"
     );
     let restamped = accounts::Sample {
@@ -860,7 +860,7 @@ fn an_account_rows_store_figure_carries_its_age() {
     };
     assert_eq!(
         label_with(NOW - 3 * 3600, Some(restamped)),
-        "main \u{b7} dedicated \u{b7} 61% left \u{b7} 3h ago",
+        "main \u{b7} preferred \u{b7} 61% left \u{b7} 3h ago",
         "a tap's note re-stamps the week it holds: as old as the window's reading"
     );
     let (rows, _) = account_menu_rows_from(
@@ -878,7 +878,7 @@ fn an_account_rows_store_figure_carries_its_age() {
         NOW,
     );
     assert_eq!(
-        rows[0].label, "main \u{b7} dedicated \u{b7} 62% left \u{b7} 40m ago",
+        rows[0].label, "main \u{b7} preferred \u{b7} 62% left \u{b7} 40m ago",
         "no store figure: the session's own, with its age"
     );
     let beside = |session: Option<&str>, at: i64| {
@@ -919,17 +919,17 @@ fn an_account_rows_store_figure_carries_its_age() {
     };
     assert_eq!(
         beside(Some("main"), NOW - 60),
-        "main \u{b7} dedicated \u{b7} 40% left",
+        "main \u{b7} preferred \u{b7} 40% left",
         "the session's own figure, read since the store's, on its own account's row"
     );
     assert_eq!(
         beside(Some("main"), NOW - 3 * 86_400),
-        "main \u{b7} dedicated \u{b7} 61% left \u{b7} 2d ago",
+        "main \u{b7} preferred \u{b7} 61% left \u{b7} 2d ago",
         "the store's, read since the session's"
     );
     assert_eq!(
         beside(Some("other"), NOW - 60),
-        "main \u{b7} dedicated \u{b7} 61% left \u{b7} 2d ago",
+        "main \u{b7} preferred \u{b7} 61% left \u{b7} 2d ago",
         "the control: another account's session figure never reaches this row"
     );
     {
@@ -963,7 +963,7 @@ fn an_account_rows_store_figure_carries_its_age() {
             NOW,
         );
         assert_eq!(
-            rows[0].label, "main \u{b7} dedicated \u{b7} 40% left \u{b7} 25m ago",
+            rows[0].label, "main \u{b7} preferred \u{b7} 40% left \u{b7} 25m ago",
             "the session's own figure wins over a warned_week when no store window figure exists"
         );
     }
@@ -1078,7 +1078,7 @@ fn the_sessions_week_reaches_the_row_its_login_is_judged_to() {
     let roster = accounts::Roster {
         rows: vec![accounts::Row {
             label: "main".into(),
-            class: accounts::Class::Dedicated,
+            class: accounts::Class::Preferred,
             dir: None,
             email: Some("main@example.test".into()),
             identity_email: Some("canonical@example.test".into()),
@@ -1126,17 +1126,17 @@ fn the_sessions_week_reaches_the_row_its_login_is_judged_to() {
     };
     assert_eq!(
         row(Some("main"), None),
-        ("main \u{b7} dedicated \u{b7} 10% left".into(), true),
+        ("main \u{b7} preferred \u{b7} 10% left".into(), true),
         "the row its login is judged to takes its newer figure, with no email to match"
     );
     let kept = (
-        "main \u{b7} dedicated \u{b7} 61% left \u{b7} 30m ago".to_string(),
+        "main \u{b7} preferred \u{b7} 61% left \u{b7} 30m ago".to_string(),
         true,
     );
     for label in [Some("main"), None] {
         assert_eq!(
             row(label, Some("canonical@example.test")),
-            ("main \u{b7} dedicated \u{b7} 10% left".into(), true),
+            ("main \u{b7} preferred \u{b7} 10% left".into(), true),
             "the provider identity selects the alias row's newer figure"
         );
         assert_eq!(
@@ -1318,35 +1318,35 @@ fn account_menu_rows_from_distinguishes_auto_login_and_disabled_rows() {
         rows: vec![
             accounts::Row {
                 label: "m15-2".into(),
-                class: accounts::Class::Dedicated,
+                class: accounts::Class::Preferred,
                 dir: None,
                 email: Some("m15-2@example.test".into()),
                 ..accounts::Row::default()
             },
             accounts::Row {
                 label: "m15-3".into(),
-                class: accounts::Class::Dedicated,
+                class: accounts::Class::Preferred,
                 dir: Some("/synthetic/m15-3".into()),
                 email: Some("m15-3@example.test".into()),
                 ..accounts::Row::default()
             },
             accounts::Row {
                 label: "m15-4".into(),
-                class: accounts::Class::Dedicated,
+                class: accounts::Class::Preferred,
                 dir: Some("/synthetic/m15-4".into()),
                 email: None,
                 ..accounts::Row::default()
             },
             accounts::Row {
                 label: "m15-5".into(),
-                class: accounts::Class::Shared,
+                class: accounts::Class::Pool,
                 dir: Some("/synthetic/m15-5".into()),
                 email: Some("m15-5@example.test".into()),
                 ..accounts::Row::default()
             },
             accounts::Row {
                 label: "m15-6".into(),
-                class: accounts::Class::Shared,
+                class: accounts::Class::Pool,
                 dir: Some("/synthetic/m15-6".into()),
                 email: None,
                 ..accounts::Row::default()
@@ -1858,7 +1858,7 @@ fn no_row_reads_full_without_a_figure() {
     const NOW: i64 = 1_790_000_000;
     let row = |label: &str, dir: Option<&str>, email: Option<&str>| accounts::Row {
         label: label.into(),
-        class: accounts::Class::Dedicated,
+        class: accounts::Class::Preferred,
         dir: dir.map(str::to_owned),
         email: email.map(str::to_owned),
         ..accounts::Row::default()

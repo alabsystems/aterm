@@ -775,6 +775,7 @@ impl App {
                     | crate::native_app::AppKind::About
                     | crate::native_app::AppKind::SystemState
                     | crate::native_app::AppKind::Recovery
+                    | crate::native_app::AppKind::Allocation
                     | crate::native_app::AppKind::Workers => None,
                 });
             if let Some(action) = action {

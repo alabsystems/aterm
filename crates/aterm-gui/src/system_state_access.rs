@@ -209,6 +209,9 @@ pub(crate) struct StepsReach {
     pub(crate) record: fn(u64, Access, AccessOutcome) -> std::io::Result<()>,
     /// The latest outcome recorded for a row in a revision.
     pub(crate) recorded: fn(u64, Access) -> Option<AccessOutcome>,
+    /// This loaded signing identity's latest Local Network step across revisions.
+    /// A prior ask permits a silent recheck without opening System State or asking again.
+    pub(crate) local_network_recorded_before: fn() -> Option<AccessOutcome>,
     /// Whether the record holds a row's `handed` in a revision: its macOS page came up then.
     pub(crate) handed: fn(u64, Access) -> bool,
     /// Whether System State is the visible view of a focused window.
@@ -259,6 +262,7 @@ impl StepsReach {
         open_pane: |_, _| false,
         record: |_, _, _| Ok(()),
         recorded: |_, _| None,
+        local_network_recorded_before: || None,
         handed: |_, _| false,
         frontmost: |_| false,
         quiet: |_, _| false,
@@ -281,6 +285,7 @@ impl StepsReach {
             open_pane: live_open_access_pane,
             record: live_record,
             recorded: live_recorded,
+            local_network_recorded_before: live_local_network_recorded_before,
             handed: live_handed,
             frontmost: App::system_state_frontmost,
             quiet: App::step_moment_is_quiet,
@@ -310,6 +315,9 @@ pub(crate) struct AccessSteps {
     /// again: a minute after one that named a LAN but had no socket, `None` once this Mac's
     /// network moves ([`Self::network_moved`]) after one that found no LAN to name.
     local_network_retry: Option<(u64, Option<Instant>)>,
+    /// A silent check heard no answer. Retry independently of window or tab focus;
+    /// this never repeats the OS permission trigger.
+    local_network_recheck: Option<(u64, Instant)>,
     /// This Mac's network moved since the step last looked for a LAN to name, as the watch
     /// started at its first such look tells it ([`StepsReach::watch_network`]).
     network_moved: Arc<AtomicBool>,
@@ -435,6 +443,7 @@ impl AccessSteps {
             local_network_read: None,
             local_network_alert: None,
             local_network_retry: None,
+            local_network_recheck: None,
             network_moved: Arc::new(AtomicBool::new(false)),
             watching_network: false,
             nothing_to_ask: false,
@@ -1286,21 +1295,58 @@ impl App {
         self.local_network_pending()
     }
 
-    /// Read the access record's Local Network row for `revision`, once per revision: a row it
-    /// already holds (an earlier process's step) makes the step done in this one. Whether this read
-    /// found it.
+    /// A fresh worker reading may have observed a grant or another process's access record.
+    /// Invalidate a pending negative read on that wake, never on every rendered frame.
+    pub(crate) fn refresh_pending_local_network_record(&mut self) {
+        if self.local_network_pending() {
+            self.access_steps.local_network_read = None;
+        }
+    }
+
+    /// Read Local Network's record once per revision or fresh worker wake. A recorded step,
+    /// prior ask of this signing identity, or an observed grant lets its silent check run
+    /// without bringing System State forward. Whether that settles this revision's trigger.
     fn local_network_on_record(&mut self, revision: u64) -> bool {
         if self.access_steps.local_network_read == Some(revision) {
             return false;
         }
         self.access_steps.local_network_read = Some(revision);
-        let recorded = (self.access_steps.reach.recorded)(revision, Access::LocalNetwork).is_some();
-        if recorded {
+        let recorded = (self.access_steps.reach.recorded)(revision, Access::LocalNetwork);
+        let previously_asked = matches!(
+            recorded.or_else(self.access_steps.reach.local_network_recorded_before),
+            Some(AccessOutcome::Triggered | AccessOutcome::Granted)
+        ) || (recorded.is_none()
+            && self
+                .system_state_host
+                .latest_status()
+                .observed
+                .iter()
+                .any(|row| {
+                    row.subject == Subject::Access(Access::LocalNetwork)
+                        && row.standing == Standing::InPlace
+                }));
+        if recorded.is_some() || previously_asked {
             self.access_steps.local_network_done = Some(revision);
             self.access_steps.local_network_retry = None;
             self.access_steps.nothing_to_ask = false;
+            if previously_asked {
+                // This is a check of an existing ask, not another OS gesture. It must run
+                // before the frontmost/quiet gates, and owns no dialog slot. Only the probe's
+                // actual answer may record Granted for this revision.
+                if recorded.is_none() && self.access_steps_allowed() {
+                    self.record_access_at(revision, Access::LocalNetwork, AccessOutcome::Triggered);
+                }
+                if self.access_steps_allowed() {
+                    (self.access_steps.reach.start_local_network_probe)(revision);
+                } else {
+                    // Keep the check due while an explicit privacy hold suppresses its timer.
+                    // Re-enabling it wakes the loop and resumes without requiring tab focus.
+                    self.access_steps.local_network_recheck = Some((revision, Instant::now()));
+                }
+            }
+            return true;
         }
-        recorded
+        false
     }
 
     /// The step moment: an access step after Local Network may put its page, panel or folder
@@ -1331,6 +1377,7 @@ impl App {
         if !self.config.swarm_enabled() {
             cancel_local_network_probe();
             self.access_steps.local_network_alert = None;
+            self.access_steps.local_network_recheck = None;
             self.release_unused_access_dialog(now);
             return;
         }
@@ -1340,6 +1387,13 @@ impl App {
         if self.access_steps.local_network_done != Some(revision) {
             return;
         }
+        self.access_steps.local_network_recheck = match probe {
+            #[cfg(any(target_os = "macos", test))]
+            LocalNetworkProbe::Unanswered => Some((revision, now + LOCAL_NETWORK_RETRY)),
+            LocalNetworkProbe::Granted => None,
+            #[cfg(any(target_os = "macos", test))]
+            LocalNetworkProbe::Refused => None,
+        };
         // An answer heard ends the alert's hold; a re-probe that heard none leaves it to the
         // person's time with the alert ([`Self::look_at_local_network_alert`]): one raised while
         // they were away still stands, unanswered, when they come back.
@@ -1451,6 +1505,15 @@ impl App {
             }
             return;
         };
+        if let Some((checked, at)) = self.access_steps.local_network_recheck {
+            if checked != revision {
+                self.access_steps.local_network_recheck = None;
+            } else if now >= at && self.access_steps_allowed() {
+                self.access_steps.local_network_recheck = None;
+                (self.access_steps.reach.start_local_network_probe)(revision);
+                return;
+            }
+        }
         if self
             .access_steps
             .local_network_retry
@@ -1783,6 +1846,16 @@ impl App {
             .map(|at| at.max(now));
         hold.chain(look)
             .chain(retry)
+            .chain(
+                self.access_steps
+                    .local_network_recheck
+                    .and_then(|(revision, at)| {
+                        (self.config.swarm_enabled()
+                            && self.access_steps_allowed()
+                            && self.access_revision() == Some(revision))
+                        .then_some(at.max(now))
+                    }),
+            )
             .chain(saves)
             .chain(self.debugger_launch.record_deadline(now))
             .min()
@@ -1953,7 +2026,9 @@ impl App {
             return None;
         }
         if self.access_steps.local_network_done != Some(revision) {
-            Some(Access::LocalNetwork)
+            // A check waiting to start is not evidence that macOS needs an answer. The
+            // actual alert above, or a refused observation in the row, names that need.
+            None
         } else if self.devtools_helper.fda_waiting() {
             Some(Access::FullDiskAccess)
         } else if self.devtools_helper.devtools_waiting() {
@@ -2908,6 +2983,11 @@ fn live_record(revision: u64, access: Access, outcome: AccessOutcome) -> std::io
 fn live_recorded(revision: u64, access: Access) -> Option<AccessOutcome> {
     let state = aterm_types::dirs::state_dir()?;
     aterm_types::macos_setup::access_record::latest(&state, revision, access)
+}
+
+fn live_local_network_recorded_before() -> Option<AccessOutcome> {
+    let state = aterm_types::dirs::state_dir()?;
+    aterm_types::macos_setup::access_record::latest_of_any_revision(&state, Access::LocalNetwork)
 }
 
 fn live_handed(revision: u64, access: Access) -> bool {

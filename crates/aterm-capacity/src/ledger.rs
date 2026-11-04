@@ -25,6 +25,9 @@ mod cohort_ledger;
 #[cfg(all(test, unix))]
 #[path = "cohort_failure_tests.rs"]
 mod failure_tests;
+#[cfg(test)]
+#[path = "legacy_claim_tests.rs"]
+mod legacy_claim_tests;
 
 /// Saved identity of the original claim guard. These numbers are observations, not a
 /// descriptor, writer, spawn receipt or permission to release a reservation.
@@ -106,16 +109,20 @@ const WROTE_LINE: usize = "{\"wrote\":}\n".len() + 20;
 /// The ledger's directory under the per-user cache: `~/Library/Caches/aterm/capacity` on macOS, `~/.cache/aterm/capacity` on Linux, `%LOCALAPPDATA%\aterm\capacity` on Windows; `None` with no home. On Unix `~` is the account database's home, whatever `$HOME` or `$XDG_CACHE_HOME` says, so a tool run under a scratch home (the lab, the release buildplan, verify's smoke stages) claims in the one ledger every session of this user reads.
 #[must_use]
 pub fn user_dir() -> Option<PathBuf> {
-    let var = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty());
-    if cfg!(windows) {
-        return var("LOCALAPPDATA").map(|d| PathBuf::from(d).join("aterm").join("capacity"));
+    #[cfg(unix)]
+    {
+        crate::build_cpu::capacity_dir().ok()
     }
-    let home = crate::account_home().or_else(|| var("HOME").map(PathBuf::from))?;
-    Some(if cfg!(target_os = "macos") {
-        home.join("Library/Caches/aterm/capacity")
-    } else {
-        home.join(".cache/aterm/capacity")
-    })
+    #[cfg(windows)]
+    {
+        std::env::var_os("LOCALAPPDATA")
+            .filter(|v| !v.is_empty())
+            .map(|d| PathBuf::from(d).join("aterm").join("capacity"))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
+    }
 }
 
 /// An admitted claim's grant.
@@ -792,10 +799,13 @@ impl Ledger {
     pub fn cohort_aware(&self) -> io::Result<bool> {
         self.check_mode()?;
         #[cfg(unix)]
-        if matches!(self.mode, Mode::Cohort(_)) {
-            return Ok(true);
+        {
+            Ok(matches!(self.mode, Mode::Cohort(_)))
         }
-        Ok(false)
+        #[cfg(not(unix))]
+        {
+            Ok(false)
+        }
     }
 
     /// Claims for an exactly represented captured checkout in this actual cohort ledger.
@@ -1070,14 +1080,21 @@ fn lock_holder(path: &Path) -> Option<u32> {
         .flatten()
 }
 
-/// Test one claim file: `Some(record)` while its holder lives, `None` for a dead holder's (removed when `reap`) or one gone meanwhile.
+/// Test one claim file: `Some(record)` while its holder lives, `None` for a dead holder's
+/// (removed when `reap`) or one gone before opening. Unknown live metadata is an error.
 fn probe(path: &Path, held: bool, reap: bool) -> io::Result<Option<Record>> {
     let file = match crate::open_regular_reader(path) {
         Ok(f) => f,
         Err(e) if ignored_claim_entry(&e) => return Ok(None),
         Err(e) => return Err(e),
     };
-    match RecordLock::try_lock(file, RECORD_MAX) {
+    probe_opened(file, path, held, reap)
+}
+
+fn probe_opened(file: File, path: &Path, held: bool, reap: bool) -> io::Result<Option<Record>> {
+    // Keep the original open description for reading: reopening the path after
+    // testing its lock could read a replacement file with a different budget.
+    match RecordLock::try_lock(file.try_clone()?, RECORD_MAX) {
         Ok(lock) => {
             if reap {
                 let _ = std::fs::remove_file(path);
@@ -1086,16 +1103,25 @@ fn probe(path: &Path, held: bool, reap: bool) -> io::Result<Option<Record>> {
             Ok(None)
         }
         Err(std::fs::TryLockError::WouldBlock) => {
-            let mut bytes = Vec::new();
-            match crate::open_regular_reader(path)
-                .and_then(|f| f.take(RECORD_MAX).read_to_end(&mut bytes))
-            {
-                Ok(_) => Ok(std::str::from_utf8(&bytes)
-                    .ok()
-                    .and_then(|text| Record::decode(text, held))),
-                Err(e) if ignored_claim_entry(&e) => Ok(None),
-                Err(e) => Err(e),
+            let invalid = |why: &str| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("capacity claim {}: {why}", path.display()),
+                )
+            };
+            if file.metadata()?.len() > RECORD_MAX {
+                return Err(invalid("locked capacity record exceeds its size bound"));
             }
+            let mut bytes = Vec::new();
+            (&file).take(RECORD_MAX).read_to_end(&mut bytes)?;
+            if file.metadata()?.len() > RECORD_MAX {
+                return Err(invalid("locked capacity record grew past its size bound"));
+            }
+            let text = std::str::from_utf8(&bytes)
+                .map_err(|_| invalid("locked capacity record is not UTF-8"))?;
+            Record::decode(text, held)
+                .map(Some)
+                .ok_or_else(|| invalid("locked capacity record has an unreadable header"))
         }
         Err(std::fs::TryLockError::Error(e)) => Err(e),
     }

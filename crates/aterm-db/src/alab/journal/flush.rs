@@ -15,6 +15,7 @@ use super::{
     book::{self, Book, Planned, Presence, WEEK},
     event::{Event, Pk},
     heard,
+    place::Holding,
     relay::Heard,
 };
 use crate::{
@@ -55,8 +56,25 @@ pub(crate) enum Flushed {
     Kept(&'static str),
 }
 
-/// One flusher pass at `now` (Unix seconds); `presence` is read only when a record is made.
-/// With the journal off (`off`, `[alab] journal = false`, [`super::publishing`]) what the spool
+/// [`pass_with`] with no holdings report, so no place row changes.
+///
+/// # Errors
+/// As [`pass_with`].
+#[cfg(test)]
+pub(crate) fn pass(
+    paths: &Paths,
+    spool: &Spool,
+    presence: &dyn Fn() -> Presence,
+    off: bool,
+    now: u64,
+) -> Result<Flushed> {
+    pass_with(paths, spool, presence, &|| None, off, now)
+}
+
+/// One flusher pass at `now` (Unix seconds); `presence` is read only when a record is made, and
+/// `holdings` (what this Mac holds that no preference here names, [`super::place`]) only once a
+/// table read is due, so a quiet minute asks the harness nothing; `None` from it leaves every
+/// place row as the book holds it. With the journal off (`off`, `[alab] journal = false`, [`super::publishing`]) what the spool
 /// and the outbox hold is dropped unpublished and folded into nothing, and the pass writes only
 /// the `sum` row that says so: once a week, and once when the journal is turned off or on.
 ///
@@ -87,10 +105,11 @@ pub(crate) enum Flushed {
         project = "aterm_db::alab::journal::model_tests::journal_transition"
     )
 )]
-pub(crate) fn pass(
+pub(crate) fn pass_with(
     paths: &Paths,
     spool: &Spool,
     presence: &dyn Fn() -> Presence,
+    holdings: &dyn Fn() -> Option<Vec<Holding>>,
     off: bool,
     now: u64,
 ) -> Result<Flushed> {
@@ -228,7 +247,11 @@ pub(crate) fn pass(
         book.save(spool)?;
         return Ok(Flushed::Idle);
     }
+    if !off && let Some(held) = holdings() {
+        book.hold(&held, now);
+    }
     let owed = !book.uses_due(n, period, now)?.is_empty()
+        || !book.places_due(n, period, now).is_empty()
         || !book.relays_due(&heard_now, &me, n, period, now)?.is_empty();
     if !book.due(&outbox, owed, now, period, under, off) {
         book.checked_at = now;

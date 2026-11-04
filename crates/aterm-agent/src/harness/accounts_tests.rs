@@ -63,9 +63,9 @@ fn roster(rows: &[(&str, Class, Option<&str>)]) -> Roster {
 
 fn three() -> Roster {
     roster(&[
-        ("main", Class::Dedicated, None),
-        ("work-2", Class::Dedicated, Some(at!("/logins/work-2"))),
-        ("pool-a", Class::Shared, Some(at!("/logins/pool-a"))),
+        ("main", Class::Preferred, None),
+        ("work-2", Class::Preferred, Some(at!("/logins/work-2"))),
+        ("pool-a", Class::Pool, Some(at!("/logins/pool-a"))),
     ])
 }
 
@@ -213,9 +213,9 @@ dir = "{}"
 fn three_here() -> Roster {
     let (work, pool) = (abs("/logins/work-2"), abs("/logins/pool-a"));
     roster(&[
-        ("main", Class::Dedicated, None),
-        ("work-2", Class::Dedicated, Some(&work)),
-        ("pool-a", Class::Shared, Some(&pool)),
+        ("main", Class::Preferred, None),
+        ("work-2", Class::Preferred, Some(&work)),
+        ("pool-a", Class::Pool, Some(&pool)),
     ])
 }
 
@@ -225,7 +225,7 @@ fn a_roster_admits_whole_in_file_order_and_a_missing_file_is_the_empty_roster() 
     assert_eq!(parsed, three_here());
     assert_eq!(
         parsed.row("pool-a").map(|r| r.class),
-        Some(Class::Shared),
+        Some(Class::Pool),
         "a row is found by its label"
     );
     assert!(parsed.row("nobody").is_none());
@@ -252,6 +252,35 @@ fn a_roster_admits_whole_in_file_order_and_a_missing_file_is_the_empty_roster() 
     let big = "# pad\n".repeat(usize::try_from(MAX_ROSTER_BYTES / 6 + 1).expect("fits"));
     std::fs::write(&path, big).expect("write");
     assert!(Roster::load(&path).is_err(), "too large");
+}
+
+/// A roster stores an order and never a claim, in the `class` word every build reads: a pool
+/// row is written `class = "shared"`, a preferred one `class = "dedicated"`, so the installed
+/// release that shares `accounts.toml` keeps loading a roster a newer build wrote, and the text
+/// reads back as the order it was written with.
+/// NEGATIVE CONTROL: with `row_text` writing no `class` word, the roster an older build reads is
+/// refused (`has no class`).
+#[test]
+fn a_roster_writes_its_order_as_the_class_every_build_reads() {
+    let dir = abs("/logins/pool-a");
+    let rows = roster(&[
+        ("main", Class::Preferred, None),
+        ("pool-a", Class::Pool, Some(&dir)),
+    ]);
+    let text: String = rows.rows.iter().map(|row| row_text(row).unwrap()).collect();
+    assert_eq!(text.matches("class = \"shared\"").count(), 1, "{text}");
+    assert_eq!(text.matches("class = \"dedicated\"").count(), 1, "{text}");
+    assert_eq!(
+        Roster::parse(&text),
+        Ok(rows.clone()),
+        "a written roster reads back"
+    );
+    assert_eq!(Roster::parse(&reference()), Ok(three_here()));
+    let bare = "[[account]]\nlabel = \"w\"\n";
+    assert!(
+        Roster::parse(bare).is_err_and(|why| why.contains("has no class")),
+        "has no class"
+    );
 }
 
 #[test]
@@ -304,8 +333,8 @@ fn every_malformed_roster_is_refused_whole_and_names_the_row_and_the_reason() {
             "row `w`: class `team` is neither",
         ),
         (
-            second("label = \"w\"\ndir = \"/x\"\n"),
-            "row `w` has no class",
+            second("label = \"w\"\npreferred = 1\ndir = \"/x\"\n"),
+            "row `w`: its preferred is a TOML integer",
         ),
         (
             second("label = \"w\"\nclass = true\ndir = \"/x\"\n"),
@@ -415,7 +444,7 @@ fn a_dir_is_used_verbatim_and_two_spellings_of_one_place_are_two_logins() {
     let spellings = spellings.each_ref().map(String::as_str);
     let mut text = String::new();
     for (i, dir) in spellings.iter().enumerate() {
-        text = append_row(&text, &format!("w{i}"), Class::Shared, Some(dir)).expect("appends");
+        text = append_row(&text, &format!("w{i}"), Class::Pool, Some(dir)).expect("appends");
     }
     let parsed = Roster::parse(&text).expect("the appended file admits");
     assert_eq!(parsed.rows.len(), spellings.len());
@@ -428,7 +457,7 @@ fn a_dir_is_used_verbatim_and_two_spellings_of_one_place_are_two_logins() {
 
     let main = Row {
         label: "main".into(),
-        class: Class::Dedicated,
+        class: Class::Preferred,
         dir: None,
         ..Row::default()
     };
@@ -447,19 +476,19 @@ fn a_dir_is_used_verbatim_and_two_spellings_of_one_place_are_two_logins() {
 
 #[test]
 fn append_row_writes_only_what_the_next_read_admits() {
-    let one = append_row("", "main", Class::Dedicated, None).expect("the first row");
+    let one = append_row("", "main", Class::Preferred, None).expect("the first row");
     assert_eq!(
-        one,
-        "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n"
+        one, "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n",
+        "the order as the class word every build reads"
     );
     let (pool, w) = (abs("/logins/pool-a"), abs("/logins/w"));
     let two =
-        append_row(one.trim_end(), "pool-a", Class::Shared, Some(&pool)).expect("the second row");
+        append_row(one.trim_end(), "pool-a", Class::Pool, Some(&pool)).expect("the second row");
     assert_eq!(
         Roster::parse(&two).expect("admits").rows,
         roster(&[
-            ("main", Class::Dedicated, None),
-            ("pool-a", Class::Shared, Some(&pool)),
+            ("main", Class::Preferred, None),
+            ("pool-a", Class::Pool, Some(&pool)),
         ])
         .rows
     );
@@ -472,7 +501,7 @@ fn append_row_writes_only_what_the_next_read_admits() {
     ];
     for (existing, label, dir, why) in cases {
         assert!(
-            append_row(existing, label, Class::Shared, dir).is_err(),
+            append_row(existing, label, Class::Pool, dir).is_err(),
             "{why}"
         );
     }
@@ -489,23 +518,23 @@ fn enrolled_is_the_rows_in_whose_login_directory_a_login_was_made() {
     let file = dir.path().join("a-file");
     std::fs::write(&file, "").expect("write");
     let r = roster(&[
-        ("main", Class::Dedicated, None),
+        ("main", Class::Preferred, None),
         (
             "work-2",
-            Class::Dedicated,
+            Class::Preferred,
             Some(made.to_str().expect("utf-8")),
         ),
         (
             "check-2",
-            Class::Dedicated,
+            Class::Preferred,
             Some(empty.to_str().expect("utf-8")),
         ),
         (
             "pool-a",
-            Class::Shared,
+            Class::Pool,
             Some(dir.path().join("absent").to_str().expect("utf-8")),
         ),
-        ("pool-b", Class::Shared, Some(file.to_str().expect("utf-8"))),
+        ("pool-b", Class::Pool, Some(file.to_str().expect("utf-8"))),
     ]);
     let labels = |r: &Roster| enrolled(r).into_iter().collect::<Vec<String>>();
     assert_eq!(
@@ -1084,8 +1113,8 @@ fn the_transactions_keep_every_map_bounded() {
     assert!(!s.sessions.contains_key("s-0000") && s.sessions.contains_key("s-0009"));
 
     let r = roster(&[
-        ("a10", Class::Dedicated, None),
-        ("a11", Class::Dedicated, Some("/logins/a11")),
+        ("a10", Class::Preferred, None),
+        ("a11", Class::Preferred, Some("/logins/a11")),
     ]);
     let mut chained = State {
         active: Some("a10".into()),
@@ -1657,8 +1686,8 @@ fn candidates_sort_by_one_key_fresh_dedicated_soonest_week_label() {
     let seen = |s: &mut State, label: &str, reset: Option<i64>| {
         assert_eq!(note_sample(s, label, week(reset), NOW).len(), 1);
     };
-    let d = Class::Dedicated;
-    let sh = Class::Shared;
+    let d = Class::Preferred;
+    let sh = Class::Pool;
 
     let r = roster(&[
         ("pool-a", sh, Some("/p")),
@@ -1706,7 +1735,7 @@ fn candidates_sort_by_one_key_fresh_dedicated_soonest_week_label() {
                 "pool-a".to_string(),
                 Ok(Rank {
                     low: false,
-                    class: Class::Shared,
+                    class: Class::Pool,
                     week_reset: None
                 })
             ),
@@ -1843,7 +1872,7 @@ fn a_spent_account_about_to_reset_is_low_and_never_a_fresh_candidate() {
 }
 
 #[test]
-fn the_wait_is_for_the_earliest_instant_and_prefers_a_dedicated_one_minutes_later() {
+fn the_wait_is_for_the_earliest_instant_and_a_preference_never_holds_it_back() {
     let r = three();
     let enrolled = all(&r);
     let until = |main: i64, work: i64, pool: i64| {
@@ -1854,22 +1883,10 @@ fn the_wait_is_for_the_earliest_instant_and_prefers_a_dedicated_one_minutes_late
         next_usable(&r, &s, &enrolled, NOW).map(|t| t - NOW)
     };
     assert_eq!(until(3 * HOUR, 2 * HOUR, 4 * HOUR), Some(2 * HOUR));
-    assert_eq!(
-        until(3 * HOUR, HOUR + 10 * MIN, HOUR),
-        Some(HOUR + 10 * MIN)
-    );
-    assert_eq!(
-        until(3 * HOUR, HOUR + DEDICATED_WAIT_S, HOUR),
-        Some(HOUR + DEDICATED_WAIT_S)
-    );
-    assert_eq!(
-        until(3 * HOUR, HOUR + DEDICATED_WAIT_S + 1, HOUR),
-        Some(HOUR)
-    );
-    assert_eq!(
-        until(HOUR + 5 * MIN, HOUR + 10 * MIN, HOUR),
-        Some(HOUR + 5 * MIN)
-    );
+    // A preferred row a minute after the pool row is not waited for: §0's "never a limit".
+    assert_eq!(until(3 * HOUR, HOUR + MIN, HOUR), Some(HOUR));
+    assert_eq!(until(3 * HOUR, HOUR + 10 * MIN, HOUR), Some(HOUR));
+    assert_eq!(until(HOUR - MIN, HOUR + 10 * MIN, HOUR), Some(HOUR - MIN));
 
     let mut s = state();
     limited(&mut s, "main", NOW + HOUR);
@@ -1898,9 +1915,8 @@ fn the_wait_is_for_the_earliest_instant_and_prefers_a_dedicated_one_minutes_late
     limited(&mut s, "pool-a", NOW + HOUR);
     assert_eq!(
         advise(&r, &s, &enrolled, &me("main"), &wall(), Mode::Early, NOW),
-        Advice::Wait {
-            until: NOW + HOUR + 10 * MIN
-        }
+        Advice::Wait { until: NOW + HOUR },
+        "the pool row resets first, so the wait is for it and not for the preferred row"
     );
 }
 
@@ -2064,7 +2080,7 @@ fn rule_4_probes_when_the_sample_is_due_and_only_then() {
         advise(&r, &s, &enrolled, &me("main"), &wall(), Mode::Early, NOW),
         Advice::Probe
     );
-    let alone = roster(&[("main", Class::Dedicated, None)]);
+    let alone = roster(&[("main", Class::Preferred, None)]);
     assert_eq!(
         ask(&alone, &s, Mode::Early, NOW),
         Advice::Stay(StayWhy::NothingDue)
@@ -4759,11 +4775,11 @@ fn a_reset_is_allowed_only_on_the_machines_own_login_with_no_other_login_on_reco
     let own = Roster::own();
     assert_eq!(
         own,
-        roster(&[("main", Class::Dedicated, None)]),
+        roster(&[("main", Class::Preferred, None)]),
         "this machine's own login, as the first `add` lists it"
     );
     assert_eq!(
-        Roster::parse(&append_row("", "main", Class::Dedicated, None).expect("a row")),
+        Roster::parse(&append_row("", "main", Class::Preferred, None).expect("a row")),
         Ok(own.clone())
     );
     assert_eq!(reset_allowed(&own, &state(), "main", started), Ok(()));
@@ -5401,7 +5417,7 @@ fn account_selection_uses_current_bindings_and_never_turns_store_errors_into_sig
     std::fs::create_dir(&login).unwrap();
     std::fs::write(login.join(".credentials.json"), "private fixture").unwrap();
     let old_login = dir.path().join("missing-old-login");
-    let mut roster = roster(&[("work", Class::Dedicated, Some(old_login.to_str().unwrap()))]);
+    let mut roster = roster(&[("work", Class::Preferred, Some(old_login.to_str().unwrap()))]);
     roster.rows[0].email = Some("work@example.test".into());
     let path = dir.path().join("accounts.toml");
     std::fs::write(
@@ -5914,7 +5930,7 @@ fn a_label_is_judged_only_for_a_stored_login_in_the_default_home() {
         assert_eq!(judged(&[(LOGIN_ENV, unlisted)]), None, "{unlisted:?}");
     }
     assert_eq!(judged_label(&Roster::default(), &stored()), None);
-    let no_default = roster(&[("work-2", Class::Dedicated, Some(at!("/logins/work-2")))]);
+    let no_default = roster(&[("work-2", Class::Preferred, Some(at!("/logins/work-2")))]);
     assert_eq!(
         judged_label(&no_default, &stored()),
         None,
@@ -5974,8 +5990,8 @@ fn an_exec_environment_that_reads_empty_names_no_login() {
 #[test]
 fn the_footer_names_an_account_only_where_two_are_listed() {
     let two = roster(&[
-        ("main", Class::Dedicated, None),
-        ("work-2", Class::Dedicated, Some(at!("/logins/work-2"))),
+        ("main", Class::Preferred, None),
+        ("work-2", Class::Preferred, Some(at!("/logins/work-2"))),
     ]);
     let on_work = env_of(&[(LOGIN_ENV, at!("/logins/work-2"))]);
     assert_eq!(footer_label(&two, &stored()), Some("main"));
@@ -5983,8 +5999,8 @@ fn the_footer_names_an_account_only_where_two_are_listed() {
     assert_eq!(footer_label(&three(), &on_work), Some("work-2"));
 
     for one in [
-        roster(&[("main", Class::Dedicated, None)]),
-        roster(&[("work-2", Class::Dedicated, Some(at!("/logins/work-2")))]),
+        roster(&[("main", Class::Preferred, None)]),
+        roster(&[("work-2", Class::Preferred, Some(at!("/logins/work-2")))]),
     ] {
         let who = if one.rows[0].dir.is_none() {
             stored()
@@ -8860,7 +8876,7 @@ fn a_kimi_row_with_an_email_names_its_region_and_only_a_known_one() {
 fn roster_identity_distinguishes_provider_realms_but_not_login_methods() {
     let first = Row {
         label: "first".into(),
-        class: Class::Dedicated,
+        class: Class::Preferred,
         dir: Some(at!("/logins/first").into()),
         email: Some("one@example.test".into()),
         vendor: Vendor {
@@ -8966,7 +8982,7 @@ fn a_codex_or_grok_row_names_its_flow_and_no_region() {
 fn a_rows_vendor_keys_are_written_back_as_parsed() {
     let row = Row {
         label: "sol".into(),
-        class: Class::Dedicated,
+        class: Class::Preferred,
         dir: Some(at!("/logins/kimi/sol").into()),
         email: Some("sol@example.com".into()),
         vendor: Vendor {

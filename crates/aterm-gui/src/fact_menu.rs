@@ -109,7 +109,7 @@ impl FactAct {
 pub(crate) struct AccountMenuRow {
     /// The canonical identity, independent of the formatted label and row order.
     pub(crate) account: AccountLabel,
-    /// The row's label on the card (`m27 · dedicated · 0% left (limited)`).
+    /// The row's label on the card (`m27 · preferred · 0% left (limited)`).
     pub(crate) label: String,
     /// Whether this account is currently active (`●` at the right edge).
     pub(crate) active: bool,
@@ -1272,8 +1272,8 @@ pub(crate) fn account_menu_rows_from(
                 })
         };
         let class_word = match row.class {
-            accounts::Class::Dedicated => "dedicated",
-            accounts::Class::Shared => "pool",
+            accounts::Class::Preferred => "preferred",
+            accounts::Class::Pool => "pool",
         };
         let has_email = auto_login && row.email.is_some();
         let avail = match (cond, pct_left, has_email) {
@@ -1340,6 +1340,7 @@ impl App {
             ..FactMenuFacts::default()
         };
         let mut key = false;
+        let mut forecast_refusal = None;
         let mut program: Option<aterm_phase::Program> = None;
         if let Some(entry) = self.pool.get(session) {
             let timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
@@ -1349,6 +1350,7 @@ impl App {
                 .as_deref()
                 .and_then(aterm_phase::program_of);
             if let Some(facts) = timeline.claude_footer() {
+                forecast_refusal = facts.account_forecast_refusal();
                 out.account_progress = facts
                     .account_progress_view()
                     .map(std::borrow::Cow::into_owned);
@@ -1414,7 +1416,14 @@ impl App {
             out.outlook = (cli == Some(aterm_agent::harness::accounts::Cli::Claude))
                 .then(crate::accounts_outlook::snapshot)
                 .flatten()
-                .and_then(|s| s.outlook.clone());
+                .and_then(|s| s.outlook.clone())
+                .map(|outlook| {
+                    if let Some(refusal) = forecast_refusal {
+                        std::sync::Arc::new(outlook.observations_only(refusal))
+                    } else {
+                        outlook
+                    }
+                });
             (out.refresh_usage, out.own_login) = match program {
                 Some(aterm_phase::Program::Muse) => (
                     true,

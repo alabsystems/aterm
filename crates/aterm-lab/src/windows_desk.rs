@@ -437,6 +437,7 @@ public static class LaneDesk {
   [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr h);
   [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
   [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(POINT point);
+  [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT point);
   [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetClassNameW(IntPtr h, StringBuilder s, int n);
   [DllImport("user32.dll")] static extern IntPtr GetWindowDpiAwarenessContext(IntPtr h);
@@ -558,16 +559,59 @@ public static class LaneDesk {
     return "client=" + c.R + "x" + c.B + " at=" + p.X + "," + p.Y + " screen=" + x + "," + y + "," + (x + GetSystemMetrics(78)) + "," + (y + GetSystemMetrics(79));
   }
 
+
+  // Move exactly the retained owned image's unique visible HWND, preserving size,
+  // z-order and activation. The caller supplies a same-DPI existing monitor.
+
+  static IntPtr OwnedWindow(uint pid, string birth, string image, string cls) {
+    var process = System.Diagnostics.Process.GetProcessById((int)pid);
+    if (process.StartTime.ToUniversalTime().Ticks.ToString() != birth ||
+        !String.Equals(process.MainModule.FileName, image, StringComparison.OrdinalIgnoreCase))
+      return IntPtr.Zero;
+    IntPtr own = IntPtr.Zero; int count = 0;
+    EnumWindows((h, l) => {
+      uint p; GetWindowThreadProcessId(h, out p);
+      var name = new StringBuilder(256); GetClassNameW(h, name, 256);
+      if (p == pid && IsWindowVisible(h) && name.ToString() == cls) { own = h; count++; }
+      return true;
+    }, IntPtr.Zero);
+    return count == 1 ? own : IntPtr.Zero;
+  }
+
+  public static string MoveOwned(uint pid, string birth, string image, string cls, int x, int y, uint dpi) {
+    var own = OwnedWindow(pid, birth, image, cls);
+    if (own == IntPtr.Zero || GetDpiForWindow(own) != dpi) return "error=owned-window-or-dpi";
+    if (!SetWindowPos(own, IntPtr.Zero, x, y, 0, 0, 0x1 | 0x4 | 0x10)) return "error=SetWindowPos";
+    if (GetDpiForWindow(own) != dpi) return "error=dpi-changed";
+    RECT rect; GetWindowRect(own, out rect);
+    return "owned-move hwnd=" + own.ToInt64().ToString("x") + " dpi=" + dpi +
+      " rect=" + rect.L + "," + rect.T + "," + rect.R + "," + rect.B + " " + Place(own);
+  }
+
   public static string Where(uint pid, string cls) {
     var h = ClassWindow(pid, cls);
     return h == IntPtr.Zero ? "error=no-window" : "place " + Place(h);
   }
 
   public static string Hit(uint pid, string cls, int x, int y) {
-    var own = ClassWindow(pid, cls);
+    return HitWindow(ClassWindow(pid, cls), x, y);
+  }
+
+  public static string HitOwned(uint pid, string birth, string image, string cls, int x, int y) {
+    var own = OwnedWindow(pid, birth, image, cls);
+    return own == IntPtr.Zero ? "error=owned-image-or-window-mismatch" : HitWindow(own, x, y);
+  }
+
+  static string HitWindow(IntPtr own, int x, int y) {
     var hit = GetAncestor(WindowFromPoint(new POINT { X = x, Y = y }), 2);
+    POINT cursor; bool known = GetCursorPos(out cursor);
+    var cursorWindow = known ? GetAncestor(WindowFromPoint(cursor), 2) : IntPtr.Zero;
     return "target-owned=" + (own != IntPtr.Zero && hit == own && GetForegroundWindow() == own ? "1" : "0") +
-      " left_down=" + ((GetAsyncKeyState(1) & 0x8000) != 0 ? "1" : "0");
+      " left_down=" + ((GetAsyncKeyState(1) & 0x8000) != 0 ? "1" : "0") +
+      " cursor=" + (known ? cursor.X + "," + cursor.Y : "unknown") +
+      " cursor-owned=" + (known && own != IntPtr.Zero && cursorWindow == own ? "1" : "0") +
+      " foreground=" + (own != IntPtr.Zero && GetForegroundWindow() == own ? "1" : "0") +
+      " owned-hwnd=" + own.ToInt64().ToString("x");
   }
 
   // Move `pid`'s window of class `cls` up or down so its client area's top is at
@@ -750,7 +794,9 @@ switch ($verb) {
   'readback' { [LaneDesk]::Readback([uint32]$args[1], $args[2], $args[3]) }
   'place' { [LaneDesk]::Where([uint32]$args[1], $args[2]) }
   'hit' { [LaneDesk]::Hit([uint32]$args[1], $args[2], [int]$args[3], [int]$args[4]) }
+  'hit-owned' { [LaneDesk]::HitOwned([uint32]$args[1], $args[2], $args[3], $args[4], [int]$args[5], [int]$args[6]) }
   'move' { [LaneDesk]::Move([uint32]$args[1], $args[2], [int]$args[3]) }
+  'move-owned' { [LaneDesk]::MoveOwned([uint32]$args[1], $args[2], $args[3], $args[4], [int]$args[5], [int]$args[6], [uint32]$args[7]) }
   'lift' { [LaneDesk]::Lift([uint32]$args[1], $args[2], [int]$args[3]) }
   default { throw "desk.ps1: unknown verb '$verb'" }
 }

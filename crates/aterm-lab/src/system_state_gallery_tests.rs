@@ -133,13 +133,6 @@ fn the_system_state_view_is_found_in_the_tab_topology() {
 }
 
 #[test]
-fn the_motion_note_says_when_frames_are_only_settled() {
-    assert!(motion_note(&[], false).contains("no ATERM_DEV_MOTION_AT_MS seam yet"));
-    assert!(motion_note(&[], true).contains("one settled frame"));
-    assert!(motion_note(&[0, 300], true).contains("0, 300 ms"));
-}
-
-#[test]
 fn a_layouts_shape_ignores_the_ticking_fingerprint() {
     let audit = |fingerprint: &str, y: &str| {
         format!(

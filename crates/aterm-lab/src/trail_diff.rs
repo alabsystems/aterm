@@ -1309,8 +1309,8 @@ fn dump_all(
                         if status.success() {
                             Ok(())
                         } else {
-                            let err =
-                                std::fs::read_to_string(path(side, i, "err")).unwrap_or_default();
+                            let err = crate::util::read_regular_text(&path(side, i, "err"))
+                                .unwrap_or_default();
                             Err(format!("{status}: {}", err.trim()))
                         }
                     })();
@@ -1336,7 +1336,7 @@ fn dump_all(
     for (side, dump) in dumps.iter_mut().enumerate() {
         for i in 0..scripts.len() {
             let p = path(side, i, "dump");
-            let text = std::fs::read_to_string(&p)
+            let text = crate::util::read_regular_text(&p)
                 .map_err(|e| not_run(format!("{}: {e}", p.display())))?;
             dump.push_str(&text);
         }
@@ -1394,7 +1394,7 @@ pub fn cmd_trail_diff(args: &[String]) -> Res {
     let untracked =
         git(&head, &["ls-files", "--others", "--exclude-standard", "-z"]).map_err(not_run)?;
     let base_toml = git(&head, &["show", &format!("{base_sha}:Cargo.toml")]).map_err(not_run)?;
-    let head_toml = std::fs::read_to_string(head.join("Cargo.toml"))
+    let head_toml = crate::util::read_regular_text(&head.join("Cargo.toml"))
         .map_err(|e| not_run(format!("the head's Cargo.toml: {e}")))?;
     let members = closure_differs(&changed, &untracked, &base_toml, &head_toml);
     if !members.is_empty() {
@@ -1434,7 +1434,7 @@ pub fn cmd_trail_diff(args: &[String]) -> Res {
     let _tree = BaseTree::stand(&head, &base_path, &base_sha, a.keep)?;
     if a.control == Some(Control::Plant) {
         let file = base_path.join(PLANT_FILE);
-        let text = std::fs::read_to_string(&file)
+        let text = crate::util::read_regular_text(&file)
             .map_err(|e| not_run(format!("the plant: {}: {e}", file.display())))?;
         let planted = plant(&text).ok_or_else(|| {
             not_run(format!(
@@ -1447,7 +1447,7 @@ pub fn cmd_trail_diff(args: &[String]) -> Res {
     }
     if a.control == Some(Control::DarkArm) {
         let file = base_path.join(DARK_ARM_FILE);
-        let text = std::fs::read_to_string(&file)
+        let text = crate::util::read_regular_text(&file)
             .map_err(|e| not_run(format!("the dark-arm plant: {}: {e}", file.display())))?;
         let planted = plant_arm(&text).ok_or_else(|| {
             not_run(format!(
@@ -1478,7 +1478,9 @@ pub fn cmd_trail_diff(args: &[String]) -> Res {
     };
     let declared: Vec<&String> = scripts
         .iter()
-        .filter(|s| std::fs::read_to_string(head.join(s)).is_ok_and(|t| declares_no_arms(&t)))
+        .filter(|s| {
+            crate::util::read_regular_text(&head.join(s)).is_ok_and(|t| declares_no_arms(&t))
+        })
         .collect();
     let report = compare_declared(
         &parsed("head", &head_dump)?,

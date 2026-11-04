@@ -84,7 +84,7 @@ fn run_case(cli: Cli, off: bool, case: i64) -> (bool, bool) {
     edit_roster(&world, cli, |roster| {
         roster.rows.push(Row {
             label: "spare".into(),
-            class: accounts::Class::Shared,
+            class: accounts::Class::Pool,
             dir: Some(spare.to_str().unwrap().into()),
             ..Row::default()
         });
@@ -428,7 +428,7 @@ fn final_launch_check_preserves_failed_overlay_exclusions() {
         edit_roster(&world, cli, |roster| {
             roster.rows.push(Row {
                 label: "spare".into(),
-                class: accounts::Class::Shared,
+                class: accounts::Class::Pool,
                 dir: Some(spare.to_str().unwrap().into()),
                 ..Row::default()
             });

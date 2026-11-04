@@ -63,6 +63,7 @@ fn person_only_refusal(action: &str) -> Option<String> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum OpenRequest {
+    Allocation { split: bool },
     Mail,
     About,
     SystemState,
@@ -169,6 +170,7 @@ pub(crate) fn parse_open(rest: &str) -> Result<OpenRequest, String> {
         WireOpenAppRequest::About => Ok(OpenRequest::About),
         WireOpenAppRequest::SystemState => Ok(OpenRequest::SystemState),
         WireOpenAppRequest::Workers => Ok(OpenRequest::Workers),
+        WireOpenAppRequest::Allocation { split } => Ok(OpenRequest::Allocation { split }),
         WireOpenAppRequest::Settings { route } => {
             let route = if route == "/" {
                 Some(crate::native_settings::SettingsRoute::Home)
@@ -354,6 +356,9 @@ impl App {
 
     pub(crate) fn open_app(&mut self, request: OpenRequest) -> Result<String, String> {
         match request {
+            OpenRequest::Allocation { split } => self
+                .open_allocation(split)
+                .map(|()| "app allocation".into()),
             OpenRequest::Mail => self
                 .open_mail_tab()
                 .then(|| "app mail".to_owned())

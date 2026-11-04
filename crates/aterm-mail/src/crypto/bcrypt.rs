@@ -31,8 +31,8 @@ impl Blowfish {
 
     fn expand_key(&mut self, key: &[u8]) {
         let mut key_pos = 0;
-        for i in 0..18 {
-            self.p[i] ^= next_u32_wrap(key, &mut key_pos);
+        for word in &mut self.p {
+            *word ^= next_u32_wrap(key, &mut key_pos);
         }
         let mut lr = [0u32; 2];
         for i in 0..9 {
@@ -77,8 +77,8 @@ impl Blowfish {
 impl Blowfish {
     pub fn salted_expand_key(&mut self, salt: &[u8], key: &[u8]) {
         let mut key_pos = 0;
-        for i in 0..18 {
-            self.p[i] ^= next_u32_wrap(key, &mut key_pos);
+        for word in &mut self.p {
+            *word ^= next_u32_wrap(key, &mut key_pos);
         }
         let mut lr = [0u32; 2];
         let mut salt_pos = 0;

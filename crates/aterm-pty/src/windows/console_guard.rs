@@ -65,7 +65,7 @@ const CLIENT_WAIT_MS: u32 = 1000;
 const SIZE_WAIT: Duration = Duration::from_millis(250);
 
 /// The front door's hook: when this process was started as one of a tab's console clients ([`FLAG`], [`LEAVE_FLAG`]), do its one write and return the exit code; otherwise `None`, and the caller carries on.
-#[must_use]
+#[must_use = "return a handled console command's exit status to the caller"]
 pub fn serve_console_client() -> Option<std::process::ExitCode> {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let code = match client_args(&args)? {

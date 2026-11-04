@@ -170,10 +170,13 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
         None
     }
     /// [`Self::at_background`] at a break the loop describes ([`IdlePoint`]: the guards a host's
-    /// fact is judged by, [`IdlePoint::held`] and [`IdlePoint::theirs`]), as
-    /// [`Self::at_idle_on`] is to [`Self::at_idle`]: a fact the host may type there goes only
-    /// where none of the guards it is judged by holds (the quiet upgrade's line: under Cruise only
-    /// a person's grace, which holds Cruise's own carry at a break too).
+    /// fact is judged by, [`IdlePoint::held`] and [`IdlePoint::theirs`], and a line the loop
+    /// holds in custody, [`IdlePoint::line_held`]), as [`Self::at_idle_on`] is to
+    /// [`Self::at_idle`]: a fact the host may type there goes only where none of the guards it is
+    /// judged by holds (the quiet upgrade's line: under Cruise only a person's grace, which holds
+    /// Cruise's own carry at a break too), and nothing it types into the agent goes while a line
+    /// is held, save the upgrade's step once the loop judged the line lost
+    /// ([`super::LineHeld::Lost`]).
     act fn at_background_on(
         &self,
         point: IdlePoint,
@@ -191,8 +194,8 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     }
     /// The host's own fact ([`Self::fact_owed`]) at such a break, judged by the guards an idle
     /// point's fact is ([`IdlePoint::held`], [`IdlePoint::theirs`]); the loop offers it only where
-    /// no draft stands in the composer and no hold is on the session, as the occupancy door's line
-    /// at such a break. A session whose turns end with its own background work still running (a
+    /// no draft stands in the composer, no line is held in custody and no hold is on the session,
+    /// as the occupancy door's line at such a break. A session whose turns end with its own background work still running (a
     /// manager awaiting its workers) reads busy for hours and comes to no idle point, so a fact
     /// offered only there would never go.
     act fn at_background_fact(&self, point: IdlePoint) -> Option<HostStep> {

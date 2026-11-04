@@ -78,7 +78,7 @@ pub(crate) fn renewal_transition(
                     if state["case"] == 2 {
                         changed.rows[0].identity_email = Some("changed@example.test".into());
                     } else {
-                        changed.rows[1].class = Class::Shared;
+                        changed.rows[1].class = Class::Pool;
                     }
                     std::fs::write(&path, append_rows("", &changed.rows).unwrap()).unwrap();
                 }

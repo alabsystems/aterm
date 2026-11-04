@@ -26,6 +26,7 @@ aterm_secrets::memoized_x25519_in_tests!();
 
 mod common;
 mod conformance_account_key;
+mod conformance_custody;
 mod conformance_disk_free_ask;
 mod conformance_disk_free_worker;
 mod conformance_disk_pass;

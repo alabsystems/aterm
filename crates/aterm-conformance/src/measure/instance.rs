@@ -541,11 +541,12 @@ fn read_log_tail(path: &Path) -> String {
     use std::io::{Read as _, Seek as _, SeekFrom};
 
     let read = || -> std::io::Result<(Vec<u8>, bool)> {
-        let mut file = crate::measure::open_regular_file(path)?;
-        let len = file.metadata()?.len();
+        let (mut file, meta) = crate::measure::open_regular_file_with_meta(path)?;
+        let len = meta.len();
         let start = len.saturating_sub(LOG_TAIL_BYTES);
         file.seek(SeekFrom::Start(start))?;
-        let mut bytes = Vec::new();
+        let cap = usize::try_from((len - start).min(LOG_TAIL_BYTES).saturating_add(1)).unwrap_or(0);
+        let mut bytes = Vec::with_capacity(cap);
         file.take(LOG_TAIL_BYTES).read_to_end(&mut bytes)?;
         Ok((bytes, start != 0))
     };

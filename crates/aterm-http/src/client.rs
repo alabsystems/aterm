@@ -423,7 +423,16 @@ impl RequestBuilder<'_> {
     /// # Errors
     /// As [`Self::send`].
     pub fn send_with_env<E: EnvSource>(self, body: &[u8], env: &E) -> Result<Response, Error> {
-        self.send_phased_with_env(body, env)
+        self.send_phased_with_env(Body::Bytes(body), env)
+            .map_err(|failed| failed.error)
+    }
+
+    /// Send a known-length body and read the whole response under its configured limit.
+    ///
+    /// # Errors
+    /// As [`Self::send`], including a streamed body that ends short or fails while reading.
+    pub fn send_body(self, body: Body<'_>) -> Result<Response, Error> {
+        self.send_phased_with_env(body, &ProcessEnv)
             .map_err(|failed| failed.error)
     }
 
@@ -432,28 +441,15 @@ impl RequestBuilder<'_> {
     /// # Errors
     /// As [`Self::send`], with its [`Phase`].
     pub fn send_phased(self, body: &[u8]) -> Result<Response, SendError> {
-        self.send_phased_with_env(body, &ProcessEnv)
+        self.send_phased_with_env(Body::Bytes(body), &ProcessEnv)
     }
 
     fn send_phased_with_env<E: EnvSource>(
         self,
-        body: &[u8],
+        body: Body<'_>,
         env: &E,
     ) -> Result<Response, SendError> {
-        let Exchange {
-            status,
-            headers,
-            body,
-        } = self.exchange_with_env(Body::Bytes(body), env)?;
-        let body = read_to_end(body.inner).map_err(|error| SendError {
-            phase: Phase::Answered,
-            error,
-        })?;
-        Ok(Response {
-            status,
-            headers,
-            body,
-        })
+        self.exchange_with_env(body, env)?.collect()
     }
 
     /// Send `body` and read the response head, leaving its body to be read from the [`Exchange`].
@@ -961,6 +957,57 @@ impl Exchange {
     pub fn into_body(self) -> BodyReader {
         self.body
     }
+
+    /// Read this response's whole body under its existing framing, limit and deadline.
+    ///
+    /// # Errors
+    /// Body framing or I/O failed, with [`Phase::Answered`].
+    pub fn collect(self) -> Result<Response, SendError> {
+        let Self {
+            status,
+            headers,
+            body,
+        } = self;
+        let body = complete_body(body, |reader| read_to_end(&mut reader.inner))?;
+        Ok(Response {
+            status,
+            headers,
+            body,
+        })
+    }
+
+    /// Consume a body incrementally, then validate and drain anything left before returning.
+    /// A consumer's successful early return cannot skip the response's remaining framing.
+    ///
+    /// # Errors
+    /// The consumer or remaining body reports an I/O/framing failure, with [`Phase::Answered`].
+    pub fn consume_body<T>(
+        self,
+        consume: impl FnOnce(&mut BodyReader) -> io::Result<T>,
+    ) -> Result<T, SendError> {
+        complete_body(self.body, |reader| consume(reader).map_err(body_error))
+    }
+}
+
+fn complete_body<T>(
+    mut body: BodyReader,
+    consume: impl FnOnce(&mut BodyReader) -> Result<T, Error>,
+) -> Result<T, SendError> {
+    let answered = |error| SendError {
+        phase: Phase::Answered,
+        error,
+    };
+    let result = consume(&mut body).map_err(answered)?;
+    let mut tail = [0; 16 * 1024];
+    while !body.inner.is_finished() {
+        match body.read(&mut tail) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(answered(body_error(error))),
+        }
+    }
+    Ok(result)
 }
 
 impl std::fmt::Debug for Exchange {
@@ -1030,6 +1077,7 @@ struct Framed<R> {
     limit: usize,
     consumed: u64,
     chunk: Chunk,
+    eof: bool,
 }
 
 impl<R: BufRead> Framed<R> {
@@ -1040,6 +1088,7 @@ impl<R: BufRead> Framed<R> {
             limit,
             consumed: 0,
             chunk: Chunk::Size,
+            eof: false,
         }
     }
 
@@ -1048,6 +1097,15 @@ impl<R: BufRead> Framed<R> {
             Framing::Empty => Some(0),
             Framing::Length(declared) => Some(wide(declared)),
             Framing::Chunked | Framing::ToEof => None,
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        match self.framing {
+            Framing::Empty => true,
+            Framing::Length(declared) => declared <= self.limit && self.consumed == wide(declared),
+            Framing::Chunked => matches!(self.chunk, Chunk::Done),
+            Framing::ToEof => self.eof,
         }
     }
 
@@ -1150,7 +1208,11 @@ impl<R: BufRead> Read for Framed<R> {
             }
             Framing::Chunked => self.read_chunked(buf),
             Framing::ToEof => {
+                if self.eof {
+                    return Ok(0);
+                }
                 let read = self.reader.read(buf)?;
+                self.eof = read == 0;
                 self.count(read)
             }
         }
@@ -1211,7 +1273,7 @@ fn body_error(error: io::Error) -> Error {
     }
 }
 
-fn read_to_end<R: BufRead>(mut body: Framed<R>) -> Result<Vec<u8>, Error> {
+fn read_to_end<R: BufRead>(body: &mut Framed<R>) -> Result<Vec<u8>, Error> {
     let mut bytes = Vec::new();
     if let Some(declared) = body.declared_len().filter(|n| *n <= wide(body.limit)) {
         let _ = bytes.try_reserve_exact(narrow(declared).min(PREALLOC_CAP));
@@ -1377,7 +1439,7 @@ fn read_response_from<R: BufRead>(
     Ok(Response {
         status: code,
         headers,
-        body: read_to_end(Framed::new(reader, framing, limit))?,
+        body: read_to_end(&mut Framed::new(reader, framing, limit))?,
     })
 }
 
@@ -1459,6 +1521,44 @@ mod tests {
     use super::*;
 
     const HANG_DETECTOR: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn close_delimited_completion_requires_a_nonempty_eof_read_and_is_stable() {
+        struct UntilEof {
+            bytes: io::Cursor<&'static [u8]>,
+            ended: bool,
+        }
+        impl Read for UntilEof {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                assert!(!self.ended, "the completed source was read again");
+                let read = self.bytes.read(bytes)?;
+                if read == 0 && !bytes.is_empty() {
+                    self.ended = true;
+                }
+                Ok(read)
+            }
+        }
+        impl BufRead for UntilEof {
+            fn fill_buf(&mut self) -> io::Result<&[u8]> {
+                self.bytes.fill_buf()
+            }
+            fn consume(&mut self, amount: usize) {
+                self.bytes.consume(amount);
+            }
+        }
+        let source = UntilEof {
+            bytes: io::Cursor::new(b"body"),
+            ended: false,
+        };
+        let mut body = Framed::new(source, Framing::ToEof, 4);
+        assert_eq!(body.read(&mut []).unwrap(), 0);
+        assert!(!body.is_finished());
+        assert!(!body.reader.ended);
+        assert_eq!(read_to_end(&mut body).unwrap(), b"body");
+        assert!(body.is_finished());
+        assert!(body.reader.ended);
+        assert_eq!(body.read(&mut [0]).unwrap(), 0);
+    }
 
     fn uri(text: &str) -> Uri {
         Uri::parse(text).unwrap()

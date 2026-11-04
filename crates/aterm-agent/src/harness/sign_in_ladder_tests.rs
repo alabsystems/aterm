@@ -663,11 +663,14 @@ fn a_run_with_no_exit_says_why_it_failed() {
     use crate::harness::cli::Renewal;
     assert_eq!(
         how_it_ended_because(Renewal::Failed, None, None, Some("it will not run")),
-        "the sign-in did not finish: it will not run"
+        format!(
+            "{}: it will not run",
+            how_it_ended(Renewal::Failed, None, None)
+        )
     );
     assert_eq!(
         how_it_ended_because(Renewal::AuthFailed, Some(1), None, Some("stale")),
-        "claude auth login exited 1 with no login made",
+        how_it_ended(Renewal::AuthFailed, Some(1), None),
         "only a run with no ending of its own takes the cause"
     );
     let met = crate::harness::open_url::Met::new(

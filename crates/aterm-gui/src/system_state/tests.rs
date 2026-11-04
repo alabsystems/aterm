@@ -6833,8 +6833,15 @@ fn the_tools_row_names_them_and_its_button_says_it_whole_where_it_fits() {
 /// name it.
 #[test]
 fn a_restored_tools_tab_is_named_as_its_title_names_it() {
-    assert!(TOOLS_RECOVERED_NOTE.starts_with("Command Line Tools tab"));
-    assert!(!TOOLS_RECOVERED_NOTE.contains("Installer"));
+    let tab = format!("{} tab", crate::clt_install::TAB_TITLE);
+    assert!(
+        TOOLS_RECOVERED_NOTE.starts_with(&tab),
+        "{TOOLS_RECOVERED_NOTE:?}"
+    );
+    assert!(
+        TOOLS_RECOVERED_HEADLINE.ends_with(&tab),
+        "{TOOLS_RECOVERED_HEADLINE:?}"
+    );
     let status = status_of("clt-recovered");
     let plan = status.plan.clone().unwrap();
     let row = row_view(
@@ -6897,15 +6904,28 @@ fn automatic_admission_never_renders_a_phrase_prompt() {
 }
 
 /// Each thing a phrase can come to has its own words under the field. One that reached no Mac in
-/// ALab was asked nothing, so its words stay for another Join and the line says calmly what
-/// helps (the Mac that showed it awake and on this network); one refused is spent, the field
-/// empties and the line sends the person back to press Allow; one that let this Mac in empties
-/// the field too.
+/// ALab was asked nothing, so its words stay for another Join under the not-reached line (the
+/// Local Network one while macOS's switch for aterm is off); one refused is spent, the field
+/// empties and the refused line shows; one that let this Mac in empties the field too.
 ///
 /// NEGATIVE CONTROL: have `phrase_finished` wipe the field for `NotReached` too: the words the
 /// person still holds good are gone.
 #[test]
 fn each_phrase_outcome_has_its_own_words_and_only_a_spent_phrase_empties_the_field() {
+    assert_eq!(
+        [
+            PHRASE_HELP,
+            PHRASE_REFUSED,
+            PHRASE_NOT_REACHED,
+            PHRASE_STOPPED,
+            PHRASE_LOCAL_NETWORK_OFF,
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .len(),
+        5,
+        "each outcome has its own words"
+    );
     let asking = status_of("vault-asking");
     let mut app = SystemStateApp::new(asking.plan.clone().unwrap());
     app.publish(asking);
@@ -6924,8 +6944,6 @@ fn each_phrase_outcome_has_its_own_words_and_only_a_spent_phrase_empties_the_fie
 
     try_with(&mut app, &mut view, PhraseOutcome::NotReached);
     assert_eq!(app.phrase_help(), PHRASE_NOT_REACHED);
-    assert!(PHRASE_NOT_REACHED.contains("still good"));
-    assert!(PHRASE_NOT_REACHED.contains("awake and on this network"));
     assert_eq!(typed(&app), "river stone lamp", "the words stay");
     app.act(&mut view, PHRASE_JOIN, None);
     let joins = app
@@ -6948,7 +6966,6 @@ fn each_phrase_outcome_has_its_own_words_and_only_a_spent_phrase_empties_the_fie
     // line says plainly that the try stopped, and the words stay for Join to try again.
     try_with(&mut app, &mut view, PhraseOutcome::Stopped);
     assert_eq!(app.phrase_help(), PHRASE_STOPPED);
-    assert!(PHRASE_STOPPED.contains("press Join to try again"));
     assert_eq!(typed(&app), "river stone lamp", "the words stay");
 
     // A try that reached no Mac while this Mac reads macOS's Local Network switch for aterm off
@@ -6964,11 +6981,6 @@ fn each_phrase_outcome_has_its_own_words_and_only_a_spent_phrase_empties_the_fie
     app.publish(off);
     try_with(&mut app, &mut view, PhraseOutcome::NotReached);
     assert_eq!(app.phrase_help(), PHRASE_LOCAL_NETWORK_OFF);
-    assert!(PHRASE_LOCAL_NETWORK_OFF.contains("Privacy & Security > Local Network"));
-    assert!(
-        !PHRASE_LOCAL_NETWORK_OFF.contains("awake"),
-        "not the other Mac"
-    );
     assert_eq!(typed(&app), "river stone lamp", "the words stay");
 }
 

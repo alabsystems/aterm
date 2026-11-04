@@ -235,7 +235,7 @@ pub fn another_builds_mug(
 }
 
 /// The verb's entry: `args` are the words after `acaffiene`, `version` the app version the about row prints.
-#[must_use]
+#[must_use = "handle or propagate the command's exit status"]
 pub fn main_entry(args: Vec<OsString>, version: &str) -> ExitCode {
     let command = match parse(&args) {
         Ok(command) => command,

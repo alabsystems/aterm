@@ -1925,7 +1925,7 @@ pub fn instance_toml(lab: &str) -> Result<String, String> {
 /// host named m9 would otherwise pass.
 #[must_use]
 pub fn names_its_machine(config: &Path) -> Option<String> {
-    let text = match fs::read_to_string(config) {
+    let text = match crate::util::read_regular_text(config) {
         Ok(text) => text,
         Err(e) => return Some(format!("unreadable ({e})")),
     };
@@ -2275,7 +2275,7 @@ impl Drive<'_> {
         let history = dumps
             .iter()
             .take(8)
-            .filter_map(|(_, p)| fs::read(p).ok())
+            .filter_map(|(_, p)| crate::util::read_regular_file(p).ok())
             .map(|b| crate::stub::message_users(&b))
             .find(|users| {
                 users.last().is_some_and(|u| {

@@ -34,6 +34,11 @@ unsafe extern "C" {
         active_displays: *mut CGDirectDisplayID,
         display_count: *mut u32,
     ) -> CGError;
+    pub fn CGGetOnlineDisplayList(
+        max_displays: u32,
+        online_displays: *mut CGDirectDisplayID,
+        display_count: *mut u32,
+    ) -> CGError;
     pub fn CGDisplayBounds(display: CGDirectDisplayID) -> CGRect;
     pub fn CGDisplayPixelsWide(display: CGDirectDisplayID) -> usize;
     pub fn CGDisplayPixelsHigh(display: CGDirectDisplayID) -> usize;
@@ -84,17 +89,28 @@ impl CGDisplay {
         Self::new(unsafe { CGMainDisplayID() })
     }
 
-    /// Returns the IDs of all active displays.
+    /// Returns the IDs of all active (connected, awake, drawable) displays.
     pub fn active_displays() -> Result<Vec<CGDirectDisplayID>, CGError> {
+        Self::display_list(CGGetActiveDisplayList)
+    }
+
+    /// Returns the IDs of all online displays, including sleeping or mirrored non-drawable ones.
+    pub fn online_displays() -> Result<Vec<CGDirectDisplayID>, CGError> {
+        Self::display_list(CGGetOnlineDisplayList)
+    }
+
+    fn display_list(
+        query: unsafe extern "C" fn(u32, *mut CGDirectDisplayID, *mut u32) -> CGError,
+    ) -> Result<Vec<CGDirectDisplayID>, CGError> {
         let mut count = 0_u32;
         // SAFETY: the sizing call — a NULL list of capacity 0 is written to
-        // nowhere, and `count` receives the number of active displays.
-        check(unsafe { CGGetActiveDisplayList(0, ptr::null_mut(), &raw mut count) })?;
+        // nowhere, and `count` receives the number of displays.
+        check(unsafe { query(0, ptr::null_mut(), &raw mut count) })?;
         let cap = count.saturating_add(8).min(4096);
         let mut ids = vec![0; cap as usize];
         // SAFETY: `ids` has room for `cap` (`>= 8`) IDs; CoreGraphics writes at
         // most `cap` entries and stores how many it wrote in `count`.
-        check(unsafe { CGGetActiveDisplayList(cap, ids.as_mut_ptr(), &raw mut count) })?;
+        check(unsafe { query(cap, ids.as_mut_ptr(), &raw mut count) })?;
         ids.truncate((count as usize).min(ids.len()));
         Ok(ids)
     }

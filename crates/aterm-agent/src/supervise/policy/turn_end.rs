@@ -9745,7 +9745,7 @@ pub const CREDITS_HOLD_MODEL_TOLD: &str = "usage credits carry the requests of t
 pub const RULE_MEMORY_RESTART: &str = "memory-restart@v1";
 /// The agent restarted in its tab because it read the line the loop wrote to it and drew none of
 /// it a minute on, at rest ([`Restart::InputLost`]): the line the loop holds in custody
-/// (`supervise::run`'s `Custody`) is lost with its process, and the point resumed is decided and
+/// (`turn_end_loop`'s `Custody`) is lost with its process, and the point resumed is decided and
 /// written once.
 pub const RULE_INPUT_LOST: &str = "input-lost-restart@v1";
 /// A turn the session's host typed (upgrade notice, carry-on; [`TurnEndState::host_typed`]).

@@ -712,7 +712,7 @@ fn records_of(bytes: &[u8], signers: &Signers) -> Result<BTreeMap<RecordId, Made
 
 /// The head a Mac's `state.toml` names, read with no lock (a torn read reads as none).
 fn mac_head(paths: &Paths) -> Option<HeadMark> {
-    let text = std::fs::read_to_string(paths.dir.join("state.toml")).ok()?;
+    let text = crate::util::read_regular_text(&paths.dir.join("state.toml")).ok()?;
     let table = aterm_toml::from_str::<aterm_toml::Table>(&text).ok()?;
     let seq = table
         .get("seq")

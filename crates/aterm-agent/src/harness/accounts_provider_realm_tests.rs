@@ -53,7 +53,7 @@ fn realm_case(case: i64) -> [(&'static str, i64); 5] {
     };
     let mut original = Row {
         label: "present".into(),
-        class: Class::Dedicated,
+        class: Class::Preferred,
         dir: Some(original_dir.to_string_lossy().into_owned()),
         email: Some("one@example.test".into()),
         vendor,
@@ -176,7 +176,7 @@ fn realm_case(case: i64) -> [(&'static str, i64); 5] {
         }
         .into(),
         machines: vec!["m16".into()],
-        class: Class::Dedicated,
+        class: Class::Preferred,
         email: match case {
             9 | 10 => "OWNER@example.test",
             12 | 14 | 15 => "different@example.test",

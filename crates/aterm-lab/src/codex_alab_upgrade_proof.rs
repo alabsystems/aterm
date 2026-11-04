@@ -9,7 +9,8 @@ const HANG: Duration = Duration::from_secs(60);
 
 fn package_version(package: &Path) -> Result<String, Fail> {
     let path = package.join("codex-package.json");
-    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let text =
+        crate::util::read_regular_text(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let json = J::parse(&text)?;
     json.get("version")
         .and_then(J::as_str)
@@ -20,7 +21,8 @@ fn package_version(package: &Path) -> Result<String, Fail> {
 
 pub(super) fn describe_package(package: &Path) -> Result<(), Fail> {
     let path = package.join("alab-build.json");
-    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let text =
+        crate::util::read_regular_text(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let json = J::parse(&text)?;
     println!(
         "upgrade target codex-alab {} (source {}) at {}",
@@ -97,7 +99,7 @@ const UPGRADE_CONFIG_EXTRA: &str =
 const NATIVE_GOAL_OBJECTIVE: &str = "align native codex goal";
 
 fn package_supports_auth_and_goal(package: &Path) -> bool {
-    std::fs::read(package.join("bin/codex")).is_ok_and(|bytes| {
+    crate::util::read_regular_file(&package.join("bin/codex")).is_ok_and(|bytes| {
         bytes
             .windows(b"CODEX_AUTH_PATH".len())
             .any(|w| w == b"CODEX_AUTH_PATH")
@@ -457,7 +459,7 @@ pub(super) fn raw_legs(proof: &mut Proof, old: &Path, new: &Path) -> Result<(), 
     println!(
         "raw-upgrade-only (produced primary, missing entry, automatic crash repair, live handoff)"
     );
-    let producer = std::fs::read_to_string(&primary)
+    let producer = crate::util::read_regular_text(&primary)
         .map_err(|error| format!("{}: {error}", primary.display()))?;
     let exports = [
         "export ATPKG_MANAGED_LAUNCH_PID=\"$$\"".to_string(),

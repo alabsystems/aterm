@@ -9,8 +9,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::ptr;
 
 use crate::{ShellHangup, ShellIdentity, SpawnedShell, build_child_env};
-
-const SANDBOX_EXEC_PATH: &str = aterm_uds::os_path!("sandbox-exec");
+use aterm_containment::sbpl::{SANDBOX_EXEC_PATH, build_sandbox_wrap};
 
 /// [`spawn_shell_with_pid`] minus the pid, with the hardened default limits.
 #[cfg(test)]
@@ -896,7 +895,6 @@ fn fresh_kit(ws: &libc::winsize) -> io::Result<SpawnKit> {
     Ok(kit)
 }
 
-#[cfg(any(test, debug_assertions))]
 fn ensure_above_stdio(fd: &mut libc::c_int) -> io::Result<()> {
     if *fd > libc::STDERR_FILENO {
         return Ok(());
@@ -915,7 +913,7 @@ fn ensure_above_stdio(fd: &mut libc::c_int) -> io::Result<()> {
     Ok(())
 }
 
-/// Spawns a test's session-leading child on a fresh close-on-exec PTY `(master, slave)` whose
+/// Spawns a session-leading child on a fresh close-on-exec PTY `(master, slave)` whose
 /// slave is the child's controlling terminal (`setsid` + `TIOCSCTTY` on stdin, with all
 /// descriptors above stdio stripped via [`aterm_uds::spawnfd::InheritNothing`]).
 ///
@@ -929,7 +927,6 @@ fn ensure_above_stdio(fd: &mut libc::c_int) -> io::Result<()> {
 /// # Errors
 /// Returns an `io::Error` if opening or replacing a pty fails, if `build` fails on a live pty,
 /// if two consecutive ptys die before `exec`, or if `Command::spawn` fails for a non-pty reason.
-#[cfg(any(test, debug_assertions))]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn spawn_session_leader_on_pty(
     mut build: impl FnMut(&std::os::fd::OwnedFd) -> io::Result<aterm_uds::spawnfd::StdCommand>,
@@ -2204,37 +2201,6 @@ fn reap_polls() -> u32 {
 #[cfg(test)]
 fn take_reap_kill_tick() -> Option<u32> {
     REAP_KILL_TICK.with(std::cell::Cell::take)
-}
-
-fn build_sandbox_wrap(
-    wrapper_path: &str,
-    sbpl: &str,
-    prog: &CString,
-    orig_argv: &[CString],
-) -> io::Result<(CString, Vec<CString>)> {
-    let wrapper = CString::new(wrapper_path.as_bytes())
-        .map_err(|_| io::Error::other("sandbox-exec path not representable"))?;
-    // SAFETY: `wrapper` is a valid NUL-terminated absolute path.
-    let present = unsafe { libc::access(wrapper.as_ptr(), libc::X_OK) } == 0;
-    if !present {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!(
-                "OS sandbox demanded but {wrapper_path} is missing/not executable — refusing \
-                 to spawn an unsandboxed shell (fail-closed, ATERM_DESIGN §5.6)"
-            ),
-        ));
-    }
-    let sbpl_c = CString::new(sbpl.as_bytes()).map_err(|_| {
-        io::Error::new(io::ErrorKind::InvalidInput, "SBPL profile has interior NUL")
-    })?;
-    let mut wrapped: Vec<CString> = Vec::with_capacity(orig_argv.len().saturating_add(3).min(4096));
-    wrapped.push(CString::new("sandbox-exec").unwrap_or_else(|_| wrapper.clone()));
-    wrapped.push(CString::from(c"-p"));
-    wrapped.push(sbpl_c);
-    wrapped.push(prog.clone());
-    wrapped.extend(orig_argv.iter().skip(1).cloned());
-    Ok((wrapper, wrapped))
 }
 
 /// What an exec failure says: the target, what is wrong with it, and `from` (where a shell came from; empty for a `-e` program or the sandbox wrapper).

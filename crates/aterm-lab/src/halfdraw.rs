@@ -138,7 +138,8 @@ pub fn cmd_halfdraw(args: &[String]) -> Res {
     let (Some(file), Some(program)) = (file, program) else {
         return Err(usage());
     };
-    let text = std::fs::read_to_string(&file).map_err(|e| Fail::die(format!("{file}: {e}")))?;
+    let text = crate::util::read_regular_text(std::path::Path::new(&file))
+        .map_err(|e| Fail::die(format!("{file}: {e}")))?;
     let cast = parse_cast(&text).map_err(|e| Fail::die(format!("{file}: {e}")))?;
     let reader = program.reader();
     let guard = reader

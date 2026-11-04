@@ -1,0 +1,213 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! The steps of `LineCustody` (`aterm_models_harness::line_custody_model`) that no function here
+//! performs: the worker's program, the person, the session's state and the host's deferral, and
+//! the model's mutants. The custody's own steps are anchored on the pure core
+//! (`supervise::custody`), each projected by the Tier-1 bind (`tests/conformance_custody.rs`).
+//! Proof and test builds only.
+
+/// The program's, the person's, the session's and the host's steps, and the mutants of
+/// `LineCustody`.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "LineCustody",
+        action = "ProgramReads",
+        reason = "The worker's program reading the queued line from its input before any turn since the write: the program's. The Tier-1 bind renders the next status read clear exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "LineCustody",
+        action = "ReadsAndDraws",
+        reason = "The program reading the queued line after a turn since the write and drawing it: the program's. The Tier-1 bind renders the composer holding it exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "LineCustody",
+        action = "ReadsAndDrops",
+        reason = "The program reading the queued line after a turn since the write and dropping it: the program's. The Tier-1 bind renders the input clear and the composer empty exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "LineCustody",
+        action = "ProgramDraws",
+        reason = "The program drawing a line it read: the program's. The Tier-1 bind renders the composer holding it (whole, arriving, or joined) exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "LineCustody",
+        action = "ProgramDrops",
+        reason = "The program dropping a line it read, drawn never: the program's, which no read shows. The Tier-1 bind changes nothing the loop reads there."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "LineCustody",
+        action = "Minute",
+        reason = "ECHO_HANG passing since the first clear read: the loop's clock. The Tier-1 bind advances the clock it hands the core by ECHO_HANG exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "LineCustody",
+        action = "PersonDraws",
+        reason = "A person's keys drawn after the line: the person's. The Tier-1 bind raises the read's key count and renders their text in the composer exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "LineCustody",
+        action = "Queues",
+        reason = "Input queued unread behind a line held (a person's typeahead, another client's keys): the person's or the client's. The Tier-1 bind renders every status read unread exactly there, and nothing on the screen."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "LineCustody",
+        action = "ReadsBehind",
+        reason = "The program reading the input queued behind the line, after the line: the program's. The Tier-1 bind renders the status read clear again exactly there, and nothing on the screen."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "LineCustody",
+        action = "PersonClears",
+        reason = "Someone clearing the drawn line from the composer: the person's. The Tier-1 bind renders the composer empty exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "LineCustody",
+        action = "ProgramEnds",
+        reason = "The agent's process ending of itself (a crash, an exit), at any state: the program's. The host's upgrade, which LineHeld::Stands holds, is HostUpgrades, anchored on line_held. The Tier-1 bind has the host name another agent process exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "LineCustody",
+        action = "Stirs",
+        reason = "The session leaving rest (a turn running, a dialog, a hold, the word Off, a person's key within the grace, a background call making no progress): the session's. The Tier-1 bind renders one of those into the read's Rest exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "LineCustody",
+        action = "Rests",
+        reason = "The session at rest again: the session's. The Tier-1 bind renders the read's Rest at rest exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "LineCustody",
+        action = "NextAct",
+        reason = "The turn an act submitted ran, and the next point is the policy's to decide: the policy's. The Tier-1 bind changes nothing the custody reads there."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "LineCustody",
+        action = "RestartDeferred",
+        reason = "The host deferring the restart asked (wait:...): the host's, which Session::restart_later books and asks again on the restart's back-off. The Tier-1 bind books no restart there."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "LineCustody",
+        action = "SettleOnMove",
+        reason = "Buggy=1 negative control only; a look settles the line on a read that shows none of it, and the line the worker still holds is written again (the Tier-1 bind plants CustodySettlesUnshown in Line::look)"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "LineCustody",
+        action = "SettleWithoutTurn",
+        reason = "Buggy=2 negative control only; a clear read settles the line with no turn read running since the write (a busy spell of break reads alone), and the line read and held is written again (the Tier-1 bind probes Line::turned at every state with no turn run and requires it settle nothing)"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "LineCustody",
+        action = "TurnSettlesUnread",
+        reason = "Buggy=3 negative control only; a turn settles the line on an input read unread or unknown, and the line still queued is written again (the Tier-1 bind plants CustodyTurnAnyWord in Line::turned)"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "LineCustody",
+        action = "RestartUnread",
+        reason = "Buggy=4 negative control only; a restart in place for a line no read found clear, so the queued line goes to the shell (the Tier-1 bind plants CustodyLostUnread in Line::gate_read)"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "LineCustody",
+        action = "LostWithinMinute",
+        reason = "Buggy=5 negative control only; a line read within its minute is judged lost and the host told so, so it types behind a line that may still come (the Tier-1 bind plants CustodyLostWithinMinute in Line::gate_read)"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "LineCustody",
+        action = "RestartAgain",
+        reason = "Buggy=6 negative control only; a second loss short of an act submitted is restarted again (the Tier-1 bind plants CustodyRestartAgain in Line::lose)"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "LineCustody",
+        action = "HostOverStands",
+        reason = "Buggy=7 negative control only; the host types behind a line that stands (the Tier-1 bind plants CustodyHostUntold in line_held)"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "LineCustody",
+        action = "WriteWhileHeld",
+        reason = "Buggy=8 negative control only; a writer writes while the line stands held, the gate the session's custody checks keep (Session::custody_gate, the occupancy guards' draft, the accounts probe's PendingInput)"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "LineCustody",
+        action = "RestartBehind",
+        reason = "Buggy=9 negative control only; a restart in place for a line read while input queued behind it is unread, so that input goes to the shell (the Tier-1 bind plants CustodyLostBehind in Line::gate_read)"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "LineCustody",
+        action = "UpgradeOverStands",
+        reason = "Buggy=10 negative control only; the host's upgrade moves behind a line that stands, so a line still queued goes to the shell (the Tier-1 bind plants CustodyHostUntold in line_held)"
+    )
+)]
+#[doc(hidden)]
+pub fn line_custody_environment() {}

@@ -105,14 +105,21 @@ fn overlay(
     Ok(read_back(gpu, win))
 }
 
-/// How two read-backs differ: bytes off, and the largest difference.
+/// How two read-backs differ: bytes off, and the largest difference. Equal runs pass whole (a
+/// slice compare is one `memcmp`, even unoptimized), so only a run with a byte off is walked: a
+/// test build's byte-by-byte walk of every 10 MB frame was most of this file's time.
 fn differ(a: &[u8], b: &[u8]) -> (usize, u8) {
     assert_eq!(a.len(), b.len(), "the read-backs are one size");
-    a.iter()
-        .zip(b)
+    a.chunks(RUN)
+        .zip(b.chunks(RUN))
+        .filter(|(x, y)| x != y)
+        .flat_map(|(x, y)| x.iter().zip(y))
         .filter(|(x, y)| x != y)
         .fold((0, 0), |(n, m), (x, y)| (n + 1, m.max(x.abs_diff(*y))))
 }
+
+/// The bytes [`differ`] compares at once.
+const RUN: usize = 4096;
 
 /// A card whose model is its pixels' hash (with `fp`), as a painted card's model names what it
 /// painted.

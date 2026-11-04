@@ -70,12 +70,12 @@ and 2 in a trust-config test file deleted 2026-10-16 = 106) and the code each on
 of the `#[test]` in its doc comment.
 Nothing was compiled or run. The claims below come from reading the code.
 
-Result: **43 specs** cover **148 tests**. 35 specs are the primary spec of at least one test. Four
+Result: **43 specs** cover **149 tests**. 35 specs are the primary spec of at least one test. Four
 are lemmas that the others need and are only secondary specs of tests: `uri-render`,
 `proxy-target-debug-redacts`, `http-number-grammar` and `response-accessors`.
 `client-config-roots-fail-closed`, `error-is-revoked` and `init-crypto-installs-provider` are now
 only secondary specs too, and `provider-advertises-modern-schemes` has no test left.
-**No test outside a spec is left** (§4): every test the crate runs (96 unit tests and
+**No test outside a spec is left** (§4): every test the crate runs (97 unit tests and
 52 in the suite) has a row in §2.
 
 ## 0. Notation used in the statements
@@ -296,6 +296,7 @@ src/stream.rs	a_revoked_guard_stops_writes_and_reads_on_an_open_socket	stream-ad
 src/stream.rs	an_answer_sent_before_a_reset_is_read_and_then_the_reset	stream-admit-before-every-syscall	
 src/stream.rs	an_expired_deadline_is_a_timeout_not_a_hang	deadline-remaining	
 src/stream.rs	an_idle_cap_shorter_than_the_budget_bounds_each_call_and_names_itself	idle-deadline	deadline-remaining
+src/stream.rs	cancellation_wakes_a_silent_socket_and_prevents_writes	stream-admit-before-every-syscall	
 src/stream.rs	each_address_gets_its_share_of_the_deadline_and_the_last_the_rest	idle-deadline	deadline-remaining
 src/stream.rs	plaintext_io_sets_only_its_socket_timeout_direction	stream-admit-before-every-syscall	
 src/stream.rs	only_a_refused_local_name_is_named_as_the_local_network_refusal	dns-local-refusal	
@@ -380,9 +381,9 @@ tests/tls_stream.rs	an_answer_sent_before_the_peer_closed_over_a_failed_write_is
 tests/tls_stream.rs	authority_revoked_during_a_tls_read_stops_it	stream-admit-before-every-syscall	
 ```
 
-## 3. Open findings
+## 3. Coverage
 
-- 106 tests read. 102 mapped to one of the 35 specs and 4 were not spec samples (§4). After the
+- 106 tests originally read. 102 mapped to one of the 35 specs and 4 were not spec samples (§4). After the
   deletions since, 88 map to one of the 33 specs; five more (the three in `src/connect.rs`, one in
   `tests/tls_stream.rs` and one in `src/pem.rs`) had no row until 2026-10-20. The 47 tests agh's
   WP1 added (2026-10-20) map to the 9 specs it added, to `render-request-exact` (3), to
@@ -391,42 +392,42 @@ tests/tls_stream.rs	authority_revoked_during_a_tls_read_stops_it	stream-admit-be
   answer), so with the five, 140 tests map to one of 42 specs. Main's merge (2026-10-21) adds
   two: one to `send-pipeline-order`, one to `read-head-skips-interim`: 142. `dns-local-refusal`
   (2026-10-23) adds 6 and one spec: 148 tests map to one of 43 specs. Four duplicates deleted
-  (2026-10-27) left 144, and four unit tests added since (`idle-deadline` +3, `dns-local-refusal` +1)
-  bring the total back to 148.
+  (2026-10-27) left 144, and five unit tests added since (`idle-deadline` +3, `dns-local-refusal` +1,
+  `stream-admit-before-every-syscall` +1) bring the total to 149 live tests, all mapped in §2.
 - The biggest collapses: `idle-deadline` (13, 4 of them `src/connect.rs`'s),
-  `streamed-body-framing` (10), `stream-admit-before-every-syscall` (10, across three test files),
+  `stream-admit-before-every-syscall` (11, across three test files),
+  `streamed-body-framing` (10),
   `phase-classification` (9), `render-request-exact` (8 primary, 3 of them the golden and method
   tests), `proxy-resolve-selection` (7), `dns-local-refusal` (7), `response-body-framing` (6),
   `uri-parse-fields` (6), then `no-proxy-match` and `platform-verifier-conformance` (5 each).
 - `http-number-grammar`, `uri-render`, `proxy-target-debug-redacts` and `response-accessors` retire
   no test alone, but the larger specs cite them as lemmas, and they are a secondary spec of 11
   tests.
+- Dependencies: `http-number-grammar`, `uri-render` and `error-is-revoked` → `uri-parse-accept-set` /
+  `uri-parse-fields` → `proxy-parse`, `proxy-refusal-names-variable-never-value`, `no-proxy-match` →
+  `proxy-resolve-selection`. `aterm_codec::base64`'s specs → `pem-lossy` → `client-config-roots-fail-closed`,
+  `unix-cert-path-selection` → `unix-store-fail-closed`. On the wire: `header-validation-grammar`,
+  `response-header-fields`, `status-line-grammar` → `read-head-skips-interim` + `decide-framing-table` →
+  `response-body-framing`, `response-parse-no-panic` → `render-request-exact`, `connect-tunnel-exchange`
+  → `deadline-remaining`, `stream-admit-before-every-syscall` → `send-pipeline-order`. Then
+  `decide-framing-table` → `method-head-framing`; `response-body-framing` → `streamed-body-framing`;
+  `render-request-exact` → `bodiless-no-content-length`, `caller-accept`; `response-accessors` →
+  `header-iteration`; `deadline-remaining` → `idle-deadline`, `dns-bounded` → `phase-classification`;
+  `header-validation-grammar` and aterm-uds's `Secret` → `secret-header-scrub`. The verifier specs come
+  last; `platform-verifier-conformance` needs the model `V`.
 - A test leaves the suite only when **every** spec in its row (primary and `also`) is proved. For
   example, `framing_refuses_every_response_whose_end_is_ambiguous` waits on both
   `decide-framing-table` and `http-number-grammar`.
 
-## 4. Proof order
+## 4. Tests that are not spec samples
 
-Dependencies: `http-number-grammar`, `uri-render` and `error-is-revoked` → `uri-parse-accept-set` /
-`uri-parse-fields` → `proxy-parse`, `proxy-refusal-names-variable-never-value`, `no-proxy-match` →
-`proxy-resolve-selection`. `aterm_codec::base64`'s specs → `pem-lossy` → `client-config-roots-fail-closed`,
-`unix-cert-path-selection` → `unix-store-fail-closed`. On the wire: `header-validation-grammar`,
-`response-header-fields`, `status-line-grammar` → `read-head-skips-interim` + `decide-framing-table` →
-`response-body-framing`, `response-parse-no-panic` → `render-request-exact`, `connect-tunnel-exchange`
-→ `deadline-remaining`, `stream-admit-before-every-syscall` → `send-pipeline-order`. Then
-`decide-framing-table` → `method-head-framing`; `response-body-framing` → `streamed-body-framing`;
-`render-request-exact` → `bodiless-no-content-length`, `caller-accept`; `response-accessors` →
-`header-iteration`; `deadline-remaining` → `idle-deadline`, `dns-bounded` → `phase-classification`;
-`header-validation-grammar` and aterm-uds's `Secret` → `secret-header-scrub`. The verifier specs come
-last; `platform-verifier-conformance` needs the model `V`.
-
-No test is a pure regression of a removed bug with no general property; every regression-shaped test (header smuggling, the usize chunk-size wrap, the dribbling
+None: no test is a pure regression of a removed bug with no general property; every regression-shaped test (header smuggling, the usize chunk-size wrap, the dribbling
 TLS peer) is an instance of a spec above.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
-1. **The crate's test count is 106, not 107.** `tests/http_suite.rs` contains no `#[test]` fn; the
-   only `#[test]` is in a doc comment, and the file just declares modules. A grep-based count is off by one.
+1. **The crate's live test count is 149, not 150.** `tests/http_suite.rs` contains no `#[test]` fn; the
+   only `#[test]` is in a doc comment, and the file just declares modules. A naive substring grep is off by one.
 2. **Misleading leftover code** (fixed 2026-10-28).
    `verifier::tests::a_parse_failure_is_reported_as_one_and_never_as_a_trust_verdict` now builds only the
    per-iteration `CertificateDer` and fixed `ServerName` / `UnixTime(T26)` instead of an unused `Case`

@@ -108,6 +108,8 @@ pub(crate) struct Args {
     pub asked_prefill: Option<u32>,
     /// One-way notes the messaging world posts paced after its burst (`--paced-notes`).
     pub paced_notes: Option<u32>,
+    /// Both tallies in the messaging, attach, handoff and ask worlds (`--tally`).
+    pub tally: bool,
 }
 
 fn positive(flag: &str, raw: &str) -> Result<u32, String> {
@@ -265,6 +267,7 @@ impl Args {
                             })?,
                     );
                 }
+                "--tally" => a.tally = true,
                 "--no-windows" | "--admit" => {}
                 other => {
                     return Err(format!(
@@ -391,6 +394,9 @@ impl Args {
         if let Some(n) = self.paced_notes {
             words.push(format!("paced_notes={n}"));
         }
+        if self.tally {
+            words.push("tally=on".to_string());
+        }
         words.extend(arm.words());
         words.join(" ")
     }
@@ -446,6 +452,9 @@ impl Args {
         }
         if let Some(n) = self.paced_notes {
             line.push_str(&format!(" --paced-notes {n}"));
+        }
+        if self.tally {
+            line.push_str(" --tally");
         }
         line.push_str(&arm.flags());
         line
@@ -961,6 +970,42 @@ mod tests {
             o.insert("--scenario", scenario.to_string());
             assert!(Args::from_options(&o).is_err(), "{scenario} {bad}");
         }
+    }
+
+    /// D02: `--tally` reaches the bench's words and each entry's Run line, a run without it
+    /// names no tally (its worlds boot as before), and the bench's refusal of a ping-pong-only
+    /// run reaches the flag.
+    #[test]
+    fn the_tally_reaches_the_bench_and_the_ledger() {
+        let shipped = Arm::shipped();
+        let mut o = BTreeMap::new();
+        o.insert("--tally", String::new());
+        o.insert("--scenario", "attach".to_string());
+        let a = Args::from_options(&o).expect("parses");
+        let words = a.bench_words(Path::new("/s"), shipped);
+        assert!(
+            bench_spec::parse(&words)
+                .expect("the bench reads them")
+                .tally
+        );
+        let line = a.command_line(shipped);
+        assert!(
+            line.split_whitespace().any(|word| word == "--tally"),
+            "{line}"
+        );
+        let bare = Args::from_options(&BTreeMap::new()).expect("bare");
+        let words = bare.bench_words(Path::new("/s"), shipped);
+        assert!(!bench_spec::parse(&words).expect("bare words").tally);
+        assert!(
+            !bare
+                .command_line(shipped)
+                .split_whitespace()
+                .any(|word| word == "--tally")
+        );
+        let mut o = BTreeMap::new();
+        o.insert("--tally", String::new());
+        o.insert("--scenario", "pingpong".to_string());
+        assert!(Args::from_options(&o).is_err(), "ping-pong counts anyway");
     }
 
     #[test]

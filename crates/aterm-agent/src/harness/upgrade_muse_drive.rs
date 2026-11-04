@@ -12,13 +12,15 @@ use super::super::relaunch::{
     first_idle, hand_waits_out,
 };
 use super::super::upgrade_muse::{self as mz, ExitKind};
+#[cfg(all(test, unix))]
+use super::state_dir;
 use super::upgrade::{Agent, Dialect, Phase};
 use super::{
     Client, Hand, Kernel, Live, LiveTab, NoPlan, NoSocket, Opts, Plan, PromptLook,
     RelaunchLineError, Report, STALE_S, St, TURN_WAIT, TabLife, Typed, alive, connect, cwd_of,
     descendants_in, exe_of, exit_status, file_holders, ids, is_generation, ledger, line_status,
-    load, managed_agent_twin, now_s, open_files, pause, registry_graph, registry_life, roster,
-    running_block, said, save, screen, shell_dialect_of, squash, started_ms, state_dir,
+    load, managed_agent_twin, now_s, open_files, pause, read_upgrade_dir, registry_graph,
+    registry_life, roster, running_block, said, save, screen, shell_dialect_of, squash, started_ms,
     store_version, table, turn_takes_gen, turn_verdict, twin_version, type_relaunch_line_with,
     under_hand, unheld_hour, upgrade, wait_now, wait_until,
 };
@@ -1379,7 +1381,7 @@ pub(super) fn prune(opts: &Opts, now: u64, life: impl Fn(&str) -> TabLife) {
     if opts.dry_run || opts.background {
         return;
     }
-    let Ok(dir) = std::fs::read_dir(state_dir(opts)) else {
+    let Ok(dir) = read_upgrade_dir(&opts.state) else {
         return;
     };
     for entry in dir.flatten() {

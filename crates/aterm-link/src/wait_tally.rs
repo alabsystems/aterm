@@ -4,11 +4,15 @@
 //! Bridge loop wait tally ([`SEAM`](crate::wait_tally::SEAM), [`FILE`](crate::wait_tally::FILE), [`Tally::parse`](crate::wait_tally::Tally::parse), [`Tally::since`](crate::wait_tally::Tally::since),
 //! [`Tally::at_ns`](crate::wait_tally::Tally::at_ns), [`Recorder::idle`](crate::wait_tally::Recorder::idle)) with per-[`Row`](crate::wait_tally::Row) log2 [`Hist`](crate::wait_tally::Hist) buckets
 //! ([`Row::partitions`](crate::wait_tally::Row::partitions)): broker ([`Row::Request`](crate::wait_tally::Row::Request), [`Row::Ack`](crate::wait_tally::Row::Ack), [`Row::Commit`](crate::wait_tally::Row::Commit)), verb lane
-//! ([`Row::LaneOutbox`](crate::wait_tally::Row::LaneOutbox), [`Row::LaneOther`](crate::wait_tally::Row::LaneOther), [`lane_row`](crate::wait_tally::lane_row)), [`crate::state::StateDir`]
+//! ([`Row::LaneOutbox`](crate::wait_tally::Row::LaneOutbox), the presence reads [`Row::LaneStatus`](crate::wait_tally::Row::LaneStatus) to
+//! [`Row::LaneSessionsStatus`](crate::wait_tally::Row::LaneSessionsStatus), [`Row::LaneOther`](crate::wait_tally::Row::LaneOther), [`lane_row`](crate::wait_tally::lane_row)), [`crate::state::StateDir`]
 //! ([`Row::DirReplace`](crate::wait_tally::Row::DirReplace), [`Row::DirFlush`](crate::wait_tally::Row::DirFlush), [`Row::SetPostPin`](crate::wait_tally::Row::SetPostPin), [`Row::AppendSelfAcked`](crate::wait_tally::Row::AppendSelfAcked),
 //! [`Kept`](crate::wait_tally::Kept), [`Tally::dir`](crate::wait_tally::Tally::dir)), [`crate::mailbox::Mailbox`] wakes ([`Row::WakeEvent`](crate::wait_tally::Row::WakeEvent),
 //! [`Row::QueuedRecord`](crate::wait_tally::Row::QueuedRecord)), posts ([`Row::PostPublish`](crate::wait_tally::Row::PostPublish), [`Row::DrainPosts`](crate::wait_tally::Row::DrainPosts)), and loop park/write
-//! ([`Row::Park`](crate::wait_tally::Row::Park), [`Row::TallyWrite`](crate::wait_tally::Row::TallyWrite)).
+//! ([`Row::Park`](crate::wait_tally::Row::Park), [`Row::TallyWrite`](crate::wait_tally::Row::TallyWrite)). The line's head ([`FORMAT`](crate::wait_tally::FORMAT)) names how many rows
+//! follow, so a reader built for another count refuses the line, and carries the process's
+//! `astream_sys::flush_tally` beside the word that says which flushes it counts
+//! ([`Tally::flushes`](crate::wait_tally::Tally::flushes), `aterm_durable::ASTREAM_COUNTS`).
 
 use std::io;
 use std::path::Path;
@@ -27,8 +31,14 @@ pub const SEAM: &str = "ATERM_LINK_WAIT_TALLY";
 /// The file in the bridge's state dir the tally is written to.
 pub const FILE: &str = "wait-tally";
 
-/// What the line starts with: the format's name and version.
-const HEAD: &str = "wait-tally v=2";
+/// What the line starts with: the format's name and version. The head's fields follow it,
+/// each fixed-width, the row count ([`ROWS`]) first.
+pub const FORMAT: &str = "wait-tally v=4";
+
+/// What `astream_sys::flush_tally`, in the head, counts of this build's flushes
+/// (`aterm_durable::ASTREAM_COUNTS`): one word for every line a build writes, so every line
+/// is one length.
+pub const FLUSHES_COUNTED: &str = aterm_durable::ASTREAM_COUNTS;
 
 /// One thing the loop does, counted ([`Hist`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -47,6 +57,14 @@ pub enum Row {
     LaneSent,
     /// The verb lane's deliveries (`deliver …`).
     LaneDeliver,
+    /// The verb lane's status read of one session (`@<sid> status`).
+    LaneStatus,
+    /// The verb lane's metadata read of one session (`@<sid> meta`).
+    LaneMeta,
+    /// The verb lane's screen read of one session (`@<sid> text …`).
+    LaneText,
+    /// The verb lane's status read of every session at once (`sessions status`).
+    LaneSessionsStatus,
     /// Every other verb-lane round trip.
     LaneOther,
     /// State-dir atomic replaces.
@@ -86,7 +104,7 @@ pub enum Row {
 }
 
 /// How many rows a line holds.
-pub const ROWS: usize = 25;
+pub const ROWS: usize = 29;
 
 impl Row {
     /// Every row, in the line's order.
@@ -98,6 +116,10 @@ impl Row {
         Row::LaneSessions,
         Row::LaneSent,
         Row::LaneDeliver,
+        Row::LaneStatus,
+        Row::LaneMeta,
+        Row::LaneText,
+        Row::LaneSessionsStatus,
         Row::LaneOther,
         Row::DirReplace,
         Row::DirUnlink,
@@ -135,6 +157,10 @@ impl Row {
             Row::LaneSessions => "lane_sessions",
             Row::LaneSent => "lane_sent",
             Row::LaneDeliver => "lane_deliver",
+            Row::LaneStatus => "lane_status",
+            Row::LaneMeta => "lane_meta",
+            Row::LaneText => "lane_text",
+            Row::LaneSessionsStatus => "lane_sessions_status",
             Row::LaneOther => "lane_other",
             Row::DirReplace => "dir_replace",
             Row::DirUnlink => "dir_unlink",
@@ -176,6 +202,10 @@ impl Row {
                 | Row::LaneSessions
                 | Row::LaneSent
                 | Row::LaneDeliver
+                | Row::LaneStatus
+                | Row::LaneMeta
+                | Row::LaneText
+                | Row::LaneSessionsStatus
                 | Row::LaneOther
                 | Row::DirReplace
                 | Row::DirUnlink
@@ -204,17 +234,31 @@ impl Row {
     }
 }
 
-/// The row a verb-lane request is counted in, by its verb head.
+/// The row a verb-lane request is counted in, by its verb head: for a verb addressed to one
+/// session (`@<sid> <verb> …`), the verb after the address.
 #[must_use]
 pub fn lane_row(line: &str) -> Row {
+    let headed = |verb: &str| {
+        line.strip_prefix(verb)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+    };
     if line.starts_with("outbox sent ") {
         Row::LaneSent
-    } else if line == "outbox" || line.starts_with("outbox ") {
+    } else if headed("outbox") {
         Row::LaneOutbox
     } else if line == "sessions bridge" {
         Row::LaneSessions
+    } else if headed("sessions status") {
+        Row::LaneSessionsStatus
     } else if line.starts_with("deliver ") {
         Row::LaneDeliver
+    } else if let Some((_, verb)) = line.strip_prefix('@').and_then(|l| l.split_once(' ')) {
+        match verb.split(' ').next() {
+            Some("status") => Row::LaneStatus,
+            Some("meta") => Row::LaneMeta,
+            Some("text") => Row::LaneText,
+            _ => Row::LaneOther,
+        }
     } else {
         Row::LaneOther
     }
@@ -231,27 +275,38 @@ pub struct Tally {
     pub at_ns: u64,
     /// Whether the state dir's rows were counted ([`Row::kept_by_the_dir`]).
     pub dir: bool,
+    /// The flushes this process had asked astream-sys for at the write
+    /// (`astream_sys::flush_tally`), of which [`FLUSHES_COUNTED`] says which kinds it counts.
+    pub flushes: astream_sys::FlushTally,
     /// Each [`Row`], at its [`Row::index`].
     pub rows: [Hist; ROWS],
 }
 
-/// The head: the format, the pid, the cursor, the clock and the dir flag,
-/// zero-padded decimal so its length is fixed.
+/// The head: the format, the row count, the pid, the cursor, the clock, the dir flag, the
+/// flush counts and the word that says what they count, zero-padded decimal so its length is
+/// fixed.
 fn head_text(t: &Tally) -> String {
     format!(
-        "{HEAD} pid={:010} committed={:020} at={:020} dir={}",
+        "{FORMAT} rows={ROWS:03} pid={:010} committed={:020} at={:020} dir={} full={:020} \
+         barrier={:020} plain={:020} counted={FLUSHES_COUNTED}",
         t.pid,
         t.committed,
         t.at_ns,
-        u8::from(t.dir)
+        u8::from(t.dir),
+        t.flushes.full,
+        t.flushes.barrier,
+        t.flushes.plain,
     )
 }
 
 /// Every line's length ([`Tally::render`]): the head's ([`head_text`]: the
-/// format, ten digits of pid, twenty of cursor, twenty of clock, one of dir
-/// flag), each row's ([`row_len`]) and the checksum's ([`sum_text`]).
+/// format, three digits of row count, ten of pid, twenty of cursor, twenty of clock, one of dir
+/// flag, twenty of each flush count and the counted word), each row's ([`row_len`]) and the
+/// checksum's ([`sum_text`]).
 fn line_len() -> usize {
-    let head = HEAD.len()
+    let head = FORMAT.len()
+        + " rows=".len()
+        + 3
         + " pid=".len()
         + 10
         + " committed=".len()
@@ -259,7 +314,15 @@ fn line_len() -> usize {
         + " at=".len()
         + 20
         + " dir=".len()
-        + 1;
+        + 1
+        + " full=".len()
+        + 20
+        + " barrier=".len()
+        + 20
+        + " plain=".len()
+        + 20
+        + " counted=".len()
+        + FLUSHES_COUNTED.len();
     let rows: usize = Row::ALL.iter().map(|&row| row_len(row.name())).sum();
     head + rows + " sum=".len() + 16 + "\n".len()
 }
@@ -303,9 +366,17 @@ impl Tally {
     /// Read a line [`Tally::render`] wrote.
     ///
     /// # Errors
-    /// A line that is not one.
+    /// A line that is not one, one of another row count, or one whose flush counts count other
+    /// flushes than this build's ([`FLUSHES_COUNTED`]).
     pub fn parse(text: &str) -> Result<Tally, String> {
-        let mut words = Words::of(text, HEAD)?;
+        let mut words = Words::of(text, FORMAT)?;
+        let count = words.dec("rows")?;
+        if usize::try_from(count).ok() != Some(ROWS) {
+            return Err(format!(
+                "a tally line of {count} rows, and this reader reads {ROWS}: another build's \
+                 tally: {text:?}"
+            ));
+        }
         let pid = words.pid()?;
         let committed = words.dec("committed")?;
         let at_ns = words.dec("at")?;
@@ -314,6 +385,18 @@ impl Tally {
             "1" => true,
             _ => return Err(format!("a tally line whose `dir` is not 0 or 1: {text:?}")),
         };
+        let flushes = astream_sys::FlushTally {
+            full: words.dec("full")?,
+            barrier: words.dec("barrier")?,
+            plain: words.dec("plain")?,
+        };
+        let counted = words.next("counted")?;
+        if counted != FLUSHES_COUNTED {
+            return Err(format!(
+                "a tally line whose flush counts count `{counted}`, and this reader's count \
+                 `{FLUSHES_COUNTED}`: another build's tally: {text:?}"
+            ));
+        }
         let mut rows = [Hist::default(); ROWS];
         for (slot, row) in rows.iter_mut().zip(Row::ALL) {
             *slot = words.hist(row.name())?;
@@ -324,6 +407,7 @@ impl Tally {
             committed,
             at_ns,
             dir,
+            flushes,
             rows,
         })
     }
@@ -331,7 +415,8 @@ impl Tally {
     /// What the loop did between `earlier` and this tally.
     ///
     /// # Errors
-    /// Two processes' tallies (a relaunched bridge counts from zero again).
+    /// Two processes' tallies (a relaunched bridge counts from zero again), or a clock, a flush
+    /// count or a row that went backwards.
     pub fn since(&self, earlier: &Tally) -> Result<Tally, String> {
         if self.pid != earlier.pid {
             return Err(format!(
@@ -349,6 +434,16 @@ impl Tally {
                 earlier.at_ns, self.at_ns
             )
         })?;
+        let flush = |what: &str, then: u64, now: u64| {
+            now.checked_sub(then).ok_or_else(|| {
+                format!("the tally's `{what}` flushes went backwards, {then} to {now}")
+            })
+        };
+        let flushes = astream_sys::FlushTally {
+            full: flush("full", earlier.flushes.full, self.flushes.full)?,
+            barrier: flush("barrier", earlier.flushes.barrier, self.flushes.barrier)?,
+            plain: flush("plain", earlier.flushes.plain, self.flushes.plain)?,
+        };
         let mut rows = [Hist::default(); ROWS];
         for (i, slot) in rows.iter_mut().enumerate() {
             *slot = self.rows[i]
@@ -360,12 +455,15 @@ impl Tally {
             committed: self.committed,
             at_ns,
             dir: self.dir,
+            flushes,
             rows,
         })
     }
 
-    /// Whether anything but the clock and the tally's own writes differs from
-    /// `other`: what makes an idle moment write.
+    /// Whether anything but the clock, the flush counts and the tally's own writes differs from
+    /// `other`: what makes an idle moment write. A write carries the flush counts of its moment;
+    /// a flush alone is no move, since the process's counts move with any thread's flush, and
+    /// the loop's own flushes come with the rows that time them.
     fn moved_from(&self, other: &Tally) -> bool {
         self.committed != other.committed
             || Row::ALL
@@ -576,6 +674,7 @@ impl Recorder {
         }
         let began = Instant::now();
         self.tally.committed = committed;
+        self.tally.flushes = astream_sys::flush_tally();
         outside(&mut self.tally);
         if self
             .written
@@ -645,6 +744,11 @@ mod tests {
             committed: 119,
             at_ns: 900_000_000,
             dir: true,
+            flushes: astream_sys::FlushTally {
+                full: 3,
+                barrier: 40,
+                plain: 5,
+            },
             ..Tally::default()
         };
         t.rows[Row::Request.index()] = hist(&[31_000_000], Unit::Ns);
@@ -700,14 +804,24 @@ mod tests {
         assert_eq!(Hist::default().top(Unit::Ns), None);
     }
 
-    /// THE V=2 LINE READS BACK AS WRITTEN, AND EVERY LINE IS ONE LENGTH, so a
+    /// THE V=4 LINE READS BACK AS WRITTEN, AND EVERY LINE IS ONE LENGTH, so a
     /// write at offset 0 always replaces the line whole: the smallest tally
     /// and the largest render to the same width.
     #[test]
     fn a_tally_line_reads_back_as_written_and_every_line_is_one_length() {
         let t = sample();
         let line = t.render();
-        assert!(line.starts_with("wait-tally v=2 pid=0000004242 "), "{line}");
+        assert!(
+            line.starts_with("wait-tally v=4 rows=029 pid=0000004242 "),
+            "{line}"
+        );
+        assert!(
+            line.contains(&format!(
+                " full=00000000000000000003 barrier=00000000000000000040 \
+                 plain=00000000000000000005 counted={FLUSHES_COUNTED} request="
+            )),
+            "the flush counts and what they count end the head: {line}"
+        );
         assert_eq!(Tally::parse(&line), Ok(t));
         assert_eq!(t.blocked_ns(), 31_000_000 + 18_009_000);
         let zero = Tally::default();
@@ -716,6 +830,11 @@ mod tests {
             committed: u64::MAX,
             at_ns: u64::MAX,
             dir: true,
+            flushes: astream_sys::FlushTally {
+                full: u64::MAX,
+                barrier: u64::MAX,
+                plain: u64::MAX,
+            },
             rows: [Hist {
                 count: u64::MAX,
                 total: u64::MAX,
@@ -731,11 +850,39 @@ mod tests {
         );
         assert_eq!(Tally::parse(&full.render()), Ok(full));
         assert_eq!(full.blocked_ns(), u64::MAX, "saturates");
+    }
+
+    /// NEGATIVE CONTROL: a whole, checksummed line that names another row count is refused by
+    /// its count, never read with its rows shifted; so is one whose flush counts count other
+    /// flushes than this build's.
+    #[test]
+    fn a_line_of_another_row_count_or_flush_word_is_refused_by_its_head() {
+        let line = sample().render();
+        let (body, _) = line.trim_end().rsplit_once(" sum=").expect("a sum");
+        let resummed = |body: String| format!("{body} sum={:016x}\n", checksum(body.as_bytes()));
         assert_eq!(
-            line.matches(' ').count(),
-            5 + ROWS + 1,
-            "a space before each of the head's five fields, each row and the checksum"
+            Tally::parse(&resummed(body.to_string())),
+            Ok(sample()),
+            "the control: re-summed as it was, it reads"
         );
+        let fewer = body.replacen("rows=029", "rows=025", 1);
+        let why = Tally::parse(&resummed(fewer)).expect_err("another row count");
+        assert!(
+            why.contains("of 25 rows") && why.contains("reads 29"),
+            "{why}"
+        );
+        let other = if FLUSHES_COUNTED == "all" {
+            "barrier"
+        } else {
+            "all"
+        };
+        let word = body.replacen(
+            &format!(" counted={FLUSHES_COUNTED} "),
+            &format!(" counted={other} "),
+            1,
+        );
+        let why = Tally::parse(&resummed(word)).expect_err("another flush word");
+        assert!(why.contains(&format!("count `{other}`")), "{why}");
     }
 
     /// NEGATIVE CONTROL: a line whose checksum was corrupted is refused, and so
@@ -782,14 +929,14 @@ mod tests {
         );
         for bad in [
             "",
-            "wait-tally v=2\n",
+            "wait-tally v=4\n",
             &old[..old.len() - 1],
-            &old.replace("wait-tally v=2", "wait-tally v=1"),
+            &old.replace("wait-tally v=4", "wait-tally v=3"),
             &old.replace(" sum=", " sum=0"),
         ] {
             assert!(Tally::parse(bad).is_err(), "{bad:?}");
         }
-        for body in ["wait-tally v=2 pid=1 requests=1".to_string(), {
+        for body in ["wait-tally v=4 rows=029 pid=1 requests=1".to_string(), {
             let (body, _) = old.trim_end().rsplit_once(" sum=").expect("a sum");
             body.rsplit_once('.').expect("a band").0.to_string()
         }] {
@@ -806,8 +953,18 @@ mod tests {
         later.at_ns += 50_000_000;
         later.rows[Row::LaneDeliver.index()].add(100_000, Unit::Ns);
         later.rows[Row::Ack.index()].add(90_000_000, Unit::Ns);
+        later.flushes.barrier += 6;
         let d = later.since(&earlier).expect("one process");
         assert_eq!((d.pid, d.committed, d.at_ns), (4242, 200, 50_000_000));
+        assert_eq!(
+            d.flushes,
+            astream_sys::FlushTally {
+                full: 0,
+                barrier: 6,
+                plain: 0,
+            },
+            "the window's flushes"
+        );
         assert_eq!(
             *d.row(Row::LaneDeliver),
             Hist {
@@ -840,6 +997,12 @@ mod tests {
         assert!(backwards.since(&earlier).unwrap_err().contains("`ack`"));
         let clock_back = Tally { at_ns: 1, ..later };
         assert!(clock_back.since(&earlier).unwrap_err().contains("clock"));
+        let mut flushes_back = later;
+        flushes_back.flushes.full = 0;
+        assert!(flushes_back
+            .since(&earlier)
+            .unwrap_err()
+            .contains("`full` flushes"));
     }
 
     /// THE PARTITION: the rows the loop is in one at a time, and only those,
@@ -862,11 +1025,55 @@ mod tests {
         ] {
             assert!(!row.partitions(), "{row:?}");
         }
+        for row in [
+            Row::LaneStatus,
+            Row::LaneMeta,
+            Row::LaneText,
+            Row::LaneSessionsStatus,
+        ] {
+            assert!(row.partitions(), "a verb-lane round trip: {row:?}");
+        }
         for (i, row) in Row::ALL.iter().enumerate() {
             assert_eq!(row.index(), i);
         }
     }
 
+    /// Each write's head carries the process's astream-sys flush counts as of that write. A
+    /// flush alone is no move (any thread's flush moves the process's counts): NEGATIVE
+    /// CONTROL, the idle moment after a barrier with nothing else moved writes nothing, and the
+    /// next move's write carries the barrier.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn each_write_carries_the_processs_flushes_and_a_flush_alone_writes_nothing() {
+        use std::io::Write as _;
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let path = dir.path().join(FILE);
+        let read = || std::fs::read_to_string(&path).expect("read the tally");
+        let mut on = Recorder::at(&path).expect("open");
+        let before = astream_sys::flush_tally();
+        on.idle(5, |_| {});
+        let first = Tally::parse(&read()).expect("a whole line");
+        assert!(first.flushes.barrier >= before.barrier && first.flushes.full >= before.full);
+        std::fs::write(&path, "sentinel").expect("overwrite");
+        let mut file = std::fs::File::create(dir.path().join("f")).expect("a scratch file");
+        file.write_all(b"ordered").expect("its bytes");
+        let at_least = astream_sys::flush_tally().barrier + 1;
+        astream_sys::barrier_sync(&file).expect("this volume takes the barrier");
+        on.idle(5, |_| {});
+        assert_eq!(read(), "sentinel", "a flush alone writes nothing");
+        on.count(Row::DrainPosts, 1);
+        on.idle(5, |_| {});
+        let again = Tally::parse(&read()).expect("rewritten for the move");
+        assert!(again.flushes.barrier >= at_least, "{again:?}");
+        assert_eq!(
+            again.since(&first).map(|d| d.row(Row::DrainPosts).count),
+            Ok(1)
+        );
+    }
+
+    /// Each verb the bridge's lane sends is counted by its head, a session's verb by the verb
+    /// after its address; the presence reads have rows of their own. CONTROL: a verb no arm
+    /// names, or a head that only begins like one, is still every other verb's.
     #[test]
     fn a_verb_lane_request_is_counted_by_its_head() {
         for (line, row) in [
@@ -877,7 +1084,19 @@ mod tests {
             ("sessions bridge", Row::LaneSessions),
             ("deliver s-b receipt=3 off=9", Row::LaneDeliver),
             ("deliver s-b fetched=9 err=refused", Row::LaneDeliver),
-            ("sessions status", Row::LaneOther),
+            ("@s-a status", Row::LaneStatus),
+            ("@s-a meta", Row::LaneMeta),
+            ("@s-a text --json", Row::LaneText),
+            ("@s-a text", Row::LaneText),
+            ("sessions status", Row::LaneSessionsStatus),
+            ("@s-a topic ls", Row::LaneOther),
+            ("@s-a statusline", Row::LaneOther),
+            ("@s-a", Row::LaneOther),
+            ("@s-a  status", Row::LaneOther),
+            ("status", Row::LaneOther),
+            ("text --json", Row::LaneOther),
+            ("sessions statuses", Row::LaneOther),
+            ("sessions", Row::LaneOther),
             ("outboxes", Row::LaneOther),
             ("link mirror on", Row::LaneOther),
             ("delivered", Row::LaneOther),

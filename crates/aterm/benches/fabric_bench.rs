@@ -11,7 +11,9 @@
 //! person's asks without a pager and with one), `mix_every=` (one
 //! person-lane post before every Nth ordinary message of its mix) and the
 //! attach world's `backlog=` (records filled behind every session's refill
-//! watermark, with a paced publisher timing the writer's stall). The ask
+//! watermark, with a paced publisher timing the writer's stall), with
+//! `tally=on` booting the messaging, attach, handoff and ask worlds with
+//! both tallies on and reporting each round's rows. The ask
 //! scenario also boots two nodes on one broker and times `samples=` posts of
 //! each address form and a `burst=` of each. It measures, and never asserts a
 //! floor.

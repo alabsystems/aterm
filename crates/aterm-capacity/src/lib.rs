@@ -59,6 +59,8 @@ use std::time::Duration;
 
 pub mod admit;
 pub mod book;
+pub mod cpu_observation;
+pub use cpu_observation::{CpuHolder, CpuObservation};
 mod timing;
 pub use timing::{CpuPoint, CpuWindow, QuietPolicy, TimingCause, TimingEvidence, TimingIssue};
 mod cohort_reference;
@@ -82,6 +84,10 @@ pub mod ledger;
 pub mod reading;
 pub mod room;
 pub mod tree_meter;
+
+/// Core Trust's native CPU lease pool, shared with toolchain schedulers.
+#[cfg(unix)]
+pub use trust_build_cpu as build_cpu;
 
 pub use admit::{
     Alone, CREDIT_MAX, Claim, Error, Holder, Pace, Polled, QuietStart, Relief, Reserve, Short,

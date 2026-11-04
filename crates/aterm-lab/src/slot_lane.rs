@@ -330,7 +330,7 @@ pub fn cmd_slot_capture(args: &[String]) -> Res {
         status == Some(0),
         || format!("exit {status:?}"),
     );
-    let raw = std::fs::read(slots.join("slot-0")).unwrap_or_default();
+    let raw = crate::util::read_regular_file(&slots.join("slot-0")).unwrap_or_default();
     let text = String::from_utf8_lossy(&raw).into_owned();
     println!("  slot-0: {text}");
     match Record::parse(&raw) {
@@ -399,10 +399,12 @@ fn slot_files(dir: &Path) -> Vec<SlotFile> {
             let path = e.path();
             let m = std::fs::symlink_metadata(&path).ok()?;
             m.file_type().is_file().then(|| {
-                let pid = match Record::parse(&std::fs::read(&path).unwrap_or_default()) {
-                    RecordRead::Rec(r) => Some(r.pid),
-                    RecordRead::Empty | RecordRead::Bad => None,
-                };
+                let pid =
+                    match Record::parse(&crate::util::read_regular_file(&path).unwrap_or_default())
+                    {
+                        RecordRead::Rec(r) => Some(r.pid),
+                        RecordRead::Empty | RecordRead::Bad => None,
+                    };
                 SlotFile {
                     stamp: (
                         m.size(),

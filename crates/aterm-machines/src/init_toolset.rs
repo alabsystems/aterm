@@ -9,13 +9,15 @@
 //! each program they uninstalled.
 //!
 //! It runs once the base layer let the store lock go ([`crate::init::Base::toolset`]): before,
-//! its passes would wait on the lock init holds.
+//! its passes would wait on the lock init holds. A stop (a Ctrl-C, a closed tab) while they run
+//! ends the running pass with its process group, says so on this run's standard error, and then
+//! ends the run, as the stop would have.
 
 use crate::items::{Ctx, Item};
 use crate::model::Probe;
 use crate::port::{Ran, RunFailed, System};
 use aterm_converge::StoodAside;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// The item's id: `aterm pkg doctor`'s toolset row. The develop layer's tools run after it in
@@ -87,9 +89,14 @@ pub enum Found {
 pub type ReadToolset = Box<dyn Fn() -> Found + Send + Sync>;
 
 /// Runs `aterm pkg <args>` (this executable) as a child that inherits this process's
-/// environment, its standard input closed and its output kept, ended at the budget
-/// ([`RunFailed::TimedOut`]).
-pub type Pkg = Box<dyn Fn(&[String], Duration) -> Result<Ran, RunFailed> + Send + Sync>;
+/// environment, its standard input closed and its output kept, ended (it and its process group)
+/// at the budget ([`RunFailed::TimedOut`]) or once the stop reading (the third argument) reads
+/// true, an end the caller tells by its own stop.
+pub type Pkg =
+    Box<dyn Fn(&[String], Duration, &dyn Fn() -> bool) -> Result<Ran, RunFailed> + Send + Sync>;
+
+/// What the line a stop of the passes says starts with ([`Toolset::say_stopped`]).
+const STOPPED_LEAD: &str = "aterm init: the ALab toolset: ";
 
 /// `base.pkg.toolset`: `aterm pkg seed`, then `aterm pkg update`, when the toolset is missing
 /// programs atpkg may install.
@@ -101,6 +108,9 @@ pub struct Toolset {
     wait: Option<Duration>,
     atpkg: Atpkg,
     aside: Mutex<Option<StoodAside>>,
+    /// Where a stop of the passes is said, before the stop is sent again ends the run: this
+    /// run's standard error.
+    say: Arc<dyn Fn(&str) + Send + Sync>,
 }
 
 impl Toolset {
@@ -114,7 +124,18 @@ impl Toolset {
             wait,
             atpkg,
             aside: Mutex::new(None),
+            say: Arc::new(|text: &str| {
+                use std::io::Write as _;
+                let _ = std::io::stderr().lock().write_all(text.as_bytes());
+            }),
         }
+    }
+
+    /// This item saying a stop of its passes through `say` (a test's).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn saying(self, say: Arc<dyn Fn(&str) + Send + Sync>) -> Self {
+        Self { say, ..self }
     }
 
     /// The arguments after `aterm pkg` for `verb`'s pass: `update` carries what every
@@ -137,6 +158,27 @@ impl Toolset {
             .aside
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = aside;
+    }
+
+    /// The row's failure for stop `sig`, read `when` among the passes, said first on this run's
+    /// standard error: the stop sent again as the apply lets the stops go ends the run before
+    /// any row is reported, so the said line is what the person sees of it.
+    fn say_stopped(&self, sig: i32, when: &str) -> String {
+        let why = format!(
+            "stopped ({}) {when}; the store keeps what it finished",
+            crate::port::stop_name(sig)
+        );
+        (self.say)(&format!("{STOPPED_LEAD}{why}\n"));
+        why
+    }
+}
+
+/// Where a stop read once the pass `done` finished came: after it, and before the pass `next`
+/// where one follows.
+fn after(done: &str, next: Option<&str>) -> String {
+    match next {
+        Some(next) => format!("after `{done}`, before `{next}`"),
+        None => format!("after `{done}`"),
     }
 }
 
@@ -210,13 +252,44 @@ impl Item for Toolset {
         }
     }
 
-    fn apply(&self, _sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
+    fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
         self.set_aside(None);
+        // Each pass runs in a process group of its own, which a Ctrl-C at the terminal or a
+        // closed tab never reaches: held while the passes run, a stop ends the running pass's
+        // group (the store keeps what it finished), starts no other, is said on standard error
+        // ([`Toolset::say_stopped`]), and is sent again as this returns, so the run stops as it
+        // would have and leaves no pass behind it writing to pipes nobody reads.
+        let _stops = sys.defer_stops();
+        let stopped = || sys.stopped().is_some();
         let waited = self.wait.unwrap_or_default();
-        for (verb, budget) in [("seed", SEED_BUDGET), ("update", UPDATE_BUDGET)] {
+        let passes = [("seed", SEED_BUDGET), ("update", UPDATE_BUDGET)];
+        let named = |at: usize| {
+            passes
+                .get(at)
+                .map(|&(verb, _)| format!("aterm pkg {}", self.args(verb).join(" ")))
+        };
+        for (at, (verb, budget)) in passes.into_iter().enumerate() {
             let args = self.args(verb);
             let shown = format!("aterm pkg {}", args.join(" "));
-            let ran = (self.pkg)(&args, budget.saturating_add(waited)).map_err(|failed| {
+            if let Some(sig) = sys.stopped() {
+                let when = at.checked_sub(1).and_then(named).map_or_else(
+                    || format!("before `{shown}`"),
+                    |done| after(&done, Some(&shown)),
+                );
+                return Err(self.say_stopped(sig, &when));
+            }
+            let ran = (self.pkg)(&args, budget.saturating_add(waited), &stopped);
+            if let Some(sig) = sys.stopped() {
+                // A pass that did not return its run was ended (the stop it read ends its group
+                // at once); one that returned it had finished before the stop was read.
+                let when = if matches!(ran, Err(RunFailed::TimedOut(_))) {
+                    format!("during `{shown}`, which was ended")
+                } else {
+                    after(&shown, named(at + 1).as_deref())
+                };
+                return Err(self.say_stopped(sig, &when));
+            }
+            let ran = ran.map_err(|failed| {
                 format!("`{shown}`: {failed}; the store keeps what it finished")
             })?;
             match ran.status {
@@ -306,13 +379,15 @@ pub(crate) mod tests {
         left_for_next_pass,
     };
 
-    /// A store the passes change: what the read finds before and after them, and each pass's
-    /// arguments and exit.
+    /// A store the passes change: what the read finds before and after them, each pass's
+    /// arguments and exit, and the passes a stop ended (a pass reads its stop once, as it
+    /// starts, and one that reads it ends at once).
     #[derive(Default)]
     struct Store {
         found: Mutex<Vec<Found>>,
         ran: Mutex<Vec<Vec<String>>>,
         exits: Mutex<Vec<Ran>>,
+        ended: Mutex<Vec<String>>,
     }
 
     fn item(store: &Arc<Store>, wait: Option<Duration>) -> Toolset {
@@ -326,8 +401,12 @@ pub(crate) mod tests {
                     found[0].clone()
                 }
             }),
-            Box::new(move |args: &[String], _budget| {
+            Box::new(move |args: &[String], budget, stopped: &dyn Fn() -> bool| {
                 run.ran.lock().unwrap().push(args.to_vec());
+                if stopped() {
+                    run.ended.lock().unwrap().push(args[0].clone());
+                    return Err(RunFailed::TimedOut(budget));
+                }
                 let mut exits = run.exits.lock().unwrap();
                 Ok(if exits.is_empty() {
                     Ran::ok("")
@@ -348,14 +427,24 @@ pub(crate) mod tests {
         })
     }
 
+    /// The item's row, the machine seeing nothing of it but the stops its passes hold.
     fn run(item: &Toolset, mode: Mode) -> aterm_converge::ItemReport {
         let sys = Fake::default();
+        let row = run_on(item, mode, &sys);
+        let calls = sys.calls();
+        assert!(
+            calls.is_empty() || calls == ["defer stops", "stops restored"],
+            "{calls:?}"
+        );
+        row
+    }
+
+    fn run_on(item: &Toolset, mode: Mode, sys: &Fake) -> aterm_converge::ItemReport {
         let ctx = ctx(&[]);
-        let bound = bind([(item as &dyn Item, place())], &sys, &ctx);
+        let bound = bind([(item as &dyn Item, place())], sys, &ctx);
         let mut rows =
             aterm_converge::run_scoped(&bound, mode, Scope::EVERY, &mut NoJournal, &mut |_| {})
                 .unwrap();
-        assert!(sys.calls().is_empty(), "{:?}", sys.calls());
         rows.remove(0)
     }
 
@@ -519,6 +608,89 @@ pub(crate) mod tests {
                 wait.is_some(),
                 "{ran:?}"
             );
+        }
+    }
+
+    /// A stop while a pass runs ends that pass (the port ends its process group) and starts no
+    /// other; a stop read once a pass finished starts no later one. Either way the item says on
+    /// standard error, while it still holds the stops, where among the passes the stop came
+    /// (during the pass it ended, or after the one that finished and before the next), and the
+    /// stop is sent again once it lets them go. In a live run that ends the run as the stop
+    /// would have, before any row is reported, so the said line is what the person sees of the
+    /// row; the Fake records the stop sent again instead, so its row reads Failed. NEGATIVE
+    /// CONTROL: with no stop both passes run to the end, nothing is said and nothing is sent
+    /// again.
+    #[test]
+    fn a_stop_ends_the_running_pass_starts_no_other_and_is_sent_again() {
+        let stop = "stop sent again: signal 2";
+        let seed = "`aterm pkg seed`";
+        let update = "`aterm pkg update --defer-busy-flip`";
+        let between = format!("after {seed}, before {update}");
+        // The Fake's stop readings: the check before seed, seed's own, the check after it, then
+        // the same three for update.
+        for (stop_after, ended, ran, when) in [
+            (Some(0), &[][..], 0, Some(format!("before {seed}"))),
+            (
+                Some(1),
+                &["seed"][..],
+                1,
+                Some(format!("during {seed}, which was ended")),
+            ),
+            (Some(2), &[], 1, Some(between.clone())),
+            (Some(3), &[], 1, Some(between.clone())),
+            (
+                Some(4),
+                &["update"],
+                2,
+                Some(format!("during {update}, which was ended")),
+            ),
+            (Some(5), &[], 2, Some(format!("after {update}"))),
+            (None, &[], 2, None),
+        ] {
+            let store = store(vec![missing(), complete()], Vec::new());
+            let mut sys = Fake::default();
+            sys.stop_after = stop_after;
+            let sys = Arc::new(sys);
+            let heard = Arc::new(Mutex::new(Vec::new()));
+            let item = item(&store, None).saying({
+                let (heard, sys) = (Arc::clone(&heard), Arc::clone(&sys));
+                Arc::new(move |line: &str| {
+                    heard.lock().unwrap().push((line.to_owned(), sys.calls()));
+                })
+            });
+            let row = run_on(&item, Mode::Apply, &sys);
+            assert_eq!(*store.ended.lock().unwrap(), ended, "{stop_after:?}");
+            assert_eq!(store.ran.lock().unwrap().len(), ran, "{stop_after:?}");
+            let calls = sys.calls();
+            assert_eq!(calls.first().map(String::as_str), Some("defer stops"));
+            assert_eq!(
+                calls.iter().any(|call| call == stop),
+                when.is_some(),
+                "{stop_after:?}: {calls:?}"
+            );
+            let heard = heard.lock().unwrap().clone();
+            match when {
+                Some(when) => {
+                    assert_eq!(row.outcome, Outcome::Failed, "{row:?}");
+                    let [(line, held)] = heard.as_slice() else {
+                        panic!("{stop_after:?}: one line said: {heard:?}");
+                    };
+                    assert!(line.starts_with(STOPPED_LEAD), "{line}");
+                    assert!(
+                        line.contains(&format!("stopped (SIGINT) {when};")),
+                        "{line}"
+                    );
+                    assert_eq!(
+                        held,
+                        &["defer stops"],
+                        "{stop_after:?}: said while the stops are still held"
+                    );
+                }
+                None => {
+                    assert_eq!(row.outcome, Outcome::Changed, "{row:?}");
+                    assert!(heard.is_empty(), "{heard:?}");
+                }
+            }
         }
     }
 

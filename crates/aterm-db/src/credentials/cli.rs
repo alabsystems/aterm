@@ -40,7 +40,7 @@ fn fail(text: &str, code: u8) -> ExitCode {
 }
 
 /// Entry point for `aterm secrets need …` (the words after `need`).
-#[must_use]
+#[must_use = "handle or propagate the command's exit status"]
 pub fn main_entry(args: Vec<OsString>) -> ExitCode {
     let Ok(words) = args
         .into_iter()

@@ -3,12 +3,15 @@
 
 //! A build that failed to start, noted against the build.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use aterm_json::{Map, Value};
 
-use super::{FailedStart, Opts, Report, St, VERSION_WAIT, ledger, said, state_dir};
+use super::{
+    FailedStart, Opts, Report, St, VERSION_WAIT, check_upgrade_tree, ensure_upgrade_tree, ledger,
+    said,
+};
 use crate::harness::upgrade::{Candidate, Phase};
 
 /// The wait of a move onto a build that failed to start and is not proved since ([`crate::harness::upgrade::build_hold`]).
@@ -138,23 +141,21 @@ impl Note {
 
 /// Where the note of build `version` in install `source` lives; `None` for a
 /// word that is no plain name (nothing outside the directory is named).
-fn path(opts: &Opts, source: &str, version: &str) -> Option<PathBuf> {
+fn note_file_name(source: &str, version: &str) -> Option<String> {
     let plain = |w: &str| {
         !w.is_empty()
             && w.bytes()
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+' | b'_'))
             && !w.starts_with('.')
     };
-    (plain(source) && plain(version)).then(|| {
-        state_dir(opts)
-            .join("build-starts")
-            .join(format!("{source}-{version}.json"))
-    })
+    (plain(source) && plain(version)).then(|| format!("{source}-{version}.json"))
 }
 
 /// The note of build `version` in install `source`, if one was written.
 pub fn load(opts: &Opts, source: &str, version: &str) -> Option<Note> {
-    let text = crate::harness::accounts::read_bounded(&path(opts, source, version)?, 256 * 1024)
+    let name = note_file_name(source, version)?;
+    let dir = check_upgrade_tree(&opts.state, Some("build-starts")).ok()??;
+    let text = crate::harness::accounts::read_bounded(&dir.join(name), 256 * 1024)
         .ok()
         .flatten()?;
     Note::from_json(&text)
@@ -165,10 +166,13 @@ fn write(opts: &Opts, note: &Note) {
     if opts.dry_run {
         return;
     }
-    let Some(path) = path(opts, &note.source, &note.version) else {
+    let Some(name) = note_file_name(&note.source, &note.version) else {
         return;
     };
-    let _ = crate::harness::upgrade_models::write_atomic(&path, &note.to_json());
+    let Ok(dir) = ensure_upgrade_tree(&opts.state, Some("build-starts")) else {
+        return;
+    };
+    let _ = crate::harness::upgrade_models::write_atomic(&dir.join(name), &note.to_json());
 }
 
 /// What `session`'s record, saved at `now` over `before` (the record on disk), says of its build's start: a failure it carries ([`note_failure`]) or a stop it takes back ([`taken_back`]).

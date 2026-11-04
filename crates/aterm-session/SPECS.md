@@ -96,8 +96,8 @@ discard-and-read-evidence	contract	sink::SinkWriter::{discard_unread_input,read_
 
 ## 2. Test → spec map (TSV)
 
-`primary` is the spec that retires the test; `also` lists the other specs it samples. Some tests
-have no row yet, among them all of `tests/windows_input_release.rs`.
+`primary` is the spec that retires the test; `also` lists the other specs it samples. Every live
+`#[test]` in the crate has a row below.
 
 ```tsv
 file	test	primary	also
@@ -177,6 +177,12 @@ src/sink.rs	a_sever_ends_a_drainer_parked_on_a_full_queue	sever-terminal	sink-wa
 src/sink.rs	a_sever_unblocks_every_waiter	sever-terminal	sink-waiters-escape, reply-budget, completion-fence
 src/sink.rs	a_waiter_for_spill_room_arranges_a_pending_drainer_itself	drainer-arrangement	sink-waiters-escape, completion-fence
 src/sink.rs	reply_permits_bound_the_budget_and_release_on_drop	reply-budget	
+src/sink_prefix_tests.rs	kernel_prefix_state_conforms_including_later_reply_failure_and_cancel	kernel-prefix-custody	
+src/sink_prefix_tests.rs	a_real_partial_pipe_prefix_finishes_while_a_later_terminal_reply_is_still_spilled	kernel-prefix-custody	
+src/sink_prefix_tests.rs	queued_prefix_fails_on_sever_or_peer_close_and_ordinary_receipts_remain_unowned	kernel-prefix-custody	
+src/sink_prefix_tests.rs	a_direct_partial_error_owns_only_its_accepted_kernel_prefix_and_zero_bytes_own_none	kernel-prefix-custody	
+src/sink_prefix_tests.rs	kernel_prefix_cancelled_native_write_conforms_and_rejects_early_retirement	kernel-prefix-native-custody	
+src/sink_prefix_tests.rs	a_cleared_pipe_prefix_retains_its_started_native_write_and_never_retries_the_old_chunk	kernel-prefix-native-custody	
 tests/conformance_authorize.rs	the_real_authorization_gate_conforms_to_authorize_soundness	decide-edge-denotation	
 tests/conformance_authorize.rs	the_dropped_destination_mutant_is_told_apart_from_the_real_gate	decide-edge-denotation	
 tests/conformance_input_unread.rs	gate_and_classify_are_the_models_guards_at_every_step	gate-classify-refine-input-unread-model	input-backlog-reading, gate-table, classify-table
@@ -213,13 +219,13 @@ tests/windows_input_release.rs	a_tabs_close_releases_a_frame_blocked_in_writefil
 tests/windows_input_release.rs	a_released_write_reports_every_byte_the_program_reads	sink-waiters-escape	write-metered
 ```
 
-## 3. Findings
+## 3. Coverage
 
-- 111 live tests mapped to the 37 specs (plus 4 historical non-spec tests deleted in §4).
+- 116 live tests mapped across 39 specs (plus 4 historical non-spec tests deleted in §4).
 - The biggest collapses: `sink-ordered-egress` (9 primary, plus 4 shared), `decide-edge-denotation`
   (6 primary, including all three real-code conformance tests), `immediate-write` (10, four added 2026-10-16 with the whole guarded write),
   `input-backlog-reading` (6), `edge-table-ops` (5), `discard-and-read-evidence` (7, two added 2026-10-16: a discard never splits a frame) and
-  `gate-classify-refine-input-unread-model` (5).
+  `gate-classify-refine-input-unread-model` (6).
 - The pure core is `edge.rs`, `id.rs` and `input_backlog.rs`: 16 specs (all but the model refinement), 35 tests. It needs no effect lane
   (gap 8) except `session-id-format` (FFI CSPRNG) and the skipped `grant`/`insert` bodies in
   `edge-table-ops`. Everything in `sink.rs` beyond `bulk-stop-cut`, `write-metered` and
@@ -230,13 +236,9 @@ tests/windows_input_release.rs	a_released_write_reports_every_byte_the_program_r
   nothing yet (§5.8). Clause (2) of `sink-ordered-egress` should replace it with a theorem over
   the imported bodies.
 
-## 4. Proof order (easiest, high value first)
+## 4. Tests that are not spec samples
 
-The pure core (`edge.rs`, `id.rs`, `input_backlog.rs`) needs no effects lane (gap 8) except
-`session-id-format` (the FFI CSPRNG), the `trust::skip` bodies in `edge-table-ops`, and the
-real-pty half of `gate-classify-refine-input-unread-model`. In `sink.rs` everything beyond
-`bulk-stop-cut`, `write-metered` and `receipt-constructors` needs gap 13 (threads), and most of
-it gap 8.
+None remain (the 4 historical non-spec tests were deleted during the 2026-10-16..2026-10-28 audits).
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
@@ -260,8 +262,8 @@ it gap 8.
 8. **A model-only Clean island (not a test).** `sink.rs`'s `SinkSpillOrder` island proves `rfl`
    theorems about a hand-written `OrderState`, not about a `trust_import` of `next_accepted_order` or
    `direct_order_if_spill_empty`. The plan does not accept that as migrated (§3).
-9. **The test census over-counts.** The chunk manifest reports 102 tests; the 102nd hit is a doc comment
-   in `tests/session_suite.rs`, which only declares modules. The real count is 101.
+9. **The test census over-counts.** A naive `#[test]` substring grep finds 117 hits; the extra hit is a doc comment
+   in `tests/session_suite.rs`, which only declares modules. The live `#[test]` count is 116.
 
 ## 6. Proof order (easiest high-value first)
 

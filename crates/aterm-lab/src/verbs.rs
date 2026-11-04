@@ -911,7 +911,7 @@ pub fn egress_text(run: &Run, minutes: &str) -> String {
     let mut s = String::from(
         "# sockets seen (sampled every second by the egress witness; cmd[pid] proto kind endpoint):\n",
     );
-    let read = |p: &Path| fs::read_to_string(p).unwrap_or_default();
+    let read = |p: &Path| crate::util::read_regular_text(p).unwrap_or_default();
     for l in read(&run.run.join("sockets.log")).lines() {
         s.push_str(&format!("  {l}\n"));
     }
@@ -1116,9 +1116,11 @@ pub fn record_launch(run: &Run, sid: &str, launcher: &str) -> Result<(), Fail> {
 #[must_use]
 pub fn launch_record(run: &Run, sid: &str) -> String {
     let kept = (!sid.is_empty())
-        .then(|| fs::read_to_string(launch_path(run, sid)).ok())
+        .then(|| crate::util::read_regular_text(&launch_path(run, sid)).ok())
         .flatten();
-    kept.unwrap_or_else(|| fs::read_to_string(run.run.join("claude.sh")).unwrap_or_default())
+    kept.unwrap_or_else(|| {
+        crate::util::read_regular_text(&run.run.join("claude.sh")).unwrap_or_default()
+    })
 }
 
 /// Which way a Claude Code launch reached a model's API ([`claude_route`]).

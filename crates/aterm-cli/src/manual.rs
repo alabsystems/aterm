@@ -126,17 +126,22 @@ Closing the tab never cancels or holds setup: it goes on behind your tabs.
 System State remains available to rerun setup or to press Restore previous settings.
 Terminal and ssh sessions, -e commands, headless runs, private lab homes and utilities
 never start setup by themselves. Your own `aterm pkg install` or `aterm pkg update` ends
-once it succeeds with `aterm init --no-wait --no-sign-out --no-profile` (no permission
-walk; the command keeps the package pass's exit status) when its input and its error
-output are both your terminal, it runs as you (not as root) in your own login and home
-(no private state root), and it is none of these: `--help` or `-h`, a Command Line Tools
+once it succeeds (or, for a whole `update`, once it finds nothing this Mac can install)
+with `aterm init --no-wait --no-sign-out --no-profile` (no permission walk; the command
+keeps the package pass's exit status unless you stop that run: Ctrl-C ends it and its
+toolset pass, says setup is not finished and that `aterm init` finishes it, and the
+command ends as interrupted) when its input and its error output are both your terminal,
+it runs as you (not as root) in your own login and home (no private state root), not
+under CI (`CI` set), and it is none of these: `--help` or `-h`, a Command Line Tools
 install, a program built into aterm, a pass a program waits behind (`--wait-lock`), or
 one that says `--no-init`. Type `--no-init` to skip it; an AI CLI's Install button,
 `aterm ai doctor` and `aterm ai login` pass it, since each installs as one step of its
 own. At this Mac's screen, until macOS has answered whether aterm may use the local
-network, that run leaves the look for the vault to System State or to an `aterm init` you
-type, so it never puts that question on screen; over ssh, where macOS asks nothing, it
-looks at once, as an `aterm init` you type there does.
+network, that run leaves the look for the vault, and any reach of a vault at a URL this
+Mac is in, to System State or to an `aterm init` you type, so it never puts that question
+on screen (a vault at a path is no network use, and one already in sync needs no reach,
+so both read as anywhere else); over ssh, where macOS asks nothing, it looks at once, as
+an `aterm init` you type there does.
 
 Setup choices:
   Caps Lock as Control; natural scrolling off; trackpad momentum scrolling on
@@ -196,16 +201,27 @@ root, and one that sets its own `DEVELOPER_DIR`.
 A shell that ran one keeps working once they arrive: `git`, `cc` and the
 rest run through Apple's own `/usr/bin/<tool>` then, `xcrun` included, with the SDK it sets.
 The tab ends on one line that says they are installed, or why the install did not finish; an
-install that failed asks again at the next launch, one you stopped (a Ctrl-C, a closed tab)
-does not by itself on that build, and the card's Install Command Line Tools…
-opens it at once. In Low Data Mode the row waits calmly and the tab opens
-by itself once the mode is off; an account
-that is not one of the Mac's administrators is told so, with no Install…. When Apple's own
-installer window is open, System State asks you to finish there. `aterm init` asks for your
-Mac password for them only when you run it yourself at this Mac's screen and nothing is
-installing them already; anywhere else it leaves them waiting and exits 0. Once their install
-ends, `sudo` forgets your password, in the tab and in your own terminal alike, and a Ctrl-C
-during it waits until `sudo` has.
+install that failed, or a tab whose program never started, asks again at the next launch where
+that tab's own ask spent this build's opening. One you stopped (a Ctrl-C, a closed tab, or
+Apple's installer window closed without installing them) does not by itself on that build, and
+neither does a failed Install… you pressed after you declined on that build or after your own
+`aterm pkg install` or `update` asked: the card's Install Command Line Tools… opens it at once.
+In Low Data Mode the row waits calmly
+and the tab opens by itself once the mode is off; an account
+that is not one of the Mac's administrators is told so, with no Install…. While Apple's own
+installer window for them is open, however long ago it opened and whether or not you pressed
+Install there, System State asks you to finish there, and `aterm init` leaves them to it and
+asks no password: finish in that window, or quit it so aterm can install them. Where Apple's
+catalog offers them none, the install opens that window and waits on it; closing it without
+installing them ends the wait at once. `aterm init` asks for your
+Mac password for them only at this Mac's screen, in a terminal, with nothing installing them
+already; anywhere else it leaves them waiting and exits 0. One you type asks each time. The one
+your own `aterm pkg install` or `update` ends with asks by itself at most once per build, the
+tab's ask included, and never after you press Stop; otherwise it names Install Command Line
+Tools… and `aterm init --only base.clt`, and one that failed asks again on that build. Each run
+says why on one line before `sudo` asks, and `sudo` asks afresh: a password you typed for an
+earlier `sudo` never stands in, and none is kept once the install ends, in the tab and in your
+own terminal alike. A Ctrl-C during it waits until the install's step has ended.
 System State reads GitHub
 repositories again whenever you return to it, and by itself only once a renewed token
 reaches this Mac through the vault. A join turns sync on; with sync turned off since, the join lands
@@ -772,7 +788,7 @@ LIMITS
 
 THE DOCTOR
   `aterm ai` prints one row per CLI and a health line (exit 0): what `aterm ai doctor`
-  tries itself, then a `NEEDS YOU:` line for each sign-in no route of aterm's makes.
+  tries itself, then a `NEEDS YOU:` line for each sign-in aterm does not make unattended.
   A CLI nobody asked for here is a note with its `fix:`, never a FAIL, a `NEEDS YOU:`
   line, an exception or an exit code: asked means the preferred CLI, named by `[ai.<id>]
   use = true` or an `[ai] reviewers` list, a pinned pool row, or actually used here (a
@@ -1029,6 +1045,44 @@ HOW A MAC LEAVES
   "m7 removed this Mac and 3 others. Undo m7's removals?": a quorum of the Macs that
   were members before m7's contested removals undoes them all, and then m7 is out. A
   vault with no log yet removes by an admin's `aterm secrets revoke`."#,
+        ),
+    },
+    Topic {
+        name: "status",
+        tagline: "this machine at a glance: setup, membership, vault, fleet, name, tools, repos and agents, each with its next step and who takes it",
+        body: Some(
+            r#"status — one read of this machine (macOS and Linux): each area, where it stands,
+its next step and who takes that step. It reads local state only: no prompt, no dial, no
+write, never a secret's value or an email address, and every area answers within 3 s.
+
+  aterm status            the report, one line an area and its step under it
+  aterm status --json     {"schema":1,"areas":[{"area","state","says","next":{"who","act"}|null}]}
+
+AREAS (each read by its own verb's reader, which says more)
+  setup       macOS's first-launch setup, as System State reads it; before aterm.app's first
+              launch (installed from a terminal, the app never opened) `aterm init` is the step
+  membership  this Mac in ALab                      `aterm members status`
+  vault       the secrets vault: names only         `aterm secrets status`
+  fleet       what a fleet sync would do, the peers `aterm fleet peers`
+  name        the one name this Mac goes by (its m<N> label, or your `[identity] name`), its
+              fleet name and whether its own Computer Name and Local hostname say it yet
+  tools       Apple's Command Line Tools, then the toolset   `aterm pkg doctor`
+  repos       the setup's GitHub repositories step and what it waits on; with no setup
+              (Linux, or before the app's first launch) the clone `aterm init` owes
+  agents      the AI CLIs someone asked for          `aterm ai status`
+
+STATES  ok (nothing to do) · working (aterm is on it) · due (a step waits) · off (not
+        wanted here, or a person's own choice holds it, as a Stop in System State does) ·
+        unknown (not read; the step names the verb that says why)
+
+WHO ACTS
+  aterm   aterm does it by itself; nobody needs to do anything
+  agent   anyone at a terminal, an agent included, runs the command the step names
+  person  only a person can: a member's Allow and the phrase typed here, a sign-in only a
+          browser approval finishes, a System Settings switch, a value only a person picks
+
+A CLI nobody asked for is a note ("N more on demand"), never a step, whatever its state.
+The read exits 0 whatever it finds; 2 is a usage error."#,
         ),
     },
     Topic {
@@ -1469,14 +1523,16 @@ WHAT IT IS
   vendor anchors.
   The first window launch runs `aterm pkg seed` and `aterm pkg update` by itself, and
   `aterm init` runs the same two (its `base.pkg.toolset` row) on a Mac with no window.
-  On macOS and Linux, an `install` or `update` you type finishes setup once it succeeds,
-  with `aterm init --no-wait --no-sign-out --no-profile`, and exits with the pass's own
-  status, when its input and its error output are both your terminal and it runs as you
-  (not as root) in your own login and home; `--help`, a Command Line Tools install, a
-  program built into aterm, a `--wait-lock` and `--no-init` (type it to skip setup) never
-  do. At a Mac's screen that run looks for the vault only once macOS has answered its
-  Local Network question; over ssh, where macOS asks nothing, it looks at once (see
-  `aterm help setup`).
+  On macOS and Linux, an `install` or `update` you type finishes setup once it succeeds
+  (a whole `update` also once it finds nothing installable here: no build for this
+  machine, or an exclude or uninstalls that leave nothing), with `aterm init --no-wait
+  --no-sign-out --no-profile`, and exits with the pass's own status unless a stop (Ctrl-C)
+  ends that run, when its input and its error output are both your terminal, it runs as
+  you (not as root) in your own login and home, and not under CI (`CI` set); `--help`, a
+  Command Line Tools install, a program built into aterm, a `--wait-lock` and `--no-init`
+  (type it to skip setup) never do. At a Mac's screen that run looks for the vault, or
+  reaches a vault at a URL, only once macOS has answered its Local Network question; over
+  ssh, where macOS asks nothing, it looks at once (see `aterm help setup`).
 
 KEY USAGE (`aterm pkg --help` lists every verb, plumbing included)
   aterm pkg install --default-set
@@ -2272,6 +2328,10 @@ fn overview_page() -> String {
             crate::Verb::Init => {
                 "set up this Mac (SSH, CLI-only Macs) or a Linux machine from a terminal; aterm.app's \
                  first launch does it by itself"
+            }
+            crate::Verb::Status => {
+                "this machine at a glance: membership, vault, fleet, name, tools, repos, agents — each \
+                 with its next step and who takes it (--json)"
             }
             crate::Verb::Secrets => {
                 "one credentials file for every machine: the vault, its server and ~/.secrets \

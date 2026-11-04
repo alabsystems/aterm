@@ -34,9 +34,16 @@
 //!   at the same point, without the drain of the drive's cache, which only a power loss
 //!   shows and no test makes. No application sets the mark, and a release build never
 //!   reads it.
-//! - [`flush_tally`]: how many of those three calls this process has made, by kind, so
-//!   a reading around a span of the broker's work counts every flush it asked the OS
-//!   for, whatever the broker's own counts say (astream-broker's benches gate it).
+//! - [`plain_fsync`] (Unix): a plain `fsync(2)`, retried on `EINTR`, in every build:
+//!   the file's writes handed to the drive without the drain of its cache, for a
+//!   caller that asks for exactly that (aterm-durable's `ordered_or_fsync`, where a
+//!   volume refuses both the barrier and the full flush). On Apple it is the `fsync`
+//!   behind [`full_sync`] in a test's process tree; elsewhere [`File::sync_all`], which
+//!   is `fsync(2)` there.
+//! - [`flush_tally`]: how many of those four calls this process has made, by kind, so
+//!   a reading around a span of a process's work counts every flush it asked the OS
+//!   for through this crate, whatever the broker's own counts say (astream-broker's
+//!   benches gate it, and its `<log>.health` carries it).
 //! - [`boot_session`]: THIS BOOT of the machine as the kernel names it, as 16 bytes.
 //!   Two readings are equal exactly when no boot came between them, which is the
 //!   question a log that trusts the page cache asks — "has the kernel holding my
@@ -78,7 +85,7 @@
 //! The crate root is `deny(unsafe_code)`, and its OS modules re-permit it, for
 //! hand-declared FFI calls with a `// SAFETY:` note each. `apple`
 //! (`cfg(target_vendor = "apple")`): `fcntl(F_BARRIERFSYNC)` behind [`barrier_sync`],
-//! `fsync` behind [`full_sync`] in a test's debug process,
+//! `fsync` behind [`plain_fsync`] and behind [`full_sync`] in a test's debug process,
 //! `sysctlbyname("kern.bootsessionuuid")` behind [`boot_session`], `poll` behind
 //! `socket_hung_up`, `fcntl(F_GETFD)` and `fcntl(F_SETFD)` behind [`close_on_fork`],
 //! and `signal(SIGHUP)` behind [`install_sighup_handler`]. `owner`
@@ -109,8 +116,12 @@
 //! subprocess, to read what its enrollment root script reads. On
 //! Apple targets every ordered write it makes, to a file or a directory, is finished
 //! with [`barrier_sync`], [`barrier_refused`] telling a volume that takes no barrier
-//! from a failed flush; elsewhere aterm-durable's ordered write is a full flush of its
-//! own, not this crate's. aterm-durable's `Flush::dir_best_effort` and aterm-link's
+//! from a failed flush; elsewhere aterm-durable's ordered write is [`full_sync`]. Every
+//! durable write aterm-durable finishes ends with [`full_sync`] or [`full_sync_data`],
+//! and the plain flush its ordered write falls back to where a volume refuses both is
+//! [`plain_fsync`], so [`flush_tally`] counts every flush aterm-durable makes, and
+//! aterm-link's BROKER section quotes the tally its broker's `<log>.health` carries.
+//! aterm-durable's `Flush::dir_best_effort` and aterm-link's
 //! tolerated state-dir flushes go on without a directory's flush exactly where
 //! [`dir_flush_unavailable`] says so, the broker's own rule, and return any other
 //! failure. [`file_flush_refused`] classifies refusals from a file's selected flush;
@@ -405,6 +416,7 @@ pub fn test_plain_fsync() -> bool {
 /// # Errors
 /// The flush's own error.
 pub fn full_sync(file: &File) -> io::Result<()> {
+    // Counted `full` whatever a test's process takes underneath: the call is a full flush.
     let _ = FULL_FLUSHES.fetch_add(1, Ordering::Relaxed);
     #[cfg(all(debug_assertions, target_vendor = "apple"))]
     if test_plain_fsync() {
@@ -448,26 +460,69 @@ pub fn barrier_sync(file: &File) -> io::Result<()> {
     }
 }
 
+/// A plain `fsync(2)` of `file`, retried while it is interrupted (`EINTR`), in every
+/// build: its writes handed to the drive, without the drain of the drive's cache that
+/// [`full_sync`] waits for on Apple. For a caller that asks for exactly that flush — a
+/// volume that refuses both [`barrier_sync`] and [`full_sync`] (a network home whose
+/// server takes no `F_FULLFSYNC`) still takes it, as SQLite finds there. Apple: the
+/// cordon's `fsync`. Elsewhere [`File::sync_all`], which is `fsync(2)` there and is
+/// retried on `EINTR` by std.
+///
+/// # Errors
+/// The flush's own error.
+#[cfg(unix)]
+pub fn plain_fsync(file: &File) -> io::Result<()> {
+    let _ = PLAIN_FLUSHES.fetch_add(1, Ordering::Relaxed);
+    #[cfg(target_vendor = "apple")]
+    {
+        apple::plain_fsync(file)
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        file.sync_all()
+    }
+}
+
+/// `call` until it answers anything but `EINTR` ([`io::ErrorKind::Interrupted`]): the
+/// retry every flush of the cordon makes, so an interrupted flush is never reported as
+/// a failed one.
+#[cfg(any(test, target_vendor = "apple"))]
+fn retried_on_eintr(mut call: impl FnMut() -> io::Result<()>) -> io::Result<()> {
+    loop {
+        match call() {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            answer => return answer,
+        }
+    }
+}
+
 /// The [`full_sync`] and [`full_sync_data`] calls this process has made ([`flush_tally`]).
 static FULL_FLUSHES: AtomicU64 = AtomicU64::new(0);
 
 /// The [`barrier_sync`] calls this process has made ([`flush_tally`]).
 static BARRIERS: AtomicU64 = AtomicU64::new(0);
 
+/// The [`plain_fsync`] calls this process has made ([`flush_tally`]).
+static PLAIN_FLUSHES: AtomicU64 = AtomicU64::new(0);
+
 /// How many flushes this process has asked this crate for since it started, by kind
 /// ([`flush_tally`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FlushTally {
-    /// [`full_sync`] and [`full_sync_data`] calls.
+    /// [`full_sync`] and [`full_sync_data`] calls (a plain `fsync(2)` underneath in a
+    /// test's process tree, counted here all the same).
     pub full: u64,
     /// [`barrier_sync`] calls (a full flush off Apple, counted here all the same).
     pub barrier: u64,
+    /// [`plain_fsync`] calls.
+    pub plain: u64,
 }
 
 /// The flushes this process has asked this crate for so far: every [`full_sync`] and
 /// [`full_sync_data`] call is one `full`, every [`barrier_sync`] call one `barrier`,
-/// counted as the call begins, whatever it then returns (a barrier the device refuses
-/// is counted, and so is the full flush a caller issues in its place).
+/// every [`plain_fsync`] call one `plain`, counted as the call begins, whatever it then
+/// returns (a barrier the device refuses is counted, and so is the full flush a caller
+/// issues in its place).
 ///
 /// It counts calls, not what any caller meant by them. `astream-broker` is
 /// `forbid(unsafe_code)` and finishes every write it makes durable or ordered through
@@ -482,6 +537,7 @@ pub fn flush_tally() -> FlushTally {
     FlushTally {
         full: FULL_FLUSHES.load(Ordering::Relaxed),
         barrier: BARRIERS.load(Ordering::Relaxed),
+        plain: PLAIN_FLUSHES.load(Ordering::Relaxed),
     }
 }
 
@@ -1264,6 +1320,63 @@ mod tests {
             assert!(barrier_sync(&null).is_err_and(|e| barrier_refused(&e)));
             assert!(flush_tally().barrier > at.barrier);
         }
+    }
+
+    /// The plain flush is its own kind: [`plain_fsync`] raises `plain` and no other count.
+    /// No other test of this binary calls it, so its count is this test's alone; the other
+    /// two kinds only grow, and a plain flush counted as either falls short here.
+    #[cfg(unix)]
+    #[test]
+    fn a_plain_fsync_is_counted_plain_and_nothing_else() {
+        let dir = std::env::temp_dir().join(format!("astream-sys-plain-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut f = File::create(dir.join("plain")).unwrap();
+        std::io::Write::write_all(&mut f, b"handed to the drive").unwrap();
+        let before = flush_tally();
+        let flushed = plain_fsync(&f).and_then(|()| plain_fsync(&f));
+        let after = flush_tally();
+        let _ = std::fs::remove_dir_all(&dir);
+        flushed.expect("a regular file takes a plain fsync");
+        assert_eq!(after.plain, before.plain + 2, "{before:?} -> {after:?}");
+    }
+
+    /// An interrupted flush is retried and never reported, and the first answer that is
+    /// not `EINTR` is the flush's own: success, or another failure returned at once
+    /// (`EIO` here). The cordon's `fsync` and `fcntl(F_BARRIERFSYNC)` both retry through
+    /// it. NEGATIVE CONTROL: the `EINTR` the kernel answers reads as interrupted, so a
+    /// retry that matched another kind would return it here.
+    #[test]
+    fn an_interrupted_flush_is_retried_and_another_failure_is_returned() {
+        let interrupted = || {
+            if cfg!(unix) {
+                io::Error::from_raw_os_error(4)
+            } else {
+                io::Error::from(io::ErrorKind::Interrupted)
+            }
+        };
+        assert_eq!(interrupted().kind(), io::ErrorKind::Interrupted);
+        let mut calls = 0;
+        retried_on_eintr(|| {
+            calls += 1;
+            if calls < 3 {
+                Err(interrupted())
+            } else {
+                Ok(())
+            }
+        })
+        .expect("the third call succeeded");
+        assert_eq!(calls, 3, "each EINTR is retried");
+        let mut calls = 0;
+        let failed = retried_on_eintr(|| {
+            calls += 1;
+            if calls < 2 {
+                Err(interrupted())
+            } else {
+                Err(io::Error::from_raw_os_error(5))
+            }
+        });
+        assert_eq!(failed.unwrap_err().raw_os_error(), Some(5));
+        assert_eq!(calls, 2, "a failure other than EINTR is not retried");
     }
 
     #[test]

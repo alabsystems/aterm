@@ -67,7 +67,11 @@ pub fn on_ask_members(ask: AskMembers) {
 }
 
 /// Whether macOS has answered aterm's Local Network question (a look reached the LAN or was
-/// refused, or the window recorded the grant), for the login this process runs as.
+/// refused, or the window recorded the grant), for the login this process runs as. A process
+/// another app is responsible for (a shell in Terminal) is asked that app's question, which this
+/// reads as aterm's: telling the two apart needs the code identity of the process macOS holds
+/// responsible, which [`LanKeeper::keeps`] reads by its file alone, and a window an update swapped
+/// aside while it runs would then read as another app's.
 pub type LanAnswered = fn() -> bool;
 
 /// What reads [`LanAnswered`] ([`on_lan_answered`]); unset, macOS's question is taken as not
@@ -79,6 +83,70 @@ static LAN_ANSWERED: std::sync::OnceLock<LanAnswered> = std::sync::OnceLock::new
 /// State's records). The first call wins.
 pub fn on_lan_answered(answered: LanAnswered) {
     let _ = LAN_ANSWERED.set(answered);
+}
+
+pub use aterm_secrets::client::LocalNetworkHeard as LanHeard;
+
+/// What a look that asked the network for a vault (`probed`: `aterm_secrets::client::probe` of
+/// one address, or [`alab_look_heard`]'s) heard of macOS's Local Network switch: any answer there
+/// (the vault, another vault, an answer that is no vault, or a server holding none, a 404 or
+/// 204) is the switch on, and macOS's refusal of the name is it off; anything else (a timeout, a
+/// refused connect, a lookup macOS holds while its question is open) says nothing of it. System
+/// State's look and `aterm init`'s read this one rule.
+#[must_use]
+pub fn lan_heard(probed: &aterm_secrets::Result<ProbeOutcome>) -> Option<LanHeard> {
+    match probed {
+        Ok(_) => Some(LanHeard::Reached),
+        Err(why) => {
+            aterm_secrets::client::refused_by_local_network(why).then_some(LanHeard::Refused)
+        }
+    }
+}
+
+/// [`lan_heard`] of a look for the ALab vault (`aterm_secrets::client::probe_default`), which
+/// asks the network only where this build carries the ALab vault's signer: without one its
+/// [`ProbeOutcome::Absent`] heard nothing.
+#[must_use]
+pub fn alab_look_heard(probed: &aterm_secrets::Result<ProbeOutcome>) -> Option<LanHeard> {
+    aterm_secrets::client::alab_signer_built_in()
+        .then(|| lan_heard(probed))
+        .flatten()
+}
+
+/// What keeps what this process's looks and vault syncs at a `.local` address hear of macOS's
+/// Local Network switch ([`on_lan_heard`]): System State's records, as the window's own looks
+/// keep it.
+#[derive(Clone, Copy, Debug)]
+pub struct LanKeeper {
+    /// Whether this process's looks are aterm's to keep: the question macOS puts it is aterm's
+    /// own. Read only where a look or an actual sync request heard something.
+    pub keeps: fn() -> bool,
+    /// Keep what a look heard; called only where [`Self::keeps`] said so.
+    pub keep: fn(LanHeard),
+}
+
+/// What keeps a look's [`LanHeard`] ([`on_lan_heard`]); unset, nothing keeps it.
+static LAN_KEEPER: std::sync::OnceLock<LanKeeper> = std::sync::OnceLock::new();
+
+/// Keep what this process's looks and vault syncs at a `.local` address hear of macOS's Local
+/// Network switch through `keeper`. The first call wins.
+pub fn on_lan_heard(keeper: LanKeeper) {
+    let _ = LAN_KEEPER.set(keeper);
+}
+
+/// The keeper of this process's looks ([`on_lan_heard`]), where there is one and they are its
+/// to keep ([`LanKeeper::keeps`]).
+fn lan_keeper() -> Option<&'static LanKeeper> {
+    LAN_KEEPER.get().filter(|keeper| (keeper.keeps)())
+}
+
+/// Hand `heard` to what keeps it ([`lan_keeper`]), where a look heard something.
+fn keep_lan_heard(heard: Option<LanHeard>) {
+    if let Some(heard) = heard
+        && let Some(keeper) = lan_keeper()
+    {
+        (keeper.keep)(heard);
+    }
 }
 
 /// Only the ALab vault says a Mac is ALab's (init design §8.1): `status` holds a membership of a
@@ -121,9 +189,10 @@ pub enum Here {
     /// questions, and the row says how an admin lets this Mac in.
     Person,
     /// Nobody to ask, in the console login's own session (an agent's tab, no terminal). A look
-    /// for the ALab vault there would put macOS's Local Network question on the screen of a
-    /// person who may not be there, so it looks only once macOS has answered it
-    /// ([`SecretsOps::lan_answered`]), and never waits on it.
+    /// for the ALab vault there, or a reach of the vault this Mac is in, would put macOS's
+    /// Local Network question on the screen of a person who may not be there, so it does
+    /// either only once macOS has answered it ([`SecretsOps::lan_answered`]), and never waits on
+    /// it.
     Session,
     /// Nobody to ask, in a remote shell (SSH) of the login that owns the console, where macOS
     /// raises no Local Network question.
@@ -131,9 +200,10 @@ pub enum Here {
     /// A person at a terminal, as [`Here::Person`], in a run nobody asked for: aterm's own,
     /// finishing setup after their package install or update ([`crate::init::Decider::Aterm`]).
     /// The row says how an admin lets this Mac in, but the run asks nothing: no `--vault`
-    /// question, no signer for its join to confirm, and on a Mac its look for the ALab vault
-    /// waits for macOS's Local Network answer as [`Here::Session`]'s does, since putting that
-    /// question on the screen is no decision aterm makes by itself.
+    /// question, no signer for its join to confirm, and on a Mac its look for the ALab vault and
+    /// its reach of the vault this Mac is in wait for macOS's Local Network answer as
+    /// [`Here::Session`]'s do, since putting that question on the screen is no decision aterm
+    /// makes by itself.
     Unbidden,
 }
 
@@ -470,8 +540,12 @@ fn look_here(home: &Path) -> aterm_secrets::Result<ProbeOutcome> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_secs());
+    // Only a look that asked the network hears the switch: one a kept answer stands for asks
+    // nothing.
     look_here_with(home, aterm_secrets::heard::network_key(), now, || {
-        aterm_secrets::client::probe_default(PROBE_WAIT)
+        let probed = aterm_secrets::client::probe_default(PROBE_WAIT);
+        keep_lan_heard(alab_look_heard(&probed));
+        probed
     })
 }
 
@@ -625,6 +699,17 @@ impl LiveSecrets {
 
     fn paths(&self) -> Paths {
         Paths::for_home(&self.home)
+    }
+
+    /// Keep only what an actual sync request heard, while this app's own answer is not kept.
+    /// This callback reads no vault configuration and starts no additional request.
+    fn hear_vault_lan(&self, heard: LanHeard) {
+        let Some(keeper) = LAN_KEEPER.get() else {
+            return;
+        };
+        if !self.lan_answered() && (keeper.keeps)() {
+            (keeper.keep)(heard);
+        }
     }
 
     fn with_join_options(
@@ -995,7 +1080,10 @@ impl SecretsOps for LiveSecrets {
     }
 
     fn sync(&self) -> aterm_secrets::Result<()> {
-        aterm_secrets::client::sync(&self.paths(), None).map(drop)
+        aterm_secrets::client::sync_observing_local_network(&self.paths(), None, |heard| {
+            self.hear_vault_lan(heard);
+        })
+        .map(drop)
     }
 
     fn say(&self, line: &str) {
@@ -1131,7 +1219,9 @@ pub struct Secrets {
     pub items: Vec<Box<dyn Item>>,
     /// The item a GitHub credential waits for ([`crate::init_github::items`]): this run joins
     /// a vault, or this Mac waits to be let into one, so the token file the vault writes may
-    /// not be there yet.
+    /// not be there yet. Not where the vault's reach waits for macOS's Local Network answer and
+    /// its subscriber is down, by the one reading the vault's row judges by too: nothing lands
+    /// the join on that run, so GitHub reads its own row.
     pub waited_on: Option<String>,
 }
 
@@ -1277,13 +1367,16 @@ pub fn items(
     items_at(sys, ctx, ops, mode, vault, Here::Person)
 }
 
-/// What an unconfigured Mac's row says where a run that asks nobody (nobody is there to answer,
-/// or aterm decided the run, [`Here::Unbidden`]) did not look for the ALab vault, because the
-/// look would raise macOS's Local Network question on the screen.
-const LAN_NOT_ASKED: &str = "not looked for yet: the look would put macOS's question whether \
-                             aterm may use the local network on this Mac's screen, which this \
-                             run puts to nobody; System State asks it, or aterm init at this \
-                             Mac's console looks";
+/// What the row says where a run that asks nobody (nobody is there to answer, or aterm decided
+/// the run, [`Here::Unbidden`]) neither looked for the ALab vault nor reached the vault at a URL
+/// this Mac is in, because either can raise macOS's Local Network question on the screen: the
+/// look always does, and a URL may name a host on this network (the ALab vault's is a `.local`
+/// one).
+const LAN_NOT_ASKED: &str = "not looked for or reached yet: a look for the ALab vault, or a \
+                             reach of a vault at a URL, can put macOS's question whether aterm \
+                             may use the local network on this Mac's screen, which this run puts \
+                             to nobody; System State asks it, or aterm init at this Mac's \
+                             console takes the step";
 
 /// The secrets step for this run, for `here`. An unconfigured Mac joins the open default ALab
 /// vault on its LAN with no question, and says no code: a person at a terminal included, and an
@@ -1291,7 +1384,9 @@ const LAN_NOT_ASKED: &str = "not looked for yet: the look would put macOS's ques
 /// something, of a person at a terminal (its signing key, or another source where none answers
 /// there); a join password is never asked. Where no vault answers, it asks nothing. On a Mac,
 /// a run in the console login's session that is no person's own ([`Here::Session`],
-/// [`Here::Unbidden`]) looks only once macOS has answered aterm's Local Network question.
+/// [`Here::Unbidden`]) looks for the ALab vault, or reaches a vault at a URL this Mac is in,
+/// only once macOS has answered aterm's Local Network question; a vault at a path is no network
+/// use, and one already in sync is reached by nothing ([`Vault::holding_for_lan`]).
 /// # Errors
 /// The run does not name exactly one user, or the person stopped a prompt (Ctrl-C); nothing
 /// was changed then.
@@ -1336,6 +1431,14 @@ pub fn items_at(
             ));
         }
     };
+    // A run in the console login's session that is no person's own reaches the LAN only once
+    // macOS has answered aterm's Local Network question: neither to look for the open ALab vault
+    // nor to reach the vault this Mac is in at a URL (the ALab vault's address is a `.local`
+    // one), whose sync, subscriber or wait for an admin can raise that question as a look does.
+    // A read of the vault this Mac is in (`--check`, `--plan`, and an apply's own probe) reads
+    // this Mac's own records and reaches nothing, so only an apply that would reach it waits.
+    let lan_unasked =
+        matches!(here, Here::Session | Here::Unbidden) && sys.macos() && !ops.lan_answered();
     if let Some(config) = &status.config {
         let other = vault.is_some_and(|typed| {
             !matches!(
@@ -1354,7 +1457,24 @@ pub fn items_at(
                 },
             ));
         }
-        let waited_on = matches!(status.membership, Membership::Pending).then(|| item_id(&user));
+        // A vault at a path is no network use (as `aterm::converge`'s publications read it).
+        let lan_held =
+            lan_unasked && mode == Mode::Apply && matches!(config.source, Source::Url(_));
+        // A Mac waiting to be let in owes GitHub its token once the subscriber lands the join.
+        // Held for the Local Network answer, an idle subscriber is not started (the row reads
+        // Deferred, with no wait of its own, or the sync the person turned off), so nothing
+        // lands the join this run: GitHub then reads its own row (no token on this Mac yet)
+        // rather than one blocked on the vault. A running subscriber (a local read) still
+        // finishes the join, and GitHub waits for it, as it does where the subscriber cannot be
+        // read (the vault's row then fails on that read). The subscriber is read once, here, and
+        // the vault's probe judges by that same reading ([`Vault::holding_for_lan`]): one that
+        // stops or starts between two reads (launchd restarting its KeepAlive job) would leave
+        // GitHub waiting on a row deferred with no wait of its own, or owed nothing beside a
+        // join that lands.
+        let held = lan_held.then(|| ops.subscriber());
+        let idle_held = matches!(&held, Some(Ok(state)) if idle(state).is_some());
+        let waited_on = (matches!(status.membership, Membership::Pending) && !idle_held)
+            .then(|| item_id(&user));
         let vault = Vault::new(
             user,
             ops,
@@ -1364,7 +1484,12 @@ pub fn items_at(
             Duration::ZERO,
         );
         return Ok(Secrets {
-            items: vec![Box::new(vault.saying_codes(says_codes).asking(person))],
+            items: vec![Box::new(
+                vault
+                    .saying_codes(says_codes)
+                    .asking(person)
+                    .holding_for_lan(held),
+            )],
             waited_on,
         });
     }
@@ -1373,7 +1498,7 @@ pub fn items_at(
     if mode != Mode::Apply || (vault.is_some() && !asks) {
         return Ok(Secrets::not_applicable(user, UNCONFIGURED));
     }
-    if matches!(here, Here::Session | Here::Unbidden) && sys.macos() && !ops.lan_answered() {
+    if lan_unasked {
         return Ok(Secrets::note(
             user,
             Probe::Deferred {
@@ -1429,8 +1554,9 @@ pub fn finishes_by_itself(row: &crate::model::ItemReport) -> bool {
     row.id.starts_with(ITEM) && matches!(row.stood_aside, Some(StoodAside::Waiting(_)))
 }
 
-/// Whether `row` is the vault's look left for a person to answer macOS's Local Network question
-/// ([`LAN_NOT_ASKED`]): System State asks it, or `aterm init` at this Mac's console looks.
+/// Whether `row` is the vault's look, or its reach of a vault at a URL, left for a person to
+/// answer macOS's Local Network question ([`LAN_NOT_ASKED`]): System State asks it, or `aterm
+/// init` at this Mac's console takes the step.
 #[must_use]
 pub fn waits_for_local_network(row: &crate::model::ItemReport) -> bool {
     row.id.starts_with(ITEM) && row.why.as_deref() == Some(LAN_NOT_ASKED)
@@ -1540,6 +1666,10 @@ pub(crate) struct Vault {
     /// own run ([`Here::Person`]), never in one aterm decided ([`Here::Unbidden`]), which shows
     /// the codes but asks nothing.
     asks: bool,
+    /// Whether an apply waits for macOS's Local Network answer ([`Vault::holding_for_lan`]):
+    /// the probe reads a change it would make as deferred ([`LAN_NOT_ASKED`]). Held, it is the
+    /// subscriber's state as [`items_at`] read it, which the probe judges by.
+    lan_held: Option<aterm_secrets::Result<State>>,
 }
 
 impl Vault {
@@ -1565,6 +1695,7 @@ impl Vault {
             keeps_off: false,
             says_codes: true,
             asks: false,
+            lan_held: None,
         }
     }
 
@@ -1581,6 +1712,20 @@ impl Vault {
     /// without it asks nothing.
     const fn asking(mut self, asks: bool) -> Self {
         self.asks = asks;
+        self
+    }
+
+    /// This vault item, its apply waiting for macOS's Local Network answer when `held` is the
+    /// subscriber's state as [`items_at`] read it: a vault at a URL this Mac is in, in an apply
+    /// that asks nobody before that answer. Its probe still reads this Mac's own records first,
+    /// reaching nothing, and judges the subscriber by that one reading, never a second (GitHub's
+    /// wait, [`Secrets::waited_on`], was decided by it), so a vault in sync (or waiting on its
+    /// running subscriber to be let in) reads as it is; only a change, which an apply makes by
+    /// reaching the vault (its sync, its subscriber's start, a wait to be let in that asks
+    /// ALab's members, the look before it), reads as deferred ([`LAN_NOT_ASKED`]), and nothing
+    /// is planned or applied.
+    fn holding_for_lan(mut self, held: Option<aterm_secrets::Result<State>>) -> Self {
+        self.lan_held = held;
         self
     }
 
@@ -2185,7 +2330,12 @@ impl Item for Vault {
         }
         let unsynced = match status.membership {
             Membership::In { .. } | Membership::Plain | Membership::Pending => {
-                match self.ops.subscriber() {
+                // Held, the reading GitHub's wait was decided by.
+                let reading = self
+                    .lan_held
+                    .clone()
+                    .unwrap_or_else(|| self.ops.subscriber());
+                match reading {
                     Ok(state) => idle(&state),
                     Err(why) => {
                         return Probe::Unusable {
@@ -2240,6 +2390,11 @@ impl Item for Vault {
         };
         if let (Membership::Pending, Probe::Unusable { why }) = (&status.membership, &probe) {
             *self.waiting.lock().unwrap_or_else(PoisonError::into_inner) = Some(why.clone());
+        }
+        if self.lan_held.is_some() && matches!(probe, Probe::Change { .. }) {
+            return Probe::Deferred {
+                why: LAN_NOT_ASKED.into(),
+            };
         }
         if matches!(probe, Probe::Change { .. }) {
             self.plan(match self.origin {
@@ -2474,6 +2629,9 @@ pub(crate) mod tests {
         dies: Mutex<Option<String>>,
         /// Looks answered first, in order, before `probed` answers the rest.
         looks: Mutex<VecDeque<aterm_secrets::Result<ProbeOutcome>>>,
+        /// What `subscriber` answers first, in order, before `subscriber` answers the rest: a
+        /// subscriber that stops or starts between two reads.
+        readings: Mutex<VecDeque<aterm_secrets::Result<State>>>,
         /// What each `check` answers, in order (`Pinned` once they run out), and the sources it
         /// was asked about.
         checked: Mutex<VecDeque<Result<Checked, String>>>,
@@ -2627,6 +2785,9 @@ pub(crate) mod tests {
         }
 
         fn subscriber(&self) -> aterm_secrets::Result<State> {
+            if let Some(state) = self.readings.lock().unwrap().pop_front() {
+                return state;
+            }
             if let Some(state) = self.subscriber.lock().unwrap().clone() {
                 return state;
             }
@@ -3481,6 +3642,100 @@ pub(crate) mod tests {
         }
     }
 
+    /// The vault this Mac is already in may be on its LAN too (the ALab vault's `.local`
+    /// address): in the console login's session with nobody to answer, and in a run aterm
+    /// decided, a sync that would reach it at its URL does not until macOS has answered aterm's
+    /// Local Network question, and the row waits for the person as the look does. A check reads
+    /// this Mac's own records there, as anywhere, and says what a sync would change. NEGATIVE
+    /// CONTROL: the person's own run at the console and a remote shell, where the question is
+    /// theirs or never raised, sync it; with no `holding_for_lan` on the configured vault, the
+    /// first two sync too.
+    #[test]
+    fn off_the_console_the_vault_this_mac_is_in_waits_for_the_local_network_answer() {
+        for here in [Here::Session, Here::Unbidden] {
+            let sys = fake();
+            let ops = Scripted::new(vec![Ok(configured(Membership::In {
+                seq: 7,
+                heard: 1_800_000_000,
+            }))]);
+            ops.subscribed(Ok(installed_state()));
+            *ops.unwritten.lock().unwrap() = true;
+            ops.lan_unanswered();
+            let rows = run_at(&sys, &ops, Mode::Plan, here);
+            assert_eq!(*ops.syncs.lock().unwrap(), 0, "{here:?}: {rows:?}");
+            assert_ne!(rows[0].outcome, Outcome::Deferred, "{here:?}: {rows:?}");
+            assert_ne!(rows[0].why.as_deref(), Some(LAN_NOT_ASKED), "{here:?}");
+        }
+        for (here, reaches) in [
+            (Here::Session, false),
+            (Here::Unbidden, false),
+            (Here::Person, true),
+            (Here::Remote, true),
+        ] {
+            let sys = fake();
+            let ops = Scripted::new(vec![Ok(configured(Membership::In {
+                seq: 7,
+                heard: 1_800_000_000,
+            }))]);
+            ops.subscribed(Ok(installed_state()));
+            *ops.unwritten.lock().unwrap() = true;
+            ops.lan_unanswered();
+            let rows = run_at(&sys, &ops, Mode::Apply, here);
+            assert_eq!(
+                *ops.syncs.lock().unwrap(),
+                u32::from(reaches),
+                "{here:?}: {rows:?}"
+            );
+            if reaches {
+                assert_eq!(rows[0].outcome, Outcome::Changed, "{here:?}: {rows:?}");
+            } else {
+                assert_eq!(rows[0].outcome, Outcome::Deferred, "{here:?}: {rows:?}");
+                assert_eq!(rows[0].why.as_deref(), Some(LAN_NOT_ASKED), "{here:?}");
+                assert_eq!(*ops.reached.lock().unwrap(), 0, "{here:?}");
+            }
+        }
+    }
+
+    /// Only a reach of the vault waits for macOS's Local Network answer, never a read of this
+    /// Mac's own records: in the console login's session with nobody to answer, and in a run
+    /// aterm decided, a vault at a path (a file this Mac reads, no network use) is synced as
+    /// anywhere, and a vault at a URL already in sync, its subscriber running, reads in place
+    /// with nothing reached. NEGATIVE CONTROL: the same URL vault with a file to write again
+    /// waits ([`off_the_console_the_vault_this_mac_is_in_waits_for_the_local_network_answer`]);
+    /// with the gate on every configured source, as it was, the path vault is deferred unsynced
+    /// and the vault in sync reads deferred.
+    #[test]
+    fn off_the_console_a_vault_at_a_path_syncs_and_one_in_sync_reads_in_place() {
+        for here in [Here::Session, Here::Unbidden] {
+            let mut at_path = configured(Membership::In {
+                seq: 7,
+                heard: 1_800_000_000,
+            });
+            if let Some(config) = at_path.config.as_mut() {
+                config.source = Source::Path("/Volumes/Keys/team.vault".into());
+            }
+            let sys = fake();
+            let ops = Scripted::new(vec![Ok(at_path)]);
+            ops.subscribed(Ok(installed_state()));
+            *ops.unwritten.lock().unwrap() = true;
+            ops.lan_unanswered();
+            let rows = run_at(&sys, &ops, Mode::Apply, here);
+            assert_eq!(rows[0].outcome, Outcome::Changed, "{here:?}: {rows:?}");
+            assert_eq!(*ops.syncs.lock().unwrap(), 1, "{here:?}: {rows:?}");
+            assert_ne!(rows[0].why.as_deref(), Some(LAN_NOT_ASKED), "{here:?}");
+
+            let sys = fake();
+            let ops = converged();
+            ops.lan_unanswered();
+            let rows = run_at(&sys, &ops, Mode::Apply, here);
+            assert_eq!(rows[0].outcome, Outcome::Ok, "{here:?}: {rows:?}");
+            assert_ne!(rows[0].why.as_deref(), Some(LAN_NOT_ASKED), "{here:?}");
+            assert_eq!(*ops.syncs.lock().unwrap(), 0, "{here:?}");
+            assert_eq!(*ops.reached.lock().unwrap(), 0, "{here:?}: nothing reached");
+            assert_eq!(ops.installs(), 0, "{here:?}");
+        }
+    }
+
     /// A pairing code is said only where a person is at the console, in their own run or one
     /// aterm decided: off it, a Mac waiting to be let into another vault reads that an admin Mac
     /// approves it, without its code.
@@ -3654,6 +3909,49 @@ pub(crate) mod tests {
             );
         }
         assert_eq!(asked.get(), 6, "each was asked, none kept");
+    }
+
+    /// A look that asked the network hears the switch on at any answer there (another vault, an
+    /// answer that is no vault, a 404 or 204), off at macOS's refusal of the `.local` name, and
+    /// nothing at a failure that is neither: a timeout, a refused connect, a lookup macOS holds
+    /// while its question is open. A look for the ALab vault asks the network only with its
+    /// signer built in, so without one it hears nothing.
+    /// NEGATIVE CONTROL: a rule that read a timeout or a held lookup as an answer keeps a switch
+    /// nobody heard; one that read a refused connect as macOS's refusal keeps an Off nobody gave.
+    #[test]
+    fn a_look_hears_the_switch_only_from_an_answer_there_or_macoss_refusal() {
+        let built_in = aterm_secrets::client::alab_signer_built_in();
+        for answered in [
+            Ok(ProbeOutcome::Absent),
+            Ok(ProbeOutcome::NotThisVault("503 Service Unavailable".into())),
+            Ok(ProbeOutcome::AnotherVault("another vault".into())),
+        ] {
+            assert_eq!(
+                lan_heard(&answered),
+                Some(LanHeard::Reached),
+                "{answered:?}"
+            );
+            assert_eq!(
+                alab_look_heard(&answered),
+                built_in.then_some(LanHeard::Reached),
+                "{answered:?}"
+            );
+        }
+        let refused = Err(aterm_secrets::Error::new(format!(
+            "dns: alab-secrets.local: {}",
+            aterm_secrets::client::LOCAL_NETWORK_REFUSED
+        )));
+        assert_eq!(lan_heard(&refused), Some(LanHeard::Refused));
+        for silent in [
+            Err(aterm_secrets::Error::new("request deadline exceeded")),
+            Err(aterm_secrets::Error::new(
+                "connect: Connection refused (os error 61)",
+            )),
+            pending_look(),
+        ] {
+            assert_eq!(lan_heard(&silent), None, "{silent:?}");
+            assert_eq!(alab_look_heard(&silent), None, "{silent:?}");
+        }
     }
 
     #[test]
@@ -4233,6 +4531,193 @@ pub(crate) mod tests {
         all.extend(crate::init_github::items(&sys, &context, step.waited_on.as_deref()).unwrap());
         let rows = engine::run(&all, Mode::Apply, &sys, &context, &mut NoJournal);
         github_after(&rows);
+    }
+
+    /// alice's Mac with git and her own home, which the GitHub step reads beside the vault's,
+    /// and, where `github` gives one, her init.toml with that `[github]` table.
+    fn with_git(github: Option<&[u8]>) -> Fake {
+        let sys = fake();
+        sys.file(crate::items::github::CLT_GIT, b"git").stat_of(
+            "/Users//alice",
+            Stat {
+                uid: 501,
+                gid: 20,
+                mode: 0o700,
+                dir: true,
+                symlink: false,
+                len: 0,
+            },
+        );
+        if let Some(profile) = github {
+            const INIT_TOML: &str = "/Users//alice/.config/aterm/init.toml";
+            sys.file(INIT_TOML, profile).stat_of(
+                INIT_TOML,
+                Stat {
+                    uid: 501,
+                    gid: 20,
+                    mode: 0o644,
+                    dir: false,
+                    symlink: false,
+                    len: profile.len() as u64,
+                },
+            );
+            let alice = user("alice", 501);
+            crate::git_credential::script::unconfigured(&sys, &alice);
+            crate::git_credential::script::holds_nothing(&sys, Some(&alice));
+        }
+        sys
+    }
+
+    /// Off the console with macOS's Local Network answer unrecorded, a Mac waiting to be let into
+    /// a vault at a URL whose subscriber is down has that subscriber held (the vault's row
+    /// Deferred, the person's step), so nothing lands the join this run: with no init.toml
+    /// `[github]`, GitHub reads its own row, no token on this Mac yet, rather than one blocked on
+    /// the vault with no wait to name, and the apply exits 0. A running subscriber still finishes
+    /// the join, so GitHub waits for it, and the apply exits 0 too. An init.toml `[github]` that
+    /// names a `token_file` reads that file's own step, which says the file is not on this Mac
+    /// yet and fails (exit 1); one that names only an account reads the vault's token file as
+    /// the person's step, which needs them (exit 1).
+    /// NEGATIVE CONTROL: GitHub composed after the held vault whatever the subscriber (as it
+    /// was) reads Blocked on it with no wait of its own, and the apply exits 1.
+    #[test]
+    fn a_held_waiting_vault_with_its_subscriber_down_leaves_github_its_own_row() {
+        let context = ctx(&[user("alice", 501)]);
+        let applied = |subscriber: State, after: Option<Option<&str>>, github: Option<&[u8]>| {
+            let sys = with_git(github);
+            let ops = Scripted::new(vec![Ok(configured(Membership::Pending))]);
+            ops.subscribed(Ok(subscriber));
+            ops.lan_unanswered();
+            let port: Arc<dyn SecretsOps> = ops.clone();
+            let step = items_at(&sys, &context, port, Mode::Apply, None, Here::Session).unwrap();
+            let mut all = step.items;
+            let after = after.unwrap_or(step.waited_on.as_deref());
+            all.extend(crate::init_github::items(&sys, &context, after).unwrap());
+            let rows = engine::run(&all, Mode::Apply, &sys, &context, &mut NoJournal);
+            assert_eq!(ops.installs(), 0, "{rows:?}");
+            rows
+        };
+        let github = |rows: &[ItemReport]| {
+            rows.iter()
+                .find(|row| row.family == "github")
+                .cloned()
+                .expect("the GitHub row")
+        };
+
+        let rows = applied(State::Absent, None, None);
+        assert_eq!(rows[0].outcome, Outcome::Deferred, "{rows:?}");
+        assert_eq!(rows[0].why.as_deref(), Some(LAN_NOT_ASKED), "{rows:?}");
+        let own = github(&rows);
+        assert_eq!(own.outcome, Outcome::NotApplicable, "{own:?}");
+        assert!(
+            own.why
+                .as_deref()
+                .is_some_and(|why| why.starts_with("no GitHub token on this Mac yet")),
+            "{own:?}"
+        );
+        assert_eq!(crate::init::apply_status_for_test(&rows), 0, "{rows:?}");
+
+        let rows = applied(
+            State::Absent,
+            None,
+            Some(b"[github]\naccount='octocat'\ntoken_file='~/.secrets/github'\n"),
+        );
+        assert_eq!(rows[0].outcome, Outcome::Deferred, "{rows:?}");
+        let file = github(&rows);
+        assert_eq!(file.outcome, Outcome::Blocked, "{file:?}");
+        assert_eq!(
+            file.why.as_deref(),
+            Some("the GitHub token file (/Users//alice/.secrets/github) is not on this Mac yet"),
+            "{file:?}"
+        );
+        assert!(file.stood_aside.is_none(), "{file:?}");
+        assert_eq!(crate::init::apply_status_for_test(&rows), 1, "{rows:?}");
+
+        let rows = applied(State::Absent, None, Some(b"[github]\naccount='octocat'\n"));
+        assert_eq!(rows[0].outcome, Outcome::Deferred, "{rows:?}");
+        let account = github(&rows);
+        assert_eq!(account.outcome, Outcome::Person, "{account:?}");
+        assert!(account.stood_aside.is_none(), "{account:?}");
+        assert_eq!(crate::init::apply_status_for_test(&rows), 1, "{rows:?}");
+
+        let rows = applied(installed_state(), None, None);
+        assert!(
+            matches!(rows[0].stood_aside, Some(StoodAside::Waiting(_))),
+            "{rows:?}"
+        );
+        let waits = github(&rows);
+        assert!(
+            waits.why.as_deref().is_some_and(
+                |why| why.starts_with("waits for init.secrets@alice: waiting to be let in")
+            ),
+            "{waits:?}"
+        );
+        assert!(matches!(waits.stood_aside, Some(StoodAside::Waiting(_))));
+        assert_eq!(crate::init::apply_status_for_test(&rows), 0, "{rows:?}");
+
+        let rows = applied(State::Absent, Some(Some("init.secrets@alice")), None);
+        let blocked = github(&rows);
+        assert_eq!(blocked.outcome, Outcome::Blocked, "{blocked:?}");
+        assert_eq!(
+            blocked.why.as_deref(),
+            Some("waits for init.secrets@alice"),
+            "{blocked:?}"
+        );
+        assert!(blocked.stood_aside.is_none(), "{blocked:?}");
+        assert_eq!(crate::init::apply_status_for_test(&rows), 1, "{rows:?}");
+    }
+
+    /// Held for the Local Network answer, the vault's row and GitHub's wait judge by one reading
+    /// of the subscriber, taken as the step is composed, so a subscriber that stops or starts
+    /// before the vault's probe (launchd restarting its KeepAlive job) leaves the two agreeing,
+    /// whichever way it moved, and the apply exits 0: running at that reading, the vault's row
+    /// waits to be let in and GitHub waits for it; idle, the vault's row reads Deferred and
+    /// GitHub its own row. The later answer is never read.
+    /// NEGATIVE CONTROL (the mutant): the vault's probe reading `subscriber` again, in place of
+    /// the held reading, fails both orders: running then idle reads GitHub Blocked beside a
+    /// Deferred vault, with no wait of its own (exit 1), and idle then running a vault waiting to
+    /// be let in beside a GitHub that owes nothing.
+    #[test]
+    fn a_held_vaults_row_and_githubs_wait_judge_by_one_reading_of_the_subscriber() {
+        let context = ctx(&[user("alice", 501)]);
+        for (first, then) in [
+            (installed_state(), State::Absent),
+            (State::Absent, installed_state()),
+        ] {
+            let running = idle(&first).is_none();
+            let sys = with_git(None);
+            let ops = Scripted::new(vec![Ok(configured(Membership::Pending))]);
+            *ops.readings.lock().unwrap() = vec![Ok(first), Ok(then)].into();
+            ops.lan_unanswered();
+            let port: Arc<dyn SecretsOps> = ops.clone();
+            let step = items_at(&sys, &context, port, Mode::Apply, None, Here::Session).unwrap();
+            let mut all = step.items;
+            all.extend(
+                crate::init_github::items(&sys, &context, step.waited_on.as_deref()).unwrap(),
+            );
+            let rows = engine::run(&all, Mode::Apply, &sys, &context, &mut NoJournal);
+            let github = rows
+                .iter()
+                .find(|row| row.family == "github")
+                .expect("the GitHub row");
+            let waits = |row: &ItemReport| matches!(row.stood_aside, Some(StoodAside::Waiting(_)));
+            assert_eq!(waits(&rows[0]), running, "running {running}: {rows:?}");
+            assert_eq!(waits(github), running, "running {running}: {rows:?}");
+            if !running {
+                assert_eq!(rows[0].outcome, Outcome::Deferred, "{rows:?}");
+                assert_eq!(github.outcome, Outcome::NotApplicable, "{rows:?}");
+            }
+            assert_eq!(
+                crate::init::apply_status_for_test(&rows),
+                0,
+                "running {running}: {rows:?}"
+            );
+            assert_eq!(
+                ops.readings.lock().unwrap().len(),
+                1,
+                "running {running}: the later answer is never read"
+            );
+            assert_eq!(ops.installs(), 0, "{rows:?}");
+        }
     }
 
     #[test]

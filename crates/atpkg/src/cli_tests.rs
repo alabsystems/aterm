@@ -375,6 +375,33 @@ fn a_finished_install_or_update_is_followed_by_setup_unless_its_words_say_otherw
     assert!(!super::pass_finishes_setup(&words(&["update", built_in])));
 }
 
+/// Setup follows a pass that ended settled: a success, or the exit 2 of a whole update that
+/// found nothing installable here (`the_updates_empty_store_verdict_prints_the_seeds_unusable_line`
+/// runs those passes). A usage error's 2 never reads as settled, even on a thread whose last
+/// pass did. NEGATIVE CONTROL: without `main_entry`'s reset, each usage error below reads as
+/// the settled pass before it.
+#[test]
+fn a_usage_errors_exit_2_never_reads_as_a_settled_pass() {
+    assert!(super::pass_ended_settled(ExitCode::SUCCESS));
+    for code in [1, 2, 69, 75] {
+        assert!(!super::pass_ended_settled(ExitCode::from(code)), "{code}");
+    }
+    for refused in [
+        &["update", "--bogus"][..],
+        &["update", "claude", "codex"],
+        &["install", "--bogus"],
+    ] {
+        super::PASS_SETTLED_EMPTY.with(|settled| settled.set(true));
+        assert!(
+            super::pass_ended_settled(ExitCode::from(2)),
+            "the pass before"
+        );
+        let code = main_entry(refused.iter().map(std::ffi::OsString::from).collect());
+        assert_eq!(code, ExitCode::from(2), "{refused:?}");
+        assert!(!super::pass_ended_settled(code), "{refused:?}");
+    }
+}
+
 #[test]
 fn a_held_toolchain_flip_writes_deferred_rows_and_counts_no_failure() {
     let layout = temp_layout("flip-deferred-rows");
@@ -5900,15 +5927,22 @@ fn write_registry(dir: &Path, channel: &str) {
 }
 
 fn write_registry_at(dir: &Path, channel: &str, index_build: u64) {
+    write_registry_yanking(dir, channel, index_build, &["zz@5"]);
+}
+
+/// [`write_registry_at`]'s index and builds, its channel revoking each build `yanked` names.
+fn write_registry_yanking(dir: &Path, channel: &str, index_build: u64, yanked: &[&str]) {
+    let yanked: Vec<String> = yanked.iter().map(|y| format!("\"{y}\"")).collect();
     let index_body = format!(
         "schema = 2\nindex_build = {index_build}\nvalid_until = \"2026-07-05T12:00:00Z\"\n\
          machine_id = \"{id}\"\nroster_seq = {seq}\n\
          [programs.ay]\nrepo = \"ay\"\n[programs.ny]\nrepo = \"ny\"\n\
          [programs.zz]\nrepo = \"zz\"\n[programs.lk]\nrepo = \"lk\"\n\
          [[channels]]\nname = \"{channel}\"\nchannel_build = 1\nmin_build = 0\n\
-         yanked = [\"zz@5\"]\npin = {{ ay = 18, ny = 7, zz = 5, lk = 3 }}\n",
+         yanked = [{yanked}]\npin = {{ ay = 18, ny = 7, zz = 5, lk = 3 }}\n",
         id = testkit::MACHINE_ID,
-        seq = testkit::SEQ
+        seq = testkit::SEQ,
+        yanked = yanked.join(", ")
     );
     std::fs::write(dir.join("index.toml"), index_body.as_bytes()).unwrap();
     std::fs::write(
@@ -6163,6 +6197,10 @@ fn a_translated_pass_replaces_an_earlier_passs_unreachable_row() {
         &seams,
     );
     assert_eq!(code, 2, "the translated refusal");
+    assert!(
+        !pass_ended_settled(ExitCode::from(code)),
+        "a native relaunch installs the toolset: no setup follows this pass"
+    );
     let status = crate::status::read(&layout).expect("pass-end record");
     assert_eq!(status.last_pass, "ok");
     assert!(!status.last_success_at.is_empty());
@@ -6180,28 +6218,43 @@ fn a_translated_pass_replaces_an_earlier_passs_unreachable_row() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A whole update that installs nothing on an empty store exits 2, and only a verdict a retry
+/// does not change (nothing published for this machine, or narrowed to nothing) leaves setup to
+/// follow ([`pass_ended_settled`]) and prints the seed's unusable line. Every published build
+/// revoked, removal decisions that cannot be read, and an index the pass cannot reach are
+/// passes a later one can end otherwise: the first two exit 2 too, unsettled, and the last
+/// exits 1, never 2. NEGATIVE CONTROL: with the flag set for every verdict, the refused and
+/// unreadable rows read settled and the test fails.
+///
+/// Removal decisions that cannot be read as the pass starts fail its lanes (exit 1); the
+/// verdict reads them unreadable only when they went so once the lanes had read them, as
+/// another run's write can make them. The case lays a directory where their file belongs from
+/// the pass's rustup seam, which runs between the lanes and the verdict.
 #[test]
 fn the_updates_empty_store_verdict_prints_the_seeds_unusable_line() {
+    /// The index a case's pass reads, and its store.
+    #[derive(Clone, Copy)]
+    enum Laid {
+        /// Every pinned build published for this triple.
+        For(&'static str),
+        /// Every pinned build published here, and each one revoked.
+        Revoked,
+        /// Every pinned build published here and revoked, and the store's removal decisions
+        /// unreadable by the verdict.
+        RemovalsUnreadable,
+        /// No index at all.
+        Nothing,
+    }
     let names = |n: &[&str]| n.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
-    let cfg = crate::config::PackagesConfig {
-        exclude: Some(names(&["ay", "ny", "zz", "lk", "claude", "codex"])),
+    let excluding = |n: &[&str]| crate::config::PackagesConfig {
+        exclude: Some(names(n)),
         ..Default::default()
     };
+    let everything = excluding(&["ay", "ny", "zz", "lk", "claude", "codex"]);
+    let vendors = excluding(&["claude", "codex"]);
     let trust = crate::vendor_direct::lane::world::trust();
-    let seams = PassSeams {
-        anchor: |_| test_anchor(),
-        now: || 1,
-        trust: &trust,
-        shell_hooks: no_shell_hooks,
-        rustup_seam: &no_rustup_seam,
-        progress: None,
-        path: Some(std::ffi::OsString::new()),
-        warm_agents: record_warm,
-        translated: || false,
-        flip_policy: || crate::quiet::FlipPolicy::Now,
-        running: &no_processes,
-        vendor_read_grace: VENDOR_READ_GRACE,
-        read_ahead_in: &no_read_ahead_note,
+    let unreadable_by_the_verdict = |layout: &crate::store::Layout| {
+        std::fs::create_dir_all(layout.removed()).unwrap();
     };
     let narrowed = Narrowing {
         excluded: names(&["ay", "lk", "ny", "zz"]),
@@ -6210,27 +6263,86 @@ fn the_updates_empty_store_verdict_prints_the_seeds_unusable_line() {
     .verdict(current_triple())
     .0;
     let unserved = unserved_sentence(current_triple(), &names(&["riscv64gc-unknown-linux-gnu"]));
-    for (case, published_for, expected) in [
-        ("narrowed", Some(current_triple()), Some(narrowed)),
+    // Each case's exit, the toolset row its verdict records (none where the pass failed before
+    // any verdict), and its unusable line.
+    for (case, laid, cfg, exit, row, expected) in [
+        (
+            "narrowed",
+            Laid::For(current_triple()),
+            &everything,
+            2,
+            Some(crate::state::TOOLSET_EXCLUDED),
+            Some(narrowed),
+        ),
         (
             "unserved",
-            Some("riscv64gc-unknown-linux-gnu"),
+            Laid::For("riscv64gc-unknown-linux-gnu"),
+            &everything,
+            2,
+            Some(crate::state::TOOLSET_UNSERVED),
             Some(unserved),
         ),
-        ("unreachable", None, None),
+        (
+            "refused",
+            Laid::Revoked,
+            &vendors,
+            2,
+            Some("unavailable: every published build was refused"),
+            None,
+        ),
+        (
+            "removals unreadable",
+            Laid::RemovalsUnreadable,
+            &vendors,
+            2,
+            Some("error: removal decisions unreadable"),
+            None,
+        ),
+        ("unreachable", Laid::Nothing, &everything, 1, None, None),
     ] {
-        let dir = scratch(&format!("update-unusable-{case}"));
-        if let Some(triple) = published_for {
-            write_registry_at(&dir, "stable", 46);
-            for (prog, build) in [("ay", 18), ("ny", 7), ("lk", 3), ("zz", 5)] {
-                write_pkg_for_triple(&dir, prog, build, triple);
+        let rustup_seam: &dyn Fn(&crate::store::Layout) =
+            if matches!(laid, Laid::RemovalsUnreadable) {
+                &unreadable_by_the_verdict
+            } else {
+                &no_rustup_seam
+            };
+        let seams = PassSeams {
+            anchor: |_| test_anchor(),
+            now: || 1,
+            trust: &trust,
+            shell_hooks: no_shell_hooks,
+            rustup_seam,
+            progress: None,
+            path: Some(std::ffi::OsString::new()),
+            warm_agents: record_warm,
+            translated: || false,
+            flip_policy: || crate::quiet::FlipPolicy::Now,
+            running: &no_processes,
+            vendor_read_grace: VENDOR_READ_GRACE,
+            read_ahead_in: &no_read_ahead_note,
+        };
+        let dir = scratch(&format!("update-unusable-{}", case.replace(' ', "-")));
+        let layout = temp_layout(&format!("update-unusable-{}", case.replace(' ', "-")));
+        let pins = [("ay", 18), ("ny", 7), ("lk", 3), ("zz", 5)];
+        match laid {
+            Laid::For(triple) => {
+                write_registry_at(&dir, "stable", 46);
+                for (prog, build) in pins {
+                    write_pkg_for_triple(&dir, prog, build, triple);
+                }
             }
+            Laid::Revoked | Laid::RemovalsUnreadable => {
+                write_registry_yanking(&dir, "stable", 46, &["ay@18", "ny@7", "lk@3", "zz@5"]);
+                for (prog, build) in pins {
+                    write_pkg(&dir, prog, build);
+                }
+            }
+            Laid::Nothing => {}
         }
-        let layout = temp_layout(&format!("update-unusable-{case}"));
         let _ = take_markers_said();
         let code = run_recorded_update_pass(
             &layout,
-            &cfg,
+            cfg,
             &crate::DirFetcher::new(dir.clone()),
             &std::collections::BTreeMap::new(),
             true,
@@ -6240,9 +6352,22 @@ fn the_updates_empty_store_verdict_prints_the_seeds_unusable_line() {
             .into_iter()
             .filter(|line| line.contains(SEED_UNUSABLE_MARKER))
             .collect();
-        if expected.is_some() {
-            assert_eq!(code, 2, "{case}: the empty store's verdict exits 2");
-        }
+        assert_eq!(code, exit, "{case}");
+        assert_eq!(
+            crate::status::read(&layout)
+                .and_then(|status| status.programs.get("*toolset*").map(|p| p.state.clone()))
+                .as_deref(),
+            row,
+            "{case}"
+        );
+        // Nothing to install here, by a verdict a retry does not change, leaves setup to follow;
+        // an exit 2 a later pass can end otherwise does not, nor an index the pass could not
+        // reach.
+        assert_eq!(
+            pass_ended_settled(ExitCode::from(code)),
+            expected.is_some(),
+            "{case}"
+        );
         assert_eq!(
             unusable,
             expected

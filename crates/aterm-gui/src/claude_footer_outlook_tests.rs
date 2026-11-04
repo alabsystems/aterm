@@ -102,13 +102,12 @@ fn card_rows() -> Vec<MenuRow> {
         .iter()
         .map(|c| {
             let ink = match c {
-                BarCell::Left | BarCell::Fresh => PlotInk::Track,
+                BarCell::Left => PlotInk::Track,
                 _ => PlotInk::Meter,
             };
             cell(c.glyph(), ink)
         })
         .collect();
-    plot.push(cell(BarCell::Fresh.glyph(), PlotInk::Track));
     plot.push(cell(' ', PlotInk::Value));
     plot.push(cell('\u{2573}', PlotInk::Warn));
     vec![

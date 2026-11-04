@@ -462,7 +462,7 @@ fn email(row: &str) -> String {
 fn roster() -> Roster {
     let row = |label: &str| accounts::Row {
         label: label.to_owned(),
-        class: Class::Shared,
+        class: Class::Pool,
         dir: Some(format!("/nonexistent/lab-home/{label}")),
         email: Some(email(label)),
         ..accounts::Row::default()

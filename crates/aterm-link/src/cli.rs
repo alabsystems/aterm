@@ -59,7 +59,7 @@ is `node` on a node's own row):
 ";
 
 /// Library entry point for the `aterm-link` CLI.
-#[must_use]
+#[must_use = "handle or propagate the command's exit status"]
 pub fn dispatch(args: &[String]) -> ExitCode {
     dispatch_with_inherited_lanes(args, || {
         Err(std::io::Error::new(
@@ -70,7 +70,7 @@ pub fn dispatch(args: &[String]) -> ExitCode {
 }
 
 /// Dispatch with the composing executable's one-shot lane admission.
-#[must_use]
+#[must_use = "handle or propagate the command's exit status"]
 pub fn dispatch_with_inherited_lanes(
     args: &[String],
     take_lanes: impl FnOnce() -> std::io::Result<crate::bridge::InheritedLanes>,

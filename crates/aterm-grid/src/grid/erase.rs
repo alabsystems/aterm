@@ -324,12 +324,19 @@ impl Grid {
 
     /// Clear all DEC line attributes (decdwl/decdhl) on every visible row.
     pub fn clear_line_attributes(&mut self) {
+        let mut changed = false;
         for row_idx in 0..self.storage.visible_rows {
-            if let Some(r) = self.row_mut(row_idx) {
+            if let Some(r) = self.storage.row_at_screen_mut(row_idx)
+                && r.line_size() != super::LineSize::SingleWidth
+            {
                 r.set_line_size(super::LineSize::SingleWidth);
+                changed = true;
             }
         }
         self.storage.any_double_width = false;
+        if changed {
+            self.storage.mark_content_full();
+        }
     }
 
     /// Erase scrollback.
@@ -2441,6 +2448,66 @@ mod tests {
             !grid.has_any_double_width(),
             "no visible row is double any more, so the fast-path flag goes with them"
         );
+    }
+
+    #[test]
+    fn clearing_line_attributes_damages_preserved_cells() {
+        let mut grid = Grid::new(4, 20);
+        poison_row(&mut grid, 0, crate::LineSize::DoubleWidth);
+        poison_row(&mut grid, 1, crate::LineSize::DoubleHeightTop);
+        poison_row(&mut grid, 2, crate::LineSize::DoubleHeightBottom);
+        grid.clear_damage();
+        let content_gen = grid.content_gen();
+
+        grid.clear_line_attributes();
+
+        for row in 0..3 {
+            assert_eq!(line_size_of(&grid, row), crate::LineSize::SingleWidth);
+        }
+        assert!(
+            grid.needs_full_redraw(),
+            "changing a row's scale must invalidate its preserved cells"
+        );
+        assert_eq!(
+            grid.content_gen(),
+            content_gen + 1,
+            "changing row scale must invalidate content-keyed caches"
+        );
+
+        grid.clear_damage();
+        let content_gen = grid.content_gen();
+        grid.clear_line_attributes();
+        assert!(!grid.damage().has_damage());
+        assert_eq!(grid.content_gen(), content_gen);
+    }
+
+    #[test]
+    fn clearing_line_attributes_targets_live_rows_while_scrolled_back() {
+        let mut grid = Grid::new(4, 20);
+        grid.scroll_up(3);
+        poison_row(&mut grid, 3, crate::LineSize::DoubleWidth);
+        grid.scroll_display(2);
+        poison_row(&mut grid, 0, crate::LineSize::DoubleHeightTop);
+        assert_eq!(grid.display_offset(), 2);
+        assert_eq!(line_size_of(&grid, 0), crate::LineSize::DoubleHeightTop);
+        assert_eq!(
+            grid.row_at_screen(3).expect("live bottom row").line_size(),
+            crate::LineSize::DoubleWidth
+        );
+
+        grid.clear_line_attributes();
+
+        assert_eq!(grid.display_offset(), 2, "the reader's viewport is stable");
+        assert_eq!(
+            line_size_of(&grid, 0),
+            crate::LineSize::DoubleHeightTop,
+            "a historical viewport row is not the live screen"
+        );
+        assert_eq!(
+            grid.row_at_screen(3).expect("live bottom row").line_size(),
+            crate::LineSize::SingleWidth
+        );
+        assert!(!grid.has_any_double_width());
     }
 
     #[test]

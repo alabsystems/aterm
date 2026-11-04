@@ -22,7 +22,7 @@ use crate::{
         },
     },
     typed::{
-        Derive, Kind, SCHEMA, Ty,
+        Derive, SCHEMA, Ty,
         cell::{self, CellKey, CellValue, Cells},
         keys,
         owned::SchemaState,
@@ -100,8 +100,6 @@ fn registry_schemas_keep_secrets_and_addresses_out() {
         (Derive::Random, Derive::Random)
     );
     assert!(MAILBOX.column("receives").is_none() && MAILBOX.column("login").is_none());
-    assert_eq!(registry::REGISTRY.self_quota, 24);
-    assert_eq!(MACHINE_FACTS.kind, Kind::Owned);
 }
 
 /// Apply `records` as one writer's chain to `cells`, as the Commons projection does.

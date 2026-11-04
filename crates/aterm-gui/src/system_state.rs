@@ -196,12 +196,13 @@ pub enum ToolsInstall {
     /// A live installer tab was restored. Its exact prompt is not known: the person continues
     /// there, or closes it before retrying, and no second installer is opened.
     Recovered,
-    /// An install runs (`softwareupdate` or Apple's installer holding the on-demand placeholder,
-    /// the tab's program outliving it, or the tab having said they are installed while the row's
-    /// next reading is still to come): the row waits, calmly, and moves on once the tools arrive.
+    /// An install runs (`softwareupdate` or `installer` holding the on-demand placeholder, a live
+    /// run of aterm's root half that stamped it, the tab's program outliving it, or the tab having
+    /// said they are installed while the row's next reading is still to come): the row waits,
+    /// calmly, and moves on once the tools arrive.
     Installing,
-    /// Apple's own installer window waits for the person's Install or Agree press: they are
-    /// needed there.
+    /// Apple's own installer window is open, at any age: waiting for the person's Install or
+    /// Agree press, or running the install a press started there. They finish there.
     AppleWindow,
     /// The tab a person's Install… asked for did not open, for this reason: the row offers
     /// Install… again and says why.
@@ -2285,8 +2286,8 @@ pub(crate) const TOOLS_NEEDED_NOTE: &str =
 /// and VoiceOver hears.
 pub(crate) const INSTALL_TOOLS_LABEL: &str = "Install Command Line Tools…";
 
-/// The GitHub repositories row's note while Apple's own installer window waits for the person's
-/// press ([`ToolsInstall::AppleWindow`]).
+/// The GitHub repositories row's note while Apple's own installer window is open, waiting for the
+/// person's press or running the install a press started ([`ToolsInstall::AppleWindow`]).
 pub(crate) const APPLE_WINDOW_NOTE: &str = "Finish in Apple's installer window";
 
 /// The GitHub repositories row's note when the tab a press of Install… asked for did not open
@@ -5386,9 +5387,9 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
             // rows will change, and the repositories wait for the token the
             // vault this Mac has not joined yet holds. Each carries the
             // engine's own line in its description (`init_observe` gives a
-            // row that differs none, and a blocked part's reason is the
-            // token file's rule): the page shows none, only the waiting
-            // row's note.
+            // row that differs none, and a blocked part's reason is that
+            // the token file is not there yet): the page shows none, only
+            // the waiting row's note.
             let engine = |setting: Setting, standing: Standing, now: Option<&str>, line: &str| {
                 let mut row = read(Subject::Setting(setting), standing, now);
                 row.detail = Some(line.to_owned());
@@ -5459,8 +5460,8 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
                     {
                         let mut repositories = token_waiting();
                         repositories.detail = Some(
-                            "GitHub token source must be an owned private regular file \
-                             (0600), without links, at most 64 KiB"
+                            "the GitHub token file (/Users//alice/.secrets/gh_access_token) \
+                             is not on this Mac yet"
                                 .to_owned(),
                         );
                         repositories

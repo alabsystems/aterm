@@ -2542,7 +2542,7 @@ pub fn cmd_scn(args: &[String]) -> crate::Res {
                 .get(1)
                 .ok_or_else(|| crate::Fail::usage("scn show <run>"))?;
             let p = results_dir().join(run).join("summary.json");
-            let text = fs::read_to_string(&p)
+            let text = crate::util::read_regular_text(&p)
                 .map_err(|e| crate::Fail::die(format!("{}: {e}", p.display())))?;
             let j = J::parse(&text).map_err(crate::Fail::die)?;
             if let J::Obj(pairs) = j {
@@ -2605,8 +2605,10 @@ fn agg(pat: &str) {
                     let n = e.file_name().to_string_lossy().into_owned();
                     let num = n.strip_prefix(pat)?.strip_prefix('-')?;
                     (num.len() == 2 && num.chars().all(|c| c.is_ascii_digit())).then_some(())?;
-                    let j =
-                        J::parse(&fs::read_to_string(e.path().join("summary.json")).ok()?).ok()?;
+                    let j = J::parse(
+                        &crate::util::read_regular_text(&e.path().join("summary.json")).ok()?,
+                    )
+                    .ok()?;
                     Some((n, j))
                 })
                 .collect()

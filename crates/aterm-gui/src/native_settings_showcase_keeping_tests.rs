@@ -1290,7 +1290,7 @@ impl Sweep {
         // These first where the first frame lists the row: held ones listing it alike need none.
         let early = match key.reads {
             Reads::Landing | Reads::Beside(_) => {
-                first.plan.as_ref().filter(|_| first.list).and_then(&tops)
+                first.plan.as_ref().filter(|_| first.list).and_then(tops)
             }
             _ => None,
         };
@@ -1303,7 +1303,7 @@ impl Sweep {
                     .borrow()
                     .as_ref()
                     .and_then(Option::as_ref)
-                    .and_then(&tops)
+                    .and_then(tops)
                     == Some(*asked)
         });
         if early.is_none() {
@@ -1351,7 +1351,7 @@ impl Sweep {
         let beside = early.or_else(|| {
             plan.as_ref()
                 .filter(|_| matches!(key.reads, Reads::Landing | Reads::Beside(_)))
-                .and_then(&tops)
+                .and_then(tops)
                 .filter(|asked| {
                     looked(*asked).all(|top| look(top, &mut reach).is_some())
                         && reach.strays.is_empty()

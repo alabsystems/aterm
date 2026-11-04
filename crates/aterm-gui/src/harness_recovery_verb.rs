@@ -62,7 +62,7 @@ fn reply(progress: Option<&AccountProgress>) -> String {
             .unwrap_or("-".into())
     };
     let mut line = format!(
-        "OK recovery version=1 available=1 phase={phase} account={} target={} route={} known={} eligible={} wall={} observed_at={} next_at={} detail_count={}",
+        "OK recovery version=1 available=1 phase={phase} account={} target={} route={} known={} eligible={} wall={} observed_at={} next_at={} forecasts_paused={} detail_count={}",
         text(progress.account.as_deref()),
         text(target),
         text(route),
@@ -71,6 +71,7 @@ fn reply(progress: Option<&AccountProgress>) -> String {
         text(progress.wall.as_deref()),
         time(Some(progress.observed_at)),
         time(progress.next_at),
+        u8::from(progress.forecasts_paused),
         progress.details.len()
     );
     for (index, detail) in progress.details.iter().enumerate() {
@@ -130,6 +131,7 @@ mod tests {
         let known = reply(Some(&progress));
         assert_eq!(field(&known, "known"), "2");
         assert_eq!(field(&known, "eligible"), "0");
+        assert_eq!(field(&known, "forecasts_paused"), "0");
     }
 
     #[test]
@@ -140,12 +142,14 @@ mod tests {
             label: "account two".into(),
             route: Some("vault → browser".into()),
         };
+        progress.forecasts_paused = true;
         progress.details = vec!["a=b\nsecond line %20".repeat(100), "Last blocker".into()];
         let line = reply(Some(&progress));
         assert_eq!(line.lines().count(), 1);
         assert_eq!(field(&line, "phase"), "signing-in");
         assert_eq!(field(&line, "target"), "account two");
         assert_eq!(field(&line, "route"), "vault → browser");
+        assert_eq!(field(&line, "forecasts_paused"), "1");
         assert_eq!(field(&line, "detail_count"), "2");
         for (index, detail) in progress.details.iter().enumerate() {
             assert_eq!(field(&line, &format!("detail_{index}")), *detail);

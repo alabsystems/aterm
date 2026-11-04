@@ -118,7 +118,7 @@ impl Rig {
         self.session
             .reader_join
             .as_ref()
-            .is_none_or(std::thread::JoinHandle::is_finished)
+            .is_none_or(crate::spawn::ReaderJoin::is_finished)
     }
 }
 

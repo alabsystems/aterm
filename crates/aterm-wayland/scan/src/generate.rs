@@ -156,7 +156,8 @@ fn read_protocol_xml(path: &Path) -> std::io::Result<String> {
             "protocol XML exceeds 16 MiB limit",
         ));
     }
-    let cap = usize::try_from(meta.len().min(MAX_PROTOCOL_XML_BYTES)).unwrap_or(0);
+    let cap =
+        usize::try_from(meta.len().min(MAX_PROTOCOL_XML_BYTES).saturating_add(1)).unwrap_or(0);
     let mut buf = Vec::with_capacity(cap);
     file.take(MAX_PROTOCOL_XML_BYTES + 1)
         .read_to_end(&mut buf)?;

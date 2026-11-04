@@ -270,7 +270,7 @@ pub fn register_rosetta() -> io::Result<bool> {
 /// dial is a fault (the helper listens before the guest has a userspace), and so is a boot
 /// with no key disk (the helper believes no hello without its key): either is written to the
 /// console and the agent exits.
-#[must_use]
+#[must_use = "handle or propagate the agent's exit status"]
 pub fn run() -> ExitCode {
     let say = |what: &str| eprintln!("aterm-vz-agent: {what}");
     match boot::refresh_unit(Path::new(boot::UNIT_PATH), boot::UNIT) {

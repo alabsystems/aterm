@@ -503,9 +503,29 @@ pub fn objc_drive_build_args(drive: &ObjcDrive) -> Vec<String> {
     .collect()
 }
 
-/// How the ladder reads one driver's exit.
+/// Extracts the last `NOT RUN — <reason>` clause an objc driver printed to its transcript.
+#[must_use]
+pub fn objc_drive_not_run_reason(transcript: &str) -> Option<&str> {
+    transcript.lines().rev().find_map(|line| {
+        let (_, why) = line.trim().split_once("NOT RUN — ")?;
+        let why = why.trim();
+        (!why.is_empty()).then_some(why)
+    })
+}
+
+/// How the ladder reads one driver's exit without a transcript.
 #[must_use]
 pub fn objc_drive_outcome(drive: &ObjcDrive, code: Option<i32>) -> (Outcome, String) {
+    objc_drive_outcome_with_transcript(drive, code, "")
+}
+
+/// How the ladder reads one driver's exit and transcript, quoting its `NOT RUN — <reason>` line on exit `2`.
+#[must_use]
+pub fn objc_drive_outcome_with_transcript(
+    drive: &ObjcDrive,
+    code: Option<i32>,
+    transcript: &str,
+) -> (Outcome, String) {
     let name = drive.example;
     let (outcome, what) = match (code, drive.code3) {
         (Some(0), _) => (Outcome::Ok, drive.pass.to_string()),
@@ -515,7 +535,10 @@ pub fn objc_drive_outcome(drive: &ObjcDrive, code: Option<i32>) -> (Outcome, Str
         ),
         (Some(2), _) => (
             Outcome::Fail(Severity::CouldNotRun),
-            "no event loop, no window, nothing installed to drive, or another app held the activation a check needs (the transcript says which), so its claim was not proven (exit 2, never a pass)".to_string(),
+            match objc_drive_not_run_reason(transcript) {
+                Some(why) => format!("NOT RUN — {why} (exit 2, never a pass)"),
+                None => "no event loop, no window, nothing installed to drive, or another app held the activation a check needs (the transcript says which), so its claim was not proven (exit 2, never a pass)".to_string(),
+            },
         ),
         (Some(3), Code3::WeakerPassOk(label)) => (Outcome::Ok, label.to_string()),
         (Some(3), Code3::Hung) => (
@@ -1653,19 +1676,35 @@ fn spec_check(ctx: &Ctx, r: &mut Report) {
     }
 }
 
-/// `targo --unverified test --workspace --features aterm-spec/checkers --no-fail-fast --tests`: the `checkers` check's child.
+/// Selected test roots and the shared checker runtime that supplies their feature.
+/// Selecting the runtime makes feature activation independent of the requested roots'
+/// own dependency declarations, without selecting unrelated workspace packages.
+pub fn spec_checkers_scope(scope: &Scope) -> Scope {
+    if scope.is_workspace() || scope.selects_nothing() || scope.includes_crate("aterm-spec") {
+        return scope.clone();
+    }
+    match scope {
+        Scope::Packages(packages) => {
+            let mut packages = packages.clone();
+            packages.push("aterm-spec".into());
+            Scope::packages(&packages)
+        }
+        Scope::Changed(changed) => {
+            let mut changed = changed.clone();
+            changed.crates.push("aterm-spec".into());
+            changed.crates.sort();
+            changed.any_lib = true;
+            Scope::Changed(changed)
+        }
+        Scope::Workspace => scope.clone(),
+    }
+}
+
+/// The selected tests and shared runtime with per-step checker agreement enabled.
 #[must_use]
-pub fn spec_checkers_args() -> Vec<String> {
-    let mut a: Vec<String> = [
-        "--unverified",
-        "test",
-        "--workspace",
-        "--features",
-        "aterm-spec/checkers",
-        "--no-fail-fast",
-    ]
-    .map(String::from)
-    .into();
+pub fn spec_checkers_args(scope: &Scope) -> Vec<String> {
+    let mut a = test_base_args(&spec_checkers_scope(scope));
+    a.extend(["--features".into(), "aterm-spec/checkers".into()]);
     a.extend(TEST_TARGETS.map(String::from));
     a
 }
@@ -1691,11 +1730,15 @@ pub fn gpu_oracle_args() -> Vec<String> {
 }
 
 fn checkers_compile(ctx: &Ctx, r: &mut Report) {
+    if ctx.scope.selects_nothing() {
+        r.skip(format!("checker-enabled compilation {EMPTY_CONE}"));
+        return;
+    }
     if !ctx.tools.have_targo() {
         r.skip("checkers compile (no targo)");
         return;
     }
-    let args = spec_checkers_args();
+    let args = spec_checkers_args(&ctx.scope);
     let label = format!("targo {} --no-run", args[1..].join(" "));
     let cmd = spec_checkers_cmd(ctx).arg("--no-run").demoted();
     if !run_labeled(ctx, r, &label, &cmd) {
@@ -1705,27 +1748,38 @@ fn checkers_compile(ctx: &Ctx, r: &mut Report) {
 }
 
 fn spec_checkers_cmd(ctx: &Ctx) -> Cmd {
-    in_lane(ctx, Lane::CheckersTarget, targo(ctx, spec_checkers_args()))
+    in_lane(
+        ctx,
+        Lane::CheckersTarget,
+        targo(ctx, spec_checkers_args(&ctx.scope)),
+    )
 }
 
 fn spec_checkers(ctx: &Ctx, r: &mut Report) {
+    if ctx.scope.selects_nothing() {
+        r.skip(format!("checker-enabled tests {EMPTY_CONE}"));
+        return;
+    }
     if !ctx.tools.have_targo() {
         r.skip("checkers (no targo)");
         return;
     }
-    const LABEL: &str = "targo test --workspace --features aterm-spec/checkers --tests";
+    let label = format!(
+        "targo test {} --features aterm-spec/checkers --tests",
+        spec_checkers_scope(&ctx.scope).label()
+    );
     if ctx
         .checkers_compile_failed
         .load(std::sync::atomic::Ordering::Acquire)
     {
         not_run_behind(
             r,
-            LABEL,
+            &label,
             "checker-enabled compilation failed; its runtime stage does not retry compilation",
         );
         return;
     }
-    crate::testrun::run_tests(ctx, r, LABEL, &spec_checkers_cmd(ctx));
+    crate::testrun::run_tests(ctx, r, &label, &spec_checkers_cmd(ctx));
 }
 
 /// Did a passing gpu-oracle child not pass the oracle's test ([`crate::checks::GOLDEN`])?
@@ -1868,7 +1922,9 @@ fn objc_drive(ctx: &Ctx, r: &mut Report, drive: &ObjcDrive) {
         return;
     }
     let out = exec::run(&Cmd::new(&bin), ctx.exec_env());
-    r.record_driven(&out, name, |code, _| objc_drive_outcome(drive, code));
+    r.record_driven(&out, name, |code, transcript| {
+        objc_drive_outcome_with_transcript(drive, code, transcript)
+    });
 }
 
 /// `targo --unverified build --profile test -q -p aterm -p aterm-lab --bin aterm --bin aterm-lab`: the lab and the one binary it drives ([`MAIN_PROFILE`]).
@@ -2781,6 +2837,84 @@ mod tests {
     }
 
     #[test]
+    fn a_scoped_checker_graph_enables_its_runtime_without_selecting_other_members() {
+        let directory = aterm_tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nresolver='2'\nmembers=['aterm-spec','selected','outside']\n",
+        )
+        .unwrap();
+        for name in ["aterm-spec", "selected", "outside"] {
+            let package = root.join(name);
+            std::fs::create_dir_all(package.join("src")).unwrap();
+            let features = if name == "aterm-spec" {
+                "[features]\ncheckers=[]\n"
+            } else {
+                ""
+            };
+            std::fs::write(
+                package.join("Cargo.toml"),
+                format!("[package]\nname='{name}'\nversion='1.0.0'\nedition='2021'\n{features}"),
+            )
+            .unwrap();
+            std::fs::write(package.join("src/lib.rs"), "").unwrap();
+        }
+        let mut c = ctx(Scope::crate_only("selected"));
+        c.root = root.to_owned();
+        c.scratch = root.join("scratch");
+        std::fs::create_dir_all(&c.scratch).unwrap();
+        c.tools.targo = PathBuf::from(env!("CARGO"));
+        c.child_ceiling = Some(std::time::Duration::from_secs(60));
+        let query = |args: Vec<String>| {
+            let cmd = targo(&c, args)
+                .args(["--unit-graph", "-Z", "unstable-options", "--offline"])
+                .env("CARGO_HOME", root.join("cargo-home"));
+            exec::run(&cmd, c.exec_env())
+        };
+        let mut missing_runtime = test_base_args(&c.scope);
+        missing_runtime.extend(["--features".into(), "aterm-spec/checkers".into()]);
+        missing_runtime.extend(TEST_TARGETS.map(String::from));
+        assert!(
+            !query(missing_runtime).ok,
+            "the fixture must require a feature provider"
+        );
+        let output = query(spec_checkers_args(&c.scope));
+        assert!(output.ok, "{}", output.output);
+        let graph = output
+            .output
+            .lines()
+            .filter_map(|line| aterm_json::from_str::<aterm_json::Value>(line).ok())
+            .find(|value| value["units"].is_array())
+            .expect("Cargo's unit graph");
+        let units = graph["units"].as_array().unwrap();
+        let roots = graph["roots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|index| {
+                let unit = &units[usize::try_from(index.as_u64().unwrap()).unwrap()];
+                crate::unitgraph::package_name(unit["pkg_id"].as_str().unwrap()).to_owned()
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            roots,
+            std::collections::BTreeSet::from(["selected".into(), "aterm-spec".into()])
+        );
+        for unit in units.iter().filter(|unit| {
+            crate::unitgraph::package_name(unit["pkg_id"].as_str().unwrap()) == "aterm-spec"
+        }) {
+            assert!(
+                unit["features"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|feature| feature.as_str() == Some("checkers"))
+            );
+        }
+    }
+
+    #[test]
     fn every_argv_reaches_its_whole_selection() {
         let has = |argv: &[String], w: &str| argv.iter().any(|a| a == w);
         for scope in [
@@ -2792,6 +2926,7 @@ mod tests {
                 test_compile_args(&scope),
                 test_run_args(&scope),
                 doctest_args(&scope),
+                spec_checkers_args(&scope),
             ] {
                 assert!(has(&argv, "--no-fail-fast"), "{argv:?}");
                 for c in scope.crates() {
@@ -2816,7 +2951,7 @@ mod tests {
         for argv in [
             measuring_args(),
             measure_prebuild_args(),
-            spec_checkers_args(),
+            spec_checkers_args(&Scope::workspace()),
             gpu_oracle_args(),
         ] {
             assert!(has(&argv, "--no-fail-fast"), "{argv:?}");
@@ -2882,6 +3017,8 @@ mod tests {
             StageId::Test,
             StageId::Doctests,
             StageId::Tippy,
+            StageId::CheckersCompile,
+            StageId::SpecCheckers,
         ] {
             let mut cc = ctx(c.scope.clone());
             cc.tools.targo = PathBuf::from("/bin/sh");
@@ -3811,6 +3948,10 @@ mod tests {
         }
     }
 
+    /// NEGATIVE CONTROL: exit `2` (`NOT RUN`) is always `CouldNotRun` (never `Ok`), and when the
+    /// driver's transcript names `NOT RUN — <reason>` (such as a closed clamshell with no active
+    /// display), the ladder row quotes that reason directly instead of hiding it behind the
+    /// generic fallback.
     #[test]
     fn every_objc_drive_reads_its_exit_contract() {
         for drive in &OBJC_DRIVES {
@@ -3825,6 +3966,25 @@ mod tests {
             assert_eq!(
                 read(Some(2)).0,
                 Outcome::Fail(Severity::CouldNotRun),
+                "{name}"
+            );
+            let with_reason = objc_drive_outcome_with_transcript(
+                drive,
+                Some(2),
+                &format!(
+                    "{name}: NOT RUN — no display is online for drawing (CoreGraphics lists no active display)\n"
+                ),
+            );
+            assert_eq!(
+                with_reason.0,
+                Outcome::Fail(Severity::CouldNotRun),
+                "{name}"
+            );
+            assert_eq!(
+                with_reason.1,
+                format!(
+                    "{name}: NOT RUN — no display is online for drawing (CoreGraphics lists no active display) (exit 2, never a pass)"
+                ),
                 "{name}"
             );
             let want = match drive.code3 {

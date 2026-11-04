@@ -17,6 +17,41 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex, PoisonError};
 
+/// Writes `text`, what `aterm init` answers on standard output (its usage for `--help`, the
+/// closing summary and the lines after the tally, the JSON report), to `out` and flushes it. A
+/// reader gone (`aterm init | head -1`, a pager quit early) ends the answer, never the run,
+/// whose exit status stays its own ([`aterm_uds::stdout::answer_status`]). Any other write
+/// error (a full disk under `aterm init --json > file`, EIO) leaves the answer short: it is
+/// said in one line through `say` (standard error), whose own failure (the same full disk under
+/// `2>&1`) is dropped rather than unwinding, and the run fails (`Err`, its exit status).
+fn answer_to(
+    out: &mut dyn std::io::Write,
+    text: &str,
+    say: impl FnOnce(&str) -> std::io::Result<()>,
+) -> Result<(), ExitCode> {
+    let written = out.write_all(text.as_bytes()).and_then(|()| out.flush());
+    aterm_uds::stdout::answer_status("aterm init", written, ()).map_err(|line| {
+        let _ = say(&line);
+        ExitCode::FAILURE
+    })
+}
+
+/// [`answer_to`] on this process's standard output, a lost answer said on standard error
+/// ([`aterm_uds::stdout::stderr_line`], which returns its error where `eprintln!` would panic).
+fn answer(text: &str) -> Result<(), ExitCode> {
+    answer_to(&mut std::io::stdout().lock(), text, |line| {
+        aterm_uds::stdout::stderr_line(format_args!("{line}"))
+    })
+}
+
+/// One line on standard error once a run or a converge pass has returned
+/// ([`aterm_uds::stdout::stderr_line`]), its own failure dropped: `eprintln!` panics on any
+/// stderr write error but EBADF (a full disk under `2>&1`), which would unwind past the exit
+/// status the run decided and, after an apply, past the walk of the grants it hands over.
+fn say_after_run(line: std::fmt::Arguments<'_>) {
+    let _ = aterm_uds::stdout::stderr_line(line);
+}
+
 /// `aterm init` usage, printed by `--help`, after a usage error and as `aterm help init`: what
 /// runs by itself, the three opt-ins and the exit meanings, each setting in its System State
 /// label ([`Setting::label`]), the one source both surfaces read.
@@ -657,13 +692,37 @@ pub enum Decider {
     Person,
     /// aterm by itself: nobody ran `aterm init`, and aterm finishes setup after a package
     /// install or update a person typed ([`PACKAGE_FOLLOW_UP`]). Such a run puts no question of
-    /// macOS's on the screen: at this Mac's console its look for the ALab vault waits until
-    /// macOS has answered aterm's Local Network question
+    /// macOS's on the screen: at this Mac's console its look for the ALab vault, and its reach
+    /// of the vault this Mac is in, wait until macOS has answered aterm's Local Network question
     /// ([`crate::init_secrets::Here::Unbidden`]); in a remote shell of the console's login,
     /// where macOS raises none, it looks as a typed `aterm init` there does
     /// ([`crate::init_secrets::Here::Remote`]). Rust in Spotlight searches no folder of the
-    /// person's for build folders ([`crate::init_spotlight::Projects::Unread`]).
+    /// person's for build folders ([`crate::init_spotlight::Projects::Unread`]). Apple's Command
+    /// Line Tools ask for the Mac password at most once per build, sharing System State's Command
+    /// Line Tools tab's ask, and never under the person's Stop, read as they run
+    /// ([`Self::compose`]).
     Aterm,
+}
+
+impl Decider {
+    /// `base` as a run this one decided composes it: in a run aterm decided, `base.clt` asks for
+    /// the Mac password at most once per build and never while the person's choices hold System
+    /// State's own Command Line Tools tab, held by what `unbidden` makes (this account's record
+    /// and a reader of the setup records' holds, [`crate::init_clt::Unbidden::here`], which
+    /// `base.clt` reads as its probe runs and again right before it claims the ask, never here),
+    /// and is deferred naming the person's step otherwise
+    /// ([`crate::init_clt::CommandLineTools::unbidden`]); a person's run asks each time and makes
+    /// no `unbidden`.
+    pub(crate) fn compose(
+        self,
+        mut base: Base,
+        unbidden: impl FnOnce() -> crate::init_clt::Unbidden,
+    ) -> Base {
+        if self == Self::Aterm {
+            base.clt = base.clt.map(|clt| clt.unbidden(unbidden()));
+        }
+        base
+    }
 }
 
 /// The words of `aterm init` that finishes setup after a person's package install or update
@@ -683,8 +742,10 @@ pub struct Host<'a> {
     pub base: &'a dyn Fn(BaseLock) -> Base,
     /// Whether this process holds Full Disk Access, as the runner measures it.
     pub full_disk_access: &'a dyn Fn() -> Option<bool>,
-    /// This Mac's setup records, shared with the first launch ([`Records`]).
-    pub records: &'a dyn Records,
+    /// This Mac's setup records, shared with the first launch ([`Records`]): `'static`, since a
+    /// run aterm decided reads their holds again as `base.clt` runs, long after the run composed
+    /// it ([`crate::init_clt::Unbidden::here`]).
+    pub records: &'static dyn Records,
     /// aterm's macOS grants, as the Permissions phase reads them ([`Grants`]).
     pub grants: Grants,
     /// Hand the grants the Permissions phase left to the person to the running aterm window's
@@ -1026,8 +1087,7 @@ fn entry(
         }
     };
     if options.help {
-        print!("{}", usage());
-        return ExitCode::SUCCESS;
+        return answer(&usage()).map_or_else(|failed| failed, |()| ExitCode::SUCCESS);
     }
     if in_tab(tab_var, &options) {
         return ExitCode::from(tab_run(&options, host));
@@ -1111,7 +1171,12 @@ fn entry(
                 &sys,
                 &options,
                 &Front {
-                    base: &|applies| (host.base)(options.base_lock(applies)),
+                    base: &|applies| {
+                        host.decided
+                            .compose((host.base)(options.base_lock(applies)), || {
+                                crate::init_clt::Unbidden::here(host.records)
+                            })
+                    },
                     groups: &groups,
                     targo: composed.targo.clone(),
                     cwd: cwd.as_deref(),
@@ -1132,12 +1197,12 @@ fn entry(
     let rows = match result {
         Ok(rows) => rows,
         Err(Refused::Usage(why)) => {
-            eprintln!("aterm init: {why}\n{}", usage());
+            say_after_run(format_args!("aterm init: {why}\n{}", usage()));
             return ExitCode::from(2);
         }
         Err(Refused::Failed(why)) => {
             aterm_log::info!("aterm init: no report; {laps}");
-            eprintln!("aterm init: {why}");
+            say_after_run(format_args!("aterm init: {why}"));
             return ExitCode::FAILURE;
         }
     };
@@ -1149,44 +1214,49 @@ fn entry(
         &start,
     );
     if let Err(why) = &recorded {
-        eprintln!(
+        say_after_run(format_args!(
             "aterm init: {why}; once this Mac is let into the vault, {} runs the GitHub step",
             naming(Setting::Repositories)
-        );
+        ));
     }
     let complete = complete(&rows, options.action);
     let code = status(&rows, options.action);
     aterm_log::info!("aterm init: {} rows, exit {code}; {laps}", rows.len());
     let held = held.into_inner().unwrap_or_else(PoisonError::into_inner);
-    if options.json {
+    let answered = if options.json {
         let mut rows = rows;
         rows.extend(held);
         match report_json(options.action, complete, rows, &laps) {
-            Ok(report) => println!("{report}"),
+            Ok(report) => answer(&format!("{report}\n")),
             Err(why) => {
-                eprintln!("aterm init: cannot encode report: {why}");
+                say_after_run(format_args!("aterm init: cannot encode report: {why}"));
                 return ExitCode::FAILURE;
             }
         }
     } else {
-        println!(
-            "{}",
+        use std::fmt::Write as _;
+        let mut summary = format!(
+            "{}\n",
             completion_summary(&rows, options.action, recorded.is_ok())
         );
-        for row in held {
-            if let Some(line) = row.why {
-                println!("aterm init: {line}");
-            }
+        for line in held.into_iter().filter_map(|row| row.why) {
+            let _ = writeln!(summary, "aterm init: {line}");
         }
+        let mut answered = answer(&summary);
+        // The walk is handed over whatever became of the summary: it is the person's grants,
+        // not part of the answer. Nothing written since the run unwinds ([`say_after_run`],
+        // [`answer`]), so a lost line never keeps it from them.
         let missing = walk_grants(&rows);
         if options.action == Action::Apply
             && !missing.is_empty()
             && let Some(line) = (host.walk)(&missing)
+            && answered.is_ok()
         {
-            println!("aterm init: {line}");
+            answered = answer(&format!("aterm init: {line}\n"));
         }
-    }
-    ExitCode::from(code)
+        answered
+    };
+    answered.map_or_else(|failed| failed, |()| ExitCode::from(code))
 }
 
 /// The id of the row `--json` carries for the line of what the person's choices in System
@@ -1236,8 +1306,8 @@ fn in_tab(var: Option<&std::ffi::OsStr>, options: &Options) -> bool {
 
 /// What the tab's run exits with when the window's go line never came ([`tab`]): neither 0 nor
 /// 1, which say the run printed its last line, so the window ends the tab itself if it still
-/// shows.
-const TAB_NOT_STARTED: u8 = 2;
+/// shows ([`aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_NOT_STARTED`]).
+const TAB_NOT_STARTED: u8 = aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_NOT_STARTED;
 
 /// Clears the tab's screen and scrollback once its run starts, so nothing typed or echoed while
 /// it waited for the go line stays in view.
@@ -1292,8 +1362,8 @@ fn tab_entry(options: &Options, host: &Host<'_>) -> u8 {
 /// `converge` (in this person's own login, `live`), and ends on one line:
 /// [`crate::init_clt::TAB_INSTALLED`] and 0, or why the install did not finish
 /// ([`crate::init_clt::Unfinished::line`]) and that class's exit
-/// ([`crate::init_clt::Unfinished::tab_exit`]: 1, or Low Data Mode's, a non-administrator's and
-/// a stop's own). None of init's own report is printed.
+/// ([`crate::init_clt::Unfinished::tab_exit`]: 1, or Low Data Mode's, a non-administrator's, a
+/// stop's and Apple's window closed's own). None of init's own report is printed.
 fn tab(
     sys: &dyn System,
     out: &crate::init_clt::Tab,
@@ -1339,9 +1409,10 @@ fn tab(
 /// it reaches only through them (no workstation item, question or setup record), at background
 /// QoS. `--check` probes and writes nothing. Its rows print as init's do, then a tally (or the
 /// JSON report). Exit 0 once it ran with no failed row (what it defers included), 75 while
-/// another pass holds the lock, 1 for a failed row, an unwritten record or a pass that cannot
-/// run here. A subscriber's pass from a program that is not the installed release app (a held
-/// copy) is the installed app's to run ([`hand_off`]).
+/// another pass holds the lock, 1 for a failed row, an unwritten record, a pass that cannot
+/// run here or a tally standard output could not take ([`answer_to`]). A subscriber's pass
+/// from a program that is not the installed release app (a held copy) is the installed app's
+/// to run ([`hand_off`]).
 fn converge_entry(options: &Options, ports: &dyn crate::sync::Ports) -> ExitCode {
     ports.background();
     let trigger = options.trigger.unwrap_or(crate::sync::Trigger::Init);
@@ -1363,43 +1434,45 @@ fn converge_entry(options: &Options, ports: &dyn crate::sync::Ports) -> ExitCode
     let pass = match pass {
         Ok(pass) => pass,
         Err(crate::sync::Stop::Held) => {
-            eprintln!(
+            say_after_run(format_args!(
                 "aterm init: another converge pass holds {}/{}; this one did not run",
                 aterm_converge::FileJournal::DIR,
                 crate::sync::LOCK
-            );
+            ));
             return ExitCode::from(75);
         }
         Err(crate::sync::Stop::Refused(why)) => {
-            eprintln!("aterm init: {why}");
+            say_after_run(format_args!("aterm init: {why}"));
             return ExitCode::FAILURE;
         }
     };
     let failed = pass.rows.iter().any(|row| row.outcome.is_failure());
     let complete = !pass.rows.is_empty() && !failed;
-    if options.json {
+    let answered = if options.json {
         match report_json(action, complete, pass.rows, &laps) {
-            Ok(report) => println!("{report}"),
+            Ok(report) => answer(&format!("{report}\n")),
             Err(why) => {
-                eprintln!("aterm init: cannot encode report: {why}");
+                say_after_run(format_args!("aterm init: cannot encode report: {why}"));
                 return ExitCode::FAILURE;
             }
         }
     } else {
-        println!(
-            "{} \u{b7} converge {}/{}",
+        answer(&format!(
+            "{} \u{b7} converge {}/{}\n",
             completion_summary(&pass.rows, action, pass.unrecorded.is_none()),
             trigger.word(),
             pass.due.word()
-        );
-    }
+        ))
+    };
     if let Some(why) = &pass.unrecorded {
-        eprintln!("aterm init: the pass's record was not written: {why}");
+        say_after_run(format_args!(
+            "aterm init: the pass's record was not written: {why}"
+        ));
     }
     if failed || pass.unrecorded.is_some() {
         ExitCode::FAILURE
     } else {
-        ExitCode::SUCCESS
+        answered.map_or_else(|failed| failed, |()| ExitCode::SUCCESS)
     }
 }
 
@@ -1814,14 +1887,23 @@ pub fn owed_clone(sys: &dyn System, state: &Path, now: &Holds) -> Result<OwedClo
     {
         return Ok(OwedClone::Held(line));
     }
-    // Every clone runs Apple's git, which aterm installs by itself (`base.clt`): no person's step
-    // the step waits for, and nothing a pass could do before it is there.
+    // Every clone runs an installed git: on a Mac Apple's, which `base.clt` installs (System
+    // State's Install…, or an `aterm init` a person runs) and this pass never does. Nothing a
+    // pass could do comes before it, so the step waits for it as for the token, naming the
+    // step that brings it, and the pass after it arrives clones.
     if crate::items::github::installed_git(sys).is_none() {
-        return Ok(OwedClone::Waiting(
-            "aterm init's GitHub step waits for Apple's Command Line Tools, which aterm installs, \
-             to bring git"
-                .into(),
-        ));
+        return Ok(OwedClone::Waiting(if sys.macos() {
+            "aterm init's GitHub step waits for Apple's Command Line Tools to bring git: \
+             Install\u{2026} on System State, or `aterm init --only base.clt` in a terminal, \
+             installs them"
+                .into()
+        } else {
+            format!(
+                "aterm init's GitHub step waits for git ({}), which this system's package \
+                 manager installs",
+                crate::items::github::SYSTEM_GIT
+            )
+        }));
     }
     if let Some((how, _)) = record
         .lines()
@@ -2896,7 +2978,7 @@ fn verified_mac_settings(ctx: &Ctx, groups: &[Group], rows: &[ItemReport]) -> Se
         (WorkstationGroup::Preferences, Some(preferences)),
         (WorkstationGroup::Accounts, accounts),
     ] {
-        if expected.as_deref().is_some_and(&covered) {
+        if expected.as_deref().is_some_and(covered) {
             let selected = group.selected(Selection::all());
             for setting in Setting::ALL {
                 if selected.contains(setting) {
@@ -4740,7 +4822,7 @@ impl Journal for Shared<'_, '_> {
 
 /// Run `base` items, release the store lock, and then run `base.clt`, `groups`, and `develop`
 /// in three lanes at once ([`Lane`]): the Desktop lane and the vault's join in the Network lane
-/// start at once, the rest of the Network lane (`base.clt`, GitHub, the develop layer) once
+/// start at once, the rest of the Network lane (the toolset, GitHub, `base.clt`, the develop layer) once
 /// the base layer let the store lock go ([`AfterBase`]), and the Base lane follows the base
 /// layer. Each row reaches `hooks.on_row` as its item finishes, and the Desktop lane runs
 /// inside `hooks.desktop`; the rows come back in composition order whichever lane finished
@@ -4816,20 +4898,21 @@ fn run_layers(
             decided: std::sync::OnceLock::new(),
         })
         .collect();
-    let gated: Vec<(&dyn Item, Place)> = clt
+    // Downloaded tools and repository clones need no Apple compiler. Finish them before
+    // an interactive Command Line Tools installation can wait for a Mac password.
+    let gated: Vec<(&dyn Item, Place)> = toolset
         .as_ref()
-        .map(|clt| (clt as &dyn Item, crate::init_clt::place()))
+        .map(|toolset| (toolset as &dyn Item, crate::init_toolset::place()))
         .into_iter()
-        .chain(
-            toolset
-                .as_ref()
-                .map(|toolset| (toolset as &dyn Item, crate::init_toolset::place())),
-        )
         .chain(
             later
                 .iter()
                 .zip(&held_late)
                 .map(|((_, place), item)| (item as &dyn Item, place.clone())),
+        )
+        .chain(
+            clt.as_ref()
+                .map(|clt| (clt as &dyn Item, crate::init_clt::place())),
         )
         .chain(
             develop
@@ -5062,7 +5145,8 @@ fn complete(rows: &[ItemReport], action: Action) -> bool {
 /// ([`waits_by_itself`]). For a run that is not `--check`, a grant only the person switches on
 /// ([`is_grant`]), a row deferred to a person ([`waits_for_a_person`]), one that runs once
 /// this Mac is let into the vault ([`owed`]), and Apple's Command Line Tools deferred to an
-/// install under way or to a person at this Mac's console ([`crate::init_clt::deferred`]) are
+/// install under way, to Apple's installer window open for them or to a person at this Mac's
+/// console ([`crate::init_clt::deferred`]) are
 /// not this run's to finish, so an apply or a plan completes with them (exit 0), naming them;
 /// `--check` still reads them as not verified.
 fn counts(row: &ItemReport, action: Action) -> bool {
@@ -5080,8 +5164,9 @@ fn counts(row: &ItemReport, action: Action) -> bool {
 
 /// Whether `row` is deferred to a person: the stand-in for the workstation rows a person at
 /// this Mac's console makes ([`AwayFromConsole`]), a sign-out that found nobody at the screen
-/// as it started ([`NOBODY_AT_THE_SCREEN`]), or the vault's look, which waits for a person to
-/// answer macOS's Local Network question ([`crate::init_secrets::waits_for_local_network`]).
+/// as it started ([`NOBODY_AT_THE_SCREEN`]), or the vault's look (or reach of a vault at a URL),
+/// which waits for a person to answer macOS's Local Network question
+/// ([`crate::init_secrets::waits_for_local_network`]).
 fn waits_for_a_person(row: &ItemReport) -> bool {
     row.outcome == Outcome::Deferred
         && (row.id == AWAY
@@ -5234,6 +5319,55 @@ mod tests {
             present: &|| true,
             holds: Holds::default(),
         }
+    }
+
+    /// What `aterm init` answers on standard output fails the run only when the answer is lost:
+    /// a reader gone ends the answer and keeps the run's own status, while a full disk under a
+    /// redirect (or EIO) is said on stderr, once, and exits 1, so `aterm init --json > file`
+    /// never reads a short report as a success; a stderr that fails too (`2>&1` onto the same
+    /// full disk) still returns exit 1, never unwinding, so the walk after the summary is still
+    /// handed over. CONTROL: an answer written in full is the run's, and says nothing on stderr.
+    #[test]
+    fn a_lost_answer_fails_the_run_and_a_gone_reader_does_not() {
+        use std::io::ErrorKind;
+        struct Refusing(ErrorKind);
+        impl std::io::Write for Refusing {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(self.0.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let said = std::cell::RefCell::new(Vec::<String>::new());
+        let say = |line: &str| {
+            said.borrow_mut().push(line.to_owned());
+            Ok(())
+        };
+        let mut written = Vec::new();
+        assert_eq!(answer_to(&mut written, "{}\n", say), Ok(()));
+        assert_eq!(written, b"{}\n");
+        assert_eq!(
+            answer_to(&mut Refusing(ErrorKind::BrokenPipe), "{}\n", say),
+            Ok(())
+        );
+        assert!(said.borrow().is_empty(), "{:?}", said.borrow());
+        for kind in [ErrorKind::StorageFull, ErrorKind::Other] {
+            said.borrow_mut().clear();
+            assert_eq!(
+                answer_to(&mut Refusing(kind), "{}\n", say),
+                Err(ExitCode::FAILURE),
+                "{kind:?}"
+            );
+            assert_eq!(said.borrow().len(), 1, "{kind:?}: {:?}", said.borrow());
+        }
+        assert_eq!(
+            answer_to(&mut Refusing(ErrorKind::StorageFull), "{}\n", |_| {
+                Err(ErrorKind::StorageFull.into())
+            }),
+            Err(ExitCode::FAILURE),
+            "stderr lost too"
+        );
     }
 
     #[test]
@@ -6798,8 +6932,75 @@ mod tests {
         assert!(sys.calls().is_empty(), "{:?}", sys.calls());
     }
 
+    #[test]
+    fn repository_setup_does_not_wait_for_the_apple_tools_install() {
+        use std::sync::Arc;
+        struct Repositories(Arc<Mutex<Vec<&'static str>>>);
+        impl Item for Repositories {
+            fn id(&self) -> String {
+                "init.github.native@alice".into()
+            }
+            fn family(&self) -> &'static str {
+                "github"
+            }
+            fn title(&self) -> String {
+                "Repositories".into()
+            }
+            fn probe(&self, _: &dyn System, _: &Ctx) -> Probe {
+                self.0.lock().unwrap().push("repositories");
+                ok()
+            }
+            fn apply(&self, _: &dyn System, _: &Ctx) -> Result<(), String> {
+                panic!("the repositories are already present")
+            }
+        }
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let toolset_seen = Arc::clone(&seen);
+        let clt_seen = Arc::clone(&seen);
+        let base = Base {
+            items: Vec::new(),
+            held: None,
+            toolset: Some(crate::init_toolset::Toolset::new(
+                Box::new(move || {
+                    toolset_seen.lock().unwrap().push("toolset");
+                    crate::init_toolset::Found::Complete("Git installed".into())
+                }),
+                Box::new(|_, _, _| panic!("the toolset is already installed")),
+                None,
+                crate::init_toolset::tests::ATPKG,
+            )),
+            clt: Some(crate::init_clt::CommandLineTools::new(
+                Box::new(move |_| {
+                    let mut seen = clt_seen.lock().unwrap();
+                    assert!(seen.contains(&"repositories"), "{seen:?}");
+                    seen.push("apple tools");
+                    crate::init_clt::Found::Present("compiler installed".into())
+                }),
+                PathBuf::from("/Applications/aterm.app/Contents/MacOS/aterm"),
+            )),
+            targo: None,
+        };
+        let groups: Vec<Group> = vec![(
+            vec![Box::new(Repositories(Arc::clone(&seen)))],
+            place(Class::Install),
+        )];
+        run(
+            &Fake::default(),
+            &at_console(user("alice", 501)),
+            base,
+            &groups,
+            Mode::Apply,
+            &mut NoJournal,
+        )
+        .unwrap();
+        let seen = seen.lock().unwrap();
+        let at = |name| seen.iter().position(|step| *step == name).unwrap();
+        assert!(at("toolset") < at("repositories"), "{seen:?}");
+        assert!(at("repositories") < at("apple tools"), "{seen:?}");
+    }
+
     /// `base.pkg.toolset` READS ONLY ONCE THE BASE LAYER LET THE STORE LOCK GO (its passes
-    /// take it), after `base.clt` and before the develop layer, whose tools run after it
+    /// take it), before `base.clt` and the develop layer, whose tools run after it
     /// whatever it ends as: once it installed the set, and while it installs nothing
     /// (`auto_install = false`), since their own probe reads the `targo` they need. CONTROL:
     /// with the toolset complete it runs no pass.
@@ -6870,7 +7071,7 @@ mod tests {
                 },
                 {
                     let ran = Arc::clone(&ran);
-                    Box::new(move |args: &[String], _| {
+                    Box::new(move |args: &[String], _, _: &dyn Fn() -> bool| {
                         ran.lock().unwrap().push(args.join(" "));
                         Ok(Ran::ok(""))
                     })
@@ -6944,7 +7145,13 @@ mod tests {
                     ]
                 );
             }
-            assert!(sys.calls().is_empty(), "{:?}", sys.calls());
+            // The machine sees nothing of the run but the stops the toolset's passes hold.
+            let held: &[&str] = if passes > 0 {
+                &["defer stops", "stops restored"]
+            } else {
+                &[]
+            };
+            assert_eq!(sys.calls(), held);
         }
     }
 
@@ -9815,10 +10022,10 @@ mod tests {
 
     const TAB_CC: &str = "/Library/Developer/CommandLineTools/usr/bin/cc";
 
-    /// The tab's `sudo` argv on `alice_with_checkout`: the plain prompt and the root half's
-    /// `--plain`, which reads no file.
+    /// The `sudo` argv on `alice_with_checkout`, in the tab and outside it: `-k`, the plain prompt
+    /// and the root half's `--plain`, which reads no file.
     fn tab_sudo() -> String {
-        format!("tty /usr/bin/sudo -p 'Mac password: ' {TAB_ATERM} machines here apply --plain")
+        format!("tty /usr/bin/sudo -k -p 'Mac password: ' {TAB_ATERM} machines here apply --plain")
     }
 
     /// [`tab`] over `sys` (`live`: in the person's own login), composing `base.clt` alone as
@@ -10028,9 +10235,10 @@ mod tests {
     }
 
     /// Every way the tab's install falls short, early ones included, ends on its one plain line
-    /// `The install did not finish: <reason>. Install… on System State tries again.` and 1:
-    /// `sudo`'s own refusal, each class the root half exits with, a signal, a `sudo` that never
-    /// ran, a run outside the person's own login, and a refused converge.
+    /// `The install did not finish: <reason>. Install… on System State tries again.` and its
+    /// class's exit (1, or a stop's and Apple's window closed's own): `sudo`'s own refusal, each
+    /// class the root half exits with, a signal, a `sudo` that never ran, a run outside the
+    /// person's own login, and a refused converge.
     #[test]
     fn the_tab_ends_on_one_line_saying_why_the_install_did_not_finish() {
         use crate::init_clt::Unfinished;
@@ -10055,6 +10263,7 @@ mod tests {
             (Some(Ran::exit(85, "")), Unfinished::Stopped),
             (Some(Ran::exit(86, "")), Unfinished::AppleWindow),
             (Some(Ran::exit(87, "")), Unfinished::Other),
+            (Some(Ran::exit(88, "")), Unfinished::WindowClosed),
             (Some(Ran::exit(127, "")), Unfinished::Other),
             (
                 Some(Ran {
@@ -10171,12 +10380,15 @@ mod tests {
     fn clt_rows(sys: &Fake) -> Vec<ItemReport> {
         let (ctx, _) = local_context(sys).unwrap();
         let base = Base {
-            clt: Some(crate::init_clt::CommandLineTools::new(
-                Box::new(|_: &dyn System| {
-                    crate::init_clt::Found::Missing("no developer directory".into())
-                }),
-                PathBuf::from(TAB_ATERM),
-            )),
+            clt: Some(
+                crate::init_clt::CommandLineTools::new(
+                    Box::new(|_: &dyn System| {
+                        crate::init_clt::Found::Missing("no developer directory".into())
+                    }),
+                    PathBuf::from(TAB_ATERM),
+                )
+                .saying(Arc::new(|_: &str| {})),
+            ),
             ..Base::none()
         };
         run(sys, &ctx, base, &[], Mode::Apply, &mut NoJournal).unwrap()
@@ -10188,7 +10400,7 @@ mod tests {
     /// a person there, and the run exits 0. CONTROL: a person at the console is asked once.
     #[test]
     fn off_the_console_init_asks_no_password_for_the_command_line_tools_and_exits_0() {
-        let sudo = format!("tty /usr/bin/sudo {TAB_ATERM} machines here apply --plain");
+        let sudo = tab_sudo();
         for (terminal, agent) in [
             (true, Some("Claude Code")),
             (false, Some("Claude Code")),

@@ -1261,8 +1261,7 @@ impl App {
         }
     }
 
-    /// Attach another view of an existing native app as a sibling of the focused canonical leaf, for the mixed-leaf tests (no shipping command duplicates a native view).
-    #[cfg(test)]
+    /// Attach a view of an existing native app beside the focused canonical leaf.
     pub(crate) fn split_active_with_native(
         &mut self,
         wid: WindowId,
@@ -1270,9 +1269,17 @@ impl App {
         instance: crate::tab_model::AppInstanceId,
         state: crate::native_app::AppViewState,
     ) -> Result<crate::tab_model::ViewId, NativeTabInstallError> {
-        if !self.windows.contains_key(&wid) {
-            return Err(NativeTabInstallError::UnknownWindow);
-        }
+        let (tab_id, prior_projection) = self
+            .windows
+            .get(&wid)
+            .and_then(|window| {
+                let tab = window.tab_set.active()?;
+                Some((
+                    tab.id,
+                    terminal_projection_index(&window.tab_set, &self.view_store, tab.id),
+                ))
+            })
+            .ok_or(NativeTabInstallError::UnknownWindow)?;
         let view = self
             .view_store
             .insert_native(instance)
@@ -1291,6 +1298,7 @@ impl App {
             self.view_store.remove(view);
             return Err(NativeTabInstallError::UnknownWindow);
         }
+        self.reconcile_view_topology_projection(wid, tab_id, prior_projection);
         self.resize_panes(wid);
         self.resync_active_or_window(wid);
         debug_assert!(
@@ -5437,7 +5445,7 @@ impl App {
                 })
                 .is_some();
             if inserted {
-                self.reconcile_reopened_view_projection(
+                self.reconcile_view_topology_projection(
                     wid,
                     candidate.value.original_tab,
                     prior_projection,
@@ -5491,7 +5499,8 @@ impl App {
         }
     }
 
-    fn reconcile_reopened_view_projection(
+    /// Reconcile a preexisting terminal projection after a tab's leaf topology changes.
+    fn reconcile_view_topology_projection(
         &mut self,
         wid: WindowId,
         tab_id: crate::tab_model::TabId,
@@ -7987,6 +7996,54 @@ mod mixed_tab_tests {
             "retirement does not evict a live sibling's retained raster"
         );
         assert_eq!(app.windows_displaying(0).count(), 0);
+        assert!(app.structural_invariants_ok());
+    }
+
+    #[test]
+    fn native_split_retires_only_its_terminal_projection_and_close_restores_it() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.push_stub_tab(wid, crate::stub_session(app.next_session_id));
+        app.push_stub_tab(wid, crate::stub_session(app.next_session_id));
+        app.switch_tab_in(wid, 1);
+        let tab_id = app.windows[&wid].tab_set.active_id().unwrap();
+        let terminal_view = app.windows[&wid].tab_set.active().unwrap().focus;
+        let layouts = app.windows[&wid].layouts.clone();
+        let next_session = app.next_session_id;
+        let instance = app
+            .native_runtime
+            .insert_instance(crate::native_app::NativeApp::Allocation(Box::default()))
+            .unwrap();
+
+        let native_view = app
+            .split_active_with_native(
+                wid,
+                crate::tab_model::SplitAxis::Horizontal,
+                instance,
+                crate::native_app::AppViewState::Allocation(Box::default()),
+            )
+            .unwrap();
+
+        let window = &app.windows[&wid];
+        assert_eq!(window.tab_set.active_id(), Some(tab_id));
+        assert_eq!(window.tab_set.len(), 3);
+        assert_eq!(window.tabs.count, 2);
+        assert_eq!(window.layouts, vec![layouts[0].clone(), layouts[2].clone()]);
+        assert_eq!(
+            window.tab_set.get(tab_id).unwrap().root.leaves(),
+            vec![terminal_view, native_view]
+        );
+        assert_eq!(app.next_session_id, next_session);
+        assert!(app.structural_invariants_ok());
+
+        app.close_focused_mixed_leaf(wid).unwrap();
+
+        let window = &app.windows[&wid];
+        assert_eq!(window.tab_set.active_id(), Some(tab_id));
+        assert_eq!(window.tab_set.active().unwrap().focus, terminal_view);
+        assert_eq!(window.layouts, layouts);
+        assert_eq!(window.tabs.count, 3);
+        assert_eq!(app.next_session_id, next_session);
         assert!(app.structural_invariants_ok());
     }
 

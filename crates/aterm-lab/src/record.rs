@@ -354,21 +354,19 @@ impl Journal {
         let mut file = out.and_then(|d| std::fs::File::create(d.join("journal.jsonl")).ok());
         let (l, s) = (Arc::clone(&lines), Arc::clone(&stop));
         let thread = std::thread::spawn(move || {
-            let mut n = 0usize;
+            let mut cursor = crate::util::LineTailCursor::default();
             while !s.load(Ordering::SeqCst) {
-                let text = crate::sys::scratch_read(&path)
-                    .ok()
-                    .flatten()
-                    .map(|b| String::from_utf8_lossy(&b).into_owned())
-                    .unwrap_or_default();
-                let ls: Vec<&str> = text.lines().collect();
-                if ls.len() > n {
+                let (reset, delta) = cursor.poll_scratch_text(&path).unwrap_or_default();
+                if reset {
+                    l.lock().unwrap_or_else(|x| x.into_inner()).clear();
+                }
+                if !delta.is_empty() {
                     let w = now();
-                    for ln in &ls[n..] {
+                    for ln in delta.lines() {
                         let rec = J::parse(ln).unwrap_or_else(|_| {
                             #[allow(clippy::cast_possible_truncation)]
                             let t = (w * 1000.0) as i64;
-                            J::obj([("t", J::Int(t)), ("kind", J::s("raw")), ("line", J::s(*ln))])
+                            J::obj([("t", J::Int(t)), ("kind", J::s("raw")), ("line", J::s(ln))])
                         });
                         if let Some(f) = file.as_mut() {
                             let _ = writeln!(
@@ -379,7 +377,6 @@ impl Journal {
                         }
                         l.lock().unwrap_or_else(|x| x.into_inner()).push((w, rec));
                     }
-                    n = ls.len();
                 }
                 std::thread::sleep(Duration::from_millis(40));
             }

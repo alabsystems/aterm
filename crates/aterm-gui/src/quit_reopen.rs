@@ -164,7 +164,7 @@ pub(crate) fn leave_reopen_at_quit() {
 }
 
 /// [`REOPEN_VERB`]: wait for the named aterm process to be gone, then open the bundle named.
-#[must_use]
+#[must_use = "return or inspect the reopen helper's exit status"]
 pub fn run_reopen_after(args: &[OsString]) -> std::process::ExitCode {
     #[cfg(target_os = "macos")]
     if let Some((target, bundle)) = parse_reopen_args(args) {

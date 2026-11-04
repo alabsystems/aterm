@@ -14,6 +14,9 @@ use crate::supervise::run::CtlReply;
 #[path = "cli_label_retention_tests.rs"]
 mod label_retention;
 
+#[path = "cli_asked_tests.rs"]
+mod asked;
+
 #[path = "cli_report_read_tests.rs"]
 mod report_read;
 
@@ -357,9 +360,9 @@ fn the_account_table_separates_assignment_readiness_and_local_logins() {
     login_made_in(&login);
     std::fs::create_dir_all(login.join("credentials")).unwrap();
     std::fs::write(login.join("credentials/kimi-code.json"), "{}").unwrap();
-    let roster = accounts::append_row("", "kimi-m22", Class::Dedicated, None).unwrap();
+    let roster = accounts::append_row("", "kimi-m22", Class::Preferred, None).unwrap();
     let roster =
-        accounts::append_row(&roster, "kimi-local", Class::Dedicated, login.to_str()).unwrap();
+        accounts::append_row(&roster, "kimi-local", Class::Preferred, login.to_str()).unwrap();
     std::fs::write(env.accounts_roster_for(Cli::Kimi).unwrap(), roster).unwrap();
     let store = env.accounts_store_for(Cli::Kimi).unwrap();
     let mut logins = accounts::Logins::default();
@@ -550,17 +553,17 @@ fn the_grammar_parses_what_the_help_text_advertises() {
             "accounts add work-2",
             Cmd::Accounts(AccountsCmd::Add {
                 label: "work-2".to_string(),
-                class: Class::Dedicated,
+                class: Class::Preferred,
                 email: None,
                 identity_email: None,
                 browser: None,
             }),
         ),
         (
-            "accounts add pool-a --shared",
+            "accounts add pool-a --pool",
             Cmd::Accounts(AccountsCmd::Add {
                 label: "pool-a".to_string(),
-                class: Class::Shared,
+                class: Class::Pool,
                 email: None,
                 identity_email: None,
                 browser: None,
@@ -733,11 +736,11 @@ fn the_grammar_refuses_what_it_does_not_know() {
         "accounts login",
         "accounts use",
         "accounts use work-2 --auto",
-        "accounts --shared",
-        "accounts login work-2 --shared",
+        "accounts --pool",
+        "accounts login work-2 --pool",
         "accounts --auto",
         "accounts login work-2 --auto",
-        "usage --shared",
+        "usage --pool",
         "upgrade --auto",
         "accounts add work-2 --json",
         "accounts login work-2 --json",
@@ -746,11 +749,11 @@ fn the_grammar_refuses_what_it_does_not_know() {
         "accounts --dry-run",
         "accounts --json --dry-run",
         "accounts stats --dry-run",
-        "accounts stats --shared",
+        "accounts stats --pool",
         "accounts stats --sock /a.sock",
         "accounts stats main",
         "accounts add work-2 --dry-run",
-        "accounts add pool-a --shared --dry-run",
+        "accounts add pool-a --pool --dry-run",
         "accounts login work-2 --dry-run",
         "accounts use work-2 --dry-run",
         "accounts use --auto --dry-run",
@@ -764,7 +767,7 @@ fn the_grammar_refuses_what_it_does_not_know() {
         "upgrade s-abc --now --skip",
         "upgrade s-abc --status --now",
         "upgrade s-abc --now --dry-run",
-        "upgrade --status --shared",
+        "upgrade --status --pool",
         "upgrade s-abc --skip --auto",
         "upgrade s-abc --now --email owner@example.com",
         "upgrade s-abc --defer 1h --browser Work",
@@ -1094,9 +1097,9 @@ fn usage_names_the_account_its_claude_code_runs_under() {
     let roster = env.accounts_roster().expect("a config dir");
     let work = tmp.path().join("logins").join("work-2");
     let work = work.to_str().expect("utf-8");
-    let one = accounts::append_row("", "main", Class::Dedicated, None).expect("the row admits");
+    let one = accounts::append_row("", "main", Class::Preferred, None).expect("the row admits");
     let two =
-        accounts::append_row(&one, "work-2", Class::Dedicated, Some(work)).expect("the row admits");
+        accounts::append_row(&one, "work-2", Class::Preferred, Some(work)).expect("the row admits");
     std::fs::write(&roster, &two).expect("write");
 
     let shown = |env: &Env, process: &FakeClaude| {
@@ -2098,7 +2101,7 @@ fn kimi_limits_report_the_month_and_optional_week_with_absolute_resets() {
 fn a_kimi_limits_read_persists_the_month_and_session() {
     let tmp = tmp_dir("kimi-limits-store");
     let env = env_at(&tmp);
-    let roster = accounts::append_row("", "kimi-m22", Class::Dedicated, None).unwrap();
+    let roster = accounts::append_row("", "kimi-m22", Class::Preferred, None).unwrap();
     std::fs::write(env.accounts_roster_for(Cli::Kimi).unwrap(), roster).unwrap();
     let rows = rows(&[
         "   ╭ Usage ─────────────────────────────────────────╮",
@@ -2149,7 +2152,7 @@ fn a_kimi_limits_read_persists_the_month_and_session() {
 fn a_kimi_row_with_no_monthly_reading_says_why() {
     let tmp = tmp_dir("kimi-no-month");
     let env = env_at(&tmp);
-    let roster = accounts::append_row("", "kimi-m22", Class::Dedicated, None).unwrap();
+    let roster = accounts::append_row("", "kimi-m22", Class::Preferred, None).unwrap();
     std::fs::write(env.accounts_roster_for(Cli::Kimi).unwrap(), roster).unwrap();
     let mut out = Vec::new();
     let mut err = Vec::new();
@@ -2173,7 +2176,7 @@ fn a_kimi_row_with_no_monthly_reading_says_why() {
 fn kimi_refresh_uses_a_quota_only_tab_and_always_closes_it() {
     let tmp = tmp_dir("kimi-refresh");
     let env = env_at(&tmp);
-    let roster = accounts::append_row("", "kimi-m22", Class::Dedicated, None).unwrap();
+    let roster = accounts::append_row("", "kimi-m22", Class::Preferred, None).unwrap();
     std::fs::write(env.accounts_roster_for(Cli::Kimi).unwrap(), roster).unwrap();
     let mut ctl = RefreshCtl {
         calls: Vec::new(),
@@ -2257,7 +2260,7 @@ fn kimi_refresh_uses_a_quota_only_tab_and_always_closes_it() {
 fn kimi_refresh_closes_its_tab_when_startup_fails() {
     let tmp = tmp_dir("kimi-refresh-failure");
     let env = env_at(&tmp);
-    let roster = accounts::append_row("", "kimi-m22", Class::Dedicated, None).unwrap();
+    let roster = accounts::append_row("", "kimi-m22", Class::Preferred, None).unwrap();
     std::fs::write(env.accounts_roster_for(Cli::Kimi).unwrap(), roster).unwrap();
     let mut ctl = RefreshCtl {
         calls: Vec::new(),
@@ -2279,7 +2282,7 @@ fn kimi_refresh_closes_its_tab_when_startup_fails() {
 fn kimi_refresh_takes_an_already_gone_tab_as_closed() {
     let tmp = tmp_dir("kimi-refresh-gone");
     let env = env_at(&tmp);
-    let roster = accounts::append_row("", "kimi-m22", Class::Dedicated, None).unwrap();
+    let roster = accounts::append_row("", "kimi-m22", Class::Preferred, None).unwrap();
     std::fs::write(env.accounts_roster_for(Cli::Kimi).unwrap(), roster).unwrap();
     let mut ctl = RefreshCtl {
         calls: Vec::new(),
@@ -2303,7 +2306,7 @@ fn kimi_refresh_refuses_wait_timeouts_and_unmeasured_usage() {
     ] {
         let tmp = tmp_dir("kimi-refresh-unobserved");
         let env = env_at(&tmp);
-        let roster = accounts::append_row("", "kimi-m22", Class::Dedicated, None).unwrap();
+        let roster = accounts::append_row("", "kimi-m22", Class::Preferred, None).unwrap();
         std::fs::write(env.accounts_roster_for(Cli::Kimi).unwrap(), roster).unwrap();
         let mut ctl = RefreshCtl {
             timeout_at,
@@ -2349,7 +2352,7 @@ fn kimi_refresh_executes_the_enrolled_home_as_an_environment_assignment() {
     let env = env_at(&tmp);
     let login = tmp.path().join("kimi space's home");
     std::fs::create_dir_all(&login).unwrap();
-    let roster = accounts::append_row("", "dedicated", Class::Dedicated, login.to_str()).unwrap();
+    let roster = accounts::append_row("", "dedicated", Class::Preferred, login.to_str()).unwrap();
     std::fs::write(env.accounts_roster_for(Cli::Kimi).unwrap(), roster).unwrap();
     let store = env.accounts_store_for(Cli::Kimi).unwrap();
     let mut logins = accounts::Logins::default();
@@ -5072,9 +5075,9 @@ fn three_accounts(tmp: &Tmp, env: &Env) -> (String, String) {
     let pool = pool.to_str().expect("utf-8").to_string();
     let mut text = String::new();
     for (label, class, dir) in [
-        ("main", Class::Dedicated, None),
-        ("work-2", Class::Dedicated, Some(work.as_str())),
-        ("pool-a", Class::Shared, Some(pool.as_str())),
+        ("main", Class::Preferred, None),
+        ("work-2", Class::Preferred, Some(work.as_str())),
+        ("pool-a", Class::Pool, Some(pool.as_str())),
     ] {
         text = accounts::append_row(&text, label, class, dir).expect("the row admits");
     }
@@ -5150,7 +5153,7 @@ fn where_no_account_can_take_over_the_report_names_another() {
     login_made_in(&work);
     let mut roster = String::new();
     for (label, dir) in [("main", None), ("work-2", work.to_str())] {
-        roster = accounts::append_row(&roster, label, Class::Dedicated, dir).expect("admits");
+        roster = accounts::append_row(&roster, label, Class::Preferred, dir).expect("admits");
     }
     std::fs::write(env.accounts_roster().expect("a config dir"), &roster).expect("write");
     let names_add = |out: &str| {
@@ -5189,7 +5192,7 @@ fn where_no_account_can_take_over_the_report_names_another() {
     let out = report(&env);
     assert!(names_add(&out), "{out}");
     let pool = tmp.path().join("logins").join("pool-a");
-    roster = accounts::append_row(&roster, "pool-a", Class::Shared, pool.to_str()).expect("admits");
+    roster = accounts::append_row(&roster, "pool-a", Class::Pool, pool.to_str()).expect("admits");
     std::fs::write(env.accounts_roster().expect("a config dir"), &roster).expect("write");
     let out = report(&env);
     assert!(out.contains("accounts login pool-a"), "{out}");
@@ -5232,7 +5235,7 @@ fn a_refused_roster_is_said_by_name_and_nothing_acts_on_it() {
         AccountsCmd::Use {
             label: "main".to_string(),
         },
-        add("work-2", Class::Dedicated),
+        add("work-2", Class::Preferred),
     ] {
         let (code, out, err) = acc_quiet(form.clone(), &env);
         assert_eq!(code, exit(1), "{form:?}");
@@ -5270,7 +5273,7 @@ fn the_first_add_lists_this_machines_own_login_then_the_new_row() {
     let roster = env.accounts_roster().expect("a config dir");
     let store = env.accounts_store();
 
-    let (code, _, err) = acc_quiet(add("work-2", Class::Dedicated), &env);
+    let (code, _, err) = acc_quiet(add("work-2", Class::Preferred), &env);
     assert_eq!(code, exit(0), "{err}");
     let dir = store.login_dir("work-2").expect("a label");
     assert!(err.is_empty(), "{err}");
@@ -5289,20 +5292,20 @@ fn the_first_add_lists_this_machines_own_login_then_the_new_row() {
         vec![
             accounts::Row {
                 label: "main".to_string(),
-                class: Class::Dedicated,
+                class: Class::Preferred,
                 dir: None,
                 ..accounts::Row::default()
             },
             accounts::Row {
                 label: "work-2".to_string(),
-                class: Class::Dedicated,
+                class: Class::Preferred,
                 dir: Some(dir.to_str().expect("utf-8").to_string()),
                 ..accounts::Row::default()
             },
         ]
     );
 
-    let (code, _, err) = acc_quiet(add("pool-a", Class::Shared), &env);
+    let (code, _, err) = acc_quiet(add("pool-a", Class::Pool), &env);
     assert_eq!(code, exit(0), "{err}");
     let read = Roster::load(&roster).expect("still admits");
     assert_eq!(
@@ -5312,14 +5315,14 @@ fn the_first_add_lists_this_machines_own_login_then_the_new_row() {
             .collect::<Vec<_>>(),
         ["main", "work-2", "pool-a"]
     );
-    assert_eq!(read.row("pool-a").map(|r| r.class), Some(Class::Shared));
+    assert_eq!(read.row("pool-a").map(|r| r.class), Some(Class::Pool));
 }
 
 #[test]
 fn a_row_whose_login_directory_is_empty_is_listed_and_not_enrolled() {
     let tmp = tmp_dir("accounts-empty-dir");
     let env = env_at(&tmp);
-    let (code, _, err) = acc_quiet(add("check-2", Class::Dedicated), &env);
+    let (code, _, err) = acc_quiet(add("check-2", Class::Preferred), &env);
     assert_eq!(code, exit(0), "{err}");
     let dir = env.accounts_store().login_dir("check-2").expect("a label");
     let dir_text = dir.to_str().expect("utf-8").to_string();
@@ -5398,7 +5401,7 @@ fn an_add_to_a_roster_with_rows_lists_no_login_of_its_own() {
         abs("/logins/pool-a")
     );
     std::fs::write(&roster, &hand).expect("write");
-    let (code, _, err) = acc_quiet(add("work-2", Class::Dedicated), &env);
+    let (code, _, err) = acc_quiet(add("work-2", Class::Preferred), &env);
     assert_eq!(code, exit(0), "{err}");
     let text = std::fs::read_to_string(&roster).expect("read");
     assert!(text.starts_with(&hand), "what was there is kept: {text}");
@@ -5420,14 +5423,14 @@ fn add_refuses_a_listed_or_inadmissible_label_by_name_and_writes_nothing() {
     let roster = env.accounts_roster().expect("a config dir");
 
     for label in ["Work", "-x", "a/b", "", "with space"] {
-        let (code, out, _) = acc_quiet(add(label, Class::Dedicated), &env);
+        let (code, out, _) = acc_quiet(add(label, Class::Preferred), &env);
         assert_eq!(code, exit(1), "{label:?}");
         assert!(out.is_empty(), "{label:?}: {out}");
     }
-    let (code, out, _) = acc_quiet(add("help", Class::Dedicated), &env);
+    let (code, out, _) = acc_quiet(add("help", Class::Preferred), &env);
     assert_eq!(code, exit(1));
     assert!(out.is_empty(), "{out}");
-    let (code, _, _) = acc_quiet(add("main", Class::Dedicated), &env);
+    let (code, _, _) = acc_quiet(add("main", Class::Preferred), &env);
     assert_eq!(code, exit(1));
     assert!(!roster.exists(), "no refusal made a roster");
     assert!(
@@ -5435,19 +5438,19 @@ fn add_refuses_a_listed_or_inadmissible_label_by_name_and_writes_nothing() {
         "no refusal made a login directory"
     );
 
-    let (code, _, err) = acc_quiet(add("work-2", Class::Dedicated), &env);
+    let (code, _, err) = acc_quiet(add("work-2", Class::Preferred), &env);
     assert_eq!(code, exit(0), "{err}");
     let before = std::fs::read_to_string(&roster).expect("read");
-    let (code, out, _) = acc_quiet(add("work-2", Class::Shared), &env);
+    let (code, out, _) = acc_quiet(add("work-2", Class::Pool), &env);
     assert_eq!(code, exit(1));
     assert!(out.is_empty(), "{out}");
-    let (code, _, _) = acc_quiet(add("main", Class::Dedicated), &env);
+    let (code, _, _) = acc_quiet(add("main", Class::Preferred), &env);
     assert_eq!(code, exit(1));
     assert_eq!(std::fs::read_to_string(&roster).expect("read"), before);
 
     let mut relative = env_at(&tmp);
     relative.state = PathBuf::from("relative-state");
-    let (code, _, _) = acc_quiet(add("pool-a", Class::Shared), &relative);
+    let (code, _, _) = acc_quiet(add("pool-a", Class::Pool), &relative);
     assert_eq!(code, exit(1));
     assert_eq!(std::fs::read_to_string(&roster).expect("read"), before);
     assert!(
@@ -5461,8 +5464,8 @@ fn login_prints_the_line_and_runs_it_only_at_a_terminal() {
     let tmp = tmp_dir("accounts-login");
     let env = env_at(&tmp);
     let odd = format!("{}/it's here/", tmp.path().display());
-    let text = accounts::append_row("", "main", Class::Dedicated, None)
-        .and_then(|t| accounts::append_row(&t, "work-2", Class::Dedicated, Some(&odd)))
+    let text = accounts::append_row("", "main", Class::Preferred, None)
+        .and_then(|t| accounts::append_row(&t, "work-2", Class::Preferred, Some(&odd)))
         .expect("the rows admit");
     std::fs::write(env.accounts_roster().expect("a config dir"), text).expect("write");
     let login = |label: &str| AccountsCmd::Login {
@@ -5554,7 +5557,7 @@ fn a_failed_flow_preserves_current_accounts_and_unbound_staging_files() {
     #[cfg(unix)]
     assert_eq!(wake_id(&store), woken, "nobody is woken");
 
-    let (code, _, err) = acc_quiet(add("work-3", Class::Dedicated), &env);
+    let (code, _, err) = acc_quiet(add("work-3", Class::Preferred), &env);
     assert_eq!(code, exit(0), "{err}");
     #[cfg(unix)]
     let woken = {
@@ -5623,19 +5626,19 @@ fn a_roster_write_wakes_a_waiting_host_and_a_refused_one_wakes_nobody() {
     let tmp = tmp_dir("accounts-add-wakes");
     let env = env_at(&tmp);
     let store = env.accounts_store();
-    let (code, _, _) = acc_quiet(add("Work", Class::Dedicated), &env);
+    let (code, _, _) = acc_quiet(add("Work", Class::Preferred), &env);
     assert_eq!(code, exit(1));
     assert_eq!(wake_id(&store), None, "a refused add wakes nobody");
 
-    let (code, _, err) = acc_quiet(add("work-2", Class::Dedicated), &env);
+    let (code, _, err) = acc_quiet(add("work-2", Class::Preferred), &env);
     assert_eq!(code, exit(0), "{err}");
     assert!(err.is_empty(), "{err}");
     let woken = wake_id(&store);
     assert!(woken.is_some(), "the add wakes a waiting host");
-    let (code, _, _) = acc_quiet(add("work-2", Class::Shared), &env);
+    let (code, _, _) = acc_quiet(add("work-2", Class::Pool), &env);
     assert_eq!(code, exit(1));
     assert_eq!(wake_id(&store), woken, "a listed label wakes nobody");
-    let (code, _, err) = acc_quiet(add("pool-a", Class::Shared), &env);
+    let (code, _, err) = acc_quiet(add("pool-a", Class::Pool), &env);
     assert_eq!(code, exit(0), "{err}");
     assert_ne!(wake_id(&store), woken, "each add wakes it again");
 
@@ -6427,7 +6430,7 @@ fn a_survey_reads_each_row_as_the_report_does() {
     };
     assert_eq!(
         (main.label.as_str(), main.class, main.enrolled),
-        ("main", Class::Dedicated, true)
+        ("main", Class::Preferred, true)
     );
     assert_eq!(main.condition, accounts::Condition::Usable);
     assert_eq!((main.five_hour_pct, main.seven_day_pct), (Some(42), None));
@@ -6445,7 +6448,7 @@ fn a_survey_reads_each_row_as_the_report_does() {
     assert_eq!(work.five_hour_pct, Some(100));
     assert_eq!(
         (pool_a.label.as_str(), pool_a.class, pool_a.enrolled),
-        ("pool-a", Class::Shared, false)
+        ("pool-a", Class::Pool, false)
     );
     assert_eq!(pool_a.condition, accounts::Condition::NotEnrolled);
     assert_eq!((pool_a.five_hour_pct, pool_a.used_at), (None, None));
@@ -6644,13 +6647,13 @@ fn add_writes_a_symlinked_roster_through_the_link() {
     };
     chmod(&target, 0o644);
 
-    let (code, _, err) = acc_quiet(add("work-2", Class::Dedicated), &env);
+    let (code, _, err) = acc_quiet(add("work-2", Class::Preferred), &env);
     assert_eq!(code, exit(0), "{err}");
     assert!(is_link(&link), "the link is still a link");
     assert!(!is_link(&target));
     assert_eq!(mode(&target), 0o644, "the target keeps the mode it had");
     chmod(&target, 0o640);
-    let (code, _, err) = acc_quiet(add("pool-a", Class::Shared), &env);
+    let (code, _, err) = acc_quiet(add("pool-a", Class::Pool), &env);
     assert_eq!(code, exit(0), "{err}");
     assert_eq!(mode(&target), 0o640);
     assert!(
@@ -6683,7 +6686,7 @@ fn add_writes_a_symlinked_roster_through_the_link() {
     let roster = env.accounts_roster().expect("a config dir");
     std::fs::write(&roster, hand).expect("write");
     chmod(&roster, 0o644);
-    let (code, _, err) = acc_quiet(add("work-2", Class::Dedicated), &env);
+    let (code, _, err) = acc_quiet(add("work-2", Class::Preferred), &env);
     assert_eq!(code, exit(0), "{err}");
     assert_eq!(mode(&roster), 0o600);
 
@@ -6692,7 +6695,7 @@ fn add_writes_a_symlinked_roster_through_the_link() {
     let link = env.accounts_roster().expect("a config dir");
     std::os::unix::fs::symlink(other.path().join("gone").join("accounts.toml"), &link)
         .expect("symlink");
-    let (code, out, _) = acc_quiet(add("work-2", Class::Dedicated), &env);
+    let (code, out, _) = acc_quiet(add("work-2", Class::Preferred), &env);
     assert_eq!(code, exit(1));
     assert!(out.is_empty(), "{out}");
     assert!(is_link(&link), "the link is as it was");
@@ -6711,11 +6714,11 @@ fn add_to_an_inline_roster_says_so_and_prints_the_row_to_add_by_hand() {
     assert_eq!(code, exit(0));
     assert!(out.contains("main"), "the report reads it: {out}");
 
-    let (code, out, err) = acc_quiet(add("work-2", Class::Shared), &env);
+    let (code, out, err) = acc_quiet(add("work-2", Class::Pool), &env);
     assert_eq!(code, exit(1));
     assert!(out.is_empty(), "{out}");
     let dir = env.accounts_store().login_dir("work-2").expect("a label");
-    let row = accounts::row_inline("work-2", Class::Shared, dir.to_str()).expect("a row");
+    let row = accounts::row_inline("work-2", Class::Pool, dir.to_str()).expect("a row");
     assert!(
         err.trim_end().ends_with(&row),
         "the row, to add by hand: {err}"
@@ -6727,15 +6730,15 @@ fn add_to_an_inline_roster_says_so_and_prints_the_row_to_add_by_hand() {
     let read = Roster::load(&roster).expect("admits");
     assert_eq!(
         read.row("work-2").map(|r| (r.class, r.dir.clone())),
-        Some((Class::Shared, dir.to_str().map(str::to_owned)))
+        Some((Class::Pool, dir.to_str().map(str::to_owned)))
     );
 
     let empty = "account = []\n";
     std::fs::write(&roster, empty).expect("write");
-    let (code, out, err) = acc_quiet(add("work-2", Class::Shared), &env);
+    let (code, out, err) = acc_quiet(add("work-2", Class::Pool), &env);
     assert_eq!(code, exit(1));
     assert!(out.is_empty(), "{out}");
-    let own = accounts::row_inline(ACCOUNTS_OWN_LABEL, Class::Dedicated, None).expect("a row");
+    let own = accounts::row_inline(ACCOUNTS_OWN_LABEL, Class::Preferred, None).expect("a row");
     assert!(
         err.trim_end().ends_with(&format!("{own}, {row}")),
         "both rows, to add by hand: {err}"
@@ -6750,8 +6753,8 @@ fn add_to_an_inline_roster_says_so_and_prints_the_row_to_add_by_hand() {
             .map(|r| (r.label.as_str(), r.class, r.dir.is_some()))
             .collect::<Vec<_>>(),
         [
-            (ACCOUNTS_OWN_LABEL, Class::Dedicated, false),
-            ("work-2", Class::Shared, true)
+            (ACCOUNTS_OWN_LABEL, Class::Preferred, false),
+            ("work-2", Class::Pool, true)
         ]
     );
 }
@@ -7957,7 +7960,7 @@ fn accounts_stats_labels_an_enrolled_home_by_its_roster_row() {
         let mut text = String::new();
         for (label, dir) in rows {
             let dir = dir.map(|d| d.to_str().expect("utf-8"));
-            text = accounts::append_row(&text, label, Class::Dedicated, dir).expect("admits");
+            text = accounts::append_row(&text, label, Class::Preferred, dir).expect("admits");
         }
         text
     };
@@ -7983,7 +7986,8 @@ fn accounts_stats_labels_an_enrolled_home_by_its_roster_row() {
 
     std::fs::write(&path, roster(&[("fresh", Some(fresh.as_path()))])).expect("write");
     assert_eq!(label(&env), keyed);
-    let refused = roster(&[("work", Some(work.as_path()))]).replace("class = \"dedicated\"\n", "");
+    let refused = roster(&[("work", Some(work.as_path()))])
+        .replace("[[account]]\n", "[[account]]\npreferred = 1\n");
     assert!(Roster::parse(&refused).is_err(), "{refused}");
     std::fs::write(&path, &refused).expect("write");
     assert_eq!(label(&env), keyed, "a refused roster lists no row");
@@ -8014,7 +8018,7 @@ fn accounts_stats_recovers_before_choosing_its_label_and_state() {
     let env = stats_env(&tmp, new.clone(), new.join(".claude.json"));
     std::fs::write(
         env.accounts_roster().unwrap(),
-        accounts::append_row("", "work", Class::Dedicated, old.to_str()).unwrap(),
+        accounts::append_row("", "work", Class::Preferred, old.to_str()).unwrap(),
     )
     .unwrap();
     let store = env.accounts_store();
@@ -9630,7 +9634,10 @@ fn another_clis_rows_are_added_listed_and_pinned_in_its_own_roster_and_login_roo
     assert!(out.contains("sol") && out.contains("not-enrolled"), "{out}");
     let (code, _, err) = run_line("accounts use sol --cli kimi", &env);
     assert_eq!(code, exit(1), "not signed in yet");
-    assert!(err.contains("its login is not made yet"), "{err}");
+    assert!(
+        err.contains("`aterm harness accounts renew sol --cli kimi`"),
+        "the sign-in `add` named: {err}"
+    );
     std::fs::create_dir_all(dir.join("credentials")).expect("mkdir");
     std::fs::write(dir.join("credentials/kimi-code.json"), "{}").expect("a stand-in login");
     let (code, out, err) = run_line("accounts use sol --cli kimi", &env);
@@ -9884,9 +9891,37 @@ fn the_agy_verb_parses_its_forms() {
         }
     );
     assert!(p("agy frob").is_err());
+    assert_eq!(
+        p("agy login primary --json").unwrap(),
+        Cmd::Agy {
+            what: AgyWhat::Login("primary".into()),
+            refresh: false,
+            json: true,
+        }
+    );
+    assert!(p("agy login").is_err());
+    assert!(p("agy login ../outside").is_err());
     assert_eq!(p("agy --help").unwrap(), Cmd::Help(HelpPage::Agy));
     assert!(help_page(HelpPage::Agy).contains("agy pick [<model>]"));
     assert!(help_page(HelpPage::Agy).contains("stopped at a quota wall rotates across pools"));
+}
+
+#[test]
+fn harness_agy_login_fails_closed_without_reading_home_quota() {
+    let (_dir, env) = agy_env("agy-login-unprovisioned");
+    let (code, text) = agy_go(
+        &env,
+        &AgyWhat::Login("primary".into()),
+        true,
+        &GEMINI_DEFAULT,
+    );
+    assert_eq!(code, ExitCode::FAILURE);
+    let value: Value = aterm_json::from_str(&text).unwrap();
+    assert_eq!(value["kind"].as_str(), Some("agy-login"));
+    assert_eq!(value["verified"].as_bool(), Some(false));
+    assert!(value["error"].as_str().is_some());
+    assert!(!env.state.join("agy-quota").exists());
+    assert!(!env.state.join("agy-logins").exists());
 }
 
 #[test]
@@ -10464,7 +10499,7 @@ fn the_source_tables_default_codex_row_is_here_only_with_its_login_file() {
             accounts: vec![FleetAccount {
                 label: "main".into(),
                 machines: vec!["m16".into()],
-                class: Class::Dedicated,
+                class: Class::Preferred,
                 email: "owner@example.test".into(),
                 browser: None,
                 vendor: accounts::Vendor::default(),
@@ -10535,7 +10570,7 @@ fn source_table_rows_treats_held_by_rows_as_elsewhere_and_matches_identity_email
                 FleetAccount {
                     label: "codex-m16".into(),
                     machines: vec!["m16".into()],
-                    class: Class::Dedicated,
+                    class: Class::Preferred,
                     email: "warm@example.test".into(),
                     browser: None,
                     vendor: accounts::Vendor::default(),
@@ -10543,7 +10578,7 @@ fn source_table_rows_treats_held_by_rows_as_elsewhere_and_matches_identity_email
                 FleetAccount {
                     label: "codex-other".into(),
                     machines: vec!["m22".into()],
-                    class: Class::Dedicated,
+                    class: Class::Preferred,
                     email: "other@example.test".into(),
                     browser: None,
                     vendor: accounts::Vendor::default(),

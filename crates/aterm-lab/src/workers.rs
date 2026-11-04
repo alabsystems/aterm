@@ -1405,10 +1405,10 @@ fn run_workers(tag: &str, upgrade: Option<&str>, early: bool) -> Result<Verdict,
         ),
     );
 
-    let egress = fs::read_to_string(run.run.join("egress.log")).unwrap_or_default();
+    let egress = crate::util::read_regular_text(&run.run.join("egress.log")).unwrap_or_default();
     let external = egress.lines().filter(|l| l.contains("EXTERNAL")).count();
     let to_stub = format!("127.0.0.1:{}", run.port);
-    let mut clients: Vec<String> = fs::read_to_string(run.run.join("sockets.log"))
+    let mut clients: Vec<String> = crate::util::read_regular_text(&run.run.join("sockets.log"))
         .unwrap_or_default()
         .lines()
         .filter(|l| {

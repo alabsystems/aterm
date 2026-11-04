@@ -2696,19 +2696,22 @@ fn seed_builds(opts: &Opts) {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if scanned.as_ref().is_none_or(|(k, _)| *k != key) {
         let once = ScratchDir::new("upgrade", "builds");
+        // The shared temporary parent may belong to root. Put the cache beneath our
+        // owned scratch directory, as a real state directory owns its builds cache.
+        let cache = once.join("builds");
         let recording = aterm_durable::seam::Recording::start();
-        let first = catalog::baked_cached(&bin, &once);
+        let first = catalog::baked_cached(&bin, &cache);
         assert_eq!(
             recording.take(),
             [aterm_durable::Flush::Ordered],
             "the facts cache is only ordered"
         );
         assert_eq!(
-            catalog::baked_cached(&bin, &once),
+            catalog::baked_cached(&bin, &cache),
             first,
             "the cache file reads back as the scan that wrote it"
         );
-        let files = std::fs::read_dir(&*once)
+        let files = std::fs::read_dir(&cache)
             .expect("the builds cache")
             .flatten()
             .map(|e| {
@@ -30300,7 +30303,8 @@ fn a_carry_whose_screen_read_goes_unanswered_waits_and_carries_on_next() {
 
 /// A continuation whose turn the window leaves unanswered is read off the agent's own record: an
 /// agent whose record never moved waits (`wait:unanswered`), its relaunch still in flight; one
-/// whose status left idle took it (`continued`).
+/// whose status left idle took it (`continued`), its record's move waited for by the hang
+/// detector.
 #[cfg(unix)]
 #[test]
 fn an_unanswered_continuation_is_read_off_the_agents_record() {
@@ -30324,6 +30328,7 @@ fn an_unanswered_continuation_is_read_off_the_agents_record() {
         answers,
     );
     rig.opts.timings.drive_reply = Duration::from_millis(200);
+    rig.opts.timings.first_idle = aterm_spec::wait::MUST_HAPPEN;
     let file = rig
         .opts
         .home

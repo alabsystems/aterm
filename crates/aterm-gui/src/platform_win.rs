@@ -577,7 +577,14 @@ fn sys_color(index: i32) -> [u8; 3] {
 }
 
 fn resolve_forced_chrome(high_contrast: bool) -> Option<crate::chrome_band::ForcedChrome> {
-    (high_contrast || force_hc_chrome_env()).then(|| crate::chrome_band::ForcedChrome {
+    resolve_forced_chrome_with(high_contrast, force_hc_chrome_env())
+}
+
+fn resolve_forced_chrome_with(
+    high_contrast: bool,
+    force_override: bool,
+) -> Option<crate::chrome_band::ForcedChrome> {
+    (high_contrast || force_override).then(|| crate::chrome_band::ForcedChrome {
         window: sys_color(COLOR_WINDOW),
         window_text: sys_color(COLOR_WINDOWTEXT),
         highlight: sys_color(COLOR_HIGHLIGHT),
@@ -586,8 +593,12 @@ fn resolve_forced_chrome(high_contrast: bool) -> Option<crate::chrome_band::Forc
     })
 }
 
+fn force_hc_chrome_value(seam: Option<&std::ffi::OsStr>) -> bool {
+    seam.is_some_and(|v| v != "0" && !v.is_empty())
+}
+
 fn force_hc_chrome_env() -> bool {
-    aterm_types::dev_seam!("ATERM_FORCE_HC_CHROME").is_some_and(|v| v != "0" && !v.is_empty())
+    force_hc_chrome_value(aterm_types::dev_seam!("ATERM_FORCE_HC_CHROME").as_deref())
 }
 
 /// Re-reads Windows High Contrast state and updates the forced chrome palette, returning whether it changed.
@@ -1395,7 +1406,7 @@ mod tests {
         caption_color_label, caption_tint, chrome_policy_code, chrome_policy_from_code,
         chrome_reassert_needed, claim_os_settings_wake, colorref_swap, effective_backdrop,
         high_contrast_active, is_os_settings_message, os_text_scale, resolve_chrome_theme,
-        resolve_forced_chrome, transparency_effects_enabled, validate_window_capture_transfer,
+        resolve_forced_chrome_with, transparency_effects_enabled, validate_window_capture_transfer,
         watch_os_settings_message, wheel_notch_from_raw, work_area_pts_from_rect,
     };
     use crate::app_config::{BackgroundMaterial, WindowTheme};
@@ -1687,16 +1698,21 @@ mod tests {
         crate::native_appearance::install_preferences(previous);
     }
 
+    /// NEGATIVE CONTROL: with both `high_contrast` and `force_override` false (including `None`, `""`, and `"0"` seam values), no palette is forced.
     #[test]
     fn the_chrome_palette_is_forced_only_under_high_contrast() {
-        // The diagnostic override would make the negative arm a lie.
-        if super::force_hc_chrome_env() {
-            aterm_spec::host::could_not_run(
-                "the high-contrast chrome override is set here, so the negative arm cannot hold",
-            );
-        }
-        assert_eq!(resolve_forced_chrome(false), None);
-        assert!(resolve_forced_chrome(true).is_some());
+        use std::ffi::OsStr;
+
+        assert!(!super::force_hc_chrome_value(None));
+        assert!(!super::force_hc_chrome_value(Some(OsStr::new(""))));
+        assert!(!super::force_hc_chrome_value(Some(OsStr::new("0"))));
+        assert!(super::force_hc_chrome_value(Some(OsStr::new("1"))));
+        assert!(super::force_hc_chrome_value(Some(OsStr::new("true"))));
+
+        assert_eq!(resolve_forced_chrome_with(false, false), None);
+        assert!(resolve_forced_chrome_with(true, false).is_some());
+        assert!(resolve_forced_chrome_with(false, true).is_some());
+        assert!(resolve_forced_chrome_with(true, true).is_some());
     }
 
     #[test]

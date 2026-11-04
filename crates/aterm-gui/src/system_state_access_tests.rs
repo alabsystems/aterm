@@ -813,8 +813,8 @@ fn the_local_network_step_runs_first_and_once_per_approved_revision() {
     assert_eq!(app.access_revision(), Some(3));
     assert_eq!(
         app.system_state_access_step(),
-        Some(Access::LocalNetwork),
-        "about to start"
+        None,
+        "a step that has not asked macOS is not a request for a person"
     );
     assert!(!app.access_step_moment(now), "Local Network goes first");
     app.tick_local_network_step(now);
@@ -854,6 +854,148 @@ fn the_local_network_step_runs_first_and_once_per_approved_revision() {
     approve(&mut app, 4);
     app.tick_local_network_step(later);
     assert_eq!(triggers(), fired + 2, "a new revision asks again");
+}
+
+#[test]
+fn a_recorded_lan_ask_rechecks_and_recovers_without_system_state_or_focus() {
+    use super::{LOCAL_NETWORK_RETRY, LocalNetworkProbe};
+    use std::cell::Cell;
+    thread_local! {
+        static PRIOR: Cell<Option<AccessOutcome>> = const { Cell::new(None) };
+        static CURRENT: Cell<Option<AccessOutcome>> = const { Cell::new(None) };
+        static STARTS: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+        static OUTCOME: Cell<Option<(u64, LocalNetworkProbe)>> = const { Cell::new(None) };
+    }
+    for (current, prior) in [
+        (None, Some(AccessOutcome::Triggered)),
+        (None, Some(AccessOutcome::Granted)),
+        (Some(AccessOutcome::Triggered), None),
+        (Some(AccessOutcome::Granted), None),
+        (None, None),
+    ] {
+        PRIOR.with(|slot| slot.set(prior));
+        CURRENT.with(|slot| slot.set(current));
+        STARTS.with(|slot| slot.borrow_mut().clear());
+        OUTCOME.with(|slot| slot.set(None));
+        let mut app = App::headless_for_test();
+        app.access_steps.set_reach(StepsReach {
+            local_network_recorded_before: || PRIOR.with(Cell::get),
+            recorded: |_, access| {
+                (access == Access::LocalNetwork)
+                    .then(|| CURRENT.with(Cell::get))
+                    .flatten()
+            },
+            start_local_network_probe: |revision| {
+                STARTS.with(|slot| slot.borrow_mut().push(revision))
+            },
+            take_local_network_probe: || OUTCOME.with(Cell::take),
+            frontmost: |_| false,
+            quiet: |_, _| false,
+            ..stepping()
+        });
+        focus(&mut app, false);
+        approve(&mut app, 91);
+        let before = triggers();
+        let now = Instant::now();
+        if prior.is_none() && current.is_none() {
+            app.tick_local_network_step(now);
+            assert!(STARTS.with(|slot| slot.borrow().is_empty()));
+            // A grant arriving after a cached negative record read must wake progress too.
+            app.publish_system_state(SetupStatus {
+                observed: vec![observed(
+                    Subject::Access(Access::LocalNetwork),
+                    Standing::InPlace,
+                    None,
+                )],
+                ..SetupStatus::default()
+            });
+        }
+        app.tick_local_network_step(now);
+        app.tick_local_network_step(now);
+        assert_eq!(STARTS.with(|slot| slot.borrow().clone()), [91]);
+        assert_eq!(triggers(), before, "no new OS question");
+        assert!(!app.local_network_pending());
+        assert_eq!(app.system_state_access_step(), None);
+        assert!(app.access_steps.local_network_alert.is_none());
+
+        // No peer answered the first bounded check. Its retry must wake without focus.
+        OUTCOME.with(|slot| slot.set(Some((91, LocalNetworkProbe::Unanswered))));
+        app.on_local_network_probe_ready(now);
+        assert_eq!(
+            app.next_access_step_deadline(now),
+            Some(now + LOCAL_NETWORK_RETRY)
+        );
+        app.tick_local_network_step(now + LOCAL_NETWORK_RETRY);
+        assert_eq!(STARTS.with(|slot| slot.borrow().clone()), [91, 91]);
+        assert_eq!(triggers(), before);
+        OUTCOME.with(|slot| slot.set(Some((91, LocalNetworkProbe::Granted))));
+        app.on_local_network_probe_ready(now + LOCAL_NETWORK_RETRY);
+        assert_eq!(
+            records().last(),
+            Some(&(91, Access::LocalNetwork, AccessOutcome::Granted))
+        );
+        assert!(app.access_steps.local_network_recheck.is_none());
+        assert_eq!(app.system_state_access_step(), None);
+    }
+}
+
+#[test]
+fn an_unfocused_unasked_lan_step_does_not_raise_or_claim_a_permission_question() {
+    let mut app = App::headless_for_test();
+    app.access_steps.set_reach(StepsReach {
+        start_local_network_probe: |_| panic!("no prior ask authorizes a probe"),
+        frontmost: |_| false,
+        quiet: |_, _| false,
+        ..stepping()
+    });
+    focus(&mut app, false);
+    approve(&mut app, 92);
+    let before = triggers();
+    app.tick_local_network_step(Instant::now());
+    assert_eq!(triggers(), before);
+    assert!(app.local_network_pending());
+    assert_eq!(app.system_state_access_step(), None);
+}
+
+#[test]
+fn a_background_lan_recheck_respects_privacy_holds_and_a_refused_answer() {
+    use super::LocalNetworkProbe;
+    use std::cell::Cell;
+    thread_local! {
+        static STARTS: Cell<usize> = const { Cell::new(0) };
+        static OUTCOME: Cell<Option<(u64, LocalNetworkProbe)>> = const { Cell::new(None) };
+    }
+    for off in SWITCHES {
+        STARTS.with(|slot| slot.set(0));
+        OUTCOME.with(|slot| slot.set(None));
+        let mut app = App::headless_for_test();
+        app.access_steps.set_reach(StepsReach {
+            local_network_recorded_before: || Some(AccessOutcome::Triggered),
+            start_local_network_probe: |_| STARTS.with(|slot| slot.set(slot.get() + 1)),
+            take_local_network_probe: || OUTCOME.with(Cell::take),
+            frontmost: |_| false,
+            quiet: |_, _| false,
+            ..stepping()
+        });
+        app.config.privacy = Some(switches(Some(off)));
+        approve(&mut app, 93);
+        let now = Instant::now();
+        let before = records().len();
+        app.tick_local_network_step(now);
+        assert_eq!(STARTS.with(Cell::get), 0, "{off} holds the check");
+        assert_eq!(records().len(), before);
+        assert_eq!(app.next_access_step_deadline(now), None);
+        app.config.privacy = Some(switches(None));
+        let resumed = Instant::now() + Duration::from_secs(1);
+        app.tick_local_network_step(resumed);
+        assert_eq!(STARTS.with(Cell::get), 1, "resumes without focus");
+        OUTCOME.with(|slot| slot.set(Some((93, LocalNetworkProbe::Refused))));
+        app.on_local_network_probe_ready(resumed);
+        assert_eq!(records().len(), before, "a refusal never records Granted");
+        assert_eq!(app.next_access_step_deadline(resumed), None);
+        app.tick_local_network_step(resumed + Duration::from_secs(300));
+        assert_eq!(STARTS.with(Cell::get), 1, "no retry against a refusal");
+    }
 }
 
 /// Once macOS's step started, a failed record write is still owed after the disk recovers:

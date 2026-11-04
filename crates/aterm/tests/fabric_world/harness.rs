@@ -170,136 +170,23 @@ pub fn connect(sock: &str, token: &str) -> std::io::Result<Ctl> {
     connect_within(sock, token, VERB_DEADLINE)
 }
 
-fn max_concurrent_boots() -> usize {
-    std::thread::available_parallelism().map_or(2, |n| (n.get() / 3).clamp(2, 4))
-}
-
-fn boot_gate() -> &'static (std::sync::Mutex<usize>, std::sync::Condvar) {
-    static GATE: std::sync::OnceLock<(std::sync::Mutex<usize>, std::sync::Condvar)> =
-        std::sync::OnceLock::new();
-    GATE.get_or_init(|| (std::sync::Mutex::new(0), std::sync::Condvar::new()))
-}
-
 #[must_use]
-pub struct BootPermit;
-
-impl Drop for BootPermit {
-    fn drop(&mut self) {
-        let (lock, cv) = boot_gate();
-        let mut n = lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *n = n.saturating_sub(1);
-        cv.notify_one();
-    }
-}
-
-fn max_live_stack_tests() -> usize {
-    std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 11))
-}
-
-#[derive(Default)]
-struct LiveGate {
-    held: usize,
-    waiting: std::collections::BTreeSet<(String, u64)>,
-    arrivals: u64,
-}
-
-fn live_gate() -> &'static (std::sync::Mutex<LiveGate>, std::sync::Condvar) {
-    static GATE: std::sync::OnceLock<(std::sync::Mutex<LiveGate>, std::sync::Condvar)> =
-        std::sync::OnceLock::new();
-    GATE.get_or_init(Default::default)
-}
-
-struct LiveSlot;
-
-impl Drop for LiveSlot {
-    fn drop(&mut self) {
-        let (lock, cv) = live_gate();
-        let mut gate = lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        gate.held = gate.held.saturating_sub(1);
-        cv.notify_all();
-    }
-}
+pub struct BootPermit(aterm_spec::subprocess_lane::BootPermit);
 
 thread_local! {
-    static LIVE_SLOT: std::cell::RefCell<Option<LiveSlot>> =
-        const { std::cell::RefCell::new(None) };
+    static LIVE_SLOT: std::cell::RefCell<
+        Option<std::sync::Arc<aterm_spec::subprocess_lane::SubprocessLease>>,
+    > = const { std::cell::RefCell::new(None) };
 }
 
-struct Queued(Option<(String, u64)>);
-
-impl Drop for Queued {
-    fn drop(&mut self) {
-        if let Some(me) = self.0.take() {
-            let (lock, cv) = live_gate();
-            let mut gate = lock
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            gate.waiting.remove(&me);
-            cv.notify_all();
-        }
-    }
-}
-
-fn queue_for_live_slot() -> Option<Queued> {
-    if LIVE_SLOT.with(|s| s.borrow().is_some()) {
-        return None;
-    }
-    let (lock, _) = live_gate();
-    let mut gate = lock
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    gate.arrivals += 1;
-    let me = (
-        std::thread::current()
-            .name()
-            .unwrap_or_default()
-            .to_string(),
-        gate.arrivals,
-    );
-    gate.waiting.insert(me.clone());
-    Some(Queued(Some(me)))
-}
-
-fn take_live_slot(mut queued: Queued) {
-    let me = queued.0.take().expect("a queued test holds its place");
-    let (lock, cv) = live_gate();
-    let cap = max_live_stack_tests();
-    let mut gate = lock
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    while gate.held >= cap || gate.waiting.first() != Some(&me) {
-        gate = cv
-            .wait(gate)
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-    }
-    gate.waiting.remove(&me);
-    gate.held += 1;
-    drop(gate);
-    cv.notify_all();
-    LIVE_SLOT.with(|s| *s.borrow_mut() = Some(LiveSlot));
-}
-
-/// Take a boot permit, waiting for one if [`max_concurrent_boots`] are already out.
+/// Take a shared cross-process live-stack lease for this test thread and a short-lived boot permit.
 pub fn boot_permit() -> BootPermit {
-    if let Some(queued) = queue_for_live_slot() {
-        take_live_slot(queued);
-    }
-    let (lock, cv) = boot_gate();
-    let cap = max_concurrent_boots();
-    let mut n = lock
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    while *n >= cap {
-        n = cv
-            .wait(n)
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-    }
-    *n += 1;
-    BootPermit
+    LIVE_SLOT.with(|slot| {
+        if slot.borrow().is_none() {
+            *slot.borrow_mut() = Some(aterm_spec::subprocess_lane::acquire());
+        }
+    });
+    BootPermit(aterm_spec::subprocess_lane::acquire_boot_permit())
 }
 
 struct Reaped(Child);
@@ -465,11 +352,6 @@ pub fn write_cap(path: &std::path::Path, ring: impl AsRef<[u8]>) {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::write(path, ring).expect("write a cap file");
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("chmod a cap");
-}
-
-/// Returns the capability grant ring for `node` ([`aterm_link::enable::node_grants`]).
-pub fn node_grants(node: &str) -> Vec<String> {
-    aterm_link::enable::node_grants(FLEET, node)
 }
 
 /// Strips every inherited `ATERM_*` environment variable but the verify run's mark
@@ -681,7 +563,8 @@ pub fn prepare_fixture_config(tmp: &Path) {
     }
 }
 
-/// What makes a node's grant ring from its node id ([`node_grants`] when a boot names none).
+/// What makes a node's grant ring from its node id (its ceiling's rules,
+/// `astream_cap::GrantCeiling::aterm_node_ring`, when a boot names none).
 pub type GrantsFor<'a> = &'a dyn Fn(&str) -> Vec<String>;
 
 struct Scratch {
@@ -1205,7 +1088,14 @@ impl World {
         };
 
         let cap_path = tmp.join("node.cap");
-        let grants = grants.map_or_else(|| node_grants(&node), |f| f(&node));
+        let grants = grants.map_or_else(
+            || {
+                astream_cap::GrantCeiling::aterm_node_ring(FLEET, &node)
+                    .expect("a node ring")
+                    .rules()
+            },
+            |f| f(&node),
+        );
         let caps: String = grants.iter().map(|g| cap_line(g)).collect();
         write_cap(&cap_path, caps);
 
@@ -2002,6 +1892,11 @@ impl Successor {
         connect(&self.sock, &self.token).expect("connect to the successor aterm")
     }
 
+    /// Its aterm's pid, while it runs.
+    pub fn pid(&self) -> u32 {
+        self.child.as_ref().expect("a running successor").id()
+    }
+
     /// Every session it hosts, as `(local, sid, nonce)`.
     pub fn sessions(&self) -> Vec<(u64, String, String)> {
         let reply = self
@@ -2285,7 +2180,12 @@ impl Node {
         assert_sock_fits(&ctl_sock);
 
         let cap_file = tmp.join("node.cap");
-        let caps: String = node_grants(&node).iter().map(|g| cap_line(g)).collect();
+        let caps: String = astream_cap::GrantCeiling::aterm_node_ring(FLEET, &node)
+            .expect("a node ring")
+            .rules()
+            .iter()
+            .map(|g| cap_line(g))
+            .collect();
         write_cap(&cap_file, caps);
 
         let mut fabric_cmd = format!(

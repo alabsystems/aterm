@@ -405,7 +405,7 @@ fn waits_rows(d: &Tally, n: usize) -> Vec<String> {
     ]
 }
 
-const TAIL_1MS: usize = 11;
+pub(super) const TAIL_1MS: usize = 11;
 const TAIL_8MS: usize = 14;
 
 pub(super) fn describe(row: TallyRow) -> &'static str {
@@ -417,6 +417,12 @@ pub(super) fn describe(row: TallyRow) -> &'static str {
         TallyRow::LaneSessions => "verb lane: a drain's roster read (`sessions bridge`)",
         TallyRow::LaneSent => "verb lane: a post's retirement (`outbox sent`)",
         TallyRow::LaneDeliver => "verb lane: deliveries (`deliver`)",
+        TallyRow::LaneStatus => "verb lane: a session's status read (`@<sid> status`)",
+        TallyRow::LaneMeta => "verb lane: a session's metadata read (`@<sid> meta`)",
+        TallyRow::LaneText => "verb lane: a session's screen read (`@<sid> text`)",
+        TallyRow::LaneSessionsStatus => {
+            "verb lane: every session's status read at once (`sessions status`)"
+        }
         TallyRow::LaneOther => "verb lane: every other verb",
         TallyRow::DirReplace => "state dir: replaces (temp + rename)",
         TallyRow::DirUnlink => "state dir: unlinks",
@@ -438,7 +444,7 @@ pub(super) fn describe(row: TallyRow) -> &'static str {
     }
 }
 
-fn largest(h: &Hist) -> String {
+pub(super) fn largest(h: &Hist) -> String {
     if h.max > 0 {
         return format!("{:.3}", ns_ms(h.max));
     }
@@ -458,9 +464,11 @@ fn tally_rows(d: &Tally, n: usize) -> Vec<String> {
         }
     };
     let mut rows = vec![
-        "| the loop's step (wait tally v=2) | partitions | count | per round trip | ms | ms per \
-         round trip | ≥ 1.05 ms | ≥ 8.39 ms | largest (ms) |"
-            .to_string(),
+        format!(
+            "| the loop's step (`{}`) | partitions | count | per round trip | ms | ms per round \
+             trip | ≥ 1.05 ms | ≥ 8.39 ms | largest (ms) |",
+            wait_tally::FORMAT
+        ),
         "|---|---|---:|---:|---:|---:|---:|---:|---:|".to_string(),
     ];
     for row in TallyRow::ALL {
@@ -561,7 +569,7 @@ fn tally_json(d: &Tally, n: usize, rt: Option<f64>) -> Value {
         })
         .collect();
     json!({
-        "format": "wait-tally v=2",
+        "format": wait_tally::FORMAT,
         "bands": "log2: band 0 under 1024 ns, band i from 1 [2^(i+9), 2^(i+10)) ns, the last from 2^26 ns; a count's band 0 is 0, band i [2^(i-1), 2^i)",
         "dir_counted": d.dir,
         "bridge_wall_ms": stats::round3(ns_ms(d.at_ns)),
@@ -692,7 +700,7 @@ impl ParkSplit {
 }
 
 /// What a row of aterm's handler tally ([`HandlerRow`]) times.
-const fn describe_handler(row: HandlerRow) -> &'static str {
+pub(super) const fn describe_handler(row: HandlerRow) -> &'static str {
     match row {
         HandlerRow::Deliver => "`deliver`",
         HandlerRow::WakeWatchers => {
@@ -715,7 +723,7 @@ const fn describe_handler(row: HandlerRow) -> &'static str {
 /// The bound of the log2 band that holds the nearest-rank `q` quantile of `h`'s values, in µs:
 /// the value is below it and, past the first band, at least half of it. The first band holds
 /// everything under its bound, zero included; the last band has no bound, only a floor.
-fn band_quantile(h: &Hist, q: f64) -> String {
+pub(super) fn band_quantile(h: &Hist, q: f64) -> String {
     let rank = ((q * h.count as f64).ceil() as u64).max(1);
     let mut seen = 0u64;
     for (i, &n) in h.buckets.iter().enumerate() {
@@ -754,6 +762,9 @@ impl RequestSplit {
     }
 
     fn share(&self) -> Option<f64> {
+        if self.handled == 0 {
+            return None;
+        }
         share(self.handler_ns as f64, self.outside_ns as f64)
     }
 }
@@ -782,6 +793,22 @@ fn request_splits(waits: &Tally, handlers: &HandlerTally, rounds: &[Round]) -> V
             HandlerRow::OtherBridge,
         ),
     ];
+    // The presence reads are no bridge-only verbs, so aterm's handler tally times none of them.
+    splits.extend(
+        [
+            ("`@<sid> status`", TallyRow::LaneStatus),
+            ("`@<sid> meta`", TallyRow::LaneMeta),
+            ("`@<sid> text`", TallyRow::LaneText),
+            ("`sessions status`", TallyRow::LaneSessionsStatus),
+        ]
+        .map(|(what, row)| RequestSplit {
+            what,
+            calls: waits.row(row).count,
+            outside_ns: waits.row(row).total,
+            handled: 0,
+            handler_ns: 0,
+        }),
+    );
     let lane_total = splits.iter().fold(
         RequestSplit {
             what: "**the verb lane, all**",
@@ -1017,7 +1044,7 @@ fn paced_report(raw: &Raw) -> (Value, Vec<String>) {
         "ping_post_to_visible_ms": stats::to_json(&ping_leg),
         "pong_post_to_visible_ms": stats::to_json(&pong_leg),
         "turnaround_ms": stats::to_json(&turnaround),
-        "wait_tally_v2": tally_json(&d, n, rt_mean),
+        "wait_tally": tally_json(&d, n, rt_mean),
         "park_split": park_json,
         "handlers": handlers_json,
     });
@@ -1229,7 +1256,7 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
                 "acks": per_rt(waits.row(TallyRow::Ack).count as f64),
             },
         },
-        "wait_tally_v2": tally_json(&waits, n, rt_mean),
+        "wait_tally": tally_json(&waits, n, rt_mean),
         "park_split": park_json,
         "handlers": handlers_json,
         "bystanders": spec.bystanders,
@@ -1305,7 +1332,7 @@ pub(super) fn measure(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             fmt_x(stats::summarize(&round_trip).map(|s| s.mean)),
         ),
         format!(
-            "Where the loop's time went, the wait tally's v=2 rows over the same window \
+            "Where the loop's time went, the wait tally's rows over the same window \
              (`aterm_link::wait_tally`; the bridge's own clock: {} ms, {} ms per round trip, \
              {} ms a round trip of it outside every round trip — the bench's own work between \
              rounds, A's listing after each pong, and the window's edges — whose time the rows \

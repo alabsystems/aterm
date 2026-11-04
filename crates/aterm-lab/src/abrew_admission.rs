@@ -79,7 +79,7 @@ fn index(args: &Args, file: &str, casks: bool) -> Result<Vec<u8>, Fail> {
     match &args.indexes {
         Some(dir) => {
             let path = std::path::Path::new(dir).join(file);
-            std::fs::read(&path)
+            crate::util::read_regular_file(&path)
                 .map_err(|e| Fail::die(format!("abrew-admission: {}: {e}", path.display())))
         }
         None => api::fetch_index(casks).map_err(|e| Fail::die(format!("abrew-admission: {e}"))),

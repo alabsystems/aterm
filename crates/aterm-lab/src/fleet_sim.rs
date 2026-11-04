@@ -252,7 +252,7 @@ impl Sim {
         let state = world.insts[0].state();
         let secret = aterm_net::fleet::read_key_file(&state)
             .map_err(|e| Fail::die(format!("machine 0's fleet key: {e}")))?;
-        let secret_raw = std::fs::read_to_string(state.join(aterm_net::fleet::KEY_FILE))
+        let secret_raw = crate::util::read_regular_text(&state.join(aterm_net::fleet::KEY_FILE))
             .ok()
             .and_then(|t| aterm_codec::hex::decode_vec(t.trim().as_bytes()))
             .ok_or_else(|| Fail::die("machine 0's fleet key is not hex"))?;
@@ -808,7 +808,7 @@ impl Sim {
             secrets.push(inst.home().to_string_lossy().into_owned());
         }
         let config = inst.config();
-        let text = std::fs::read_to_string(&config)
+        let text = crate::util::read_regular_text(&config)
             .map_err(|e| Fail::die(format!("m{i:02} config: {e}")))?;
         let flipped = text.replace("allow = \"content\"", "allow = \"facts\"");
         if flipped == text {
@@ -861,7 +861,7 @@ impl Sim {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
         let machine = Machine::read();
-        let before = std::fs::read_to_string(&path).unwrap_or_default();
+        let before = crate::util::read_regular_text(&path).unwrap_or_default();
         let earlier = Kept {
             rows: between(&before, INVOCATIONS)
                 .into_iter()
@@ -1361,7 +1361,8 @@ fn reader_of(inst: &Inst) -> Result<Reader, Fail> {
                 dir.display()
             ))
         })?;
-    let bytes = std::fs::read(&file).map_err(|e| Fail::die(format!("{}: {e}", file.display())))?;
+    let bytes = crate::util::read_regular_file(&file)
+        .map_err(|e| Fail::die(format!("{}: {e}", file.display())))?;
     let env: Vec<(OsString, OsString)> = bytes
         .split(|&b| b == 0)
         .filter_map(|kv| {
@@ -1410,7 +1411,7 @@ fn form_fleet(world: &World) -> Result<Joins, Fail> {
         )));
     }
     world.await_listening(issuer).map_err(Fail::die)?;
-    let code = std::fs::read_to_string(issuer.state().join("fleet-join-code"))
+    let code = crate::util::read_regular_text(&issuer.state().join("fleet-join-code"))
         .map_err(|e| Fail::die(format!("the join code: {e}")))?;
     println!(
         "  fleet init on m00 (issuer); joining {} members (loopback: each registration taken \

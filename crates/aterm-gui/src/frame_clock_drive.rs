@@ -539,6 +539,10 @@ mod macos {
                   the stage before it left"
     )]
     pub(super) fn run(_windowed: crate::platform::Windowed) -> i32 {
+        if let Some(why) = crate::driver_display_unavailable() {
+            crate::logging::stderr_line!("objc-frame-clock-drive: NOT RUN — {why}");
+            return NOT_RUN;
+        }
         std::thread::spawn(|| {
             std::thread::sleep(WATCHDOG);
             crate::logging::stderr_line!(

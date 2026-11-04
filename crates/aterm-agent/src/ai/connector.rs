@@ -64,7 +64,8 @@ pub enum Login {
         remote: Option<&'static [&'static str]>,
         /// What the person is told before it starts.
         tell: &'static str,
-        /// Whether the flow revokes the current login before starting.
+        /// Whether the flow revokes the current login before starting: the person is told so
+        /// ([`SIGNS_OUT_FIRST`]) where a login of it is stored to revoke.
         signs_out_first: bool,
         /// The status read run after the flow, on the login it just made.
         after: Option<Status>,
@@ -1067,6 +1068,11 @@ pub const CLAUDE: Connector = Connector {
     accounts: Some(&CLAUDE_ACCOUNTS),
 };
 
+/// What a person is told past a [`Login::Run`]'s `tell` where its flow signs out first
+/// (`signs_out_first`, Codex's) and a login of it is stored to revoke.
+pub const SIGNS_OUT_FIRST: &str = "It signs out (revokes) Codex's current login before it starts: \
+                                   if you cancel, Codex stays signed out.";
+
 /// Codex CLI (OpenAI).
 pub const CODEX: Connector = Connector {
     id: "codex",
@@ -1080,8 +1086,7 @@ pub const CODEX: Connector = Connector {
     login: Login::Run {
         args: &["login"],
         remote: None,
-        tell: "Codex's own sign-in opens in your browser. It signs out (revokes) Codex's \
-               current login before it starts: if you cancel, Codex stays signed out.",
+        tell: "Codex's own sign-in opens in your browser.",
         signs_out_first: true,
         after: Some(Status {
             args: &["login", "status"],

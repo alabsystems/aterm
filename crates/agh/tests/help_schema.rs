@@ -329,19 +329,12 @@ fn version_prints_both_versions() {
 #[test]
 fn every_write_verb_has_its_page() {
     let rows: Vec<_> = VERBS.iter().filter(|verb| verb.milestone == 2).collect();
-    assert_eq!(rows.len(), 17);
     for verb in rows {
         let mut line = vec!["help"];
         line.extend(verb.path.iter().copied());
         let (exit, captured) = run(&line);
         assert_eq!(exit, 0, "{verb:?}: {}", captured.stderr_text());
-        let page = captured.stdout_text();
-        for flag in verb.flags {
-            assert!(page.contains(flag.name), "{verb:?}: {}", flag.name);
-        }
-        if verb.class == Class::Destructive {
-            assert!(page.contains("--confirm"), "{verb:?}: {page}");
-        }
+        assert_eq!(captured.stdout_text(), verb_page(verb), "{verb:?}");
     }
     // A Destructive verb's page, and only one, adds the line body 11 names.
     for verb in VERBS {

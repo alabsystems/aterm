@@ -93,6 +93,19 @@ pub(super) fn post_records(
     .collect()
 }
 
+/// Post each immutable record selection under the one fan-out deadline.
+pub(super) fn post_record_selections(
+    posts: &[(&str, &[crate::membership_log::Record])],
+    by: Instant,
+) -> Vec<crate::Result<crate::Result<()>>> {
+    each_at_once("vault-records", posts, |(url, records)| {
+        transport::post_record_selection_answered_until(url, records, Some(by))
+    })
+    .into_iter()
+    .map(|answered| answered.unwrap_or_else(|| Err(Error::new("a records post panicked"))))
+    .collect()
+}
+
 /// [`post_records`] of the same `records` to every one of `urls`, by `by`: each server's answer
 /// as [`transport::post_records`] gives it, in `urls`' order.
 pub(super) fn post_records_to(
@@ -152,10 +165,11 @@ const RECORDS_PEEK: usize = 256 << 10;
 /// at most `limit` bytes ([`Pulled::Larger`] past it). Every server's answer is read first under
 /// `reads.peek`, all at once. One longer than that is asked again and read whole, up to
 /// `reads.whole`, under one of `reads.at_once` slots, held until `judge` has made what it makes of
-/// it, as a server's pull from its peers reads them. Nothing verifies a body before `judge` does,
-/// and up to [`crate::discover::MAX_CANDIDATES`] of the servers are a browse's, which any host on
-/// the LAN can advertise: read whole at once, 16 instances of one host, each answering with a
-/// 16 MiB envelope, had a fan-out hold 256 MiB of them before any was refused.
+/// it, as a server's pull from its peers reads them. Records can be verified incrementally by
+/// `read`; their Store judgment still runs before the slot is released. Up to
+/// [`crate::discover::MAX_CANDIDATES`] servers are a browse's, which any host on the LAN can
+/// advertise: read whole at once, 16 instances of one host, each answering with a 16 MiB envelope,
+/// had a fan-out hold 256 MiB of them before any was refused.
 ///
 /// A compiled-in default address ([`crate::ALAB_DEFAULT_URLS`]), the first time `urls` names it,
 /// reads its longer answer whole without a slot. A browse cannot add one, so the whole reads at

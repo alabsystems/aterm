@@ -912,6 +912,8 @@ fn stats_under_reads_every_sessions_files_and_creates_nothing() {
     assert_eq!(listing(&root), before);
 }
 
+/// NEGATIVE CONTROL: a missing or symlinked `drive` or `upgrade` directory reads empty and
+/// never follows a symlink outside the owned state root.
 #[test]
 fn a_missing_state_dir_is_empty_and_stays_missing() {
     let root = ScratchDir::new("stats", "missing");
@@ -925,6 +927,31 @@ fn a_missing_state_dir_is_empty_and_stays_missing() {
     std::fs::create_dir_all(state.join("drive")).expect("drive");
     assert!(stats_under(&state, &harness, 0).is_empty());
     assert!(!harness.exists());
+    #[cfg(unix)]
+    {
+        let planted = root.join("planted");
+        std::fs::create_dir_all(&planted).expect("planted");
+        std::fs::write(
+            planted.join("s-1.jsonl"),
+            format!("{}\n", typed(1_000, RULE_CONTINUE, "keep going")),
+        )
+        .expect("planted drive row");
+        std::fs::write(
+            planted.join("ledger.jsonl"),
+            "{\"t\":1,\"pid\":42,\"tab\":\"s-1\",\"session\":\"c-1\",\"from\":\"1\",\"to\":\"2\",\"step\":\"relaunched\",\"detail\":\"-\"}\n",
+        )
+        .expect("planted upgrade row");
+        let linked_state = root.join("linked-state");
+        let linked_harness = root.join("linked-harness");
+        std::fs::create_dir_all(&linked_state).expect("linked_state");
+        std::fs::create_dir_all(&linked_harness).expect("linked_harness");
+        std::os::unix::fs::symlink(&planted, linked_state.join("drive")).expect("symlink drive");
+        std::os::unix::fs::symlink(&planted, linked_harness.join("upgrade"))
+            .expect("symlink upgrade");
+        let refused = stats_under(&linked_state, &linked_harness, 0);
+        assert!(refused.is_empty(), "{refused:#?}");
+        assert_eq!(refused.rows, 0);
+    }
 }
 
 #[test]

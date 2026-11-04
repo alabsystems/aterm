@@ -59,7 +59,7 @@ pub fn is_serve(args: &[OsString]) -> bool {
 /// update bridge and retires the job that ran it (on macOS), and exits 0, as an old mug's
 /// refusals did, so launchd's KeepAlive does not start it again; anything else names the new
 /// verb and exits 2.
-#[must_use]
+#[must_use = "handle or propagate the command's exit status"]
 pub fn main_entry(args: &[OsString]) -> ExitCode {
     if !is_serve(args) {
         eprintln!("{RENAMED}");

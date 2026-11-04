@@ -579,9 +579,16 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
         }
         return set_mode(to, &meta);
     }
-    let bytes =
-        crate::durable::read_file(from).map_err(|e| format!("read {}: {e}", from.display()))?;
-    std::fs::write(to, bytes).map_err(|e| format!("write {}: {e}", to.display()))?;
+    // Streamed, not read whole: a dSYM's DWARF runs to gigabytes, past any whole-file read bound.
+    let mut source = crate::durable::open_regular_file(from)
+        .map_err(|e| format!("open {}: {e}", from.display()))?;
+    let mut sink = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(to)
+        .map_err(|e| format!("create {}: {e}", to.display()))?;
+    std::io::copy(&mut source, &mut sink)
+        .map_err(|e| format!("copy {} to {}: {e}", from.display(), to.display()))?;
     set_mode(to, &meta)
 }
 

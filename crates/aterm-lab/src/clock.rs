@@ -225,7 +225,7 @@ pub(crate) fn parse_offset(text: &str) -> Option<i64> {
 /// The file is missing, or holds no offset the lab writes.
 pub(crate) fn read_offset(run: &Run) -> Result<i64, String> {
     let f = Layout::of(run).offset;
-    let text = fs::read_to_string(&f).map_err(|e| format!("{}: {e}", f.display()))?;
+    let text = crate::util::read_regular_text(&f).map_err(|e| format!("{}: {e}", f.display()))?;
     parse_offset(&text).ok_or_else(|| format!("{} holds no offset: {text:?}", f.display()))
 }
 

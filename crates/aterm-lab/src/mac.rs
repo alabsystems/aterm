@@ -912,7 +912,7 @@ impl Build {
             built.as_secs_f64(),
             waited.elapsed().as_secs_f64()
         );
-        let lines = std::fs::read_to_string(&self.json)
+        let lines = crate::util::read_regular_text(&self.json)
             .map_err(|e| format!("{}: {e}", self.json.display()))?;
         Ok(bench_executables(&lines))
     }

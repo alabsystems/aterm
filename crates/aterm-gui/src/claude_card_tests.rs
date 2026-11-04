@@ -536,9 +536,13 @@ fn the_wrapped_card_wears_its_border_kitty_stars_and_line() {
         .map(|c| c.ch)
         .collect();
     assert_eq!(word, HERO_WORD, "the hero word's cells");
-    for col in start..start + want.chars().count() {
+    for (offset, cell) in scratch.cells[line_row][start..start + want.chars().count()]
+        .iter()
+        .enumerate()
+    {
+        let col = start + offset;
         assert_eq!(
-            scratch.cells[line_row][col].bold,
+            cell.bold,
             hero.contains(&col),
             "col {col}: bold on the hero word alone"
         );

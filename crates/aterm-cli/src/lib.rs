@@ -191,6 +191,9 @@ pub enum Verb {
     Machines,
     /// `aterm init` — configure the current macOS login and optional GitHub bootstrap.
     Init,
+    /// `aterm status` — one read of this machine: membership, vault, fleet, tools, repositories
+    /// and agents, each with its next step and who takes it.
+    Status,
     /// `aterm secrets` — the credentials vault, its keyless server and `~/.secrets`
     /// (docs/DESIGN-secrets-2026-10-20.md).
     Secrets,
@@ -239,6 +242,7 @@ impl Verb {
         Verb::Ai,
         Verb::Machines,
         Verb::Init,
+        Verb::Status,
         Verb::Secrets,
         Verb::Members,
         Verb::Db,
@@ -273,6 +277,7 @@ impl Verb {
             Verb::Ai => "ai",
             Verb::Machines => "machines",
             Verb::Init => "init",
+            Verb::Status => "status",
             Verb::Secrets => "secrets",
             Verb::Members => "members",
             Verb::Db => "db",
@@ -311,6 +316,7 @@ impl Verb {
             | Verb::Ai
             | Verb::Machines
             | Verb::Init
+            | Verb::Status
             | Verb::Secrets
             | Verb::Members
             | Verb::Db
@@ -345,6 +351,7 @@ impl Verb {
             Verb::Init => {
                 "aterm init [--plan|--check] [--json] [--develop|--no-develop] [--only <items>]"
             }
+            Verb::Status => "aterm status [--json]",
             Verb::Secrets => "aterm secrets [<cmd>]",
             Verb::Members => "aterm members <cmd>",
             Verb::Db => "aterm db <cmd> --dir <database>",
@@ -448,6 +455,12 @@ impl Verb {
                 "vault and repositories only.",
                 "`--develop`: fast-forward recorded checkouts and",
                 "provision their test tools, no settings.",
+            ],
+            Verb::Status => &[
+                "This machine at a glance: membership, vault,",
+                "fleet, tools, repositories and agents, each with",
+                "its next step and who takes it (aterm, an agent",
+                "or a person). Reads only; Unix only.",
             ],
             Verb::Email => &[
                 "Read mail without a window (accounts | folders |",

@@ -357,17 +357,18 @@ impl TerminalHandler<'_> {
     fn set_column_mode_132(&mut self, enabled: bool) {
         let changed = self.modes.column_mode_132 != enabled;
         self.modes.column_mode_132 = enabled;
-        if changed && !self.modes.decncsm {
+        if changed {
             self.grid.reset_scroll_region();
             self.modes.left_right_margin_mode = false;
             self.grid.reset_horizontal_margins();
-            self.grid.set_cursor_template(
-                crate::grid::Cell::bce_blank(self.style.cached_colors()),
-                self.style.bce_bg_rgb(),
-            );
-            self.grid.erase_screen();
+            if !self.modes.decncsm {
+                self.grid.set_cursor_template(
+                    crate::grid::Cell::bce_blank(self.style.cached_colors()),
+                    self.style.bce_bg_rgb(),
+                );
+                self.grid.erase_screen();
+            }
             self.grid.clear_line_attributes();
-            self.grid.reset_tab_stops();
             self.grid.set_cursor(0, 0);
         }
     }

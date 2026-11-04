@@ -366,6 +366,7 @@ fn calls_of(ctx: &Ctx, s: &StageSpec, calls: Vec<crate::shape::Call>) -> Vec<Sta
 #[must_use]
 pub fn declared(scope: &Scope) -> Vec<StageSpec> {
     let label = scope.label();
+    let checker_label = crate::stages::spec_checkers_scope(scope).label();
     vec![
         spec(
             StageId::TestCompile,
@@ -415,15 +416,17 @@ pub fn declared(scope: &Scope) -> Vec<StageSpec> {
         },
         spec(
             StageId::CheckersCompile,
-            "checkers compile (the workspace's tests with aterm-spec/checkers, --no-run)",
+            format!("checkers compile ({checker_label} with aterm-spec/checkers, --no-run)"),
             Lane::CheckersTarget,
         ),
         StageSpec {
             after_stages: vec![StageId::Test, StageId::GpuOracle],
             ..spec(
                 StageId::SpecCheckers,
-                "checkers (the workspace's tests with aterm-spec/checkers: per-step ty \
-                 agreement; after the test run and the gpu oracle's)",
+                format!(
+                    "checkers ({checker_label} with aterm-spec/checkers: per-step ty \
+                 agreement; after the test run and the gpu oracle's)"
+                ),
                 Lane::CheckersTarget,
             )
         },

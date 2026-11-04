@@ -360,7 +360,8 @@ fn checks(run: &Run) -> Result<Before, Fail> {
             });
     }
     let pids = agent_pids(run);
-    let sockets = || fs::read_to_string(run.run.join("sockets.log")).unwrap_or_default();
+    let sockets =
+        || crate::util::read_regular_text(&run.run.join("sockets.log")).unwrap_or_default();
     for _ in 0..20 {
         if talked(&sockets(), &pids, &run.port) {
             break;
@@ -512,7 +513,7 @@ fn checks(run: &Run) -> Result<Before, Fail> {
     print!("{}", members_table(&members));
     let before = members.unwrap_or_default();
 
-    let egress = fs::read_to_string(run.run.join("egress.log")).unwrap_or_default();
+    let egress = crate::util::read_regular_text(&run.run.join("egress.log")).unwrap_or_default();
     let (requests, other_auth) = gemini_auths(&stub_log);
     let refused = proxy_refused(&stub_log);
     let refusals = refusals_verdict(&denied, control);

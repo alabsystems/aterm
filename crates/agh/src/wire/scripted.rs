@@ -124,9 +124,10 @@ impl Transport for ScriptedTransport {
         let body = match req.body {
             WireBody::Empty => Vec::new(),
             WireBody::Bytes(bytes) => bytes.to_vec(),
-            WireBody::Reader { reader, .. } => {
+            WireBody::Reader { len, reader } => {
+                use std::io::Read as _;
                 let mut bytes = Vec::new();
-                reader
+                std::io::Read::take(reader, len.saturating_add(1))
                     .read_to_end(&mut bytes)
                     .map_err(|e| local(&format!("scripted transport: the body: {e}")))?;
                 bytes

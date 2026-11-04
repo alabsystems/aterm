@@ -122,12 +122,31 @@ fn log(line: &str) {
     }
 }
 
+fn read_regular_text(path: &Path) -> Option<String> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(16 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() <= 16 * 1024 * 1024)
+        .then(|| String::from_utf8(bytes).ok())
+        .flatten()
+}
+
 /// The version this build's store record names: `<store>/<program>/<build>.vendor` beside
 /// `exe`'s `<build>/bin/<cmd>`, its `version = "…"` line.
 fn store_version(exe: &Path) -> Option<String> {
     let build = exe.parent()?.parent()?;
     let record = build.with_extension("vendor");
-    let text = std::fs::read_to_string(record).ok()?;
+    let text = read_regular_text(&record)?;
     text.lines().find_map(|l| {
         let v = l.trim().strip_prefix("version")?.trim_start();
         let v = v.strip_prefix('=')?.trim().trim_matches('"');
@@ -311,7 +330,7 @@ impl Session {
         if let Some(dir) = &dir
             && std::fs::create_dir_all(dir).is_ok()
         {
-            start = 1 + std::fs::read_to_string(dir.join("session.jsonl"))
+            start = 1 + read_regular_text(&dir.join("session.jsonl"))
                 .unwrap_or_default()
                 .matches("\"payload_type\":\"session.started\"")
                 .count();

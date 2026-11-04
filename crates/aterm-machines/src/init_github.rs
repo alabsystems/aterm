@@ -586,7 +586,7 @@ impl Item for Auth {
         let held = stored(sys, &self.user, &self.config.account)?;
         if held.is_none() {
             crate::port::no_core_dumps();
-            let token = read_token(sys, &self.user, &self.config)?;
+            let token = read_token(sys, &self.user, &self.config).map_err(String::from)?;
             let account = identity(sys, &self.user, &token).map_err(|_| {
                 "GitHub did not verify the supplied token (output withheld); nothing was stored"
             })?;
@@ -648,11 +648,22 @@ fn read_token(sys: &dyn System, user: &User, config: &Github) -> Result<Secret, 
     crate::port::no_core_dumps();
     let mut bytes = sys
         .read_owned_file(&config.token_file, user.uid, INPUT_MAX, true)
-        .map_err(|error| TokenUnread {
-            absent: error.kind() == io::ErrorKind::NotFound,
-            why: "GitHub token source must be an owned private regular file (0600), without \
-                  links, at most 64 KiB"
-                .into(),
+        .map_err(|error| {
+            let absent = error.kind() == io::ErrorKind::NotFound;
+            TokenUnread {
+                absent,
+                why: if absent {
+                    format!(
+                        "the GitHub token file ({}) is not on this {} yet",
+                        config.token_file.display(),
+                        if sys.macos() { "Mac" } else { "machine" }
+                    )
+                } else {
+                    "GitHub token source must be an owned private regular file (0600), without \
+                     links, at most 64 KiB"
+                        .into()
+                },
+            }
         })?;
     let result = token(&bytes, config.token_key.as_deref());
     scrub(&mut bytes);

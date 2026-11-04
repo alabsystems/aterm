@@ -1087,7 +1087,9 @@ impl Engine {
 
     #[inline]
     const fn host_sweep_for(&self, from: (u16, u16), to: (u16, u16)) -> Option<Instant> {
-        match self.events.as_slice().last() {
+        // Vec's deref coercion is not const; retain the explicit slice boundary.
+        let events = self.events.as_slice();
+        match events.last() {
             Some(&(Event::Sweep { row, col0, col1 }, at))
                 if row == to.0 && col0 == from.1 && col1 == to.1 =>
             {
@@ -1327,10 +1329,8 @@ impl Engine {
 
     #[inline]
     const fn unechoed_tail(&self) -> &[(Event, Instant)] {
-        self.events
-            .as_slice()
-            .split_at(self.unechoed_tail_start())
-            .1
+        let events = self.events.as_slice();
+        events.split_at(self.unechoed_tail_start()).1
     }
 
     #[inline]

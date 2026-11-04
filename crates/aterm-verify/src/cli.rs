@@ -341,8 +341,9 @@ Options:
                           available here (one that alone does not runs
                           with no other that claims memory)
       --test-threads <n>  RUST_TEST_THREADS ceiling for every test binary
-      --test-jobs <n>     test binaries at once (default 8); under build-slot,
-                          binaries times threads stays within CARGO_BUILD_JOBS
+      --test-jobs <n>     test binary ceiling (default 8); direct binaries times
+                          threads stay within held CARGO_BUILD_JOBS, or host
+                          cores when no build-slot share is held
       --timeout <s|off>   hang ceiling on each child's work (default 3h); its
                           waits for a lock or for room are left out
       --log <path>        where the full log goes (default: a new file in

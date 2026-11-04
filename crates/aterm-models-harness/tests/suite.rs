@@ -5,6 +5,7 @@
 
 mod derived_supervise_tape;
 mod models_account_progress_policy;
+mod models_custody;
 mod models_disk_discovery_cycle;
 mod models_disk_projected;
 mod models_disk_worker;

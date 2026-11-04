@@ -982,6 +982,10 @@ mod macos {
                   nothing"
     )]
     pub(crate) fn run(_windowed: crate::platform::Windowed) -> i32 {
+        if let Some(why) = crate::driver_display_unavailable() {
+            crate::logging::stderr_line!("objc-toolbar-drive: NOT RUN — {why}");
+            return NOT_RUN;
+        }
         std::thread::spawn(|| {
             std::thread::sleep(Duration::from_secs(180));
             crate::logging::stderr_line!(

@@ -16,6 +16,7 @@ fn stamp(pid: u32, start: &str, cause: Cause, at: u64) -> Stamp {
     }
 }
 
+/// NEGATIVE CONTROL: a symlinked `state` or `<state>/upgrade` directory is refused on read, write, and take.
 #[test]
 fn a_stamp_is_one_file_per_tab_written_whole() {
     let tmp = scratch();
@@ -37,6 +38,51 @@ fn a_stamp_is_one_file_per_tab_written_whole() {
     for bad in ["", "../s-1", "s 1", "s/1"] {
         assert_eq!(path(state, bad), None, "{bad:?}");
         assert!(write(state, bad, &first).is_err(), "{bad:?}");
+    }
+    #[cfg(unix)]
+    {
+        let outside = scratch();
+        std::fs::create_dir_all(outside.path().join("upgrade")).expect("outside upgrade");
+        std::fs::write(
+            outside.path().join("upgrade/asked-s-1.json"),
+            first.to_json(),
+        )
+        .expect("plant outside stamp");
+        let linked_state = tmp.path().join("linked-state");
+        std::os::unix::fs::symlink(outside.path(), &linked_state).expect("symlink state");
+        assert_eq!(read(&linked_state, "s-1"), None, "symlinked state refused");
+        assert_eq!(
+            take_if(&linked_state, "s-1", |_| true),
+            None,
+            "symlinked state not unlinked"
+        );
+        assert!(
+            write(&linked_state, "s-3", &first).is_err(),
+            "symlinked state refused on write"
+        );
+        assert!(
+            !outside.path().join("upgrade/asked-s-3.json").exists(),
+            "nothing written into outside target"
+        );
+
+        let real_state = tmp.path().join("real-state");
+        std::fs::create_dir_all(&real_state).expect("real state");
+        std::os::unix::fs::symlink(outside.path().join("upgrade"), real_state.join("upgrade"))
+            .expect("symlink upgrade");
+        assert_eq!(read(&real_state, "s-1"), None, "symlinked upgrade refused");
+        assert_eq!(
+            take_if(&real_state, "s-1", |_| true),
+            None,
+            "symlinked upgrade not unlinked"
+        );
+        assert!(
+            write(&real_state, "s-3", &first).is_err(),
+            "symlinked upgrade refused on write"
+        );
+        assert!(
+            outside.path().join("upgrade/asked-s-1.json").exists(),
+            "outside stamp untouched"
+        );
     }
     assert_eq!(Stamp::from_json("{\"pid\":1}"), None, "a torn stamp");
     assert_eq!(Cause::parse("stall"), Some(Cause::Stall));

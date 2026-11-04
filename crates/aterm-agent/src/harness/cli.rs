@@ -96,7 +96,7 @@ USAGE:
     aterm harness accounts stats [--json]        5h/week/Fable windows, plan, credits, \u{2248}$, and active sessions
     aterm harness accounts refresh --cli kimi [--json]
                                                  read fresh Kimi /usage in a temporary tab
-    aterm harness accounts add <label> [--shared] [--email <e>] [--browser <b>]
+    aterm harness accounts add <label> [--pool] [--email <e>] [--browser <b>]
                                                  create login directory and append roster row
     aterm harness accounts adopt-default <label> --email <e> [--browser <b>]
                                                  enroll this machine's default login as a renewable row
@@ -156,7 +156,8 @@ OPTIONS:
     --region <r>        accounts add, adopt-default, import --cli kimi: `global` (kimi.ai) or
                         `mainland-cn` (kimi.com)
     --flow <f>          accounts add, adopt-default --cli codex|grok: `browser` or `device`
-    --shared            accounts add: mark account `shared` across machines
+    --pool              accounts add: a row this Mac does not prefer, tried after the
+                        preferred ones (an order; any Mac may run any account)
     --email <e>         accounts add, adopt-default: account email verified on renewal
     --identity-email <e> accounts add, adopt-default --cli claude|codex:
                         reported account email when the login email is an alias
@@ -217,6 +218,10 @@ limit; a pool is `open`, `low` (a limit at or under `[harness.agy] low`, default
 (`agy-quota/home.json`, 15 minutes current, 5 while a pool is low or spent, until a spent
 limit's refill passes) and every read adds a line to `agy-quota/home.jsonl`, from which each
 limit's burn per hour and the moment it runs out at that rate are reckoned.
+  - `agy login <account>`: authenticate the explicitly bound Google identity in a private
+    native agy profile, then verify its account with Google. Uses provisioned credentials
+    and an owned headless browser; never asks for interactive approval. Existing native
+    grants renew without loading a Google password unless fresh sign-in is required.
   - `agy pick [<model>]`: the model a launch of `<model>` (agy's default when none) runs. A
     spent pool rotates any launch to the first `[harness.agy] order` model in an open pool,
     else in the low pool with the most left, else it waits (exit 3) until the earliest refill;
@@ -435,17 +440,20 @@ const HELP_LEDGER: &str = "\
 
 const HELP_ACCOUNTS: &str = "\
 `accounts` manages Claude Code logins on this machine and reports rotation state.
-The roster is `accounts.toml` beside `aterm.toml`: `[[account]]` rows with `label`,
-`class` (`dedicated` or `shared`), optional `dir` (the one row without `dir` is the
+The roster is `accounts.toml` beside `aterm.toml`: `[[account]]` rows with `label`, `class`
+(`dedicated` for a row this Mac prefers, `shared` for one tried after those: an order, never a
+claim, since any Mac may run any account), optional `dir` (the one row without `dir` is the
 machine's default login), and optional `email`, `identity_email` and `browser`. An invalid roster is
 refused whole (exit 1). The report prints no credential. Its rows print no email but in Codex's
 JSON report (`--cli codex --json`), which carries each row's `email` and `identity_email`; the
 retained Commons rows listed after them show a shared account's email where the catalog has
 one, and for one CLI the local label it matches (`--json`: `shared_accounts`, or
 `shared_catalog` under `--cli all` unless it finds no pool and reports Claude's alone).
-A label names one login, never a machine: a row found by itself is named for the Mac or Macs it
-runs on, with a number past the first (`m2`, `m2-2`, `m2-3`, or `m106-m38` for a shared one), and
-its `email` in the roster says which account that is.
+A label names one login, never a machine. Where the lab registry names this Mac, a row takes its
+account's lab label (`claude-<6 hex>`, or the owner's), the default login's too. On a Mac the lab
+does not name, a row found by itself is still named for the Mac or Macs it runs on, with a number
+past the first (`m2`, `m2-2`, or `m106-m38`), and its `email` in the roster says which account
+that is.
 
 REPORT & ROTATION (`[harness] accounts = \"early\" | \"wall\" | \"off\"`):
   Prints `active: <label>, N of M sessions on it`; a row per account with its class, its
@@ -493,9 +501,14 @@ VERBS:
   - `accounts import <label> --cli kimi [--region <r>]`
     Imports one pending source row for its preferred machine. A missing region must be
     explicit. The source supplies the account identity; no credentials are copied.
-  - `accounts add <label> [--shared] [--email <e>] [--identity-email <e>] [--browser <b>]`
+  - `accounts add <label> [--pool] [--email <e>] [--identity-email <e>] [--browser <b>]`
     Creates `<state>/accounts/logins/<label>` (0700) and appends the row to `accounts.toml`
-    (the first `add` also lists the default login as `main`). Labels match
+    (the first `add` also lists the default login as `main`, an asked-for lab account's `add`
+    too; a lab sync keeps that row as it is and lists no second default login beside it). Where
+    the lab registry names this Mac, a `<label>` that is a lab account's label, legacy label or
+    account key (`ac-…`), given with no `--email`, is that account asked for by name: the row
+    takes the lab's label, address, identity and vendor keys, it runs here like any row, and no
+    preference is written (a paused or retired account is refused). `--pool` lists a row this Mac does not prefer. Labels match
     `[a-z0-9][a-z0-9._-]{0,63}` (not `help`). A row stays `not-enrolled` until signed in.
     Where a fleet file on this machine writes the roster (`fleet-accounts.toml` beside it,
     and the copy in `~/.secrets` that aterm keeps of it or that lists this machine alone),
@@ -575,11 +588,18 @@ VERBS:
   - `accounts stats [--json]`
     Reads 5h, week, and Fable windows, plan, credits, 8-day list-price spend (\u{2248}$), login
     state, and running sessions for the current home (`--json` is schema 1 `account-stats`).
-  - `accounts sync [<source>] [--machine <mN>] [--json]`
-    Synchronizes this machine's `accounts.toml` and `fleet-accounts.toml` from `<source>` (a
-    file, `~/` for the home; an http(s) URL fetched with curl, a Sheets `/edit` link read as
-    its CSV export; an `rclone:<remote>:<path>` source is refused), else from the source
-    this machine configured. With neither it reads nothing and exits 1. It waits at most
+  - `accounts sync [alab | <source>] [--machine <mN>] [--json]`
+    Synchronizes this machine's `accounts.toml`. The default source is the lab registry
+    (`alab`) wherever the lab names this Mac, ahead of every other default: its rows are the
+    accounts this Mac prefers in rank order, each labelled `claude-<6 hex>` (or the owner's
+    label), plus the default login's account under its lab label; every row already here
+    stays, an account another Mac prefers can still run here, an empty lab roster stays
+    empty, and no fleet file is written. A `[fleet] accounts_source` in aterm.toml still wins.
+    Elsewhere it syncs `accounts.toml` and `fleet-accounts.toml` from `<source>` (a file, `~/`
+    for the home; an http(s) URL fetched with curl, a Sheets `/edit` link read as its CSV
+    export; an `rclone:<remote>:<path>` source is refused), else from the source this machine
+    configured. With neither it reads nothing and exits 1. On a Mac the lab names, a sheet
+    named as a source is refused: the sheet is the lab importer's input. It waits at most
     10 s for the accounts lock, then fails and syncs nothing. Where the default row is on
     record signed out from before the default login moved onto it (a `displaced` event
     after that sign-out), it then checks the default login once with `claude auth status
@@ -627,14 +647,17 @@ OTHER CLIS (`--cli codex|grok|kimi`; `--cli claude`, or none, is the above):
     sends only `/usage`, records the 5h, optional weekly and monthly observations, then closes
     the tab on success or failure. No model prompt is sent and no credentials are copied.
     Nothing runs that refresh for you: no timer reads a provider's usage.
-  - `accounts sync --cli <id> [<source>] [--machine <mN>] [--json]` adds this machine's rows
-    of the CLI's fleet to its roster, each with a login directory of its own, and changes or
-    removes no row the roster has. The fleet is the source named, else
-    `~/.secrets/ai-accounts-<cli>.toml` (the rows of `fleet-accounts.toml`, with `region` or
-    `flow`), else the CLI's column of `~/.secrets/ai-accounts.csv` (`Open AI` for codex,
-    `xai`, `x` or `grok`, `kimi`; a cell of `1`, or a vendor word: `global`/`mainland-cn`
-    for kimi, whose bare `1` is held, `browser`/`device` for codex and grok), its rows labelled
-    `<cli>-<machine label>`. A note naming a vendor (`kimi banned`) drops that vendor's
+  - `accounts sync --cli <id> [alab | <source>] [--machine <mN>] [--json]` adds this machine's
+    rows of the CLI's fleet to its roster, each with a login directory of its own, and changes or
+    removes no row the roster has (under the lab it clears a hold an old pool file left and
+    keeps each row's derived order). The fleet is the source named, else the lab registry
+    (`alab`) wherever the lab names this Mac: the accounts this Mac prefers, labelled
+    `<cli>-<6 hex>` (or the owner's label), and no sheet or vault file is read. On a Mac the lab
+    does not name it is `~/.secrets/ai-accounts-<cli>.toml` (the rows of `fleet-accounts.toml`,
+    with `region` or `flow`), else the CLI's column of `~/.secrets/ai-accounts.csv` (`Open AI`
+    for codex, `xai`, `x` or `grok`, `kimi`; a cell of `1`, or a vendor word:
+    `global`/`mainland-cn` for kimi, whose bare `1` is held, `browser`/`device` for codex and
+    grok), its rows labelled `<cli>-<machine label>` there. A note naming a vendor (`kimi banned`) drops that vendor's
     membership alone among these pools; Claude Code's own `accounts sync` drops the row on any
     disqualifying note, a vendor's included, so `kimi banned` removes that account's Claude
     Code row on every machine that syncs from the sheet too. It writes the roster and the
@@ -1154,11 +1177,11 @@ pub enum AccountsCmd {
         /// The JSON form.
         json: bool,
     },
-    /// `accounts add <label> [--shared] [--email <e>] [--browser <b>]`: make the login directory, append the roster row.
+    /// `accounts add <label> [--pool] [--email <e>] [--browser <b>]`: make the login directory, append the roster row.
     Add {
         /// The label as typed; admitted when the verb runs, so an inadmissible one is a refusal by name (exit 1), not a usage error.
         label: String,
-        /// `--shared`, else dedicated.
+        /// `--pool`, else preferred here ([`Class`]: an order, never a claim).
         class: Class,
         /// `--email`: the row renews through `accounts renew`.
         email: Option<String>,
@@ -1602,7 +1625,7 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
     let mut help = false;
     let mut apply: Option<disk::Class> = None;
     let mut dry_run = false;
-    let mut shared = false;
+    let mut pool_row = false;
     let mut auto = false;
     let mut due = false;
     let mut here = false;
@@ -1632,7 +1655,7 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
             "-h" | "--help" | "help" => help = true,
             "--json" => json = true,
             "--dry-run" => dry_run = true,
-            "--shared" => shared = true,
+            "--pool" => pool_row = true,
             "--auto" => auto = true,
             "--due" => due = true,
             "--here" => here = true,
@@ -1770,9 +1793,12 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
                 [] | ["quota"] => AgyWhat::Quota,
                 ["pick"] => AgyWhat::Pick(None),
                 ["pick", model] if !model.is_empty() => AgyWhat::Pick(Some((*model).to_owned())),
+                ["login", account] if super::accounts::admissible_label(account) => {
+                    AgyWhat::Login((*account).to_owned())
+                }
                 other => {
                     return Err(format!(
-                        "agy takes `quota` or `pick [<model>]`, not {other:?}"
+                        "agy takes `quota`, `pick [<model>]` or `login <account>`, not {other:?}"
                     ));
                 }
             },
@@ -1814,7 +1840,7 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
                 || dry_run
                 || json
                 || over.sock.is_some()
-                || shared
+                || pool_row
                 || auto
                 || due
                 || here
@@ -1969,10 +1995,10 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
                 ["refresh"] => AccountsCmd::Refresh { json },
                 ["add", label] => AccountsCmd::Add {
                     label: (*label).to_string(),
-                    class: if shared {
-                        Class::Shared
+                    class: if pool_row {
+                        Class::Pool
                     } else {
-                        Class::Dedicated
+                        Class::Preferred
                     },
                     email: email.take(),
                     identity_email: identity_email.take(),
@@ -2053,7 +2079,7 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
                         "accounts takes nothing (or `list`), `table`, `import <label>`, `stats`, \
                          `refresh`, `sync [<source>] [--machine <mN>]`, `serve [<source>] \
                          [--bind <addr:port>] [--machine <mN>]`, `add <label> \
-                         [--shared] [--email <e>] [--browser <b>]`, `adopt-default <label> \
+                         [--pool] [--email <e>] [--browser <b>]`, `adopt-default <label> \
                          --email <e>`, `login <label>`, `browser <label>`, `renew [--due | \
                          <label>…] [--on <host>,…]` or `use <label> | --auto`, not {other:?}"
                     ));
@@ -2086,8 +2112,8 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
     if !owner.is_empty() && !matches!(cmd, Cmd::UpgradeOwner { .. }) {
         return Err("--status, --now, --defer and --skip belong to `upgrade`".to_string());
     }
-    if shared && !matches!(accounts_form(&cmd), Some(AccountsCmd::Add { .. })) {
-        return Err("--shared belongs to `accounts add <label>`".to_string());
+    if pool_row && !matches!(accounts_form(&cmd), Some(AccountsCmd::Add { .. })) {
+        return Err("--pool belongs to `accounts add <label>`".to_string());
     }
     if auto && !matches!(accounts_form(&cmd), Some(AccountsCmd::Auto)) {
         return Err("--auto belongs to `accounts use`".to_string());
@@ -2163,9 +2189,11 @@ fn report_program(cli: Cli, host: &dyn AccountsHost) -> Option<PathBuf> {
 }
 
 /// What `cli`'s accounts report knows of the program a launch aterm makes of it runs here, which
-/// narrows `next:` ([`accounts_next`]): for Codex, the program a worker aterm starts types
-/// ([`report_program`]) and whether a launch of it would start nothing here; for every other CLI,
-/// and wherever nothing is known, neither ([`Launch::default`]).
+/// narrows `next:` ([`accounts_next`]) and `accounts use`'s words ([`use_recorded`]): the program
+/// [`AccountsHost::launch_program`] names (for Codex, the one a worker aterm starts types,
+/// [`report_program`]; for Grok Build and Kimi Code CLI, atpkg's managed copy, else the program
+/// word) and whether a launch of it would start nothing here; for Claude Code, and wherever
+/// nothing is known, neither ([`Launch::default`]).
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct Launch<'a> {
     /// The program, `None` where none is known.
@@ -2177,7 +2205,8 @@ pub(super) struct Launch<'a> {
 }
 
 impl<'a> Launch<'a> {
-    /// `program` (as [`report_program`] names it) judged on the `PATH` `host` reads.
+    /// `program` (as [`AccountsHost::launch_program`] names it) judged on the `PATH` `host`
+    /// reads.
     fn of(program: Option<&'a Path>, host: &dyn AccountsHost) -> Launch<'a> {
         Launch {
             program,
@@ -2257,7 +2286,7 @@ fn run_accounts_all_with_catalog(
     let mut code = ExitCode::SUCCESS;
     for (cli, path, records) in kept {
         let mut report = Vec::new();
-        let program = report_program(cli, host);
+        let program = host.launch_program(cli);
         let ran = run_accounts_report_snapshot_with_catalog(
             (cli, Launch::of(program.as_deref(), host)),
             env,
@@ -3152,6 +3181,8 @@ fn run_usage(env: &Env, process: &dyn ClaudeProcess, json: bool, out: &mut dyn W
 /// What `aterm harness agy` shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgyWhat {
+    /// Authenticate and canonically verify an explicitly bound Google account.
+    Login(String),
     /// Every pool's limits, standing and burn.
     Quota,
     /// The model a launch of `<model>` (or agy's default) runs after rotation.
@@ -3162,6 +3193,59 @@ fn agy_store(env: &Env) -> super::agy_quota_store::Store {
     super::agy_quota_store::Store::new(&env.state, &super::agy_quota_store::launch_key(None, &[]))
 }
 
+fn run_agy_login(_env: &Env, account: &str, json: bool, out: &mut dyn Write) -> ExitCode {
+    #[cfg(unix)]
+    let result = (|| -> Result<(), String> {
+        let env = _env;
+        let home = env
+            .home
+            .as_deref()
+            .ok_or("Google login home is unavailable")?;
+        let layout = versions_layout(env).ok_or("Managed agy layout is unavailable")?;
+        let program = crate::ai::facts::managed_of(&layout, "agy")
+            .ok_or("Managed native agy is unavailable")?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+        let grant =
+            super::agy_signin::run_google(&program.path, &env.state, home, account, deadline)
+                .map_err(|error| error.to_string())?;
+        let verified = grant.verify(deadline).map_err(str::to_owned)?;
+        verified.check_current().map_err(str::to_owned)
+    })();
+    #[cfg(not(unix))]
+    let result: Result<(), String> =
+        Err("Native Google agy login is unavailable on this platform".into());
+    let success = result.is_ok();
+    if json {
+        let mut value = Map::new();
+        value.insert("schema".into(), Value::from(1u64));
+        value.insert("kind".into(), Value::from("agy-login"));
+        value.insert("account".into(), Value::from(account));
+        value.insert("verified".into(), Value::from(success));
+        if let Err(error) = result {
+            value.insert("error".into(), Value::from(error));
+        }
+        let _ = writeln!(
+            out,
+            "{}",
+            aterm_json::to_string(&Value::Object(value)).unwrap_or_default()
+        );
+    } else {
+        match result {
+            Ok(()) => {
+                let _ = writeln!(out, "agy account {account}: Google identity verified");
+            }
+            Err(error) => {
+                let _ = writeln!(out, "agy login unavailable: {error}");
+            }
+        }
+    }
+    if success {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
 fn run_agy(
     env: &Env,
     what: &AgyWhat,
@@ -3170,6 +3254,9 @@ fn run_agy(
     source: &dyn super::agy_quota_store::Source,
     out: &mut dyn Write,
 ) -> ExitCode {
+    if let AgyWhat::Login(account) = what {
+        return run_agy_login(env, account, json, out);
+    }
     use super::agy_quota::{self, Pick};
     use super::agy_quota_store as store;
     let (rotation, notes) = agy_quota::Rotation::from_path(env.config.as_deref());
@@ -3205,6 +3292,7 @@ fn run_agy(
     let age = env.now.saturating_sub(reading.as_of);
     let history = st.history();
     match what {
+        AgyWhat::Login(account) => run_agy_login(env, account, json, out),
         AgyWhat::Quota => {
             if json {
                 let mut v = agy_quota::to_json(&reading.quota, env.now);
@@ -6784,6 +6872,13 @@ pub trait AccountsHost {
         None
     }
 
+    /// The program a launch aterm makes of `cli` runs where it finds no starter's own, which the accounts report's `next:` and `accounts use` judge by ([`Launch::of`]): Codex's is [`Self::codex_launch_program`]; Grok Build's and Kimi Code CLI's, atpkg's managed copy where one is laid, else the program word a launch's shell looks for on its `PATH` ([`super::worker::pooled_launch_program_in`]); `None` names none, and Claude Code's is none.
+    fn launch_program(&self, cli: Cli) -> Option<PathBuf> {
+        (cli == Cli::Codex)
+            .then(|| self.codex_launch_program())
+            .flatten()
+    }
+
     /// The `PATH` the shell of a launch aterm makes reads, as the doctor reads it, where [`Self::codex_launch_program`]'s bare word is looked for ([`crate::ai::facts::launch_finds_nothing`]); `None` where it is not known, which judges no bare word.
     fn launch_path(&self) -> Option<OsString> {
         None
@@ -7108,6 +7203,19 @@ impl AccountsHost for LiveAccounts {
     #[cfg(not(test))]
     fn codex_launch_program(&self) -> Option<PathBuf> {
         Some(super::worker::codex_launch_program())
+    }
+
+    // As `codex_launch_program`: a unit test's `run` reads no build of the machine it runs on.
+    #[cfg(not(test))]
+    fn launch_program(&self, cli: Cli) -> Option<PathBuf> {
+        match cli {
+            Cli::Claude => None,
+            Cli::Codex => self.codex_launch_program(),
+            Cli::Grok | Cli::Kimi => Some(super::worker::pooled_launch_program_in(
+                cli,
+                atpkg::store::resolve_configured().as_ref(),
+            )),
+        }
     }
 
     // As `codex_launch_program`: a unit test's `run` reads no `PATH` of the machine it runs on.
@@ -8329,6 +8437,32 @@ fn sole_listed_running<'a>(roster: &'a Roster, state: &'a accounts::State) -> Op
     }
 }
 
+/// Where the `active:` line names `cli`'s recorded active row with no session on it and a launch
+/// aterm makes would not take that row (`next`, [`accounts_next`]), the words that say so, led by
+/// `; `: the row a launch takes, else that it does not take this one now. `None` for Claude Code,
+/// whose sessions are what `active:` counts, where a session runs, and where a launch takes the
+/// active row: a recorded active row is only a launch's first pick, so no launch runs on it
+/// until one takes it.
+fn launch_passes_active(
+    cli: Cli,
+    roster: &Roster,
+    state: &accounts::State,
+    next: &AccountsNext,
+) -> Option<String> {
+    let active = state.active.as_deref()?;
+    if cli == Cli::Claude
+        || !running_accounts(roster, state).is_empty()
+        || next.to.as_deref() == Some(active)
+    {
+        return None;
+    }
+    let launch = launch_words(cli);
+    Some(match &next.to {
+        Some(to) => format!("; {launch} takes `{to}`, as `next:` says"),
+        None => format!("; {launch} does not take it now, as `next:` says"),
+    })
+}
+
 fn active_header_line(roster: &Roster, state: &accounts::State) -> String {
     let running = running_accounts(roster, state);
     match (running.as_slice(), state.active.as_deref()) {
@@ -8378,18 +8512,21 @@ fn active_header_line(roster: &Roster, state: &accounts::State) -> String {
 /// no lab pass measured the CLI's login seam), it is none, and why ([`no_row_words`]); on a Codex
 /// program (`launch`'s) that keeps no row's login its own
 /// ([`super::accounts_pool::default_only_now`]) it is what a launch there takes
-/// ([`default_only_next`]). The row the others are weighed against is
-/// the pool's active row; for Claude Code, whose sessions rotate off the account they run on,
-/// else the one account running sessions, else the row on this machine's own login. Every other
-/// CLI's is the active row alone, as [`accounts::launch_row`] weighs a launch's pick, so `next:`
-/// names the row a launch takes past a fresh active row; under the owner's pin that a launch
-/// takes (its row is signed in here and this Mac's to use), it is that pinned row, which a
-/// launch takes and no rotation leaves while the pin holds; where the owner's pin refuses every
-/// launch ([`super::accounts_pool::pin_refusal`]: it names no row, or its row is not signed in
-/// here), it is none, and why. The row in use is not next for its own condition where that keeps
-/// it from serving ([`own_condition`]), else for being in use. Where `launch` says a launch would
+/// ([`default_only_next`]). For Claude Code, whose sessions rotate off the account they run on,
+/// the rows are weighed against the pool's active row, else the one account running sessions,
+/// else the row on this machine's own login, and that row is not next for its own condition
+/// where that keeps it from serving ([`own_condition`]), else for being in use. Every other CLI's
+/// `next:` is the row a launch aterm makes of it takes ([`super::accounts_pool::launch_now`],
+/// the pick `accounts use` records and the launch makes): the owner's pin while it can be taken,
+/// which no rotation leaves, else a fresh active row, else the pool's pick past it; no row is
+/// weighed as one in use, so each other row is not next for its own condition or for the
+/// claims that keep it from this Mac (another Mac's warm set or claim); where the owner's pin
+/// refuses every launch ([`super::accounts_pool::pin_refusal`]: it names no row, or its row is
+/// not signed in here), it is none, and why. Where `launch` says a launch would
 /// start nothing here ([`Launch::uninstalled`]: the doctor's `not installed`), no row is next in
-/// any mode, and the reason is the doctor's, with its fix.
+/// any mode, and the reason is the doctor's, with its fix; the rows are then judged as on no
+/// known program, so none is not next for what the build it names would run (no `this Codex
+/// build:` line either).
 fn accounts_next(
     (cli, launch): (Cli, Launch<'_>),
     rotation: &Rotation,
@@ -8398,14 +8535,10 @@ fn accounts_next(
     enrolled: &BTreeSet<String>,
     now: i64,
 ) -> AccountsNext {
-    let mut next = next_on(
-        (cli, launch.program),
-        rotation,
-        roster,
-        state,
-        enrolled,
-        now,
-    );
+    // A program that starts nothing here is no build to judge rows by: each row is not next for
+    // its own condition and claims alone, never for what a build it names would run.
+    let program = launch.program.filter(|_| !launch.uninstalled);
+    let mut next = next_on((cli, program), rotation, roster, state, enrolled, now);
     if launch.uninstalled {
         next.to = None;
         next.wait_until = None;
@@ -8450,24 +8583,25 @@ fn next_on(
     {
         return default_only_next(roster, rule, now);
     }
-    let active = state
-        .active
-        .as_deref()
-        .filter(|label| roster.row(label).is_some());
-    let me = if cli == Cli::Claude {
-        active
+    // Claude Code's sessions rotate off the account they run on, so its rows are weighed against
+    // that one. A launch of any other CLI weighs no row as its own: nothing runs on the active
+    // row until a launch takes it, so each row is judged for its own condition and claims.
+    let me = (cli == Cli::Claude).then(|| {
+        state
+            .active
+            .as_deref()
+            .filter(|label| roster.row(label).is_some())
             .or_else(|| sole_listed_running(roster, state))
             .or_else(|| roster.row_for_login(None).map(|row| row.label.as_str()))
-    } else {
-        active
-    };
+    });
     let point = accounts::Point::Wall {
         window: String::new(),
         at: None,
     };
     let mut to = None;
     let mut not = Vec::new();
-    for (label, verdict) in accounts::candidates(roster, state, enrolled, me, &point, now) {
+    for (label, verdict) in accounts::candidates(roster, state, enrolled, me.flatten(), &point, now)
+    {
         match verdict {
             Ok(_) => {
                 to.get_or_insert(label);
@@ -8482,29 +8616,45 @@ fn next_on(
             Err(why) => not.push((label, NotNext::Pool(why))),
         }
     }
-    // A launch of a pool's CLI takes the owner's pin first: where the pin refuses every launch,
-    // no row is next, as under rotation off, whatever a launch past the pin would take.
-    if cli != Cli::Claude
-        && let Some(refused) = super::accounts_pool::pin_refusal(cli, roster, state, enrolled, now)
-    {
-        return AccountsNext {
-            to: None,
-            wait_until: None,
-            not,
-            only_default: None,
-            off: None,
-            none: Some(format!("the pin cannot be taken now: {refused}")),
-        };
-    }
-    // A pin that can be taken is the row a launch takes ([`accounts::launch_row`]), and no
-    // rotation moves off it while it holds, so it is next, not a row past it.
-    if cli != Cli::Claude
-        && state.pinned
-        && let Some(own) = active
-        && accounts::launch_row(roster, state, enrolled, now).is_some_and(|row| row.label == own)
-    {
-        not.retain(|(label, _)| label != own);
-        to = Some(own.to_string());
+    if cli != Cli::Claude {
+        // A launch of a pool's CLI takes the owner's pin first: where the pin refuses every
+        // launch, no row is next, as under rotation off, whatever a launch past the pin would
+        // take.
+        if let Some(refused) = super::accounts_pool::pin_refusal(cli, roster, state, enrolled, now)
+        {
+            return AccountsNext {
+                to: None,
+                wait_until: None,
+                not,
+                only_default: None,
+                off: None,
+                none: Some(format!("the pin cannot be taken now: {refused}")),
+            };
+        }
+        // The row a launch takes is next: the pin while it can be taken, which no rotation
+        // leaves, else a fresh active row, else the pool's pick past it, as `accounts use` and
+        // the launch itself read it. A launch that takes no row (the roster's one row is this
+        // machine's own login, with no pin) runs on that row's login, which `to` names.
+        match super::accounts_pool::launch_now(
+            (cli, rotation.keyring, rotation.mode),
+            roster,
+            state,
+            enrolled,
+            program,
+            now,
+        ) {
+            Ok(Some(row)) => to = Some(row.label.clone()),
+            Ok(None) => {}
+            // Past the pin's own refusal (above), a launch is refused only where the pool's
+            // verdicts serve no row either: a preparation hold on the lone default row, or no
+            // usable row.
+            Err(_) => to = None,
+        }
+        // The row a launch takes where the pool's ranking passes it over (a low pin while another
+        // row opens soon, a low active row it still runs) is next, and so not also not next.
+        if let Some(taken) = &to {
+            not.retain(|(label, _)| label != taken);
+        }
     }
     let wait_until = match to {
         Some(_) => None,
@@ -8573,11 +8723,11 @@ fn launch_noun(cli: Cli) -> String {
 /// the records as they stand (`roster`, `state` and the rows whose login is here, `enrolled`):
 /// [`super::accounts_pool::launch_now`]'s pick or refusal, the one
 /// [`super::accounts_pool::launch_env_for`] holds a launch to before its usage read, on the
-/// program `launch` names ([`report_program`]) under `rotation`, as the report's `next:` reads
-/// them. `pinned` is the row `use <label>` pinned, `None` once `use --auto` ended a pin. A
-/// refusal is the launch's own words, which name the way back; where `launch` says a launch
-/// would start nothing here ([`Launch::uninstalled`]) it is the doctor's `not installed`, with
-/// its fix.
+/// program `launch` names ([`AccountsHost::launch_program`]) under `rotation`, as the report's
+/// `next:` reads them. `pinned` is the row `use <label>` pinned, `None` once `use --auto` ended
+/// a pin. A refusal is the launch's own words, which name the way back; where `launch` says a
+/// launch would start nothing here ([`Launch::uninstalled`]) it is the doctor's `not installed`,
+/// with its fix.
 fn use_recorded(
     (cli, launch): (Cli, Launch<'_>),
     rotation: &Rotation,
@@ -8625,7 +8775,7 @@ fn use_recorded(
                 .map_or_else(String::new, |why| {
                     format!(
                         ", while it is not this Mac's to use ({})",
-                        not_this_macs(why)
+                        why_not_words(why)
                     )
                 });
             format!(
@@ -8681,20 +8831,6 @@ fn use_recorded(
                 format!("recorded, but {a_launch} now is refused: {refused}")
             }
         }
-    }
-}
-
-/// Why the account claims keep a pinned row from this Mac (`why`: its `held_by`, or
-/// [`accounts::State::lease_verdict`]'s verdict), in the words [`super::accounts_pool`]'s
-/// refusals use.
-fn not_this_macs(why: accounts::WhyNot) -> String {
-    match why {
-        accounts::WhyNot::HeldElsewhere => "held for another Mac's warm set".to_string(),
-        accounts::WhyNot::Unclaimed => {
-            "this Mac cannot record a claim on it, and it is not this Mac's home account"
-                .to_string()
-        }
-        other => why_not_words(other),
     }
 }
 
@@ -8998,9 +9134,17 @@ fn not_next_words(why: &NotNext) -> String {
     }
 }
 
+/// Why a row is not next or not taken (`why`), in the report's words; `accounts use` names a
+/// pinned row this Mac may not use now in the same words (its `held_by`, or
+/// [`accounts::State::lease_verdict`]'s verdict), as [`super::accounts_pool`]'s refusals do.
 fn why_not_words(why: accounts::WhyNot) -> String {
     match why {
         accounts::WhyNot::Me => "the account in use".to_string(),
+        accounts::WhyNot::HeldElsewhere => "held for another Mac's warm set".to_string(),
+        accounts::WhyNot::Unclaimed => {
+            "this Mac cannot record a claim on it, and it is not this Mac's home account"
+                .to_string()
+        }
         accounts::WhyNot::Limited { until } => format!("limited until {}", rfc3339_utc(until)),
         accounts::WhyNot::LeasedElsewhere { until } => {
             format!("leased elsewhere until {}", rfc3339_utc(until))
@@ -9093,7 +9237,14 @@ fn accounts_text(
         }
         return text;
     }
+    let next = accounts_next((cli, launch), rotation, roster, state, enrolled, now);
     let mut text = active_header_line(roster, state);
+    if let Some(taken) = launch_passes_active(cli, roster, state, &next) {
+        // The header's line ends in a newline, which the words go before.
+        text.pop();
+        text.push_str(&taken);
+        text.push('\n');
+    }
     let width = roster.rows.iter().map(|r| r.label.len()).max().unwrap_or(0);
     for row in &roster.rows {
         let here = enrolled.contains(&row.label);
@@ -9152,7 +9303,6 @@ fn accounts_text(
             text.push('\n');
         }
     }
-    let next = accounts_next((cli, launch), rotation, roster, state, enrolled, now);
     text.push_str(&match (&next.to, next.wait_until, next.none.as_deref()) {
         (Some(to), _, _) => format!("next: {to}\n"),
         (None, Some(until), _) => format!(
@@ -10092,13 +10242,33 @@ fn run_accounts_add(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
+    // A name the lab knows, given with no address, is that account asked for by name (§0): it
+    // joins this roster under the lab's label, and no preference is written.
+    let from_lab = match (asked.email.is_none() && asked.identity_email.is_none())
+        .then(|| super::alab_roster::asked_row(cli, &asked.label))
+        .flatten()
+    {
+        None => None,
+        Some(Ok(row)) => Some(accounts::Row {
+            browser: asked.browser.clone().or(row.browser.clone()),
+            ..row
+        }),
+        Some(Err(why)) => {
+            let _ = writeln!(
+                err,
+                "aterm harness accounts add: {why}; nothing was written"
+            );
+            return ExitCode::from(1);
+        }
+    };
+    let asked = from_lab.as_ref().unwrap_or(asked);
     let (label, class) = (asked.label.as_str(), asked.class);
     match accounts_add(cli, env, asked) {
         Ok(added) => {
             if added.listed_own {
                 let _ = writeln!(
                     out,
-                    "listed `{ACCOUNTS_OWN_LABEL}` (dedicated): this machine's own login, the \
+                    "listed `{ACCOUNTS_OWN_LABEL}` (preferred): this machine's own login, the \
                      first row of a new roster"
                 );
             }
@@ -10108,6 +10278,13 @@ fn run_accounts_add(
                 class.as_str(),
                 added.roster.display()
             );
+            if from_lab.is_some() {
+                let _ = writeln!(
+                    out,
+                    "the lab's account, asked for by name: it runs here and no preference was \
+                     written, so the lab's preferences still order the pool"
+                );
+            }
             let _ = writeln!(out, "login directory: {}", added.dir.display());
             for fleet in &added.fleets {
                 let _ = writeln!(
@@ -10279,7 +10456,7 @@ fn accounts_add(cli: Cli, env: &Env, asked: &accounts::Row) -> Result<Added, Str
     };
     store.check_new_rows(&rows, &roster, env.now)?;
     let text = accounts::append_rows_for(cli, &existing, &rows).map_err(|why| {
-        let own = accounts::row_inline(ACCOUNTS_OWN_LABEL, Class::Dedicated, None);
+        let own = accounts::row_inline(ACCOUNTS_OWN_LABEL, Class::Preferred, None);
         if listed_own && own.is_some_and(|own| why.contains(&own)) {
             format!(
                 "a roster with no rows gets this machine's own login too (`{ACCOUNTS_OWN_LABEL}`, \
@@ -10857,10 +11034,50 @@ fn run_accounts_login(
 #[doc(hidden)]
 pub fn account_plain_login_commit_environment() {}
 
+/// The way past `accounts use`'s refusal to pin `row` of `cli`'s pool for `why` ([`accounts::pin`]
+/// refuses it so, [`accounts::pin_refusal`]), `None` where no person's step here ends it: a label
+/// the roster does not list is listed by `accounts add`; a row with no login made here, or one
+/// known signed out, is signed in at a terminal, in the verb the report's `sign-in needed:` and
+/// `accounts add` give it ([`Cli::sign_in_verb`]: `renew` for a row with an email whose page a
+/// renewal approves, else `login`), except that on a Codex build that keeps no row's login its own
+/// (`default_only`) the row on this machine's own login is signed in by Codex's own sign-in
+/// ([`super::codex_alab::DEFAULT_SIGN_IN`]), since `accounts login|renew` refuses it there; a row
+/// held for preparation only waits for its execution authority, which no sign-in gives.
+fn use_remedy(
+    cli: Cli,
+    why: Option<accounts::PinRefusal>,
+    row: Option<&accounts::Row>,
+    default_only: bool,
+) -> Option<String> {
+    match (why?, row) {
+        (accounts::PinRefusal::NotListed, _) | (_, None) => Some(format!(
+            "`aterm harness accounts add <label>{}` lists an account",
+            cli_flag(cli)
+        )),
+        (accounts::PinRefusal::PreparationOnly, Some(_)) => None,
+        (accounts::PinRefusal::NotEnrolled | accounts::PinRefusal::SignedOut, Some(row))
+            if cli == Cli::Codex && row.dir.is_none() && default_only =>
+        {
+            Some(format!(
+                "sign it in with Codex's own sign-in, `{}`, in a terminal",
+                super::codex_alab::DEFAULT_SIGN_IN
+            ))
+        }
+        (accounts::PinRefusal::NotEnrolled | accounts::PinRefusal::SignedOut, Some(row)) => {
+            Some(format!(
+                "sign it in with `aterm harness accounts {} {}{}`, in a terminal",
+                cli.sign_in_verb(row.email.is_some()),
+                row.label,
+                cli_flag(cli)
+            ))
+        }
+    }
+}
+
 /// `accounts use <label>` (`label`) and `accounts use --auto` (`None`) of `cli`'s pool. Claude
 /// Code's words say what its supervisor does with its sessions; every other CLI's say what a
 /// launch aterm makes of it does then ([`use_recorded`]), on the program `host` names
-/// ([`report_program`]).
+/// ([`AccountsHost::launch_program`]).
 fn run_accounts_use(
     (cli, host): (Cli, &dyn AccountsHost),
     env: &Env,
@@ -10873,7 +11090,7 @@ fn run_accounts_use(
         return ExitCode::from(1);
     };
     let now = env.now;
-    let program = report_program(cli, host);
+    let program = host.launch_program(cli);
     let launch = Launch::of(program.as_deref(), host);
     let done = match label {
         Some(label) => {
@@ -10893,27 +11110,21 @@ fn run_accounts_use(
             let Some((_, raw)) = accounts_read_roster_for(cli, env, err) else {
                 return ExitCode::from(1);
             };
-            let roster = match store.bound(&raw, now) {
-                Ok(roster) => roster,
-                Err(why) => {
-                    let _ = writeln!(
-                        err,
-                        "aterm harness accounts use: {why}; nothing was selected"
-                    );
-                    return ExitCode::from(1);
-                }
-            };
-            let remedy = match roster.row(label) {
-                None => format!(
-                    "`aterm harness accounts add <label>{}` lists an account",
-                    cli_flag(cli)
-                ),
-                Some(_) if cli != Cli::Claude => "its login is not made yet".to_string(),
-                Some(row) => format!(
-                    "sign it in with `aterm harness accounts {} {label}`, in a terminal",
-                    cli.sign_in_verb(row.email.is_some())
-                ),
-            };
+            // The roster as its logins bind it, read now only to refuse one that does not bind;
+            // the pin judges the rows as they stand under the lock.
+            if let Err(why) = store.bound(&raw, now) {
+                let _ = writeln!(
+                    err,
+                    "aterm harness accounts use: {why}; nothing was selected"
+                );
+                return ExitCode::from(1);
+            }
+            // The Codex a launch runs, where it keeps no row's login its own: the row on this
+            // machine's own login is signed in by Codex's own sign-in there.
+            let unread = program
+                .as_deref()
+                .filter(|_| cli == Cli::Codex)
+                .and_then(super::codex_alab::auth_path_unread);
             let mut note = None;
             // The records the pin left, which a launch is judged on once the lock is let go.
             let mut taken = None;
@@ -10930,8 +11141,14 @@ fn run_accounts_use(
                     }
                     let roster = accounts::bound(current, logins);
                     let enrolled = enrolled_at(cli, &roster, env);
-                    let event = accounts::pin(state, &roster, &enrolled, label, now)
-                        .map_err(|why| format!("{why}; {remedy}"))?;
+                    let event =
+                        accounts::pin(state, &roster, &enrolled, label, now).map_err(|why| {
+                            let kind = accounts::pin_refusal(state, &roster, &enrolled, label);
+                            match use_remedy(cli, kind, roster.row(label), unread.is_some()) {
+                                Some(remedy) => format!("{why}; {remedy}"),
+                                None => why,
+                            }
+                        })?;
                     taken = Some((roster, state.clone(), enrolled));
                     Ok(vec![event.because("the owner's word")])
                 },
@@ -11103,7 +11320,7 @@ fn run_accounts_adopt(
         Ok((path, unwoken)) => {
             let _ = writeln!(
                 out,
-                "listed `{}` (dedicated): this machine's own login, in {}",
+                "listed `{}` (preferred): this machine's own login, in {}",
                 row.label,
                 path.display()
             );
@@ -14028,7 +14245,7 @@ pub fn run_accounts_of(
         AccountsCmd::Table { json } => run_accounts_source_table(Some(cli), env, *json, out, err),
         AccountsCmd::Import { label } => run_accounts_import(cli, env, label, of.vendor, out, err),
         AccountsCmd::Report { json } => {
-            let program = report_program(cli, host);
+            let program = host.launch_program(cli);
             run_accounts_report(
                 (cli, Launch::of(program.as_deref(), host)),
                 env,

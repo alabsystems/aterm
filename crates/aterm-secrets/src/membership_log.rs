@@ -45,6 +45,7 @@ mod eval;
 pub mod genesis;
 #[cfg(unix)]
 pub(crate) mod history;
+mod payload;
 pub mod store;
 #[cfg(unix)]
 pub(crate) mod untaken;
@@ -56,7 +57,21 @@ pub use entries::{
 };
 pub use eval::{Member, Membership, NodeStanding, Quorum, Removal, Undo};
 pub use genesis::Proof;
+pub use payload::Payload;
 pub use store::{MAX_RECORDS_STREAM, Store, decode_records, encode_records};
+
+#[cfg(any(test, debug_assertions))]
+static RECORD_DECODE_ATTEMPTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The process-wide number of calls to [`Record::decode`], including refused records.
+/// Observers compare snapshots after joining their workers; this counter never affects a verdict.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+#[must_use]
+pub fn test_record_decode_attempts() -> usize {
+    RECORD_DECODE_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Exercise the actual quorum grounder at its current maximum candidate count for heap tests.
 ///
@@ -382,7 +397,7 @@ pub enum Body {
         /// The recipient whose age identity opens `capsule`.
         recipient: Recipient,
         /// Binary age v1 ciphertext carrying the committed epoch key.
-        capsule: Vec<u8>,
+        capsule: Payload,
     },
     /// Seals a secret entry (name, flags and value) under `epoch` (§3.3.6, §3.5.3).
     Put {
@@ -393,7 +408,7 @@ pub enum Body {
         /// Random 32-byte HKDF salt deriving this record's one-shot AEAD key.
         salt: [u8; 32],
         /// ChaCha20-Poly1305 ciphertext over `(name, flags, optional anchor, value)`.
-        ciphertext: Vec<u8>,
+        ciphertext: Payload,
     },
     /// Tombstones a secret entry name in `audience` under `epoch` (§3.5.3).
     Delete {
@@ -404,7 +419,7 @@ pub enum Body {
         /// Random 32-byte HKDF salt deriving this record's one-shot AEAD key.
         salt: [u8; 32],
         /// ChaCha20-Poly1305 ciphertext over the deleted entry name.
-        ciphertext: Vec<u8>,
+        ciphertext: Payload,
     },
     /// The signer's own fleet node key: it binds a member whose entry carried none (ALab's
     /// Genesis v2 founders), and it rotates one. Its latest effective `Node` is the member's node
@@ -490,7 +505,8 @@ impl Draft {
 
 /// One signed record of the membership log. A copy shares the record's parts rather than copying
 /// them: a copy of a [`Store`] copies no record's bytes, so a server that copies its store to
-/// try a POST against it (`server::post_records`) copies none of them, however large its store.
+/// try a POST against it (`server::apply_records`) copies none of them, however large its store.
+/// Decoded ciphertext payloads are views into the same owned wire allocation.
 #[derive(Clone, Debug)]
 pub struct Record {
     id: RecordId,
@@ -581,6 +597,8 @@ impl Record {
     /// # Errors
     /// Anything in the bytes is malformed, out of bound, trailing or unsigned.
     pub fn decode(wire: &[u8]) -> Result<Self> {
+        #[cfg(any(test, debug_assertions))]
+        RECORD_DECODE_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if wire.len() > MAX_RECORD {
             return Err(Error::new("membership record is too long"));
         }
@@ -603,9 +621,12 @@ impl Record {
         }
         let authored_ms = reader.u64()?;
         let length = reader.len(4)?;
-        let body = decode_body(kind, reader.take(length)?)?;
+        let body_start = reader.at;
+        reader.take(length)?;
         let body_end = reader.at;
-        let signature = reader.take(64)?;
+        let owned_wire: Arc<[u8]> = Arc::from(wire);
+        let body = decode_body(kind, &owned_wire, body_start..body_end)?;
+        reader.take(64)?;
         reader.finish()?;
         let header = Header {
             network,
@@ -622,13 +643,16 @@ impl Record {
             _ => &actor[..32],
         };
         UnparsedPublicKey::new(&ED25519, key)
-            .verify(&signed_message(&wire[..body_end]), signature)
+            .verify(
+                &signed_message(&owned_wire[..body_end]),
+                &owned_wire[body_end..],
+            )
             .map_err(|_| Error::new("membership record signature failed"))?;
         Ok(Self {
-            id: Sha256::digest(wire),
+            id: Sha256::digest(&owned_wire),
             header: Arc::new(header),
             body: Arc::new(body),
-            wire: Arc::from(wire),
+            wire: owned_wire,
         })
     }
 
@@ -725,7 +749,7 @@ impl Record {
     /// names. The layout (`VERSION` 1) frames a record of a kind only a newer build writes as it
     /// frames any other, so a stream holding one still splits into its records' ids
     /// (`store::frames`). Nothing is verified: the parents are whatever the bytes say.
-    #[cfg(unix)]
+    #[cfg(all(test, unix))]
     pub(super) fn frame_prefix(wire: &[u8]) -> Result<(usize, Vec<RecordId>)> {
         let (len, parents) = Self::frame_header(wire)?;
         if wire.len() < len {
@@ -1080,8 +1104,8 @@ fn encode_text(out: &mut Vec<u8>, text: &str) {
     }
 }
 
-fn decode_body(kind: Kind, bytes: &[u8]) -> Result<Body> {
-    let mut reader = Reader::new(bytes);
+fn decode_body(kind: Kind, wire: &Arc<[u8]>, range: std::ops::Range<usize>) -> Result<Body> {
+    let mut reader = Reader::new(&wire[range.clone()]);
     let body = match kind {
         Kind::Genesis => {
             let signer = reader.array::<32>()?;
@@ -1123,7 +1147,7 @@ fn decode_body(kind: Kind, bytes: &[u8]) -> Result<Body> {
             if !(1..=entries::MAX_WRAP_CAPSULE).contains(&len) {
                 return Err(Error::new("membership Wrap capsule length out of bounds"));
             }
-            let capsule = reader.take(len)?.to_vec();
+            let capsule = reader.payload(len, wire, range.start)?;
             Body::Wrap {
                 epoch,
                 recipient,
@@ -1138,7 +1162,7 @@ fn decode_body(kind: Kind, bytes: &[u8]) -> Result<Body> {
             if !(17..=entries::MAX_PUT_CIPHERTEXT).contains(&len) {
                 return Err(Error::new("membership Put ciphertext length out of bounds"));
             }
-            let ciphertext = reader.take(len)?.to_vec();
+            let ciphertext = reader.payload(len, wire, range.start)?;
             Body::Put {
                 audience,
                 epoch,
@@ -1156,7 +1180,7 @@ fn decode_body(kind: Kind, bytes: &[u8]) -> Result<Body> {
                     "membership Delete ciphertext length out of bounds",
                 ));
             }
-            let ciphertext = reader.take(len)?.to_vec();
+            let ciphertext = reader.payload(len, wire, range.start)?;
             Body::Delete {
                 audience,
                 epoch,
@@ -1286,6 +1310,16 @@ impl<'a> Reader<'a> {
         self.take(N)?
             .try_into()
             .map_err(|_| Error::new("membership record is truncated"))
+    }
+    fn payload(&mut self, length: usize, wire: &Arc<[u8]>, base: usize) -> Result<Payload> {
+        let start = base
+            .checked_add(self.at)
+            .ok_or_else(|| Error::new("membership record is too long"))?;
+        self.take(length)?;
+        let end = base
+            .checked_add(self.at)
+            .ok_or_else(|| Error::new("membership record is too long"))?;
+        Payload::in_wire(wire, start..end)
     }
     fn byte(&mut self) -> Result<u8> {
         Ok(self.array::<1>()?[0])
@@ -1953,7 +1987,7 @@ impl Log {
     }
 
     /// The bytes of every held record: what the records of `order` take on the wire, and what a
-    /// server's records file of complete records holds (`server::post_records`).
+    /// server's records file of complete records holds (`server::apply_records`).
     pub(crate) const fn held_bytes(&self) -> usize {
         self.held_bytes
     }

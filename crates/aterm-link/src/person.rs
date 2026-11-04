@@ -101,7 +101,7 @@ pub fn parse(verb: &str, rest: &[String]) -> Result<Option<PersonCmd>, String> {
                 return Err(
                     "halt needs a reason (`halt --cap-file <cap> main is broken`) or `off`"
                         .to_string(),
-                )
+                );
             }
             [off] if off == "off" => Act::Halt(None),
             reason => Act::Halt(Some(reason.join(" "))),
@@ -173,7 +173,7 @@ fn parse_post(words: &[String], literal_at: Option<usize>) -> Result<Act, String
 }
 
 /// Run one person verb against the broker `cfg` names using the person's cap files.
-#[must_use]
+#[must_use = "handle or propagate the command's exit status"]
 pub fn main(verb: &str, cmd: &PersonCmd, cfg: &Config) -> ExitCode {
     let person = match person_of(&cmd.cap_files, &cfg.fleet) {
         Ok(p) => p,
@@ -443,7 +443,7 @@ fn inbox(
             None => {
                 return Err(io::Error::other(
                     "the broker closed the inbox before it caught up; nothing was marked read",
-                ))
+                ));
             }
             Some(Event::Mark { next, .. }) if next >= end => break,
             Some(Event::Mark { .. }) => {}
@@ -654,7 +654,7 @@ fn absolute(path: &str) -> PathBuf {
 }
 
 /// `aterm fabric mint-for h-<name>|a-<name> [--out <cap>] [--fleet <F>] [--expires <N>d|<N>h]`.
-#[must_use]
+#[must_use = "handle or propagate the command's exit status"]
 pub fn mint_for(opts: &MintForOpts) -> ExitCode {
     let person = &opts.person;
     if !is_person_id(person) {
@@ -706,7 +706,13 @@ pub fn mint_for(opts: &MintForOpts) -> ExitCode {
     let exp = opts
         .expires
         .map(|lifetime| crate::now_ms().saturating_add(lifetime));
-    let ring = crate::enable::person_grants(&fleet, person);
+    let ring = match astream_cap::GrantCeiling::aterm_person_ring(&fleet, person) {
+        Ok(ceiling) => ceiling.rules(),
+        Err(e) => {
+            eprintln!("aterm fabric mint-for: {e}");
+            return ExitCode::from(2);
+        }
+    };
     let mut lines = String::new();
     for grant in &ring {
         let grant = exp.map_or_else(|| grant.clone(), |exp| with_expiry(grant, exp));
@@ -957,7 +963,7 @@ mod tests {
     #[test]
     fn a_person_ring_stamped_with_an_expiry_reads_its_expiry() {
         let exp = 1_800_000_000_000u64;
-        let stamped: Vec<String> = crate::enable::person_grants("lab", "h-andrew")
+        let stamped: Vec<String> = crate::enable::person_rules("lab", "h-andrew")
             .iter()
             .map(|g| with_expiry(g, exp))
             .collect();
@@ -1108,7 +1114,7 @@ mod tests {
         let socket = dir.path().join("bus.sock");
         let server = broker.serve(&socket).unwrap();
         let cap_path = dir.path().join("person.cap");
-        let mut grants = crate::enable::person_grants("f", person);
+        let mut grants = crate::enable::person_rules("f", person);
         if legacy_halt {
             grants.push(format!("rw,p={person}:/f/f/fleet/{person}/>"));
             grants.sort();
@@ -1709,7 +1715,7 @@ mod tests {
     fn only_a_humans_ring_can_publish_a_halt() {
         let secret = [7u8; 32];
         let can = |person: &str, subject: &str| {
-            crate::enable::person_grants("f1", person).iter().any(|g| {
+            crate::enable::person_rules("f1", person).iter().any(|g| {
                 let cap = astream_cap::mint(&secret, g).expect("mint");
                 astream_cap::grants_publish(
                     &secret,
@@ -1740,12 +1746,12 @@ mod tests {
             crate::bridge::write_owner_only(&path, lines);
             path.to_string_lossy().into_owned()
         };
-        let person = write("h.cap", &crate::enable::person_grants("f1", "h-andrew"));
+        let person = write("h.cap", &crate::enable::person_rules("f1", "h-andrew"));
         let node = write(
             "n.cap",
-            &crate::enable::node_grants("f1", "n-00000000000000aa"),
+            &crate::enable::node_rules("f1", "n-00000000000000aa"),
         );
-        let other = write("o.cap", &crate::enable::person_grants("f1", "h-other"));
+        let other = write("o.cap", &crate::enable::person_rules("f1", "h-other"));
         assert_eq!(
             person_of(&[node.clone(), person.clone()], "f1"),
             Ok("h-andrew".to_string())

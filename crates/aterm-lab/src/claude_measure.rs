@@ -1251,7 +1251,7 @@ fn admitted_by(
         return Ok(Vec::new());
     }
     let from = one_transcript(&run2.world.dir.join("transcripts"))?;
-    let source = std::fs::read_to_string(&from).map_err(|e| {
+    let source = crate::util::read_regular_text(&from).map_err(|e| {
         Refusal::new(
             Class::Transcripts,
             format!("{LEG}: {}: {e}", from.display()),
@@ -1315,7 +1315,7 @@ pub fn cmd_claude_measure(args: &[String]) -> Res {
     gate(Class::ProofRed, &run1)?;
     let world1 = run1.world.dir.clone();
     let from = one_transcript(&world1.join("transcripts")).map_err(kept(&world1))?;
-    let source = std::fs::read_to_string(&from).map_err(|e| {
+    let source = crate::util::read_regular_text(&from).map_err(|e| {
         kept(&world1)(Refusal::new(
             Class::Transcripts,
             format!("{LEG}: {}: {e}", from.display()),

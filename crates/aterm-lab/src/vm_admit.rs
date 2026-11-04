@@ -353,7 +353,7 @@ impl Booter {
     /// The booter the record at `path` names.
     #[must_use]
     pub fn read(path: &Path) -> Option<Booter> {
-        Booter::parse(&std::fs::read_to_string(path).ok()?)
+        Booter::parse(&crate::util::read_regular_text(path).ok()?)
     }
 
     /// Write this record at `path`, whole or not at all (staged beside it, then renamed over).

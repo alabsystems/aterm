@@ -212,8 +212,10 @@ impl GrantCeiling {
         Self::parse(&lines)
     }
 
-    /// Construct the canonical 8-grant `aterm-link` node ring ceiling for `(fleet, node)`
-    /// (`DESIGN-aterm-fabric.md` §8.2; `aterm-link` `SPECS.md` `node-and-person-grants`).
+    /// Construct the canonical 6-grant `aterm-link` node ring ceiling for `(fleet, node)`
+    /// (`DESIGN-aterm-fabric.md` §8.2). aterm mints a node's ring from its [`Self::rules`]
+    /// and checks a ring it holds against it (§14 Open Question 5). No grant reaches
+    /// `/f/<fleet>/term/`: the drive face those grants served is cut.
     pub fn aterm_node_ring(fleet: &str, node: &str) -> Result<Self, String> {
         validate_fleet_segment(fleet)?;
         if !node.starts_with("n-") || !valid_principal(node) {
@@ -228,8 +230,6 @@ impl GrantCeiling {
             format!("rw,p={node}:/f/{fleet}/in/*/*/{node}/*"),
             format!("ro:/f/{fleet}/in/{node}/>"),
             format!("rw,p={node}:/f/{fleet}/cur/{node}/>"),
-            format!("ro:/f/{fleet}/term/{node}/>"),
-            format!("rw,p={node}:/f/{fleet}/term/{node}/*/screen"),
         ];
         Self::parse(&rules)
     }
@@ -237,6 +237,7 @@ impl GrantCeiling {
     /// Construct the canonical `aterm-link` person ring ceiling for `(fleet, person)`:
     /// 6 grants for a human (`h-*`, including `/f/<fleet>/fleet/<person>/>` halt authority)
     /// and 5 grants for an agent/service (`a-*`, never permitted to write a fleet halt).
+    /// aterm mints a person's ring from its [`Self::rules`].
     pub fn aterm_person_ring(fleet: &str, person: &str) -> Result<Self, String> {
         validate_fleet_segment(fleet)?;
         if (!person.starts_with("h-") && !person.starts_with("a-")) || !valid_principal(person) {
@@ -266,6 +267,20 @@ impl GrantCeiling {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// The ceiling's grant rules in order, each as it was parsed (trimmed): the grants a
+    /// minter issues for the ring this ceiling bounds, so a ring minted from them is the
+    /// ceiling exactly and [`Self::check_ring`] accepts it.
+    #[must_use]
+    pub fn rules(&self) -> Vec<String> {
+        let mut rules = Vec::with_capacity(self.entries.len());
+        let mut rest = self.entries.as_slice();
+        while let [entry, ref tail @ ..] = rest {
+            rules.push(entry.raw.clone());
+            rest = tail;
+        }
+        rules
     }
 
     /// Verify that a single `grant` string is monotonically subsumed by at least one
@@ -405,7 +420,7 @@ mod tests {
     fn aterm_node_ring_accepts_exact_and_attenuated_ring_and_rejects_god_cap() {
         let node = "n-0123456789abcdef";
         let ceiling = GrantCeiling::aterm_node_ring("f1", node).unwrap();
-        assert_eq!(ceiling.len(), 8);
+        assert_eq!(ceiling.len(), 6);
 
         let exact_grants = [
             format!("rw,p={node}:/f/f1/pub/{node}/>"),
@@ -414,10 +429,10 @@ mod tests {
             format!("rw,p={node}:/f/f1/in/*/*/{node}/*"),
             format!("ro:/f/f1/in/{node}/>"),
             format!("rw,p={node}:/f/f1/cur/{node}/>"),
-            format!("ro:/f/f1/term/{node}/>"),
-            format!("rw,p={node}:/f/f1/term/{node}/*/screen"),
         ];
-        let mut ring: Vec<Capability> = exact_grants
+        assert_eq!(ceiling.rules(), exact_grants, "the rules, in mint order");
+        let mut ring: Vec<Capability> = ceiling
+            .rules()
             .iter()
             .map(|g| mint(SECRET, g).unwrap())
             .collect();
@@ -426,23 +441,38 @@ mod tests {
             .check_authenticated_ring(SECRET, &ring, 1_700_000_000_000)
             .unwrap();
 
-        // Offline Macaroon attenuation with an expiry narrowing one session's screen stays valid.
+        // Offline Macaroon attenuation with an expiry narrowing one sender's lane stays valid.
         let narrowed = attenuate_offline(
-            &ring[7],
-            &format!("rw,p={node},exp=1900000000000:/f/f1/term/{node}/s-1/screen"),
+            &ring[3],
+            &format!("rw,p={node},exp=1900000000000:/f/f1/in/n-peer/s-1/{node}/ask"),
             1_700_000_000_000,
         )
         .unwrap();
-        ring[7] = narrowed;
+        ring[3] = narrowed;
         ceiling
             .check_authenticated_ring(SECRET, &ring, 1_700_000_000_000)
             .unwrap();
+
+        // The cut drive face's grants are outside the ring: neither the screen write nor the
+        // read of the node's term subtree.
+        for term in [
+            format!("rw,p={node}:/f/f1/term/{node}/*/screen"),
+            format!("ro:/f/f1/term/{node}/>"),
+        ] {
+            let err = ceiling
+                .check_ring(&[mint(SECRET, &term).unwrap()])
+                .unwrap_err();
+            assert!(
+                matches!(err.kind, CeilingViolationKind::ExceedsCeiling { .. }),
+                "{term}: {err}"
+            );
+        }
 
         // Unbound fleet-root god cap (`DESIGN-aterm-fabric` §14 Q5) is refused by name!
         let mut with_god = ring.clone();
         with_god.push(mint(SECRET, "rw:/f/f1/>").unwrap());
         let err = ceiling.check_ring(&with_god).unwrap_err();
-        assert_eq!(err.index, 8);
+        assert_eq!(err.index, 6);
         assert!(matches!(
             err.kind,
             CeilingViolationKind::UnboundGodCap { .. }
@@ -484,6 +514,36 @@ mod tests {
         let agent_ceiling = GrantCeiling::aterm_person_ring("lab", "a-worker").unwrap();
         assert_eq!(human_ceiling.len(), 6);
         assert_eq!(agent_ceiling.len(), 5);
+        assert_eq!(
+            human_ceiling.rules(),
+            [
+                "rw,p=h-alice:/f/lab/fleet/h-alice/>",
+                "rw,p=h-alice:/f/lab/in/*/*/h-alice/*",
+                "rw,p=h-alice:/f/lab/pub/p/h-alice/>",
+                "ro:/f/lab/in/p/h-alice/>",
+                "rw,p=h-alice:/f/lab/cur/p/h-alice/>",
+                "ro:/f/lab/pub/>",
+            ],
+            "a human's rules, in mint order"
+        );
+        assert_eq!(
+            agent_ceiling.rules(),
+            human_ceiling.rules()[1..]
+                .iter()
+                .map(|r| r.replace("h-alice", "a-worker"))
+                .collect::<Vec<_>>(),
+            "an agent's are a human's without the halt grant"
+        );
+        for ceiling in [&human_ceiling, &agent_ceiling] {
+            let minted: Vec<Capability> = ceiling
+                .rules()
+                .iter()
+                .map(|g| mint(SECRET, g).unwrap())
+                .collect();
+            ceiling
+                .check_authenticated_ring(SECRET, &minted, 1_700_000_000_000)
+                .unwrap();
+        }
 
         let h_halt = mint(SECRET, "rw,p=h-alice:/f/lab/fleet/h-alice/halt").unwrap();
         human_ceiling.check_ring(&[h_halt]).unwrap();
@@ -497,6 +557,24 @@ mod tests {
 
         let a_mail = mint(SECRET, "rw,p=a-worker:/f/lab/in/n-1/s-1/a-worker/ask").unwrap();
         agent_ceiling.check_ring(&[a_mail]).unwrap();
+    }
+
+    /// `rules` renders each rule as parsed (trimmed), in order, and a ceiling parsed back from
+    /// them has the same rules.
+    #[test]
+    fn rules_render_the_parsed_grants_in_order() {
+        let ceiling = GrantCeiling::parse_text(
+            "# comment\n  ro:/f/a/pub/>  \n\nrw,p=a-b:/f/a/in/*/*/a-b/*\n",
+        )
+        .unwrap();
+        assert_eq!(
+            ceiling.rules(),
+            ["ro:/f/a/pub/>", "rw,p=a-b:/f/a/in/*/*/a-b/*"]
+        );
+        assert_eq!(
+            GrantCeiling::parse(&ceiling.rules()).unwrap().rules(),
+            ceiling.rules()
+        );
     }
 
     #[test]

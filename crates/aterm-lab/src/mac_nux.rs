@@ -2713,7 +2713,7 @@ fn host_dns_sd(file: &Path, args: &[String], secs: u64) -> Result<String, Fail> 
     stop::sleep(Duration::from_secs(secs))?;
     let _ = crate::sys::kill_group(i32::try_from(child.id()).unwrap_or(0), libc::SIGTERM);
     crate::mac::reap_within(&mut child, STEP);
-    Ok(std::fs::read_to_string(file).unwrap_or_default())
+    Ok(crate::util::read_regular_text(file).unwrap_or_default())
 }
 
 /// What a step changed in the account: the processes init and setup restart, the Dock's pins,

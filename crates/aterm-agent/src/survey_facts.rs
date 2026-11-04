@@ -881,7 +881,7 @@ mod tests {
         use crate::harness::cli::SurveyAccount;
         let row = |label: &str, condition: Condition| SurveyAccount {
             label: label.to_owned(),
-            class: Class::Dedicated,
+            class: Class::Preferred,
             enrolled: condition != Condition::NotEnrolled,
             condition,
             five_hour_pct: Some(10),

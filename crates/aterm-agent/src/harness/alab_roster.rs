@@ -13,13 +13,23 @@
 //! - [`fleet_for`]: the `alab` source, the fleet a sync of one CLI reads: this Mac's preferred
 //!   accounts, preferred first in rank order. A preference orders a pool and never limits it, so
 //!   the sync keeps every row already on this Mac whatever the lab says of it ([`retain`]) and
-//!   adds only accounts this Mac prefers; nothing here drops, refuses or signs out a row.
+//!   adds only accounts this Mac prefers, and the default login's account under its lab label;
+//!   nothing here drops, refuses or signs out a row.
+//! - [`asked_row`]: an account asked for by name (`accounts add <lab label|account key>`), which
+//!   joins this Mac's roster for that request and writes no preference.
+//! - [`names_this_mac`]: where it holds, the harness reads no sheet: the upkeep's triggers
+//!   ([`sync_due`], [`fleet_digest`]), the mailbox labels ([`mailbox_labels`]) and the mail
+//!   routes ([`mail_targets`], [`mailbox_of`]) come from the lab.
 //! - [`migrate`]: once this Mac's registry inventory has equalled a peer's ([`Lab::settled`]),
 //!   each row whose account the lab calls by another label takes that label, its login
 //!   directory pinned where it is, its records moved with it ([`accounts::move_accounts`]) in one
 //!   crash-safe commit (the sync receipt, `accounts_sync_commit.rs`).
 //! - [`mail_targets`]: the addresses an alias's auth codes arrive at, for the mail routes, and
-//!   [`legacy_labels`]: the labels a renamed account's label-keyed sign-in secrets still name.
+//!   [`mailbox_labels`]: the labels (each lab label, and the legacy label a renamed row's
+//!   label-keyed sign-in secrets still name) the mailbox config maps to addresses.
+//! - [`holdings`]: what this Mac runs that it does not prefer, from its rosters, which the
+//!   journal publishes as `place` rows; [`Lab::places`] is what every Mac's rows say, and
+//!   [`Lab::holders`] reads them beside the preferences ("which Macs hold A"), never as a limit.
 
 use super::accounts::{self, Class, Cli, Roster, Row, Store, Vendor};
 use super::accounts_sync::{self, FleetAccount, FleetRoster};
@@ -45,6 +55,26 @@ pub struct Lab {
     /// Each address with an `alias_of` link, lower-cased, to the live addresses its auth codes
     /// arrive at, nearest first ([`mail_targets`]).
     pub aliases: std::collections::BTreeMap<String, Vec<String>>,
+    /// Each address, lower-cased, to the login (lower-cased) of the mailbox its codes arrive in,
+    /// where the lab decides that mailbox (its `mailbox` column, through `alias_of`, or a
+    /// mailbox's own address list; never a route or a guess) and this Mac can name the
+    /// mailbox's login (the importer's mailbox keys and `ai-mailbox.toml`, an admin Mac's alone):
+    /// [`mailbox_of`].
+    pub mailboxes: std::collections::BTreeMap<String, String>,
+    /// What the journal's live `place` rows say each Mac runs that it does not prefer, where a
+    /// reader asks for them (the exports, `aterm db alab export`); the lab every process caches
+    /// for its syncs leaves this empty, since none of them reads it.
+    pub places: Placements,
+}
+
+/// What the journal's live `place` rows say (design §0, §4.17, §7): which Macs run an account
+/// they do not prefer, beside the preferences. A place row says what a Mac does, never what it
+/// may do: nothing reads one as a limit.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Placements {
+    /// Each account key to the machines, by label and smaller number first, whose live place rows
+    /// say they run it, each with its reason (`fill`, `borrow`, `stranded`, `probation`).
+    pub by_account: std::collections::BTreeMap<String, Vec<(String, String)>>,
 }
 
 /// One account of a pooled CLI.
@@ -92,6 +122,35 @@ impl LabAccount {
 }
 
 impl Lab {
+    /// The order a row of `account` takes on this Mac: [`Class::Preferred`] where this Mac
+    /// prefers it, else [`Class::Pool`]. An order alone: several Macs may prefer one account.
+    #[must_use]
+    pub fn class_of(&self, account: &LabAccount) -> Class {
+        match self.me.as_deref() {
+            Some(me) if account.preferred_on(me).is_some() => Class::Preferred,
+            _ => Class::Pool,
+        }
+    }
+
+    /// Which Macs hold `account` (§7), by label: those that prefer it, in its preference order,
+    /// then those whose live place rows say they run it. Neither half is a limit.
+    #[must_use]
+    pub fn holders(&self, account: &LabAccount) -> Vec<String> {
+        let mut out: Vec<String> = account.preferred.iter().map(|(m, _)| m.clone()).collect();
+        for (machine, _) in self
+            .places
+            .by_account
+            .get(&account.pk)
+            .into_iter()
+            .flatten()
+        {
+            if !out.contains(machine) {
+                out.push(machine.clone());
+            }
+        }
+        out
+    }
+
     /// `cli`'s accounts.
     pub fn of(&self, cli: Cli) -> impl Iterator<Item = &LabAccount> {
         self.accounts.iter().filter(move |a| a.cli == cli)
@@ -112,6 +171,13 @@ pub trait Source: Send + Sync {
     /// The lab as last projected, at once; `None` while nothing is projected, or where the
     /// registry is not held here or the roster source is turned off.
     fn lab(&self) -> Option<Arc<Lab>>;
+
+    /// Whether no projection is held because reading the registry failed, where a projection
+    /// named this Mac before: the lab may still name it, so nothing reads the sheet or labels a row after a machine until
+    /// a read succeeds ([`pending`]).
+    fn pending(&self) -> bool {
+        false
+    }
 }
 
 static INSTALLED: OnceLock<Box<dyn Source>> = OnceLock::new();
@@ -124,6 +190,35 @@ pub fn install(source: Box<dyn Source>) -> bool {
 #[cfg(test)]
 thread_local! {
     static OVERRIDE: std::cell::RefCell<Option<Arc<Lab>>> = const { std::cell::RefCell::new(None) };
+    static PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the lab this process may hold could not be read yet ([`Source::pending`]): a Mac the
+/// lab may name then reads no sheet ([`chosen`] refuses a sync with no source named), so a
+/// failed first look never labels a row after a machine that a later look would have named.
+#[must_use]
+pub fn pending() -> bool {
+    #[cfg(test)]
+    if PENDING.with(std::cell::Cell::get) {
+        return true;
+    }
+    current().is_none() && INSTALLED.get().is_some_and(|source| source.pending())
+}
+
+/// Run `f` with this thread's lab [`pending`].
+#[cfg(test)]
+pub(crate) fn while_pending<T>(f: impl FnOnce() -> T) -> T {
+    PENDING.with(|cell| cell.set(true));
+    let out = f();
+    PENDING.with(|cell| cell.set(false));
+    out
+}
+
+/// Whether the lab this process holds names this Mac: its facts row binds a live machine. Where
+/// it does, the harness reads no sheet (§0: the sheet is the importer's input alone).
+#[must_use]
+pub fn names_this_mac() -> bool {
+    current().is_some_and(|lab| lab.me.is_some())
 }
 
 /// The lab as this process holds it now.
@@ -148,8 +243,11 @@ pub(crate) fn with_lab<T>(lab: Lab, f: impl FnOnce() -> T) -> T {
 /// The `alab` fleet of `cli` for this Mac ([`SOURCE`]): every account it prefers that may join,
 /// smaller rank first, each under the label `existing` already gives it (a row is renamed only
 /// by [`migrate`], never by a sync), else the lab's. `None` where the lab names no machine for
-/// this Mac. Every row has this Mac alone as its machine and [`Class::Dedicated`] (preferred
-/// here); a row this Mac has that the fleet does not list stays, by [`retain`].
+/// this Mac. Every row has this Mac alone as its machine and [`Class::Preferred`]; a row this Mac
+/// has that the fleet does not list stays, by [`retain`]. Every other account of `cli` the lab
+/// knows that may join is in [`FleetRoster::known`] under its lab label, so the default login's account is
+/// named by the lab ([`accounts_sync::build_machine_roster`]) and never by a machine or a slot
+/// read from its address; nothing adds one of those unasked.
 #[must_use]
 #[cfg_attr(
     any(test, debug_assertions),
@@ -157,6 +255,22 @@ pub(crate) fn with_lab<T>(lab: Lab, f: impl FnOnce() -> T) -> T {
         machine = "AlabCells",
         action = "Sync",
         project = "aterm_agent::harness::alab_roster::tests::preference_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "FleetMachineAssignment",
+        action = "Sync",
+        project = "aterm_agent::harness::alab_roster::assignment_tests::order_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "FleetMachineAssignment",
+        action = "SyncLabels",
+        project = "aterm_agent::harness::alab_roster::assignment_tests::labels_transition"
     )
 )]
 pub fn fleet_for(lab: &Lab, cli: Cli, existing: Option<&Roster>) -> Option<FleetRoster> {
@@ -192,24 +306,45 @@ pub fn fleet_for(lab: &Lab, cli: Cli, existing: Option<&Roster>) -> Option<Fleet
         {
             continue;
         }
-        accounts.push(FleetAccount {
-            label,
-            machines: vec![me.clone()],
-            class: Class::Dedicated,
-            email: account.email.clone(),
-            browser: account.browser.clone(),
-            vendor: match cli {
-                Cli::Claude => Vendor::default(),
-                _ => account.vendor,
-            },
-        });
+        accounts.push(fleet_account(account, cli, &me, label, Class::Preferred));
     }
+    // Only an account that may be signed in names the default login's row: a paused, retired or
+    // barred one joins no roster unasked, as [`asked_row`] refuses it asked (a row it already has
+    // stays, by [`retain`]).
+    let known = lab
+        .of(cli)
+        .filter(|account| account.joinable && account.preferred_on(&me).is_none())
+        .filter(|account| accounts::label_refusal(&account.label).is_none())
+        .map(|account| fleet_account(account, cli, &me, account.label.clone(), Class::Pool))
+        .collect();
     Some(FleetRoster {
         source: SOURCE.to_owned(),
         accounts,
         alab: Some(me),
+        known,
         ..FleetRoster::default()
     })
+}
+
+/// `account` as a fleet row of `me` under `label`.
+fn fleet_account(
+    account: &LabAccount,
+    cli: Cli,
+    me: &str,
+    label: String,
+    class: Class,
+) -> FleetAccount {
+    FleetAccount {
+        label,
+        machines: vec![me.to_owned()],
+        class,
+        email: account.email.clone(),
+        browser: account.browser.clone(),
+        vendor: match cli {
+            Cli::Claude => Vendor::default(),
+            _ => account.vendor,
+        },
+    }
 }
 
 /// The `alab` fleet a sync of `cli` reads, given the source it was `named` (none, or a path or
@@ -217,12 +352,15 @@ pub fn fleet_for(lab: &Lab, cli: Cli, existing: Option<&Roster>) -> Option<Fleet
 /// the lab's fleet or a refusal where no lab names this Mac; with another source named, or for
 /// Claude Code a source the owner set in `config` (`[fleet] accounts_source`), none, so that
 /// source is read; with none named, the lab's fleet ahead of every other default once the lab
-/// names this Mac and either prefers an account here or this Mac already keeps rows (a new Mac
-/// the lab says nothing of yet keeps reading what it always read). The roster is read without
-/// the lock, only to keep each account's label; the sync reads it again under the lock.
+/// names this Mac, even one that prefers nothing here: an empty lab roster stays empty (a sync
+/// keeps every row the roster has and adds none), and no legacy discovery labels a row after a
+/// machine or reads a slot from an address on a Mac the lab names. A Mac the lab does not name
+/// keeps reading what it always read. The roster is read without the lock, only to keep each
+/// account's label; the sync reads it again under the lock.
 ///
 /// # Errors
-/// [`SOURCE`] was named and no lab names this Mac.
+/// [`SOURCE`] was named and no lab names this Mac; or no other source was named and the lab is
+/// [`pending`], so whether it names this Mac is not known.
 pub(super) fn chosen(
     cli: Cli,
     roster_path: Option<&Path>,
@@ -239,6 +377,13 @@ pub(super) fn chosen(
     }
     let existing = roster_path.and_then(|path| Roster::load_for(cli, path).ok());
     let fleet = current().and_then(|lab| fleet_for(&lab, cli, existing.as_ref()));
+    if fleet.is_none() && pending() {
+        return Err(
+            "the lab registry is held here but could not be read yet, so this Mac may be one it \
+             names: nothing was synced (no sheet is read meanwhile); a later sync reads it again"
+                .to_owned(),
+        );
+    }
     if named.is_some() {
         return fleet.map(Some).ok_or_else(|| {
             "the lab registry names no machine for this Mac yet (its facts row binds none, or \
@@ -246,15 +391,149 @@ pub(super) fn chosen(
                 .to_owned()
         });
     }
-    Ok(fleet.filter(|fleet| {
-        !fleet.accounts.is_empty() || existing.is_some_and(|roster| !roster.rows.is_empty())
+    Ok(fleet)
+}
+
+/// The roster row `name` asks for (§0, §7: "any account asked for by name"): the one account of
+/// `cli` the lab this process holds calls `name` (its label, legacy label or account key `ac-…`;
+/// an address is never a name), under its lab label, with its address, provider identity,
+/// browser and vendor keys and its derived order. `accounts add` writes it to this Mac's roster
+/// and no preference anywhere, and every later sync keeps it, as it keeps every row a Mac has.
+/// `None` where no lab names this Mac or no account of `cli` has that name, so `name` is a new
+/// label as it always was.
+///
+/// # Errors
+/// Several accounts have that name (a label is unique only as a finding), or the account may
+/// not be signed in (paused, broken, banned or retired), so a sign-in nobody may try is never
+/// set up.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "FleetMachineAssignment",
+        action = "Ask",
+        project = "aterm_agent::harness::alab_roster::assignment_tests::order_transition"
+    )
+)]
+pub fn asked_row(cli: Cli, name: &str) -> Option<Result<Row, String>> {
+    let lab = current()?;
+    lab.me.as_ref()?;
+    let name = name.trim();
+    let mut found = lab.of(cli).filter(|account| {
+        account.pk == name || account.label == name || account.legacy_label.as_deref() == Some(name)
+    });
+    let account = match (found.next(), found.next()) {
+        (None, _) => return None,
+        (Some(account), None) => account,
+        (Some(_), Some(_)) => {
+            return Some(Err(format!(
+                "several {} accounts of the lab are called `{}`: name one by its account key",
+                cli.connector().product,
+                super::one_line(name, 64)
+            )));
+        }
+    };
+    if !account.joinable {
+        return Some(Err(format!(
+            "the lab's `{}` may not be signed in (it is paused, retired or barred), so it joins \
+             no roster",
+            account.label
+        )));
+    }
+    if let Some(why) = accounts::label_refusal(&account.label) {
+        return Some(Err(format!("the lab's label `{}` {why}", account.label)));
+    }
+    Some(Ok(Row {
+        label: account.label.clone(),
+        class: lab.class_of(account),
+        email: Some(account.email.clone()),
+        identity_email: account
+            .identity
+            .clone()
+            .filter(|_| matches!(cli, Cli::Claude | Cli::Codex)),
+        browser: account.browser.clone(),
+        vendor: match cli {
+            Cli::Claude => Vendor::default(),
+            _ => account.vendor,
+        },
+        ..Row::default()
     }))
+}
+
+/// Whether a sync of `cli`'s roster at `roster_path` would change it under the lab this process
+/// holds, read in memory with no sheet, fleet file or provider read: the lab names this Mac and
+/// prefers an account no row holds while the roster has room for it, or one whose row names
+/// another browser profile than the lab's, a row holds a hold an old pool file left, a row the
+/// lab knows stands in another order than its derived one, or, once the lab is [`Lab::settled`],
+/// a row would take its lab label ([`renames`], against `retained`). The upkeep's trigger where the lab
+/// names this Mac.
+#[must_use]
+pub fn sync_due(cli: Cli, roster_path: &Path, retained: impl Fn(&str) -> bool) -> bool {
+    let Some(lab) = current() else {
+        return false;
+    };
+    let existing = Roster::load_for(cli, roster_path).unwrap_or_default();
+    let Some(fleet) = fleet_for(&lab, cli, Some(&existing)) else {
+        return false;
+    };
+    // A preferred account no row holds is due only while the roster has room for it: one the
+    // cap leaves out ([`retain`]) would otherwise call for a sync at every upkeep.
+    let room = existing.rows.len() < accounts::MAX_ACCOUNTS;
+    fleet
+        .accounts
+        .iter()
+        .any(|account| match existing.row(&account.label) {
+            None => room,
+            // A sync writes the lab's browser profile into the row of an account it lists.
+            Some(row) => account.browser.is_some() && row.browser != account.browser,
+        })
+        || existing.rows.iter().any(|row| {
+            row.held_by.is_some()
+                || lab
+                    .account_of(cli, row)
+                    .is_some_and(|account| lab.class_of(account) != row.class)
+        })
+        || (lab.settled && !renames(&lab, cli, &existing, retained).moved.is_empty())
+}
+
+/// A digest of what a sync of `cli` reads from the lab this process holds: this Mac's label,
+/// whether the lab is settled, and every account of `cli` (key, labels, address, identity,
+/// vendor keys, whether it may join and the Macs that prefer it). The upkeep's sync inputs where
+/// the lab names this Mac, in place of the sheet's and fleet files' bytes; `None` where it does
+/// not.
+#[must_use]
+pub fn fleet_digest(cli: Cli) -> Option<[u8; 32]> {
+    let lab = current()?;
+    let me = lab.me.as_deref()?;
+    let mut hash = aterm_digest::Sha256::new();
+    hash.update(b"aterm-alab-fleet-v1");
+    let mut field = |value: &str| {
+        hash.update((value.len() as u64).to_be_bytes());
+        hash.update(value.as_bytes());
+    };
+    field(me);
+    field(if lab.settled { "settled" } else { "partial" });
+    for account in lab.of(cli) {
+        field(&account.pk);
+        field(&account.label);
+        field(account.legacy_label.as_deref().unwrap_or(""));
+        field(&account.email);
+        field(account.identity.as_deref().unwrap_or(""));
+        field(account.browser.as_deref().unwrap_or(""));
+        field(account.vendor.region.map_or("", |r| r.as_str()));
+        field(account.vendor.flow.map_or("", |f| f.as_str()));
+        field(if account.joinable { "joinable" } else { "held" });
+        for (machine, rank) in &account.preferred {
+            field(machine);
+            field(&rank.map_or_else(String::new, |rank| rank.to_string()));
+        }
+    }
+    Some(hash.finalize())
 }
 
 /// `roster`, a sync's rebuild from the `alab` fleet, with every row of `existing` it lost put
 /// back as it was (its label, login directory, address and keys), so a preference never drops a
-/// row; and each row the lab knows given its derived class: [`Class::Dedicated`] where `machine`
-/// prefers its account, else [`Class::Shared`], which a pool tries after the preferred ones. A
+/// row; and each row the lab knows given its derived order: [`Class::Preferred`] where `machine`
+/// prefers its account, else [`Class::Pool`], which a pool tries after the preferred ones. A
 /// row the lab does not know keeps its class. A row is matched by its account, and a rebuilt row
 /// holding an existing row's label under another address gives the label back to that row. No
 /// row keeps a `held_by`: nothing under the lab limits who runs an account.
@@ -267,6 +546,22 @@ pub(super) fn chosen(
         machine = "AlabCells",
         action = "Sync",
         project = "aterm_agent::harness::alab_roster::tests::preference_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "FleetMachineAssignment",
+        action = "Sync",
+        project = "aterm_agent::harness::alab_roster::assignment_tests::order_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "FleetMachineAssignment",
+        action = "SyncLabels",
+        project = "aterm_agent::harness::alab_roster::assignment_tests::labels_transition"
     )
 )]
 pub fn retain(
@@ -309,9 +604,9 @@ pub fn retain(
         row.held_by = None;
         if let Some(account) = lab.and_then(|lab| lab.account_of(cli, row)) {
             row.class = if account.preferred_on(machine).is_some() {
-                Class::Dedicated
+                Class::Preferred
             } else {
-                Class::Shared
+                Class::Pool
             };
         }
     }
@@ -353,7 +648,7 @@ pub fn retain(
     aterm_spec_anchor::spec_unmodeled(
         machine = "AlabCells",
         action = "Ask",
-        reason = "A person adding an account here is a roster row this Mac already has: the conformance test writes it into the roster the sync starts from."
+        reason = "A person asking for an account by name is `accounts add <lab label|account key>` ([`asked_row`]), which writes a roster row and no preference: the conformance test writes that row into the roster the sync starts from, and `an_account_asked_for_by_name_joins_with_no_preference` holds `asked_row` to it."
     )
 )]
 #[cfg_attr(
@@ -385,6 +680,14 @@ pub struct Migrated {
 /// config maps it to the account's address from the lab (`headless_oauth::mailbox_aliases`), so
 /// a row under any other label, whose secrets nothing would map, keeps its label. Pure.
 #[must_use]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "FleetMachineAssignment",
+        action = "Migrate",
+        project = "aterm_agent::harness::alab_roster::assignment_tests::labels_transition"
+    )
+)]
 pub fn renames(lab: &Lab, cli: Cli, roster: &Roster, retained: impl Fn(&str) -> bool) -> Migrated {
     let mut out = Migrated::default();
     for row in &roster.rows {
@@ -421,6 +724,14 @@ pub fn renames(lab: &Lab, cli: Cli, roster: &Roster, retained: impl Fn(&str) -> 
 /// The writer lock is held past `ladder`, an interrupted commit cannot be completed, the roster
 /// or the store cannot be read, or the moves are refused (a destination label still holds
 /// records): nothing is written.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "FleetMachineAssignment",
+        action = "Migrate",
+        project = "aterm_agent::harness::alab_roster::assignment_tests::labels_transition"
+    )
+)]
 pub fn migrate(
     lab: &Lab,
     cli: Cli,
@@ -504,36 +815,230 @@ pub(super) fn migrate_before_sync(
     }
 }
 
+/// What this Mac runs of `cli` that it does not prefer, from its `roster` and the lab: each row
+/// the lab knows as one account this Mac has no preference for, by account key, with the reason
+/// the journal's `place` row gives it (design §0, §4.17): `borrow` where another Mac prefers the
+/// account, else `fill` where it may be signed in (the default login, an account asked for by
+/// name, a row an earlier source gave this Mac), else `stranded` (the lab bars a sign-in: the row
+/// stays, as every row does). The journal says `probation` instead until it saw the account run
+/// or sign in here. A row the lab does not know, or one two accounts could be, is not reported.
+/// Empty where the lab names no machine for this Mac. Pure.
+#[must_use]
+pub fn holdings(lab: &Lab, cli: Cli, roster: &Roster) -> Vec<(String, &'static str)> {
+    let Some(me) = lab.me.as_deref() else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, &'static str)> = Vec::new();
+    for row in &roster.rows {
+        let Some(account) = lab.account_of(cli, row) else {
+            continue;
+        };
+        if account.preferred_on(me).is_some() || out.iter().any(|(pk, _)| *pk == account.pk) {
+            continue;
+        }
+        let why = if account.preferred.iter().any(|(machine, _)| machine != me) {
+            "borrow"
+        } else if account.joinable {
+            "fill"
+        } else {
+            "stranded"
+        };
+        out.push((account.pk.clone(), why));
+    }
+    out
+}
+
+/// The login of the mailbox the lab says `email`'s codes arrive in ([`Lab::mailboxes`]), which
+/// `mailbox_routes::resolve_index` takes before any `receives` pattern; `None` where no lab is
+/// held or it cannot name one here.
+#[must_use]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "FleetMachineAssignment",
+        action = "Resolve",
+        project = "aterm_agent::harness::alab_roster::assignment_tests::mail_transition"
+    )
+)]
+pub fn mailbox_of(email: &str) -> Option<String> {
+    current()?
+        .mailboxes
+        .get(&email.trim().to_ascii_lowercase())
+        .cloned()
+}
+
 /// The addresses whose mail routes receive `email`'s auth codes besides its own: the lab's
 /// `alias_of` chain, nearest first (§0: an alias is linked with the address its auth login is
 /// received at). Empty where no lab is held.
 #[must_use]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "FleetMachineAssignment",
+        action = "Resolve",
+        project = "aterm_agent::harness::alab_roster::assignment_tests::mail_transition"
+    )
+)]
 pub fn mail_targets(email: &str) -> Vec<String> {
     current()
         .and_then(|lab| lab.aliases.get(&email.to_ascii_lowercase()).cloned())
         .unwrap_or_default()
 }
 
-/// Each `(cli, legacy label, login address)` of the lab this process holds where the account's
-/// label is no longer its legacy one: what the mailbox config maps a `<label>` password, mailbox
-/// password or TOTP seed through after [`migrate`] renamed the row ([`renames`] moves only a row
-/// under its legacy label). Empty where no lab is held.
+/// Each `(cli, label, login address)` the mailbox config maps a `<label>` password, mailbox
+/// password or TOTP seed through, from the lab this process holds where it names this Mac: every
+/// account's lab label, and its legacy label where that differs, since [`migrate`] renamed a row
+/// only from its legacy label ([`renames`]) and the secrets kept that name. Empty where no lab
+/// names this Mac, which then reads its sheet and fleet files as it always did.
 #[must_use]
-pub fn legacy_labels() -> Vec<(Cli, String, String)> {
-    current()
-        .map(|lab| {
-            lab.accounts
-                .iter()
-                .filter_map(|account| {
-                    let legacy = account.legacy_label.as_deref()?;
-                    (legacy != account.label)
-                        .then(|| (account.cli, legacy.to_owned(), account.email.clone()))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+pub fn mailbox_labels() -> Vec<(Cli, String, String)> {
+    let Some(lab) = current().filter(|lab| lab.me.is_some()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for account in &lab.accounts {
+        out.push((account.cli, account.label.clone(), account.email.clone()));
+        if let Some(legacy) = account
+            .legacy_label
+            .as_deref()
+            .filter(|legacy| *legacy != account.label)
+        {
+            out.push((account.cli, legacy.to_owned(), account.email.clone()));
+        }
+    }
+    out
 }
+
+/// `FleetMachineAssignment`'s steps no code here takes: which area a walk checks, and the owner's
+/// verbs, a Mac's own rows, the inventory round and the mailbox routes, each an input
+/// `assignment_tests` sets in the lab, roster or routes the code then reads.
+#[cfg(any(test, debug_assertions))]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "FleetMachineAssignment",
+        action = "ChooseFile",
+        reason = "The model's choice of the law one walk checks: no code chooses it. fleet_assignment_conforms_and_unsafe_coercions_are_detected takes the file area's steps."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "FleetMachineAssignment",
+        action = "ChooseOrder",
+        reason = "The model's choice of the law one walk checks: no code chooses it. the_lab_sync_orders_by_this_macs_preference_and_limits_nothing takes the order area's steps."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "FleetMachineAssignment",
+        action = "ChooseLabels",
+        reason = "The model's choice of the law one walk checks: no code chooses it. labels_come_from_the_lab_and_only_a_legacy_label_is_renamed takes the label area's steps."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "FleetMachineAssignment",
+        action = "ChooseMail",
+        reason = "The model's choice of the law one walk checks: no code chooses it. an_alias_resolves_to_one_effective_mailbox takes the mail area's steps."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "FleetMachineAssignment",
+        action = "PreferHere",
+        reason = "A preference is the owner's `lab prefer`, a registry row aterm-db writes: the conformance test names this Mac among the account's preferred machines in the Lab the sync reads."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "FleetMachineAssignment",
+        action = "PreferElsewhere",
+        reason = "Another Mac's preference is the owner's `lab prefer` for that Mac: the conformance test names m2 among the account's preferred machines in the Lab the sync reads."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "FleetMachineAssignment",
+        action = "Unprefer",
+        reason = "Withdrawing this Mac's preference is the owner's `lab unprefer`, a registry row aterm-db writes: the conformance test leaves this Mac out of the account's preferred machines in the Lab the next sync reads."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "FleetMachineAssignment",
+        action = "RowLegacy",
+        reason = "A row a Mac already had under the account's legacy label is the roster an earlier source wrote: the conformance test writes it into the roster the sync starts from."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "FleetMachineAssignment",
+        action = "RowOwner",
+        reason = "A row under a label the owner gave is `accounts add` or a hand edit: the conformance test writes it into the roster the sync starts from."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "FleetMachineAssignment",
+        action = "DefaultLogin",
+        reason = "Which account the CLI's default login holds is what the provider's profile reports: the conformance test passes the account's address as the sync's default login."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "FleetMachineAssignment",
+        action = "Settle",
+        reason = "A repair round's matching inventory (`alab_view::round`) settles the registry: the conformance test sets `Lab::settled`."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "FleetMachineAssignment",
+        action = "LabMailbox",
+        reason = "The mailbox an address's codes arrive in is the registry's projection (`LabView::mailboxes`) and an admin Mac's ai-mailbox.toml: the conformance test sets `Lab::mailboxes` and a route with that login."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "FleetMachineAssignment",
+        action = "OwnRoute",
+        reason = "A route naming the address is a row of ai-mailbox.toml: the conformance test adds it to the routes resolve_index reads."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "FleetMachineAssignment",
+        action = "AliasLink",
+        reason = "An alias link is the registry's `address.alias_of`: the conformance test sets `Lab::aliases` and a route naming the linked address."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "FleetMachineAssignment",
+        action = "DomainRoute",
+        reason = "A `*@domain` route is a row of ai-mailbox.toml: the conformance test adds it to the routes resolve_index reads."
+    )
+)]
+pub fn fleet_assignment_environment() {}
 
 #[cfg(test)]
 #[path = "alab_roster_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "alab_assignment_tests.rs"]
+mod assignment_tests;

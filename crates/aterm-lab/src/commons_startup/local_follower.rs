@@ -76,7 +76,8 @@ pub(super) fn run(
     rows: &table::Rows,
     out: &Path,
 ) -> Result<Value, Fail> {
-    let config = std::fs::read_to_string(source.cfg.join("aterm/aterm.toml")).map_err(fail)?;
+    let config =
+        crate::util::read_regular_text(&source.cfg.join("aterm/aterm.toml")).map_err(fail)?;
     let mut follower = World::new(&config).map_err(fail)?;
     // Share only the synthetic vault home; configuration, socket and launch logs stay distinct.
     follower.home.clone_from(&source.home);

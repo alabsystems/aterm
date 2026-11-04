@@ -423,14 +423,14 @@ fn rendezvous_mirror_dir(sock_dir: &Path) -> Option<PathBuf> {
     {
         let over_guard = discovery().mirror_dir_override.read();
         if let Some(over) = over_guard.unwrap_or_else(|p| p.into_inner()).clone() {
-            return if same_dir(sock_dir, &over) {
-                None
-            } else {
-                Some(over)
-            };
+            return rendezvous_mirror_dir_with(sock_dir, Some(over));
         }
     }
-    let rv = aterm_uds::control_socket_dir()?;
+    rendezvous_mirror_dir_with(sock_dir, aterm_uds::control_socket_dir())
+}
+
+fn rendezvous_mirror_dir_with(sock_dir: &Path, default_dir: Option<PathBuf>) -> Option<PathBuf> {
+    let rv = default_dir?;
     if same_dir(sock_dir, &rv) {
         None
     } else {
@@ -1292,22 +1292,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(&default_dir);
     }
 
+    /// NEGATIVE CONTROL: a missing default dir or a `sock_dir` matching the default dir (literally or via symlink) yields `None`, never a double-write.
     #[test]
     fn mirror_dir_only_for_out_of_default_instances() {
         let _guard = self_sock_test_guard();
-        let Some(def) = aterm_uds::control_socket_dir() else {
-            aterm_spec::host::could_not_run("no per-user control socket dir resolves here");
-        };
+        let def = crate::test_scratch::short_dir("default rendezvous dir");
+        let other = crate::test_scratch::short_dir("out-of-default dir");
+        assert_eq!(
+            rendezvous_mirror_dir_with(other.path(), None),
+            None,
+            "an absent default dir yields no mirror target"
+        );
+        set_mirror_dir_override(Some(def.path().to_path_buf()));
         assert!(
-            rendezvous_mirror_dir(&def).is_none(),
+            rendezvous_mirror_dir(def.path()).is_none(),
             "a default instance must not double-write"
         );
-        let other = std::env::temp_dir().join("aterm-not-the-default-dir-xyz");
+        #[cfg(unix)]
+        {
+            let alias = other.path().join("default-alias");
+            std::os::unix::fs::symlink(def.path(), &alias).expect("create symlink alias");
+            assert!(
+                rendezvous_mirror_dir(&alias).is_none(),
+                "a symlinked alias of the default dir must not double-write"
+            );
+        }
         assert_eq!(
-            rendezvous_mirror_dir(&other).as_deref(),
-            Some(def.as_path()),
+            rendezvous_mirror_dir(other.path()).as_deref(),
+            Some(def.path()),
             "an out-of-dir instance mirrors into the default rendezvous dir"
         );
+        set_mirror_dir_override(None);
     }
 
     #[test]

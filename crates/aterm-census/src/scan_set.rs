@@ -3,6 +3,10 @@
 // Author: Andrew Yates
 
 //! Workspace dependency graph and scan-set derivation.
+//!
+//! Registry packages and immutable Git packages are external lock-graph nodes,
+//! not local source bodies. Git declarations must match one exact locked source;
+//! their transitive dependency edges still participate in process guards.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -459,6 +463,12 @@ fn parse_doc(text: &str, file: &str) -> Result<Doc, String> {
     Ok(Doc { sections })
 }
 
+#[derive(Clone)]
+struct GitPin {
+    url: String,
+    revision: String,
+}
+
 struct DepEdge {
     /// The dependency key: what features name (`dep:<key>`, `<key>/feat`) and
     /// what `workspace = true` looks up in the root table.
@@ -468,6 +478,8 @@ struct DepEdge {
     package: Option<String>,
     /// `path = "…"` (relative to the declaring crate dir), if any.
     path: Option<String>,
+    /// A fully pinned external source. Its dependency closure remains in Cargo.lock.
+    git: Option<GitPin>,
     /// `workspace = true`?
     workspace: bool,
     optional: bool,
@@ -579,6 +591,7 @@ fn dep_edge(key: &str, value: &Value, file: &str) -> Result<DepEdge, String> {
                 key: name.to_string(),
                 package: None,
                 path: None,
+                git: None,
                 workspace: true,
                 optional: false,
                 default_features: true,
@@ -598,12 +611,15 @@ fn dep_edge(key: &str, value: &Value, file: &str) -> Result<DepEdge, String> {
         key: key.to_string(),
         package: None,
         path: None,
+        git: None,
         workspace: false,
         optional: false,
         default_features: true,
         features: Vec::new(),
         target: None,
     };
+    let mut git = None;
+    let mut revision = None;
     match value {
         Value::Str(_) => {}
         Value::Table(pairs) => {
@@ -612,6 +628,8 @@ fn dep_edge(key: &str, value: &Value, file: &str) -> Result<DepEdge, String> {
                     ("version", Value::Str(_)) => {}
                     ("package", Value::Str(p)) => edge.package = Some(p.clone()),
                     ("path", Value::Str(p)) => edge.path = Some(p.clone()),
+                    ("git", Value::Str(url)) if git.is_none() => git = Some(url.clone()),
+                    ("rev", Value::Str(rev)) if revision.is_none() => revision = Some(rev.clone()),
                     ("workspace", Value::Bool(true)) => edge.workspace = true,
                     ("optional", Value::Bool(b)) => edge.optional = *b,
                     ("default-features", Value::Bool(b)) => edge.default_features = *b,
@@ -631,8 +649,8 @@ fn dep_edge(key: &str, value: &Value, file: &str) -> Result<DepEdge, String> {
                     (other, _) => {
                         return Err(format!(
                             "{file}: dependency `{key}` uses spec key `{other}`, which the \
-                             derivation cannot soundly classify (git/registry deps are out \
-                             of the modeled subset — fail-closed)"
+                             derivation cannot soundly classify (outside the modeled \
+                             subset — fail-closed)"
                         ));
                     }
                 }
@@ -641,6 +659,27 @@ fn dep_edge(key: &str, value: &Value, file: &str) -> Result<DepEdge, String> {
         other => {
             return Err(format!(
                 "{file}: dependency `{key}` has unsupported value {other:?} (fail-closed)"
+            ));
+        }
+    }
+    match (git, revision) {
+        (None, None) => {}
+        (Some(url), Some(revision))
+            if edge.path.is_none()
+                && !edge.workspace
+                && !url.is_empty()
+                && !url
+                    .chars()
+                    .any(|c| c.is_whitespace() || matches!(c, '?' | '#'))
+                && revision.len() == 40
+                && revision.bytes().all(|b| b.is_ascii_hexdigit()) =>
+        {
+            edge.git = Some(GitPin { url, revision });
+        }
+        _ => {
+            return Err(format!(
+                "{file}: dependency `{key}` cannot soundly classify a Git source without a \
+             unique URL and full immutable rev (no path/workspace mixture; fail-closed)"
             ));
         }
     }
@@ -746,7 +785,37 @@ fn load_manifest(root: &Path, dir: &str) -> Result<Manifest, String> {
     let (workspace_root, tables) = declaring_workspace(root, dir, &doc)?;
     m.workspace_root = workspace_root;
     m.ws_deps = tables.ws_deps;
+    for edge in &m.deps {
+        let pinned = if edge.workspace {
+            m.ws_deps
+                .get(&edge.key)
+                .and_then(|ws| ws.git.as_ref())
+                .map(|(name, pin)| (name.as_str(), pin))
+        } else {
+            edge.git
+                .as_ref()
+                .map(|pin| (edge.package.as_deref().unwrap_or(&edge.key), pin))
+        };
+        if let Some((name, pin)) = pinned {
+            validate_git_lock(root, name, pin)?;
+        }
+    }
     Ok(m)
+}
+
+/// Git sources follow the same external lock-graph path as registry packages,
+/// but only when the declaration and the exact locked commit agree.
+fn validate_git_lock(root: &Path, name: &str, pin: &GitPin) -> Result<(), String> {
+    let lock = read_lock(root)?;
+    let matches: Vec<_> = lock.iter().filter(|package| package.name == name).collect();
+    let expected = format!("git+{}?rev={}#{}", pin.url, pin.revision, pin.revision);
+    if matches.len() != 1 || matches[0].source.as_deref() != Some(expected.as_str()) {
+        return Err(format!(
+            "Git dependency `{name}` must have one Cargo.lock entry matching its full \
+             immutable source `{expected}` (missing, different or ambiguous; fail-closed)"
+        ));
+    }
+    Ok(())
 }
 
 /// Returns normal external dependency package names declared in `<root>/<dir>/Cargo.toml`.
@@ -763,7 +832,17 @@ pub(crate) fn external_dependency_names(root: &Path, dir: &str) -> Result<Vec<St
                         .get(&edge.key)
                         .is_some_and(|ws| ws.dir.is_some()))
         })
-        .map(|edge| edge.package.unwrap_or(edge.key))
+        .map(|edge| {
+            if edge.workspace
+                && let Some((name, _)) = manifest
+                    .ws_deps
+                    .get(&edge.key)
+                    .and_then(|ws| ws.git.as_ref())
+            {
+                return name.clone();
+            }
+            edge.package.unwrap_or(edge.key)
+        })
         .collect())
 }
 
@@ -1068,6 +1147,7 @@ fn normalize_rel(base: &str, rel: &str) -> Result<String, String> {
 struct WsSpec {
     /// Repo-relative crate dir, if this is a path dep.
     dir: Option<String>,
+    git: Option<(String, GitPin)>,
     default_features: bool,
     features: Vec<String>,
 }
@@ -1190,6 +1270,9 @@ fn load_tables(root: &Path, base: &str) -> Result<RootTables, String> {
                         edge.key.clone(),
                         WsSpec {
                             dir,
+                            git: edge
+                                .git
+                                .map(|pin| (edge.package.unwrap_or_else(|| edge.key.clone()), pin)),
                             default_features: edge.default_features,
                             features: edge.features,
                         },
@@ -2572,6 +2655,79 @@ mod tests {
             err.contains("neither a feature nor an optional dependency"),
             "err: {err}"
         );
+    }
+
+    #[test]
+    fn pinned_git_edges_require_the_exact_lock_and_keep_their_package_identity() {
+        let hash = "1234567890123456789012345678901234567890";
+        let url = "https://github.com/example/leaf.git";
+        let spec = format!("{{ package = \"leaf\", git = \"{url}\", rev = \"{hash}\" }}");
+        let locked = format!(
+            "[[package]]\nname = \"leaf\"\nversion = \"1.0.0\"\nsource = \"git+{url}?rev={hash}#{hash}\"\n"
+        );
+        let fixture = |name: &str, specification: &str, lock: Option<&str>, inherited: bool| {
+            let dependency = if inherited {
+                "{ workspace = true }"
+            } else {
+                specification
+            };
+            let manifest = format!("[dependencies]\nexternal = {dependency}\n");
+            let mut files = test_fixtures::workspace_manifests(&[("aterm-a", &manifest)]);
+            if inherited {
+                for (path, content) in &mut files {
+                    if path == "Cargo.toml" {
+                        *content = content.replace(
+                            "[workspace.dependencies]\n",
+                            &format!("[workspace.dependencies]\nexternal = {specification}\n"),
+                        );
+                    }
+                }
+            }
+            if let Some(lock) = lock {
+                files.push(("Cargo.lock".into(), lock.into()));
+            }
+            synth_tree("aterm-census-git", name, &with_src(files))
+        };
+        for inherited in [false, true] {
+            let root = fixture(
+                if inherited { "inherited" } else { "direct" },
+                &spec,
+                Some(&locked),
+                inherited,
+            );
+            derive_gui_scan_set(&root).expect("the exact immutable external edge is modeled");
+            assert_eq!(
+                external_dependency_names(&root, "crates/aterm-a").unwrap(),
+                ["leaf"]
+            );
+        }
+        for (name, specification, lock) in [
+            ("missing-lock", spec.clone(), None),
+            (
+                "wrong-lock",
+                spec.clone(),
+                Some(locked.replace(hash, "9876543210987654321098765432109876543210")),
+            ),
+            (
+                "ambiguous-lock",
+                spec.clone(),
+                Some(format!("{locked}{locked}")),
+            ),
+            ("mutable", spec.replace(hash, "main"), Some(locked.clone())),
+            (
+                "no-rev",
+                format!("{{ git = \"{url}\" }}"),
+                Some(locked.clone()),
+            ),
+            (
+                "mixed-path",
+                format!("{{ git = \"{url}\", rev = \"{hash}\", path = \"../leaf\" }}"),
+                Some(locked.clone()),
+            ),
+        ] {
+            let root = fixture(name, &specification, lock.as_deref(), true);
+            assert!(derive_gui_scan_set(&root).is_err(), "accepted {name}");
+        }
     }
 
     #[test]

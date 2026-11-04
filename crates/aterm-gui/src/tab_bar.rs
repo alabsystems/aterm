@@ -3325,11 +3325,11 @@ fn command_cut(title: &str, max: usize) -> Option<String> {
     };
     let Some(tail) = max
         .checked_sub(strip_display_cells(first) + mark)
-        .and_then(&fits)
+        .and_then(fits)
     else {
         return max
             .checked_sub(1)
-            .and_then(&fits)
+            .and_then(fits)
             .map(|tail| format!("\u{2026}{tail}"));
     };
     let head_room = max - mark - strip_display_cells(tail);

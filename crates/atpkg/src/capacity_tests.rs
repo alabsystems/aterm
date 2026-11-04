@@ -73,7 +73,15 @@ fn report(
     claims: &[Record],
     trees: Option<&HashMap<u32, TreeUse>>,
 ) -> Vec<String> {
-    lines(r, volumes, None, &Ok(claims.to_vec()), trees, 1_000)
+    lines(
+        r,
+        volumes,
+        None,
+        &Ok(claims.to_vec()),
+        trees,
+        1_000,
+        &super::cpu::Report::absent(),
+    )
 }
 
 /// Each claim's line of the report, in the ledger's order.
@@ -89,7 +97,15 @@ fn json_report(
     claims: &[Record],
     trees: Option<&HashMap<u32, TreeUse>>,
 ) -> Value {
-    let text = json_of(r, volumes, None, &Ok(claims.to_vec()), trees, 1_000);
+    let text = json_of(
+        r,
+        volumes,
+        None,
+        &Ok(claims.to_vec()),
+        trees,
+        1_000,
+        &super::cpu::Report::absent(),
+    );
     aterm_json::from_str(&text).expect("the report is JSON")
 }
 

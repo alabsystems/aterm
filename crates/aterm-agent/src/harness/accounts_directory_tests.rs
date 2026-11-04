@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 fn row(label: &str, dir: Option<&Path>) -> Row {
     Row {
         label: label.into(),
-        class: Class::Dedicated,
+        class: Class::Preferred,
         dir: dir.map(|path| path.to_string_lossy().into_owned()),
         ..Row::default()
     }

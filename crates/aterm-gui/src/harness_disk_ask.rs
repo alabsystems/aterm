@@ -1810,7 +1810,8 @@ enum Stepped {
 /// would not seat by a lasting fact is never typed its line, nor is one the loop holds for
 /// someone else for good: its `exchange` or `managed`, which the worker hands in as `unfit`). A
 /// line `held` at this turn break for a while (the loop's word, `person`: a person's grace or
-/// another driver's hand, the occupancy door's guard; or what the seat rule holds it by,
+/// another driver's hand, the occupancy door's guard; `held`: a line the loop holds in custody,
+/// which a line typed behind would join; or what the seat rule holds it by,
 /// [`held_of`]: the owner's hold, a draft standing in its composer) is not claimed or typed and
 /// stays owed, `wait:<held>`, until the look gives it back to the episode. The claim, the typing
 /// and its record hold the lease's lock as one step ([`ask::at_break`]), so no other host hands

@@ -291,7 +291,7 @@ pub fn claims(held: &[Held], roots: &[String], uid: u32, since: i64, fs: &dyn Vi
 /// The record of `run_dir`, each entry once.
 #[must_use]
 pub fn read_record(run_dir: &Path) -> Vec<Held> {
-    let set: BTreeSet<Held> = std::fs::read_to_string(run_dir.join(RECORD))
+    let set: BTreeSet<Held> = crate::util::read_regular_text(&run_dir.join(RECORD))
         .unwrap_or_default()
         .lines()
         .filter_map(Held::parse)

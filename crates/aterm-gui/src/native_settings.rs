@@ -1670,6 +1670,7 @@ pub(crate) struct SettingsViewState {
     showcase_strip: RefCell<Option<Vec<showcase_page::SharedStrip>>>,
     /// The Themes heading as each chrome heads it, while [`showcase_page::BlocksShared`] is open.
     showcase_heading: RefCell<Option<Vec<showcase_page::SharedHeading>>>,
+    scroll_seats: RefCell<Option<Vec<scroll::MemoSeat>>>,
     /// Colours each side and value resolved to while [`page`] builds ([`resolved_colors_from`]).
     colors_shared: RefCell<
         Option<
@@ -1926,6 +1927,7 @@ impl SettingsViewState {
             showcase_demo: RefCell::new(None),
             showcase_strip: RefCell::new(None),
             showcase_heading: RefCell::new(None),
+            scroll_seats: RefCell::new(None),
             colors_shared: RefCell::new(None),
             follows_shared: Cell::new(None),
             pinned_place: Cell::new(None),
@@ -15126,10 +15128,10 @@ fn compact_window_lists_toolbar(width: SettingsWidth, viewport: LogicalRect) -> 
 /// window's chrome, shed last ([`PageChrome::toolbar_listed`]), leads the page's list with the
 /// toolbar, so the list has the window's height; at 2× text a 178x152 window's list kept 100pt
 /// under a 52pt toolbar, under a control 130pt tall ("Coding Agent Harness") that no screen showed
-/// whole, and a 164x98 window's 46pt under no 2× control at all. Only the narrowest window's
-/// toolbar, its leading button and Search icons alone ([`compact_toolbar_wordless`]), or one that
-/// takes more than half the window, leads a list: one the person types in stays over the page. A
-/// status never docks in a toolbar that leads the list ([`compact_status_dock_required`]).
+/// whole, and a 164x98 window's 46pt under no 2× control at all. Listing wins only when it
+/// improves physical stop coverage or supplies the keyboard's required name. An open search
+/// stays over the page. A status never docks in a toolbar that leads the list
+/// ([`compact_status_dock_required`]).
 fn compact_toolbar_lists(state: &SettingsViewState, viewport: LogicalRect) -> bool {
     state.page_chrome.get().toolbar_listed && compact_toolbar_can_list(state, viewport)
 }
@@ -15138,7 +15140,8 @@ fn compact_toolbar_can_list(state: &SettingsViewState, viewport: LogicalRect) ->
     compact_window_lists_toolbar(SettingsWidth::for_viewport(viewport.width), viewport)
         && !state.compact_navigation
         && (compact_toolbar_wordless(state, viewport)
-            || 2.0 * compact_undocked_toolbar_height(state, viewport) > viewport.height)
+            || 2.0 * compact_undocked_toolbar_height(state, viewport) > viewport.height
+            || state.focused_control_needs_name())
         && !compact_search_shows_its_field(state)
         && !reset_all_question_takes_page(state, viewport)
 }
@@ -15955,6 +15958,7 @@ fn page(
     state.start_let_go.set(false);
     let _shared = showcase_page::BlocksShared::open(state);
     let _plans = scroll::PlansShared::open();
+    let _seats = scroll::SeatsShared::open(state);
     let _widths = scroll::RowWidths::open();
     let _words = scroll::KeyboardWords::watch(state.common.last_focus.clone());
     let _status = StatusWordsShared::open();
@@ -16070,7 +16074,7 @@ fn page(
         drop(rooms);
         state.status_extra.set(0.0);
         state.status_slack.set(0.0);
-        let (holds, cuts) = if state.route == SettingsRoute::Messages
+        let mut fit = if state.route == SettingsRoute::Messages
             && state.search.trim().is_empty()
             && !state.compact_navigation
         {
@@ -16089,30 +16093,30 @@ fn page(
                 state.messages_tag_menu,
             );
             let holds = visible.is_empty() || !plan.view(0).rows.is_empty();
-            (holds, (plan.cut_stops(), 0))
+            PageFit {
+                holds,
+                cuts: (plan.cut_stops(), 0),
+                name_complete: true,
+            }
         } else {
-            state.scroll_plan().map_or((true, (0, 0)), |plan| {
-                (
-                    plan.first_screen_need() <= plan.room() + 0.01
-                        && state.keyboard_name_fits_in(&plan),
-                    (plan.cut_stops(), plan.bare_captions()),
-                )
-            })
+            state
+                .scroll_plan()
+                .map_or(PageFit::EMPTY, |plan| PageFit::of(state, &plan))
         };
         // A page whose list did not take the toolbar it was told to lead with holds nothing:
         // the toolbar stays over it ([`compact_toolbar_lists`]).
         // Nor does one led by the toolbar only for its row: R2's give-way alone takes that rung.
         let lent = state.toolbar_head_lent.get();
-        let (holds, cuts) = if chrome.toolbar_listed
+        if chrome.toolbar_listed
             && compact_toolbar_can_list(state, cx.viewport)
             && (!built.2 || lent)
         {
-            (false, (usize::MAX, usize::MAX))
-        } else {
-            (holds, cuts)
-        };
+            fit.holds = false;
+            fit.cuts = (usize::MAX, usize::MAX);
+            fit.name_complete = false;
+        }
         state.measuring_calm.set(false);
-        (built, holds, cuts)
+        (built, fit)
     };
     // The list's room in `chrome` under the bar at `most`, calm or not, measured once a render.
     let measures: RefCell<Vec<ListMeasure>> = RefCell::new(Vec::new());
@@ -16143,7 +16147,11 @@ fn page(
             list_calm,
             state.status_extra.get(),
             state.status_slack.get(),
-            feedback_bar_height(state, width, cx.viewport),
+            if state.reset_all_confirmation {
+                feedback_bar_height(state, width, cx.viewport)
+            } else {
+                0.0
+            },
             f32::from(u8::from(lent)),
         ]
         .map(f32::to_bits);
@@ -16152,9 +16160,12 @@ fn page(
             .iter()
             .find(|(_, seen, _, list)| *seen == at && (!rows || list.is_some()))
             .map(|(by, _, laid, list)| (*by, *laid, list.clone().flatten()));
-        // A measure shared across chromes is checked against one made here in a test build.
+        // A measure shared across chromes or bar bounds is checked against one made here.
         #[cfg(test)]
-        if let Some((by, laid, list)) = seen.as_ref().filter(|(by, _, _)| *by != (chrome, calm)) {
+        if let Some((by, laid, list)) = seen
+            .as_ref()
+            .filter(|(by, _, _)| *by != (chrome, calm, most.map(f32::to_bits)))
+        {
             let (again, rows_again) = unseen(|| measure_now(rows));
             state.status_overrun.set(0.0);
             let planned = |list: Option<&std::rc::Rc<scroll::ListLaid>>| {
@@ -16167,7 +16178,7 @@ fn page(
                         || rows_again.is_none()
                         || planned(list.as_ref()) == planned(rows_again.as_ref())),
                 "a list measured at what {by:?} read measures alike in {:?}",
-                (chrome, calm)
+                (chrome, calm, most.map(f32::to_bits))
             );
         }
         let (laid, list) = seen.map_or_else(
@@ -16180,7 +16191,12 @@ fn page(
                 if counted {
                     let mut measures = measures.borrow_mut();
                     measures.retain(|(_, seen, _, _)| *seen != at);
-                    measures.push(((chrome, calm), at, laid, rows.then(|| list.clone())));
+                    measures.push((
+                        (chrome, calm, most.map(f32::to_bits)),
+                        at,
+                        laid,
+                        rows.then(|| list.clone()),
+                    ));
                 }
                 (laid, list)
             },
@@ -16236,10 +16252,7 @@ fn page(
     let told_holds = |chrome: PageChrome, calm: bool| {
         let planned = told_plan(chrome, calm)?;
         let plan = &planned.0;
-        Some((
-            plan.first_screen_need() <= plan.room() + 0.01 && state.keyboard_name_fits_in(plan),
-            (plan.cut_stops(), plan.bare_captions()),
-        ))
+        Some(PageFit::of(state, plan))
     };
     // Chromes whose rows built unlike under two bars this render: measured with their rows.
     let rows_unlike: RefCell<Vec<PageChrome>> = RefCell::new(Vec::new());
@@ -16247,17 +16260,16 @@ fn page(
     // under another bar where the page lays them out alike there, else laid out there.
     let rows_at = |chrome: PageChrome, most: Option<f32>| {
         let other = !rows_unlike.borrow().contains(&chrome)
-            && measures
-                .borrow()
-                .iter()
-                .any(|(by, _, _, list)| *by == (chrome, false) && matches!(list, Some(Some(_))));
+            && measures.borrow().iter().any(|(by, _, _, list)| {
+                (by.0, by.1) == (chrome, false) && matches!(list, Some(Some(_)))
+            });
         let (there, pinned, list) = measured(chrome, most, !other)?;
         #[cfg(test)]
         if list.is_none() && reuses_checked() {
             let lists = measures.borrow().clone();
             for (by, _, laid, list) in lists {
                 if let (Some((laid, _)), Some(Some(list))) = (laid, list)
-                    && by == (chrome, false)
+                    && (by.0, by.1) == (chrome, false)
                 {
                     let reused = there.drawn_as(laid, state) && list.builds_alike_in(there.room());
                     reuse_checked("rows_at", (laid, &list), (there, reused), (chrome, most));
@@ -16267,7 +16279,7 @@ fn page(
         let alike = list.or_else(|| {
             measures.borrow().iter().find_map(|(by, _, laid, list)| {
                 let list = list.clone().flatten()?;
-                (*by == (chrome, false)
+                ((by.0, by.1) == (chrome, false)
                     && laid.is_some_and(|(laid, _)| there.drawn_as(laid, state))
                     && list.builds_alike_in(there.room()))
                 .then_some(list)
@@ -16653,18 +16665,18 @@ fn page(
                 .then(|| told_holds(chrome, bars))
                 .flatten();
             match told {
-                Some((holds, cuts)) if tells || !holds => {
-                    spared.set(spared.get() || !holds);
-                    (None, holds, cuts)
+                Some(fit) if tells || !fit.holds => {
+                    spared.set(spared.get() || !fit.holds);
+                    (None, fit)
                 }
                 _ => {
-                    let (built, holds, cuts) = seat(chrome, bars);
-                    (Some(built), holds, cuts)
+                    let (built, fit) = seat(chrome, bars);
+                    (Some(built), fit)
                 }
             }
         };
         let mut chosen = None;
-        let mut full_cuts = None;
+        let mut full_fit = None;
         // No bar up, a demo-led rung short of its first screen's room holds nothing, untried.
         let led_short = |chrome: PageChrome| {
             !bars
@@ -16685,8 +16697,8 @@ fn page(
                     .iter()
                     .any(|short| room_at(*short, bar_most) == room_at(chrome, bar_most))
         };
-        // The rungs that keep the toolbar over the page: the toolbar is listed only where that
-        // brings a stop no rung keeping it shows whole onto a screen (below).
+        // The rungs that keep the toolbar over the page. Listing it must improve physical stop
+        // coverage or supply the keyboard's required identifying name (below).
         let kept_toolbar = || {
             PageChrome::ladder(width, cx.viewport)
                 .into_iter()
@@ -16694,14 +16706,14 @@ fn page(
                 .collect::<Vec<_>>()
         };
         for (index, chrome) in kept_toolbar().into_iter().enumerate() {
-            let (built, holds, cuts) = match spare.take() {
-                Some((was, (built, holds, cuts))) if was == chrome => (Some(built), holds, cuts),
+            let (built, fit) = match spare.take() {
+                Some((was, (built, fit))) if was == chrome => (Some(built), fit),
                 _ if (index > 0 || !ahead(chrome))
                     && (led_short(chrome) || laid_short(chrome, &shorts)) =>
                 {
                     #[cfg(test)]
                     assert!(
-                        !unseen(|| told_holds(chrome, false)).is_some_and(|(holds, _)| holds),
+                        !unseen(|| told_holds(chrome, false)).is_some_and(|fit| fit.holds),
                         "a rung led or laid out short of its first screen holds it: {chrome:?}"
                     );
                     shorts.push(chrome);
@@ -16711,32 +16723,33 @@ fn page(
                 _ => tried(chrome, index == 0),
             };
             if chrome == PageChrome::FULL {
-                full_cuts = Some(cuts);
+                full_fit = Some(fit);
             }
-            if holds {
-                chosen = Some((chrome, built, cuts));
+            if fit.holds {
+                chosen = Some((chrome, built, fit));
                 break;
             }
             if !bars {
                 shorts.push(chrome);
             }
-            spare = built.map(|built| (chrome, (built, holds, cuts)));
+            spare = built.map(|built| (chrome, (built, fit)));
         }
-        // No rung holds: FULL, built only if nothing is cut; trials below tell another, FULL again.
-        let (chrome, built, cuts) = chosen.unwrap_or_else(|| match spare {
-            Some((was, (built, _, cuts))) if was == PageChrome::FULL => {
-                (PageChrome::FULL, Some(built), cuts)
+        // No rung holds: start from FULL's fit. A zero-cut list can still owe the keyboard's
+        // identifying name, so later trials must retain that separate obligation.
+        let (chrome, built, fit) = chosen.unwrap_or_else(|| match spare {
+            Some((was, (built, fit))) if was == PageChrome::FULL => {
+                (PageChrome::FULL, Some(built), fit)
             }
-            _ => match full_cuts {
-                Some(cuts) => (PageChrome::FULL, None, cuts),
+            _ => match full_fit {
+                Some(fit) => (PageChrome::FULL, None, fit),
                 // FULL, passed over for its demo, is seated now that no rung holds.
                 None => {
-                    let (built, _, cuts) = seat(PageChrome::FULL, bars);
-                    (PageChrome::FULL, Some(built), cuts)
+                    let (built, fit) = seat(PageChrome::FULL, bars);
+                    (PageChrome::FULL, Some(built), fit)
                 }
             },
         });
-        if cuts == (0, 0) {
+        if fit.complete() {
             return (
                 chrome,
                 built.or_else(|| (!bars && !ahead(chrome)).then(|| seat(chrome, false).0)),
@@ -16747,7 +16760,7 @@ fn page(
             .iter()
             .position(|rung| *rung == chrome)
             .map_or(ladder.len(), |at| at + 1);
-        let mut best = (chrome, None, cuts);
+        let mut best = (chrome, None, fit);
         let mut last = chrome;
         // The rung, of those as cut as the best, that gives the list the most room.
         let room_now = || state.scroll_plan().map_or(0.0, |plan| plan.room());
@@ -16767,7 +16780,7 @@ fn page(
             .flatten();
         for trial in sheds.chain(lists) {
             let listing = trial.preview_listed && !chrome.preview_listed;
-            if listing && best.2.0 == 0 {
+            if listing && best.2.cuts.0 == 0 && best.2.name_complete {
                 break;
             }
             // Spared, a trial with more room than the best rung may hold, and is seated untold.
@@ -16775,27 +16788,26 @@ fn page(
             let told = (bars || ahead(trial) || (spared.get() && !roomier()))
                 .then(|| told_holds(trial, bars))
                 .flatten();
-            let (trial_built, trial_cuts) = match told {
-                Some((_, cuts)) => (None, cuts),
+            let (trial_built, trial_fit) = match told {
+                Some(fit) => (None, fit),
                 None => {
-                    let (built, _, cuts) = seat(trial, bars);
-                    (Some(built), cuts)
+                    let (built, fit) = seat(trial, bars);
+                    (Some(built), fit)
                 }
             };
             last = trial;
             let seated = trial_built.is_some();
-            let better = if listing {
-                trial_cuts.0 < best.2.0
-            } else {
-                trial_cuts < best.2
-            };
+            let better = trial_fit.better_than(best.2, listing);
             if better {
-                best = (trial, trial_built, trial_cuts);
+                best = (trial, trial_built, trial_fit);
                 widest = (trial, None);
             } else {
                 spared.set(spared.get() || !seated);
             }
-            if !listing && trial_cuts.0 == best.2.0 {
+            if !listing
+                && trial_fit.cuts.0 == best.2.cuts.0
+                && trial_fit.name_complete == best.2.name_complete
+            {
                 // A trial told, not seated, has its told plan's room.
                 let room = if seated {
                     room_now()
@@ -16806,23 +16818,28 @@ fn page(
                     widest = (trial, Some(room));
                 }
             }
-            if trial_cuts == (0, 0) || (better && listing && trial_cuts.0 == 0) {
+            if trial_fit.complete()
+                || (better && listing && trial_fit.cuts.0 == 0 && trial_fit.name_complete)
+            {
                 break;
             }
         }
-        // Last, the toolbar listed over the best of them, where that cuts fewer stops
-        // ([`compact_toolbar_lists`]); else over the one, as cut, that gives the list the most
+        // Last, the toolbar listed over the best of them, where that cuts fewer stops or
+        // supplies its required name with no more cut stops ([`compact_toolbar_lists`]); else
+        // over the one, as cut and as named, that gives the list the most
         // room: where every rung cuts every stop (Themes at 2x in 164x98, its list no room at
         // all under the toolbar), the toolbar listed over the best alone cut them all as well,
         // and the page stood blank under the toolbar.
-        if best.2.0 > 0 && compact_toolbar_can_list(state, cx.viewport) {
+        if (best.2.cuts.0 > 0 || !best.2.name_complete)
+            && compact_toolbar_can_list(state, cx.viewport)
+        {
             let over = std::iter::once(best.0).chain((widest.0 != best.0).then_some(widest.0));
             for rung in over.collect::<Vec<_>>() {
                 let trial = rung.listing_toolbar();
-                let (trial_built, _, trial_cuts) = seat(trial, bars);
+                let (trial_built, trial_fit) = seat(trial, bars);
                 last = trial;
-                if trial_cuts.0 < best.2.0 {
-                    best = (trial, Some(trial_built), trial_cuts);
+                if trial_fit.better_than(best.2, true) {
+                    best = (trial, Some(trial_built), trial_fit);
                     break;
                 }
             }
@@ -16992,31 +17009,13 @@ fn page(
         Some((there, plan))
     };
     // The screen a seat in `chrome` under `most` leaves, told as its overrun is, once a render.
-    let screens: RefCell<Vec<ToldScreen>> = RefCell::new(Vec::new());
     let seated_told = |chrome: PageChrome,
                        seated: Option<(showcase_page::ListRoom, &[scroll::ListLaid])>,
                        most: Option<f32>| {
-        let at = (chrome, bar_at(most));
-        let known = screens
-            .borrow()
-            .iter()
-            .find(|(seen, _)| *seen == at)
-            .map(|(_, told)| told.clone());
-        if known.is_some() {
-            return known;
-        }
         let (there, plan) = seat_plan(chrome, seated, most)?;
         let mut plan = plan.0.clone();
         plan.pin_keyboard(there.keyboard_pin());
-        let told = state.seated_under(plan, record.clone());
-        #[cfg(test)]
-        let counted = crate::work_counts::page_work_counted();
-        #[cfg(not(test))]
-        let counted = true;
-        if counted {
-            screens.borrow_mut().push((at, told.clone()));
-        }
-        Some(told)
+        Some(state.seated_under(plan, record.clone()))
     };
     // The bar shortens a step for each overrun a seat notes, from the steps this render told
     // already: the page seated last, the most it was seated at, and whether any step was told.
@@ -17252,24 +17251,83 @@ fn page(
             }
         })
     };
+    // Each candidate's screen and bar result, told once at these reveal/focus inputs. This
+    // render's measured inputs, original record and initial bar bound are captured above.
+    let tolds = RefCell::new(Vec::new());
+    let told_seat = |chrome: PageChrome| {
+        let seats = seat_lists.borrow();
+        let seated = seats
+            .iter()
+            .rev()
+            .find(|(was, _, _)| *was == chrome)
+            .map(|(_, laid, lists)| (*laid, lists.as_slice()));
+        let at = (
+            chrome,
+            state.page_reveal.clone(),
+            state.reveal_as,
+            state.common.last_focus.clone(),
+            state.start_let_go.get(),
+            seated.map(|(laid, _)| laid),
+        );
+        if let Some(known) = tolds
+            .borrow()
+            .iter()
+            .find(|(was, _)| *was == at)
+            .map(|(_, told): &(_, Option<ToldSeat>)| told.clone())
+        {
+            return known;
+        }
+        let told = (|| {
+            if !bars {
+                return Some(ToldSeat {
+                    record: seated_told(chrome, seated, bar_most)?,
+                    bar: None,
+                    kept_before_least: None,
+                });
+            }
+            let (left, last) = descend(chrome, None, seated)?;
+            let record = seated_told(chrome, seated, last)?;
+            let kept_before_least = state.reading(record.clone(), |state| state.keyboard_left());
+            let (record, least) = match least_from(chrome, seated, record.clone(), left) {
+                LeastFrom::Wins(least) => (*least, Some(true)),
+                LeastFrom::Untried => (record, None),
+                LeastFrom::Turned { .. } | LeastFrom::Loses => (record, Some(false)),
+                LeastFrom::Untold => return None,
+            };
+            Some(ToldSeat {
+                record,
+                bar: Some(BarSeat {
+                    seated: last,
+                    left,
+                    least,
+                }),
+                kept_before_least,
+            })
+        })();
+        #[cfg(test)]
+        let counted = crate::work_counts::page_work_counted();
+        #[cfg(not(test))]
+        let counted = true;
+        if counted {
+            tolds.borrow_mut().push((at, told.clone()));
+        }
+        told
+    };
     // The page seated under its bar in `chrome`, and where the bar settled: whether its least won
     // the landing, where that was tried. A least told to win is the only seat.
     let seat_bar = |chrome: PageChrome| {
-        let won = state.landing_owed().then(|| {
-            let seats = seat_lists.borrow();
-            let seated = seats
-                .iter()
-                .rev()
-                .find(|(was, _, _)| *was == chrome)
-                .map(|(_, laid, lists)| (*laid, lists.as_slice()));
-            descend(chrome, None, seated).and_then(|(left, last)| {
-                let told = seated_told(chrome, seated, last)?;
-                let kept = state.reading(told.clone(), |state| state.keyboard_left());
-                matches!(least_from(chrome, seated, told, left), LeastFrom::Wins(_))
-                    .then_some((left, last, kept))
-            })
-        });
-        if let Some((left, last, kept)) = won.flatten() {
+        let won = state
+            .landing_owed()
+            .then(|| told_seat(chrome))
+            .flatten()
+            .and_then(|told| {
+                told.bar
+                    .filter(|bar| bar.least == Some(true))
+                    .map(|bar| (bar, told.kept_before_least))
+            });
+        if let Some((settled, kept)) = won {
+            #[cfg(test)]
+            let (left, last) = (settled.left, settled.seated);
             #[cfg(test)]
             if BAR_STEPS_SEATED.with(Cell::get) && crate::work_counts::page_work_counted() {
                 let by_seats = unseen(|| settled_seat_by_seat(chrome));
@@ -17289,11 +17347,6 @@ fn page(
             );
             #[cfg(not(test))]
             let _ = kept;
-            let settled = BarSeat {
-                seated: last,
-                left,
-                least: Some(true),
-            };
             return (least, settled);
         }
         let (seated, at, told) = settle(chrome);
@@ -17462,25 +17515,6 @@ fn page(
         seats.truncate(BAR_SEATS_KEPT);
         seated
     };
-    // The screen a seat in `chrome` lands, told.
-    let told_seat = |chrome: PageChrome| {
-        let seats = seat_lists.borrow();
-        let seated = seats
-            .iter()
-            .rev()
-            .find(|(was, _, _)| *was == chrome)
-            .map(|(_, laid, lists)| (*laid, lists.as_slice()));
-        if !bars {
-            return seated_told(chrome, seated, bar_most);
-        }
-        let (left, last) = descend(chrome, None, seated)?;
-        let told = seated_told(chrome, seated, last)?;
-        match least_from(chrome, seated, told.clone(), left) {
-            LeastFrom::Wins(least) => Some(*least),
-            LeastFrom::Untold => None,
-            _ => Some(told),
-        }
-    };
     // Rooms a seat in `chrome` is told in, and its bar's take: the bar now, else settled and least.
     let told_rooms = |chrome: PageChrome, peek: scroll::Peek| {
         let seats = seat_lists.borrow();
@@ -17540,23 +17574,9 @@ fn page(
         if uncut {
             return None;
         }
-        told_seat(chrome)
+        told_seat(chrome).map(|told| told.record)
     };
-    // Each rung's told screen, once a frame.
-    let tolds: RefCell<Vec<(PageChrome, Option<Option<scroll::ScrollRecord>>)>> =
-        RefCell::new(Vec::new());
-    let drawn_told = |chrome: PageChrome| {
-        let known = tolds
-            .borrow()
-            .iter()
-            .find(|(was, _)| *was == chrome)
-            .map(|(_, told)| told.clone());
-        known.unwrap_or_else(|| {
-            let told = told_once(chrome);
-            tolds.borrow_mut().push((chrome, told.clone()));
-            told
-        })
-    };
+    let drawn_told = told_once;
     // A rung holds what `owed` asks of the keyboard's control only where its list's body, and the
     // list measured in it, has room for it under the bar's least.
     let body_least = |trial: PageChrome| {
@@ -17607,7 +17627,7 @@ fn page(
         if built.is_some() && !bars {
             shows(state)
         } else {
-            told_seat(chrome).map_or((false, false), |told| state.reading(told, shows))
+            told_seat(chrome).map_or((false, false), |told| state.reading(told.record, shows))
         }
     });
     // The page's choice is taken where it keeps the control the held chrome is told to cut (R2).
@@ -17657,16 +17677,24 @@ fn page(
                 && !(state.keyboard_short_of(record.as_ref()) && state.keyboard_cut())
         })
     };
-    // Under bars, a held rung a bar left, told to cut the landing, seats after rungs it yields to.
+    // Under bars, a held rung a bar left, or a first untouched landing, is told before
+    // materialization. The first landing's seat_bar prepass already owes this same solver.
     let bar_left = drawn_at
         .is_some_and(|at| (at.warning && !chrome_at.warning) || (at.status && !chrome_at.status));
     let held_chrome =
         chrome != PageChrome::FULL && chrome == drawn_chrome && bar_left && state.landing_owed();
-    let bars_told =
-        (bars && gives_way && held_chrome && doomed.is_none() && lists_themes(state, width))
-            .then(|| told_seat(chrome))
-            .flatten()
-            .filter(cuts_reveal);
+    let opening = drawn_at.is_none()
+        && state.landing_owed()
+        && state.landing_untouched()
+        && !state.showcase.sheet_open;
+    let bars_told = (bars
+        && gives_way
+        && (held_chrome || opening)
+        && doomed.is_none()
+        && lists_themes(state, width))
+    .then(|| told_seat(chrome))
+    .flatten()
+    .filter(|told| cuts_reveal(&told.record));
     let mut drawn = match built {
         _ if doomed.is_some() || bars_told.is_some() => None,
         Some(built) if !bars => Some(built),
@@ -17679,17 +17707,43 @@ fn page(
         (drawn.is_none() && doomed.is_none())
             .then(|| told_seat(chrome))
             .flatten()
-            .filter(cuts_reveal)
+            .filter(|told| cuts_reveal(&told.record))
     });
     #[cfg(test)]
     if let Some(told) = ahead_told.as_ref() {
+        let before_record = state.scroll_record.borrow().clone();
+        let before_most = state.status_bar_most.get();
+        let before_seats = state.bar_seats.borrow().clone();
         unseen(|| {
             let _ = seat_drawn(chrome);
             assert_eq!(
                 *state.scroll_record.borrow(),
-                *told,
+                told.record,
                 "a chrome told before it is seated seats as told"
             );
+            if let Some(bar) = told.bar {
+                assert_eq!(
+                    state.status_bar_most.get(),
+                    if bar.least == Some(true) {
+                        Some(0.0)
+                    } else {
+                        bar.left
+                    },
+                    "a told screen carries the bar bound actual seating leaves"
+                );
+            }
+        });
+        // The comparison is not an actual materialization and cannot prime its reuse cache.
+        state.scroll_record.replace(before_record);
+        state.status_bar_most.set(before_most);
+        state.bar_seats.replace(before_seats);
+    }
+    if let Some(bar) = ahead_told.as_ref().and_then(|told| told.bar) {
+        // R3's downstream snapshots must read the solver's effective bar, not the old bound.
+        state.status_bar_most.set(if bar.least == Some(true) {
+            Some(0.0)
+        } else {
+            bar.left
         });
     }
     if drawn.is_none() && doomed.is_none() && ahead_told.is_none() {
@@ -17870,7 +17924,7 @@ fn page(
         let let_go = |go: bool| {
             state.start_let_go.set(go || geometry_changed);
             overruns.borrow_mut().clear();
-            screens.borrow_mut().clear();
+            state.forget_shared_seats();
             tolds.borrow_mut().clear();
             #[cfg(test)]
             overruns_seated.borrow_mut().clear();
@@ -18051,13 +18105,13 @@ fn page(
             }
     };
     let cut = match ahead_told.as_ref() {
-        Some(told) => state.reading(told.clone(), |state| cuts(state)),
+        Some(told) => state.reading(told.record.clone(), |state| cuts(state)),
         None => cuts(state),
     };
     // A CHROME CUTTING THE REVEAL YIELDS TO THE FIRST RUNG SHOWING IT AND THE KEYBOARD (R3/R5).
     if gives_way && lists_themes(state, width) && cut {
         let left = match ahead_told.as_ref() {
-            Some(told) => state.reading(told.clone(), |state| state.keyboard_on_page()),
+            Some(told) => state.reading(told.record.clone(), |state| state.keyboard_on_page()),
             None => state.keyboard_on_page(),
         };
         // The least a list shows of the reveal and the keyboard's control by panel width and frame.
@@ -18104,13 +18158,9 @@ fn page(
         };
         // What a rung's list, told unseated under the bar at its least, keeps: strictly, and not.
         let tell = |trial: PageChrome, strict: bool| {
-            let Some((there, _, list)) = rows_at(trial, least()) else {
+            let Some(told) = seated_told(trial, None, least()) else {
                 return (false, false);
             };
-            let given = there.extra();
-            let mut plan = list.planned(there.room(), given).0.clone();
-            plan.pin_keyboard(there.keyboard_pin());
-            let told = state.seated_under(plan, record.clone());
             state.reading(told, |state| {
                 let lax = keeps(state, trial, false);
                 (lax && uncut(state, trial, strict), lax)
@@ -18262,7 +18312,7 @@ fn page(
             left: left.clone(),
             chrome,
             plan: match ahead_told.as_ref() {
-                Some(told) => state.reading(told.clone(), |state| state.scroll_plan()),
+                Some(told) => state.reading(told.record.clone(), |state| state.scroll_plan()),
                 None => state.scroll_plan(),
             }
             .map(|plan| plan.unseated()),
@@ -18900,6 +18950,48 @@ fn page_chrome(
     (heading, subtitle && !state.page_chrome.get().no_subtitle)
 }
 
+/// What one already measured candidate holds. Physical stop/caption cuts stay distinct from
+/// the identifying name owed to the keyboard's control.
+#[derive(Clone, Copy, Debug)]
+struct PageFit {
+    holds: bool,
+    cuts: (usize, usize),
+    name_complete: bool,
+}
+
+impl PageFit {
+    const EMPTY: Self = Self {
+        holds: true,
+        cuts: (0, 0),
+        name_complete: true,
+    };
+
+    fn of(state: &SettingsViewState, plan: &scroll::ScrollPlan) -> Self {
+        let name_complete = state.keyboard_name_fits_in(plan);
+        Self {
+            holds: plan.first_screen_need() <= plan.room() + 0.01 && name_complete,
+            cuts: (plan.cut_stops(), plan.bare_captions()),
+            name_complete,
+        }
+    }
+
+    fn complete(self) -> bool {
+        self.cuts == (0, 0) && self.name_complete
+    }
+
+    /// Fewer physical cut stops win first (R2); with those equal, a required name wins before bare
+    /// captions. A preview or toolbar listing still cannot win on bare captions alone.
+    fn better_than(self, other: Self, listing: bool) -> bool {
+        if self.cuts.0 != other.cuts.0 {
+            return self.cuts.0 < other.cuts.0;
+        }
+        if self.name_complete != other.name_complete {
+            return self.name_complete;
+        }
+        !listing && self.cuts.1 < other.cuts.1
+    }
+}
+
 /// The chrome a page draws around its list, which a short window sheds rung by rung
 /// ([`PageChrome::ladder`]) before it cuts content.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -19112,9 +19204,6 @@ type BarAt = (
     bool,
 );
 
-/// A screen told in a chrome under a bar ([`page`]).
-type ToldScreen = ((PageChrome, f32), Option<scroll::ScrollRecord>);
-
 /// Caption over the reveal's row and its section's tallest row by panel width and frame (R3).
 type RevealOver = ((u32, bool), Option<(f32, f32)>);
 
@@ -19135,11 +19224,13 @@ type Beside = (
 type RungPanel = (PageChrome, Option<u32>, (showcase_page::PanelAt, f32));
 
 /// What a list's measure reads of its chrome and bars ([`page`]), a lent toolbar's row last.
+/// Ordinary bar heights act through body room and coverage; reset confirmations also read the
+/// raw height when deciding whether their question takes the page.
 type MeasureAt = [u32; 6];
 
-/// A list measured in a chrome, calm or not: its room, overrun and rows ([`page`]).
+/// A list measured in a chrome, calm or not, at a bar bound: its room, overrun and rows ([`page`]).
 type ListMeasure = (
-    (PageChrome, bool),
+    (PageChrome, bool, Option<u32>),
     MeasureAt,
     Option<(showcase_page::ListRoom, f32)>,
     Option<Option<std::rc::Rc<scroll::ListLaid>>>,
@@ -19152,6 +19243,15 @@ struct BarSeat {
     seated: Option<f32>,
     left: Option<f32>,
     least: Option<bool>,
+}
+
+/// A screen told by the existing bar solver, with its authoritative bar result when barred.
+/// `kept_before_least` preserves the keyboard obligation used by a winning least materialization.
+#[derive(Clone)]
+struct ToldSeat {
+    record: Option<scroll::ScrollRecord>,
+    bar: Option<BarSeat>,
+    kept_before_least: Option<scroll::Left>,
 }
 
 /// What the bar's least does for the landing from a screen ([`page`], R3 of seat_scroll).
@@ -35215,6 +35315,17 @@ fn choice_words(spec: &mut ButtonSpec, complete: &str, max_width: f32) -> usize 
     let full = wrapped[0].as_str();
     let short = wrapped[1..].iter().map(String::as_str).collect::<Vec<_>>();
     if let Some((words, lines)) = whole_button_words_in(spec, full, &short, max_width) {
+        if spec.trailing_icon.is_some() {
+            let mut bare = spec.clone();
+            bare.trailing_icon = None;
+            if let Some((words, fewer)) = whole_button_words_in(&bare, full, &short, max_width)
+                && fewer < lines
+            {
+                spec.trailing_icon = None;
+                spec.visual_label = Some(words);
+                return fewer;
+            }
+        }
         spec.visual_label = Some(words);
         return lines;
     }

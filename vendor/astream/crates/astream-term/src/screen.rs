@@ -390,6 +390,9 @@ pub const fn is_vs16_emoji_capable(ch: char) -> bool {
     let mut hi = TEXT_DEFAULT_EMOJI_RANGES.len();
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
+        if mid >= TEXT_DEFAULT_EMOJI_RANGES.len() {
+            return false;
+        }
         let (start, end) = TEXT_DEFAULT_EMOJI_RANGES[mid];
         if u < start {
             hi = mid;

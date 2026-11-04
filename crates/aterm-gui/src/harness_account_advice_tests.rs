@@ -11,6 +11,7 @@ fn autopilot_off_retires_a_normal_wait_until_a_fresh_same_binding_decision() {
         SESSION_AUTOPILOT_OFF_FINDING,
     };
     use aterm_agent::harness::footer::{FactsOwner, FooterFacts};
+    use aterm_agent::harness::{account_series, outlook};
     let mut app = crate::App::headless_for_test();
     app.proxy = None;
     let local = app.focused_session_id(crate::WindowId(0)).unwrap();
@@ -43,6 +44,26 @@ fn autopilot_off_retires_a_normal_wait_until_a_fresh_same_binding_decision() {
         .transact(now, &mut None, |state| {
             let mut events = Vec::new();
             for row in &roster.rows {
+                if row.label != "pool-a" {
+                    events.extend(
+                        accounts::note_reading_held(
+                            state,
+                            &row.label,
+                            &accounts::TapRead {
+                                seven_day: Some(accounts::WindowRead {
+                                    pct_x10: if row.label == "main" { 580 } else { 310 },
+                                    reset: now + 4 * 86_400,
+                                    refilled: None,
+                                }),
+                                at: now,
+                                seen_before: true,
+                                ..Default::default()
+                            },
+                            now,
+                        )
+                        .0,
+                    );
+                }
                 events.extend(accounts::note_wall(
                     state,
                     &row.label,
@@ -71,6 +92,64 @@ fn autopilot_off_retires_a_normal_wait_until_a_fresh_same_binding_decision() {
         .clone();
     assert_eq!(retained.phase, ProgressPhase::Waiting);
     assert!(retained.next_at.is_some());
+    // Use actual bound rows and store readings, with a retained usage series, rather than
+    // planting forecast prose. Both accounts' standing limits make this a real future wait.
+    let mut forecast_roster = a.roster();
+    forecast_roster.rows.retain(|row| row.label != "pool-a");
+    assert_eq!(forecast_roster.rows.len(), 2);
+    let forecast_state = a.state();
+    let series = forecast_roster
+        .rows
+        .iter()
+        .map(|row| {
+            let used = if row.label == "main" { 580 } else { 310 };
+            let history = [(now - 86_400, 100), (now, used)]
+                .into_iter()
+                .map(|(at, pct_x10)| account_series::SeriesRow {
+                    t: at,
+                    by: forecast_state.machine.clone(),
+                    said: account_series::Said::Fig {
+                        five_hour: None,
+                        seven_day: Some(account_series::Fig {
+                            pct_x10,
+                            reset: now + 4 * 86_400,
+                            at,
+                            src: accounts::SOURCE_TAP.into(),
+                            epoch: None,
+                        }),
+                    },
+                })
+                .collect();
+            (row.label.clone(), history)
+        })
+        .collect();
+    let forecast = outlook::outlook(&outlook::Inputs {
+        roster: &forecast_roster,
+        state: &forecast_state,
+        enrolled: &forecast_roster
+            .rows
+            .iter()
+            .map(|row| row.label.clone())
+            .collect(),
+        series: &series,
+        renewals: &BTreeMap::new(),
+        mode: accounts::Mode::Wall,
+        credits: false,
+        now,
+        offset: |_| 0,
+    });
+    let glance = forecast.glance("main", Some(580), true).unwrap();
+    assert!(glance.verdict.is_some() && glance.title_verdict.is_some());
+    assert!(glance.spoken.is_some());
+    assert!(
+        glance
+            .bar
+            .as_ref()
+            .unwrap()
+            .0
+            .iter()
+            .any(|cell| { matches!(cell, outlook::BarCell::More | outlook::BarCell::Tick) })
+    );
     {
         let mut timeline = ctx.timeline.lock().unwrap();
         let pid = i32::try_from(std::process::id()).unwrap();
@@ -85,6 +164,7 @@ fn autopilot_off_retires_a_normal_wait_until_a_fresh_same_binding_decision() {
                     floor: Some(born),
                     session_id: ACCT_TALK_A.into(),
                 }),
+                glance: Some(glance.clone()),
                 ..Default::default()
             }),
         );
@@ -104,6 +184,43 @@ fn autopilot_off_retires_a_normal_wait_until_a_fresh_same_binding_decision() {
             .unwrap_or_default()
     });
     app.harness = Some(host.clone());
+    let check_glance = |paused: bool| {
+        let facts = ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .claude_footer()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            facts.glance.as_ref(),
+            Some(&glance),
+            "raw pool evidence stays intact"
+        );
+        assert_eq!(facts.account_forecasts_paused(), paused);
+        let shown = facts.glance_view().unwrap();
+        if paused {
+            assert!(shown.verdict.is_none() && shown.title_verdict.is_none());
+            assert!(shown.title.is_none() && shown.spoken.is_none());
+            assert_eq!((&shown.reset, &shown.five), (&glance.reset, &glance.five));
+            let (old_ten, old_five) = glance.bar.as_ref().unwrap();
+            let (ten, five) = shown.bar.as_ref().unwrap();
+            for (before, after) in old_ten.iter().chain(old_five).zip(ten.iter().chain(five)) {
+                assert_eq!(
+                    *after == outlook::BarCell::Used,
+                    *before == outlook::BarCell::Used
+                );
+                assert!(matches!(
+                    after,
+                    outlook::BarCell::Used | outlook::BarCell::Left
+                ));
+            }
+            // The former direct-Glance projection would still expose this real wait.
+            assert!(facts.glance.as_ref().unwrap().verdict.is_some());
+        } else {
+            assert_eq!(shown.as_ref(), &glance);
+        }
+    };
     let model = aterm_models_harness::account_progress_policy_model();
     let mut policy = model.init_state();
     let mut epochs = vec![Arc::clone(
@@ -170,6 +287,15 @@ fn autopilot_off_retires_a_normal_wait_until_a_fresh_same_binding_decision() {
         ] {
             assert_eq!(state[field], actual, "{field}: {state:?}");
         }
+        assert_eq!(
+            ctx.timeline
+                .lock()
+                .unwrap()
+                .claude_footer()
+                .is_some_and(|facts| { facts.account_forecast_refusal().is_some() }),
+            matches!(state["view"], 2 | 3),
+            "the delivered policy view also withdraws forecast claims"
+        );
         for invariant in &model.invariants {
             assert!(
                 model.check_invariant(invariant.name, state),
@@ -203,6 +329,7 @@ fn autopilot_off_retires_a_normal_wait_until_a_fresh_same_binding_decision() {
         crate::harness_recovery_verb::snapshot(&ctx.timeline.lock().unwrap()),
         Some(retained.clone())
     );
+    check_glance(false);
     let wanted = HashMap::from([(sid.clone(), Program::Claude)]);
     let mut worker = idle_worker();
     worker.agent = Program::Claude;
@@ -258,6 +385,7 @@ fn autopilot_off_retires_a_normal_wait_until_a_fresh_same_binding_decision() {
         let progress =
             crate::harness_recovery_verb::snapshot(&ctx.timeline.lock().unwrap()).unwrap();
         assert_eq!(progress.phase, ProgressPhase::Paused);
+        assert!(progress.forecasts_paused);
         assert_eq!(
             progress.details.first().map(String::as_str),
             Some(if word == Autopilot::Off {
@@ -283,6 +411,22 @@ fn autopilot_off_retires_a_normal_wait_until_a_fresh_same_binding_decision() {
     read(&mut app);
     let paused = crate::harness_recovery_verb::snapshot(&ctx.timeline.lock().unwrap()).unwrap();
     assert_eq!(paused.phase, ProgressPhase::Paused);
+    assert!(paused.forecasts_paused);
+    check_glance(true);
+    // This real concurrent writer is outside the policy trace. Restore its prior view
+    // before continuing that trace; contention must never revive the stored forecast.
+    progress::lifecycle_tests::with_progress_writer(&host.shared.state, || read(&mut app));
+    {
+        let timeline = ctx.timeline.lock().unwrap();
+        let facts = timeline.claude_footer().unwrap();
+        assert!(facts.account_progress_busy);
+        let busy = facts.account_progress_view().unwrap();
+        assert_eq!(busy.phase, ProgressPhase::Unknown);
+        assert!(busy.forecasts_paused);
+    }
+    check_glance(true);
+    read(&mut app);
+    check_glance(true);
     // Former presentation kept the same normal wait/deadline despite a known Off verdict.
     let mut former = policy.clone();
     former.insert("view", 1);
@@ -344,7 +488,12 @@ fn autopilot_off_retires_a_normal_wait_until_a_fresh_same_binding_decision() {
             .any(|(_, value)| value == SESSION_AUTOPILOT_OFF_FINDING)
     );
     let reply = crate::harness_recovery_verb::cmd("recovery", true, || Ok(Some(paused.clone())));
-    for field in ["phase=paused", "eligible=-", "next_at=-"] {
+    for field in [
+        "phase=paused",
+        "eligible=-",
+        "next_at=-",
+        "forecasts_paused=1",
+    ] {
         assert!(
             reply.split_whitespace().any(|word| word == field),
             "{reply}"
@@ -397,6 +546,8 @@ fn autopilot_off_retires_a_normal_wait_until_a_fresh_same_binding_decision() {
     read(&mut app);
     let resumed = crate::harness_recovery_verb::snapshot(&ctx.timeline.lock().unwrap()).unwrap();
     assert_eq!(resumed.phase, ProgressPhase::Paused);
+    assert!(resumed.forecasts_paused);
+    check_glance(true);
     assert_eq!(resumed.observed_at, retained.observed_at);
     assert_eq!(
         resumed.details.first().map(String::as_str),
@@ -420,6 +571,8 @@ fn autopilot_off_retires_a_normal_wait_until_a_fresh_same_binding_decision() {
     check(&policy, &epochs, None);
     let fresh = crate::harness_recovery_verb::snapshot(&ctx.timeline.lock().unwrap()).unwrap();
     assert_eq!(fresh, retained);
+    assert!(!fresh.forecasts_paused);
+    check_glance(false);
     assert!(
         idle.kept
             .lock()
@@ -463,6 +616,20 @@ fn autopilot_off_retires_a_normal_wait_until_a_fresh_same_binding_decision() {
         }
     );
     assert_eq!((working.eligible, working.next_at), (None, None));
+    assert!(working.forecasts_paused);
+    check_glance(true);
+    let reply = crate::harness_recovery_verb::cmd("recovery", true, || Ok(Some(working.clone())));
+    for field in [
+        "phase=verifying",
+        "target=work-2",
+        "next_at=-",
+        "forecasts_paused=1",
+    ] {
+        assert!(
+            reply.split_whitespace().any(|word| word == field),
+            "{reply}"
+        );
+    }
 }
 
 fn ready(sid: &str) -> (Arc<Accts>, WorkerIdle) {

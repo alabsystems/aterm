@@ -559,7 +559,7 @@ fn the_new_forms_parse_and_their_flags_belong_to_them() {
         p(&format!("accounts add w2 --email {WORK}")).map(|(c, _)| c),
         Ok(Cmd::Accounts(AccountsCmd::Add {
             label: "w2".into(),
-            class: Class::Dedicated,
+            class: Class::Preferred,
             email: Some(WORK.into()),
             identity_email: None,
             browser: None,
@@ -866,7 +866,7 @@ fn a_staging_home_is_never_a_rows_login_directory() {
         .expect("bound");
     let add = |label: &str| AccountsCmd::Add {
         label: label.into(),
-        class: Class::Dedicated,
+        class: Class::Preferred,
         email: None,
         identity_email: None,
         browser: None,
@@ -1209,7 +1209,7 @@ fn due_leaves_a_row_no_session_needs_to_the_upkeep() {
     let (code, out, err) = acc(
         AccountsCmd::Add {
             label: "w3".into(),
-            class: Class::Dedicated,
+            class: Class::Preferred,
             email: Some("w3@example.test".into()),
             identity_email: None,
             browser: None,
@@ -1260,7 +1260,7 @@ fn due_renews_only_what_is_due_and_says_when_nothing_is() {
     let (code, out, err) = acc(
         AccountsCmd::Add {
             label: "work-3".into(),
-            class: Class::Dedicated,
+            class: Class::Preferred,
             email: Some("w3@example.test".into()),
             identity_email: None,
             browser: None,
@@ -1461,7 +1461,7 @@ fn each_line_that_signs_a_row_in_names_its_own_verb() {
     let host = RenewHost::new();
     let add = |label: &str, email: Option<&str>| AccountsCmd::Add {
         label: label.into(),
-        class: Class::Dedicated,
+        class: Class::Preferred,
         email: email.map(str::to_string),
         identity_email: None,
         browser: None,
@@ -1518,7 +1518,7 @@ fn a_page_that_stopped_a_sign_in_names_the_persons_renewal() {
     let (code, out, err) = acc(
         AccountsCmd::Add {
             label: "w3".into(),
-            class: Class::Dedicated,
+            class: Class::Preferred,
             email: Some("w3@example.com".into()),
             identity_email: None,
             browser: None,
@@ -1675,7 +1675,7 @@ fn the_report_shows_a_rows_failed_automatic_sign_in_until_a_login_is_made() {
     let (code, out, err) = acc(
         AccountsCmd::Add {
             label: "w3".into(),
-            class: Class::Dedicated,
+            class: Class::Preferred,
             email: Some("w3@example.com".into()),
             identity_email: None,
             browser: None,
@@ -1797,7 +1797,7 @@ fn adopt_default_lists_this_machines_own_login_once() {
     let (code, out, _) = acc_quiet(
         AccountsCmd::Add {
             label: "w2".into(),
-            class: Class::Dedicated,
+            class: Class::Preferred,
             email: Some(WORK.into()),
             identity_email: None,
             browser: None,

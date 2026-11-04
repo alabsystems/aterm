@@ -40,7 +40,6 @@ const POLLNVAL: c_short = 0x0020;
 unsafe extern "C" {
     fn poll(fds: *mut PollFd, nfds: c_uint, timeout: c_int) -> c_int;
     fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
-    #[cfg(debug_assertions)]
     fn fsync(fd: c_int) -> c_int;
     fn signal(sig: c_int, handler: extern "C" fn(c_int)) -> usize;
     fn sysctlbyname(
@@ -82,38 +81,32 @@ pub(crate) fn sighup_generation() -> u64 {
     SIGHUP_GENERATION.load(Ordering::Acquire)
 }
 
-/// `fcntl(fd, F_BARRIERFSYNC)`, retried while it is interrupted (`EINTR`); any other
-/// failure is the call's own errno.
+/// `fcntl(fd, F_BARRIERFSYNC)`, retried while it is interrupted (`EINTR`,
+/// [`crate::retried_on_eintr`]); any other failure is the call's own errno.
 pub(crate) fn barrier_fsync(file: &File) -> io::Result<()> {
     let fd = file.as_raw_fd();
-    loop {
-        let rc = apple_ffi!(barrier_fsync(fd, F_BARRIERFSYNC));
-        if rc != -1 {
-            return Ok(());
+    crate::retried_on_eintr(|| {
+        if apple_ffi!(barrier_fsync(fd, F_BARRIERFSYNC)) == -1 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
         }
-        let err = io::Error::last_os_error();
-        if err.kind() != io::ErrorKind::Interrupted {
-            return Err(err);
-        }
-    }
+    })
 }
 
-/// `fsync(fd)`, retried while it is interrupted (`EINTR`): the file's writes handed
-/// to the drive, without the drain of its cache `F_FULLFSYNC` waits for. Only a test's
-/// process in a debug build takes it ([`crate::full_sync`], [`crate::TEST_PLAIN_FSYNC_ENV`]).
-#[cfg(debug_assertions)]
+/// `fsync(fd)`, retried while it is interrupted (`EINTR`, [`crate::retried_on_eintr`]):
+/// the file's writes handed to the drive, without the drain of its cache `F_FULLFSYNC`
+/// waits for. [`crate::plain_fsync`] in every build, and [`crate::full_sync`] in a test's
+/// process in a debug build ([`crate::TEST_PLAIN_FSYNC_ENV`]).
 pub(crate) fn plain_fsync(file: &File) -> io::Result<()> {
     let fd = file.as_raw_fd();
-    loop {
-        let rc = apple_ffi!(fsync(fd));
-        if rc != -1 {
-            return Ok(());
+    crate::retried_on_eintr(|| {
+        if apple_ffi!(fsync(fd)) == -1 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
         }
-        let err = io::Error::last_os_error();
-        if err.kind() != io::ErrorKind::Interrupted {
-            return Err(err);
-        }
-    }
+    })
 }
 
 /// The raw `kern.bootsessionuuid` answer (the UUID text and its NUL), or `None` when

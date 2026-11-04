@@ -101,7 +101,7 @@ impl Bed {
         match case {
             1 | 4 => {
                 let mut raw = self.raw.clone();
-                raw.rows[0].class = accounts::Class::Shared;
+                raw.rows[0].class = accounts::Class::Pool;
                 std::fs::write(
                     &self.path,
                     accounts::append_rows_for(self.cli, "", &raw.rows).unwrap(),

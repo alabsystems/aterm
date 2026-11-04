@@ -272,16 +272,16 @@ fn measure(cargo: &crate::resolve::Cargo, root: &Path) -> Result<Live, String> {
         .filter(|p| p.is_vendored())
         .map(|p| p.name.as_str())
         .collect();
-    let workspace = lock
+    let first_party = lock
         .iter()
-        .filter(|e| e.source.is_none() && !vendored_patch_names.contains(&e.name.as_str()))
+        .filter(|entry| first_party_lock_entry(root, entry, &vendored_patch_names))
         .count();
     live.scopes.push("lock".to_string());
     live.set("lock", "packages", u(lock.len()));
     live.set(
         "lock",
         "third_party_packages",
-        u(lock.len().saturating_sub(workspace)),
+        u(lock.len().saturating_sub(first_party)),
     );
 
     live.scopes.push("patch".to_string());
@@ -335,6 +335,17 @@ fn measure(cargo: &crate::resolve::Cargo, root: &Path) -> Result<Live, String> {
     }
 
     Ok(live)
+}
+
+fn first_party_lock_entry(
+    root: &Path,
+    entry: &crate::policy::LockEntry,
+    vendored_patch_names: &[&str],
+) -> bool {
+    match &entry.source {
+        None => !vendored_patch_names.contains(&entry.name.as_str()),
+        Some(source) => crate::provenance::is_first_party_git(root, &entry.name, source),
+    }
 }
 
 fn detail(s: &CellSurvey) -> ScopeDetail {
@@ -823,6 +834,58 @@ fn table(rows: &[[String; 5]]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lock_count_preserves_forks_and_includes_reviewed_git_components() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[workspace.package]\nrepository = \"https://github.com/our-account/aterm\"\n",
+        )
+        .unwrap();
+        let hash = "1234567890123456789012345678901234567890";
+        let source =
+            |repo: &str, rev: &str| format!("git+https://github.com/{repo}?rev={rev}#{hash}");
+        let entry = |name: &str, source: Option<String>| crate::policy::LockEntry {
+            name: name.to_owned(),
+            version: "0.1.0".to_owned(),
+            source,
+        };
+        assert!(super::first_party_lock_entry(
+            root.path(),
+            &entry(
+                "trust-build-cpu",
+                Some(source("our-account/trust.git", hash))
+            ),
+            &[]
+        ));
+        for foreign in [
+            entry("ring", Some(source("our-account/ring.git", hash))),
+            entry(
+                "trust-build-cpu",
+                Some(source("other-account/trust.git", hash)),
+            ),
+            entry(
+                "trust-build-cpu",
+                Some(source("our-account/trust.git", "main")),
+            ),
+            entry(
+                "trust-build-cpu",
+                Some("registry+https://github.com/rust-lang/crates.io-index".into()),
+            ),
+        ] {
+            assert!(!super::first_party_lock_entry(root.path(), &foreign, &[]));
+        }
+        assert!(super::first_party_lock_entry(
+            root.path(),
+            &entry("ours", None),
+            &[]
+        ));
+        assert!(!super::first_party_lock_entry(
+            root.path(),
+            &entry("vendored", None),
+            &["vendored"]
+        ));
+    }
     use super::*;
 
     fn row(scope: &str, metric: &str, ceiling: u64) -> Row {

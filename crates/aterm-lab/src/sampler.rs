@@ -193,7 +193,7 @@ pub fn main(args: &[String]) -> i32 {
     let mut ever: BTreeSet<i32> = BTreeSet::new();
     let mut runtime: BTreeSet<crate::runtime_dirs::Held> = BTreeSet::new();
     let mut kept: Option<std::time::Instant> = None;
-    while let Ok(text) = std::fs::read_to_string(dir.join("env.sh")) {
+    while let Ok(text) = crate::util::read_regular_text(&dir.join("env.sh")) {
         let run = Run::parse(&text);
         if kept.is_none_or(|t| t.elapsed() >= KEEP_EVERY) {
             keep_from_the_cleaner(dir, &run.sockdir, SystemTime::now());

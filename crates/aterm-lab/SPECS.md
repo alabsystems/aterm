@@ -434,8 +434,6 @@ The selftest itself (`agy-selftest`) is not a unit test: like `selftest` and
 `codex-selftest` it runs the real agent in a lab, and its judges are the seven `agy-proof-*`
 specs.
 
-## 8. The open recorder's verdict
-
 ## 8. Added 2026-10-21: the open recorder's verdict
 
 The four proofs that run an agent in a lab (`selftest`, `codex-selftest`, `agy-selftest`,
@@ -1091,7 +1089,7 @@ src/forever_checked_tests.rs	the_workers_await_result_and_row_say_checked	checke
 src/forever_checked_tests.rs	the_landed_title_says_its_own_receipt	checked-title	
 ```
 
-## 24. Added 2026-10-31: the tether's verb
+## 25. Added 2026-10-31: the tether's verb
 
 Both of the lab's `main`s call `aterm_uds::tether::entry` before the `argv[0]` dispatch (the
 macOS one after the debug build's claim holder, as aterm's and atpkg's do), so a child the lab
@@ -1108,7 +1106,7 @@ file	test	primary	also
 tests/tether_entry.rs	the_lab_serves_the_tether_verb	tether-verb-first	
 ```
 
-## 25. Added 2026-11-01: a letter judged by the ring round its strokes (round 27)
+## 26. Added 2026-11-01: a letter judged by the ring round its strokes (round 27)
 
 `trail-contrast`'s thresholds (`min_contrast`, `--min`, `--newest-min`) judge a glyph cell by its
 `local_contrast`, what a reader sees round each stroke, the one reading the letter guard keeps
@@ -1125,10 +1123,10 @@ file	test	primary	also
 src/trail_contrast_tests.rs	a_light_away_from_the_strokes_leaves_the_letter_its_reading	trail-contrast-judged	
 ```
 
-## 26. Added 2026-11-03: what the effects did, apart from the page's own dim text
+## 27. Added 2026-11-03: what the effects did, apart from the page's own dim text
 
 `trail-contrast --lowered-min X` counts a glyph cell only where the effects took it down: its
-judged reading (§25) under X and under `LOWERED_SHARE` (0.97, the letter guard's `OWN_SHARE`) of the
+judged reading (§26) under X and under `LOWERED_SHARE` (0.97, the letter guard's `OWN_SHARE`) of the
 same reading on its clean twin, `clean_local_contrast`. A page's own low-contrast text (a coloured
 prompt segment) reads the same with and without the effects, and is not counted. Without a clean
 twin it is an error, never a pass. Read the same way as §1.
@@ -1141,4 +1139,21 @@ trail-contrast-lowered	contract	trail_contrast::{clean_judged,lowered_under,meas
 ```tsv
 file	test	primary	also
 src/trail_contrast_tests.rs	lowered_min_counts_only_the_glyphs_the_effects_took_down	trail-contrast-lowered	
+```
+
+## 28. Added 2026-11-03: bounded regular-file reads in `util`
+
+`util::{open_regular_file, read_regular_file, read_regular_text}` open lab files with
+`O_NONBLOCK | O_CLOEXEC`, verify `fstat` is a regular file (`InvalidInput` on directories, FIFOs,
+sockets and devices), and bound reads to `MAX_LAB_FILE_BYTES` (256 MiB, `InvalidData` when larger or
+grown mid-read, or when UTF-8 decoding fails). Read the same way as §1.
+
+```tsv
+id	kind	functions	statement	subsumes	difficulty	blocking_gaps
+util-read-regular	contract	util::{open_regular_file,read_regular_file,read_regular_text}	open_regular_file(p) opens p with O_NONBLOCK | O_CLOEXEC and returns Ok(f) iff f.metadata().is_file(), else Err(InvalidInput). read_regular_file(p) reads at most MAX_LAB_FILE_BYTES + 1 bytes from open_regular_file(p) and returns Ok(bytes) iff meta.len() ≤ MAX_LAB_FILE_BYTES and |bytes| ≤ MAX_LAB_FILE_BYTES, else Err(InvalidData). read_regular_text(p) decodes read_regular_file(p) as UTF-8, returning Err(InvalidData) on invalid UTF-8.	util.rs::read_regular_file_and_text_refuse_non_regular_entries	fs open with custom flags, fstat, Read::take, UTF-8 decode	1,7,8
+```
+
+```tsv
+file	test	primary	also
+src/util.rs	read_regular_file_and_text_refuse_non_regular_entries	util-read-regular	
 ```

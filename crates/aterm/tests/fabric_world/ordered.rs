@@ -32,7 +32,9 @@ fn ordered_world(tag: &str) -> Option<World> {
 fn person_cap(w: &World, person: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
     let path = w.tmp.join(format!("{person}.cap"));
-    let caps: String = aterm_link::enable::person_grants(FLEET, person)
+    let caps: String = astream_cap::GrantCeiling::aterm_person_ring(FLEET, person)
+        .expect("a person ring")
+        .rules()
         .iter()
         .map(|g| harness::cap_line(g))
         .collect();

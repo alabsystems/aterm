@@ -109,7 +109,9 @@ impl Rig {
 /// Maximum size (128 MiB) accepted when reading PNG frames, recording indices, or logs.
 pub(crate) const MAX_MEASURE_FILE_BYTES: u64 = 128 << 20;
 
-pub(crate) fn open_regular_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+pub(crate) fn open_regular_file_with_meta(
+    path: &std::path::Path,
+) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
     #[cfg(unix)]
@@ -125,26 +127,31 @@ pub(crate) fn open_regular_file(path: &std::path::Path) -> std::io::Result<std::
         ));
     }
     let file = opts.open(path)?;
-    if !file.metadata()?.is_file() {
+    let meta = file.metadata()?;
+    if !meta.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "not a regular file",
         ));
     }
-    Ok(file)
+    Ok((file, meta))
+}
+
+pub(crate) fn open_regular_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    open_regular_file_with_meta(path).map(|(file, _)| file)
 }
 
 pub(crate) fn read_regular_file(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
-    let file = open_regular_file(path)?;
-    let meta = file.metadata()?;
+    let (file, meta) = open_regular_file_with_meta(path)?;
     if meta.len() > MAX_MEASURE_FILE_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "file exceeds 128 MiB limit",
         ));
     }
-    let cap = usize::try_from(meta.len().min(MAX_MEASURE_FILE_BYTES)).unwrap_or(0);
+    let cap =
+        usize::try_from(meta.len().min(MAX_MEASURE_FILE_BYTES).saturating_add(1)).unwrap_or(0);
     let mut buf = Vec::with_capacity(cap);
     file.take(MAX_MEASURE_FILE_BYTES + 1)
         .read_to_end(&mut buf)?;

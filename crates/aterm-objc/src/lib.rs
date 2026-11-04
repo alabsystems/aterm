@@ -63,10 +63,12 @@ pub use main_thread_bound::MainThreadBound;
 pub use path_monitor::{PathMonitor, PathReading, PathStatus};
 pub use queue::{ContainedOnQueue, SerialQueue};
 pub use retained::{ClassType, Retained};
+// Keep the guarded raw-send export explicit so Tippy resolves it in this crate as well as dependents.
+pub use runtime::msg;
 pub use runtime::{
     AutoreleasePool, ClassPtr, Id, IvarPtr, MsgFn, Obj, ObjcSuper, ProtocolPtr, Sel, autorelease,
     autoreleasepool, class, class_methods, class_name, class_of, class_protocols, method_imp,
-    method_types, msg, msg_super, ns_error_string, ns_string, ns_string_to_rust, protocol,
+    method_types, msg_super, ns_error_string, ns_string, ns_string_to_rust, protocol,
     protocol_method_extended_types, protocol_method_types, protocol_or_register,
     protocols_registered_by_aterm, returns_indirectly, superclass_of,
 };

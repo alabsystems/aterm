@@ -9105,8 +9105,14 @@ fn a_tab_lands_with_a_line_of_the_controls_name_where_a_screen_holds_both() {
         (1.0, priority, (248.0, 278.0), both),
         (0.85, priority, (220.0, 222.0), both),
         (0.85, music, (234.0, 418.0), &[true]),
+        (
+            2.0,
+            (SettingsRoute::KeyboardInput, prefs::EDIT_COPY_ON_SELECT),
+            (354.0, 166.0),
+            both,
+        ),
     ];
-    at_each_text_scale(&[0.85, 1.0], "a tab lands with its name", |scale| {
+    at_each_text_scale(&[0.85, 1.0, 2.0], "a tab lands with its name", |scale| {
         for &(_, (route, setting), (width, height), directions) in
             cases.iter().filter(|(at, ..)| (at - scale).abs() < 0.01)
         {

@@ -2961,8 +2961,10 @@ fn a_screen_unmoved_since_the_write_is_waited_past_where_it_reads_as_another_tex
 /// give-up at the echo's minute and [`turn_end_loop::UNDRAWN_INPUT_HANG`] after it, as one that
 /// moves at 100 s. The hold raises nothing (no badge, no `ESCALATED`) and journals one record per
 /// change of what holds it, however often it is looked at; on a limit wall it is no session at
-/// rest, so no restart in place. Negative control: once the screen moves, the next decision acts,
-/// an Enter fenced on that read.
+/// rest, so no restart in place, though its host could make one ([`no_rest_no_restart`]).
+/// Negative controls: once the screen moves, the next decision acts, an Enter fenced on that
+/// read; by mutation, [`Session::custody_at_rest`] reading every session at rest: the restart
+/// asked on the wall.
 #[test]
 fn a_line_held_on_an_unmoved_screen_is_never_typed_again_through_the_loop() {
     for stands in [100, 300] {
@@ -3001,6 +3003,10 @@ fn a_line_held_on_an_unmoved_screen_is_never_typed_again_through_the_loop() {
             held.len() <= 3,
             "{stands} s: one record per change of what holds it, {} records: {held:#?}",
             held.len()
+        );
+        assert!(
+            no_rest_no_restart(&noted),
+            "{stands} s: on the wall, no rest and no restart: {noted:#?}"
         );
         assert_eq!(
             t.enters().len(),
@@ -3074,12 +3080,15 @@ fn escalated_drawn_as(
     let (dir, journal) = journal_file(&format!(
         "unmoved-escalated-{stands}{tag}-{rekeyed}-{keeps}"
     ));
+    // A host that would make a restart in place: the wall alone keeps the session from rest.
+    let host = AccountHost::scripted(&[], &["relaunched"]);
     let opts = SuperviseOpts {
         policy: SupervisorConfig {
             human_grace_s: 0,
             ..owners_policy()
         },
         journal: Some(journal.clone()),
+        idle_host: Some(host as Arc<dyn IdleHost>),
         ..resuming(&auto(30), None)
     };
     let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
@@ -3093,6 +3102,18 @@ fn escalated_drawn_as(
         .collect();
     let _ = std::fs::remove_dir_all(&dir);
     (Typed { m, lines }, noted)
+}
+
+/// Whether the journal `noted` says the wall kept a line read and undrawn from a restart in place
+/// though its host could make one: a `SKIPPED` record that the session is not at rest, and no
+/// restart asked.
+fn no_rest_no_restart(noted: &[String]) -> bool {
+    noted
+        .iter()
+        .any(|l| l.starts_with("SKIPPED ") && l.contains("the session is not at rest"))
+        && !noted
+            .iter()
+            .any(|l| l.contains("restart:input-lost") || l.contains("restarting it in place"))
 }
 
 /// A LINE DRAWN LATE IS DECIDED AGAIN, THOUGH ONLY THE COMPOSER MOVED: the same frame is the same
@@ -4444,15 +4465,17 @@ fn a_left_line_a_person_cleared_lets_the_session_go_on() {
 }
 
 /// A HELD LINE'S HOLD OUTLASTS A STATUS READ OF IT UNREAD ([`Session::custody_gate`],
-/// [`turn_end_loop::Held`]): a starved worker still holds the loop's continuation queued, so
+/// `custody::Held`): a starved worker still holds the loop's continuation queued, so
 /// `status` reads it unread (`input=pending`) for 70 s after the write, on the screen the line was
 /// taken into custody on, and that read holds it with no clock of its own but a doubling due. The
 /// screen stands 300 s, so a hold that ran out [`turn_end_loop::UNDRAWN_INPUT_HANG`] after the
 /// queue last read unread would write the line again on the unmoved screen; a later clear read
-/// proves it read, and on a limit wall no session is at rest, so no restart. The continuation is
-/// written once and raises nothing, and every record of the hold is on that screen. NEGATIVE
-/// CONTROLS: the status read of the unread input is in the journal (the read the hold must outlast
-/// happened), and once the screen moves the next decision acts, an Enter fenced on that read.
+/// proves it read, and on a limit wall no session is at rest, so no restart, though its host
+/// could make one ([`no_rest_no_restart`]). The continuation is written once and raises nothing,
+/// and every record of the hold is on that screen. NEGATIVE CONTROLS: the status read of the
+/// unread input is in the journal (the read the hold must outlast happened), and once the screen
+/// moves the next decision acts, an Enter fenced on that read; by mutation,
+/// [`Session::custody_at_rest`] reading every session at rest: the restart asked on the wall.
 #[test]
 fn a_held_lines_hold_outlasts_a_status_read_of_it_unread() {
     let (t, noted) = escalated_on_an_unmoved_screen(300, Some(70));
@@ -4474,6 +4497,10 @@ fn a_held_lines_hold_outlasts_a_status_read_of_it_unread() {
                 .all(|l| l.starts_with(&format!("SKIPPED seq={on} "))),
         "held only on the screen it formed on, one record per change, {} records: {skips:#?}",
         skips.len()
+    );
+    assert!(
+        no_rest_no_restart(&noted),
+        "on the wall, no rest and no restart: {noted:#?}"
     );
     assert_eq!(
         t.enters().len(),
@@ -15181,9 +15208,29 @@ struct AccountHost {
     relaunch_owed_asked: std::sync::atomic::AtomicUsize,
     upgrade_due: std::sync::atomic::AtomicBool,
     limit_until: std::sync::Mutex<Option<u64>>,
+    /// The host wants every idle point and break offered ([`IdleHost::wants`]), and keeps each
+    /// offered, in order, with where: `idle` ([`IdleHost::at_idle_on`]) or `break`
+    /// ([`IdleHost::at_background_on`]).
+    asks_points: std::sync::atomic::AtomicBool,
+    points: std::sync::Mutex<Vec<(&'static str, IdlePoint)>>,
+    /// The loop's clock, once a test names it ([`Self::stamps_on`]), and when on it each restart
+    /// ([`IdleHost::restart`]) was asked, in order.
+    clock: std::sync::Mutex<Option<Arc<crate::supervise::fx::ScriptedClock>>>,
+    restarted_at: std::sync::Mutex<Vec<Instant>>,
 }
 
 impl AccountHost {
+    /// Stamp each restart asked on the clock of the loop `s` (from the run's setup), as the
+    /// shipped host and loop share the system's.
+    fn stamps_on<C: Ctl>(&self, s: &mut Session<'_, C>) {
+        *self.clock.lock().unwrap() = s.fx.scripted_handle();
+    }
+
+    /// When, on the loop's clock, each restart was asked ([`Self::stamps_on`]).
+    fn restarted_at(&self) -> Vec<Instant> {
+        self.restarted_at.lock().unwrap().clone()
+    }
+
     fn scripted(advice: &[Option<AccountAdvice>], answers: &[&'static str]) -> Arc<Self> {
         Arc::new(Self {
             advice: std::sync::Mutex::new(advice.iter().cloned().collect()),
@@ -15252,7 +15299,18 @@ impl IdleHost for AccountHost {
         }
     }
     fn wants(&self) -> bool {
-        self.carry.load(Ordering::SeqCst)
+        self.carry.load(Ordering::SeqCst) || self.asks_points.load(Ordering::SeqCst)
+    }
+    fn at_idle_on(&self, point: IdlePoint) -> Option<HostStep> {
+        self.points.lock().unwrap().push(("idle", point));
+        self.at_idle()
+    }
+    fn at_background_on(
+        &self,
+        point: IdlePoint,
+    ) -> Option<(String, crate::supervise::policy::turn_end::HostTurn)> {
+        self.points.lock().unwrap().push(("break", point));
+        None
     }
     fn at_idle(&self) -> Option<HostStep> {
         if !self.carry.swap(false, Ordering::SeqCst) {
@@ -15283,6 +15341,9 @@ impl IdleHost for AccountHost {
             other => format!("restart:{}", other.word()),
         };
         self.said.lock().unwrap().push(what);
+        if let Some(clock) = self.clock.lock().unwrap().as_ref() {
+            self.restarted_at.lock().unwrap().push(clock.mono());
+        }
         if let Some(advice) = self.advised_on_restart.lock().unwrap().take() {
             *self.advised.lock().unwrap() = advice;
         }
@@ -15413,6 +15474,7 @@ const ACCOUNT_NOW: i64 = TEST_NOW + 8 * 3600 + 10 * 60;
 
 #[test]
 fn execution_authority_is_checked_when_rotation_and_login_repair_are_off() {
+    const RUN_S: u64 = 60;
     for (held, after) in [(false, 0), (true, 0), (true, 1)] {
         let host = Arc::new(AccountHost::default());
         host.execution_after.store(after, Ordering::SeqCst);
@@ -15422,8 +15484,10 @@ fn execution_authority_is_checked_when_rotation_and_login_repair_are_off() {
         ]);
         mock.turn_releases = Some(1);
         mock.vanish_after = Some(2);
-        mock.stall_sleep = Some(Duration::from_millis(5));
-        let mut opts = hosted(60);
+        // No early nap: a held wait answers after the whole timeout the loop asked for, as the
+        // server does, so the run's minute on the virtual clock is its own few waits rather than
+        // 7,500 five-millisecond polls (each taped and replayed three times).
+        let mut opts = hosted(RUN_S);
         opts.policy.accounts = crate::harness::accounts::Mode::Off;
         opts.policy.logins = false;
         opts.idle_host = Some(Arc::clone(&host) as Arc<dyn IdleHost>);
@@ -15453,6 +15517,13 @@ fn execution_authority_is_checked_when_rotation_and_login_repair_are_off() {
         if held {
             assert!(!host.said("execution-held").is_empty());
         }
+        // A hold is waited out, never polled: each wait runs the whole timeout the loop asked
+        // for, so the minute takes fewer requests than it has seconds (a poll takes thousands).
+        let asked = mock.requests.len();
+        assert!(
+            asked < usize::try_from(RUN_S).expect("seconds"),
+            "{held}: {asked} requests in a {RUN_S} s run"
+        );
     }
 }
 
@@ -15704,7 +15775,7 @@ fn a_juniors_move_ahead_the_relaunch_defers_waits_on_its_yield() {
     use crate::harness::accounts::{self, Class, Me, Mode, Point, Roster, Row, State};
     let row = |label: &str| Row {
         label: label.into(),
-        class: Class::Shared,
+        class: Class::Pool,
         dir: Some(format!("/tmp/{label}")),
         email: Some(format!("{label}@example.test")),
         ..Row::default()

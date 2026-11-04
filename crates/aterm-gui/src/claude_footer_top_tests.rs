@@ -1510,8 +1510,8 @@ fn the_rule_flows_into_the_switch() {
                 run.end,
                 "{at}: to the rule's end"
             );
-            for c in 0..2 {
-                assert_eq!(top.cells[c].fg, tint_at(palette, 1.0), "{at}: the lead");
+            for cell in &top.cells[..2] {
+                assert_eq!(cell.fg, tint_at(palette, 1.0), "{at}: the lead");
             }
             let g = gap.len() as f32 - 1.0;
             for (j, c) in gap.clone().enumerate() {

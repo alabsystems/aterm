@@ -104,6 +104,7 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
         ),
         M::Overview => spec("view.overview", S::App, A::Owner, C::Any),
         M::Workers => spec("view.workers", S::App, A::Owner, C::Any),
+        M::Allocation => spec("app.allocation.open", S::Window, A::LocalUi, C::Any),
         M::CloseTab => spec("view.close_focused", S::View, A::LocalUi, C::Any),
         M::Copy => spec("selection.copy", S::View, A::Clipboard, C::Any),
         M::CopySessionId => spec("session.copy_id", S::Tab, A::Clipboard, C::Terminal),
@@ -392,6 +393,12 @@ mod tests {
             menu_command(menu::MenuAction::ToggleSettings).authority
         );
         assert_eq!(system_state.content, ContentRequirement::Any);
+
+        let allocation = menu_command(menu::MenuAction::Allocation);
+        assert_eq!(allocation.id.as_str(), "app.allocation.open");
+        assert_eq!(allocation.scope, CommandScope::Window);
+        assert_eq!(allocation.authority, ActionAuthority::LocalUi);
+        assert_eq!(allocation.content, ContentRequirement::Any);
 
         let all_actions: Vec<menu::MenuAction> =
             (0..=128).filter_map(menu::MenuAction::from_tag).collect();

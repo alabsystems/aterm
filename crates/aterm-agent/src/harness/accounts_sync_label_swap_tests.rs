@@ -45,7 +45,7 @@ fn account(label: &str, email: &str) -> FleetAccount {
     FleetAccount {
         label: label.into(),
         machines: vec!["m3".into()],
-        class: Class::Dedicated,
+        class: Class::Preferred,
         email: email.into(),
         browser: None,
         vendor: accounts::Vendor::default(),
@@ -1722,17 +1722,21 @@ fn a_new_account_at_a_departed_accounts_label_is_not_served_its_renewal() {
 
 const RETURNED_ID: &str = "00000000-0000-0000-0000-0000000000b2";
 
-fn departed_verified_account() -> (Desk, PathBuf, super::super::profile::AccountKey, String) {
+fn verified_account(staged: bool) -> (Desk, PathBuf, super::super::profile::AccountKey, String) {
     let desk = Desk::new("m3");
     let store = desk.store();
     let all = sheet(&[("m3", ANN), ("m3-2", BEA), ("m3-3", CID)]);
     persist_as(&desk, &all, ANN, NOW).unwrap();
-    let staged = store.logins_dir().join("m3-2+1");
-    signed_in(&staged, BEA);
+    let dir = if staged {
+        store.logins_dir().join("m3-2+1")
+    } else {
+        store.login_dir("m3-2").unwrap()
+    };
+    signed_in(&dir, BEA);
     let id = RETURNED_ID;
     let profile =
         format!("{{\"oauthAccount\":{{\"emailAddress\":\"{BEA}\",\"accountUuid\":\"{id}\"}}}}\n");
-    fs::write(staged.join(".claude.json"), &profile).unwrap();
+    fs::write(dir.join(".claude.json"), &profile).unwrap();
     let key = super::super::profile::AccountKey::claude(id).unwrap();
     store
         .transact_logins(NOW, &mut None, |state, logins| {
@@ -1752,17 +1756,349 @@ fn departed_verified_account() -> (Desk, PathBuf, super::super::profile::Account
             logins.labels.insert(
                 "m3-2".into(),
                 accounts::Binding {
-                    dir: Some(text(&staged)),
+                    dir: Some(text(&dir)),
                     renewed_at: Some(NOW),
-                    was: vec![store.login_dir("m3-2").map(|dir| text(&dir))],
+                    was: if staged {
+                        vec![store.login_dir("m3-2").map(|dir| text(&dir))]
+                    } else {
+                        Vec::new()
+                    },
                     ..accounts::Binding::default()
                 },
             );
             Ok(Vec::new())
         })
         .unwrap();
-    persist_as(&desk, &sheet(&[("m3", ANN), ("m3-3", CID)]), ANN, NOW + 10).unwrap();
-    (desk, staged, key, profile)
+    (desk, dir, key, profile)
+}
+
+fn departed_verified_account() -> (Desk, PathBuf, super::super::profile::AccountKey, String) {
+    let seed = verified_account(true);
+    persist_as(
+        &seed.0,
+        &sheet(&[("m3", ANN), ("m3-3", CID)]),
+        ANN,
+        NOW + 10,
+    )
+    .unwrap();
+    seed
+}
+
+const NEW_BEA: &str = "bea-new@example.test";
+
+fn changed_address_source(to: &str) -> FleetRoster {
+    if to == "m3-2" {
+        sheet(&[("m3", ANN), ("m3-2", NEW_BEA), ("m3-3", CID)])
+    } else {
+        sheet(&[("m3", ANN), ("m3-2", EVE), ("m3-3", CID), (to, NEW_BEA)])
+    }
+}
+
+#[test]
+fn a_departing_accounts_provider_key_preserves_its_record_before_label_reuse() {
+    for staged in [false, true] {
+        for to in ["m3-2", "m3-4"] {
+            let (desk, dir, key, profile) = verified_account(staged);
+            let store = desk.store();
+            store
+                .transact_logins(NOW + 1, &mut None, |state, logins| {
+                    Ok(accounts::note_checked_sign_in(
+                        state,
+                        logins,
+                        "m3-2",
+                        NOW + 1,
+                    ))
+                })
+                .unwrap();
+            let before_state = store.load(NOW + 1).unwrap().0;
+            let before_logins = store.load_logins(NOW + 1).unwrap().0;
+            let before_binding = before_logins.labels["m3-2"].clone();
+            assert!(before_logins.sign_in_receipts.contains_key("m3-2"));
+            let old_row = store
+                .bound(&desk.rows(), NOW + 1)
+                .unwrap()
+                .row("m3-2")
+                .unwrap()
+                .clone();
+            let ann = desk.rows().row("m3").unwrap().clone();
+            let profile = profile.replace(BEA, NEW_BEA);
+            fs::write(dir.join(".claude.json"), &profile).unwrap();
+
+            let source = changed_address_source(to);
+            persist_as(&desk, &source, ANN, NOW + 10).unwrap();
+
+            let state = store.load(NOW + 10).unwrap().0;
+            assert_eq!(state.account(to).key, Some(key));
+            assert_eq!(state.account(to).auth, accounts::Auth::Ok);
+            assert_eq!(
+                state.account(to).auth_at,
+                before_state.account("m3-2").auth_at
+            );
+            assert_eq!(state.account(to).walls, before_state.account("m3-2").walls);
+            assert_eq!(state.account("m3"), before_state.account("m3"));
+            assert_eq!(desk.rows().row("m3"), Some(&ann));
+            let logins = store.load_logins(NOW + 10).unwrap().0;
+            let binding = &logins.labels[to];
+            assert!(binding.renewal_generation > before_logins.generation_clock);
+            let mut expected = before_binding;
+            expected.renewal_generation = binding.renewal_generation;
+            expected.last_success_generation = 0;
+            assert_eq!(binding, &expected);
+            assert!(!logins.sign_in_receipts.contains_key("m3-2"));
+            assert!(!logins.sign_in_receipts.contains_key(to));
+            let bound = store.bound(&desk.rows(), NOW + 10).unwrap();
+            assert_eq!(
+                bound.row(to).unwrap().dir.as_deref(),
+                Some(text(&dir).as_str())
+            );
+            if to != "m3-2" {
+                assert_ne!(state.account("m3-2").auth, accounts::Auth::Ok);
+                assert!(state.account("m3-2").walls.is_empty());
+                assert_ne!(
+                    bound.row("m3-2").unwrap().dir.as_deref(),
+                    Some(text(&dir).as_str())
+                );
+            }
+            let after = records(&desk);
+            let mut called = false;
+            assert!(
+                store
+                    .observe_login_within(
+                        &[],
+                        NOW + 10,
+                        accounts::LoginObservation {
+                            roster_path: &desk.roster(),
+                            row: &old_row,
+                            who: &accounts::ProcessLogin {
+                                login: old_row.dir.clone(),
+                                default_home: false,
+                                stored_login: true,
+                            },
+                        },
+                        |_, _| {
+                            called = true;
+                            Ok(Vec::new())
+                        }
+                    )
+                    .is_err()
+            );
+            assert!(!called);
+            assert_eq!(records(&desk), after);
+            persist_as(&desk, &source, ANN, NOW + 20).unwrap();
+            assert_eq!(records(&desk), after, "a settled recovery writes nothing");
+            assert_eq!(
+                fs::read_to_string(dir.join(".claude.json")).unwrap(),
+                profile
+            );
+            assert!(pointed_at_another(&desk).is_empty());
+            assert!(distinct_dirs(&desk));
+        }
+    }
+}
+
+#[test]
+fn a_departing_accounts_missing_mismatched_or_ambiguous_key_grants_no_recovery() {
+    for staged in [false, true] {
+        for case in ["missing-key", "changed-key", "changed-email", "ambiguous"] {
+            let (desk, dir, _, profile) = verified_account(staged);
+            let store = desk.store();
+            let profile = profile.replace(BEA, NEW_BEA);
+            fs::write(dir.join(".claude.json"), &profile).unwrap();
+            match case {
+                "missing-key" => {
+                    store
+                        .transact_logins(NOW + 1, &mut None, |state, _| {
+                            state.accounts.get_mut("m3-2").unwrap().key = None;
+                            Ok(Vec::new())
+                        })
+                        .unwrap();
+                }
+                "changed-key" => fs::write(
+                    dir.join(".claude.json"),
+                    profile.replace(RETURNED_ID, "00000000-0000-0000-0000-0000000000c3"),
+                )
+                .unwrap(),
+                "changed-email" => fs::write(
+                    dir.join(".claude.json"),
+                    profile.replace(NEW_BEA, "unlisted@example.test"),
+                )
+                .unwrap(),
+                _ => {
+                    let other = store.logins_dir().join("retained-bea");
+                    signed_in(&other, NEW_BEA);
+                    fs::write(other.join(".claude.json"), &profile).unwrap();
+                    store
+                        .transact_logins(NOW + 1, &mut None, |state, logins| {
+                            let record = state.account("m3-2").clone();
+                            state.accounts.insert("retained-bea".into(), record);
+                            logins.labels.insert(
+                                "retained-bea".into(),
+                                accounts::Binding {
+                                    dir: Some(text(&other)),
+                                    ..accounts::Binding::default()
+                                },
+                            );
+                            Ok(Vec::new())
+                        })
+                        .unwrap();
+                }
+            }
+            let held_profile = fs::read(dir.join(".claude.json")).unwrap();
+            persist_as(&desk, &changed_address_source("m3-4"), ANN, NOW + 10).unwrap();
+            let state = store.load(NOW + 10).unwrap().0;
+            let bound = store.bound(&desk.rows(), NOW + 10).unwrap();
+            for label in ["m3-2", "m3-4"] {
+                assert_ne!(state.account(label).auth, accounts::Auth::Ok, "{case}");
+                assert!(state.account(label).walls.is_empty(), "{case}");
+                assert_ne!(
+                    bound.row(label).unwrap().dir.as_deref(),
+                    Some(text(&dir).as_str()),
+                    "{case}"
+                );
+            }
+            assert_eq!(fs::read(dir.join(".claude.json")).unwrap(), held_profile);
+        }
+    }
+}
+
+#[test]
+fn a_departing_account_cannot_take_another_bindings_current_or_retained_directory() {
+    for staged in [false, true] {
+        for current in [false, true] {
+            let (desk, dir, _, profile) = verified_account(staged);
+            let store = desk.store();
+            fs::write(dir.join(".claude.json"), profile.replace(BEA, NEW_BEA)).unwrap();
+            store
+                .transact_logins(NOW + 1, &mut None, |_, logins| {
+                    logins.labels.insert(
+                        "retained-owner".into(),
+                        accounts::Binding {
+                            dir: current.then(|| text(&dir)),
+                            was: if current {
+                                Vec::new()
+                            } else {
+                                vec![Some(text(&dir))]
+                            },
+                            ..accounts::Binding::default()
+                        },
+                    );
+                    Ok(Vec::new())
+                })
+                .unwrap();
+            persist_as(&desk, &changed_address_source("m3-4"), ANN, NOW + 10).unwrap();
+            let state = store.load(NOW + 10).unwrap().0;
+            assert_ne!(state.account("m3-4").auth, accounts::Auth::Ok);
+            assert!(state.account("m3-4").walls.is_empty());
+            assert_ne!(
+                store
+                    .bound(&desk.rows(), NOW + 10)
+                    .unwrap()
+                    .row("m3-4")
+                    .unwrap()
+                    .dir
+                    .as_deref(),
+                Some(text(&dir).as_str())
+            );
+        }
+    }
+}
+
+#[test]
+fn a_still_listed_account_is_not_reinterpreted_by_a_changed_profile_address() {
+    let (desk, dir, key, profile) = verified_account(false);
+    let store = desk.store();
+    fs::write(dir.join(".claude.json"), profile.replace(BEA, NEW_BEA)).unwrap();
+    let mut source = changed_address_source("m3-4");
+    source.accounts.push(account("m3-5", BEA));
+    persist_as(&desk, &source, ANN, NOW + 10).unwrap();
+    let state = store.load(NOW + 10).unwrap().0;
+    assert_eq!(state.account("m3-5").key, Some(key));
+    assert!(!state.account("m3-5").walls.is_empty());
+    assert_ne!(state.account("m3-4").auth, accounts::Auth::Ok);
+    assert!(state.account("m3-4").walls.is_empty());
+}
+
+#[test]
+fn a_departing_accounts_profile_and_retained_key_are_rechecked_before_restore() {
+    for change in ["profile-key", "profile-email", "record-key"] {
+        let (desk, dir, _, profile) = verified_account(false);
+        let store = desk.store();
+        let profile = profile.replace(BEA, NEW_BEA);
+        fs::write(dir.join(".claude.json"), &profile).unwrap();
+        let existing = desk.rows();
+        let source = changed_address_source("m3-4");
+        let next = build_machine_roster(&source, "m3", &store, Some(&existing), Some(ANN));
+        let mut state = store.load(NOW + 1).unwrap().0;
+        let logins = store.load_logins(NOW + 1).unwrap().0;
+        let plans = returned::find(&store, &existing, &next, &state, &logins, &[]).unwrap();
+        assert_eq!(plans.len(), 1);
+        match change {
+            "profile-key" => fs::write(
+                dir.join(".claude.json"),
+                profile.replace(RETURNED_ID, "00000000-0000-0000-0000-0000000000c3"),
+            )
+            .unwrap(),
+            "profile-email" => fs::write(
+                dir.join(".claude.json"),
+                profile.replace(NEW_BEA, "unlisted@example.test"),
+            )
+            .unwrap(),
+            _ => state.accounts.get_mut("m3-2").unwrap().key = None,
+        }
+        assert!(plans[0].recheck(&state, &next).is_err(), "{change}");
+    }
+}
+
+#[test]
+fn departing_provider_keys_can_trade_labels_without_erasing_either_source() {
+    let (desk, bea_dir, bea_key, profile) = verified_account(false);
+    let store = desk.store();
+    fs::write(bea_dir.join(".claude.json"), profile.replace(BEA, NEW_BEA)).unwrap();
+    let cid_dir = store.login_dir("m3-3").unwrap();
+    let cid_id = "00000000-0000-0000-0000-0000000000c3";
+    let new_cid = "cid-new@example.test";
+    signed_in(&cid_dir, new_cid);
+    fs::write(
+        cid_dir.join(".claude.json"),
+        format!(
+            "{{\"oauthAccount\":{{\"emailAddress\":\"{new_cid}\",\"accountUuid\":\"{cid_id}\"}}}}\n"
+        ),
+    )
+    .unwrap();
+    let cid_key = super::super::profile::AccountKey::claude(cid_id).unwrap();
+    store
+        .transact_logins(NOW + 1, &mut None, |state, logins| {
+            let events = accounts::note_auth(state, "m3-3", accounts::Auth::Ok, NOW + 1);
+            let walls = state.account("m3-2").walls.clone();
+            let record = state.accounts.get_mut("m3-3").unwrap();
+            record.key = Some(cid_key);
+            record.walls = walls;
+            logins.labels.insert(
+                "m3-3".into(),
+                accounts::Binding {
+                    dir: Some(text(&cid_dir)),
+                    ..accounts::Binding::default()
+                },
+            );
+            Ok(events)
+        })
+        .unwrap();
+    let source = sheet(&[("m3", ANN), ("m3-2", new_cid), ("m3-3", NEW_BEA)]);
+    persist_as(&desk, &source, ANN, NOW + 10).unwrap();
+    let state = store.load(NOW + 10).unwrap().0;
+    let bound = store.bound(&desk.rows(), NOW + 10).unwrap();
+    for (label, key, dir) in [("m3-2", cid_key, cid_dir), ("m3-3", bea_key, bea_dir)] {
+        assert_eq!(state.account(label).key, Some(key));
+        assert_eq!(state.account(label).auth, accounts::Auth::Ok);
+        assert!(!state.account(label).walls.is_empty());
+        assert_eq!(
+            bound.row(label).unwrap().dir.as_deref(),
+            Some(text(&dir).as_str())
+        );
+    }
+    let after = records(&desk);
+    persist_as(&desk, &source, ANN, NOW + 20).unwrap();
+    assert_eq!(records(&desk), after);
 }
 
 #[test]

@@ -490,14 +490,14 @@ src/macos_setup.rs	one_use_asks_and_the_others_follow_its_answer	access-record-a
 src/macos_setup.rs	swarm_off_holds_the_automatic_lan_uses	access-record-any-revision	
 ```
 
+## 3. Coverage
+
+- §2 maps 252 spec-sample test rows across the §1 specs (the crate currently holds 441 `#[test]`
+  functions); 0 non-spec tests remain after the 2026-10-15 retirement pass.
+
 ## 4. Tests that are not spec samples
 
-Status 2026-10-15: all 18 rows (including `src/scheme.rs::builtin_palette_values_are_canonical` and the now-empty test module in `src/paragraph_direction.rs`) are deleted; 0 non-spec tests remain.
-
-| test | why | action |
-|---|---|---|
-
-Actions: delete: 17, delete with the oracle: 1. No test here is a regression
+Status 2026-10-15: all 18 rows (including `src/scheme.rs::builtin_palette_values_are_canonical` and the now-empty test module in `src/paragraph_direction.rs`) are deleted; 0 non-spec tests remain. No test here is a regression
 of a removed bug with no general property: every regression test found is an instance of a §1 spec.
 
 ## 5. Implied specs that look wrong, or disagree with the code

@@ -3,7 +3,7 @@
 
 //! FILES, WRITTEN THE CAREFUL WAY.
 
-use std::io::{self, Write as _};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -14,6 +14,48 @@ use std::time::{Duration, Instant};
 /// but its entry may not survive a power loss.
 pub fn write(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
     write_checked(path, bytes, mode, || Ok(()))
+}
+
+/// Produce a file atomically, with the same permissions and durability as [`write`].
+/// The producer must finish and flush any buffering it owns before returning success.
+///
+/// # Errors
+/// As [`write`], or the producer fails. A producer error leaves the old destination intact.
+pub fn write_with(
+    path: &Path,
+    mode: u32,
+    produce: impl FnOnce(&mut dyn io::Write) -> io::Result<()>,
+) -> io::Result<()> {
+    write_produced_landing(
+        path,
+        mode,
+        produce,
+        || Ok(()),
+        |dir| aterm_durable::Flush::Durable.dir(dir),
+    )?
+}
+
+/// Produce a file atomically and return metadata captured from its completed temporary
+/// before closing and renaming it. A caller identifying the path afterward must compare
+/// that path's device and inode; rename can change the file's timestamps.
+///
+/// # Errors
+/// As [`write_with`], or reading the completed temporary's metadata fails.
+pub fn write_with_metadata(
+    path: &Path,
+    mode: u32,
+    produce: impl FnOnce(&mut dyn io::Write) -> io::Result<()>,
+) -> io::Result<std::fs::Metadata> {
+    let (metadata, landed) = write_captured_landing(
+        path,
+        mode,
+        produce,
+        std::fs::File::metadata,
+        || Ok(()),
+        |dir| aterm_durable::Flush::Durable.dir(dir),
+    )?;
+    landed?;
+    Ok(metadata)
 }
 
 /// Write `bytes` to `path` with `mode`: a temporary file beside it, durably flushed
@@ -59,22 +101,65 @@ fn write_landing(
     check: impl FnOnce() -> io::Result<()>,
     flush_dir: impl FnOnce(&Path) -> io::Result<()>,
 ) -> io::Result<Landed> {
+    write_produced_landing(
+        path,
+        mode,
+        |writer| writer.write_all(bytes),
+        check,
+        flush_dir,
+    )
+}
+
+struct Temporary {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl Drop for Temporary {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn write_produced_landing(
+    path: &Path,
+    mode: u32,
+    produce: impl FnOnce(&mut dyn io::Write) -> io::Result<()>,
+    check: impl FnOnce() -> io::Result<()>,
+    flush_dir: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<Landed> {
+    write_captured_landing(path, mode, produce, |_| Ok(()), check, flush_dir)
+        .map(|(_, landed)| landed)
+}
+
+fn write_captured_landing<T>(
+    path: &Path,
+    mode: u32,
+    produce: impl FnOnce(&mut dyn io::Write) -> io::Result<()>,
+    capture: impl FnOnce(&std::fs::File) -> io::Result<T>,
+    check: impl FnOnce() -> io::Result<()>,
+    flush_dir: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<(T, Landed)> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let (tmp, mut f) = create_temp_beside(path, mode)?;
-    let result = (|| {
-        f.write_all(bytes)?;
-        f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(mode))?;
-        aterm_durable::durable(&f)?;
-        drop(f);
-        check()?;
-        std::fs::rename(&tmp, path)
-    })();
-    if let Err(e) = result {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
+    let (tmp, file) = create_temp_beside(path, mode)?;
+    let mut temporary = Temporary {
+        path: tmp,
+        armed: true,
+    };
+    let mut file = file;
+    produce(&mut file)?;
+    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(mode))?;
+    aterm_durable::durable(&file)?;
+    let captured = capture(&file)?;
+    drop(file);
+    check()?;
+    std::fs::rename(&temporary.path, path)?;
+    // The old temporary name is free after the rename; do not remove a later user's file.
+    temporary.armed = false;
     let dir = match path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
         _ => Path::new("."),
@@ -83,7 +168,10 @@ fn write_landing(
     // write but not open) is accepted: the bytes are flushed on their own handle, and the
     // rename has landed. A failed flush is returned as it came, its errno kept for a caller
     // that classifies it.
-    Ok(aterm_durable::DirFlushed::classify(flush_dir(dir)).map(|_flushed_or_unavailable| ()))
+    Ok((
+        captured,
+        aterm_durable::DirFlushed::classify(flush_dir(dir)).map(|_flushed_or_unavailable| ()),
+    ))
 }
 
 /// The bytes of a temporary name's salt ([`create_temp_beside`]), written as twice as many hex
@@ -607,3 +695,7 @@ impl ConfigEdit<'_> {
 #[cfg(test)]
 #[path = "atomic_file_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "atomic_file_producer_tests.rs"]
+mod producer_tests;

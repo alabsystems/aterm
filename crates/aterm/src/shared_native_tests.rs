@@ -11,6 +11,45 @@ thread_local! {
 }
 
 #[test]
+fn native_connector_exec_preserves_success_and_failure_status() {
+    const CHILD: &str = "ATERM_TEST_NATIVE_CONNECTOR_EXIT";
+    const NAME: &str =
+        "shared_login::native::tests::native_connector_exec_preserves_success_and_failure_status";
+    if let Some(code) = std::env::var_os(CHILD) {
+        let code = code.to_str().unwrap().parse::<u8>().unwrap();
+        let shell = aterm_uds::deadline::stand_in(Path::new("/bin/sh"));
+        let mut command = aterm_uds::spawnfd::command(shell);
+        command.args(["-c", &format!("echo native-connector-ran; exit {code}")]);
+        match replace_with_connector(command) {
+            Err(why) => panic!("{why}"),
+            Ok(never) => match never {},
+        }
+    }
+    for code in [0, 37] {
+        let mut command = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", NAME, "--nocapture"])
+            .env(CHILD, code.to_string());
+        let output = aterm_uds::deadline::ends_within(&mut command, aterm_spec::wait::MUST_HAPPEN);
+        assert_eq!(
+            output.status.code(),
+            Some(code),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("native-connector-ran"));
+    }
+}
+
+#[test]
+fn native_connector_exec_failure_remains_an_error() {
+    let home = aterm_tempfile::tempdir().unwrap();
+    let command = aterm_uds::spawnfd::command(home.path().join("missing-connector"));
+    let error = replace_with_connector(command).unwrap_err();
+    assert!(error.starts_with("native connector did not start: "));
+}
+
+#[test]
 fn native_preparation_refuses_unknown_local_policy_before_provider_access() {
     let (_temp, approved, config) = fixture(Provider::Google, false);
     let mut ordinary = Server {

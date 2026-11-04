@@ -889,8 +889,8 @@ pub fn plan(
     let mut plan = Plan::default();
     let mut present = BTreeSet::new();
     let mut born = BTreeSet::new();
-    for record in 1..sheet.records.len() {
-        let texts: Vec<String> = (0..sheet.records[record].cells.len().max(width))
+    for (record, row) in sheet.records.iter().enumerate().skip(1) {
+        let texts: Vec<String> = (0..row.cells.len().max(width))
             .map(|at| reader.cell(record, at))
             .collect();
         if texts.iter().all(|t| t.trim().is_empty()) {

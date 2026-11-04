@@ -221,15 +221,16 @@ pub enum Fresh {
     AsOf,
     /// The carrier's, older than an hour while a session runs on it: its pace is refused.
     Stale,
-    /// Its reset ahead; dedicated; nothing ran here since the reading.
+    /// Its reset ahead; preferred here; nothing ran here since the reading. Idle *here* says
+    /// nothing of another Mac, which may prefer it too (a preference is no claim), so the
+    /// replay counts the reading as a lower bound, exactly as it does a pool row's.
     IdleHere,
-    /// Its reset ahead; dedicated; a session ran here after the reading.
+    /// Its reset ahead; preferred here; a session ran here after the reading.
     UsedSince,
-    /// Its reset ahead; shared; older than 15 minutes: others may use it.
+    /// Its reset ahead; not preferred here; older than 15 minutes: others may use it.
     Pool,
-    /// Its reset passed since the reading; dedicated; nothing ran here since the reset.
-    FreshSinceReset,
-    /// Its reset passed since the reading, and any other case.
+    /// Its reset passed since the reading: nothing is known of the new window until a read,
+    /// since any Mac may have used it (a preference is no claim on an account).
     ResetUnread,
     /// No figure, wall or warning, ever.
     NeverRead,
@@ -252,7 +253,6 @@ impl Fresh {
             Fresh::IdleHere => "idle-here",
             Fresh::UsedSince => "used-since",
             Fresh::Pool => "pool",
-            Fresh::FreshSinceReset => "fresh-since-reset",
             Fresh::ResetUnread => "reset-unread",
             Fresh::NeverRead => "never-read",
             Fresh::Walled => "walled",
@@ -264,17 +264,17 @@ impl Fresh {
     /// Whether the replay counts its figure exactly.
     const fn known(self) -> Known {
         match self {
-            Fresh::Now
-            | Fresh::AsOf
-            | Fresh::Stale
-            | Fresh::IdleHere
-            | Fresh::FreshSinceReset
-            | Fresh::Walled => Known::Exact,
-            Fresh::UsedSince | Fresh::Pool => Known::Lower,
+            Fresh::Now | Fresh::AsOf | Fresh::Stale | Fresh::Walled => Known::Exact,
+            Fresh::IdleHere | Fresh::UsedSince | Fresh::Pool => Known::Lower,
             Fresh::ResetUnread | Fresh::NeverRead | Fresh::SignedOut | Fresh::NotEnrolled => {
                 Known::Unknown
             }
         }
+    }
+
+    /// Whether its figure is a bound: what was read, which any Mac may have spent since.
+    const fn bounded(self) -> bool {
+        matches!(self.known(), Known::Lower)
     }
 
     /// Whether a figure of this class may be shown as a number (never an unread one).
@@ -300,9 +300,17 @@ enum Known {
     Unknown,
 }
 
-/// Why a pace is refused: no dashes, no tick and no verdict, and the card and the CLI say why.
+/// Why a projection is refused: no dashes, no tick and no verdict, and the card and the CLI say why.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Refusal {
+    /// No row has local account access on which the forecast can run.
+    AccountUnavailable,
+    /// The current account is unavailable and rotation is disabled.
+    RotationOff,
+    /// This pane's recovery is paused; the pool's observations remain available.
+    SessionPaused,
+    /// This pane's recovery observer could not confirm the current decision.
+    ObserverBusy,
     /// The carrier has no current reading of the window.
     NoFigure,
     /// The carrier's reading is older than an hour while a session runs on it.
@@ -328,6 +336,10 @@ impl Refusal {
     #[must_use]
     pub const fn word(self) -> &'static str {
         match self {
+            Refusal::AccountUnavailable => "account-unavailable",
+            Refusal::RotationOff => "rotation-off",
+            Refusal::SessionPaused => "session-paused",
+            Refusal::ObserverBusy => "observer-busy",
             Refusal::NoFigure => "no-figure",
             Refusal::Stale { .. } => "stale",
             Refusal::Skew => "skew",
@@ -340,6 +352,10 @@ impl Refusal {
     #[must_use]
     pub fn words(self) -> String {
         match self {
+            Refusal::AccountUnavailable => "account access unavailable".into(),
+            Refusal::RotationOff => "rotation off".into(),
+            Refusal::SessionPaused => "session recovery paused".into(),
+            Refusal::ObserverBusy => "account recovery observer busy".into(),
             Refusal::NoFigure => "no reading".into(),
             Refusal::Stale { age_s } => {
                 format!("not projected: read {} ago while in use", span_words(age_s))
@@ -444,8 +460,6 @@ pub struct WindowOutlook {
     pub fresh: Fresh,
     /// The replay's projection, where the chain uses it.
     pub projection: Option<Proj>,
-    /// The next reset the replay assumes for a [`Fresh::FreshSinceReset`] window.
-    pub assumed_reset: Option<i64>,
     /// Where it was read.
     pub source: Option<Source>,
 }
@@ -464,7 +478,7 @@ pub struct Source {
 pub struct RowOutlook {
     /// Its label.
     pub label: String,
-    /// Dedicated or shared.
+    /// Preferred here or not ([`Class`]): an order, never a claim.
     pub class: Class,
     /// Its plan.
     pub plan: Plan,
@@ -737,15 +751,6 @@ pub enum Approx {
     /// Rows of different plans: one account's week is put on another's scale by the plans'
     /// 5-hour multiples, which Anthropic states per 5-hour session, not per week.
     MultiplesScaled,
-    /// A row's reset passed, unused here since: counted fresh, its next reset assumed.
-    FreshAssumed {
-        /// The row.
-        label: String,
-        /// The reset that passed.
-        passed: i64,
-        /// The next reset assumed.
-        next: i64,
-    },
 }
 
 /// The whole outlook.
@@ -784,7 +789,7 @@ pub struct Inputs<'a> {
     pub roster: &'a Roster,
     /// The accounts state, as read; never written.
     pub state: &'a State,
-    /// The enrolled labels.
+    /// The authoritative enrolled labels, including any enrolled default-home row.
     pub enrolled: &'a BTreeSet<String>,
     /// Each label's series rows, oldest first.
     pub series: &'a BTreeMap<String, Vec<SeriesRow>>,
@@ -986,7 +991,7 @@ fn fresh_of(
                     Fresh::AsOf
                 } else if carrier && in_use(state, &row.label) {
                     Fresh::Stale
-                } else if row.class == Class::Shared {
+                } else if row.class == Class::Pool {
                     Fresh::Pool
                 } else if ran_here_since(state, &row.label, s.at) {
                     Fresh::UsedSince
@@ -994,18 +999,8 @@ fn fresh_of(
                     Fresh::IdleHere
                 }
             }
-            Some(s) => {
-                let ran_before = acct.and_then(|a| a.ran_at).is_none_or(|ran| ran < s.reset);
-                let since = state
-                    .sessions
-                    .values()
-                    .any(|x| x.account == row.label && x.at >= s.reset);
-                if row.class == Class::Dedicated && ran_before && !since {
-                    Fresh::FreshSinceReset
-                } else {
-                    Fresh::ResetUnread
-                }
-            }
+            // Nothing here running it since the reset says nothing of another Mac's use.
+            Some(_) => Fresh::ResetUnread,
         },
     };
     (fresh, seen)
@@ -1194,7 +1189,6 @@ struct Win {
 #[derive(Clone, Debug)]
 struct SimRow {
     label: String,
-    class: Class,
     m: u32,
     seen: bool,
     week: Win,
@@ -1483,7 +1477,9 @@ impl<'a> Sim<'a> {
                 self.capture(i, w);
                 let carrier = i == self.carrier && self.stop.is_none();
                 let row = &mut self.rows[i];
-                let keeps = row.seen || row.class == Class::Dedicated;
+                // Only the carrier's own window is followed past a reset: any other Mac may
+                // have used any other row's.
+                let keeps = row.seen;
                 let win = row.win_mut(w);
                 win.fills_at = None;
                 win.low_fired = false;
@@ -1521,7 +1517,7 @@ impl<'a> Sim<'a> {
             .roster
             .row(label)
             .map(|row| {
-                let enrolled = row.dir.is_none() || self.ctx.enrolled.contains(label);
+                let enrolled = self.ctx.enrolled.contains(label);
                 matches!(
                     accounts::condition(row, &self.state, enrolled, self.t),
                     Condition::Limited { .. }
@@ -1957,22 +1953,79 @@ fn plans_of(inputs: &Inputs<'_>) -> BTreeMap<String, Plan> {
     out
 }
 
-fn carrier_of<'a>(inputs: &Inputs<'a>) -> Option<&'a accounts::Row> {
+fn account_access(
+    row: &accounts::Row,
+    state: &State,
+    enrolled: &BTreeSet<String>,
+    now: i64,
+) -> bool {
+    let enrolled = enrolled.contains(&row.label);
+    !matches!(
+        accounts::condition(row, state, enrolled, now),
+        Condition::SignedOut | Condition::NotEnrolled
+    ) && accounts::row_available_here(row, state, now)
+}
+
+/// Settle only a canary whose account was already available to this replay.
+/// Quota simulation cannot supply a missing login or override a retained access refusal.
+fn prove_available_active(inputs: &Inputs<'_>, state: &mut State) {
+    let Some(active) = state.active.clone() else {
+        return;
+    };
+    if inputs
+        .roster
+        .row(&active)
+        .is_some_and(|row| account_access(row, state, inputs.enrolled, inputs.now))
+    {
+        let _ = accounts::prove(state, &active, inputs.now);
+    }
+}
+
+fn carrier_of<'a>(inputs: &Inputs<'a>) -> Result<&'a accounts::Row, Refusal> {
     let roster = inputs.roster;
     let active = inputs
         .state
         .active
         .as_deref()
         .and_then(|label| roster.row(label));
+    // A cold launch choice is not permission to move existing work while rotation is off.
+    if inputs.mode == Mode::Off && inputs.state.active.is_some() {
+        return active
+            .filter(|row| account_access(row, inputs.state, inputs.enrolled, inputs.now))
+            .ok_or(Refusal::RotationOff);
+    }
     if let Some(row) = active {
-        let enrolled = row.dir.is_none() || inputs.enrolled.contains(&row.label);
+        let access = account_access(row, inputs.state, inputs.enrolled, inputs.now);
+        let enrolled = inputs.enrolled.contains(&row.label);
+        if inputs.state.pinned
+            && row.held_by.is_none()
+            && accounts::condition(row, inputs.state, enrolled, inputs.now).runs()
+            && !access
+        {
+            return Err(Refusal::AccountUnavailable);
+        }
+    }
+    let active =
+        active.filter(|row| account_access(row, inputs.state, inputs.enrolled, inputs.now));
+    if let Some(row) = active {
+        let enrolled = inputs.enrolled.contains(&row.label);
         if accounts::condition(row, inputs.state, enrolled, inputs.now).runs() {
-            return Some(row);
+            return Ok(row);
         }
     }
     accounts::launch_row(roster, inputs.state, inputs.enrolled, inputs.now)
         .or(active)
-        .or_else(|| roster.rows.first())
+        .or_else(|| {
+            roster
+                .rows
+                .iter()
+                .find(|row| account_access(row, inputs.state, inputs.enrolled, inputs.now))
+        })
+        .ok_or(if roster.rows.is_empty() {
+            Refusal::NoFigure
+        } else {
+            Refusal::AccountUnavailable
+        })
 }
 
 fn win_of(seen: Option<Seen>, fresh: Fresh, m: u32, now: i64, w: Window) -> Win {
@@ -1980,16 +2033,6 @@ fn win_of(seen: Option<Seen>, fresh: Fresh, m: u32, now: i64, w: Window) -> Win 
     let known = fresh.known();
     let current = seen.filter(|s| s.reset > now);
     match (fresh, current) {
-        // A week resets on its cadence; a 5-hour window opens again at its first use.
-        (Fresh::FreshSinceReset, _) => Win {
-            acc: 0,
-            reset: seen
-                .filter(|_| w == Window::Week)
-                .map(|s| next_reset(s.reset, w.len_s(), now)),
-            known: Known::Exact,
-            low_fired: false,
-            fills_at: None,
-        },
         (Fresh::Walled, s) => Win {
             acc: i128::from(FULL_X10) * scale,
             reset: s.map(|s| s.reset),
@@ -2134,7 +2177,8 @@ fn build(
     let state = inputs.state;
     let roster = inputs.roster;
     let plans = plans_of(inputs);
-    let carrier = carrier_of(inputs);
+    let choice = carrier_of(inputs);
+    let carrier = choice.ok();
     let carrier_label = carrier.map(|r| r.label.clone());
     let carrier_plan = carrier_label
         .as_ref()
@@ -2156,7 +2200,7 @@ fn build(
     let mut rows = Vec::new();
     let mut sim_rows = Vec::new();
     for row in roster.rows.iter().take(MAX_ROWS) {
-        let enrolled = row.dir.is_none() || inputs.enrolled.contains(&row.label);
+        let enrolled = inputs.enrolled.contains(&row.label);
         let cond = accounts::condition(row, state, enrolled, now);
         let is_carrier = carrier_label.as_deref() == Some(row.label.as_str());
         let mut plan = plans.get(&row.label).cloned().unwrap_or(Plan {
@@ -2184,16 +2228,6 @@ fn build(
         };
         let (fresh_week, seen_week) = fresh_of(row, state, cond, is_carrier, Window::Week, now);
         let (fresh_five, seen_five) = fresh_of(row, state, cond, is_carrier, Window::Five, now);
-        let assumed_reset = (fresh_week == Fresh::FreshSinceReset)
-            .then(|| seen_week.map(|s| next_reset(s.reset, accounts::WEEK_WINDOW_S, now)))
-            .flatten();
-        if let (Some(next), Some(seen)) = (assumed_reset, seen_week) {
-            approx.push(Approx::FreshAssumed {
-                label: row.label.clone(),
-                passed: seen.reset,
-                next,
-            });
-        }
         let window = |w: Window, fresh: Fresh, seen: Option<Seen>| WindowOutlook {
             window: w,
             used_x10: seen.filter(|_| fresh.shows_figure()).map(|s| s.pct_x10),
@@ -2201,14 +2235,11 @@ fn build(
             at: seen.map(|s| s.at),
             fresh,
             projection: None,
-            assumed_reset: (w == Window::Week).then_some(assumed_reset).flatten(),
             source: seen.map(|s| s.source),
         };
         let walled = matches!(cond, Condition::Limited { .. }).then(|| {
             let mut clone = state.clone();
-            if let Some(active) = clone.active.clone() {
-                let _ = accounts::prove(&mut clone, &active, now);
-            }
+            prove_available_active(inputs, &mut clone);
             let window = state
                 .accounts
                 .get(&row.label)
@@ -2263,13 +2294,22 @@ fn build(
             ],
             walled,
         });
+        // The carrier is followed from its reading whatever its order here (the replay holds the
+        // work on it, as R7 follows a row once taken); every other row read before now is a
+        // bound, since any Mac may run any account.
+        let start = |seen, fresh, w| {
+            let mut win = win_of(seen, fresh, plan.m, now, w);
+            if is_carrier && win.known == Known::Lower {
+                win.known = Known::Exact;
+            }
+            win
+        };
         sim_rows.push(SimRow {
             label: row.label.clone(),
-            class: row.class,
             m: plan.m,
             seen: is_carrier,
-            week: win_of(seen_week, fresh_week, plan.m, now, Window::Week),
-            five: win_of(seen_five, fresh_five, plan.m, now, Window::Five),
+            week: start(seen_week, fresh_week, Window::Week),
+            five: start(seen_five, fresh_five, Window::Five),
             fresh_week,
             read_week: seen_week.filter(|s| s.reset > now),
         });
@@ -2306,7 +2346,7 @@ fn build(
         not_needed: Vec::new(),
     };
     let Some(carrier_label) = carrier_label else {
-        out.verdict = Verdict::Refused(Refusal::NoFigure);
+        out.verdict = Verdict::Refused(choice.err().unwrap_or(Refusal::NoFigure));
         return out;
     };
     let Some(carrier_index) = sim_rows.iter().position(|r| r.label == carrier_label) else {
@@ -2328,9 +2368,7 @@ fn build(
     if clone.active.is_none() {
         clone.active = Some(carrier_label.clone());
     }
-    if let Some(active) = clone.active.clone() {
-        let _ = accounts::prove(&mut clone, &active, now);
-    }
+    prove_available_active(inputs, &mut clone);
     // The carrier's figure advanced from its reading's instant to now, at the week's pace,
     // where the work ran on it since (a reading of now or as of the last hour, §6): a row the
     // work only now moves onto (idle here since its reading) holds its reading.
@@ -2785,8 +2823,6 @@ pub enum BarCell {
     Tick,
     /// `─` left over at the reset.
     Left,
-    /// `┄` counted fresh: its reset passed, and nothing here used it since (the card only).
-    Fresh,
 }
 
 impl BarCell {
@@ -2798,7 +2834,6 @@ impl BarCell {
             BarCell::More => '\u{254d}',
             BarCell::Tick => '\u{253d}',
             BarCell::Left => '\u{2500}',
-            BarCell::Fresh => '\u{2504}',
         }
     }
 
@@ -2899,7 +2934,59 @@ pub struct Glance {
     pub spoken: Option<String>,
 }
 
+impl Glance {
+    /// Keep observed usage and reset information without a projected service promise.
+    #[must_use]
+    pub fn observations(&self) -> Self {
+        let mut view = self.clone();
+        if let Some((ten, five)) = view.bar.as_mut() {
+            for cell in ten.iter_mut().chain(five.iter_mut()) {
+                if *cell != BarCell::Used {
+                    *cell = BarCell::Left;
+                }
+            }
+        }
+        view.verdict = None;
+        view.title = None;
+        view.title_verdict = None;
+        view.spoken = None;
+        view
+    }
+}
+
 impl Outlook {
+    /// A pane-local observation view, retaining the pool's raw snapshot unchanged.
+    /// No service chain, proposed target or future-use projection survives the given refusal.
+    #[must_use]
+    pub fn observations_only(&self, refusal: Refusal) -> Self {
+        Self {
+            as_of: self.as_of,
+            offsets: self.offsets.clone(),
+            mode: self.mode,
+            credits: self.credits,
+            carrier: None,
+            demand: self.demand,
+            rows: self
+                .rows
+                .iter()
+                .map(|row| {
+                    let mut row = row.clone();
+                    row.carrier = false;
+                    row.walled = None;
+                    for window in &mut row.windows {
+                        window.projection = None;
+                    }
+                    row
+                })
+                .collect(),
+            week: None,
+            working: None,
+            verdict: Verdict::Refused(refusal),
+            approx: self.approx.clone(),
+            not_needed: Vec::new(),
+        }
+    }
+
     fn row(&self, label: &str) -> Option<&RowOutlook> {
         self.rows.iter().find(|r| r.label == label)
     }
@@ -3429,8 +3516,6 @@ impl Outlook {
             Fresh::UsedSince => format!("used here{}", since(week.at)),
             Fresh::Pool if short => format!("as of {}", self.age(week.at)),
             Fresh::Pool => format!("as of {}, others may use it", self.age(week.at)),
-            Fresh::FreshSinceReset if short => "unused since reset".into(),
-            Fresh::FreshSinceReset => "unused here since reset".into(),
             Fresh::ResetUnread if short => "not read since reset".into(),
             Fresh::ResetUnread => "reset passed, not read since".into(),
             Fresh::NeverRead => "never read".into(),
@@ -3474,7 +3559,7 @@ impl Outlook {
     fn figure_words(week: &WindowOutlook) -> String {
         match (week.fresh, week.used_x10) {
             (Fresh::Walled, _) => "0%".into(),
-            (Fresh::UsedSince | Fresh::Pool, Some(x10)) => {
+            (f, Some(x10)) if f.bounded() => {
                 format!("\u{2264}{}", pct(1000 - x10.min(1000)))
             }
             (f, Some(x10)) if f.shows_figure() => pct(1000 - x10.min(1000)),
@@ -3484,7 +3569,7 @@ impl Outlook {
 
     fn reset_words(&self, w: &WindowOutlook) -> String {
         match (w.fresh, w.reset) {
-            (Fresh::FreshSinceReset | Fresh::ResetUnread, Some(r)) => {
+            (Fresh::ResetUnread, Some(r)) => {
                 format!("reset {}", day_words(r, &self.offsets))
             }
             (_, Some(r)) if r > self.as_of => format!("\u{267b} {}", self.when(r)),
@@ -3499,12 +3584,6 @@ impl Outlook {
             "5-hour"
         };
         match (w.fresh, w.used_x10) {
-            (Fresh::FreshSinceReset, _) => format!(
-                "{}, {name}: reset {}, not used on this machine since; counted as a fresh week.",
-                row.label,
-                w.reset
-                    .map_or_else(String::new, |r| spoken_day(r, &self.offsets))
-            ),
             (_, Some(x10)) => {
                 let mut out = format!(
                     "{}, {name}: {} percent used, {} left",
@@ -3801,7 +3880,7 @@ impl Outlook {
                             "{head} ({})",
                             match why {
                                 Fresh::NeverRead => "never read",
-                                Fresh::UsedSince | Fresh::Pool => "not read lately",
+                                f if f.bounded() => "not read lately",
                                 _ => "not read",
                             }
                         ),
@@ -3856,7 +3935,7 @@ impl Outlook {
                     ]));
                 }
                 head.push(note(match why {
-                    Fresh::UsedSince | Fresh::Pool => vec![
+                    f if f.bounded() => vec![
                         format!("   if {row} holds what was read: continuous for 7 days"),
                         "   if it holds what was read: continuous 7d".into(),
                     ],
@@ -3980,24 +4059,24 @@ impl Outlook {
                 }
             } else {
                 let mut t = match (row.class, wide) {
-                    (Class::Shared, true) => format!(
+                    (Class::Pool, true) => format!(
                         "{} \u{b7} pool \u{b7} {plan} \u{b7} {}",
                         row.label,
                         self.class_word(row, false)
                     ),
-                    (Class::Shared, false) => {
+                    (Class::Pool, false) => {
                         format!(
                             "{} \u{b7} pool \u{b7} {}",
                             row.label,
                             self.class_word(row, true)
                         )
                     }
-                    (Class::Dedicated, true) => format!(
-                        "{} \u{b7} {plan} \u{b7} dedicated \u{b7} {}",
+                    (Class::Preferred, true) => format!(
+                        "{} \u{b7} {plan} \u{b7} preferred \u{b7} {}",
                         row.label,
                         self.class_word(row, false)
                     ),
-                    (Class::Dedicated, false) => {
+                    (Class::Preferred, false) => {
                         format!(
                             "{} \u{b7} {plan} \u{b7} {}",
                             row.label,
@@ -4015,15 +4094,15 @@ impl Outlook {
                 row.label,
                 row.plan.title().unwrap_or_else(|| "plan not seen".into()),
                 match row.class {
-                    Class::Dedicated => "dedicated",
-                    Class::Shared => "pool",
+                    Class::Preferred => "preferred",
+                    Class::Pool => "pool",
                 },
                 match (week.fresh.shows_figure(), week.used_x10) {
                     (true, Some(x10)) if week.fresh == Fresh::Walled => {
                         let _ = x10;
                         "0 percent left".to_string()
                     }
-                    (true, Some(x10)) if matches!(week.fresh, Fresh::UsedSince | Fresh::Pool) => {
+                    (true, Some(x10)) if week.fresh.bounded() => {
                         format!("at most {} percent left", whole(1000 - x10.min(1000)))
                     }
                     (true, Some(x10)) => format!("{} percent left", whole(1000 - x10.min(1000))),
@@ -4043,18 +4122,7 @@ impl Outlook {
             };
             let mut bars = Vec::new();
             if !narrow {
-                if week.fresh == Fresh::FreshSinceReset {
-                    bars.push((
-                        Window::Week,
-                        bar_row(
-                            Window::Week,
-                            &vec![BarCell::Fresh; bar_n],
-                            "\u{2014}",
-                            &reset,
-                            self.bar_spoken(row, week, None),
-                        ),
-                    ));
-                } else if let Some(used) = week.used_x10.filter(|_| week.fresh.shows_figure()) {
+                if let Some(used) = week.used_x10.filter(|_| week.fresh.shows_figure()) {
                     let proj = week.projection.filter(|_| self.demand.week.is_ok());
                     let used = if week.fresh == Fresh::Walled {
                         1000
@@ -4165,15 +4233,6 @@ fn first_fit(cands: Vec<String>, room: usize) -> String {
         .unwrap_or_default()
 }
 
-fn spoken_day(t: i64, offsets: &Offsets) -> String {
-    let (day, _) = local(t, offsets.at(t));
-    let (_, m, d) = aterm_types::rfc3339::civil_from_days(day);
-    format!(
-        "{d} {}",
-        MONTHS_LONG[usize::try_from(m - 1).unwrap_or(0).min(11)]
-    )
-}
-
 fn fit_card_row(row: CardRow, room: usize) -> CardRow {
     let cut = |text: String, room: usize| -> String {
         if super::footer::text_width(&text) <= room {
@@ -4245,20 +4304,6 @@ impl Outlook {
             return out;
         }
         match w.fresh {
-            Fresh::FreshSinceReset => {
-                out.push_str(&format!(
-                    "\u{2014} \u{b7} reset {} passed, unused here since: counted fresh",
-                    w.reset
-                        .map_or_else(String::new, |r| long_when(r, &self.offsets))
-                ));
-                if let Some(next) = w.assumed_reset {
-                    out.push_str(&format!(
-                        ", next reset assumed {}",
-                        long_when(next, &self.offsets)
-                    ));
-                }
-                return out;
-            }
             Fresh::ResetUnread => {
                 out.push_str(&format!(
                     "\u{2014} \u{b7} reset {} passed, not read since",
@@ -4280,7 +4325,7 @@ impl Outlook {
             out.push('\u{2014}');
             return out;
         };
-        let lower = matches!(w.fresh, Fresh::UsedSince | Fresh::Pool);
+        let lower = w.fresh.bounded();
         let (ge, le) = if lower {
             ("\u{2265}", "\u{2264}")
         } else {
@@ -4452,22 +4497,6 @@ impl Outlook {
             Approx::PlansAlike { carrier } => {
                 vec![format!("{carrier}: plan not seen; every row counted alike")]
             }
-            Approx::FreshAssumed {
-                label,
-                passed,
-                next,
-            } if !card => vec![format!(
-                "{label}: reset {} passed, unused here since: counted fresh, next reset assumed {}",
-                day_words(*passed, &self.offsets),
-                long_when(*next, &self.offsets)
-            )],
-            Approx::FreshAssumed { label, passed, .. } => vec![
-                format!(
-                    "{label}: counted fresh since its reset {}",
-                    day_words(*passed, &self.offsets)
-                ),
-                format!("{label}: counted fresh"),
-            ],
             Approx::MultiplesScaled if !card => vec![
                 "weeks put on one scale by the plans' 5-hour multiples, which Anthropic states \
                  per 5-hour session"
@@ -4530,8 +4559,8 @@ impl Outlook {
             }
         }
         out.push_str(
-            "  assumes: today's pace holds; dedicated rows are this machine's alone; pool rows \
-             hold at most what was read\n",
+            "  assumes: today's pace holds; a row not read now holds at most what was read, since \
+             any Mac may run any account\n",
         );
         out
     }
@@ -4641,7 +4670,7 @@ impl Outlook {
             out.push_str(&format!(
                 "{indent}  if it {}:\n",
                 match lean.why {
-                    Fresh::UsedSince | Fresh::Pool => "holds what was read",
+                    f if f.bounded() => "holds what was read",
                     _ => "has a fresh week",
                 }
             ));
@@ -4783,16 +4812,6 @@ impl Outlook {
                     }
                     Approx::MultiplesScaled => {
                         o.insert("kind".into(), Value::from("multiples-scaled"));
-                    }
-                    Approx::FreshAssumed {
-                        label,
-                        passed,
-                        next,
-                    } => {
-                        o.insert("kind".into(), Value::from("fresh-assumed"));
-                        o.insert("label".into(), Value::from(label.clone()));
-                        o.insert("passed".into(), Value::from(*passed));
-                        o.insert("next".into(), Value::from(*next));
                     }
                 }
                 Value::Object(o)

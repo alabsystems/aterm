@@ -75,7 +75,7 @@ pub(crate) fn usage_observation_transition(
                     match case {
                         4 => changed.email = Some("another@example.test".into()),
                         13 => changed.browser = Some("another-profile".into()),
-                        14 => changed.class = Class::Shared,
+                        14 => changed.class = Class::Pool,
                         15 => changed.identity_email = Some("another@example.test".into()),
                         _ => unreachable!(),
                     }

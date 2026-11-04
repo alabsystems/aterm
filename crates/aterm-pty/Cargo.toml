@@ -26,6 +26,8 @@ aterm-spec-anchor = { workspace = true }
 # The Windows backend calls kernel32 directly and needs no libc.
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+# `sbpl::build_sandbox_wrap` + `SANDBOX_EXEC_PATH`: the one fail-closed Seatbelt argv wrap.
+aterm-containment = { workspace = true }
 # The child's inheritance strip (`spawnfd::InheritStrip`).
 aterm-uds = { workspace = true }
 # Debug/test PTY fixture admission shares the same quiet temporary root as the runners.
@@ -40,8 +42,6 @@ aterm-cap = { workspace = true, features = ["launcher-mint"] }
 aterm-spec = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]
-# The sandbox-wrap enforcement tests reuse the policy crate's base profile.
-aterm-containment = { workspace = true }
 # `spawn_locale_model` conformance check (`unix_tests::spawn_locale_conformance_child_always_utf8_ctype`).
 aterm-models-session = { workspace = true }
 

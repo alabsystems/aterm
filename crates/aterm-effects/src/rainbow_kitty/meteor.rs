@@ -997,9 +997,7 @@ const fn mint_burst(seed: u32, at: Instant, cells: f32) -> Burst {
     while i < n {
         let mut j = i;
         while j > 0 && len[order[j - 1] as usize] < len[order[j] as usize] {
-            let tmp = order[j - 1];
-            order[j - 1] = order[j];
-            order[j] = tmp;
+            order.swap(j - 1, j);
             j -= 1;
         }
         i += 1;

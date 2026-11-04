@@ -1134,6 +1134,12 @@ mod macos {
                 .available_monitors()
                 .map(|m| m.native_id())
                 .collect();
+            if all.is_empty()
+                && let Some(why) = aterm_gui::driver_display_unavailable()
+            {
+                self.report.blocked = Some(why);
+                return;
+            }
             self.report.check(
                 all.contains(&cg_main),
                 &format!("available_monitors {all:?} contains the main display {cg_main}"),
@@ -1280,6 +1286,10 @@ mod macos {
 
     /// Drive the window loop through every verification stage and return an exit code.
     pub fn run() -> i32 {
+        if let Some(why) = aterm_gui::driver_display_unavailable() {
+            eprintln!("objc-window-drive: NOT RUN — {why}");
+            return NOT_RUN;
+        }
         let mut el = match aterm_gui::quiet_driver_event_loop_builder::<u8>().build() {
             Ok(el) => el,
             Err(e) => {

@@ -124,7 +124,7 @@ crates/aterm-tempfile/src/lib.rs	a_cache_folder_not_the_users_alone_is_refused	s
 crates/aterm-tempfile/src/lib.rs	windows_os_random_succeeds	(none; §4)	
 ```
 
-## 3. Findings
+## 3. Coverage
 
 - 16 `#[test]` functions in `src/lib.rs` (including the `.ubd` quiet-folder suite and the stand-in suite of
   2026-10-28, plus the non-`#[test]` child helper `stand_in_cache_child_if_asked`). `tempdir-creates-fresh-private-dir-under-parent`

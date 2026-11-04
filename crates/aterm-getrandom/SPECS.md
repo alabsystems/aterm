@@ -59,6 +59,11 @@ tests/fill.rs	getrandom_writes_every_byte_of_every_length	os-fill-writes-every-b
 tests/fill.rs	getrandom_uninit_writes_every_byte_and_returns_the_same_memory	getrandom-uninit-refines-getrandom	os-fill-writes-every-byte
 ```
 
+## 3. Coverage
+
+- All 6 live `#[test]` functions across `src/error.rs` (1), `tests/recorded.rs` (3), and
+  `tests/fill.rs` (2) map to the 8 specs in §1.
+
 ## 4. Tests that are not spec samples
 
 None.

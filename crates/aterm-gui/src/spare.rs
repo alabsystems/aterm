@@ -3054,7 +3054,7 @@ impl Wake {
             Wake::MailChanged
             | Wake::WorkstationSetup(_)
             | Wake::DeveloperToolsInstall(_, _)
-            | Wake::DeveloperToolsWatch
+            | Wake::DeveloperToolsWatch(_)
             | Wake::DeveloperToolsLowData(_)
             | Wake::InitialSetupStatus { .. }
             | Wake::InitialSetupApplyResolved

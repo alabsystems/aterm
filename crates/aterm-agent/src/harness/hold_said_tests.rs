@@ -147,11 +147,3 @@ fn the_files_git_found_are_named() {
         "the prompt and the glass list the files alike: {summary} / {listed}"
     );
 }
-
-/// The words around a quote, from one source.
-#[test]
-fn a_quote_is_said_in_curly_quotes_with_its_rest_counted() {
-    assert_eq!(quoted("x"), "\u{201c}x\u{201d}");
-    assert_eq!(more_words(0), "");
-    assert_eq!(more_words(3), " (+3 more)");
-}

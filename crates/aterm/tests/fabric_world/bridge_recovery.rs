@@ -294,7 +294,9 @@ fn a_post_to_a_session_whose_exit_line_never_arrives_is_still_retired() {
 fn a_record_the_broker_refuses_for_good_is_retired_and_the_queue_behind_it_lands() {
     let w = World::boot_with_grants("r3forgood", &|node| {
         let any_kind = format!("rw,p={node}:/f/{FLEET}/in/*/*/{node}/*");
-        harness::node_grants(node)
+        astream_cap::GrantCeiling::aterm_node_ring(FLEET, node)
+            .expect("a node ring")
+            .rules()
             .into_iter()
             .map(|g| {
                 if g == any_kind {

@@ -282,6 +282,11 @@ pub(crate) enum Mutant {
     /// to then has the bridge's move of its cursor to the fork judged a delivery below its
     /// `since`, a violation of no rule of the bridge's. A found seed pins the law's reading.
     FollowOnTheBrokersLog,
+    /// Every presence row reads its session's screen (`@<sid> text --json`) as it is published,
+    /// as before critic item D03 (`Bridge::publish_session_presence`). Its control is a bridge
+    /// unit test on the scripted verb lane
+    /// (`an_attach_of_ready_sessions_reads_one_status_batch_a_meta_each_and_no_screen`).
+    ReadTheScreenEveryRow,
 }
 
 /// What one run is.

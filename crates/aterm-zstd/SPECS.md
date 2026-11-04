@@ -86,6 +86,15 @@ tests/decode_frames.rs	every_raw_frame_decodes_to_its_content	raw-frame-rfc8878-
 tests/decode_frames.rs	concatenated_raw_frames_decode_as_one_stream	raw-frame-rfc8878-conformance	write-raw-layout
 ```
 
+## 3. Coverage
+
+- §2 maps the 7 raw-frame and XXH64 tests; §7 maps the encoder tests (96 `#[test]` functions across
+  `src/` and `tests/`).
+
+## 4. Tests that are not spec samples
+
+None.
+
 ## 5. Notes on the tests
 
 1. **Resolved: `digest_then_continue` carries no redundant ownership doc.** It tests only that

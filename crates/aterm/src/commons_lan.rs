@@ -277,8 +277,9 @@ fn refusal(host: Host) -> Option<fn() -> bool> {
 /// runtime says in its observation while its local network sockets fail
 /// ([`aterm_db::runtime::LanGate::with_refusal`]). It never closes the LAN the gate let through:
 /// the gate's first use is the one that puts macOS's question to this app on this Mac, and a
-/// later use raises none; the records may be stale (only a look at the ALab vault's address or
-/// the window's step writes them, and every Mac and app on this home shares them), while a person
+/// later use raises none; the records may be stale (only the window's step and a look or vault
+/// sync at a `.local` address from a process whose question is aterm's own write them, and every
+/// Mac and app on this home shares them), while a person
 /// who turns aterm on in System Settings is heard at the transport's next use.
 #[cfg(target_os = "macos")]
 fn refused() -> bool {

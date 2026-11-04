@@ -202,6 +202,35 @@ pub mod fault {
         /// A look reads the composer under a box drawn over it (`Session::left_seen`): the
         /// box's read settles the line it hides.
         BoxedComposerRead,
+        /// [`Line::look`](crate::supervise::custody::Line::look) settles a line held drawn at a
+        /// point on a read that shows none of it: a move of the screen settles it, and the line
+        /// the worker still holds is written again.
+        CustodySettlesUnshown,
+        /// [`Line::turned`](crate::supervise::custody::Line::turned) settles a line held on any
+        /// input word after a turn: one still queued settles, and is written again.
+        CustodyTurnAnyWord,
+        /// [`Line::gate_read`](crate::supervise::custody::Line::gate_read) reads a line no
+        /// `status` read found clear as lost: a restart in place hands a line still queued to the
+        /// shell.
+        CustodyLostUnread,
+        /// [`Line::gate_read`](crate::supervise::custody::Line::gate_read) reads a line read
+        /// clear as lost before its minute: the host is told a line the worker may still draw is
+        /// lost.
+        CustodyLostWithinMinute,
+        /// [`Line::lose`](crate::supervise::custody::Line::lose) takes no restart as spent: a
+        /// second loss short of an act submitted is restarted again.
+        CustodyRestartAgain,
+        /// [`line_held`](crate::supervise::custody::line_held) tells the host nothing of a line
+        /// that stands: the host types behind a line that may still come.
+        CustodyHostUntold,
+        /// [`Line::look`](crate::supervise::custody::Line::look) takes a read that cannot say what
+        /// the composer holds (a dialog over it, no composer drawn) for one that shows the line
+        /// whole: the line the worker still holds settles drawn, and is written again.
+        CustodySettlesUnreadable,
+        /// [`Line::gate_read`](crate::supervise::custody::Line::gate_read) reads a line read clear
+        /// a minute ago as lost though `status` now reads input unread behind it: a restart in
+        /// place hands that input to the shell.
+        CustodyLostBehind,
     }
 
     thread_local! {
@@ -287,6 +316,14 @@ pub(crate) mod fault {
         ToldLineUnanswered,
         StuckLeftNotTheLine,
         BoxedComposerRead,
+        CustodySettlesUnshown,
+        CustodyTurnAnyWord,
+        CustodyLostUnread,
+        CustodyLostWithinMinute,
+        CustodyRestartAgain,
+        CustodyHostUntold,
+        CustodySettlesUnreadable,
+        CustodyLostBehind,
     }
 
     /// The shipped build: never armed.

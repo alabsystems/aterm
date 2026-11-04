@@ -6,7 +6,8 @@
 //! ledger before the build starts, and holds it until the build ends.
 //!
 //! What claims ([`classify`]): `build`, `check`, `test`, `bench`, `doc`, `rustc`, `rustdoc`,
-//! `fix` and the lint (`tippy`, `clippy`, `targo-tippy`), and `targo trust` over one of them; a
+//! `fix`, `package` with its default compile verification, and the lint (`tippy`, `clippy`,
+//! `targo-tippy`), and `targo trust` over one of them; a
 //! `targo` verb other than the lint only in a lane it runs (`--unverified`, `trust`), since a bare
 //! one is refused. Never `run` (which holds its program's whole life), an alias (`verify`, `lab`,
 //! `ship`: each claims for the work it starts), `metadata`, `clean`, or a call for help or a
@@ -262,6 +263,7 @@ fn compiling(word: &str) -> Option<&'static str> {
         "rustc" => "rustc",
         "rustdoc" => "rustdoc",
         "fix" => "fix",
+        "package" => "package",
         "tippy" | "clippy" => "tippy",
         _ => return None,
     })
@@ -287,6 +289,7 @@ pub fn classify(args: &[String], tool: Tool) -> Option<Build> {
     let mut verb: Option<&str> = (tool == Tool::Tippy).then_some("tippy");
     let mut trust = false;
     let mut unverified = false;
+    let mut no_verify = false;
     let mut named: Vec<String> = Vec::new();
     let mut workspace = false;
     let mut shape: Vec<String> = Vec::new();
@@ -306,6 +309,7 @@ pub fn classify(args: &[String], tool: Tool) -> Option<Build> {
                 return None;
             }
             "--unverified" => unverified = true,
+            "--no-verify" => no_verify = true,
             "-p" | "--package" => named.push(value(inline, &mut it)?.to_owned()),
             "--workspace" | "--all" => workspace = true,
             "-r" | "--release" => shape.push("release".to_owned()),
@@ -340,6 +344,9 @@ pub fn classify(args: &[String], tool: Tool) -> Option<Build> {
         }
     }
     let verb = compiling(verb?)?;
+    if verb == "package" && no_verify {
+        return None;
+    }
     let program = match tool {
         Tool::Cargo => "cargo",
         Tool::Targo | Tool::Tippy => "targo",
@@ -1049,7 +1056,7 @@ pub fn run_if_claimed_at(
 /// [`run_if_claimed_at`] in this process's directory, at this user's seat ([`Seat::live`]);
 /// `None` too where the directory is unread.
 #[cfg(unix)]
-#[must_use]
+#[must_use = "return an admitted command's exit status to the caller"]
 pub fn run_if_claimed(
     target: &Path,
     args: &[String],
@@ -1072,7 +1079,7 @@ pub fn run_if_claimed(
 /// Then a call that claims runs `target` under its claim in this pid ([`front_exec`]); other calls
 /// become `target` by exec, their words handed on unchanged. A shim refuses non-UTF-8 words
 /// because its cache placement cannot be established; a non-shim front still passes them on.
-#[must_use]
+#[must_use = "return or inspect the admitted build command's exit status"]
 pub fn run_hidden(argv: &[std::ffi::OsString]) -> std::process::ExitCode {
     if let [only] = argv
         && only == "--capabilities"
@@ -1449,7 +1456,7 @@ pub fn raise_like(status: &std::process::ExitStatus) {
 /// The front's end as its build's `status` ([`raise_like`], else its exit code, `128 + n` for a
 /// core signal).
 #[cfg(unix)]
-#[must_use]
+#[must_use = "return or inspect the build's propagated exit status"]
 pub fn end_like(status: std::process::ExitStatus) -> std::process::ExitCode {
     raise_like(&status);
     crate::platform::exit_code_like(status)

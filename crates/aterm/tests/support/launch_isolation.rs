@@ -71,14 +71,28 @@ pub const CONFIG_OFF: &str = "[update]\nenabled = false\nauto_apply = false\n\
 #[allow(dead_code)]
 pub const HARNESS_OFF: &str = "[harness]\nenabled = false\n";
 
-/// Arm `cmd`, a `--headless` launch, with a lifeline (`aterm_uds::lifeline`).
+/// An instance's lifeline FIFO paired with its subprocess admission lease.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub struct Lifeline {
+    /// Closed first to cut the instance's lifeline FIFO before releasing the subprocess slot.
+    _inner: aterm_uds::lifeline::Lifeline,
+    _lease: std::sync::Arc<aterm_spec::subprocess_lane::SubprocessLease>,
+}
+
+/// Arm `cmd`, a `--headless` launch, with a lifeline (`aterm_uds::lifeline`) and a subprocess lease.
 /// # Panics
 /// The lifeline's FIFO could not be created in `root`.
 #[cfg(unix)]
 #[allow(dead_code)]
-pub fn lifeline(cmd: &mut Command, root: &Path) -> aterm_uds::lifeline::Lifeline {
-    aterm_uds::lifeline::Lifeline::arm(cmd, root)
-        .unwrap_or_else(|e| panic!("arm the instance's lifeline in {}: {e}", root.display()))
+pub fn lifeline(cmd: &mut Command, root: &Path) -> Lifeline {
+    let lease = aterm_spec::subprocess_lane::acquire();
+    let inner = aterm_uds::lifeline::Lifeline::arm(cmd, root)
+        .unwrap_or_else(|e| panic!("arm the instance's lifeline in {}: {e}", root.display()));
+    Lifeline {
+        _inner: inner,
+        _lease: lease,
+    }
 }
 
 /// Whether the control socket at `sock` is listening.

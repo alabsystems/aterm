@@ -392,12 +392,18 @@ pub(crate) struct Host {
     /// The attempt whose result may change the install's state. Kept after its terminal leaves,
     /// so an older child's delayed status cannot become current again.
     pub(crate) developer_tools_attempt: Option<u64>,
-    /// Whether the tab opened for this account on this build ([`crate::clt_install::Mark`]):
-    /// aterm opens it by itself once per account and build, so an update retries it once.
+    /// Whether aterm asked for the tools by itself for this account on this build, its tab or
+    /// the package follow-up's `aterm init` ([`crate::clt_install::Mark`]): aterm asks by itself
+    /// once per account and build, so an update retries it once.
     pub(crate) developer_tools_mark: crate::clt_install::Mark,
-    /// What this Mac shows of an install under way ([`crate::clt_install::installing_now`]);
-    /// none in a headless instance or a test, which never look at this Mac's installers.
+    /// What this Mac shows of an install under way ([`crate::clt_install::installing_now`]), probed
+    /// live at a dispatch boundary; none in a headless instance or a test, which never look at
+    /// this Mac's installers.
     pub(crate) developer_tools_probe: Option<fn() -> crate::clt_install::Reading>,
+    /// The newest reading of this Mac's installers while the watch runs: the one its last second
+    /// carried ([`App::developer_tools_watch`]), or a dispatch boundary's since, which the
+    /// window's other looks read in place of a probe on its loop. `None` where no watch runs.
+    pub(crate) developer_tools_seen: Option<crate::clt_install::Reading>,
     /// Read-only C compiler presence, asked only while its missing-tools exception is
     /// unresolved; none in headless instances and tests, which inject their own reading.
     pub(crate) developer_tools_installed: Option<fn() -> Option<bool>>,
@@ -411,14 +417,21 @@ pub(crate) struct Host {
     pub(crate) developer_tools_want: Option<u64>,
     /// That shim, reconciled ahead of the launch's first shell
     /// ([`crate::clt_shim::Shim::for_launch`]) and settled at each change of the want or of the
-    /// install, and each second until the tools exist ([`App::developer_tools_watch`]).
+    /// install, and at a watch's second that moves its word or finds the tools
+    /// ([`App::developer_tools_watch`]).
     pub(crate) developer_tools_shim: crate::clt_shim::Shim,
+    /// Whether the shim's last settle said the tools are on their way
+    /// ([`App::settle_developer_tools_shim`]): a watch's second that would say the same settles
+    /// nothing. `None` before the first.
+    pub(crate) developer_tools_shim_said: std::cell::Cell<Option<bool>>,
     /// An install of the tools ended unfinished (the tab said why, or ended without saying), or
-    /// the tab opened for this account at an earlier launch of this build and nothing has started
-    /// one since: nothing installs them until a person presses Install…, so the shim says they are
-    /// missing and not on their way, though a pass still wants them. A tab that starts the install,
-    /// or one adopted alive from an earlier aterm, clears it; a newer build's launch starts without
-    /// it, as its own automatic tab may open.
+    /// aterm asked for them for this account on this build already (the tab at an earlier launch,
+    /// or the package follow-up, whose own install may be under way now) and no tab of this
+    /// window's has started one since: no tab opens by itself until a person presses Install…,
+    /// so the shim says they are missing and not on their way, though a pass still wants them,
+    /// unless an install of them is under way on this Mac ([`App::developer_tools_on_their_way`]).
+    /// A tab that starts the install, or one adopted alive from an earlier aterm, clears it; a
+    /// newer build's launch starts without it, as its own automatic tab may open.
     pub(crate) developer_tools_unfinished: bool,
     /// Whether Low Data Mode holds the tools' download back, as the network watch reads it or the
     /// tab's program said: the automatic tab waits while it does, unspent. `None`: unread.
@@ -501,11 +514,13 @@ impl Host {
             developer_tools_probe: (!headless && !cfg!(test)).then_some(
                 crate::clt_install::installing_now as fn() -> crate::clt_install::Reading,
             ),
+            developer_tools_seen: None,
             developer_tools_installed: (!headless && !cfg!(test))
                 .then_some(crate::clt_install::c_toolchain_installed as fn() -> Option<bool>),
             developer_tools_after: crate::clt_install::Aftermath::default(),
             developer_tools_want: launch.want(),
             developer_tools_shim: shim,
+            developer_tools_shim_said: std::cell::Cell::new(None),
             developer_tools_low_data: None,
             developer_tools_network: None,
             developer_tools_not_admin: false,

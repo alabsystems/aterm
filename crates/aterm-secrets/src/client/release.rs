@@ -438,7 +438,7 @@ fn authorized_ring_check(paths: &Paths, anchors: &[&str], now: i64, advance: boo
     let Ok(signer) = crate::release_ring::authorize_with(
         profile.as_slice(),
         key.as_slice(),
-        roster.as_slice().to_vec(),
+        roster.to_vec(),
         &signature,
         anchors,
         floor,

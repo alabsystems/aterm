@@ -30,7 +30,7 @@ Gap 0 (a seal that publishes Clean-discharged rows) blocks every spec, so every 
   bytes of M ∧ `h.state` = foldl FIPS.compress H_INIT (the first ⌊|M|/64⌋ blocks of M).
   `h.buf[buf_len..]` is unconstrained.
 - `feed(h, [x1..xn])` = `h.update(x1); …; h.update(xn)` (n ≥ 0, empty pieces included).
-- **Precondition everywhere:** total absorbed length < 2^61 bytes (a legal FIPS message; §4.5).
+- **Precondition everywhere:** total absorbed length < 2^61 bytes (a legal FIPS message; §5.5).
 
 ## 1. Specs (TSV)
 
@@ -57,11 +57,11 @@ opaque-debug	contract	<Sha256 as Debug>::fmt	∀ h : Sha256: format!("{h:?}") = 
 file	test	primary	also
 ../../vendor/astream/crates/astream-digest/src/lib.rs	fips_empty_message	sha256-digest-refines-fips	
 ../../vendor/astream/crates/astream-digest/src/lib.rs	fips_abc	sha256-digest-refines-fips	
-../../vendor/astream/crates/astream-digest/src/lib.rs	fips_448_bit_message	sha256-digest-refines-fips	sha256-finalize-pads (56 bytes spill the length, §4.1)
+../../vendor/astream/crates/astream-digest/src/lib.rs	fips_448_bit_message	sha256-digest-refines-fips	sha256-finalize-pads (56 bytes spill the length, §5.1)
 ../../vendor/astream/crates/astream-digest/src/lib.rs	fips_896_bit_message	sha256-digest-refines-fips	
 ../../vendor/astream/crates/astream-digest/src/lib.rs	fips_one_million_a	sha256-digest-refines-fips	
 ../../vendor/astream/crates/astream-digest/src/lib.rs	padding_boundary_lengths_stream_identically	sha256-streaming-equals-one-shot	sha256-finalize-pads
-../../vendor/astream/crates/astream-digest/src/lib.rs	the_length_field_is_64_bits_wide	sha256-finalize-pads	sha256-compress-refines-fips (uses compress as its own oracle, §4.3)
+../../vendor/astream/crates/astream-digest/src/lib.rs	the_length_field_is_64_bits_wide	sha256-finalize-pads	sha256-compress-refines-fips (uses compress as its own oracle, §5.3)
 ../../vendor/astream/crates/astream-digest/src/lib.rs	the_ring_schedule_compression_gives_the_transcriptions_state_on_random_blocks	sha256-compress-refines-fips	
 ../../vendor/astream/crates/astream-digest/src/lib.rs	whole_blocks_from_the_input_digest_as_every_byte_through_the_buffer_does	sha256-streaming-equals-one-shot	sha256-state-invariant, sha256-digest-refines-fips
 ../../vendor/astream/crates/astream-digest/src/lib.rs	default_matches_new	sha256-state-invariant	
@@ -72,10 +72,14 @@ file	test	primary	also
 ../../vendor/astream/crates/astream-digest/tests/lengths_and_splits.rs	every_length_to_1024_is_the_recorded_answer	sha256-digest-refines-fips	sha256-streaming-equals-one-shot
 ```
 
-15 tests map to the 6 rows; `sha256-digest-refines-fips` retires the most (7). astream-digest's
-HMAC, HKDF and `ct_eq` tests are mapped in its own file.
+## 3. Coverage
 
-## 3. Tests that are not spec samples
+- `aterm-digest` itself is a pure re-export facade (0 local `#[test]` functions); 15 SHA-256 tests in
+  `vendor/astream/crates/astream-digest` map to the 6 rows above (`sha256-digest-refines-fips`
+  retires 7), plus the 2 tests in §4. `astream-digest`'s HMAC, HKDF, and `ct_eq` tests are mapped in
+  `vendor/astream/crates/astream-digest/SPECS.md`.
+
+## 4. Tests that are not spec samples
 
 - `the_digest_still_evaluates_at_compile_time` pins that `update_slice`, `compress` and
   `finalize` stay `const fn`; its values are instances of `sha256-digest-refines-fips`, but a proof
@@ -84,7 +88,7 @@ HMAC, HKDF and `ct_eq` tests are mapped in its own file.
   Clean-island kernels (`buf_len_is_partial`, `sha256_partial_take`, `sha256_clamp_partial_len`,
   `sha256_next_buf_len`), which no row here states.
 
-## 4. Where the specs and the code disagree, or could
+## 5. Where the specs and the code disagree, or could
 
 1. **`fips_448_bit_message`'s comment is wrong.** It calls 56 bytes "the tightest single-block
    case". After the 0x80, `pos = 57 > 56`, so `finalize` spills the length into a second block;
@@ -103,7 +107,7 @@ HMAC, HKDF and `ct_eq` tests are mapped in its own file.
    `len` field's doc states the bound; no `requires` does. Add one (a ghost precondition on the
    abstraction) when the specs land.
 
-## 5. Proof order (easiest, high value first)
+## 6. Proof order (easiest, high value first)
 
 No spec is blocked by gap 0 alone, so the order goes by fewest and smallest gaps, then by tests
 retired and by what each spec unlocks. `sha256-compress-refines-fips` is the one leaf the other

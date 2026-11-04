@@ -616,7 +616,7 @@ fn could_not(m: &str) -> Fail {
 /// The lab records no aterm, or the instance runs without the seam.
 pub(crate) fn seam_checked(run: &Run) -> Result<String, Fail> {
     let aterm = run.need_aterm()?.display().to_string();
-    if fs::read_to_string(run.run.join("aterm.out"))
+    if crate::util::read_regular_text(&run.run.join("aterm.out"))
         .unwrap_or_default()
         .contains("ATERM_DEBUG_HEADLESS_RESTORE is set")
     {
@@ -808,7 +808,7 @@ pub(crate) fn relaunch_instance(
     let _ = fs::remove_file(format!("{}/a.sock.token", run.sockdir));
     let t_launch = now_ms();
     if let Err(e) = crate::lab::start_instance(run, UpOpts::from_env().scale.as_deref(), armed) {
-        let out = fs::read_to_string(run.run.join("aterm.out")).unwrap_or_default();
+        let out = crate::util::read_regular_text(&run.run.join("aterm.out")).unwrap_or_default();
         let tail: Vec<&str> = out.lines().rev().take(20).collect();
         for l in tail.iter().rev() {
             eprintln!("{l}");

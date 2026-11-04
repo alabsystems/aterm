@@ -9,9 +9,10 @@ use std::path::Path;
 use aterm_json::{Map, Value};
 
 use super::{
-    LiveTab, Opts, Phase, Report, Request, STALE_S, St, alive, connect, conversation_live, ledger,
-    load, now_s, process_group, roster_aside, save, session_files, started_s, state_dir,
-    sweep_lock, tab_is_live, unique_tab_for_group, upgrade,
+    LiveTab, Opts, Phase, Report, Request, STALE_S, St, alive, check_upgrade_tree, connect,
+    conversation_live, ensure_upgrade_tree, ledger, load, now_s, process_group, read_upgrade_dir,
+    roster_aside, save, session_files, started_s, state_dir, sweep_lock, tab_is_live,
+    unique_tab_for_group, upgrade,
 };
 use crate::harness::relaunch::{TAB_TAKEN, overtakable, overtaken, overtaken_line};
 
@@ -477,7 +478,12 @@ impl Row {
 
     /// Judges this row again at `now` when served later than it was read.
     pub fn reread(&mut self, now: u64) {
-        self.awake_since = awake_since().max(self.awake_since);
+        self.reread_with_awake(now, awake_since());
+    }
+
+    /// Judges this row again at `now` against an explicit awake-clock reading `awake`.
+    pub fn reread_with_awake(&mut self, now: u64, awake: u64) {
+        self.awake_since = awake.max(self.awake_since);
         self.read_at(now);
     }
 
@@ -3546,7 +3552,7 @@ struct Unread {
 }
 
 fn read_records(opts: &Opts, now: u64) -> (Vec<Row>, bool, Vec<Unread>) {
-    let dir = match std::fs::read_dir(state_dir(opts)) {
+    let dir = match read_upgrade_dir(&opts.state) {
         Ok(dir) => dir,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return (Vec::new(), true, Vec::new());
@@ -4150,7 +4156,7 @@ fn ask_within(
         }
     };
     let now = now_s();
-    let candidates: Vec<(String, St)> = std::fs::read_dir(state_dir(opts))
+    let candidates: Vec<(String, St)> = read_upgrade_dir(&opts.state)
         .map(|dir| {
             dir.flatten()
                 .filter_map(|e| {
@@ -4449,13 +4455,27 @@ pub const BACK_FILE: &str = "agents-back";
 const BACK_MAX: u64 = 64 * 1024;
 
 fn read_back(opts: &Opts) -> BTreeMap<String, u64> {
-    let path = state_dir(opts).join(BACK_FILE);
-    let Some(text) = std::fs::File::open(&path).ok().and_then(|f| {
-        let mut text = String::new();
-        std::io::Read::read_to_string(&mut std::io::Read::take(f, BACK_MAX), &mut text)
-            .ok()
-            .map(|_| text)
-    }) else {
+    let Some(dir) = check_upgrade_tree(&opts.state, None).ok().flatten() else {
+        return BTreeMap::new();
+    };
+    let path = dir.join(BACK_FILE);
+    let Some(text) = super::read_record_text(&path)
+        .ok()
+        .flatten()
+        .filter(|text| u64::try_from(text.len()).is_ok_and(|len| len <= BACK_MAX))
+        .or_else(|| {
+            std::fs::symlink_metadata(&path)
+                .ok()
+                .filter(|m| m.is_file())
+                .and_then(|_| std::fs::File::open(&path).ok())
+                .and_then(|f| {
+                    let mut text = String::new();
+                    std::io::Read::read_to_string(&mut std::io::Read::take(f, BACK_MAX), &mut text)
+                        .ok()
+                        .map(|_| text)
+                })
+        })
+    else {
         return BTreeMap::new();
     };
     text.lines()
@@ -4469,11 +4489,16 @@ fn read_back(opts: &Opts) -> BTreeMap<String, u64> {
 }
 
 fn write_back(opts: &Opts, back: &BTreeMap<String, u64>) {
-    let path = state_dir(opts).join(BACK_FILE);
     if back.is_empty() {
-        let _ = std::fs::remove_file(&path);
+        if let Ok(Some(dir)) = check_upgrade_tree(&opts.state, None) {
+            let _ = std::fs::remove_file(dir.join(BACK_FILE));
+        }
         return;
     }
+    let Ok(dir) = ensure_upgrade_tree(&opts.state, None) else {
+        return;
+    };
+    let path = dir.join(BACK_FILE);
     let body: String = back
         .iter()
         .map(|(session, exited)| format!("{session} {exited}\n"))
@@ -5022,8 +5047,10 @@ pub fn word_marker(state: &Path) -> std::path::PathBuf {
 }
 
 fn announce_word(opts: &Opts, now: u64) {
-    let path = word_marker(&opts.state);
-    let _ = crate::harness::upgrade_models::write_atomic(&path, &format!("{now}\n"));
+    let Ok(dir) = ensure_upgrade_tree(&opts.state, Some("owner")) else {
+        return;
+    };
+    let _ = crate::harness::upgrade_models::write_atomic(&dir.join("word"), &format!("{now}\n"));
 }
 
 #[cfg(all(test, unix))]

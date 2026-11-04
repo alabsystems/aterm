@@ -579,7 +579,12 @@ impl Follows {
 /// What a Mac a member let in says while it waits for the vault to record it: that finishes by
 /// itself only while its vault subscriber runs (`follows`).
 fn allowed_words(follows: &Follows) -> String {
-    match follows.fix() {
+    allowed_line(follows.fix().as_deref())
+}
+
+/// [`allowed_words`] where `fix` is what starts the vault subscriber, if one is needed.
+fn allowed_line(fix: Option<&str>) -> String {
+    match fix {
         None => {
             "allowed: ~/.secrets is written, and this Mac follows vault changes once the vault \
                  records it (that finishes by itself)"
@@ -1200,39 +1205,91 @@ fn status() -> ExitCode {
         eprintln!("aterm members: no home directory");
         return ExitCode::from(1);
     };
-    println!(
-        "{}",
-        status_said(&paths, &Follows::now, &|| {
-            aterm_types::dirs::state_dir()
-                .map_or(join::JoinPlace::Unknown, |state| join_place(&state))
-        })
-    );
+    println!("{}", Standing::live(&paths).line());
     ExitCode::SUCCESS
 }
 
 /// `status`'s line for the Mac at `paths`, `follows` reading whether its vault subscriber runs
 /// and `place` where it is, which says what lets an asking Mac in ([`join::let_in`]).
+#[cfg(test)]
 fn status_said(
     paths: &Paths,
     follows: &dyn Fn(&Path) -> Follows,
     place: &dyn Fn() -> join::JoinPlace,
 ) -> String {
-    match client::status(paths).map(|status| status.membership) {
-        Ok(client::Membership::In { .. }) => {
-            let name = client::config(paths)
-                .ok()
-                .flatten()
-                .map_or_else(client::default_host_name, |config| config.host);
-            format!("member as {name}")
+    Standing::read(paths, follows, place).line()
+}
+
+/// Where this Mac stands in ALab, as `aterm members status` reads it from local files alone
+/// (never a dial), typed so `aterm status` can say who acts next.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Standing {
+    /// A member, under this machine name.
+    Member(String),
+    /// A member let it in and `~/.secrets` is written; the vault records it once this Mac's
+    /// vault subscriber follows the vault.
+    Allowed {
+        /// What starts the subscriber, where none runs ([`Follows::fix`]).
+        fix: Option<String>,
+        /// A person turned Sync off on this Mac, which stands until a person turns it on.
+        held: bool,
+    },
+    /// Asking to be let in from this place ([`join::let_in`] says what lets it in there).
+    Asking(join::JoinPlace),
+    /// Neither a member nor asking.
+    NotIn,
+    /// The vault's local state could not be read: why.
+    Unknown(String),
+}
+
+impl Standing {
+    /// This Mac's standing over `paths`, `follows` reading whether its vault subscriber runs and
+    /// `place` where it is.
+    fn read(
+        paths: &Paths,
+        follows: &dyn Fn(&Path) -> Follows,
+        place: &dyn Fn() -> join::JoinPlace,
+    ) -> Self {
+        match client::status(paths).map(|status| status.membership) {
+            Ok(client::Membership::In { .. }) => Self::Member(
+                client::config(paths)
+                    .ok()
+                    .flatten()
+                    .map_or_else(client::default_host_name, |config| config.host),
+            ),
+            Ok(client::Membership::Pending) if client::holds_allowed(paths) => {
+                let follows = follows(&paths.home);
+                Self::Allowed {
+                    fix: follows.fix(),
+                    held: matches!(follows, Follows::Off),
+                }
+            }
+            Ok(client::Membership::Pending) => Self::Asking(place()),
+            Ok(_) => Self::NotIn,
+            Err(error) => Self::Unknown(error.to_string()),
         }
-        Ok(client::Membership::Pending) if client::holds_allowed(paths) => {
-            allowed_words(&follows(&paths.home))
+    }
+
+    /// This Mac's standing, read only: its vault subscriber's state as installed (never
+    /// repaired) and its network place as last recorded.
+    #[must_use]
+    pub fn live(paths: &Paths) -> Self {
+        Self::read(paths, &Follows::now, &|| {
+            aterm_types::dirs::state_dir()
+                .map_or(join::JoinPlace::Unknown, |state| join_place(&state))
+        })
+    }
+
+    /// `aterm members status`'s line.
+    #[must_use]
+    pub fn line(&self) -> String {
+        match self {
+            Self::Member(name) => format!("member as {name}"),
+            Self::Allowed { fix, .. } => allowed_line(fix.as_deref()),
+            Self::Asking(place) => format!("asking: {}", join::let_in(*place)),
+            Self::NotIn => "not in ALab: run `aterm members join` here".to_owned(),
+            Self::Unknown(error) => format!("unknown: {error}"),
         }
-        Ok(client::Membership::Pending) => {
-            format!("asking: {}", join::let_in(place()))
-        }
-        Ok(_) => "not in ALab: run `aterm members join` here".to_owned(),
-        Err(error) => format!("unknown: {error}"),
     }
 }
 

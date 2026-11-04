@@ -157,3 +157,7 @@ __pycache__/
 # joined the workspace (`members = ["crates/*"]`). A member's own lockfile is never
 # read: the workspace root's Cargo.lock is, so a leftover one is stale noise.
 /crates/aterm-link/Cargo.lock
+
+# The imported leaf library is tested as its own workspace; the app's lockfile
+# owns the dependency used by releases.
+/vendor/trust-build-cpu/Cargo.lock

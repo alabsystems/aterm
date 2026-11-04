@@ -8,8 +8,8 @@ use std::path::PathBuf;
 
 use super::upgrade::{self, Candidate, Phase, Source, Step, Version};
 use super::{
-    AT_POINT, Opts, Proc, Report, St, TAIL_BYTES, at_second, due_by, ledger, load, now_s, rearm,
-    rounds_step, save_at, state_dir, step, sweep_lock, tail_to_end, watch_at,
+    AT_POINT, Opts, Proc, Report, St, TAIL_BYTES, at_second, due_by, ledger, load, now_s,
+    read_upgrade_dir, rearm, rounds_step, save_at, step, sweep_lock, tail_to_end, watch_at,
 };
 
 /// Who looks and why ([`watch`], [`watch_at`]).
@@ -285,7 +285,7 @@ pub(super) fn look_word(step: &str, claude: bool, status: impl FnOnce() -> Strin
 }
 
 fn tab_records(opts: &Opts, tab: &str) -> Vec<(String, St)> {
-    let Ok(dir) = std::fs::read_dir(state_dir(opts)) else {
+    let Ok(dir) = read_upgrade_dir(&opts.state) else {
         return Vec::new();
     };
     let mut out: Vec<(String, St)> = dir

@@ -243,15 +243,37 @@ pub fn resolve<'a>(
     resolve_index(routes, target_email).map(|at| &routes[at])
 }
 
-/// [`resolve`]'s entry, as its index in `routes`. Where no pattern names the target or its base
-/// address, the addresses the lab registry says it is an alias of
+/// [`resolve`]'s entry, as its index in `routes`. The lab registry decides first: the entry whose
+/// login is the mailbox the lab says the target's codes arrive in
+/// ([`super::alab_roster::mailbox_of`]: the address's `mailbox` column, through `alias_of`, or a
+/// mailbox's own address list). Then the closest pattern; where no pattern names the target or
+/// its base address, the addresses the lab says it is an alias of
 /// ([`super::alab_roster::mail_targets`], nearest first) are tried for an address or base match
 /// before a `*@domain` or `*` entry: an alias's auth codes arrive where its linked address's do.
 #[must_use]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "FleetMachineAssignment",
+        action = "Resolve",
+        project = "aterm_agent::harness::alab_roster::assignment_tests::mail_transition"
+    )
+)]
 pub fn resolve_index(routes: &[MailboxRoute], target_email: Option<&str>) -> Option<usize> {
     let target = target_email
         .map(|t| t.trim().to_ascii_lowercase())
         .filter(|t| !t.is_empty());
+    if let Some(at) = target
+        .as_deref()
+        .and_then(super::alab_roster::mailbox_of)
+        .and_then(|login| {
+            routes
+                .iter()
+                .position(|route| route.login.trim().eq_ignore_ascii_case(&login))
+        })
+    {
+        return Some(at);
+    }
     let best = best_route(routes, target.as_deref());
     if best.is_some_and(|(tier, _)| tier <= Tier::Base) {
         return best.map(|(_, at)| at);
@@ -298,6 +320,50 @@ pub fn mask_login(login: &str) -> String {
     } else {
         format!("{shown}…")
     }
+}
+
+/// The login of every `[[mailboxes]]` entry in the mailbox file at `file` (`ai-mailbox.toml`,
+/// whose entries sit at its root or under `[ai.mailbox]`, `[harness.mailbox]` or `[mailbox]`), as
+/// written: what `crates/aterm/src/alab_view.rs` names a mailbox key's login by. No password,
+/// second password, TOTP seed or `*_file` is read; a missing or unreadable file names none.
+#[must_use]
+pub fn mailbox_logins(file: &std::path::Path) -> Vec<String> {
+    super::accounts::read_bounded(file, 1024 * 1024)
+        .ok()
+        .flatten()
+        .map(|text| logins_in(&text))
+        .unwrap_or_default()
+}
+
+/// [`mailbox_logins`] of the file's `text`.
+fn logins_in(text: &str) -> Vec<String> {
+    let Ok(doc) = aterm_toml::from_str::<aterm_toml::Table>(text) else {
+        return Vec::new();
+    };
+    let under = |outer: &str| {
+        doc.get(outer)
+            .and_then(aterm_toml::Value::as_table)
+            .and_then(|t| t.get("mailbox"))
+            .and_then(aterm_toml::Value::as_table)
+    };
+    let table = under("ai")
+        .or_else(|| under("harness"))
+        .or_else(|| doc.get("mailbox").and_then(aterm_toml::Value::as_table))
+        .unwrap_or(&doc);
+    let get_str = |t: &aterm_toml::Table, keys: &[&str]| {
+        keys.iter().find_map(|key| {
+            t.get(key)?
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        })
+    };
+    parse_mailboxes(&doc, table, &get_str, &|_| None, &|_| false)
+        .into_iter()
+        .map(|route| route.login)
+        .filter(|login| !login.trim().is_empty())
+        .collect()
 }
 
 /// Parse every `[[mailboxes]]` entry of `table` (and, when it is another table, of `doc`'s

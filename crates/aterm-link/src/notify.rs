@@ -79,6 +79,10 @@ pub const FLUSH_TALLY_SEAM: &str = "ATERM_LINK_NOTIFY_FLUSH_TALLY";
 pub const FLUSH_TALLY: &str = "flush-tally";
 
 /// The flushes this process's notify stores asked for ([`FLUSH_TALLY`]): full, then ordered.
+/// These count what each store ASKED for (aterm-durable's [`Flush`]), where
+/// `astream_sys::flush_tally` counts the CALLS that answered it, every store's in the process:
+/// an ordered flush whose barrier the volume refused is one `ordered` here, and one `barrier`
+/// plus the one `full` that answered it there.
 static FLUSHES: [std::sync::atomic::AtomicU64; 2] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -2861,7 +2865,7 @@ fn fill(words: impl Iterator<Item = &'static str>) -> String {
 }
 
 /// `aterm-link notify`.
-#[must_use]
+#[must_use = "handle or propagate the command's exit status"]
 pub fn main(args: &[String]) -> ExitCode {
     if crate::cli::asks_help(args) {
         return aterm_uds::stdout::answer_exit("aterm link notify", &usage(), 0);

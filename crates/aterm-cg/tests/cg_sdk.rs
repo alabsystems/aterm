@@ -25,7 +25,7 @@ fn the_parser_saw_every_declaration() {
     sdk_decls::the_parser_saw_every_declaration(
         SUBJECT,
         &Floor {
-            fns: 18,
+            fns: 19,
             structs: 0,
             opaque: 4,
         },

@@ -36,7 +36,7 @@ pub const TARGET_BUILD_LEAF: &str = "build.noindex";
 /// The subcommands that get a build directory.
 pub const BUILD_VERBS: &[&str] = &[
     "build", "b", "check", "c", "test", "t", "run", "r", "bench", "doc", "d", "rustc", "rustdoc",
-    "clippy", "tippy", "fix", "clean",
+    "clippy", "tippy", "fix", "clean", "package",
 ];
 
 /// `$HOME/Library/Caches/aterm/.ubd/cargo-build.noindex` ([`CACHE_UNDER_HOME`]).

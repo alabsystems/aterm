@@ -8,6 +8,7 @@ use std::ffi::OsString;
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -143,6 +144,105 @@ fn a_streamed_upload_arrives_whole_with_its_length() {
         String::from_utf8_lossy(&head)
     );
     assert_eq!(body, data);
+}
+
+struct InterruptedFragments<'a> {
+    remaining: &'a [u8],
+    interrupt: bool,
+}
+
+impl Read for InterruptedFragments<'_> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        if std::mem::take(&mut self.interrupt) {
+            return Err(io::Error::from(ErrorKind::Interrupted));
+        }
+        let take = output.len().min(3);
+        self.remaining.read(&mut output[..take])
+    }
+}
+
+#[test]
+fn collected_streams_preserve_responses_and_read_failures() {
+    enum Expected {
+        Body(u16, &'static [u8]),
+        TooLarge,
+        Short,
+    }
+
+    let cases: &[(&[u8], usize, Expected)] = &[
+        (
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nX-Checked: yes\r\n\r\n2\r\nok\r\n0\r\n\r\n",
+            8,
+            Expected::Body(200, b"ok"),
+        ),
+        (
+            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 2\r\nX-Checked: yes\r\n\r\nno",
+            8,
+            Expected::Body(403, b"no"),
+        ),
+        (
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+            1,
+            Expected::TooLarge,
+        ),
+        (
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n",
+            1,
+            Expected::TooLarge,
+        ),
+        (
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nok",
+            8,
+            Expected::Short,
+        ),
+    ];
+    let data = b"selected record bytes spanning reader fragments";
+    for (answer, limit, expected) in cases {
+        for streamed in [false, true] {
+            let answer = answer.to_vec();
+            let (endpoint, received) = one_connection(move |mut stream| {
+                let head = read_head(&mut stream);
+                let mut body = vec![0; declared(&head)];
+                stream.read_exact(&mut body).unwrap();
+                let _ = stream.write_all(&answer);
+                body
+            });
+            let http = client();
+            let request = http.post(&endpoint).limit(*limit);
+            let result = if streamed {
+                let mut reader = InterruptedFragments {
+                    remaining: data,
+                    interrupt: true,
+                };
+                request.send_body(Body::Reader {
+                    len: data.len() as u64,
+                    reader: &mut reader,
+                })
+            } else {
+                request.send(data)
+            };
+            assert_eq!(received.recv_timeout(HANG_DETECTOR).unwrap(), data);
+            match expected {
+                Expected::Body(status, body) => {
+                    let response = result.unwrap();
+                    assert_eq!(response.status(), *status);
+                    assert_eq!(response.header("x-checked"), Some("yes"));
+                    assert_eq!(response.body(), *body);
+                }
+                Expected::TooLarge => assert!(
+                    matches!(result, Err(Error::TooLarge { limit: 1 })),
+                    "streamed={streamed}: {result:?}"
+                ),
+                Expected::Short => assert!(
+                    matches!(result, Err(Error::Io(ref error)) if error.kind() == ErrorKind::UnexpectedEof),
+                    "streamed={streamed}: {result:?}"
+                ),
+            }
+        }
+    }
 }
 
 #[test]
@@ -304,6 +404,174 @@ fn a_body_past_the_limit_is_too_large_inside_the_io_error() {
             "{error:?}"
         );
     }
+}
+
+#[test]
+fn a_successful_consumer_finishes_the_http_body_before_returning() {
+    let endpoint = answering(
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nX-Seen: yes\r\n\r\n2\r\nok\r\n4\r\ntail\r\n0\r\nX-Trailer: done\r\n\r\n".to_vec(),
+    );
+    let exchange = client()
+        .get(&endpoint)
+        .exchange_with_env(Body::Empty, &NoEnv)
+        .unwrap();
+    assert_eq!(exchange.status(), 200);
+    assert_eq!(exchange.header("x-seen"), Some("yes"));
+    let prefix = exchange
+        .consume_body(|body| {
+            let mut prefix = [0; 2];
+            body.read_exact(&mut prefix)?;
+            Ok(prefix)
+        })
+        .expect("the tail and trailers complete the response");
+    assert_eq!(&prefix, b"ok");
+}
+
+#[test]
+fn a_successful_consumer_cannot_hide_a_late_body_failure() {
+    enum Failure {
+        Short,
+        Protocol,
+        TooLarge,
+    }
+    let cases: &[(&[u8], usize, Failure)] = &[
+        (b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nok", 8, Failure::Short),
+        (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\nzz\r\n", 8, Failure::Protocol),
+        (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nokXX\r\n", 8, Failure::Protocol),
+        (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\nX-Trailer: incomplete", 8, Failure::Short),
+        (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n4\r\ntail\r\n0\r\n\r\n", 4, Failure::TooLarge),
+        (b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\noktail", 4, Failure::TooLarge),
+        (b"HTTP/1.1 200 OK\r\n\r\noktail", 4, Failure::TooLarge),
+    ];
+    for (answer, limit, expected) in cases {
+        let endpoint = answering(answer.to_vec());
+        let exchange = client()
+            .get(&endpoint)
+            .limit(*limit)
+            .exchange_with_env(Body::Empty, &NoEnv)
+            .unwrap();
+        let mut consumed = false;
+        let failed = exchange
+            .consume_body(|_| {
+                consumed = true;
+                Ok("staged result")
+            })
+            .expect_err("the staged result cannot bypass HTTP completion");
+        assert!(consumed);
+        assert_eq!(failed.phase, Phase::Answered, "{failed:?}");
+        match expected {
+            Failure::Short => assert_eq!(io_error(&failed).kind(), ErrorKind::UnexpectedEof),
+            Failure::Protocol => assert!(matches!(failed.error, Error::Protocol(_)), "{failed:?}"),
+            Failure::TooLarge => assert!(
+                matches!(failed.error, Error::TooLarge { limit: n } if n == *limit),
+                "{failed:?}"
+            ),
+        }
+    }
+}
+
+#[test]
+fn an_empty_consumer_read_does_not_finish_a_close_delimited_body() {
+    let endpoint = answering(b"HTTP/1.1 200 OK\r\n\r\nover the limit".to_vec());
+    let failed = client()
+        .get(&endpoint)
+        .limit(2)
+        .exchange_with_env(Body::Empty, &NoEnv)
+        .unwrap()
+        .consume_body(|body| {
+            assert_eq!(body.read(&mut [])?, 0);
+            Ok(())
+        })
+        .expect_err("a zero-length read did not observe the real EOF");
+    assert_eq!(failed.phase, Phase::Answered);
+    assert!(matches!(failed.error, Error::TooLarge { limit: 2 }));
+}
+
+#[derive(Debug)]
+struct CompletionGuard(AtomicBool);
+
+impl aterm_http::Guard for CompletionGuard {
+    fn is_authorized(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+#[test]
+fn a_consumer_that_observed_completion_needs_no_further_socket_read() {
+    for answer in [
+        &b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"[..],
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\n\r\nok",
+    ] {
+        let guard = Arc::new(CompletionGuard(AtomicBool::new(true)));
+        let endpoint = answering(answer.to_vec());
+        let http = client();
+        let exchange = http
+            .get(&endpoint)
+            .guard(Arc::clone(&guard) as Arc<dyn aterm_http::Guard>)
+            .exchange_with_env(Body::Empty, &NoEnv)
+            .unwrap();
+        let bytes = exchange
+            .consume_body(|body| {
+                let mut bytes = Vec::new();
+                body.read_to_end(&mut bytes)?;
+                guard.0.store(false, Ordering::Release);
+                Ok(bytes)
+            })
+            .expect("completed framing needs no new authorized read");
+        assert_eq!(bytes, b"ok");
+    }
+}
+
+#[test]
+fn a_body_consumer_failure_preserves_its_type_and_answered_phase() {
+    for timeout in [false, true] {
+        let endpoint = answering(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec());
+        let failed = client()
+            .get(&endpoint)
+            .exchange_with_env(Body::Empty, &NoEnv)
+            .unwrap()
+            .consume_body::<()>(|_| {
+                Err(if timeout {
+                    io::Error::new(ErrorKind::TimedOut, "consumer timeout")
+                } else {
+                    io::Error::other(Error::TooLarge { limit: 3 })
+                })
+            })
+            .unwrap_err();
+        assert_eq!(failed.phase, Phase::Answered);
+        if timeout {
+            assert_eq!(io_error(&failed).kind(), ErrorKind::TimedOut);
+            assert_eq!(io_error(&failed).to_string(), "consumer timeout");
+        } else {
+            assert!(matches!(failed.error, Error::TooLarge { limit: 3 }));
+        }
+    }
+}
+
+#[test]
+fn a_timeout_draining_an_answered_body_keeps_its_phase() {
+    let (finish, hold) = mpsc::channel();
+    let (endpoint, stopped) = one_connection(move |mut stream| {
+        let _ = read_head(&mut stream);
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n")
+            .unwrap();
+        // The missing body deliberately exceeds the idle policy; this wait only
+        // keeps the socket alive until the client observes that policy failure.
+        hold.recv_timeout(HANG_DETECTOR).unwrap();
+    });
+    let result = client()
+        .get(&endpoint)
+        .idle(Duration::from_millis(200))
+        .exchange_with_env(Body::Empty, &NoEnv)
+        .expect("the server supplies the complete response head")
+        .consume_body(|_| Ok(()));
+    finish.send(()).unwrap();
+    stopped.recv_timeout(HANG_DETECTOR).unwrap();
+    let failed = result.expect_err("a successful consumer cannot hide the idle timeout");
+    assert_eq!(failed.phase, Phase::Answered);
+    assert_eq!(io_error(&failed).kind(), ErrorKind::TimedOut);
 }
 
 #[test]

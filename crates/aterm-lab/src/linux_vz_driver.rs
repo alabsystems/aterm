@@ -1665,7 +1665,7 @@ pub fn smoke_checks(up: &crate::linux::Up, repo: &str, scratch: &Path) -> Vec<Ch
         None,
     );
     let copied = g.copy_dir_out("/tmp/vz-smoke-dir", scratch);
-    let read = std::fs::read_to_string(scratch.join("vz-smoke-dir/a/b/c.txt"));
+    let read = crate::util::read_regular_text(&scratch.join("vz-smoke-dir/a/b/c.txt"));
     rows.push(check(
         "copy_dir_out lands the tree under its own name",
         t,

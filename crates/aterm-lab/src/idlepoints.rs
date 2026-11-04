@@ -390,7 +390,7 @@ pub fn cmd_idle_points(args: &[String]) -> Res {
             .ok_or_else(|| Fail::usage("idle-points cast: name the program".to_string()))?
             .reader();
         for p in &paths {
-            let text = std::fs::read_to_string(p)
+            let text = crate::util::read_regular_text(p)
                 .map_err(|e| Fail::die(format!("{}: {e}", p.display())))?;
             let c = halfdraw::parse_cast(&text)
                 .map_err(|e| Fail::die(format!("{}: {e}", p.display())))?;
@@ -408,7 +408,8 @@ pub fn cmd_idle_points(args: &[String]) -> Res {
     let reader = program.map(Program::reader);
     let (mut total, mut bare, mut nameless) = (0usize, 0usize, 0usize);
     for t in &tapes {
-        let bytes = std::fs::read(t).map_err(|e| Fail::die(format!("{}: {e}", t.display())))?;
+        let bytes = crate::util::read_regular_file(t)
+            .map_err(|e| Fail::die(format!("{}: {e}", t.display())))?;
         let tape = match show::open(&bytes, true) {
             Ok(tape) => tape,
             Err(e) => {
@@ -687,7 +688,7 @@ fn tape_subject(drive: &Path, sid: &str) -> Option<String> {
     }
     tapes.sort();
     tapes.iter().find_map(|p| {
-        let tape = show::open(&std::fs::read(p).ok()?, true).ok()?;
+        let tape = show::open(&crate::util::read_regular_file(p).ok()?, true).ok()?;
         subject_named(&show::skim(&tape))
     })
 }
@@ -773,7 +774,7 @@ fn gate_dir(dir: &Path) -> Result<(String, usize), Fail> {
         )
     };
     let read = |p: &Path| {
-        std::fs::read_to_string(p).map_err(|e| Fail::die(format!("{}: {e}", p.display())))
+        crate::util::read_regular_text(p).map_err(|e| Fail::die(format!("{}: {e}", p.display())))
     };
     let mut tabs = Vec::new();
     let mut rd: Vec<PathBuf> = std::fs::read_dir(&drive)

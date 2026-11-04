@@ -67,11 +67,15 @@ src/lib.rs	empty_slice_cast	try-cast-slice-classify	cast-slice-refines-try, cast
 src/lib.rs	zeroed_returns_all_zero_bits	zeroed-is-all-zero-bits	bytes-of-view
 ```
 
-## 3. Tests with no row
+## 3. Coverage
 
-None. All 7 `#[test]` functions in `src/lib.rs` map to one of the 6 specs above.
+- All 7 `#[test]` functions in `src/lib.rs` map to one of the 6 specs in §1.
 
-## 4. Open findings and resolved notes
+## 4. Tests that are not spec samples
+
+None.
+
+## 5. Implied specs that look wrong, or disagree with the code
 
 1. *(Partially resolved)* **`SizeMismatch`'s doc names the ZST mismatch**; its `Display` text
    (`"input slice is smaller than one output value"`) is kept unchanged while `panic_cast_failed!`
@@ -90,7 +94,7 @@ None. All 7 `#[test]` functions in `src/lib.rs` map to one of the 6 specs above.
 6. **Cleanup on retirement:** delete the `panic_message` helper (`catch_unwind` + downcast)
    together with `exact_panic_message_matches_display` once `cast-slice-refines-try` is proved.
 
-## 5. Proof order (easiest high-value first)
+## 6. Proof order (easiest high-value first)
 
 No spec is blocked by gap 0 alone. Each needs gap 1 (slice/enum/`&str` carriers) and most need
 gap 11 (generics).

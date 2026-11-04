@@ -174,7 +174,8 @@ pub(crate) fn fact_title(facts: &FooterFacts, cwd: Option<&Path>, fact: Fact) ->
                 );
             }
             let mut parts: Vec<std::borrow::Cow<'_, str>> = Vec::new();
-            let glance = facts.glance.as_ref();
+            let glance_view = facts.glance_view();
+            let glance = glance_view.as_deref();
             if let Some(sub) = facts.subscription.as_ref() {
                 if let Some(email) = sub.email.as_deref() {
                     parts.push(email.into());
@@ -396,9 +397,9 @@ pub(crate) fn fact_spoken_of(
             }
             let words = parts.join(", ");
             // The outlook's sentences follow the week's own words (§2.5).
-            let more = facts
-                .glance
-                .as_ref()
+            let glance = facts.glance_view();
+            let more = glance
+                .as_deref()
                 .and_then(|g| g.spoken.as_deref())
                 .map_or_else(String::new, |more| {
                     format!(". {}", more.trim_end_matches('.'))

@@ -114,7 +114,7 @@ impl World {
                         .into(),
                 )
             }
-            7 => raw.rows[0].class = Class::Shared,
+            7 => raw.rows[0].class = Class::Pool,
             8 => raw.rows[0].browser = Some("Profile 2".into()),
             9 => {
                 if self.cli == Cli::Kimi {

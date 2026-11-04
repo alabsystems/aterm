@@ -345,7 +345,7 @@ its child marker, not libtest entries.
 | test | why | action |
 |---|---|---|
 | src/actuator.rs::enforcement_proof_network_deny_blocks_loopback_connect | Live Seatbelt check of `deny network*`, with a control. Binds `sbpl-profile-denotation`. | **keep as conformance** |
-| src/actuator.rs::enforcement_proof_file_read_deny_yields_operation_not_permitted | Runs a hand-written profile through the test-only `sandbox_wrap`; tests Seatbelt itself, not anything aterm generates. | **keep as conformance** (platform) |
+| src/actuator.rs::enforcement_proof_file_read_deny_yields_operation_not_permitted | Runs a hand-written profile through `sandbox_wrap` (over `sbpl::build_sandbox_wrap`); tests Seatbelt itself, not anything aterm generates. | **keep as conformance** (platform) |
 | src/actuator.rs::shell_compat_full_containment_profile_keeps_a_normal_shell_working | Live check that the generated profile does not break `/bin/sh` (over-breadth). | **keep as conformance** |
 | src/actuator.rs::secret_deny_full_containment_profile_blocks_secret_but_allows_nonsecret | Live secret-deny check against a scratch `$HOME/.aws`. | **keep as conformance** |
 | src/actuator.rs::enforcement_proof_containment_confines_writes | Live write-confinement check over a scratch `$HOME` and user cache; profile content is `write-confinement`. | **keep as conformance** |
@@ -377,9 +377,9 @@ Totals: keep as conformance 24, move-to-bench 2.
 3. *(Resolved: the mislabelled `MonotonicCapabilities` over-time claim in `src/lib.rs` was removed.)*
 4. *(Resolved: `classify_responsible` now guards `Ok(pid) if pid > 0 && pid == self_pid`, so non-positive
    pids always map to `Unknown` regardless of `self_pid`.)*
-5. **The enforcement tests bind a copy of the wrap.** `sandbox_wrap` is a test-only copy that "mirrors the wrap
-   done in aterm-pty::spawn_shell", so the conformance tests bind a duplicate of the production wrap, and the
-   two can drift. The kept conformance tests should call the production wrap.
+5. *(Resolved: both `aterm-pty::spawn_shell_with_pid_cell_px` and `src/actuator.rs::sandbox_wrap` call the single
+   production `aterm_containment::sbpl::build_sandbox_wrap` argv builder, so the Seatbelt conformance tests bind
+   the production wrap directly.)*
 6. *(Resolved: `secret_deny_full_containment_profile_blocks_secret_but_allows_nonsecret` and
    `enforcement_proof_containment_confines_writes` now run over `scratch_home_outside_writable_roots`, and
    `sbpl::private_data_is_gated_on_the_fs_capability_not_network` runs over `profile_for_scoped` with a

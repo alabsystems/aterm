@@ -1209,7 +1209,7 @@ fn link_act(
                 |old: &Path| old.parent().is_some_and(|d| d.ends_with("Contents/MacOS"));
             let ours = in_release_bundle(&old)
                 || (name == "atpkg" && in_a_bundle(&old))
-                || (name == "amacs" && in_a_bundle(&old) && aterm_settled);
+                || (matches!(name, "amacs" | "agh") && in_a_bundle(&old) && aterm_settled);
             (ours && old != target).then_some(Some(old))
         }
         Ok(_) => None,
@@ -2608,6 +2608,11 @@ mod tests {
             fs::canonicalize(bin.join("amacs")).unwrap(),
             release.join("aterm")
         );
+        assert_eq!(
+            target("agh"),
+            Some(release.join("agh")),
+            "GitHub's client is on PATH outside a tab"
+        );
 
         ensure_command_links_from(&home, &dev.join("aterm"));
         assert_eq!(target("amacs"), Some(release.join("amacs")));
@@ -2618,12 +2623,23 @@ mod tests {
         };
         aim("aterm", &dev.join("aterm"));
         aim("amacs", &dev.join("amacs"));
+        aim("agh", &dev.join("agh"));
         ensure_command_links_from(&home, &release.join("aterm"));
         assert_eq!(target("aterm"), Some(dev.join("aterm")));
         assert_eq!(target("amacs"), Some(dev.join("amacs")));
+        assert_eq!(
+            target("agh"),
+            Some(dev.join("agh")),
+            "agh stays while aterm is aimed away"
+        );
         aim("aterm", &release.join("aterm"));
         ensure_command_links_from(&home, &release.join("aterm"));
         assert_eq!(target("amacs"), Some(release.join("amacs")));
+        assert_eq!(
+            target("agh"),
+            Some(release.join("agh")),
+            "agh follows aterm back"
+        );
         let own = root.join("src/amacs/target/debug/amacs");
         aim("amacs", &own);
         ensure_command_links_from(&home, &release.join("aterm"));

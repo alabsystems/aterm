@@ -479,7 +479,7 @@ pub const WEB2: &str = r"C:\usr\share\dict\web2";
 /// ([`provision_plan`]).
 #[must_use]
 pub fn provision_steps() -> Vec<Step> {
-    let web2 = std::fs::read(crate::linux_guest::WEB2).ok();
+    let web2 = crate::util::read_regular_file(std::path::Path::new(crate::linux_guest::WEB2)).ok();
     provision_plan(web2.as_deref().map(crate::linux_vz::sha256_hex).as_deref())
 }
 

@@ -16,12 +16,15 @@
 //! - `flush` (the Commons owner's `alab-journal` thread, `super::upkeep`): the spool into the
 //!   outbox, the window's tables into the heard archive and the relays, one record when due.
 //! - `heard`: this Mac's archive of every batch it read from the ring, 120 days or 64 MiB.
+//! - [`place`]: what this Mac holds that no preference of its own names (the harness's
+//!   [`place::Holding`]s), written as `place` rows; and the reader of every Mac's live rows.
 //!
 //! The ring's collections are compiled ATT/1 schemas ([`EV`], [`USE`], [`SUM`], [`RELAY`],
 //! [`PLACE`]); every row lives at its writer's own Commons machine uuid and is inert at any
 //! other key (`typed::owned`).
 
 pub mod event;
+pub mod place;
 pub mod spool;
 
 pub(crate) mod book;
@@ -143,7 +146,8 @@ crate::att_collection!(
 crate::att_collection!(
     /// This Mac's automatic use of an account (design §4.17 `place`, revision 2):
     /// `<account pk>.<uuid32>`, at most 512 B, with no seat: the key names the account and the
-    /// Mac. A future allocator writes these; no code writes one yet.
+    /// Mac. The flusher writes one for each account the harness holds a row of that no preference
+    /// here names ([`place`]); `until` is when it lapses unless restated.
     pub PLACE = Collection {
         name: "place",
         version: 1,

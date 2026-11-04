@@ -9678,15 +9678,54 @@ fn a_look_alike_of_the_chrome_intro_is_not_pressed_by_its_rule() {
             }
         }
     }
+    // The reader's guards, each on the intro's own reading: another program's (which an earlier
+    // guard hands to a person before the intro's arm), a phase that is no prompt, and a reading
+    // the reader does not vouch for are a person's.
     let rows = phase_fixtures::screen(phase_fixtures::CHROME_INTRO);
-    if let Some(d) = decide_screen(Some("codex"), &rows, &full()) {
-        assert!(approved(&d).is_none(), "{d:?}");
+    let read = aterm_phase::read(Some("claude"), &rows, None);
+    assert_eq!(
+        approved(&decide(&read, &rows, &full())),
+        Some(RULE_CHROME_INTRO),
+        "CONTROL: the intro's own reading is confirmed"
+    );
+    for program in [
+        aterm_phase::Program::Codex,
+        aterm_phase::Program::Grok,
+        aterm_phase::Program::Kimi,
+        aterm_phase::Program::Agy,
+        aterm_phase::Program::Muse,
+        aterm_phase::Program::Generic,
+    ] {
+        let reading = aterm_phase::Reading {
+            program,
+            ..read.clone()
+        };
+        let d = decide(&reading, &rows, &full());
+        assert!(
+            matches!(d, Decision::Escalate { .. }),
+            "{program:?}'s reading is a person's: {d:?}"
+        );
     }
-    let reading = aterm_phase::Reading {
-        phase_authoritative: false,
-        ..aterm_phase::read(Some("claude"), &rows, None)
-    };
-    assert!(reason(&decide(&reading, &rows, &full())).contains("reader vouches for"));
+    for (what, reading) in [
+        (
+            "a phase that is no prompt",
+            aterm_phase::Reading {
+                phase: aterm_phase::Phase::Idle,
+                ..read.clone()
+            },
+        ),
+        (
+            "a reading the reader does not vouch for",
+            aterm_phase::Reading {
+                phase_authoritative: false,
+                ..read.clone()
+            },
+        ),
+    ] {
+        let d = decide(&reading, &rows, &full());
+        assert_eq!(approved(&d), None, "{what}: {d:?}");
+        assert!(reason(&d).contains("reader vouches for"), "{what}: {d:?}");
+    }
 }
 
 #[test]

@@ -3271,10 +3271,11 @@ pub fn render(h: &Header, runs: &[Run], state: State) -> (String, i32) {
 
 fn drain<R: std::io::Read + Send + 'static>(r: Option<R>) -> mpsc::Receiver<String> {
     let (tx, rx) = mpsc::channel();
-    if let Some(mut r) = r {
+    if let Some(r) = r {
         std::thread::spawn(move || {
+            use std::io::Read as _;
             let mut bytes = Vec::new();
-            let _ = r.read_to_end(&mut bytes);
+            let _ = r.take(64 * 1024 * 1024).read_to_end(&mut bytes);
             let _ = tx.send(String::from_utf8_lossy(&bytes).into_owned());
         });
     }

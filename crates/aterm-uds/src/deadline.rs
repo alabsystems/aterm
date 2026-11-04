@@ -492,6 +492,38 @@ pub fn output_until_from(
     )
 }
 
+/// [`output_until_from`] that also ends `cmd` once `stopped()` reads true: read at least every
+/// [`STOP_TICK`] while it runs, and then the child and its group killed and it reaped, as at
+/// `deadline`. Either end answers [`RunError::TimedOut`]; the caller tells its stop from its
+/// deadline by its own reading.
+///
+/// # Errors
+/// Returns the same errors as [`output_until`].
+pub fn output_until_from_unless(
+    cmd: &mut Command,
+    stdin: Stdio,
+    deadline: Instant,
+    stopped: &mut dyn FnMut() -> bool,
+) -> Result<Output, RunError> {
+    output_by(
+        cmd,
+        stdin,
+        &mut || {
+            if stopped() {
+                Duration::ZERO
+            } else {
+                deadline
+                    .saturating_duration_since(deadline_now())
+                    .min(STOP_TICK)
+            }
+        },
+        &mut end,
+    )
+}
+
+/// How often [`output_until_from_unless`] reads its stop while the child runs.
+pub const STOP_TICK: Duration = Duration::from_millis(100);
+
 #[cfg(test)]
 thread_local! {
     /// The clock a test reads this thread's deadlines on, in place of the real one.
@@ -1503,6 +1535,50 @@ mod tests {
         assert!(
             dead,
             "the child's descendant {grandchild} outlived the call"
+        );
+    }
+
+    /// A stop ends the child long before its deadline, killed and reaped with its descendants,
+    /// as a deadline would: the stop reads true once the shell has written both pids, so both
+    /// are checked on every run. Negative control: an `output_until_from_unless` that never
+    /// reads its stop runs to the hang detector's deadline and fails the `waited` check.
+    #[cfg(unix)]
+    #[test]
+    fn a_stop_ends_the_child_and_its_group_before_the_deadline() {
+        let dir = scratch("stopped");
+        let pid_file = dir.join("pid");
+        let grandchild_file = dir.join("grandchild");
+        let mut cmd = sh(
+            "sleep 600 & echo $! > \"$1\"; echo $$ > \"$0\"; exec sleep 600",
+            &[&pid_file, &grandchild_file],
+        );
+        let began = Instant::now();
+        let both = [pid_file.clone(), grandchild_file.clone()];
+        let mut stopped = || both.iter().all(|file| pid_in(file).is_some());
+        let result = super::output_until_from_unless(
+            &mut cmd,
+            crate::spawnfd::Stdio::null(),
+            began + HANG,
+            &mut stopped,
+        );
+        let waited = began.elapsed();
+        let child = pid_in(&pid_file);
+        let grandchild = pid_in(&grandchild_file);
+        let _ = std::fs::remove_dir_all(&dir);
+        let (Some(child), Some(grandchild)) = (child, grandchild) else {
+            panic!("the shell wrote no pids: {child:?} {grandchild:?}");
+        };
+        assert!(matches!(result, Err(RunError::TimedOut)), "{result:?}");
+        assert!(waited < HANG, "the stop did not end the call: {waited:?}");
+        assert!(
+            !crate::process::pid_alive(child),
+            "pid {child} outlived the stop"
+        );
+        let dead = gone(grandchild);
+        kill_stray((!dead).then_some(grandchild));
+        assert!(
+            dead,
+            "the child's descendant {grandchild} outlived the stop"
         );
     }
 

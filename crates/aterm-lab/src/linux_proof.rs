@@ -803,13 +803,8 @@ fn copy_frame(image: &str, to: &Path, copy: impl FnOnce(&str, &Path) -> Out) -> 
     if !copied.ok() {
         return Err(format!("{source} not copied out: {}", copied.tail(3)));
     }
-    let metadata = std::fs::symlink_metadata(to)
-        .map_err(|error| format!("{} was not retained: {error}", to.display()))?;
-    if !metadata.is_file() {
-        return Err(format!("{} is not a regular frame file", to.display()));
-    }
-    let bytes =
-        std::fs::read(to).map_err(|error| format!("{} cannot be read: {error}", to.display()))?;
+    let bytes = crate::util::read_artifact(to)
+        .map_err(|error| format!("{} cannot be read: {error}", to.display()))?;
     aterm_png::decode_rgba8(&bytes, 8192)
         .ok_or_else(|| format!("{}: not a PNG this lab decodes", to.display()))?;
     Ok(())
@@ -1279,7 +1274,7 @@ impl Gui<'_> {
         if !copied.ok() {
             return Err(format!("{guest_png} not copied out: {}", copied.tail(2)));
         }
-        let presented = std::fs::read(&png)
+        let presented = crate::util::read_artifact(&png)
             .ok()
             .and_then(|b| aterm_png::decode_rgba8(&b, 8192))
             .ok_or_else(|| format!("{}: not a PNG this lab decodes", png.display()))?;
@@ -1287,7 +1282,7 @@ impl Gui<'_> {
         match display {
             Display::Xvfb | Display::Xwayland => {
                 let ppm = self.x_grab(display, results, suffix)?;
-                let server = std::fs::read(&ppm)
+                let server = crate::util::read_artifact(&ppm)
                     .ok()
                     .and_then(|b| parse_ppm(&b))
                     .ok_or_else(|| format!("{}: not a PPM this lab reads", ppm.display()))?;
@@ -1368,7 +1363,7 @@ impl Gui<'_> {
                     (num("offset_x").unwrap_or(0), num("offset_y").unwrap_or(0))
                 };
                 let shot = self.weston_shot(display, results, suffix)?;
-                let output = std::fs::read(&shot)
+                let output = crate::util::read_artifact(&shot)
                     .ok()
                     .and_then(|b| aterm_png::decode_rgba8(&b, 8192))
                     .ok_or_else(|| format!("{}: not a PNG this lab decodes", shot.display()))?;
@@ -1398,7 +1393,7 @@ impl Gui<'_> {
             }
             Display::Mutter => {
                 let shot = self.mutter_cast(results, suffix)?;
-                let output = std::fs::read(&shot)
+                let output = crate::util::read_artifact(&shot)
                     .ok()
                     .and_then(|b| aterm_png::decode_rgba8(&b, 8192))
                     .ok_or_else(|| format!("{}: not a PNG this lab decodes", shot.display()))?;

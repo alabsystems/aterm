@@ -2107,6 +2107,9 @@ fn allowlist(file: &str) -> Vec<String> {
                     "crate::aos_gpu_bench::clean_commit",
                     "crate::trail_gallery::checkouts",
                     "crate::trail_gallery::resolve_out",
+                    // The bounded regular-file reads that stand for `std::fs::read` (064dc5a189).
+                    "crate::util::read_regular_file",
+                    "crate::util::read_regular_text",
                     // Reviewed in stage D: the child's footprint self-report (G4).
                     "crate::sys::max_footprint",
                 ]

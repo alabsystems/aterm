@@ -311,11 +311,16 @@ it as privileged:
 - The one network door is the fleet listener (`[fleet] listen`, set by `aterm
   fleet init` and `join`). It accepts loopback, private and link-local IPv4
   addresses only, admits peers that prove the shared fleet secret, and answers
-  reads at the `[fleet] allow` level (`facts` by default, or `content`), never
-  as the owner. Driving needs
+  reads at the configured `[fleet] allow` level, never as the owner. Driving needs
   `allow = "drive"` and a grant (`aterm fleet allow drive --from <node>` or
-  `--all`) bound to each peer's node key, so the secret (`<state>/fleet.key`)
-  alone drives nothing, and a local Take Over always wins (`aterm help fleet`).
+  `--all`) checked against each peer's node key. A local Take Over always wins
+  (`aterm help fleet`).
+- On the trusted ALab LAN, setup automatically joins the vault, materializes
+  available shared credentials and syncs fleet membership. A synced join enables
+  drive access from every member by default. Being on this LAN is the admission
+  authority; no per-machine approval is required. Members can read and drive one
+  another's sessions. Explicit sharing Off and lower access choices remain in
+  force, and macOS permissions remain separate OS decisions.
 - Capture paths are confined to server-managed runtime directories.
 - Browser automation never adds Chromium's `--no-sandbox` flag. On Linux, run
   it as an unprivileged user so Chromium can keep its sandbox enabled.

@@ -1337,15 +1337,13 @@ fn pool_for_with(
                     })
                     .or_else(|| bound.rows.first());
                 let first_in_class = |pred: &dyn Fn(&accounts::Row) -> bool| {
-                    [Class::Dedicated, Class::Shared]
-                        .into_iter()
-                        .find_map(|cls| {
-                            bound
-                                .rows
-                                .iter()
-                                .filter(|r| executable(r) && r.class == cls)
-                                .find(|r| pred(r))
-                        })
+                    [Class::Preferred, Class::Pool].into_iter().find_map(|cls| {
+                        bound
+                            .rows
+                            .iter()
+                            .filter(|r| executable(r) && r.class == cls)
+                            .find(|r| pred(r))
+                    })
                 };
                 active
                     .filter(|r| {
@@ -1524,7 +1522,7 @@ fn pool_for_with(
         let signed_out = matches!(cond, Condition::SignedOut | Condition::NotEnrolled);
         if out.limited_until.is_some() || signed_out {
             // Rotation off takes no row but the pin, so no other row's sign-in serves a launch.
-            out.next_sign_in = [Class::Dedicated, Class::Shared]
+            out.next_sign_in = [Class::Preferred, Class::Pool]
                 .into_iter()
                 .filter(|_| !default_only && mode != Mode::Off)
                 .find_map(|cls| {

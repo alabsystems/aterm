@@ -55,7 +55,7 @@ fn tapes_under(dir: &Path) -> io::Result<Vec<PathBuf>> {
 }
 
 fn ended(path: &Path) -> bool {
-    std::fs::read(path)
+    crate::util::read_regular_file(path)
         .ok()
         .and_then(|raw| show::open(&raw, false).ok())
         .is_some_and(|tape| tape.items.iter().any(|i| matches!(i, Item::End(_))))
@@ -128,8 +128,8 @@ pub struct Cost {
 pub fn summary(dir: &Path) -> Result<Cost, String> {
     let mut cost = Cost::default();
     for path in tapes_under(dir).map_err(|e| format!("incomplete tape inventory: {e}"))? {
-        let raw =
-            std::fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let raw = crate::util::read_regular_file(&path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         cost.tapes += 1;
         cost.bytes += raw.len() as u64;
         match show::open(&raw, true) {
@@ -162,7 +162,7 @@ pub fn replay_all(dir: &Path) -> Vec<(PathBuf, Result<report::Verdict, String>)>
     tapes
         .into_iter()
         .map(|path| {
-            let verdict = std::fs::read(&path)
+            let verdict = crate::util::read_regular_file(&path)
                 .map_err(|e| format!("cannot read it: {e}"))
                 .and_then(|raw| replay::replay(&raw, &replay::Options::default()))
                 .map(|r| r.verdict);
@@ -316,7 +316,8 @@ pub(crate) fn summary_refusal(source: &Path) -> Result<(), String> {
     if !source.is_dir() || !path.exists() {
         return Ok(());
     }
-    let raw = std::fs::read(&path).map_err(|e| format!("{} does not read: {e}", path.display()))?;
+    let raw = crate::util::read_regular_file(&path)
+        .map_err(|e| format!("{} does not read: {e}", path.display()))?;
     let summary =
         J::parse_bytes(&raw).map_err(|e| format!("{} does not read: {e}", path.display()))?;
     if summary
@@ -355,7 +356,7 @@ fn lost(old: &Census, new: &Census) -> Vec<&'static str> {
 }
 
 fn held(path: &Path) -> Option<Census> {
-    let raw = std::fs::read(path).ok()?;
+    let raw = crate::util::read_regular_file(path).ok()?;
     Some(
         show::open(&raw, false)
             .map(|tape| corpus::census(&tape))
@@ -373,7 +374,8 @@ fn promote_into(
 ) -> Result<(PathBuf, corpus::Promoted, Option<Census>), String> {
     summary_refusal(source)?;
     let tape = the_tape(source)?;
-    let bytes = std::fs::read(&tape).map_err(|e| format!("cannot read {}: {e}", tape.display()))?;
+    let bytes = crate::util::read_regular_file(&tape)
+        .map_err(|e| format!("cannot read {}: {e}", tape.display()))?;
     let (scrub, home) = machine_scrub()?;
     let kept = corpus::promote(&bytes, &scrub, Some(&home))
         .map_err(|e| format!("{} is not promoted: {e}", tape.display()))?;
@@ -490,7 +492,7 @@ pub fn cmd_lint(args: &[String]) -> Res {
     let (scrub, home) = machine_scrub().map_err(Fail::die)?;
     let mut flagged = 0;
     for path in &tapes {
-        let problems = std::fs::read(path)
+        let problems = crate::util::read_regular_file(path)
             .map_err(|e| e.to_string())
             .and_then(|bytes| show::open(&bytes, false))
             .map(|tape| {

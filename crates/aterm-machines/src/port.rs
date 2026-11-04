@@ -36,7 +36,7 @@ pub use github_rest::RestMethod;
 pub use scratch::Scratch;
 pub use secret::{SECRET_MAX, Secret, no_core_dumps};
 pub use staged_child::{START_BYTE, START_LIMIT, StagedChild};
-pub use stops::name as stop_name;
+pub use stops::{name as stop_name, say_on_stop};
 
 /// Default deadline for a single tool run.
 pub const DEFAULT_BUDGET: Duration = Duration::from_secs(60);
@@ -454,6 +454,27 @@ pub trait ServiceRestartHold {}
 
 impl ServiceRestartHold for aterm_update_core::FileLock {}
 
+/// [`System::clt_mark`]'s default: no record, every read, write and lock refused.
+struct NoCltMark;
+
+impl aterm_types::clt_mark::Files for NoCltMark {
+    fn read(&self, _path: &Path, _max: usize) -> io::Result<Option<String>> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
+    fn write(&self, _path: &Path, _text: &str) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
+    fn remove(&self, _path: &Path) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
+    fn lock(&self, _path: &Path) -> io::Result<aterm_types::clt_mark::Held> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+}
+
 /// The operating system, as items see it.
 pub trait System: Sync {
     /// Read one GitHub API endpoint through `agh` as `user` with the admitted development
@@ -663,6 +684,15 @@ pub trait System: Sync {
         Err(io::ErrorKind::Unsupported.into())
     }
 
+    /// The file I/O of this account's record of aterm's own Command Line Tools ask
+    /// ([`aterm_types::clt_mark`]), which System State's window reads and writes through the same
+    /// code: this Mac's ([`aterm_types::clt_mark::Live`]) on the live system, a test double's own
+    /// files in its world. This default, a double's that keeps no such record, refuses every read,
+    /// write and lock, which holds the ask as a record naming every build does.
+    fn clt_mark(&self) -> &dyn aterm_types::clt_mark::Files {
+        &NoCltMark
+    }
+
     /// Write `bytes` to `path` atomically with `mode`, without following symlinks.
     fn write_file(&self, path: &Path, bytes: &[u8], mode: u32) -> io::Result<()>;
 
@@ -700,15 +730,6 @@ pub trait System: Sync {
 
     /// Return `lstat(path)` metadata without following symlinks.
     fn stat(&self, path: &Path) -> io::Result<Stat>;
-
-    /// When the file at `path` last changed, in Unix seconds: its status change time (`st_ctime`)
-    /// as `lstat` reports it, so no link is followed. Every write, truncation and `touch` moves
-    /// it, and no call sets it back. `None` where it cannot be read (no such file, and this
-    /// default).
-    fn changed(&self, path: &Path) -> Option<u64> {
-        let _ = path;
-        None
-    }
 
     /// List entry names in directory `path`.
     fn list_dir(&self, path: &Path) -> io::Result<Vec<String>>;
@@ -1630,6 +1651,10 @@ impl System for Live {
         Ok(bytes)
     }
 
+    fn clt_mark(&self) -> &dyn aterm_types::clt_mark::Files {
+        &aterm_types::clt_mark::Live
+    }
+
     /// Opened by [`aterm_uds::nofollow::open_reader`] (`O_NOFOLLOW_ANY | O_NONBLOCK`, then
     /// `fstat`), so a link on `path` answers `ELOOP` and a FIFO is refused without waiting for a
     /// writer; `Unsupported` off macOS.
@@ -1748,11 +1773,6 @@ impl System for Live {
             symlink: m.file_type().is_symlink(),
             len: m.len(),
         })
-    }
-
-    fn changed(&self, path: &Path) -> Option<u64> {
-        use std::os::unix::fs::MetadataExt as _;
-        u64::try_from(std::fs::symlink_metadata(path).ok()?.ctime()).ok()
     }
 
     fn list_dir(&self, path: &Path) -> io::Result<Vec<String>> {
@@ -2261,10 +2281,6 @@ mod fake {
         alive: Mutex<Vec<u32>>,
         /// Each pid's start second ([`Fake::born`]).
         born: Mutex<BTreeMap<u32, u64>>,
-        /// Each file's last change second ([`System::changed`]): set by [`Fake::changed_at`], by
-        /// [`System::write_file`] and [`System::create_new`] at [`Fake::now`], dropped by
-        /// [`System::remove`]; a file seeded otherwise has none, unread.
-        changed: Mutex<BTreeMap<PathBuf, u64>>,
         /// The effective uid the fake reports (0 = root, the agent's case).
         pub euid: u32,
         /// The clock.
@@ -2370,6 +2386,7 @@ mod fake {
     enum Output {
         File(PathBuf, Vec<u8>),
         Stat(PathBuf, Stat),
+        Running(Vec<String>),
     }
 
     struct Journaled<'a>(&'a Fake);
@@ -2597,6 +2614,20 @@ mod fake {
                 .entry(key.to_owned())
                 .or_default()
                 .push(Output::Stat(path.to_owned(), stat));
+            self
+        }
+
+        /// The processes running once `key` ran, as [`Fake::running`] lists them: a program
+        /// that started (or ended) while the scripted tool ran.
+        pub fn on_running(&self, key: &str, exes: &[&str]) -> &Self {
+            self.outputs
+                .lock()
+                .unwrap()
+                .entry(key.to_owned())
+                .or_default()
+                .push(Output::Running(
+                    exes.iter().map(|exe| (*exe).to_owned()).collect(),
+                ));
             self
         }
 
@@ -2964,6 +2995,9 @@ mod fake {
                     Output::Stat(path, stat) => {
                         self.stats.lock().unwrap().insert(path, stat);
                     }
+                    Output::Running(exes) => {
+                        self.running(&exes.iter().map(String::as_str).collect::<Vec<_>>());
+                    }
                 }
             }
         }
@@ -3006,15 +3040,6 @@ mod fake {
             self
         }
 
-        /// Record that the file at `path` last changed at `unix` seconds ([`System::changed`]).
-        pub fn changed_at(&self, path: &str, unix: u64) -> &Self {
-            self.changed
-                .lock()
-                .unwrap()
-                .insert(PathBuf::from(path), unix);
-            self
-        }
-
         /// Set the awake clock [`System::awake_ms`] reads to `ms`.
         pub fn awake_at(&self, ms: u64) -> &Self {
             *self.awake.lock().unwrap() = Some(ms);
@@ -3031,7 +3056,45 @@ mod fake {
         }
     }
 
+    /// The record of aterm's own Command Line Tools ask in this world's files
+    /// ([`System::clt_mark`]): its writes and removals are this world's, and so its calls.
+    impl aterm_types::clt_mark::Files for Fake {
+        fn read(&self, path: &Path, max: usize) -> io::Result<Option<String>> {
+            if self.links.lock().unwrap().contains_key(path) {
+                return Err(io::ErrorKind::InvalidData.into());
+            }
+            let bytes = match System::read_file(self, path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            if bytes.len() > max {
+                return Err(io::ErrorKind::InvalidData.into());
+            }
+            String::from_utf8(bytes)
+                .map(Some)
+                .map_err(|_| io::ErrorKind::InvalidData.into())
+        }
+
+        fn write(&self, path: &Path, text: &str) -> io::Result<()> {
+            System::write_file(self, path, text.as_bytes(), 0o600)
+        }
+
+        fn remove(&self, path: &Path) -> io::Result<()> {
+            System::remove(self, path)
+        }
+
+        /// One world, whose record changes one call at a time: the hold is its own.
+        fn lock(&self, _path: &Path) -> io::Result<aterm_types::clt_mark::Held> {
+            Ok(aterm_types::clt_mark::Held::new(()))
+        }
+    }
+
     impl System for Fake {
+        fn clt_mark(&self) -> &dyn aterm_types::clt_mark::Files {
+            self
+        }
+
         fn github_api(
             &self,
             user: &User,
@@ -3376,10 +3439,6 @@ mod fake {
                 .lock()
                 .unwrap()
                 .insert(path.to_path_buf(), (bytes.to_vec(), mode));
-            self.changed
-                .lock()
-                .unwrap()
-                .insert(path.to_path_buf(), self.now);
             Ok(())
         }
 
@@ -3446,7 +3505,6 @@ mod fake {
             self.files.lock().unwrap().remove(path);
             self.links.lock().unwrap().remove(path);
             self.stats.lock().unwrap().remove(path);
-            self.changed.lock().unwrap().remove(path);
             Ok(())
         }
 
@@ -3539,10 +3597,6 @@ mod fake {
                     len: b.len() as u64,
                 })
                 .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
-        }
-
-        fn changed(&self, path: &Path) -> Option<u64> {
-            self.changed.lock().unwrap().get(path).copied()
         }
 
         fn list_dir(&self, path: &Path) -> io::Result<Vec<String>> {
@@ -3688,10 +3742,6 @@ mod fake {
                 .unwrap()
                 .push(format!("create {} {mode:o}", path.display()));
             files.insert(path.to_path_buf(), (bytes.to_vec(), mode));
-            self.changed
-                .lock()
-                .unwrap()
-                .insert(path.to_path_buf(), self.now);
             Ok(())
         }
 

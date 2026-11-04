@@ -373,6 +373,13 @@ pub fn twin_binary(twin_text: &str) -> Option<std::path::PathBuf> {
         .then(|| std::path::PathBuf::from(path))
 }
 
+/// Returns the baked catalog of `binary` without consulting or writing a cache directory.
+#[must_use]
+pub(super) fn scan_baked(binary: &Path) -> Option<Baked> {
+    std::fs::metadata(binary).ok()?;
+    scan_build(binary).baked
+}
+
 /// Returns the baked catalog of `binary`, cached under `cache_dir` by path, size, and mtime.
 #[must_use]
 pub fn baked_cached(binary: &Path, cache_dir: &Path) -> Option<Baked> {
@@ -384,17 +391,34 @@ pub fn baked_cached(binary: &Path, cache_dir: &Path) -> Option<Baked> {
         .map_or(0, |d| d.as_secs());
     let key = format!("{}|{}|{mtime}", binary.display(), m.len());
     let h = aterm_hash::fnv1a_64(key.as_bytes());
+    if let Some(parent) = cache_dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+        if parent.file_name().is_some_and(|n| n == "upgrade")
+            && let Some(state) = parent.parent().filter(|p| !p.as_os_str().is_empty())
+            && super::upgrade_drive::check_owned_plain_dir_existing(state).is_err()
+        {
+            return None;
+        }
+        if super::upgrade_drive::check_owned_plain_dir_existing(parent).is_err() {
+            return None;
+        }
+    }
+    let existing = match super::upgrade_drive::check_owned_plain_dir_existing(cache_dir) {
+        Ok(existing) => existing,
+        Err(_) => return None,
+    };
     let file = cache_dir.join(format!("{h:016x}.json"));
-    if let Some(facts) = super::accounts::read_bounded(&file, 1024 * 1024)
-        .ok()
-        .flatten()
-        .and_then(|t| parse_facts(&t))
+    if existing
+        && let Some(facts) = super::accounts::read_bounded(&file, 1024 * 1024)
+            .ok()
+            .flatten()
+            .and_then(|t| parse_facts(&t))
     {
         return facts.baked;
     }
     let facts = scan_build(binary);
-    let _ = std::fs::create_dir_all(cache_dir);
-    let _ = super::upgrade_models::write_atomic_ordered(&file, &render_facts(&facts));
+    if existing || super::upgrade_drive::ensure_owned_plain_dir(cache_dir).is_ok() {
+        let _ = super::upgrade_models::write_atomic_ordered(&file, &render_facts(&facts));
+    }
     facts.baked
 }
 

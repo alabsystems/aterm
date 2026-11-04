@@ -302,7 +302,7 @@ fn stopping(signalled: &AtomicBool, line: &RefCell<OnWake>) -> bool {
 
 /// Called first by the executable: only the guardian's early arm forks, before threads.
 /// Normal publication commands return None and retain their existing entry.
-#[must_use]
+#[must_use = "return a handled guardian command's exit status to the caller"]
 pub fn early_entry() -> Option<ExitCode> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     let verb = args.first()?.to_str()?;

@@ -190,7 +190,7 @@ fn start_s(pid: i32) -> Option<i64> {
 }
 
 fn read(path: &Path) -> Result<Option<Record>, String> {
-    match std::fs::read_to_string(path) {
+    match crate::util::read_regular_text(path) {
         Ok(text) => Record::parse(&text)
             .map(Some)
             .ok_or_else(|| format!("{} is not a meta-keys record", path.display())),

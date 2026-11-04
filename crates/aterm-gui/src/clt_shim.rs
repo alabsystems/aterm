@@ -45,11 +45,17 @@ pub(crate) struct Shim {
 }
 
 impl Default for Shim {
-    /// A shim laid nowhere (a test's, or a headless one's that needs none).
+    /// A shim laid nowhere (a test's, or a headless one's that needs none). A test's reads the
+    /// tools missing, as no test reads this Mac's; one that needs them there says so
+    /// ([`Self::at`]).
     fn default() -> Self {
         Self {
             dir: None,
-            present: aterm_types::clt_shim::developer_git,
+            present: if cfg!(test) {
+                (|| false) as fn() -> bool
+            } else {
+                aterm_types::clt_shim::developer_git
+            },
             exe: None,
         }
     }
@@ -97,7 +103,13 @@ impl Shim {
 
     /// Whether a directory is kept here and the tools are missing now.
     pub(crate) fn tools_missing(&self) -> bool {
-        self.dir.is_some() && !(self.present)()
+        self.dir.is_some() && !self.tools_present()
+    }
+
+    /// Whether the tools are installed now, as this shim reads them (a stat and a readlink), laid
+    /// or not.
+    pub(crate) fn tools_present(&self) -> bool {
+        (self.present)()
     }
 
     /// While the tools are missing, lay the directory and mark it wanted, with its installing mark

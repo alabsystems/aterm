@@ -1181,7 +1181,7 @@ fn reload(workspace: &mut EditorWorkspace, buffer: &mut Buffer) -> Result<(), St
 }
 
 /// The terminal face over `/dev/tty`, to its exit status.
-#[must_use]
+#[must_use = "handle or propagate the editor's exit status"]
 pub fn run_tui(
     write: WriteCap,
     targets: &[Target],

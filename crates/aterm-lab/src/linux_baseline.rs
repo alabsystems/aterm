@@ -2509,7 +2509,8 @@ impl Session<'_> {
         if !copied.ok() {
             return Err(format!("{guest_path} not copied out: {}", copied.tail(2)));
         }
-        let bytes = std::fs::read(&to).map_err(|e| format!("{}: {e}", to.display()))?;
+        let bytes =
+            crate::util::read_regular_file(&to).map_err(|e| format!("{}: {e}", to.display()))?;
         aterm_png::decode_rgba8(&bytes, 8192)
             .map(|(rgba, w, h)| Frame { rgba, w, h })
             .ok_or_else(|| format!("{}: not a PNG this lab decodes", to.display()))
@@ -4487,7 +4488,7 @@ impl Baseline {
             secs: t0.elapsed().as_secs_f64(),
             detail,
         };
-        let lock = std::fs::read_to_string(Path::new(&repo).join("Cargo.lock"))
+        let lock = crate::util::read_regular_text(&Path::new(&repo).join("Cargo.lock"))
             .map_err(|e| not_run(format!("{repo}/Cargo.lock: {e}")))?;
         let _ = up.sh(&guest::a11y_address());
         let enabled = accessibility(up, true);
@@ -4601,7 +4602,7 @@ impl Baseline {
         let _ = std::fs::write(self.results.join(&file), &fresh);
         let secs = started.elapsed().as_secs_f64();
         let target = self.committed.join(&file);
-        let old = std::fs::read_to_string(&target)
+        let old = crate::util::read_regular_text(&target)
             .ok()
             .map(|t| Recording::parse(&t));
         let row = |verdict, detail| proof::Row {

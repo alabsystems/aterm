@@ -526,6 +526,7 @@ fn fx_window_in(
                 ("system-state", None, None) => NativeTabRestore::SystemState,
                 ("about", None, None) => NativeTabRestore::About,
                 ("mail", None, None) => NativeTabRestore::Mail,
+                ("allocation", None, None) => NativeTabRestore::Allocation,
                 other => panic!("a native tab this generator does not spell: {other:?}"),
             };
             if descriptor.joins_mirror(&native_tabs) {
@@ -4439,6 +4440,18 @@ fn fx_variants_desk() -> FxDesk {
         RestoredSplitTree::Leaf { view: RestoredView::Native(native) } if native.restore_tag == "mail"
     ));
     tabs.push(mail);
+    app.stage_allocation_tab(crate::WindowId(0))
+        .expect("the native Allocation tab opens");
+    let allocation = app.capture_handoff_layout().windows[0]
+        .restored_tabs
+        .pop()
+        .expect("the opened Allocation tab is captured");
+    assert!(matches!(
+        &allocation.root,
+        RestoredSplitTree::Leaf { view: RestoredView::Native(native) }
+            if native.restore_tag == "allocation"
+    ));
+    tabs.push(allocation);
     FxDesk {
         name: "variants",
         nonce_seed: 0x0100_0019,

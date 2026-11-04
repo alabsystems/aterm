@@ -349,7 +349,7 @@ impl Follow {
             return Vec::new();
         }
         let mut bytes = Vec::new();
-        if f.read_to_end(&mut bytes).is_err() {
+        if f.take(16 * 1024 * 1024).read_to_end(&mut bytes).is_err() {
             return Vec::new();
         }
         self.offset += u64::try_from(bytes.len()).unwrap_or(u64::MAX);

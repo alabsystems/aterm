@@ -1964,6 +1964,15 @@ pub(super) mod tests {
             Probe::NotApplicable { why } => assert!(why.contains("on this machine yet"), "{why}"),
             other => panic!("{other:?}"),
         }
+        // So does an init.toml `[github]` account's step, whose token file is not there yet
+        // (with the distribution's git there, so the step reaches the token).
+        linux.file(crate::items::github::SYSTEM_GIT, b"synthetic git");
+        match item(&bare.user, None, false).probe(&linux, &context) {
+            Probe::Person { how, .. } => {
+                assert!(how.contains("is not on this machine yet"), "{how}");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     /// The default set is the account's own repositories that are neither forks nor archived;

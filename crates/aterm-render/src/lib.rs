@@ -8994,8 +8994,8 @@ impl Renderer {
         else {
             return;
         };
-        for slot in 0..3 {
-            if self.styled_faces[slot].is_some() {
+        for (slot, styled_face) in self.styled_faces.iter_mut().enumerate() {
+            if styled_face.is_some() {
                 continue;
             }
             let target = FaceTarget::for_slot(slot);
@@ -9015,7 +9015,7 @@ impl Renderer {
             if let Some((_, i)) = best
                 && face_admissible(bytes, i)
             {
-                self.styled_faces[slot] = Some(StyledFace {
+                *styled_face = Some(StyledFace {
                     font: LazyFontdue::deferred(),
                     bytes: bytes.clone(),
                     index: i,
@@ -16039,7 +16039,7 @@ pub fn cursor_cutout_cols(plan: &[ColumnGlyph], cc: usize) -> (usize, usize) {
         lo -= 1;
     }
     let mut hi = cc;
-    while hi.checked_add(1).is_some_and(&ligated) {
+    while hi.checked_add(1).is_some_and(ligated) {
         hi += 1;
     }
     (lo, hi)

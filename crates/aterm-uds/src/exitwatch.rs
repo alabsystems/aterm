@@ -362,6 +362,19 @@ mod moment_tests {
             .expect("spawn");
         let pid = child.id();
         let watch = ExitMoment::watch(pid, stamp);
+        let watch_error = std::io::Error::last_os_error();
+        if watch.is_none()
+            && cfg!(target_os = "linux")
+            && watch_error.raw_os_error() == Some(38)
+            && let Some(translator) = crate::process::translator()
+        {
+            child.kill().expect("kill the unwatchable child");
+            child.wait().expect("reap the unwatchable child");
+            println!(
+                "NOT RUN under {translator}: exitwatch::moment_tests::the_moment_is_stamped_when_the_kernel_reports_the_exit: pidfd_open returned ENOSYS"
+            );
+            return;
+        }
         if !cfg!(any(target_vendor = "apple", target_os = "linux")) {
             assert!(watch.is_none(), "no primitive: no watch");
             let _ = child.kill();

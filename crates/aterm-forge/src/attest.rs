@@ -1079,8 +1079,8 @@ fn ob1_patch_vendor_agreement(
                 let _ = writeln!(
                     log,
                     "  ✗ FAIL [OB-1] `{rel}` is a FIRST-PARTY vendored path dependency on the \
-                     roster, but NO workspace member under crates/ carries a `path = …` that \
-                     resolves inside it — so it is exactly the dead weight this obligation \
+                     roster, but NO consumer under crates/ has a direct or workspace-inherited \
+                     path dependency that resolves inside it — so it is exactly the dead weight this obligation \
                      refuses, first-party or not. Add the edge back, or delete the directory \
                      and its roster row."
                 );

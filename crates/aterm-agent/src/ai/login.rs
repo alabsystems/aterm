@@ -512,7 +512,9 @@ pub fn pool_sign_in(
 /// pool has nothing to run ([`pool_target`]), accounts v2's sign-in of Claude Code has nothing
 /// to run ([`claude_mend`]: a home other than the default one, a refused accounts.toml,
 /// unreadable records, or this machine's own login listed with no email), or the CLI's own
-/// login would sign a working login out first. `None` where a person's run at a terminal would
+/// login would sign a working login out first, or one aterm cannot see ([`State::Unproven`]: a
+/// credential store it does not inspect, say), when the refusal says so and names the CLI's own
+/// login for the person who knows. `None` where a person's run at a terminal would
 /// start something; the run may still refuse for what only it knows (an agent's marker, SSH with
 /// no sign-in kept off this desk).
 #[must_use]
@@ -551,6 +553,19 @@ pub fn refusal(f: &Facts, row: &Row) -> Option<String> {
     match c.login {
         Login::Run {
             signs_out_first: true,
+            args,
+            ..
+        } if !pooled_default && matches!(row.state, State::Unproven) => Some(format!(
+            "aterm cannot see whether {} is signed in ({}); its own login signs any current \
+             login out (revokes it) before it starts, so aterm does not start it: `{} {}` at a \
+             terminal signs it in",
+            c.product,
+            row.fact,
+            c.id,
+            args.join(" ")
+        )),
+        Login::Run {
+            signs_out_first: true,
             ..
         } if !pooled_default && !matches!(row.state, State::SignedOut) => Some(format!(
             "{} is signed in; its own login signs that login out (revokes it) before it starts",
@@ -559,6 +574,17 @@ pub fn refusal(f: &Facts, row: &Row) -> Option<String> {
         Login::Accounts => claude_mend(f).map(|m| m.refusal()),
         Login::Run { .. } => None,
     }
+}
+
+/// Whether a sign-in of `f`'s CLI that signs out first has a login to revoke: one is stored in
+/// the home the sign-in runs in, or the doctor cannot see (a credential store it does not read,
+/// or a home it cannot place), so the person is told it is revoked.
+fn revokes_a_stored_login(f: &Facts) -> bool {
+    f.hidden_store
+        || match &f.home {
+            Ok(home) => super::connector::stored_login_file(f.connector, home).is_some(),
+            Err(_) => true,
+        }
 }
 
 /// Signs `row`'s CLI in: Claude Code through accounts v2, a CLI with a roster through its pool
@@ -605,15 +631,15 @@ pub fn sign_in(h: &Host<'_>, f: &Facts, row: &Row, out: &mut dyn Write) -> Done 
             .map(|(label, store)| (label, store, cli, pool.roster.as_path())),
         _ => None,
     };
-    let (args, remote, tell, after) = match &c.login {
+    let (args, remote, tell, signs_out_first, after) = match &c.login {
         Login::Accounts => return claude(h, f, out),
         Login::Run {
             args,
             remote,
             tell,
+            signs_out_first,
             after,
-            ..
-        } => (args, remote, tell, after),
+        } => (args, remote, tell, *signs_out_first, after),
     };
     if let Some(marker) = agent_marker(h.var) {
         return Done::Refused(format!(
@@ -681,7 +707,16 @@ pub fn sign_in(h: &Host<'_>, f: &Facts, row: &Row, out: &mut dyn Write) -> Done 
             "the default account changed, requires shared authority, or could not be read; no sign-in was run".into(),
         );
     }
-    let _ = writeln!(out, "{}: {tell}", c.product);
+    if signs_out_first && revokes_a_stored_login(f) {
+        let _ = writeln!(
+            out,
+            "{}: {tell} {}",
+            c.product,
+            super::connector::SIGNS_OUT_FIRST
+        );
+    } else {
+        let _ = writeln!(out, "{}: {tell}", c.product);
+    }
     let _ = out.flush();
     if !storage_current() {
         return Done::Refused(

@@ -1129,26 +1129,6 @@ fn a_failed_lane_clone_leaves_no_directory_it_made() {
     assert!(kept.is_dir());
 }
 
-/// A temporary asset a cut clobber left with other bytes (`{name}.agh-{8 hex}`) is deleted by
-/// the next clobber of that name, as `RestHost` drops its staged copy: the release ends holding
-/// the file alone, so the mirror finds no extra asset.
-#[test]
-fn a_clobber_drops_a_cut_clobbers_temporary_of_other_bytes() {
-    let w = AghWorld::new();
-    w.lay("v1", true, &[("a.toml.agh-00000000", b"old manifest")]);
-    let bytes: &[u8] = b"new manifest";
-    w.host()
-        .upload(
-            &slug(),
-            "v1",
-            &[file(w.dir(), "a.toml", bytes)],
-            Replace::Clobber,
-        )
-        .expect("the clobber");
-    assert_eq!(w.read("v1"), vec![held(true, &[("a.toml", bytes)])]);
-    assert_eq!(w.fake.violations(), Vec::<String>::new());
-}
-
 /// During the swap both hosts write the same staging releases, so a clobber drops the other
 /// host's leftover too: a cut `RestHost` replace's `{name}.atpkg-staged` beside a cut agh
 /// clobber's `{name}.agh-{8 hex}`. The release ends holding the file alone, so the mirror

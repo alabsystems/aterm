@@ -123,9 +123,7 @@ pub fn write(state: &Path, tab: &str, stamp: &Stamp) -> std::io::Result<()> {
     let path = path(state, tab).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "a tab key names a file")
     })?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
+    let _ = super::upgrade_drive::ensure_upgrade_tree(state, None)?;
     let tmp = unique(&path, "tmp");
     let mut open = std::fs::OpenOptions::new();
     open.write(true).create_new(true);
@@ -147,6 +145,7 @@ pub fn write(state: &Path, tab: &str, stamp: &Stamp) -> std::io::Result<()> {
 /// Tab `tab`'s stamp, if one stands.
 #[must_use]
 pub fn read(state: &Path, tab: &str) -> Option<Stamp> {
+    let _ = super::upgrade_drive::check_upgrade_tree(state, None).ok()??;
     Stamp::from_json(&super::accounts::read_bounded(&path(state, tab)?, 64 * 1024).ok()??)
 }
 
@@ -158,6 +157,7 @@ pub fn standing(state: &Path, tab: &str, pid: u32, start: &str, now: u64) -> Opt
 
 /// Take tab `tab`'s stamp when `ours` says it is the one meant.
 pub fn take_if(state: &Path, tab: &str, ours: impl FnOnce(&Stamp) -> bool) -> Option<Stamp> {
+    let _ = super::upgrade_drive::check_upgrade_tree(state, None).ok()??;
     let path = path(state, tab)?;
     let judged = read(state, tab).filter(ours)?;
     let taken = unique(&path, "taken");

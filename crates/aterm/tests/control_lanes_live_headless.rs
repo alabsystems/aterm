@@ -76,7 +76,7 @@ impl Drop for World {
     }
 }
 
-struct Reaped(Child, Option<aterm_uds::lifeline::Lifeline>);
+struct Reaped(Child, Option<launch_isolation::Lifeline>);
 
 impl Drop for Reaped {
     fn drop(&mut self) {
@@ -143,6 +143,7 @@ fn boot(root: &Path, sock: &Path, soft_limit: u64) -> (Reaped, u64) {
     let mut ready = aterm_agent::ready::Ready::open(root)
         .unwrap_or_else(|e| panic!("arm the ready signal in {}: {e}", root.display()));
     ready.hand(&mut cmd);
+    let _boot = aterm_spec::subprocess_lane::acquire_boot_permit();
     let mut child = match cmd.spawn() {
         Ok(child) => Reaped(child, Some(lifeline)),
         Err(e) => could_not_run(format!("cannot launch aterm --headless ({e})")),

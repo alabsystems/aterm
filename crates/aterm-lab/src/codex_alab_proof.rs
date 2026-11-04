@@ -72,8 +72,9 @@ pub fn package(given: Option<&str>, home: &str) -> Result<PathBuf, String> {
         })
         .ok_or_else(|| format!("{why} ({}) is in no Codex package", real.display()))?
         .to_path_buf();
-    let text = std::fs::read_to_string(root.join(aterm_agent::harness::codex_alab::PACKAGE_JSON))
-        .unwrap_or_default();
+    let text =
+        crate::util::read_regular_text(&root.join(aterm_agent::harness::codex_alab::PACKAGE_JSON))
+            .unwrap_or_default();
     aterm_agent::harness::codex_alab::package_entrypoint(&text)
         .ok_or_else(|| format!("{} holds no layout-1 package manifest", root.display()))?;
     if !root
@@ -1016,11 +1017,12 @@ impl Proof {
 
     fn record(leg: &Leg, pid: i32) -> Option<J> {
         let path = leg.home.join(format!("alab/sessions/{pid}.json"));
-        J::parse(&std::fs::read_to_string(path).ok()?).ok()
+        J::parse(&crate::util::read_regular_text(&path).ok()?).ok()
     }
 
     fn aterm_log(&self) -> String {
-        let bytes = std::fs::read(self.h.join("Library/Logs/aterm/aterm.log")).unwrap_or_default();
+        let bytes = crate::util::read_regular_file(&self.h.join("Library/Logs/aterm/aterm.log"))
+            .unwrap_or_default();
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
@@ -1195,8 +1197,9 @@ impl Proof {
 
     /// The package's version (`alab-build.json`'s), for the captures' headers.
     pub(crate) fn package_version(&self) -> String {
-        std::fs::read_to_string(
-            self.s
+        crate::util::read_regular_text(
+            &self
+                .s
                 .join("pkg-a")
                 .join(aterm_agent::harness::codex_alab::ALAB_BUILD_JSON),
         )
@@ -1759,7 +1762,7 @@ impl Proof {
             "approval: the escalated exec is approved once (approve-all@v1)",
             acts.iter().filter(|a| *a == "approve-all@v1").count() == 1,
         );
-        let ran = std::fs::read_to_string(leg.proj.join("ran.txt")).unwrap_or_default();
+        let ran = crate::util::read_regular_text(&leg.proj.join("ran.txt")).unwrap_or_default();
         self.check(
             "approval: the approved command ran (ran.txt) and its output went back to the model",
             ran.contains("approved-run") && ran_back,
@@ -1847,7 +1850,7 @@ impl Proof {
                 && said(&row, "needs") == "-"
                 && said(&row, "needs_by") == "-"
         })?;
-        let ran = std::fs::read_to_string(leg.proj.join("ran.txt")).unwrap_or_default();
+        let ran = crate::util::read_regular_text(&leg.proj.join("ran.txt")).unwrap_or_default();
         self.check(
             &format!(
                 "{name}: answered (`send y`, codex's Yes, proceed: {}), the box and the need it \
@@ -1898,7 +1901,7 @@ impl Proof {
     fn rollout_build(leg: &Leg) -> Option<String> {
         let rollouts = aterm_agent::harness::codex_rollout::rollouts_by_write(&leg.home);
         let (path, _) = rollouts.last()?;
-        let text = std::fs::read_to_string(path).ok()?;
+        let text = crate::util::read_regular_text(path).ok()?;
         let meta = J::parse(text.lines().next()?).ok()?;
         meta.get("payload")?
             .get("cli_version")?
@@ -2717,7 +2720,7 @@ impl Proof {
     }
 
     fn codex_log(leg: &Leg) -> String {
-        std::fs::read_to_string(journal_path(&leg.home)).unwrap_or_default()
+        crate::util::read_regular_text(&journal_path(&leg.home)).unwrap_or_default()
     }
 
     fn upgrade_ledger(&self) -> Vec<J> {
@@ -3680,10 +3683,11 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
         .map(|given| package(Some(given), home))
         .transpose()
         .map_err(not_run)?;
-    let build =
-        std::fs::read_to_string(pkg.join(aterm_agent::harness::codex_alab::ALAB_BUILD_JSON))
-            .ok()
-            .and_then(|t| J::parse(&t).ok());
+    let build = crate::util::read_regular_text(
+        &pkg.join(aterm_agent::harness::codex_alab::ALAB_BUILD_JSON),
+    )
+    .ok()
+    .and_then(|t| J::parse(&t).ok());
     let said = |k: &str| {
         build
             .as_ref()

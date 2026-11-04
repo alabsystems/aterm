@@ -31,7 +31,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use aterm_aos::{ArtifactId, ArtifactKind, Digest};
@@ -54,27 +54,10 @@ const SIX: &str = "\
 010003000000000000000000
 ";
 
-/// At most a third as many runs at once as this host has cores (two on an 8-core host, four on
-/// a 14-core one), never fewer than one: each run is four processes judging, about two cores'
-/// worth.
+/// Take one slot from the shared subprocess pool (`aterm_spec::subprocess_lane`): each run
+/// spawns four judging processes, so multi-worker searches share the stage's subprocess budget.
 fn slot() -> impl Drop {
-    struct Slot;
-    static GATE: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
-    impl Drop for Slot {
-        fn drop(&mut self) {
-            let mut n = GATE.0.lock().unwrap_or_else(|p| p.into_inner());
-            *n -= 1;
-            GATE.1.notify_one();
-        }
-    }
-    let cap =
-        (std::thread::available_parallelism().map_or(2, std::num::NonZeroUsize::get) / 3).max(1);
-    let mut n = GATE.0.lock().unwrap_or_else(|p| p.into_inner());
-    while *n >= cap {
-        n = GATE.1.wait(n).unwrap_or_else(|p| p.into_inner());
-    }
-    *n += 1;
-    Slot
+    aterm_spec::subprocess_lane::acquire()
 }
 
 /// One finished run.

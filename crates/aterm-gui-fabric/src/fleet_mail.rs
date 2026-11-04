@@ -1964,6 +1964,50 @@ mod tests {
     }
 
     #[test]
+    fn a_storage_endpoint_alone_does_not_admit_mailbox_io() {
+        // This adapter exposes a valid endpoint but makes no ownership declaration.
+        struct Endpoint<'a>(&'a Session);
+        impl FabricSession for Endpoint<'_> {
+            fn self_id(&self) -> &SessionId {
+                self.0.self_id()
+            }
+            fn fabric(&self) -> &SessionFabric {
+                self.0.fabric()
+            }
+            fn record_fact(&self, who: &'static str, fact: FabricFact<'_>) -> bool {
+                self.0.record_fact(who, fact)
+            }
+            fn fabric_changed(&self) {
+                self.0.fabric_changed();
+            }
+            fn holder_token(&self) -> Option<String> {
+                self.0.holder_token()
+            }
+            fn fleet_mail_path(&self) -> Option<std::path::PathBuf> {
+                self.0.fleet_mail_path()
+            }
+        }
+
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let path = scratch.path().join("private/s-aaaaaaaa.toml");
+        let before = legacy_mailbox(&path);
+        let owner = session(&path);
+        let endpoint = Endpoint(&owner);
+        assert!(!restore(&endpoint));
+        let posted = as_node("b", || post(&endpoint, "key=unowned kind=ask -- unowned"));
+        assert!(posted.starts_with("ERR "), "{posted}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!path.parent().unwrap().join(KEY).exists());
+        assert!(owner.fabric.lock().direct_mail.rows.is_empty());
+        assert!(owner.facts.lock().unwrap().is_empty());
+        assert_eq!(owner.wakes.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        // The same endpoint is usable once its actual owner declares readiness.
+        assert!(restore(&owner));
+        assert!(std::fs::read(&path).unwrap().starts_with(SEALED));
+    }
+
+    #[test]
     fn migration_waits_for_committed_ownership_before_reading_or_writing() {
         use std::sync::atomic::Ordering;
         let scratch = aterm_tempfile::tempdir().unwrap();

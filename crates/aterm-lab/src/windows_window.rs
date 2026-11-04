@@ -414,6 +414,22 @@ pub(crate) fn press_to(
     Ok(())
 }
 
+pub(crate) fn move_tablet(l: &Layout, d: &Display, point: (i32, i32)) -> Result<(), String> {
+    let r = d.primary.rect;
+    if !r.holds(point) {
+        return Err("tablet target is outside the primary monitor".into());
+    }
+    qmp(
+        l,
+        desk::tablet_move(point.0 - r.l, point.1 - r.t, r.width(), r.height()),
+    )
+}
+
+/// Press only after the caller observed actual Win32 cursor ownership and button-up.
+pub(crate) fn tablet_down(l: &Layout) -> Result<(), String> {
+    qmp(l, desk::tablet_button(true))
+}
+
 /// Release the tablet's left button where it is.
 pub(crate) fn release(l: &Layout) -> Result<(), String> {
     qmp(l, desk::tablet_button(false))?;
@@ -522,9 +538,6 @@ impl<'a> Session<'a> {
             &dir,
             &config,
         ];
-        if owned {
-            words.push("--no-reroute");
-        }
         if cpu {
             words.push("--cpu");
         }
@@ -594,6 +607,24 @@ impl<'a> Session<'a> {
 
     /// `aterm-ctl` to this instance.
     fn ask(&self, words: &[&str], ok: bool) -> Result<String, String> {
+        self.ask_observed(words, ok, |_, _| Ok(()))
+    }
+
+    /// Retain the actual command exit and complete output before validating its reply.
+    pub(crate) fn ctl_observed(
+        &self,
+        words: &[&str],
+        record: impl FnOnce(Option<i32>, &str) -> Result<(), String>,
+    ) -> Result<String, String> {
+        self.ask_observed(words, true, record)
+    }
+
+    fn ask_observed(
+        &self,
+        words: &[&str],
+        ok: bool,
+        record: impl FnOnce(Option<i32>, &str) -> Result<(), String>,
+    ) -> Result<String, String> {
         let quoted: Vec<String> = words.iter().map(|w| guest::cmd_quote(w)).collect();
         let out = self.up.ssh.run(&format!(
             "{}\\aterm-ctl.exe --sock {}\\aterm.sock --timeout 90 {}",
@@ -601,8 +632,9 @@ impl<'a> Session<'a> {
             self.dir,
             quoted.join(" ")
         ));
+        record(out.code, &out.text)?;
         let r = reply(&out.text).to_string();
-        if out.ok() && (!ok || r.starts_with("OK")) {
+        if out.ok() && (!ok || valid_control_reply(words, &r)) {
             Ok(r)
         } else {
             Err(format!(
@@ -639,6 +671,17 @@ impl<'a> Session<'a> {
             .ssh
             .run(&format!("type {}\\stderr.log", self.dir))
             .text
+    }
+
+    /// The retained image identity used by owned-window operations.
+    pub(crate) fn owned_identity(&self) -> Result<(&str, &str), String> {
+        if !self.owned {
+            return Err("operation requires an owned instance".into());
+        }
+        self.identity
+            .as_ref()
+            .map(|(birth, image)| (birth.as_str(), image.as_str()))
+            .ok_or_else(|| "owned image identity unavailable".into())
     }
 
     /// Its exit status, once the helper wrote it.
@@ -1017,11 +1060,11 @@ impl Run<'_> {
                 return Err(format!("{from} not copied out: {}", got.tail(2)));
             }
         }
-        let presented = std::fs::read(&png)
+        let presented = crate::util::read_artifact(&png)
             .ok()
             .and_then(|b| aterm_png::decode_rgba8(&b, 8192))
             .ok_or_else(|| format!("{}: not a PNG this lab decodes", png.display()))?;
-        let window = std::fs::read(&ppm)
+        let window = crate::util::read_artifact(&ppm)
             .ok()
             .and_then(|b| parse_ppm(&b))
             .ok_or_else(|| format!("{}: not a PPM this lab reads", ppm.display()))?;
@@ -2614,5 +2657,58 @@ mod tests {
             b: 1200,
         };
         assert!(r.holds((1919, 1199)) && !r.holds((1920, 0)));
+    }
+}
+
+fn valid_control_reply(words: &[&str], response: &str) -> bool {
+    if words.first() == Some(&"inspect") {
+        let payload = words[1..].join(" ");
+        aterm_types::app_inspection::parse_inspect(&payload)
+            .and_then(|request| {
+                aterm_types::app_inspection::validate_inspection_response(response, request)
+            })
+            .is_ok()
+    } else {
+        response.starts_with("OK")
+    }
+}
+
+#[cfg(test)]
+mod control_reply_tests {
+    use super::valid_control_reply;
+    use aterm_types::app_inspection::{InspectionEnvelope, InspectionSubject};
+
+    #[test]
+    fn structured_inspection_does_not_relax_mutation_acknowledgements() {
+        let response = InspectionEnvelope {
+            revision: 3,
+            subject: InspectionSubject::Tabs,
+        }
+        .header_line();
+        assert!(valid_control_reply(
+            &["inspect", "app/v1", "tabs"],
+            &response
+        ));
+        assert!(!valid_control_reply(
+            &["inspect", "app/v1", "network"],
+            &response
+        ));
+        assert!(!valid_control_reply(&["inspect", "app/v1", "tabs"], "OK"));
+        assert!(!valid_control_reply(
+            &["inspect", "app/v1", "tabs"],
+            "ERR refused"
+        ));
+        assert!(!valid_control_reply(
+            &["open", "app", "settings", "/"],
+            &response
+        ));
+        assert!(!valid_control_reply(
+            &["open", "app", "settings", "/"],
+            "ERR refused"
+        ));
+        assert!(valid_control_reply(
+            &["open", "app", "settings", "/"],
+            "OK opened"
+        ));
     }
 }

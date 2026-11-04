@@ -443,8 +443,8 @@ pub fn cmd_mailbox_signin(args: &[String]) -> Res {
                 mbx_src.display()
             )));
         }
-        let raw =
-            std::fs::read(&mbx_src).map_err(|e| format!("read {}: {e}", mbx_src.display()))?;
+        let raw = crate::util::read_regular_file(&mbx_src)
+            .map_err(|e| format!("read {}: {e}", mbx_src.display()))?;
         let tmp_check = aterm_tempfile::tempdir().map_err(|e| e.to_string())?;
         // `sys::put` refuses a link in its path, as macOS's `/var` is.
         let tmp_root = std::fs::canonicalize(tmp_check.path()).map_err(|e| e.to_string())?;

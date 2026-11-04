@@ -460,6 +460,8 @@ fn tab_with(journal: &[(i64, &str)]) -> Tab {
                 .collect(),
             ..Seen::default()
         },
+        journal_cursor: crate::util::LineTailCursor::default(),
+        ledger_cursor: crate::util::LineTailCursor::default(),
         t0: 0,
         ask_tried: false,
         over: false,

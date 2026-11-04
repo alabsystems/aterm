@@ -401,3 +401,44 @@ fn the_at_rest_word_round_trips() {
     assert!(off.words().contains(" at_rest=off"), "{}", off.words());
     assert!(parse("out=/tmp/x at_rest=sealed").is_err());
 }
+
+/// D02's knob: both tallies in the messaging, attach, handoff and ask worlds, named only when it
+/// is on, so every entry without it keeps its words; refused on a run that measures only the
+/// ping-pong world, which counts with both tallies in every run.
+#[test]
+fn the_tally_is_named_only_when_on_and_reproduces() {
+    let bare = parse("out=/o").expect("bare");
+    assert!(
+        !bare.tally,
+        "off by default: the worlds boot as their baselines did"
+    );
+    assert!(!bare.words().contains("tally"), "{}", bare.words());
+    for (words, on) in [
+        ("tally=off", false),
+        ("tally=on", true),
+        ("scenario=attach attach=8,32 tally=on", true),
+        ("scenario=handoff tally=on", true),
+        ("scenario=messaging tally=on", true),
+        ("scenario=ask tally=on", true),
+        ("scenario=pingpong tally=off", false),
+    ] {
+        let spec = parse(&format!("out=/o {words}")).expect(words);
+        assert_eq!(spec.tally, on, "{words}");
+        assert_eq!(spec.words().contains(" tally=on"), on, "{words}");
+        assert!(!spec.words().contains("tally=off"), "{words}");
+        assert_eq!(
+            parse(&format!("out=/o {}", spec.words())).expect("round trip"),
+            spec,
+            "{words}"
+        );
+    }
+    for bad in [
+        "tally=yes",
+        "tally=",
+        "tally=1",
+        "scenario=pingpong tally=on",
+    ] {
+        let err = parse(&format!("out=/o {bad}")).expect_err(bad);
+        assert!(err.contains("tally="), "{bad}: {err}");
+    }
+}

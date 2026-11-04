@@ -3038,9 +3038,9 @@ pub(crate) mod owed_clone {
         );
     }
 
-    /// Every clone runs Apple's git, which aterm installs by itself (`base.clt`): a clone owed
-    /// while the Command Line Tools are missing waits for them as for the token, and is no
-    /// person's step; the pass after they arrive runs it.
+    /// Every clone runs Apple's git, which `base.clt` installs and this pass never does: a clone
+    /// owed while the Command Line Tools are missing waits for them as for the token, naming
+    /// the step that installs them; the pass after they arrive runs it.
     #[test]
     fn the_owed_clone_runs_once_the_command_line_tools_arrive() {
         let scratch = aterm_tempfile::tempdir().unwrap();
@@ -3071,7 +3071,8 @@ pub(crate) mod owed_clone {
             waiting
                 .why
                 .as_deref()
-                .is_some_and(|why| why.contains("Command Line Tools")),
+                .is_some_and(|why| why.contains("Command Line Tools")
+                    && why.contains("`aterm init --only base.clt`")),
             "{waiting:?}"
         );
         let asked = || {
@@ -3081,7 +3082,7 @@ pub(crate) mod owed_clone {
                 .count()
         };
         assert_eq!(asked(), 0, "no clone runs without git");
-        // The tools arrive (aterm's own install); the token and init.toml are as they were.
+        // The tools arrive (their install); the token and init.toml are as they were.
         sys.file(crate::items::github::CLT_GIT, b"synthetic git");
         let _second = converge(&ports, Trigger::Subscriber, Mode::Apply, &mut |_| {});
         assert!(

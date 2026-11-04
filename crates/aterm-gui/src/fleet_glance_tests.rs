@@ -1817,6 +1817,7 @@ fn the_glance_asks_the_lan_door_only_for_a_read_it_makes() {
     let (runs_tx, runs) = std::sync::mpsc::channel();
     let looks = Arc::new(AtomicUsize::new(0));
     let (posts_tx, _posts) = std::sync::mpsc::channel();
+    let (ticks_tx, ticks) = std::sync::mpsc::channel();
     let counted = Arc::clone(&looks);
     let _glance = spawn(
         Box::new(Nobody { runs: runs_tx }),
@@ -1826,13 +1827,25 @@ fn the_glance_asks_the_lan_door_only_for_a_read_it_makes() {
                 counted.fetch_add(1, Ordering::SeqCst);
                 true
             }),
+            book: Box::new(move || {
+                let _ = ticks_tx.send(());
+                BookFacts {
+                    in_fleet: true,
+                    minted: true,
+                    issuer_label: None,
+                    unbound_issuer: None,
+                }
+            }),
             ..seams(true, posts_tx)
         },
     )
     .expect("the thread starts");
     runs.recv_timeout(hang).expect("the first read");
-    // About 25 ticks within the read's quiet pause: none reads.
-    std::thread::sleep(Duration::from_millis(500));
+    while ticks.try_recv().is_ok() {}
+    // 25 ticks within the read's quiet pause: none reads.
+    for _ in 0..25 {
+        ticks.recv_timeout(hang).expect("the reader ticks again");
+    }
     let made = 1 + runs.try_iter().count();
     let asked = looks.load(Ordering::SeqCst);
     assert!(

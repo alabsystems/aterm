@@ -217,7 +217,7 @@ src/verdict.rs	findings_outrank_a_stop_and_a_stop_alone_could_not_run	report-exi
 tests/exit_codes.rs	no_oracle_could_not_run_and_a_stray_flag_is_usage	binary-exit-codes	cli-parse, run-precondition-could-not-run, report-exit-code-precedence
 ```
 
-## 3. Proof order
+## 3. Coverage
 
 - 63 live tests, and all 63 map to one of the 53 specs. 0 tests are not spec samples.
 - The specs are fine-grained, because each test here already names one property. The largest

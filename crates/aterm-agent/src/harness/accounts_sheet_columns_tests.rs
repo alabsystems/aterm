@@ -229,9 +229,9 @@ fn project(state: &State, cli: Cli, action: &str, source: &str) -> State {
             && fleet.roster.accounts[0].label == label
             && fleet.roster.accounts[0].class
                 == if action == "MultiMachine" {
-                    Class::Shared
+                    Class::Pool
                 } else {
-                    Class::Dedicated
+                    Class::Preferred
                 }
     });
     let mut next = state.clone();

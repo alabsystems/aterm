@@ -30,6 +30,11 @@ pub enum Found {
 /// The probe [`CommandLineTools`] reads.
 pub type ProbeClt = Box<dyn Fn(&dyn System) -> Found + Send + Sync>;
 
+/// The reader of the swarm `m<N>` label the vault's roster gave this Mac at admission
+/// ([`CommandLineTools::with_name`]), `None` before admission: read as the root half is about to
+/// run, so the label rides the one password wherever the roster gave it by then.
+pub type NameMac = Box<dyn Fn() -> Option<String> + Send + Sync>;
+
 /// Why the install the Command Line Tools tab runs did not finish
 /// ([`aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB`]): the plain words the tab ends on
 /// ([`Unfinished::reason`]) and, for what the root half finds, the exit code `aterm machines here
@@ -48,18 +53,24 @@ pub enum Unfinished {
     /// Apple's installer refused them: `softwareupdate -i` failed after its download, or exited
     /// 0 and installed nothing.
     Installer,
-    /// Another install of them runs: `softwareupdate`, `installer` or Apple's installer window
-    /// holds the placeholder (the window while it or the placeholder is younger than
-    /// [`aterm_types::macos_setup::APPLE_WINDOW_INSTALL_BOUND`]), or a live run of the root half
-    /// stamped it.
+    /// Another install of them runs: `softwareupdate` or `installer` holds the placeholder, or
+    /// a live run of the root half stamped it ([`crate::items::developer::Holder::Install`]).
     Busy,
     /// A stop ended the install before the tools arrived: a signal the tab's run caught (a
     /// person's Ctrl-C, at `sudo`'s password prompt or during the install), or the root half's
     /// own stop.
     Stopped,
-    /// Apple's own installer window, opened where the catalog lists none, did not install them
-    /// in time.
+    /// Apple's own installer window has not installed them: it was open when the run began,
+    /// with the placeholder beside it or not, which defers to it
+    /// ([`crate::items::developer::Holder::AppleWindow`]), or the root half's wait on it (the one
+    /// it opened where the catalog lists none, or the one already open) ran out with it still
+    /// open.
     AppleWindow,
+    /// Apple's own installer window, which the root half waited on, closed without installing
+    /// them, with no installer running: a person pressed Not Now or Cancel there or dismissed
+    /// Apple's own failure (each unlinks the placeholder), or quit the window before pressing
+    /// Install (which leaves the placeholder aterm stamped beside it).
+    WindowClosed,
     /// The tools already on this Mac refuse to build ([`Found::Refuses`]).
     Refuses,
     /// Whether they are installed could not be told ([`Found::Unknown`]).
@@ -77,7 +88,7 @@ pub enum Unfinished {
 
 impl Unfinished {
     /// Every class, in code order.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::Password,
         Self::Catalog,
         Self::NoneOffered,
@@ -86,6 +97,7 @@ impl Unfinished {
         Self::Busy,
         Self::Stopped,
         Self::AppleWindow,
+        Self::WindowClosed,
         Self::Refuses,
         Self::Unread,
         Self::NotOwnLogin,
@@ -108,6 +120,7 @@ impl Unfinished {
             Self::Stopped => Some(85),
             Self::AppleWindow => Some(86),
             Self::Other => Some(87),
+            Self::WindowClosed => Some(88),
             Self::Password
             | Self::Refuses
             | Self::Unread
@@ -118,20 +131,33 @@ impl Unfinished {
     }
 
     /// What the tab's program exits with once it said this class: Low Data Mode, an account
-    /// that is no administrator's and a stop have their own codes
-    /// ([`aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_LOW_DATA`],
+    /// that is no administrator's, a stop and Apple's window closed without installing them have
+    /// their own codes ([`aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_LOW_DATA`],
     /// [`aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_NOT_ADMIN`],
-    /// [`aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_STOPPED`]), so the window spends no
-    /// automatic opening on the first, offers no Install… for the second, and keeps the third's
-    /// opening spent, a person's decline; every other class is 1.
+    /// [`aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_STOPPED`],
+    /// [`aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_WINDOW_CLOSED`]), so the window spends
+    /// no automatic opening on the first, offers no Install… for the second, and keeps the last
+    /// two's opening spent, each a person's press; every other class is 1.
     #[must_use]
     pub const fn tab_exit(self) -> u8 {
         match self {
             Self::LowData => aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_LOW_DATA,
             Self::NotAdmin => aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_NOT_ADMIN,
             Self::Stopped => aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_STOPPED,
+            Self::WindowClosed => aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_WINDOW_CLOSED,
             _ => 1,
         }
+    }
+
+    /// Whether an ask of aterm's own that ended for this reason stays spent, as System State's
+    /// window reads the tab's exit ([`Self::tab_exit`]): a stop (a person's Ctrl-C), Apple's
+    /// window closed without the tools (a person's press there) and an account that is no
+    /// administrator's keep it, as a closed tab does; every other class installed nothing and no
+    /// person declined it (a password macOS refused, a broken download, a machine's failure, Low
+    /// Data Mode), so it takes the ask back and the next ask of that build goes ahead.
+    #[must_use]
+    pub const fn keeps_the_ask(self) -> bool {
+        matches!(self, Self::Stopped | Self::WindowClosed | Self::NotAdmin)
     }
 
     /// How `sudo <aterm> machines here apply --plain` ended (`code`, `None` on a signal): done
@@ -164,7 +190,10 @@ impl Unfinished {
             Self::Installer => "Apple's installer refused to install them",
             Self::Busy => "another install of the Command Line Tools is running",
             Self::Stopped => "it was stopped",
-            Self::AppleWindow => "Apple's installer window did not install them",
+            Self::AppleWindow => {
+                "Apple's installer window has not installed them (press Install there, or quit it)"
+            }
+            Self::WindowClosed => "Apple's installer window closed without installing them",
             Self::Refuses => "the developer tools already on this Mac do not work",
             Self::Unread => "aterm could not tell whether they are installed",
             Self::NotOwnLogin => "it runs only in your own Mac login",
@@ -207,7 +236,12 @@ pub const TAB_NOT_ADMIN: &str = "Only an administrator of this Mac can install A
 pub const TAB_INTRO: &str = "aterm is installing Apple's Command Line Tools, which git and your \
                              GitHub repositories need. macOS asks for your Mac password once.";
 
-/// The tab's password prompt (`sudo -p`).
+/// The one line a run outside the tab says right before `sudo` asks for the Mac password, so the
+/// prompt never comes bare after whatever the terminal showed last (a package install's output).
+pub const INTRO: &str = "aterm init: installing Apple's Command Line Tools (git, cc, the macOS \
+                         SDK); sudo asks for your Mac password once";
+
+/// The password prompt (`sudo -p`), in the tab and outside it.
 pub const TAB_PROMPT: &str = "Mac password: ";
 
 /// The tab's last line once the tools are installed.
@@ -269,6 +303,27 @@ pub struct CommandLineTools {
     /// System State's Command Line Tools tab, when this run is its program: plain words, a
     /// plain password prompt, and the root half's `--plain` exit codes.
     tab: Option<Tab>,
+    /// What holds the ask back in a run aterm decided ([`Self::unbidden`]); `None` in a person's
+    /// run, which asks each time.
+    unbidden: Option<Unbidden>,
+    /// Where a run outside the tab says its one line before `sudo` asks ([`INTRO`]): this run's
+    /// standard error.
+    say: Arc<dyn Fn(&str) + Send + Sync>,
+    /// The swarm `m<N>` label the vault's roster gave this Mac at admission, where it is known
+    /// by the time the root half runs: the root half names the Mac by it under the same password
+    /// ([`plain_name`], [`Self::baseline_named`]).
+    name: NameMac,
+}
+
+/// `word` when it is a name the root half gives the Mac: a bare swarm label, `m` and a number
+/// with no leading zero (`m42`), which is also a DNS label and a fleet name. Anything else,
+/// `Mac-mini-M4`, `m42-studio` or `M42` included, is none: the root half takes no free text from
+/// the person's account.
+#[must_use]
+pub fn plain_name(word: &str) -> Option<String> {
+    aterm_secrets::swarm_roster::leading_m_label(word)
+        .filter(|(_, canonical)| canonical == word)
+        .map(|(_, canonical)| canonical)
 }
 
 impl CommandLineTools {
@@ -279,7 +334,20 @@ impl CommandLineTools {
             found,
             aterm,
             tab: None,
+            unbidden: None,
+            say: Arc::new(|text: &str| {
+                use std::io::Write as _;
+                let _ = std::io::stderr().lock().write_all(text.as_bytes());
+            }),
+            name: Box::new(|| None),
         }
+    }
+
+    /// This item naming the Mac by what `name` reads as its root half is about to run, where
+    /// that is a [`plain_name`]; anything else (or none) names nothing.
+    #[must_use]
+    pub fn with_name(self, name: NameMac) -> Self {
+        Self { name, ..self }
     }
 
     /// This item as the Command Line Tools tab's program speaks it, through `tab`.
@@ -291,30 +359,239 @@ impl CommandLineTools {
         }
     }
 
+    /// This item in a run aterm decided ([`crate::init::Decider::Aterm`]: the follow-up of a
+    /// person's own package install or update), held as `unbidden` says: it asks for the Mac
+    /// password at most once per build, sharing System State's Command Line Tools tab's ask
+    /// ([`aterm_types::clt_mark`]), and never while the person's choices hold that tab, as read
+    /// when its probe runs and again right before it claims the ask; where it asks nothing it is
+    /// deferred, naming the person's step ([`PERSONS_STEP`]), and an ask a Stop or another asker
+    /// took between its probe and its apply fails in those words.
+    #[must_use]
+    pub fn unbidden(self, unbidden: Unbidden) -> Self {
+        Self {
+            unbidden: Some(unbidden),
+            ..self
+        }
+    }
+
+    /// This item saying its line before `sudo` through `say` (a test's).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn saying(self, say: Arc<dyn Fn(&str) + Send + Sync>) -> Self {
+        Self { say, ..self }
+    }
+
     /// The one-table baseline the root half applies.
     #[must_use]
     pub fn baseline() -> String {
-        format!(
+        Self::baseline_named(None)
+    }
+
+    /// [`Self::baseline`], with the Mac's Computer Name and Local hostname set to `name` where
+    /// it is a [`plain_name`] (`--name`): the one password that installs the tools also gives
+    /// the Mac the name its vault and fleet know it by.
+    #[must_use]
+    pub fn baseline_named(name: Option<&str>) -> String {
+        let mut text = format!(
             "schema = {}\n\n[developer]\ncommand_line_tools = true\n",
             crate::SCHEMA
-        )
+        );
+        if let Some(name) = name.and_then(plain_name) {
+            text.push_str(&format!(
+                "\n[names]\ncomputer_name = \"{name}\"\nlocal_host_name = \"{name}\"\n"
+            ));
+        }
+        text
     }
 
     /// The argv the apply runs on the person's terminal: the root half `--plain`, which applies
-    /// [`Self::baseline`] built in and reads no file the person's account could write; in the
-    /// tab, with the plain prompt.
+    /// [`Self::baseline`] built in and reads no file the person's account could write, under
+    /// `sudo -k` with the plain prompt ([`TAB_PROMPT`]). `-k` with a command makes `sudo` ignore
+    /// the credentials it cached for this terminal and cache none (sudo(8) 1.9.17 on macOS 27.0),
+    /// so a password typed for an earlier `sudo` never authorizes the root half by itself, none is
+    /// kept once it ends, and the person's own cached `sudo` stays as it was. Where the roster
+    /// gave this Mac its label by now ([`Self::with_name`]), `--name` carries it.
     #[must_use]
     pub fn command(&self) -> Cmd {
-        let sudo = Cmd::new(SUDO);
-        let sudo = if self.tab.is_some() {
-            sudo.args(["-p", TAB_PROMPT])
-        } else {
-            sudo
+        let root = Cmd::new(SUDO)
+            .args(["-k", "-p", TAB_PROMPT])
+            .arg(self.aterm.as_os_str())
+            .args(["machines", "here", "apply", "--plain"]);
+        match (self.name)().as_deref().and_then(plain_name) {
+            Some(name) => root.args(["--name", name.as_str()]),
+            None => root,
+        }
+    }
+
+    /// How the root half's run (`ran`) ended, as the tab's program and a run outside it both
+    /// read it: a stop this run caught (`stopped`) is the person's, whatever `sudo` or the root
+    /// half then exited with (a Ctrl-C at the password prompt ends `sudo` on its own 1, which
+    /// alone would read as a password macOS refused); else the root half's exit
+    /// ([`Unfinished::after_root`]); and tools that arrived anyway are installed, whatever it
+    /// said.
+    fn ended(
+        &self,
+        sys: &dyn System,
+        ran: &Result<Option<i32>, crate::port::RunFailed>,
+        stopped: Option<i32>,
+    ) -> Result<(), Unfinished> {
+        let ended = match ran {
+            Ok(code) if *code != Some(0) && stopped.is_some() => Err(Unfinished::Stopped),
+            Ok(code) => Unfinished::after_root(*code),
+            Err(_) => Err(Unfinished::Other),
         };
-        sudo.arg(self.aterm.as_os_str())
-            .args(["machines", "here", "apply", "--plain"])
+        match ended {
+            Err(_) if matches!((self.found)(sys), Found::Present(_)) => Ok(()),
+            ended => ended,
+        }
     }
 }
+
+/// What holds back the ask of a run aterm decided ([`CommandLineTools::unbidden`]): this
+/// account's record of aterm's own ask, which System State's Command Line Tools tab reads and
+/// writes too ([`aterm_types::clt_mark`]), the build that asks, and the person's choices in
+/// System State that hold that tab ([`held_by`]), read from the setup records as the item's probe
+/// runs and again right before its apply claims the ask, so a Stop pressed after `aterm init`
+/// began, while the base layer or the vault's join ran, still holds it (principle 4).
+pub struct Unbidden {
+    /// The record ([`aterm_types::clt_mark::path`]); `None` where it has no place, which holds
+    /// the ask as a record naming this build does.
+    mark: Option<PathBuf>,
+    /// The build that asks ([`aterm_types::version::build_id`]).
+    build: String,
+    /// The person's choices now, as the setup records say ([`crate::init::Records::holds`]).
+    holds: Arc<dyn Fn() -> crate::init::Holds + Send + Sync>,
+}
+
+impl Unbidden {
+    /// The record at `mark` and `build`, held as `holds` reads the person's choices each time
+    /// it is called.
+    #[must_use]
+    pub fn new(
+        mark: Option<PathBuf>,
+        build: String,
+        holds: impl Fn() -> crate::init::Holds + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            mark,
+            build,
+            holds: Arc::new(holds),
+        }
+    }
+
+    /// This account's record and this build, held as `records` say each time they are read
+    /// ([`held_by`]).
+    #[must_use]
+    pub fn here(records: &'static dyn crate::init::Records) -> Self {
+        Self::new(
+            aterm_types::clt_mark::path(),
+            aterm_types::version::build_id(),
+            move || records.holds(),
+        )
+    }
+
+    /// Why the person's choices hold the ask now, naming their step, as the setup records read
+    /// at this call ([`held_by`]).
+    fn held(&self) -> Option<String> {
+        held_by(&(self.holds)()).map(|why| {
+            format!("aterm asks for no Mac password by itself because {why}: {PERSONS_STEP}")
+        })
+    }
+
+    /// Why a run aterm decided asks no password by itself now, naming the person's step, or
+    /// `None` when it may ask: the person's choices hold it ([`Self::held`]), this build asked by
+    /// itself already (its tab, or an earlier run aterm decided: [`ASKED_ON_THIS_BUILD`]), or the
+    /// record has no place or cannot say whether it did ([`UNREAD_RECORD`]), as the record reads
+    /// through `sys` ([`aterm_types::clt_mark::reading`]).
+    fn withheld(&self, sys: &dyn System) -> Option<String> {
+        if let Some(why) = self.held() {
+            return Some(why);
+        }
+        let Some(mark) = self.mark.as_deref() else {
+            return Some(format!(
+                "{UNREAD_RECORD}, which has no place in this account, so it asks for no Mac \
+                 password by itself: {PERSONS_STEP}"
+            ));
+        };
+        match aterm_types::clt_mark::reading(sys.clt_mark(), mark, &self.build) {
+            aterm_types::clt_mark::Asked::NotNamed => None,
+            aterm_types::clt_mark::Asked::Named => {
+                Some(format!("{ASKED_ON_THIS_BUILD}: {PERSONS_STEP}"))
+            }
+            aterm_types::clt_mark::Asked::Unread(error) => Some(format!(
+                "{UNREAD_RECORD}, {} ({error}), so it asks for no Mac password by itself: \
+                 {PERSONS_STEP}",
+                mark.display()
+            )),
+        }
+    }
+
+    /// Claim this build's ask in the record, right before `sudo` asks
+    /// ([`aterm_types::clt_mark::claim`]): `true` when this run added its line, `false` when
+    /// another asker of this build (System State's tab) named it first.
+    ///
+    /// # Errors
+    /// No place for the record, and the claim's own.
+    fn claim(&self, sys: &dyn System) -> std::io::Result<bool> {
+        let mark = self
+            .mark
+            .as_deref()
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+        aterm_types::clt_mark::claim(sys.clt_mark(), mark, &self.build)
+    }
+
+    /// Take this build's ask back, which this run's claim added: it installed nothing, and no
+    /// person declined it, so the next run of this build, or its tab, asks again. A record that
+    /// cannot be rewritten keeps it, and says so in the log.
+    fn forget(&self, sys: &dyn System) {
+        if let Some(mark) = &self.mark
+            && let Err(error) = aterm_types::clt_mark::forget(sys.clt_mark(), mark, &self.build)
+        {
+            aterm_log::warn!(
+                "aterm init: the record of aterm's Command Line Tools ask was not taken back: {error}"
+            );
+        }
+    }
+}
+
+/// Why the person's choices in System State hold a run aterm decided back from asking for the
+/// Mac password, as they hold System State's own Command Line Tools tab: their Stop of setup, or
+/// records that cannot be read now (which hold every group, [`crate::init::Holds::stopped`]), or
+/// records a newer aterm saved ([`NEWER`]). `None` when they hold nothing of it: a group turned
+/// off holds no tab.
+#[must_use]
+pub fn held_by(holds: &crate::init::Holds) -> Option<String> {
+    if holds.newer {
+        Some(NEWER.to_owned())
+    } else {
+        holds.stopped.clone()
+    }
+}
+
+/// The person's own ways to install the tools, which a run aterm decided names where it asks no
+/// password by itself: System State's card, or an `aterm init` they type, each asking once.
+pub const PERSONS_STEP: &str = "press Install Command Line Tools\u{2026} on System State, or run \
+                                `aterm init --only base.clt` in a terminal";
+
+/// Why a run aterm decided asks no password where this build asked by itself already: its tab,
+/// or an earlier run aterm decided ([`aterm_types::clt_mark`]).
+pub const ASKED_ON_THIS_BUILD: &str = "aterm asks for your Mac password for them by itself once \
+                                       per build, and this build has asked";
+
+/// Why a run aterm decided asks no password where the record of its own ask has no place, or
+/// cannot say whether this build asked ([`aterm_types::clt_mark::Asked::Unread`]): the row goes on
+/// to name where, and why.
+pub const UNREAD_RECORD: &str = "aterm cannot read its record of asking for them";
+
+/// Why a run aterm decided asks no password where a newer aterm's setup records stand
+/// ([`held_by`]).
+pub const NEWER: &str = "a newer aterm set this Mac up";
+
+/// Why a run aterm decided asked no password after all: its claim of the ask in the record failed
+/// (no hold on the record's lock, or a write that failed), so a later run could not tell that it
+/// asked.
+pub const NOT_NOTED: &str = "aterm could not note that it asked, so it asks for no Mac password \
+                             by itself";
 
 /// `sudo`.
 const SUDO: &str = "/usr/bin/sudo";
@@ -343,7 +620,7 @@ pub const NO_TTY: &str = "installing the Command Line Tools asks for your passwo
                           run has no terminal to ask it in: run `aterm init --only base.clt` \
                           in a terminal";
 
-/// Why the item leaves the tools to an install under way ([`installing`]).
+/// Why the item leaves the tools to an install under way ([`held`]).
 pub const INSTALLING: &str = "Apple's Command Line Tools are being installed now, by an install \
                               already under way";
 
@@ -352,25 +629,29 @@ pub const NOT_ADMIN: &str = "only an administrator of this Mac can install them,
                              account is not one: an administrator runs `aterm init --only \
                              base.clt` in their own login";
 
-/// Whether an install of the tools runs now, by the predicate the window's page and the root
-/// half share ([`aterm_types::macos_setup::tools_install_running`],
-/// [`crate::items::developer::installer_runs`]): the on-demand placeholder, held by
-/// `softwareupdate`, `installer` or Apple's installer window while it or the placeholder is
-/// younger than [`aterm_types::macos_setup::APPLE_WINDOW_INSTALL_BOUND`] (an age that cannot be
-/// read included), or stamped by a run of the root half that is still alive
-/// ([`crate::items::developer::placeholder_held_by_a_live_run`]: one between its steps, or
-/// waiting on Apple's installer window after a person closed it), which alone may hold or replace
-/// it. A process table that cannot be read is no install here (the root half then says whether
-/// one holds the placeholder).
-fn installing(sys: &dyn System) -> bool {
-    sys.stat(std::path::Path::new(crate::items::developer::PLACEHOLDER))
-        .is_ok()
-        && (crate::items::developer::installer_runs(sys) == Some(true)
-            || crate::items::developer::placeholder_held_by_a_live_run(sys))
+/// Why the item leaves the tools to Apple's installer window open for them
+/// ([`crate::items::developer::Holder::AppleWindow`]), naming the person's step there.
+pub const APPLE_WINDOW_OPEN: &str = "Apple's installer window is open for them: finish in it \
+                                     (press Install there), or quit it so aterm can install them";
+
+/// What holds an install of the tools now, with the on-demand placeholder there or not as one
+/// `stat` finds it, by the rule the window's page and the root half share
+/// ([`crate::items::developer::holder`]): an install under way (`softwareupdate` or `installer`
+/// beside the placeholder, or a live run of the root half that stamped it, which alone may hold
+/// or replace it), Apple's installer window at any age with the placeholder beside it or not (its
+/// own flow, pressed or not, which makes the placeholder as it opens unless one is there, and
+/// unlinks it when its request ends), or nothing. A process table that cannot be read is no
+/// install here (the root half then says whether one holds a placeholder there).
+fn held(sys: &dyn System) -> crate::items::developer::Holder {
+    let placeholder = sys
+        .stat(std::path::Path::new(crate::items::developer::PLACEHOLDER))
+        .is_ok();
+    crate::items::developer::holder(sys, placeholder)
 }
 
-/// Whether `row` is this item's, deferred: to an install under way, or to a person at this Mac's
-/// console. Neither is this run's to finish, so an apply or a plan completes with it.
+/// Whether `row` is this item's, deferred: to an install under way, to Apple's installer window
+/// open for them, or to a person at this Mac's console. None is this run's to finish, so an
+/// apply or a plan completes with it.
 #[must_use]
 pub fn deferred(row: &aterm_converge::ItemReport) -> bool {
     row.id == ID && row.outcome == aterm_converge::Outcome::Deferred
@@ -404,30 +685,56 @@ impl Item for CommandLineTools {
         if !sys.has_tty() {
             return Err(NO_TTY.to_owned());
         }
+        // In a run aterm decided, the person's choices are read once more and aterm's own ask is
+        // claimed right before `sudo` asks: a Stop pressed since the probe holds it, neither
+        // System State's tab nor a later run of this build asks again by itself, and of this run
+        // and a tab of this build landing at once only the one whose claim added the line asks.
+        // An ask it cannot claim is not made. The engine gives an apply no deferral of its own,
+        // so each of these reads as the row's failure in the deferral's words, naming the
+        // person's step.
+        if let Some(unbidden) = &self.unbidden {
+            if let Some(why) = unbidden.held() {
+                return Err(why);
+            }
+            match unbidden.claim(sys) {
+                Ok(true) => {}
+                Ok(false) => return Err(format!("{ASKED_ON_THIS_BUILD}: {PERSONS_STEP}")),
+                Err(error) => return Err(format!("{NOT_NOTED} ({error}): {PERSONS_STEP}")),
+            }
+        }
+        (self.say)(&format!("{INTRO}\n"));
         // The root half runs in this terminal's foreground, so a Ctrl-C (which the
         // through-installer wait invites) or a closed terminal reaches this run too: held until
-        // `sudo` has forgotten the password it cached, then sent again, so the run still stops
-        // as it would have.
+        // the root half has finished its step and aterm's own ask is kept or taken back, then
+        // sent again, so the run still stops as it would have.
         let stops = sys.defer_stops();
         let ran = sys.run_tty(&self.command());
-        // The root half is over: `sudo` forgets the password it cached, on a person's own run
-        // as in the tab ([`Self::apply_in_tab`]).
-        let _ = sys.run(&Cmd::new(SUDO).arg("-K"));
+        let ended = self.ended(sys, &ran, sys.stopped());
+        if let Some(unbidden) = &self.unbidden
+            && ended.is_err_and(|why| !why.keeps_the_ask())
+        {
+            unbidden.forget(sys);
+        }
         drop(stops);
-        match ran {
-            Ok(code) => Unfinished::after_root(code).map_err(|why| why.reason().to_owned()),
-            Err(e) => Err(format!("`sudo` did not start: {e}")),
+        match (ended, ran) {
+            (Ok(()), _) => Ok(()),
+            (Err(_), Err(e)) => Err(format!("`sudo` did not start: {e}")),
+            (Err(why), Ok(_)) => Err(why.reason().to_owned()),
         }
     }
 }
 
 impl CommandLineTools {
     /// What the probe reads, and why the tab's install would not finish when it reads short of
-    /// a change: the tools present; else, with them missing, an install already under way
-    /// (deferred to it, asking nothing), a run with no person at this Mac's console (deferred to
-    /// one: only a person there types the Mac password, never an agent's tab, a script or a
-    /// remote shell), no terminal to ask in, Low Data Mode, or an account that is no
-    /// administrator's (each blocked, asking nothing); else the change.
+    /// a change: the tools present; else, with them missing, an install already under way or
+    /// Apple's installer window open for them (deferred to it, asking nothing; the window's row
+    /// names the person's step there, and the rest of the run goes on), a run with no person at
+    /// this Mac's console (deferred to one: only a person there types the Mac password, never an
+    /// agent's tab, a script or a remote shell), no terminal to ask in, Low Data Mode, or an
+    /// account that is no administrator's (each blocked, asking nothing), or, in a run aterm
+    /// decided, the person's Stop as the setup records read now, this build's ask spent, or a
+    /// record that cannot say ([`Unbidden::withheld`]: deferred, naming the person's step); else
+    /// the change.
     fn read(&self, sys: &dyn System) -> (Probe, Option<Unfinished>) {
         let from = match (self.found)(sys) {
             Found::Present(now) => return (Probe::Ok { now }, None),
@@ -436,13 +743,24 @@ impl CommandLineTools {
             Found::NotHere(why) => return (Probe::NotApplicable { why }, None),
             Found::Missing(from) => from,
         };
-        if installing(sys) {
-            return (
-                Probe::Deferred {
-                    why: format!("{from}; {INSTALLING}"),
-                },
-                Some(Unfinished::Busy),
-            );
+        match held(sys) {
+            crate::items::developer::Holder::Install => {
+                return (
+                    Probe::Deferred {
+                        why: format!("{from}; {INSTALLING}"),
+                    },
+                    Some(Unfinished::Busy),
+                );
+            }
+            crate::items::developer::Holder::AppleWindow => {
+                return (
+                    Probe::Deferred {
+                        why: format!("{from}; {APPLE_WINDOW_OPEN}"),
+                    },
+                    Some(Unfinished::AppleWindow),
+                );
+            }
+            crate::items::developer::Holder::Nothing | crate::items::developer::Holder::Unread => {}
         }
         let presence = crate::console::presence(sys);
         if let Some(person) = presence.needs_person() {
@@ -478,6 +796,18 @@ impl CommandLineTools {
                 Some(Unfinished::NotAdmin),
             );
         }
+        if let Some(why) = self
+            .unbidden
+            .as_ref()
+            .and_then(|unbidden| unbidden.withheld(sys))
+        {
+            return (
+                Probe::Deferred {
+                    why: format!("{from}; {why}"),
+                },
+                Some(Unfinished::Other),
+            );
+        }
         (
             Probe::Change {
                 from,
@@ -493,9 +823,9 @@ impl CommandLineTools {
     /// [`Item::apply`] as the tab's program: one plain line before `sudo` asks for the Mac
     /// password with the plain prompt, and the root half run `--plain`. Once that has started,
     /// this run waits for it to end, holding off a Ctrl-C or a closed tab (which reach the root
-    /// half, which finishes its step), drops `sudo`'s cached password, and says how it ended:
-    /// installed when the tools are there, whatever the root half's exit, else its plain reason
-    /// ([`Unfinished`]), never an argv or a path.
+    /// half, which finishes its step), and says how it ended ([`Self::ended`]): installed when the
+    /// tools are there, whatever the root half's exit, else its plain reason ([`Unfinished`]),
+    /// never an argv or a path.
     fn apply_in_tab(&self, sys: &dyn System, tab: &Tab) -> Result<(), String> {
         if !sys.has_tty() {
             return Err(tab.note(Unfinished::Other));
@@ -504,22 +834,8 @@ impl CommandLineTools {
         tab.line(TAB_INTRO);
         let ran = sys.run_tty(&self.command());
         let stopped = sys.stopped();
-        // Still held: a second Ctrl-C now cannot end the run before `sudo` forgets the password.
-        let _ = sys.run(&Cmd::new(SUDO).arg("-K"));
         drop(stops);
-        // A stop this run caught is the person's, whatever `sudo` or the root half then exited
-        // with: a Ctrl-C at the password prompt ends `sudo` on its own 1, which alone would read
-        // as a password macOS refused.
-        let ended = match ran {
-            Ok(code) if code != Some(0) && stopped.is_some() => Err(Unfinished::Stopped),
-            Ok(code) => Unfinished::after_root(code),
-            Err(_) => Err(Unfinished::Other),
-        };
-        match ended {
-            Ok(()) => Ok(()),
-            Err(_) if matches!((self.found)(sys), Found::Present(_)) => Ok(()),
-            Err(why) => Err(tab.note(why)),
-        }
+        self.ended(sys, &ran, stopped).map_err(|why| tab.note(why))
     }
 }
 
@@ -555,6 +871,8 @@ mod tests {
         sys
     }
 
+    /// The item over a probe that finds the tools only once [`CC`] is there, its line before
+    /// `sudo` said to nobody (a test that reads it says it through [`CommandLineTools::saying`]).
     fn item(found: Found) -> CommandLineTools {
         CommandLineTools::new(
             Box::new(move |sys: &dyn System| {
@@ -566,6 +884,12 @@ mod tests {
             }),
             PathBuf::from(ATERM),
         )
+        .saying(Arc::new(|_: &str| {}))
+    }
+
+    /// The root half's argv on the terminal, in the tab and outside it alike.
+    fn argv() -> String {
+        format!("tty /usr/bin/sudo -k -p 'Mac password: ' {ATERM} machines here apply --plain")
     }
 
     fn missing() -> CommandLineTools {
@@ -614,7 +938,7 @@ mod tests {
             sys.calls()
         );
 
-        let argv = format!("tty /usr/bin/sudo {ATERM} machines here apply --plain");
+        let argv = argv();
         sys.on(&argv, Ran::ok(""))
             .on_write(&argv, std::path::Path::new(CC), b"");
         let row = run(&sys, &item, Mode::Apply);
@@ -634,36 +958,101 @@ mod tests {
         );
     }
 
-    /// A person's own `aterm init` at the console (no tab) installs through `sudo` too, and the
-    /// password `sudo` cached goes once the root half ends, whether it finished or not (design
-    /// §6.3: `sudo -K` runs afterwards).
+    /// A swarm label known when the root half runs rides the same prompt: the one argv gains
+    /// `--name`, and the root half's baseline names the Mac by it. Free text is never passed
+    /// (NEGATIVE CONTROL: `Mac-mini-M4`, `M42`, `m42-studio`, `m042` and none leave the argv and
+    /// the baseline as they are without a name).
     #[test]
-    fn a_persons_own_run_drops_sudos_cached_password_after_the_root_half() {
-        let argv = format!("tty /usr/bin/sudo {ATERM} machines here apply --plain");
+    fn a_known_swarm_label_rides_the_one_password_prompt() {
+        let sys = console();
+        let item = missing().with_name(Box::new(|| Some("m42".to_owned())));
+        let named = format!("{} --name m42", argv());
+        sys.on(&named, Ran::ok(""))
+            .on_write(&named, std::path::Path::new(CC), b"");
+        let row = run(&sys, &item, Mode::Apply);
+        assert_eq!(row.outcome, Outcome::Changed, "{row:?} {:?}", sys.calls());
+        assert_eq!(
+            asked(&sys),
+            [named],
+            "one password prompt: {:?}",
+            sys.calls()
+        );
+        let parsed =
+            crate::baseline::parse(&CommandLineTools::baseline_named(Some("m42"))).unwrap();
+        let names = parsed.names.expect("a [names] table");
+        assert_eq!(names.computer_name.as_deref(), Some("m42"));
+        assert_eq!(names.local_host_name.as_deref(), Some("m42"));
+        assert_eq!(names.host_name, None);
+
+        for word in ["Mac-mini-M4", "M42", "m42-studio", "m042", ""] {
+            let sys = console();
+            let owned = word.to_owned();
+            let item = missing().with_name(Box::new(move || Some(owned.clone())));
+            sys.on(&argv(), Ran::ok(""))
+                .on_write(&argv(), std::path::Path::new(CC), b"");
+            run(&sys, &item, Mode::Apply);
+            assert_eq!(asked(&sys), [argv()], "{word:?}: {:?}", sys.calls());
+            assert_eq!(
+                CommandLineTools::baseline_named(Some(word)),
+                CommandLineTools::baseline(),
+                "{word:?}"
+            );
+        }
+    }
+
+    /// A run outside the tab says its one line right before `sudo` asks, whatever ran on the
+    /// terminal before it, and asks with the plain prompt under `sudo -k` (design §6.3): a
+    /// password cached for an earlier `sudo` never authorizes the root half, and none is kept
+    /// once it ends, so no `sudo -K` follows it, whether the install finished or not.
+    #[test]
+    fn a_run_outside_the_tab_says_why_right_before_sudo_asks_afresh() {
+        let argv = argv();
         for (ran, outcome) in [
             (Ran::ok(""), Outcome::Changed),
             (Ran::exit(82, ""), Outcome::Failed),
         ] {
-            let sys = console();
+            let sys = Arc::new(console());
+            let said = Arc::new(Mutex::new(Vec::new()));
+            let item = missing().saying({
+                let (said, sys) = (Arc::clone(&said), Arc::clone(&sys));
+                Arc::new(move |text: &str| {
+                    said.lock()
+                        .unwrap()
+                        .push((sys.calls().len(), text.to_owned()));
+                })
+            });
             let installs = ran.success();
             sys.on(&argv, ran);
             if installs {
                 sys.on_write(&argv, std::path::Path::new(CC), b"");
             }
-            let row = run(&sys, &missing(), Mode::Apply);
+            let row = run(&sys, &item, Mode::Apply);
             assert_eq!(row.outcome, outcome, "{row:?}");
             let calls = sys.calls();
-            let at = |call: &str| {
-                calls
-                    .iter()
-                    .position(|seen| seen == call)
-                    .unwrap_or_else(|| panic!("no {call:?}: {calls:?}"))
-            };
+            let ran = calls
+                .iter()
+                .position(|seen| *seen == argv)
+                .unwrap_or_else(|| panic!("no root half: {calls:?}"));
+            assert_eq!(
+                *said.lock().unwrap(),
+                [(ran - 1, format!("{INTRO}\n"))],
+                "said once, right before the stops are held and sudo asks: {calls:?}"
+            );
+            assert_eq!(calls[ran - 1], "defer stops", "{calls:?}");
+            assert_eq!(asked(&sys), std::slice::from_ref(&argv), "{calls:?}");
             assert!(
-                at(&argv) < at("/usr/bin/sudo -K"),
-                "`sudo -K` after the root half on a person's own run: {calls:?}"
+                !calls.iter().any(|call| call.contains("sudo -K")),
+                "nothing cached to forget: {calls:?}"
             );
         }
+        assert!(
+            missing()
+                .command()
+                .display()
+                .starts_with("/usr/bin/sudo -k -p 'Mac password: ' "),
+            "{}",
+            missing().command().display()
+        );
     }
 
     /// The root half's failure says why in plain words on a person's own run too, never the argv
@@ -671,10 +1060,7 @@ mod tests {
     #[test]
     fn a_person_s_own_run_says_why_in_plain_words_never_the_argv() {
         let sys = console();
-        sys.on(
-            &format!("tty /usr/bin/sudo {ATERM} machines here apply --plain"),
-            Ran::exit(82, ""),
-        );
+        sys.on(&argv(), Ran::exit(82, ""));
         let row = run(&sys, &missing(), Mode::Apply);
         assert_eq!(row.outcome, Outcome::Failed, "{row:?}");
         assert_eq!(row.why.as_deref(), Some(Unfinished::Download.reason()));
@@ -734,11 +1120,9 @@ mod tests {
     }
 
     /// With an install of the tools under way (the placeholder held by `softwareupdate`, Apple's
-    /// package `installer`, Apple's installer window while it or the placeholder is younger than
-    /// [`aterm_types::macos_setup::APPLE_WINDOW_INSTALL_BOUND`], or a live run of the root half),
-    /// the item asks no password and fails nothing: it is deferred to that install. A placeholder
-    /// left behind beside other programs, one merely called `installer` and Apple's window left
-    /// open past that bound beside a placeholder as old included, is no install.
+    /// package `installer`, or a live run of the root half), the item asks no password and fails
+    /// nothing: it is deferred to that install. A placeholder left behind beside other programs,
+    /// one merely called `installer` included, is no install.
     #[test]
     fn an_install_under_way_asks_no_password_and_fails_nothing() {
         for installer in ["/usr/sbin/softwareupdate", "/usr/sbin/installer"] {
@@ -765,63 +1149,9 @@ mod tests {
             Outcome::Planned
         );
 
-        // Apple's installer window beside the placeholder is the install a person started there
-        // while the window, or the placeholder its press created, is younger than its bound (an
-        // age nothing can read included): deferred, asking no password. So a press in a window
-        // opened hours before defers too. One left open past the bound beside a placeholder as
-        // old waits for a press beside a placeholder an ended install left, for days perhaps:
-        // no install, so it never defers `aterm init` for good.
-        let apple = "/System/Library/CoreServices/Install Command Line Developer Tools.app/\
-                     Contents/MacOS/Install Command Line Developer Tools";
-        let placeholder = crate::items::developer::PLACEHOLDER;
-        let bound = aterm_types::macos_setup::APPLE_WINDOW_INSTALL_BOUND.as_secs();
-        let window = |age: Option<u64>, changed: Option<u64>| {
-            let sys = console();
-            sys.file(placeholder, b"")
-                .running(&["/sbin/launchd", apple]);
-            if let Some(age) = age {
-                sys.born(Fake::PIDS + 1, sys.now - age);
-            }
-            if let Some(changed) = changed {
-                sys.changed_at(placeholder, sys.now - changed);
-            }
-            sys
-        };
-        for (age, changed) in [
-            (Some(60), Some(bound)),
-            (Some(bound - 1), Some(bound)),
-            (None, Some(bound)),
-            (Some(bound), Some(60)),
-            (Some(bound), Some(bound - 1)),
-            (Some(bound), None),
-        ] {
-            let young = window(age, changed);
-            let row = run(&young, &missing(), Mode::Apply);
-            assert_eq!(
-                row.outcome,
-                Outcome::Deferred,
-                "{age:?} {changed:?}: {row:?}"
-            );
-            assert!(
-                row.why
-                    .as_deref()
-                    .is_some_and(|why| why.ends_with(INSTALLING)),
-                "{age:?} {changed:?}: {row:?}"
-            );
-            assert!(
-                asked(&young).is_empty(),
-                "{age:?} {changed:?}: {:?}",
-                young.calls()
-            );
-        }
-        assert_eq!(
-            run(&window(Some(bound), Some(bound)), &missing(), Mode::Plan).outcome,
-            Outcome::Planned
-        );
-
         // A run of the root half that is still alive holds it, though no installer process
-        // runs this moment (it waits on Apple's installer window a person closed): a second
-        // `aterm init` defers to it, asking no password.
+        // runs this moment (it waits on Apple's installer window): a second `aterm init` defers
+        // to it, asking no password.
         let held = console();
         held.file(crate::items::developer::PLACEHOLDER, b"aterm 4242 1000\n")
             .running(&["/sbin/launchd"])
@@ -829,6 +1159,98 @@ mod tests {
         let row = run(&held, &missing(), Mode::Apply);
         assert_eq!(row.outcome, Outcome::Deferred, "{row:?}");
         assert!(asked(&held).is_empty(), "{:?}", held.calls());
+    }
+
+    /// Apple's installer window is Apple's own flow, at any age, with the placeholder beside it
+    /// (it made the placeholder as it opened, before any press, so a press hours later leaves no
+    /// trace aterm reads) or with none (it opened beside another install's, which has ended
+    /// since): the item asks no password and fails nothing, deferred to that window with the
+    /// person's step there named (finish in it, or quit it so aterm can install them), and the
+    /// tab says it as the window's class.
+    /// NEGATIVE CONTROL: the placeholder with no window beside it (left behind) plans the install.
+    #[test]
+    fn apples_window_defers_at_any_age_with_or_without_the_placeholder() {
+        let apple = "/System/Library/CoreServices/Install Command Line Developer Tools.app/\
+                     Contents/MacOS/Install Command Line Developer Tools";
+        let placeholder = crate::items::developer::PLACEHOLDER;
+        let day = 24 * 60 * 60;
+        for beside in [true, false] {
+            for age in [Some(60), Some(3 * 60 * 60), Some(10 * day), None] {
+                let sys = Arc::new(console());
+                if beside {
+                    sys.file(placeholder, b"");
+                }
+                sys.running(&["/sbin/launchd", apple]);
+                if let Some(age) = age {
+                    sys.born(Fake::PIDS + 1, sys.now - age);
+                }
+                let row = run(&sys, &missing(), Mode::Apply);
+                assert_eq!(row.outcome, Outcome::Deferred, "{beside} {age:?}: {row:?}");
+                assert!(deferred(&row), "{beside} {age:?}");
+                assert!(
+                    row.why
+                        .as_deref()
+                        .is_some_and(|why| why.ends_with(APPLE_WINDOW_OPEN)),
+                    "{beside} {age:?}: {row:?}"
+                );
+                assert!(
+                    asked(&sys).is_empty(),
+                    "{beside} {age:?}: {:?}",
+                    sys.calls()
+                );
+                let (item, said, tab) =
+                    in_tab(&sys, Found::Missing("no developer directory".into()));
+                assert_eq!(
+                    run(&sys, &item, Mode::Apply).outcome,
+                    Outcome::Deferred,
+                    "{beside} {age:?}"
+                );
+                assert_eq!(
+                    tab.unfinished(),
+                    Some(Unfinished::AppleWindow),
+                    "{beside} {age:?}"
+                );
+                assert!(said.lock().unwrap().is_empty(), "{beside} {age:?}");
+                assert!(
+                    asked(&sys).is_empty(),
+                    "{beside} {age:?}: {:?}",
+                    sys.calls()
+                );
+            }
+        }
+
+        let left = console();
+        left.file(placeholder, b"").running(&["/sbin/launchd"]);
+        assert_eq!(run(&left, &missing(), Mode::Plan).outcome, Outcome::Planned);
+    }
+
+    /// A process the kernel names no executable for (one whose file a replacement deleted while
+    /// it ran) is none of Apple's installers: beside a stale placeholder whose stamped run is
+    /// gone, `aterm init` plans the install, as the root half then takes the placeholder's place.
+    /// NEGATIVE CONTROL: with `softwareupdate` named beside it, the item defers to that install.
+    #[test]
+    fn a_process_the_kernel_names_no_file_for_defers_nothing() {
+        let unnamed = crate::port::Process {
+            pid: Fake::PIDS + 7,
+            ppid: crate::port::Process::LAUNCHD,
+            terminal: false,
+            exe: None,
+            comm: "deleted".into(),
+        };
+        for (beside, outcome) in [
+            ("/sbin/launchd", Outcome::Planned),
+            ("/usr/sbin/softwareupdate", Outcome::Deferred),
+        ] {
+            let sys = console();
+            sys.file(crate::items::developer::PLACEHOLDER, b"aterm 4242 1000\n")
+                .running(&["/sbin/launchd", beside])
+                .process(unnamed.clone(), None);
+            assert_eq!(
+                run(&sys, &missing(), Mode::Plan).outcome,
+                outcome,
+                "{beside}"
+            );
+        }
     }
 
     /// Only a person at this Mac's console types the Mac password: an agent's tab (a terminal
@@ -911,20 +1333,14 @@ mod tests {
         (item(found).in_tab(tab.clone()), said, tab)
     }
 
-    fn tab_argv() -> String {
-        format!("tty /usr/bin/sudo -p 'Mac password: ' {ATERM} machines here apply --plain")
-    }
-
     /// In the tab, the apply says its one intro line right before `sudo` asks for the Mac
-    /// password with the plain prompt, runs the root half `--plain`, holds off a stop while it
-    /// runs, and drops `sudo`'s cached password once it ended; outside it the argv keeps
-    /// `sudo`'s own prompt (pinned by
-    /// `missing_tools_plan_the_machines_here_argv_and_apply_runs_it_on_the_terminal`).
+    /// password with the plain prompt under `sudo -k`, as a run outside it does, runs the root
+    /// half `--plain`, and holds off a stop until it ended.
     #[test]
     fn in_the_tab_the_intro_comes_right_before_sudo_asks_with_the_plain_prompt() {
         let sys = Arc::new(console());
         let (item, said, tab) = in_tab(&sys, Found::Missing("no developer directory".into()));
-        let argv = tab_argv();
+        let argv = argv();
         sys.on(&argv, Ran::ok(""))
             .on_write(&argv, std::path::Path::new(CC), b"");
         let row = run(&sys, &item, Mode::Apply);
@@ -943,45 +1359,480 @@ mod tests {
             "said once, right before sudo ({ran}): {calls:?}"
         );
         assert!(at("catch stops") < ran, "{calls:?}");
-        assert!(ran < at("/usr/bin/sudo -K"), "{calls:?}");
         assert!(
-            at("/usr/bin/sudo -K") < at("stops restored"),
-            "stops are held until `sudo` forgot the password: {calls:?}"
+            ran < at("stops restored"),
+            "stops are held until the root half ended: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|call| call.contains("sudo -K")),
+            "nothing cached to forget: {calls:?}"
         );
         assert_eq!(tab.unfinished(), None);
     }
 
-    /// A person's own `aterm init` at the console runs the root half in its own terminal's
-    /// foreground, so a Ctrl-C there (which the through-installer wait invites: "Ctrl-C stops
-    /// waiting") reaches this run too. It is held until `sudo -K` has run, then sent again: the
-    /// password `sudo` cached never outlives the run, and the run still stops as it would have.
+    /// A run outside the tab, a person's own `aterm init` at the console and a run aterm decided
+    /// alike, runs the root half in the person's terminal's foreground, so a Ctrl-C there (which
+    /// the through-installer wait invites: "Ctrl-C stops waiting") reaches this run too. It is
+    /// held until the root half ended and, in a run aterm decided, its ask was kept or taken back,
+    /// then sent again: the run still stops as it would have, and the record says what the stop
+    /// left it. A person's run writes no record at all.
     #[test]
-    fn a_persons_own_run_holds_a_stop_until_sudo_forgets_the_password() {
-        let argv = format!("tty /usr/bin/sudo {ATERM} machines here apply --plain");
-        let mut sys = console();
-        sys.stop_after = Some(0);
-        sys.on(&argv, Ran::ok(""))
-            .on_write(&argv, std::path::Path::new(CC), b"");
-        let _ = run(&sys, &missing(), Mode::Apply);
+    fn a_run_on_the_persons_terminal_holds_a_stop_until_the_root_half_ended_and_the_ask_settled() {
+        let argv = argv();
+        for decider in [crate::init::Decider::Person, crate::init::Decider::Aterm] {
+            for status in [Some(0), Some(82)] {
+                let mut sys = console();
+                sys.stop_after = Some(0);
+                sys.on(
+                    &argv,
+                    Ran {
+                        status,
+                        ..Ran::default()
+                    },
+                );
+                let installs = status == Some(0);
+                if installs {
+                    sys.on_write(&argv, std::path::Path::new(CC), b"");
+                }
+                let row = run(&sys, &decided(decider), Mode::Apply);
+                let calls = sys.calls();
+                let at = |call: &str| calls.iter().position(|seen| seen == call);
+                let ran = at(&argv).expect("the root half ran");
+                let restored = at("stops restored").expect("stops restored");
+                assert!(
+                    at("defer stops").is_some_and(|held| held < ran),
+                    "{decider:?}: no stop is held around the root half: {calls:?}"
+                );
+                assert!(restored > ran, "{decider:?}: {calls:?}");
+                assert!(
+                    calls
+                        .iter()
+                        .position(|seen| seen.starts_with("stop sent again"))
+                        .is_some_and(|sent| sent > restored),
+                    "{decider:?}: the stop is sent again once the run settled: {calls:?}"
+                );
+                // A stop during an install that did not finish is the person's: the ask stays
+                // spent.
+                assert_eq!(
+                    row.outcome,
+                    if installs {
+                        Outcome::Changed
+                    } else {
+                        Outcome::Failed
+                    },
+                    "{decider:?} {status:?}: {row:?}"
+                );
+                if !installs {
+                    assert_eq!(row.why.as_deref(), Some(Unfinished::Stopped.reason()));
+                }
+                if decider == crate::init::Decider::Aterm {
+                    assert!(marked(&sys, BUILD), "{status:?}: {calls:?}");
+                    assert!(
+                        !calls.iter().any(|call| call == &format!("remove {MARK}")),
+                        "{calls:?}"
+                    );
+                } else {
+                    assert!(
+                        !calls
+                            .iter()
+                            .any(|call| call.starts_with("write ") || call.starts_with("remove ")),
+                        "a person's run writes no record: {calls:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// This account's record of aterm's own ask, in the test world.
+    const MARK: &str = "/Users//alice/Library/Application Support/aterm/command-line-tools-tab";
+
+    /// The build that asks.
+    const BUILD: &str = "0.9.0+gabc1234";
+
+    /// The missing tools' item as `decider`'s run composes it, over [`MARK`] and [`BUILD`], the
+    /// person's choices read through `holds` each time the item reads them; a person's run reads
+    /// neither.
+    fn decided_with(
+        decider: crate::init::Decider,
+        holds: impl Fn() -> crate::init::Holds + Send + Sync + 'static,
+    ) -> CommandLineTools {
+        decider
+            .compose(
+                crate::init::Base {
+                    clt: Some(missing()),
+                    ..crate::init::Base::none()
+                },
+                || Unbidden::new(Some(PathBuf::from(MARK)), BUILD.to_owned(), holds),
+            )
+            .clt
+            .expect("base.clt")
+    }
+
+    /// [`decided_with`] where the person's choices hold nothing.
+    fn decided(decider: crate::init::Decider) -> CommandLineTools {
+        decided_with(decider, || crate::init::Holds::NONE)
+    }
+
+    /// The person's Stop of setup in System State.
+    fn stop() -> crate::init::Holds {
+        crate::init::Holds {
+            stopped: Some("you stopped setup in System State".to_owned()),
+            ..crate::init::Holds::NONE
+        }
+    }
+
+    /// Whether the record names `build`.
+    fn marked(sys: &Fake, build: &str) -> bool {
+        aterm_types::clt_mark::opened_on_build(sys, std::path::Path::new(MARK), build)
+    }
+
+    /// In a run aterm decided (the follow-up of a person's own package install or update), the
+    /// first run of a build asks once, claiming the build in the record before `sudo` asks; a
+    /// second run of that build asks nothing, deferred naming the person's step, and so does a
+    /// run after System State's own tab asked on this build; an update's build asks once more,
+    /// keeping the earlier build's line.
+    /// NEGATIVE CONTROL: a person's own run asks every time, writing no record.
+    #[test]
+    fn a_run_aterm_decided_asks_once_per_build_and_a_persons_run_every_time() {
+        let sys = console();
+        let argv = argv();
+        // Apple's window closed without the tools: the person's own press there, which keeps
+        // the ask spent.
+        sys.on(&argv, Ran::exit(88, ""));
+        let aterm = decided(crate::init::Decider::Aterm);
+
+        let row = run(&sys, &aterm, Mode::Apply);
+        assert_eq!(row.outcome, Outcome::Failed, "{row:?}");
         let calls = sys.calls();
-        let at = |call: &str| calls.iter().position(|seen| seen == call);
-        let ran = at(&argv).expect("the root half ran");
-        let forgot = at("/usr/bin/sudo -K").expect("sudo -K ran");
-        assert!(
-            at("defer stops").is_some_and(|held| held < ran),
-            "no stop is held around the root half: {calls:?}"
+        let claimed = calls
+            .iter()
+            .position(|call| *call == format!("write {MARK} 600"))
+            .unwrap_or_else(|| panic!("the ask is claimed: {calls:?}"));
+        let ran = calls.iter().position(|call| *call == argv).unwrap();
+        assert!(claimed < ran, "claimed before sudo asks: {calls:?}");
+        assert_eq!(asked(&sys), std::slice::from_ref(&argv));
+        assert!(marked(&sys, BUILD));
+
+        for mode in [Mode::Plan, Mode::Apply] {
+            let row = run(&sys, &aterm, mode);
+            assert_eq!(row.outcome, Outcome::Deferred, "{mode:?}: {row:?}");
+            assert!(deferred(&row));
+            let why = row.why.unwrap_or_default();
+            assert!(
+                why.contains(ASKED_ON_THIS_BUILD) && why.ends_with(PERSONS_STEP),
+                "{why}"
+            );
+        }
+        assert_eq!(asked(&sys).len(), 1, "asked once: {:?}", sys.calls());
+
+        // The tab's own ask on this build, claimed by the window, holds the follow-up's too.
+        let tabbed = console();
+        assert!(aterm_types::clt_mark::claim(&tabbed, std::path::Path::new(MARK), BUILD).unwrap());
+        let row = run(&tabbed, &aterm, Mode::Apply);
+        assert_eq!(row.outcome, Outcome::Deferred, "{row:?}");
+        assert!(asked(&tabbed).is_empty(), "{:?}", tabbed.calls());
+
+        let update = crate::init::Decider::Aterm.compose(
+            crate::init::Base {
+                clt: Some(missing()),
+                ..crate::init::Base::none()
+            },
+            || {
+                Unbidden::new(
+                    Some(PathBuf::from(MARK)),
+                    "0.9.1+gdef5678".to_owned(),
+                    || crate::init::Holds::NONE,
+                )
+            },
         );
-        assert!(
-            at("stops restored").is_some_and(|restored| restored > forgot),
-            "stops are restored before sudo -K: {calls:?}"
+        let row = run(&sys, update.clt.as_ref().unwrap(), Mode::Apply);
+        assert_eq!(row.outcome, Outcome::Failed, "{row:?}");
+        assert_eq!(asked(&sys).len(), 2, "an update's build asks once more");
+        assert!(marked(&sys, "0.9.1+gdef5678") && marked(&sys, BUILD));
+
+        let person = console();
+        person.on(&argv, Ran::exit(88, ""));
+        let typed = crate::init::Decider::Person.compose(
+            crate::init::Base {
+                clt: Some(missing()),
+                ..crate::init::Base::none()
+            },
+            || panic!("a person's run reads no record and no holds"),
         );
-        assert!(
-            calls
+        let typed = typed.clt.as_ref().unwrap();
+        assert!(aterm_types::clt_mark::claim(&person, std::path::Path::new(MARK), BUILD).unwrap());
+        for _ in 0..2 {
+            assert_eq!(run(&person, typed, Mode::Apply).outcome, Outcome::Failed);
+        }
+        assert_eq!(asked(&person).len(), 2, "{:?}", person.calls());
+        assert_eq!(
+            person
+                .calls()
                 .iter()
-                .position(|seen| seen.starts_with("stop sent again"))
-                .is_some_and(|sent| sent > forgot),
-            "the stop is sent again once sudo -K ran: {calls:?}"
+                .filter(|call| call.starts_with("write ") || call.starts_with("remove "))
+                .count(),
+            1,
+            "only the test's own record write: {:?}",
+            person.calls()
         );
+    }
+
+    /// A run aterm decided asks for no password while the person's choices hold System State's
+    /// own Command Line Tools tab (their Stop, setup records that cannot be read, a newer
+    /// aterm's records) or where the record has no place or cannot be read: deferred, naming why
+    /// and the person's step, writing nothing; a record that cannot say is named as such, never
+    /// as this build's ask. A group turned off holds no tab, so it holds nothing here.
+    #[test]
+    fn a_run_aterm_decided_asks_nothing_under_a_stop() {
+        let newer = crate::init::Holds {
+            newer: true,
+            ..crate::init::Holds::NONE
+        };
+        assert_eq!(held_by(&crate::init::Holds::NONE), None);
+        assert_eq!(held_by(&newer).as_deref(), Some(NEWER));
+        assert!(held_by(&stop()).is_some());
+        let sys = console();
+        sys.on(&argv(), Ran::exit(88, ""));
+        let row = run(
+            &sys,
+            &decided_with(crate::init::Decider::Aterm, stop),
+            Mode::Apply,
+        );
+        assert_eq!(row.outcome, Outcome::Deferred, "{row:?}");
+        let why = row.why.unwrap_or_default();
+        assert!(
+            why.contains("because you stopped setup in System State")
+                && why.ends_with(PERSONS_STEP),
+            "{why}"
+        );
+
+        let nowhere = crate::init::Decider::Aterm.compose(
+            crate::init::Base {
+                clt: Some(missing()),
+                ..crate::init::Base::none()
+            },
+            || Unbidden::new(None, BUILD.to_owned(), || crate::init::Holds::NONE),
+        );
+        let unread = console();
+        unread.link(MARK, "/Users//alice/elsewhere");
+        for (sys, item) in [
+            (&sys, nowhere.clt.as_ref().unwrap()),
+            (&unread, &decided(crate::init::Decider::Aterm)),
+        ] {
+            let row = run(sys, item, Mode::Apply);
+            assert_eq!(row.outcome, Outcome::Deferred, "{row:?}");
+            let why = row.why.unwrap_or_default();
+            assert!(
+                why.contains(UNREAD_RECORD)
+                    && !why.contains(ASKED_ON_THIS_BUILD)
+                    && why.ends_with(PERSONS_STEP),
+                "{why}"
+            );
+        }
+        let why = run(&unread, &decided(crate::init::Decider::Aterm), Mode::Plan)
+            .why
+            .unwrap_or_default();
+        assert!(why.contains(MARK), "names the record it cannot read: {why}");
+
+        for sys in [&sys, &unread] {
+            assert!(asked(sys).is_empty(), "{:?}", sys.calls());
+            assert!(
+                !sys.calls()
+                    .iter()
+                    .any(|call| call.starts_with("write ") || call.starts_with("remove ")),
+                "{:?}",
+                sys.calls()
+            );
+        }
+    }
+
+    /// The person's Stop holds a run aterm decided whenever it is pressed before `sudo` asks:
+    /// composing the run reads none of their choices, its probe reads them, so a Stop recorded
+    /// after the run began (while the base layer or the vault's join ran) defers it, and its apply
+    /// reads them once more right before it claims the ask, so a Stop recorded between the probe
+    /// and the apply asks nothing either (the row fails in the Stop's words, naming the person's
+    /// step). Neither asks or writes the record.
+    /// NEGATIVE CONTROL: with no Stop at either read, the same run asks once.
+    #[test]
+    fn a_stop_pressed_after_the_run_began_holds_its_ask() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let reads = Arc::new(AtomicUsize::new(0));
+        let now = Arc::new(Mutex::new(crate::init::Holds::NONE));
+        let item = decided_with(crate::init::Decider::Aterm, {
+            let (reads, now) = (Arc::clone(&reads), Arc::clone(&now));
+            move || {
+                reads.fetch_add(1, Ordering::SeqCst);
+                now.lock().unwrap().clone()
+            }
+        });
+        assert_eq!(reads.load(Ordering::SeqCst), 0, "composing reads no holds");
+        *now.lock().unwrap() = stop();
+        let sys = console();
+        let row = run(&sys, &item, Mode::Apply);
+        assert_eq!(row.outcome, Outcome::Deferred, "{row:?}");
+        assert!(
+            row.why
+                .as_deref()
+                .is_some_and(|why| why.contains("because you stopped setup in System State")),
+            "{row:?}"
+        );
+        assert!(reads.load(Ordering::SeqCst) > 0);
+
+        for stop_at_apply in [true, false] {
+            let reads = Arc::new(AtomicUsize::new(0));
+            let item = decided_with(crate::init::Decider::Aterm, {
+                let reads = Arc::clone(&reads);
+                move || {
+                    // The probe's read finds no Stop; the apply's, the read after it, finds one.
+                    if reads.fetch_add(1, Ordering::SeqCst) > 0 && stop_at_apply {
+                        stop()
+                    } else {
+                        crate::init::Holds::NONE
+                    }
+                }
+            });
+            let sys = console();
+            sys.on(&argv(), Ran::exit(88, ""));
+            let row = run(&sys, &item, Mode::Apply);
+            assert_eq!(row.outcome, Outcome::Failed, "{stop_at_apply}: {row:?}");
+            assert_eq!(reads.load(Ordering::SeqCst), 2, "{stop_at_apply}");
+            let writes = sys
+                .calls()
+                .into_iter()
+                .filter(|call| call.starts_with("write ") || call.starts_with("remove "))
+                .count();
+            if stop_at_apply {
+                let why = row.why.unwrap_or_default();
+                assert!(
+                    why.contains("because you stopped setup in System State")
+                        && why.ends_with(PERSONS_STEP),
+                    "{why}"
+                );
+                assert!(asked(&sys).is_empty(), "{:?}", sys.calls());
+                assert_eq!(writes, 0, "{:?}", sys.calls());
+            } else {
+                assert_eq!(asked(&sys).len(), 1, "{:?}", sys.calls());
+                assert!(marked(&sys, BUILD));
+            }
+        }
+    }
+
+    /// A run aterm decided and System State's tab of the same build claim one record: where the
+    /// tab's landing claimed the build after this run's probe read the record, this run's claim
+    /// right before `sudo` loses, so it asks nothing (the row fails naming this build's ask and
+    /// the person's step) and never takes back the tab's line, which it did not add.
+    /// NEGATIVE CONTROL: with the record left alone, the same run's claim wins and it asks.
+    #[test]
+    fn a_run_whose_claim_lost_to_the_tab_asks_nothing_and_keeps_the_tabs_line() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for tab_lands in [true, false] {
+            let sys = Arc::new(console());
+            sys.on(&argv(), Ran::exit(82, ""));
+            let reads = Arc::new(AtomicUsize::new(0));
+            let item = decided_with(crate::init::Decider::Aterm, {
+                let (reads, sys) = (Arc::clone(&reads), Arc::clone(&sys));
+                move || {
+                    // The tab lands between this run's probe and its apply: the apply's read of the
+                    // holds, the last before its claim, is when.
+                    if reads.fetch_add(1, Ordering::SeqCst) == 1 && tab_lands {
+                        assert!(
+                            aterm_types::clt_mark::claim(&*sys, std::path::Path::new(MARK), BUILD)
+                                .unwrap()
+                        );
+                    }
+                    crate::init::Holds::NONE
+                }
+            });
+            let row = run(&sys, &item, Mode::Apply);
+            assert_eq!(row.outcome, Outcome::Failed, "{tab_lands}: {row:?}");
+            let calls = sys.calls();
+            if tab_lands {
+                let why = row.why.unwrap_or_default();
+                assert!(
+                    why.contains(ASKED_ON_THIS_BUILD) && why.ends_with(PERSONS_STEP),
+                    "{why}"
+                );
+                assert!(asked(&sys).is_empty(), "{calls:?}");
+                assert!(marked(&sys, BUILD), "the tab's line stays: {calls:?}");
+                assert_eq!(
+                    calls
+                        .iter()
+                        .filter(|call| call.starts_with("write ") || call.starts_with("remove "))
+                        .collect::<Vec<_>>(),
+                    [&format!("write {MARK} 600")],
+                    "the tab's write alone: {calls:?}"
+                );
+            } else {
+                assert_eq!(asked(&sys).len(), 1, "{calls:?}");
+                assert!(
+                    !marked(&sys, BUILD),
+                    "a failed install takes its own line back: {calls:?}"
+                );
+            }
+        }
+    }
+
+    /// A run aterm decided that installed nothing, where no person declined it (a password macOS
+    /// refused, a broken download, a machine's failure), takes its build's line back, so the next
+    /// run of that build asks again; a stop the person sent, Apple's window closed without them
+    /// and the root half's own stop keep it, as the window reads the tab's exits
+    /// ([`Unfinished::keeps_the_ask`]).
+    #[test]
+    fn a_failed_install_takes_the_ask_back_and_a_decline_keeps_it() {
+        for (status, stop, keeps) in [
+            (82, false, false),
+            (83, false, false),
+            (1, false, false),
+            (1, true, true),
+            (85, false, true),
+            (88, false, true),
+        ] {
+            let mut sys = console();
+            if stop {
+                sys.stop_after = Some(0);
+            }
+            sys.on(&argv(), Ran::exit(status, ""));
+            let aterm = decided(crate::init::Decider::Aterm);
+            let row = run(&sys, &aterm, Mode::Apply);
+            assert_eq!(row.outcome, Outcome::Failed, "{status}: {row:?}");
+            assert_eq!(
+                marked(&sys, BUILD),
+                keeps,
+                "{status} {stop}: {:?}",
+                sys.calls()
+            );
+            let calls = sys.calls();
+            if !keeps {
+                let at = |call: &str| calls.iter().position(|seen| seen == call).unwrap();
+                assert!(
+                    at(&argv()) < at(&format!("remove {MARK}"))
+                        && at(&format!("remove {MARK}")) < at("stops restored"),
+                    "taken back once the root half ended, before a stop is sent again: {calls:?}"
+                );
+                assert_eq!(
+                    run(&sys, &aterm, Mode::Plan).outcome,
+                    Outcome::Planned,
+                    "the next run of the build asks again"
+                );
+            }
+        }
+    }
+
+    /// The asks that stay spent are the tab's exits the window keeps its opening on.
+    #[test]
+    fn the_asks_that_stay_spent_are_the_tab_exits_the_window_keeps() {
+        for why in Unfinished::ALL {
+            assert_eq!(
+                why.keeps_the_ask(),
+                [
+                    aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_STOPPED,
+                    aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_WINDOW_CLOSED,
+                    aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_NOT_ADMIN,
+                ]
+                .contains(&why.tab_exit()),
+                "{why:?}"
+            );
+        }
     }
 
     /// `sudo`'s exit says why the tab's install did not finish: 0 done, `sudo`'s own 1 the Mac
@@ -1002,6 +1853,7 @@ mod tests {
             (85, Unfinished::Stopped),
             (86, Unfinished::AppleWindow),
             (87, Unfinished::Other),
+            (88, Unfinished::WindowClosed),
         ] {
             assert_eq!(why.code(), Some(code), "{why:?}");
             assert_eq!(
@@ -1013,7 +1865,7 @@ mod tests {
         for code in [
             Some(2),
             Some(79),
-            Some(88),
+            Some(89),
             Some(101),
             Some(126),
             Some(127),
@@ -1044,7 +1896,7 @@ mod tests {
             let sys = Arc::new(fake);
             let (item, said, tab) = in_tab(&sys, Found::Missing("no developer directory".into()));
             sys.on(
-                &tab_argv(),
+                &argv(),
                 Ran {
                     status,
                     ..Ran::default()
@@ -1067,7 +1919,7 @@ mod tests {
         fake.stop_after = Some(0);
         let sys = Arc::new(fake);
         let (item, _, tab) = in_tab(&sys, Found::Missing("no developer directory".into()));
-        let argv = tab_argv();
+        let argv = argv();
         sys.on(
             &argv,
             Ran {
@@ -1123,7 +1975,7 @@ mod tests {
                         aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_NOT_ADMIN
                     );
                 }
-                Unfinished::Stopped => {
+                Unfinished::Stopped | Unfinished::WindowClosed => {
                     assert_eq!(
                         why.line(),
                         format!(
@@ -1132,7 +1984,11 @@ mod tests {
                     );
                     assert_eq!(
                         why.tab_exit(),
-                        aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_STOPPED
+                        if why == Unfinished::Stopped {
+                            aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_STOPPED
+                        } else {
+                            aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_WINDOW_CLOSED
+                        }
                     );
                 }
                 _ => {
@@ -1151,7 +2007,7 @@ mod tests {
                 codes.push(code);
             }
         }
-        assert_eq!(codes.len(), 8);
+        assert_eq!(codes.len(), 9);
         assert!(TAB_LOW_DATA.contains("Low Data Mode") && TAB_LOW_DATA.contains("Network"));
         assert!(TAB_NOT_ADMIN.contains("administrator"));
         for line in [TAB_INTRO, TAB_INSTALLED] {

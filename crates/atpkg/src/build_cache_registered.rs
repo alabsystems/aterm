@@ -3160,6 +3160,69 @@ mod tests {
     }
 
     #[test]
+    fn package_registers_its_fresh_target_without_adopting_existing_output() {
+        for no_verify in [false, true] {
+            let world = World::new();
+            let machine = super::super::Machine {
+                home: Some(&world.home),
+                root: None,
+                cwd: Some(&world.owner),
+                env: &|_| None,
+                read: &|path| {
+                    if path.starts_with(&world.home) {
+                        super::super::read_config(path)
+                    } else {
+                        Ok(None)
+                    }
+                },
+                writable: &|_| Some(true),
+            };
+            let mut args = vec![
+                "--unverified".into(),
+                "package".into(),
+                format!("--target-dir={}", world.target.display()),
+            ];
+            if no_verify {
+                args.push("--no-verify".into());
+            }
+            assert!(
+                observe_for_producer(
+                    &args,
+                    super::super::Tool::Targo,
+                    &world.home,
+                    &machine,
+                    true
+                )
+                .unwrap()
+            );
+            let receipt = read(&world.path()).unwrap();
+            assert_eq!(receipt.root, world.target);
+            assert_eq!(receipt.owners, vec![world.owner.clone()]);
+            assert!(world.target.join(MARKER).is_file());
+
+            let existing = world.home.join("unmanaged-package.noindex");
+            std::fs::create_dir(&existing).unwrap();
+            std::fs::write(existing.join("keep"), b"owner artifact").unwrap();
+            args[2] = format!("--target-dir={}", existing.display());
+            assert!(
+                observe_for_producer(
+                    &args,
+                    super::super::Tool::Targo,
+                    &world.home,
+                    &machine,
+                    true
+                )
+                .is_err()
+            );
+            assert_eq!(
+                std::fs::read(existing.join("keep")).unwrap(),
+                b"owner artifact"
+            );
+            assert!(!existing.join(MARKER).exists());
+        }
+    }
+
+    #[test]
     fn observations_distinguish_unmanaged_outputs_from_registered_roots() {
         let world = World::new();
         world.build();

@@ -112,7 +112,7 @@ pub fn lay(home: &Path, source: &Path, hold: Option<&Path>) -> Result<Laid, Stri
     atpkg::activate_build(&layout, &build_dir)
         .map_err(|e| format!("cannot activate {}: {e}", build_dir.display()))?;
     let env = atpkg::shim_env::ShimEnv::from_lines(
-        &std::fs::read_to_string(build_dir.with_file_name(format!("{build}.shim-env")))
+        &crate::util::read_regular_text(&build_dir.with_file_name(format!("{build}.shim-env")))
             .unwrap_or_default(),
     );
     let tool = exe

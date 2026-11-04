@@ -35,6 +35,9 @@ mod cross;
 #[path = "run/backlog.rs"]
 mod backlog;
 
+#[path = "run/tallies.rs"]
+mod tallies;
+
 /// What a run hands back.
 pub struct Report {
     pub json: Value,
@@ -1443,7 +1446,7 @@ fn served_line_of(broker: &Broker, spec: &Spec) -> String {
 /// The messaging world: boot, measure, census.
 fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     eprintln!("fabric bench: booting the messaging world");
-    let mut w = boot_world("fbench-msg", spec, &[]);
+    let mut w = boot_world("fbench-msg", spec, &tallies::world_env(spec, &[]));
     w.wait_ready();
     let served = served_line(&w, spec);
     let (a, b) = w.two_sessions();
@@ -1462,25 +1465,41 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         "fabric bench: latency, {} round trips ({} warm-up)",
         spec.samples, spec.warmup
     );
-    let ((lat_raw, bur, paced_raw), heads) = sampled(&w, clock, || {
+    let ((lat_raw, bur, paced_raw, counted), heads) = sampled(&w, clock, || {
         let broker = w.broker.as_ref().expect("the world serves its own broker");
+        // The rounds are the phases; A, which only sends, holds the fence.
+        let mut probe = spec.tally.then(|| tallies::Probe::of(&w, broker, &a));
+        let group = "messaging";
+        if let Some(p) = probe.as_mut() {
+            p.start();
+        }
         let lat = latency(&w, broker, spec, clock, &a, &b);
+        if let Some(p) = probe.as_mut() {
+            p.round(group, "the latency phase, its warm-up included");
+        }
         eprintln!(
             "fabric bench: burst, {} posts from {} senders, at most {BURST_WINDOW} in flight",
             spec.burst,
             spec.burst_senders()
         );
         let bur = burst(&w, broker, spec, clock, &a, &b, lat.since);
+        if let Some(p) = probe.as_mut() {
+            p.round(group, "the burst, its senders' spawn and warm-up included");
+        }
         let paced = (spec.paced_notes > 0).then(|| {
             eprintln!(
                 "fabric bench: paced notes, {} one-way notes {} ms apart",
                 spec.paced_notes,
                 NOTE_PACE.as_millis()
             );
-            paced_notes(&w, broker, spec, clock, &a, &b)
+            let paced = paced_notes(&w, broker, spec, clock, &a, &b);
+            if let Some(p) = probe.as_mut() {
+                p.round(group, "the paced notes");
+            }
+            paced
         });
         await_durable(broker);
-        (lat, bur, paced)
+        (lat, bur, paced, probe.map(tallies::Probe::into_tallies))
     });
     let cal_after = calibrate(&ruler, &w.node, clock, &mut cal_seq);
     let unit = yardstick(&cal_before, &cal_after);
@@ -1615,7 +1634,7 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         paced_report(raw, &recs, &group, &heads, seq_of)
     });
 
-    let json = json!({
+    let mut json = json!({
         "node": w.node.clone(),
         "served": served.trim_end(),
         "head_changes_sampled": heads.acked.len(),
@@ -1792,6 +1811,7 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         fmt_x(burst_ms_per_message),
         fmt_x(burst_x)
     )]);
+    tallies::report(counted.as_ref(), &mut json, &mut md);
     drop(ruler);
     (json, md)
 }
@@ -2080,7 +2100,7 @@ fn attach_table_rows(size: usize, series: &[Vec<f64>; 10], backlog: usize) -> Ve
 /// The attach world: grow the population, restart the bridge `rounds` times at each size, census.
 fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     eprintln!("fabric bench: booting the attach world");
-    let mut w = boot_world("fbench-att", spec, &[]);
+    let mut w = boot_world("fbench-att", spec, &tallies::world_env(spec, &[]));
     w.wait_ready();
     let served = served_line(&w, spec);
     let first = until("aterm's boot session", || {
@@ -2098,6 +2118,10 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         let mailer = first.clone();
         let mut sids = vec![first];
         let mut pid = w.bridge_pid();
+        // A round is one restart: the restarted bridge's whole life, and aterm's handlers from
+        // just before the kill to the attach's last row.
+        let mut counted = spec.tally.then(|| tallies::Tallies::of(&w));
+        let gui = w.gui.as_ref().expect("the world's aterm").id();
         let mut up_since = Instant::now();
         let mut rounds = Vec::new();
         let mut backlogs = Vec::new();
@@ -2138,6 +2162,17 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
                 for _ in 0..spec.rounds {
                     if let Some(rest) = SUPERVISOR_HEALTHY.checked_sub(up_since.elapsed()) {
                         std::thread::sleep(rest);
+                    }
+                    if let Some(t) = counted.as_mut() {
+                        let at = tallies::At {
+                            bridge: pid,
+                            through: 0,
+                            sid: &mailer,
+                            since: mail_since,
+                        };
+                        let now = t.read(&w, &mut mail_ctl, gui, &at);
+                        t.rebase(now);
+                        t.free_wait();
                     }
                     let mark = broker.visible_head();
                     let mut watch = w
@@ -2189,6 +2224,7 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
                         "the live mail `{mail}`: woke at row {woke_at}, listed {listed:?}"
                     );
                     mail_since = woke_at;
+                    let mail_off = listed[0].off;
                     let t_every_mail_seen = (spec.backlog > 0).then(|| {
                         for (i, sid) in sids.iter().enumerate().skip(1) {
                             let text = format!("{mail}-to-{i}");
@@ -2206,6 +2242,17 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
                     });
                     await_attach(&mut watch, &node_subject, &session_subjects, new_pid);
                     drop(watch);
+                    if let Some(t) = counted.as_mut() {
+                        let at = tallies::At {
+                            bridge: new_pid,
+                            through: mail_off,
+                            sid: &mailer,
+                            since: mail_since,
+                        };
+                        let now = t.read(&w, &mut mail_ctl, gui, &at);
+                        let restart = format!("restart {}", size_rounds.len() + 1);
+                        t.round(&format!("attach, {size} session(s)"), restart, now);
+                    }
                     size_rounds.push(Round {
                         sessions: size,
                         mark,
@@ -2241,9 +2288,9 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             rounds.extend(size_rounds);
         }
         await_durable(broker);
-        (rounds, backlogs)
+        (rounds, backlogs, counted)
     });
-    let (rounds, backlogs) = rounds;
+    let (rounds, backlogs, counted) = rounds;
     let cal_after = calibrate(&ruler, &w.node, clock, &mut cal_seq);
     let unit = yardstick(&cal_before, &cal_after);
     let (recs, reopened) = stop_read_then(&mut w, |w| {
@@ -2459,7 +2506,7 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     md.extend(yardstick_rows(&ruler, &cal_before, &cal_after));
     md.extend(normalized);
     md.push(String::new());
-    let json = json!({
+    let mut json = json!({
         "node": w.node.clone(),
         "served": served.trim_end(),
         "head_changes_sampled": heads.acked.len(),
@@ -2468,6 +2515,7 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         "sizes": Value::Array(sizes),
         "backlog": backlog_json,
     });
+    tallies::report(counted.as_ref(), &mut json, &mut md);
     drop(ruler);
     (json, md)
 }

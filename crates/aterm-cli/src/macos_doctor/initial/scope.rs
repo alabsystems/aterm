@@ -291,35 +291,26 @@ fn look_place() -> Option<(std::path::PathBuf, Option<String>, u64)> {
 /// kept answer never stands for.
 pub(super) fn probe_lan() -> VaultHere {
     use access::LanAnswer;
+    use aterm_machines::init_secrets::LanHeard;
     use aterm_secrets::client::ProbeOutcome;
     let probed = aterm_secrets::client::probe_default(PROBE_WAIT);
     if let Some((home, network, now)) = look_place() {
         aterm_machines::init_secrets::keep_look(&home, network, now, &probed);
     }
+    // What the look heard of the switch, by the rule `aterm init`'s look reads too.
+    match aterm_machines::init_secrets::alab_look_heard(&probed) {
+        Some(LanHeard::Reached) => access::lan_answered(LanAnswer::Reached),
+        Some(LanHeard::Refused) => access::lan_answered(LanAnswer::Refused),
+        None => {}
+    }
     match probed {
-        Ok(ProbeOutcome::Found(_)) => {
-            access::lan_answered(LanAnswer::Reached);
-            VaultHere::Found
-        }
-        // Something on this LAN answered at the vault's `.local` address.
-        Ok(ProbeOutcome::NotThisVault(_) | ProbeOutcome::AnotherVault(_)) => {
-            access::lan_answered(LanAnswer::Reached);
-            VaultHere::Absent
-        }
-        // A server there answered with no vault (a 404 or 204), as the join's look reads it;
-        // only a build with no signer built in asks nothing of the network.
-        Ok(ProbeOutcome::Absent) => {
-            if aterm_secrets::client::alab_signer_built_in() {
-                access::lan_answered(LanAnswer::Reached);
-            }
-            VaultHere::Absent
-        }
-        Err(why) => {
-            if aterm_secrets::client::refused_by_local_network(&why) {
-                access::lan_answered(LanAnswer::Refused);
-            }
-            VaultHere::Unreached
-        }
+        Ok(ProbeOutcome::Found(_)) => VaultHere::Found,
+        // Something on this LAN answered at the vault's `.local` address, or a server there
+        // answered with no vault (a 404 or 204), as the join's look reads it.
+        Ok(
+            ProbeOutcome::NotThisVault(_) | ProbeOutcome::AnotherVault(_) | ProbeOutcome::Absent,
+        ) => VaultHere::Absent,
+        Err(_) => VaultHere::Unreached,
     }
 }
 

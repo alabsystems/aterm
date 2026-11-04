@@ -956,13 +956,16 @@ pub static VERBS: &[Verb] = &[
                 'X',
             ),
             short(
-                repeat("--raw-field", "a query pair k=v; a write's JSON body field"),
+                repeat(
+                    "--raw-field",
+                    "a query pair k=v; a write's JSON body field: k[]=v an array element, k[m]=v an object member",
+                ),
                 'f',
             ),
             short(
                 repeat(
                     "--field",
-                    "the same as -f; k=@file is refused; a write's JSON body field",
+                    "the same as -f, but a write's body reads true, false, null and an integer as JSON; k=@file is refused",
                 ),
                 'F',
             ),

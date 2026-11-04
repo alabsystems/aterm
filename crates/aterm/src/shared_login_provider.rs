@@ -280,8 +280,8 @@ impl Approved {
             })
             .transpose()?;
         let class = match requirement(value, "local-class")? {
-            None | Some("dedicated") => accounts::Class::Dedicated,
-            Some("shared") => accounts::Class::Shared,
+            None | Some("dedicated") => accounts::Class::Preferred,
+            Some("shared") => accounts::Class::Pool,
             Some(_) => return Err("unsupported required account class".into()),
         };
         let kind = Kind::of(value, prepared.credential().is_some())?;
@@ -426,7 +426,7 @@ impl Approved {
         if browser.is_some_and(|browser| browser.trim().is_empty()) {
             return Err("invalid required browser profile".into());
         }
-        if requirement(value, "local-class")?.is_some_and(|class| class != row.class.as_str())
+        if requirement(value, "local-class")?.is_some_and(|class| class != row.class.legacy_word())
             || browser.is_some_and(|browser| Some(browser) != row.browser.as_deref())
         {
             return Err("local account policy differs from the approved configuration".into());

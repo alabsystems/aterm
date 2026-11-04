@@ -102,6 +102,7 @@ unknown-registry = "deny"
 unknown-git = "deny"
 # The only registry aterm draws from.
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# No git sources are permitted (the workspace's only path deps are the internal
-# aterm-* crates, which are not "sources" in cargo-deny's sense).
-allow-git = []
+# The core toolchain's CPU lease primitive is the sole Git source. The prefix
+# includes its full immutable revision and the fragment delimiter: a branch,
+# another revision, or another repository is still an unknown source.
+allow-git = ["https://github.com/alabsystems/trust.git?rev=688953728800df761b3fedb85bad56729f04abfb#"]

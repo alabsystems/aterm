@@ -126,6 +126,15 @@ J	a_line_waits_for_another_writers_lock_and_a_hold_past_the_wait_refuses_its_cha
 J	writers_that_cross_the_bound_together_rotate_once_and_none_is_refused	FJ-LOCK	FJ-BOUND
 ```
 
+## 3. Coverage
+
+- All 61 live `#[test]` functions across `src/model.rs` (`M`, 10), `src/scope.rs` (`S`, 11),
+  `src/engine.rs` (`E`, 32), and `src/journal.rs` (`J`, 8) map to the 29 specs in §1.
+
+## 4. Tests that are not spec samples
+
+None.
+
 ## 5. Gaps and disagreements
 
 - **Resolved — `CV-ACTIVATION-CHECK`, `CV-READINESS`, and `CV-READBACK` read-back `to` value.**

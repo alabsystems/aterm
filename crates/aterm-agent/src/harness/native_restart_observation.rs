@@ -6,9 +6,58 @@
 use super::super::native_observe::{self, ObservationBinding, Registration};
 use super::*;
 
-struct Observed {
-    registration: Registration,
-    binding: Option<ObservationBinding>,
+pub(super) struct Observed {
+    pub(super) registration: Registration,
+    pub(super) binding: Option<ObservationBinding>,
+}
+
+fn is_owned_plain_dir(meta: &std::fs::Metadata) -> bool {
+    if !meta.file_type().is_dir() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if meta.uid() != aterm_uds::peer::our_uid() {
+            return false;
+        }
+    }
+    true
+}
+
+fn existing_owned_plain_dir(dir: &std::path::Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) if is_owned_plain_dir(&meta) => Ok(true),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{}: not this user's plain directory", dir.display()),
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+fn ensure_observation_dir(opts: &Opts) -> std::io::Result<std::path::PathBuf> {
+    if !existing_owned_plain_dir(&opts.state)? {
+        std::fs::create_dir_all(&opts.state)?;
+        if !existing_owned_plain_dir(&opts.state)? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{}: not this user's plain directory", opts.state.display()),
+            ));
+        }
+    }
+    let dir = opts.state.join("native-observations");
+    if !existing_owned_plain_dir(&dir)? {
+        std::fs::create_dir_all(&dir)?;
+        if !existing_owned_plain_dir(&dir)? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{}: not this user's plain directory", dir.display()),
+            ));
+        }
+    }
+    Ok(dir)
 }
 
 fn path(opts: &Opts, tab: &str) -> std::path::PathBuf {
@@ -17,7 +66,12 @@ fn path(opts: &Opts, tab: &str) -> std::path::PathBuf {
         .join(aterm_codec::hex::encode_lower(tab.as_bytes()))
 }
 
-fn read(opts: &Opts, tab: &str) -> Option<Observed> {
+pub(super) fn read(opts: &Opts, tab: &str) -> Option<Observed> {
+    if !existing_owned_plain_dir(&opts.state).ok()?
+        || !existing_owned_plain_dir(&opts.state.join("native-observations")).ok()?
+    {
+        return None;
+    }
     let bytes = aterm_uds::runs::read_bounded_regular_text(
         &path(opts, tab),
         (native_observe::MAX_REQUEST * 2) as u64,
@@ -48,7 +102,7 @@ fn read(opts: &Opts, tab: &str) -> Option<Observed> {
     })
 }
 
-fn save(opts: &Opts, tab: &str, observed: &Observed) -> std::io::Result<()> {
+pub(super) fn save(opts: &Opts, tab: &str, observed: &Observed) -> std::io::Result<()> {
     let request = native_observe::Request::Register(observed.registration.clone())
         .encode()
         .ok_or_else(|| std::io::Error::other("invalid passive registration"))?;
@@ -58,8 +112,8 @@ fn save(opts: &Opts, tab: &str, observed: &Observed) -> std::io::Result<()> {
             .encode()
             .ok_or_else(|| std::io::Error::other("invalid passive binding"))?,
     };
-    let path = path(opts, tab);
-    std::fs::create_dir_all(path.parent().expect("observation directory"))?;
+    let dir = ensure_observation_dir(opts)?;
+    let path = dir.join(aterm_codec::hex::encode_lower(tab.as_bytes()));
     let body = format!("{request}\n{binding}\n");
     #[cfg(unix)]
     {

@@ -472,6 +472,47 @@ pub fn config_flags(argv: &[String]) -> Vec<String> {
     out
 }
 
+/// Replace inherited config flags with an admitted native Google profile. Parse values
+/// by Go's flag arity so a flag-looking value cannot become a second option.
+#[cfg(unix)]
+pub(super) fn bound_worker_flags(
+    flags: &[String],
+    gemini: &Path,
+) -> Result<Vec<String>, &'static str> {
+    let directory = gemini
+        .to_str()
+        .filter(|_| gemini.is_absolute())
+        .ok_or("Native agy profile path is unavailable")?;
+    let mut argv = vec![PROGRAM.to_owned()];
+    argv.extend_from_slice(flags);
+    read(&argv).map_err(|_| "Inherited agy flags cannot be rebound")?;
+    let mut result = Vec::new();
+    let mut i = 0;
+    while i < flags.len() {
+        let token = &flags[i];
+        let (name, attached) = flag_token(token).ok_or("Inherited agy flags cannot be rebound")?;
+        let (arity, _) = flag(name).ok_or("Inherited agy flags cannot be rebound")?;
+        let count = if arity == Arity::One && attached.is_none() {
+            2
+        } else {
+            1
+        };
+        if i + count > flags.len() {
+            return Err("Inherited agy flags cannot be rebound");
+        }
+        if name != FLAG_GEMINI_DIR && name != FLAG_APP_DATA_DIR {
+            result.extend_from_slice(&flags[i..i + count]);
+        }
+        i += count;
+    }
+    result.extend([
+        "--gemini_dir".into(),
+        directory.into(),
+        "--app_data_dir=antigravity-cli".into(),
+    ]);
+    Ok(result)
+}
+
 /// The flags of `argv` a worker of this agy starts with: what moves its config
 /// ([`config_flags`]) and what it may do unasked, its parent's permissions (owner ruling
 /// 2026-11-02).

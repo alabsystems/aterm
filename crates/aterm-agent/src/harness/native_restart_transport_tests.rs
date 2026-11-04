@@ -706,3 +706,48 @@ fn rollback_phase_checkpoint_failure_never_sends_precommit_or_commit() {
     drop(client);
     assert_eq!(worker.join().unwrap().len(), 1);
 }
+
+/// NEGATIVE CONTROL: passive observation persistence refuses symlinked `state` or
+/// `state/native-observations` directories without reading or writing through the symlink.
+#[test]
+fn passive_observation_refuses_symlinked_state_directories() {
+    use super::super::native_observe::{ObservationBinding, Registration};
+    use super::observation::{Observed, read, save};
+
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let real_opts = opts(&dir.path().join("real"));
+    let proc = Process::observe(std::process::id()).expect("actual test process");
+    let observed = Observed {
+        registration: Registration {
+            id: "12".repeat(16),
+            host_epoch: "34".repeat(16),
+            vendor: proc.clone(),
+            shell: proc,
+        },
+        binding: Some(ObservationBinding {
+            id: "12".repeat(16),
+            host_epoch: "34".repeat(16),
+            capability: "cd".repeat(32),
+        }),
+    };
+    save(&real_opts, SID, &observed).expect("real state directory saves");
+    assert!(read(&real_opts, SID).is_some());
+
+    let linked_state = opts(&dir.path().join("linked-state"));
+    std::fs::create_dir_all(linked_state.state.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&real_opts.state, &linked_state.state).unwrap();
+    assert!(read(&linked_state, SID).is_none());
+    assert!(save(&linked_state, "other-tab", &observed).is_err());
+    assert!(read(&real_opts, "other-tab").is_none());
+
+    let linked_sub = opts(&dir.path().join("linked-sub"));
+    std::fs::create_dir_all(&linked_sub.state).unwrap();
+    std::os::unix::fs::symlink(
+        real_opts.state.join("native-observations"),
+        linked_sub.state.join("native-observations"),
+    )
+    .unwrap();
+    assert!(read(&linked_sub, SID).is_none());
+    assert!(save(&linked_sub, "other-tab", &observed).is_err());
+    assert!(read(&real_opts, "other-tab").is_none());
+}

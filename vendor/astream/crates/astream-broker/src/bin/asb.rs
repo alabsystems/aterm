@@ -2675,8 +2675,9 @@ fn live_stats(log: &str) -> Result<(), AsbErr> {
     Ok(say(&format!(
         "base={} head={} records={} bytes={} subjects={} producers={} wills={} groups={} \
          replica={} visible={} durable={} connections={} parked_tails={} served={} \
-         flush_barrier={} flush_full={} flush_skipped={} flush_failed={} writer={writer} \
-         pid={} at_ms={} poisoned={poisoned}",
+         flush_barrier={} flush_full={} flush_skipped={} flush_failed={} process_flush_full={} \
+         process_flush_barrier={} process_flush_plain={} writer={writer} pid={} at_ms={} \
+         poisoned={poisoned}",
         h.base,
         h.head,
         h.retained_records,
@@ -2695,6 +2696,9 @@ fn live_stats(log: &str) -> Result<(), AsbErr> {
         h.flushes.full,
         h.flushes.skipped,
         h.flushes.failed,
+        h.process_flushes.full,
+        h.process_flushes.barrier,
+        h.process_flushes.plain,
         h.pid,
         h.written_at_ms,
     ))?)

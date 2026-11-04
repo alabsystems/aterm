@@ -860,7 +860,7 @@ fn run(
     requested: &Path,
     config: &Path,
     args: &[OsString],
-) -> Result<ExitCode, String> {
+) -> Result<std::convert::Infallible, String> {
     let env = cli::Env::from_process()?;
     let home = env.home.as_deref().ok_or("native key launch has no home")?;
     if !config.is_absolute() {
@@ -888,20 +888,19 @@ fn run(
     // No check result is a lease. Reopen both current root bytes and the
     // independently signed execution policy at the final process boundary.
     permits(&approved, &observed, config, deadline)?;
-    #[cfg(unix)]
-    {
-        Err(format!(
-            "native connector did not start: {}",
-            command.exec()
-        ))
-    }
-    #[cfg(not(unix))]
-    {
-        command
-            .status()
-            .map(|status| ExitCode::from(status.code().unwrap_or(1) as u8))
-            .map_err(|_| "native connector did not start".into())
-    }
+    replace_with_connector(command)
+}
+
+// This module is Unix-only: a successful launch replaces the process, so the
+// connector itself delivers its exit status. There is no successful return
+// value for the command dispatcher to convert into a different status.
+fn replace_with_connector(
+    mut command: aterm_uds::spawnfd::Command,
+) -> Result<std::convert::Infallible, String> {
+    Err(format!(
+        "native connector did not start: {}",
+        command.exec()
+    ))
 }
 
 fn wait_selected(
@@ -1118,18 +1117,18 @@ pub(super) fn try_run(args: &[OsString]) -> Option<ExitCode> {
     ) {
         return None;
     }
-    let result = (|| -> Result<Option<Value>, String> {
+    let result = (|| -> Result<Value, String> {
         let paths = Paths::live().map_err(|e| e.to_string())?;
         if verb == "native-key" {
-            return input::command(&paths, &args[2..]).map(Some);
+            return input::command(&paths, &args[2..]);
         }
         if verb == "native-status" {
             if args.len() != 2 {
                 return Err("native-status takes no options".into());
             }
-            return Ok(Some(
+            return Ok(
                 json!({"kind":"historical-native-preparation-observations","authority":"none","current_validity":"unknown","records":records(&paths)?}),
-            ));
+            );
         }
         if verb == "native-run" {
             let provider = args
@@ -1146,8 +1145,7 @@ pub(super) fn try_run(args: &[OsString]) -> Option<ExitCode> {
                 return Err("native-run needs its exact config and argument separator".into());
             }
             let config = Path::new(args.get(5).ok_or("native-run needs its exact config")?);
-            run(provider, Path::new(program), config, &args[7..])?;
-            return Ok(None);
+            match run(provider, Path::new(program), config, &args[7..])? {}
         }
         if args.get(2).is_some_and(|arg| arg == "set")
             && args.len() == 6
@@ -1155,12 +1153,7 @@ pub(super) fn try_run(args: &[OsString]) -> Option<ExitCode> {
             && args[5] == "--automatic"
         {
             let account = super::digest(args[4].to_str().ok_or("native account is not UTF-8")?)?;
-            return Ok(Some(set_policy_mode(
-                &paths.home,
-                account,
-                Vec::new(),
-                true,
-            )?));
+            return set_policy_mode(&paths.home, account, Vec::new(), true);
         }
         if args.get(2).is_none_or(|arg| arg != "set")
             || args.len() != 7
@@ -1176,11 +1169,10 @@ pub(super) fn try_run(args: &[OsString]) -> Option<ExitCode> {
         } else {
             warm.split(',').map(str::to_owned).collect()
         };
-        Ok(Some(set_policy(&paths.home, account, warm)?))
+        set_policy(&paths.home, account, warm)
     })();
     Some(match result {
-        Ok(Some(value)) => aterm_uds::stdout::answer_exit("aterm", &format!("{value}\n"), 0),
-        Ok(None) => ExitCode::SUCCESS,
+        Ok(value) => aterm_uds::stdout::answer_exit("aterm", &format!("{value}\n"), 0),
         Err(why) => {
             eprintln!("aterm: {why}");
             ExitCode::FAILURE

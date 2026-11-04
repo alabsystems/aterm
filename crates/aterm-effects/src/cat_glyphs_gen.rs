@@ -149,8 +149,9 @@ pub const GLYPH_IDS: &[CatGlyphId] = &[
     CatGlyphId::AccCrown,
 ];
 
-/// Every roster glyph's const drawlist, indexed by [`CatGlyphId`] order.
-pub const GLYPHS: &[GlyphDef] = &[
+/// Every roster glyph's drawlist, indexed by [`CatGlyphId`] order.
+/// A `static`, so the binary holds one copy (a `const` is copied into each crate that reads it).
+pub static GLYPHS: &[GlyphDef] = &[
     // S100 (s1_00)
     GlyphDef { id: "s1_00", kind: GlyphKind::Head, aspect_x1000: 1212, eye_y: 2212, center_x: 2048, word_top: 4096, layers: &[
         Layer { role: GlyphRole::Outline, recolor: Recolor::Fixed, fill: 0x302936, paths: &[

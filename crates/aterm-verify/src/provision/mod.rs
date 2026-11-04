@@ -549,6 +549,11 @@ pub fn provide_for(
     if matches!(row.install, Install::Rustup { .. }) {
         return rustup_row(row, &t, opts.linux, machine, host, say);
     }
+    if matches!(row.install, Install::Cargo)
+        && let Err(why) = bindgen_dependencies(machine, host)
+    {
+        return State::Failed(format!("{} oracle dependencies: {why}", row.name));
+    }
     let exe = t.dir.join(&t.exe);
     if complete(&t) {
         place::touch_stamp(&t.dir);
@@ -837,6 +842,42 @@ fn files_row(
     place::write_stamp(&tree, &t.stamp(row.name, url, "sha256", None))?;
     place::place(&scratch, &tree, &t.dir, &|| complete(t))?;
     Ok(t.dir.join(&t.exe))
+}
+
+/// Fetch the library side of the oracle too: installing the CLI does not cache
+/// `wasm-bindgen`, and the oracle deliberately builds offline.
+fn bindgen_dependencies(machine: &Machine, host: &dyn Host) -> Result<(), String> {
+    let scratch = place::Scratch::new(&machine.tooling, "wasm-bindgen-dependencies")?;
+    let manifest = scratch.path().join("Cargo.toml");
+    std::fs::write(
+        &manifest,
+        format!(
+            "[package]\nname = \"aterm-bindgen-dependencies\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\
+             [workspace]\n[lib]\npath = \"lib.rs\"\n\
+             [dependencies]\nwasm-bindgen = \"={}\"\n",
+            crate::wasm_glue::BINDGEN
+        ),
+    )
+    .map_err(|e| format!("could not write oracle dependency manifest: {e}"))?;
+    std::fs::write(scratch.path().join("lib.rs"), "")
+        .map_err(|e| format!("could not write oracle dependency library: {e}"))?;
+    let mut fetch = Spawn {
+        program: host.targo()?,
+        args: vec![
+            "fetch".into(),
+            "--manifest-path".into(),
+            manifest.into_os_string(),
+            "--offline".into(),
+        ],
+        cwd: scratch.path().to_path_buf(),
+        set: Vec::new(),
+        remove: fish::removed(),
+    };
+    if host.run(&fetch).is_err() {
+        fetch.args.pop();
+        host.run(&fetch)?;
+    }
+    Ok(())
 }
 
 fn cargo_row(

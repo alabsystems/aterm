@@ -108,7 +108,7 @@ impl Job {
         launch(dir, &label, line, cwd, log)?;
         let end = Instant::now() + crate::instance::BOOT;
         loop {
-            if let Some(pid) = std::fs::read_to_string(dir.join(PID_FILE))
+            if let Some(pid) = crate::util::read_regular_text(&dir.join(PID_FILE))
                 .ok()
                 .and_then(|s| s.trim().parse::<i32>().ok())
             {
@@ -304,7 +304,7 @@ pub fn band_main(args: &[String]) -> i32 {
         remove(label);
         return 0;
     }
-    let env: Vec<(String, String)> = match std::fs::read(dir.join(ENV_FILE)) {
+    let env: Vec<(String, String)> = match crate::util::read_regular_file(&dir.join(ENV_FILE)) {
         Ok(bytes) => bytes
             .split(|b| *b == 0)
             .filter_map(|kv| {

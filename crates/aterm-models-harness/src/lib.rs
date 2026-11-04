@@ -150,6 +150,7 @@ mod models_codex_stored_identity;
 mod models_codex_usage_walls;
 mod models_cold_resume_capability;
 mod models_cold_resume_environment;
+mod models_custody;
 mod models_disk;
 mod models_disk_discovery_cycle;
 mod models_disk_projected;
@@ -295,6 +296,7 @@ pub use models_codex_stored_identity::codex_stored_identity_model;
 pub use models_codex_usage_walls::codex_usage_walls_model;
 pub use models_cold_resume_capability::cold_resume_capability_model;
 pub use models_cold_resume_environment::cold_resume_environment_model;
+pub use models_custody::line_custody_model;
 pub use models_disk::{
     disk_await_liveness, disk_await_model, disk_free_ask_model, disk_reclaim_pass_model,
 };

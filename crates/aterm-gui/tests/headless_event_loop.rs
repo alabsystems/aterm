@@ -268,6 +268,13 @@ mod macos {
     const HANG: Duration = Duration::from_secs(60);
     const DEADLINE: Duration = Duration::from_millis(120);
     const WATCHDOG: Duration = Duration::from_secs(2 * HANG.as_secs());
+    /// The lost-wake watch's stamps (`lat_epoch` ns): its session's wake is posted, then the
+    /// watch is handed the turn that begins the cut phase, the turn whose drain met the held
+    /// sender, and the turn that hands out the held sender's events.
+    const WAKE_POSTED_NS: u64 = 1_000_000_000;
+    const PASS_BEFORE_CUT_NS: u64 = WAKE_POSTED_NS + 1_000_000;
+    const PASS_AT_CUT_NS: u64 = WAKE_POSTED_NS + 2_000_000;
+    const PASS_AFTER_CUT_NS: u64 = WAKE_POSTED_NS + 3_000_000;
 
     enum Ev {
         Clone(usize, Instant),
@@ -278,7 +285,8 @@ mod macos {
     }
 
     /// The phase that makes a turn's drain of user events meet a send in progress, so
-    /// `user_events_drained` must say that drain did not empty the queue.
+    /// `user_events_drained` must say that drain did not empty the queue, and the lost-wake watch
+    /// `App::about_to_wait` hands that turn to must heal no wake the drain could have left queued.
     enum Cut {
         /// The clones and the main queue's answer are still arriving.
         Waiting,
@@ -309,6 +317,9 @@ mod macos {
         cut: Cut,
         before: bool,
         behind: bool,
+        /// The lost-wake watch `App::about_to_wait` hands each turn to, over one session whose
+        /// wake is posted as the cut phase begins and never handled.
+        wake_watch: aterm_gui::OutputWakeWatchProbe,
         deadline_armed: Option<Instant>,
         turns_while_waiting: u32,
         deadline_slept: Option<Duration>,
@@ -397,6 +408,12 @@ mod macos {
         fn about_to_wait(&mut self, el: &ActiveEventLoop) {
             self.cut = match std::mem::replace(&mut self.cut, Cut::Done) {
                 Cut::Due => {
+                    if !self.wake_watch.post(WAKE_POSTED_NS) {
+                        fail("the watched session's output wake did not post on its clear latch");
+                    }
+                    if self.wake_watch.end_turn(el, PASS_BEFORE_CUT_NS) {
+                        fail("the lost-wake watch healed a wake at the first pass that saw it");
+                    }
                     let proxy = self
                         .cut_proxy
                         .take()
@@ -431,6 +448,14 @@ mod macos {
                              still queued (the lost-wake watchdog would heal it falsely)",
                         );
                     }
+                    if self.wake_watch.end_turn(el, PASS_AT_CUT_NS) {
+                        fail(
+                            "the lost-wake watch, handed a turn whose drain met a sender \
+                             part-way through its push, healed a wake posted before its previous \
+                             pass, which may be queued behind that send: the turn's drain verdict \
+                             did not reach the watch",
+                        );
+                    }
                     let _ = release.send(());
                     Cut::Released
                 }
@@ -439,6 +464,13 @@ mod macos {
                         fail(
                             "the turn that handed out the held sender's events, with no sender \
                              left, said its drain did not empty the queue",
+                        );
+                    }
+                    if !self.wake_watch.end_turn(el, PASS_AFTER_CUT_NS) {
+                        fail(
+                            "the lost-wake watch, handed a turn whose drain emptied the queue, \
+                             kept a wake posted before its previous pass that nothing handled: \
+                             that drain proves it lost",
                         );
                     }
                     let now = Instant::now();
@@ -491,6 +523,7 @@ mod macos {
             cut: Cut::Waiting,
             before: false,
             behind: false,
+            wake_watch: aterm_gui::OutputWakeWatchProbe::default(),
             deadline_armed: None,
             turns_while_waiting: 0,
             deadline_slept: None,
@@ -534,7 +567,8 @@ mod macos {
             .unwrap_or_default();
         println!(
             "headless_event_loop: ok — {CLONES} proxy clones delivered (worst {worst:?}), the main \
-             queue drained, a drain that met a send in progress said so, a {DEADLINE:?} \
+             queue drained, a drain that met a send in progress said so and the lost-wake watch \
+             it was handed healed nothing until a drain emptied the queue, a {DEADLINE:?} \
              WaitUntil slept {slept:?}, and NSApp stayed nil"
         );
     }

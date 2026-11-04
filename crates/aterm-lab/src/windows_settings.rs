@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Three real Settings regressions under explicit, non-powering Windows custody.
+//! Bounded real Settings observations under explicit, non-powering Windows custody.
 //! Application control input is labelled separately from USB keyboard/tablet input.
 
 use std::cell::Cell;
@@ -93,6 +93,8 @@ struct Scenario<'a> {
     session: &'a Session<'a>,
     out: &'a Path,
     native_release_unconfirmed: Cell<bool>,
+    geometry_call: Cell<u32>,
+    scroll_call: Cell<u32>,
 }
 
 impl Scenario<'_> {
@@ -100,11 +102,14 @@ impl Scenario<'_> {
         self.held
             .check(&self.up.layout)
             .map_err(|e| format!("{e:?}"))?;
+        let (birth, image) = self.session.owned_identity()?;
         window::desk(
             self.up,
             &[
-                "hit",
+                "hit-owned",
                 &self.session.pid.to_string(),
+                birth,
+                image,
                 ATERM_CLASS,
                 &x.to_string(),
                 &y.to_string(),
@@ -112,25 +117,43 @@ impl Scenario<'_> {
         )
     }
 
-    fn whole_named_at(&self, layout: &Layout, key: &str, x: i32, y: i32) -> Result<bool, String> {
+    fn whole_named_at(
+        &self,
+        layout: &Layout,
+        key: &str,
+        x: i32,
+        y: i32,
+        mapping: NativeMapping,
+        label: &str,
+    ) -> Result<bool, String> {
+        if layout.scale != 1.0 || self.view()?.parse::<u64>().ok() != Some(mapping.view) {
+            return Err("native inverse mapping view/scale changed".into());
+        }
         let placed = window::desk(
             self.up,
             &["place", &self.session.pid.to_string(), ATERM_CLASS],
         )?;
         let placed = desk::parse_place(&placed).ok_or("client origin unavailable")?;
-        let point = (
-            f64::from(x - placed.at.0) / layout.scale,
-            f64::from(y - placed.at.1) / layout.scale,
-        );
+        let raw = self.observed_ctl(label, &["pointer", "status"])?;
+        let current = native_mapping(&raw, &mapping.view.to_string(), key, layout.scale)?;
+        let point = mapping
+            .inverse((x, y), placed.at)
+            .ok_or("native inverse mapping overflow")?;
+        if current.origin != mapping.origin
+            || current.screen(placed.at)? != (x, y)
+            || current.logical != point
+        {
+            return Ok(false);
+        }
         Ok(Scenario::whole(layout, key)
-            && layout
-                .nodes
-                .iter()
-                .any(|n| n.key == key && n.rect.contains(point.0, point.1))
+            && layout.nodes.iter().any(|node| {
+                node.key == key && node.rect.contains(f64::from(point.0), f64::from(point.1))
+            })
             && key
                 .strip_prefix("settings/control/")
                 .is_some_and(|setting| named_whole(layout, setting)))
     }
+
     fn only_window(&self) -> Result<desk::Window, String> {
         let raw = window::desk(self.up, &["windows", &self.session.pid.to_string()])?;
         let mut owned = desk::parse_windows(&raw)
@@ -171,25 +194,249 @@ impl Scenario<'_> {
 
     // Change only the owned app client size. Refuse an OS-clamped/unrepresentable
     // viewport rather than silently replacing the regression's content dimensions.
-    fn viewport(&self, width: f64, height: f64) -> Result<(), String> {
-        for _ in 0..4 {
-            let (_, layout) = self.layout()?;
-            if (layout.viewport.w - width).abs() <= 0.5 && (layout.viewport.h - height).abs() <= 0.5
-            {
-                return Ok(());
-            }
-            let w = self.only_window()?;
-            let cw = (f64::from(w.client.0) + (width - layout.viewport.w) * layout.scale).round();
-            let ch = (f64::from(w.client.1) + (height - layout.viewport.h) * layout.scale).round();
-            if !(1.0..=8192.0).contains(&cw) || !(1.0..=8192.0).contains(&ch) {
-                return Err("requested native viewport is unrepresentable".into());
-            }
-            self.ctl(&["resize", "px", &cw.to_string(), &ch.to_string()])?;
-            self.settled()?;
+
+    fn observed_ctl(&self, label: &str, words: &[&str]) -> Result<String, String> {
+        self.held
+            .check(&self.up.layout)
+            .map_err(|e| format!("{e:?}"))?;
+        self.session.ctl_observed(words, |code, raw| {
+            retain(
+                self.out,
+                &format!("{label}.txt"),
+                &format!("request={}\nexit={code:?}\n{raw}", words.join(" ")),
+            )
+        })
+    }
+
+    fn optional_ctl(&self, label: &str, words: &[&str]) -> Result<(), String> {
+        self.held
+            .check(&self.up.layout)
+            .map_err(|e| format!("{e:?}"))?;
+        let mut recorded = false;
+        let answer = self.session.ctl_observed(words, |code, raw| {
+            retain(
+                self.out,
+                &format!("{label}.txt"),
+                &format!("request={}\nexit={code:?}\n{raw}", words.join(" ")),
+            )?;
+            recorded = true;
+            Ok(())
+        });
+        if !recorded {
+            return Err(answer
+                .err()
+                .unwrap_or_else(|| "command receipt was not retained".into()));
         }
-        Err(format!(
-            "owned window cannot realize native content viewport {width}x{height}; no product verdict"
-        ))
+        if let Err(error) = answer {
+            retain(
+                self.out,
+                &format!("{label}-unavailable.txt"),
+                &format!(
+                    "diagnostic=Unavailable\nrequest={}\nreason={error}\n",
+                    words.join(" ")
+                ),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn geometry(&self, label: &str) -> Result<(Layout, desk::Window, GridObservation), String> {
+        let tabs = self.observed_ctl(&format!("{label}-tabs"), &["inspect", "app/v1", "tabs"])?;
+        let view = settings_view(&tabs).ok_or("no actual Settings view")?;
+        let audit = self.observed_ctl(
+            &format!("{label}-audit"),
+            &["inspect", "app/v1", "view", &view, "audit"],
+        )?;
+        let layout = measure::parse_layout(&audit)?;
+        self.observed_ctl(
+            &format!("{label}-tree"),
+            &["inspect", "app/v1", "view", &view, "tree"],
+        )?;
+        for (name, words) in [
+            ("dims", vec!["dims"]),
+            ("status", vec!["status"]),
+            ("resizes", vec!["resizes"]),
+            ("text-scale", vec!["text-scale"]),
+        ] {
+            self.optional_ctl(&format!("{label}-{name}"), &words)?;
+        }
+        self.held
+            .check(&self.up.layout)
+            .map_err(|e| format!("{e:?}"))?;
+        let raw = window::desk(self.up, &["windows", &self.session.pid.to_string()])?;
+        retain(self.out, &format!("{label}-win32.txt"), &raw)?;
+        let mut owned = desk::parse_windows(&raw)
+            .into_iter()
+            .filter(|w| w.class == ATERM_CLASS);
+        let owned_window = owned.next().ok_or("no owned visible app window")?;
+        if owned.next().is_some() {
+            return Err("multiple owned app windows; target is ambiguous".into());
+        }
+        let monitors = window::desk(self.up, &["monitors"])?;
+        retain(self.out, &format!("{label}-monitors.txt"), &monitors)?;
+        retain(
+            self.out,
+            &format!("{label}-logical.txt"),
+            &format!(
+                "viewport={:?}\nscale={}\nwindow={owned_window:?}\n",
+                layout.viewport, layout.scale
+            ),
+        )?;
+        let identity = grid_observation(&tabs, &audit)?;
+        Ok((layout, owned_window, identity))
+    }
+
+    fn place_on_existing_monitor(&self, case: &str, label: &str) -> Result<(), String> {
+        self.held
+            .check(&self.up.layout)
+            .map_err(|e| format!("{e:?}"))?;
+        let before = self.only_window()?;
+        let raw = window::desk(self.up, &["monitors"])?;
+        retain(self.out, &format!("{label}-placement-monitors.txt"), &raw)?;
+        let pointer = case == "terminal-pointer";
+        let monitor = desk::parse_monitors(&raw)
+            .into_iter()
+            .find(|monitor| {
+                monitor.primary == pointer
+                    && monitor.dpi == before.dpi
+                    && before.rect.width() <= monitor.rect.width()
+                    && before.rect.height() <= monitor.rect.height()
+            })
+            .ok_or("no same-DPI existing monitor can contain the owned case window")?;
+        let x = monitor.rect.l + (monitor.rect.width() - before.rect.width()) / 2;
+        let y = monitor.rect.t + (monitor.rect.height() - before.rect.height()) / 2;
+        let (birth, image) = self.session.owned_identity()?;
+        let moved = window::desk(
+            self.up,
+            &[
+                "move-owned",
+                &self.session.pid.to_string(),
+                birth,
+                image,
+                ATERM_CLASS,
+                &x.to_string(),
+                &y.to_string(),
+                &before.dpi.to_string(),
+            ],
+        )?;
+        retain(
+            self.out,
+            &format!("{label}-placement-move.txt"),
+            &format!(
+                "case={case}\npointer_case_primary_only={pointer}\nbefore={before:?}\nselected={monitor:?}\n{moved}"
+            ),
+        )?;
+        if !moved.trim().starts_with("owned-move hwnd=") {
+            return Err("exact owned-window placement was not acknowledged".into());
+        }
+        let after = self.only_window()?;
+        retain(
+            self.out,
+            &format!("{label}-placement-after.txt"),
+            &format!("{after:?}\n"),
+        )?;
+        if after.dpi != before.dpi
+            || after.rect.width() != before.rect.width()
+            || after.rect.height() != before.rect.height()
+            || after.rect.l != x
+            || after.rect.t != y
+            || !monitor_contains(monitor.rect, after.rect)
+        {
+            return Err(
+                "owned window is not wholly contained on its selected same-DPI monitor".into(),
+            );
+        }
+        Ok(())
+    }
+
+    fn grid_viewport(
+        &self,
+        case: &str,
+        original: (u16, u16),
+        declared: (u16, u16),
+    ) -> Result<(), String> {
+        let projected = projected_grid(original.0, original.1)?;
+        if projected != declared {
+            return Err("declared grid differs from the explicit ceiling projection".into());
+        }
+        let (rows, cols) = declared;
+        let width = f64::from(cols) * 9.0 + 24.0;
+        let height = f64::from(rows) * 23.0 + 12.0;
+        let call = self.geometry_call.get();
+        self.geometry_call.set(
+            call.checked_add(1)
+                .ok_or("geometry record sequence exhausted")?,
+        );
+        retain(
+            self.out,
+            &format!("grid-{call}-case.txt"),
+            &format!(
+                "case={case}\noriginal_exact_pixels={}x{}\noriginal_physical_acceptance=UNREPRESENTABLE\nqualification_kind=explicit-reachable-grid\ndeclared_rows={rows}\ndeclared_cols={cols}\nsource_bound_cell_px=9x23\nsource_bound_pad_px=12\nsource_bound_device_scale=1\nceil_projection=(height-12)/23,(width-24)/9\nprojected_logical={width}x{height}\n",
+                original.0, original.1
+            ),
+        )?;
+        let (before, _, identity) = self.geometry(&format!("grid-{call}-before"))?;
+        if before.scale != 1.0
+            || before.viewport.w != f64::from(identity.cols) * 9.0 + 24.0
+            || before.viewport.h != f64::from(identity.rows) * 23.0 + 12.0
+        {
+            return Err(
+                "actual source-bound cell/padding metrics differ; explicit grid case unavailable"
+                    .into(),
+            );
+        }
+        self.observed_ctl(
+            &format!("grid-{call}-request"),
+            &["resize", &rows.to_string(), &cols.to_string()],
+        )?;
+        let changed = (identity.rows, identity.cols) != declared;
+        let mut poll = 0u32;
+        let mut fatal = None;
+        let matched = window::within("declared grid and presented native geometry", || {
+            let label = format!("grid-{call}-observed-{poll}");
+            poll += 1;
+            let observed = match self.geometry(&label) {
+                Ok(value) => value,
+                Err(error) => {
+                    fatal = Some(error);
+                    return Ok(None);
+                }
+            };
+            let (layout, _, now) = &observed;
+            let ready = (now.rows, now.cols) == declared
+                && layout.scale == 1.0
+                && layout.viewport.w == width
+                && layout.viewport.h == height
+                && now.presented
+                && now.current
+                && (!changed
+                    || (now.geometry != identity.geometry && now.capture > identity.capture))
+                && now.presentation >= identity.presentation;
+            if ready {
+                Ok(Some(observed))
+            } else {
+                Err(format!(
+                    "waiting for declared grid={declared:?}, observed={now:?}, viewport={:?}",
+                    layout.viewport
+                ))
+            }
+        })?;
+        if let Some(error) = fatal {
+            return Err(error);
+        }
+        matched.ok_or_else(|| "required geometry observation unavailable".to_string())?;
+        self.place_on_existing_monitor(case, &format!("grid-{call}"))?;
+        let (placed, _, placed_grid) = self.geometry(&format!("grid-{call}-placed"))?;
+        if (placed_grid.rows, placed_grid.cols) != declared
+            || placed.viewport.w != width
+            || placed.viewport.h != height
+            || placed.scale != 1.0
+            || !placed_grid.presented
+            || !placed_grid.current
+        {
+            return Err("native geometry changed after same-DPI owned placement".into());
+        }
+        Ok(())
     }
 
     fn settled(&self) -> Result<(), String> {
@@ -209,20 +456,15 @@ impl Scenario<'_> {
 
     fn capture(&self, label: &str, transport: &str) -> Result<Layout, String> {
         self.settled()?;
-        let owned = self.only_window()?;
-        let (audit, layout) = self.layout()?;
-        let view = self.view()?;
+        let context = format!("{label}-context");
+        let (layout, owned, identity) = self.geometry(&context)?;
+        if !identity.presented || !identity.current {
+            return Err("native capture does not describe current presented geometry".into());
+        }
+        self.optional_ctl(&format!("{label}-metrics"), &["metrics"])?;
         let mut text = format!(
-            "input_transport={transport}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
-            self.ctl(&["text-scale"])?,
-            self.ctl(&["dims"])?,
-            self.ctl(&["status"])
-                .unwrap_or_else(|e| format!("status=unknown detail={e}")),
-            self.ctl(&["metrics"])
-                .unwrap_or_else(|e| format!("metrics=unknown detail={e}")),
-            self.ctl(&["inspect", "app/v1", "tabs"])?,
-            self.ctl(&["inspect", "app/v1", "view", &view, "tree"])?,
-            audit
+            "input_transport={transport}\nrequired_inspection_context={context}\nidentity={identity:?}\nviewport={:?}\nscale={}\n",
+            layout.viewport, layout.scale
         );
         let remote = format!("{}\\{label}.ppm", self.session.dir);
         self.held
@@ -276,10 +518,28 @@ impl Scenario<'_> {
     }
 
     fn scroll_to(&self, key: &str) -> Result<(), String> {
+        let call = self.scroll_call.get();
+        self.scroll_call.set(
+            call.checked_add(1)
+                .ok_or("scroll record sequence exhausted")?,
+        );
+        let mut walk = format!(
+            "target={key}\nmax_manual_inputs=32\nmanual_input_protocol=one-semantic-line-per-input\nsource_verb=pointer wheel dy=1 unit=lines\n"
+        );
         // Each input is a distinct manual scroll, not a retry of a failed check.
-        for _ in 0..32 {
+        for step in 0..32 {
             let (_, layout) = self.layout()?;
+            self.optional_ctl(
+                &format!("scroll-{call}-{step}-prefs"),
+                &["controls", "prefs"],
+            )?;
+            walk.push_str(&format!(
+                "step={step} viewport={:?} target_paint={:?}\n",
+                layout.viewport,
+                layout.nodes.iter().find(|node| node.key == key)
+            ));
             if Self::whole(&layout, key) {
+                retain(self.out, &format!("scroll-{call}-walk.txt"), &walk)?;
                 return Ok(());
             }
             let xy = format!(
@@ -287,10 +547,18 @@ impl Scenario<'_> {
                 layout.viewport.x + layout.viewport.w / 2.0,
                 layout.viewport.y + layout.viewport.h / 2.0
             );
-            self.ctl(&["pointer", "wheel", "dy=120", "unit=pt", &xy])?;
+            self.ctl(&["pointer", "wheel", "dy=1", "unit=lines", &xy])?;
             self.settled()?;
         }
-        Err(format!("{key} not whole after bounded manual scroll walk"))
+        retain(self.out, &format!("scroll-{call}-walk.txt"), &walk)?;
+        let diagnostic = self.capture(
+            &format!("scroll-{call}-unreached"),
+            "bounded application-control wheel walk exhausted; no focus or keyboard input",
+        );
+        Err(format!(
+            "{key} not whole after bounded manual scroll walk; final_capture={:?}",
+            diagnostic.as_ref().map(|_| ()).map_err(String::as_str)
+        ))
     }
 }
 
@@ -346,6 +614,8 @@ fn run_inner(up: &Up, held: &HeldVm, ask: &Ask) -> Result<(), String> {
         session: &session,
         out: &ask.out,
         native_release_unconfirmed: Cell::new(false),
+        geometry_call: Cell::new(0),
+        scroll_call: Cell::new(0),
     };
     let result = (|| {
         let identity = up.ssh.run(&format!("type {}\\identity.json", session.dir));
@@ -473,21 +743,6 @@ fn bool_control(tree: &str, key: &str) -> Option<bool> {
     })
 }
 
-fn button_state(text: &str) -> Option<bool> {
-    match text
-        .split_whitespace()
-        .find_map(|word| word.strip_prefix("left_down="))?
-    {
-        "0" => Some(false),
-        "1" => Some(true),
-        _ => None,
-    }
-}
-
-fn owned_button(text: &str, down: bool) -> bool {
-    text.split_whitespace().any(|word| word == "target-owned=1") && button_state(text) == Some(down)
-}
-
 fn cases(s: &Scenario<'_>) -> Result<(), String> {
     let mut refused = Vec::new();
     for (name, case) in [
@@ -495,6 +750,7 @@ fn cases(s: &Scenario<'_>) -> Result<(), String> {
             "cursor-history",
             history as fn(&Scenario<'_>) -> Result<(), String>,
         ),
+        ("sound-value", sound),
         ("terminal-pointer", pointer),
         ("appearance-tab", tab),
     ] {
@@ -512,7 +768,7 @@ fn cases(s: &Scenario<'_>) -> Result<(), String> {
     retain(
         s.out,
         "OBSERVATIONS.txt",
-        "Three bounded real-window cases scheduled; per-case records distinguish observations from cases not attempted. UNCONFIRMED means no acceptance verdict. Chrome-history and label/control association require review of retained geometry/pixels; this tool does not declare the library invariants proved. Application-control pointer is synthetic; native USB tablet/button and keyboard observations are separately labelled.\n",
+        "Four bounded real-window cases scheduled; per-case records distinguish observations from cases not attempted. UNCONFIRMED means no acceptance verdict. Chrome-history and label/control association require review of retained geometry/pixels; this tool does not declare the library invariants proved. Application-control pointer and Sound PageDown are synthetic application-control input; native USB tablet/button and keyboard observations are separately labelled.\n",
     )?;
     if refused.is_empty() {
         Ok(())
@@ -525,7 +781,7 @@ fn history(s: &Scenario<'_>) -> Result<(), String> {
     let anchor = "settings/cursor-style/rainbow-kitty-underline";
     s.open("/cursor-styles")?;
     s.ctl(&["text-scale", "1"])?;
-    s.viewport(318.0, 516.0)?;
+    s.grid_viewport("cursor-history", (318, 516), (22, 33))?;
     s.scroll_to(anchor)?;
     s.capture("history-1x", "application-control wheel")?;
     s.ctl(&["text-scale", "2"])?;
@@ -548,16 +804,125 @@ fn history(s: &Scenario<'_>) -> Result<(), String> {
     Ok(())
 }
 
+fn sound(s: &Scenario<'_>) -> Result<(), String> {
+    let key = "settings/control/trail_sound_style";
+    s.open("/sound")?;
+    s.ctl(&["text-scale", "2"])?;
+    s.grid_viewport("sound-value", (278, 264), (11, 29))?;
+    let mut walk = String::from(
+        "case=sound-value\nsupported_minimum=278x264\ndeclared_grid=29cols11rows\nprojected_viewport=285x265\ntext_scale=2\ninput_transport=application-control key pagedown\nmax_manual_inputs=32\nprivate_trail_sound_style=default\nstress_164x98_physical_scope=NOT_EXERCISED\nno_choice_or_audio_action=true\n",
+    );
+    retain(s.out, "sound-value-contract.txt", &walk)?;
+    for step in 0..=32 {
+        s.settled()?;
+        let scale = s.observed_ctl(&format!("sound-step-{step}-text-scale"), &["text-scale"])?;
+        let fields = measure::fields(scale.trim());
+        if one_field(&fields, "text_scale").and_then(|value| value.parse::<f64>().ok()) != Some(2.0)
+            || one_field(&fields, "source") != Some("injected")
+        {
+            return Err("Sound text scale is not observed as injected2x".into());
+        }
+        let (layout, _, identity) = s.geometry(&format!("sound-step-{step}"))?;
+        if !identity.current
+            || !identity.presented
+            || (identity.rows, identity.cols) != (11, 29)
+            || layout.scale != 1.0
+            || layout.viewport.w != 285.0
+            || layout.viewport.h != 265.0
+        {
+            return Err("Sound observation lost its declared current presented geometry".into());
+        }
+        s.optional_ctl(&format!("sound-step-{step}-prefs"), &["controls", "prefs"])?;
+        let tabs = s.observed_ctl(
+            &format!("sound-step-{step}-tabs"),
+            &["inspect", "app/v1", "tabs"],
+        )?;
+        let view = settings_view(&tabs).ok_or("Sound Settings view unavailable")?;
+        let tree = s.observed_ctl(
+            &format!("sound-step-{step}-tree"),
+            &["inspect", "app/v1", "view", &view, "tree"],
+        )?;
+        let semantic = grid_observation(&tabs, &tree)?;
+        if !semantic.current
+            || !semantic.presented
+            || semantic.view != identity.view
+            || semantic.window != identity.window
+            || semantic.generation != identity.generation
+            || semantic.geometry != identity.geometry
+            || semantic.fingerprint != identity.fingerprint
+        {
+            return Err("Sound semantics do not match the current presented observation".into());
+        }
+        let semantic_nodes = tree
+            .lines()
+            .map(|line| measure::fields(line.trim_start()))
+            .filter(|fields| one_field(fields, "key") == Some(key))
+            .collect::<Vec<_>>();
+        let meaning = match semantic_nodes.as_slice() {
+            [fields] => one_field(fields, "label").zip(one_field(fields, "value")),
+            _ => None,
+        };
+        let control = layout.nodes.iter().find(|node| node.key == key);
+        let texts = layout
+            .texts
+            .iter()
+            .filter(|text| text.key == key)
+            .collect::<Vec<_>>();
+        walk.push_str(&format!("step={step} viewport={:?} control={control:?} value_texts={texts:?} semantic_meaning={meaning:?}\n", layout.viewport));
+        retain(s.out, &format!("sound-step-{step}-observation.txt"), &walk)?;
+        let value = texts
+            .iter()
+            .map(|text| text.painted.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+        let observed = Scenario::whole(&layout, key)
+            && named_whole(&layout, "trail_sound_style")
+            && control.is_some_and(|node| {
+                (node.kind == "button" || node.role.eq_ignore_ascii_case("combobox"))
+                    && meaning.is_some_and(|(label, value)| {
+                        label == node.label
+                            && label.contains("(default)")
+                            && value.contains("(default)")
+                    })
+            })
+            && !value.is_empty()
+            && texts
+                .iter()
+                .all(|text| !text.overflow && !text.clip_truncated);
+        if observed {
+            let captured = s.capture("sound-value-whole", "application-control PageDown")?;
+            if captured != layout {
+                return Err("Sound value changed between observation and retained pixels".into());
+            }
+            walk.push_str(&format!(
+                "observed_visual_value={value:?}\nobserved_semantic_label={:?}\n",
+                control.map(|node| &node.label)
+            ));
+            retain(s.out, "sound-value-walk.txt", &walk)?;
+            return Ok(());
+        }
+        if step == 32 {
+            break;
+        }
+        s.observed_ctl(&format!("sound-step-{step}-pagedown"), &["key", "pagedown"])?;
+    }
+    retain(s.out, "sound-value-walk.txt", &walk)?;
+    let captured = s.capture(
+        "sound-value-unreached",
+        "bounded application-control PageDown exhausted",
+    );
+    Err(format!(
+        "Sound value/name/default semantics not observed whole after32 PageDown inputs; final_capture={:?}",
+        captured.as_ref().map(|_| ()).map_err(String::as_str)
+    ))
+}
+
 fn pointer(s: &Scenario<'_>) -> Result<(), String> {
     s.open("/terminal")?;
     s.ctl(&["text-scale", "1"])?;
-    s.viewport(584.0, 348.0)?;
-    let layout = s.capture("terminal-before-pointer", "application-control navigation")?;
-    let tree = s.ctl(&["inspect", "app/v1", "view", &s.view()?, "tree"])?;
-    let native = native_pointer(s, &layout, &tree);
-    if s.native_release_unconfirmed.get() {
-        return native;
-    }
+    s.grid_viewport("terminal-pointer", (584, 348), (15, 63))?;
+    s.capture("terminal-before-pointer", "application-control navigation")?;
     let (_, current) = s.layout()?;
     let xy = format!(
         "xy={},{}",
@@ -569,20 +934,56 @@ fn pointer(s: &Scenario<'_>) -> Result<(), String> {
         "terminal-last-screen",
         "application-control final manual scroll",
     )?;
-    let color = "settings/control/search_match_color";
-    if Scenario::whole(&last, color) {
-        s.ctl(&["pointer", "move", "key=settings/control/search_match_color"])?;
-        s.capture(
-            "terminal-color-hover",
-            "application-control synthetic pointer",
-        )?;
+    let view = s.view()?;
+    let tabs = s.observed_ctl("terminal-native-tabs", &["inspect", "app/v1", "tabs"])?;
+    let audit = s.observed_ctl(
+        "terminal-native-audit",
+        &["inspect", "app/v1", "view", &view, "audit"],
+    )?;
+    let tree = s.observed_ctl(
+        "terminal-native-tree",
+        &["inspect", "app/v1", "view", &view, "tree"],
+    )?;
+    let painted = grid_observation(&tabs, &audit)?;
+    let semantic = grid_observation(&tabs, &tree)?;
+    let current = measure::parse_layout(&audit)?;
+    if !painted.presented
+        || !painted.current
+        || !semantic.presented
+        || !semantic.current
+        || painted.geometry != semantic.geometry
+        || painted.fingerprint != semantic.fingerprint
+        || current != last
+    {
+        return Err("native pointer semantics do not match the captured last-screen paint".into());
     }
+    let native = native_pointer(s, &current, &tree, painted);
+    if s.native_release_unconfirmed.get() {
+        return native;
+    }
+    let hover = (|| {
+        let (_, after_native) = s.layout()?;
+        let color = "settings/control/search_match_color";
+        if Scenario::whole(&after_native, color) {
+            s.ctl(&["pointer", "move", "key=settings/control/search_match_color"])?;
+            s.capture(
+                "terminal-color-hover",
+                "application-control synthetic pointer",
+            )?;
+        }
+        Ok(())
+    })();
     // The last-screen pixels and labels must still be reviewed when the color
     // control is absent/inert; absence is not a positive pointer witness.
-    native
+    native.and(hover)
 }
 
-fn native_pointer(s: &Scenario<'_>, layout: &Layout, tree: &str) -> Result<(), String> {
+fn native_pointer(
+    s: &Scenario<'_>,
+    layout: &Layout,
+    tree: &str,
+    identity: GridObservation,
+) -> Result<(), String> {
     // Select only an actual declared, whole, named Bool on this screen. No
     // platform field list or guessed last-row cut supplies a pointer witness.
     let (node, before) = layout
@@ -598,49 +999,239 @@ fn native_pointer(s: &Scenario<'_>, layout: &Layout, tree: &str) -> Result<(), S
             "no whole named Terminal Bool on actual screen; native pointer case unavailable"
                 .to_string()
         })?;
-    let place = window::desk(s.up, &["place", &s.session.pid.to_string(), ATERM_CLASS])?;
-    let place = desk::parse_place(&place).ok_or("owned client origin unavailable")?;
+
+    s.native_release_unconfirmed.set(true);
+    if layout.scale != 1.0 {
+        return Err("native mapping case requires the observed scale-one viewport".into());
+    }
+    let place_raw = window::desk(s.up, &["place", &s.session.pid.to_string(), ATERM_CLASS])?;
+    retain(s.out, "terminal-native-client-before.txt", &place_raw)?;
+    let place = desk::parse_place(&place_raw).ok_or("owned client origin unavailable")?;
+    let owned_before = s.only_window()?;
     let monitors = window::desk(s.up, &["monitors"])?;
     let primary = desk::parse_monitors(&monitors)
         .into_iter()
-        .find(|m| m.primary)
+        .find(|monitor| monitor.primary)
         .ok_or("primary monitor identity unavailable; no native pointer input")?;
-    let x = place.at.0 + ((node.rect.x + node.rect.w / 2.0) * layout.scale).round() as i32;
-    let y = place.at.1 + ((node.rect.y + node.rect.h / 2.0) * layout.scale).round() as i32;
-    let r = primary.rect;
-    if !s.only_window()?.foreground || x < r.l || x >= r.r || y < r.t || y >= r.b {
+    if !owned_before.foreground || !monitor_contains(primary.rect, owned_before.rect) {
+        return Err("owned pointer window is not foreground and wholly on primary".into());
+    }
+    let center = (
+        place
+            .at
+            .0
+            .checked_add(i32::try_from(place.client.0 / 2).map_err(|e| e.to_string())?),
+        place
+            .at
+            .1
+            .checked_add(i32::try_from(place.client.1 / 2).map_err(|e| e.to_string())?),
+    );
+    let center = (
+        center.0.ok_or("client center overflow")?,
+        center.1.ok_or("client center overflow")?,
+    );
+    let initial = s.hit(center.0, center.1)?;
+    retain(s.out, "terminal-native-before-synthetic.txt", &initial)?;
+    if !released_owned_target(&initial) {
         return Err(
-            "owned pointer target is not foreground/on primary; no native pointer input".into(),
+            "owned foreground/button-up proof unavailable before synthetic mapping; no input"
+                .into(),
         );
     }
-    s.native_release_unconfirmed.set(true);
+    let logical = (
+        (node.rect.x + node.rect.w / 2.0).round(),
+        (node.rect.y + node.rect.h / 2.0).round(),
+    );
+    let logical = (
+        integer_coordinate(&logical.0.to_string()).ok_or("invalid whole-control logical x")?,
+        integer_coordinate(&logical.1.to_string()).ok_or("invalid whole-control logical y")?,
+    );
+    if !node
+        .rect
+        .contains(f64::from(logical.0), f64::from(logical.1))
+    {
+        return Err("integer mapping point is outside the whole control".into());
+    }
+    let xy = format!("xy={},{}", logical.0, logical.1);
+    // This changes only the application's synthetic pointer. It is a mapping
+    // precursor, never proof of OS cursor delivery or native PointerDown.
+    s.observed_ctl(
+        "terminal-native-synthetic-map-move",
+        &["pointer", "move", &xy],
+    )?;
+    let view = s.view()?;
+    if view.parse::<u64>().ok() != Some(identity.view) {
+        return Err("native view changed before mapping".into());
+    }
+    let mut mapping_fatal = None;
+    let mut mapping_poll = 0u32;
+    let mapping = window::within("authoritative synthetic native mapping status", || {
+        let label = format!("terminal-native-synthetic-map-status-{mapping_poll}");
+        mapping_poll += 1;
+        let raw = match s.observed_ctl(&label, &["pointer", "status"]) {
+            Ok(raw) => raw,
+            Err(error) => {
+                mapping_fatal = Some(error);
+                return Ok(None);
+            }
+        };
+        match native_mapping(&raw, &view, &node.key, layout.scale) {
+            Ok(mapping) if mapping.logical == logical => Ok(Some(mapping)),
+            Ok(_) => Err(
+                "known native mapping has not reached the single requested logical point".into(),
+            ),
+            Err(error) => {
+                mapping_fatal = Some(error);
+                Ok(None)
+            }
+        }
+    })?;
+    if let Some(error) = mapping_fatal {
+        return Err(error);
+    }
+    let mapping = mapping.ok_or("native coordinate mapping unavailable")?;
+    retain(
+        s.out,
+        "terminal-native-synthetic-map-transform.txt",
+        &format!(
+            "evidence_kind=SYNTHETIC_application_coordinate_mapping_NOT_native_input_proof\nreturned_mapping={mapping:?}\nrequested_logical={logical:?}\nprehover_identity={identity:?}\n"
+        ),
+    )?;
+    let tabs = s.observed_ctl(
+        "terminal-native-post-map-tabs",
+        &["inspect", "app/v1", "tabs"],
+    )?;
+    let audit = s.observed_ctl(
+        "terminal-native-post-map-audit",
+        &["inspect", "app/v1", "view", &view, "audit"],
+    )?;
+    let tree = s.observed_ctl(
+        "terminal-native-post-map-tree",
+        &["inspect", "app/v1", "view", &view, "tree"],
+    )?;
+    let painted = grid_observation(&tabs, &audit)?;
+    let semantic = grid_observation(&tabs, &tree)?;
+    let post = measure::parse_layout(&audit)?;
+    if !painted.presented
+        || !painted.current
+        || !semantic.presented
+        || !semantic.current
+        || painted.view != identity.view
+        || painted.window != identity.window
+        || painted.generation != identity.generation
+        || semantic.view != painted.view
+        || semantic.window != painted.window
+        || semantic.generation != painted.generation
+        || painted.geometry != identity.geometry
+        || semantic.geometry != painted.geometry
+        || painted.fingerprint != semantic.fingerprint
+        || post.scale != 1.0
+        || post.viewport != layout.viewport
+        || !Scenario::whole(&post, &node.key)
+        || !named_whole(
+            &post,
+            node.key
+                .strip_prefix("settings/control/")
+                .ok_or("not a declared control")?,
+        )
+        || bool_control(&tree, &node.key) != Some(before)
+        || !post.nodes.iter().any(|current| {
+            current.key == node.key
+                && current.rect == node.rect
+                && current
+                    .rect
+                    .contains(f64::from(mapping.logical.0), f64::from(mapping.logical.1))
+        })
+    {
+        return Err("current presented whole Bool no longer matches the post-hover mapping".into());
+    }
+    let status = s.observed_ctl("terminal-native-post-map-status", &["pointer", "status"])?;
+    let rebound = native_mapping(&status, &view, &node.key, post.scale)?;
+    let after_place_raw = window::desk(s.up, &["place", &s.session.pid.to_string(), ATERM_CLASS])?;
+    retain(
+        s.out,
+        "terminal-native-client-after-map.txt",
+        &after_place_raw,
+    )?;
+    let after_place =
+        desk::parse_place(&after_place_raw).ok_or("owned client placement unavailable")?;
+    let owned_after = s.only_window()?;
+    if rebound != mapping
+        || after_place != place
+        || owned_after.rect != owned_before.rect
+        || owned_after.dpi != owned_before.dpi
+        || !owned_after.foreground
+    {
+        return Err(
+            "native coordinate mapping or owned window placement changed after hover".into(),
+        );
+    }
+    let (x, y) = mapping.screen(place.at)?;
+    if !primary.rect.holds((x, y)) {
+        return Err("mapped native target is outside primary".into());
+    }
     let hit = s.hit(x, y)?;
     retain(s.out, "terminal-native-target.txt", &hit)?;
-    if button_state(&hit) == Some(false) {
-        s.native_release_unconfirmed.set(false);
-    } else {
-        // It may be somebody else's existing press: do not release it or send
-        // later input while its state is held or unknown.
-        s.native_release_unconfirmed.set(true);
-    }
-    if !owned_button(&hit, false) {
-        return Err(
-            "actual Win32 point/button is not owned, foreground and released; no native pointer input".into(),
-        );
+    if !released_owned_target(&hit) {
+        return Err("mapped owned target/button-up proof unavailable before OS move".into());
     }
     s.held.check(&s.up.layout).map_err(|e| format!("{e:?}"))?;
     let display = window::Display {
         primary: primary.clone(),
         second: primary,
     };
+    s.held.check(&s.up.layout).map_err(|e| format!("{e:?}"))?;
     s.native_release_unconfirmed.set(true);
-    let held = window::press_to(&s.up.layout, &display, (x, y), (x, y), 0).and_then(|()| {
+    window::move_tablet(&s.up.layout, &display, (x, y))?;
+    let mut movement_fatal = None;
+    let mut movement_poll = 0u32;
+    window::within(
+        "actual Win32 cursor at the owned named control with button up",
+        || {
+            let reading = s.hit(x, y);
+            let label = format!("terminal-native-moved-{movement_poll}.txt");
+            movement_poll += 1;
+            let raw = match reading {
+                Ok(raw) => raw,
+                Err(error) => {
+                    movement_fatal = Some(error);
+                    return Ok(());
+                }
+            };
+            if let Err(error) = retain(s.out, &label, &raw) {
+                movement_fatal = Some(error);
+                return Ok(());
+            }
+            match cursor_ready_to_press(&raw, (x, y)) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(
+                    "known released cursor is still moving within its owned foreground window"
+                        .into(),
+                ),
+                Err(error) => {
+                    movement_fatal = Some(error);
+                    Ok(())
+                }
+            }
+        },
+    )?;
+    if let Some(error) = movement_fatal {
+        return Err(error);
+    }
+    s.held.check(&s.up.layout).map_err(|e| format!("{e:?}"))?;
+    let predown = s.hit(x, y)?;
+    retain(s.out, "terminal-native-before-down.txt", &predown)?;
+    if !actual_cursor_button(&predown, (x, y), false) {
+        return Err("actual cursor ownership/button-up changed before PointerDown".into());
+    }
+    s.native_release_unconfirmed.set(true);
+    let held = window::tablet_down(&s.up.layout).and_then(|()| {
         let down_before = s.hit(x, y)?;
         let layout = s.capture("terminal-native-held", &format!("QMP USB tablet held screen={x},{y} key={} before={before}", node.key))?;
         let down_after = s.hit(x, y)?;
         retain(s.out, "terminal-native-held-target.txt", &format!("before_capture={down_before}\nafter_capture={down_after}\n"))?;
-        if !owned_button(&down_before, true) || !owned_button(&down_after, true)
-            || !s.whole_named_at(&layout, &node.key, x, y)? {
+        if !actual_cursor_button(&down_before, (x, y), true) || !actual_cursor_button(&down_after, (x, y), true)
+            || !s.whole_named_at(&layout, &node.key, x, y, mapping, "terminal-native-held-app-pointer")? {
             return Err("held PointerDown did not retain the exact whole named control under its actual point".into());
         }
         Ok(())
@@ -653,7 +1244,10 @@ fn native_pointer(s: &Scenario<'_>, layout: &Layout, tree: &str) -> Result<(), S
         .map_err(|e| format!("release unavailable after custody change: {e:?}"))
         .and_then(|()| window::release(&s.up.layout));
     let up = s.hit(x, y);
-    if up.as_ref().is_ok_and(|text| owned_button(text, false)) {
+    if up
+        .as_ref()
+        .is_ok_and(|text| actual_cursor_button(text, (x, y), false))
+    {
         s.native_release_unconfirmed.set(false);
     }
     let after = release.and_then(|()| {
@@ -669,7 +1263,14 @@ fn native_pointer(s: &Scenario<'_>, layout: &Layout, tree: &str) -> Result<(), S
         )?;
         let tree = s.ctl(&["inspect", "app/v1", "view", &s.view()?, "tree"])?;
         if bool_control(&tree, &node.key) != Some(!before)
-            || !s.whole_named_at(&layout, &node.key, x, y)?
+            || !s.whole_named_at(
+                &layout,
+                &node.key,
+                x,
+                y,
+                mapping,
+                "terminal-native-released-app-pointer",
+            )?
         {
             return Err("native pointer did not flip the exact whole named Bool once".into());
         }
@@ -694,7 +1295,7 @@ fn native_pointer(s: &Scenario<'_>, layout: &Layout, tree: &str) -> Result<(), S
 fn tab(s: &Scenario<'_>) -> Result<(), String> {
     s.open("/appearance")?;
     s.ctl(&["text-scale", "2"])?;
-    s.viewport(1095.0, 696.0)?;
+    s.grid_viewport("appearance-tab", (1095, 696), (30, 119))?;
     s.scroll_to("settings/control/faint_opacity")?;
     s.capture("appearance-before-tab", "application-control wheel")?;
     // The target is deliberately Windows' available field, not the macOS opacity row.
@@ -729,17 +1330,6 @@ fn tab(s: &Scenario<'_>) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn held_and_released_input_require_actual_owned_button_observations() {
-        assert!(owned_button("target-owned=1 left_down=1", true));
-        assert!(owned_button("target-owned=1 left_down=0", false));
-        assert!(!owned_button("target-owned=1 left_down=0", true));
-        assert!(!owned_button("target-owned=0 left_down=1", true));
-        assert!(!owned_button("target-owned=1", false));
-        assert!(!owned_button("target-owned=1 left_down=unknown", false));
-        assert!(!owned_button("not-target-owned=1 left_down=1", true));
-    }
 
     #[test]
     fn only_a_settings_app_leaf_with_a_retained_view_identifies_the_target() {
@@ -823,5 +1413,425 @@ mod tests {
             ),
             None
         );
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GridObservation {
+    rows: u16,
+    cols: u16,
+    view: u64,
+    window: u64,
+    generation: u64,
+    geometry: u64,
+    fingerprint: u64,
+    capture: u64,
+    presentation: u64,
+    presented: bool,
+    current: bool,
+}
+
+fn one_field<'a>(fields: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    let mut matches = fields.iter().filter(|(name, _)| name == key);
+    let value = matches.next()?.1.as_str();
+    matches.next().is_none().then_some(value)
+}
+
+fn grid_observation(tabs: &str, audit: &str) -> Result<GridObservation, String> {
+    use aterm_types::app_inspection::{InspectRequest, validate_inspection_response};
+    validate_inspection_response(tabs, InspectRequest::Tabs).map_err(|e| e.to_string())?;
+    let mut windows = tabs.lines().filter_map(|line| line.strip_prefix("window "));
+    let fields = measure::fields(windows.next().ok_or("missing window grid")?);
+    if windows.next().is_some() {
+        return Err("ambiguous window grid".into());
+    }
+    let mut sources = audit
+        .lines()
+        .filter_map(|line| line.strip_prefix("inspection-source "));
+    let source = measure::fields(sources.next().ok_or("missing inspection source")?);
+    if sources.next().is_some() {
+        return Err("ambiguous inspection source".into());
+    }
+    let parse = || -> Option<GridObservation> {
+        let rows = one_field(&fields, "rows")?.parse::<u16>().ok()?;
+        let cols = one_field(&fields, "cols")?.parse::<u16>().ok()?;
+        if rows == 0 || cols == 0 {
+            return None;
+        }
+        let view = one_field(&source, "view")?
+            .parse::<u64>()
+            .ok()
+            .filter(|view| *view > 0)?;
+        let window = one_field(&source, "window")?.parse::<u64>().ok()?;
+        if window != one_field(&fields, "id")?.parse::<u64>().ok()? {
+            return None;
+        }
+        Some(GridObservation {
+            rows,
+            cols,
+            view,
+            window,
+            generation: one_field(&source, "generation")?.parse().ok()?,
+            geometry: u64::from_str_radix(one_field(&source, "geometry")?, 16).ok()?,
+            fingerprint: u64::from_str_radix(one_field(&source, "compiled-fingerprint")?, 16)
+                .ok()?,
+            capture: one_field(&source, "capture-serial")?.parse().ok()?,
+            presentation: one_field(&source, "presentation-revision")?.parse().ok()?,
+            presented: one_field(&source, "source")? == "presented",
+            current: one_field(&source, "model-current")? == "true",
+        })
+    };
+    parse().ok_or_else(|| "invalid grid or inspection identity".into())
+}
+
+fn projected_grid(width: u16, height: u16) -> Result<(u16, u16), String> {
+    // Source-bound physical metrics observed in all fifteen frozen-app snapshots:
+    // cw=9, ch=23, pad=12, scale=1. This is an explicit qualification case,
+    // never a replacement acceptance claim for the original off-lattice pixels.
+    if width <= 24 || height <= 12 {
+        return Err("original viewport is below the projection domain".into());
+    }
+    Ok(((height - 12).div_ceil(23), (width - 24).div_ceil(9)))
+}
+
+#[cfg(test)]
+mod grid_observation_tests {
+    use super::*;
+
+    fn tabs() -> String {
+        use aterm_types::app_inspection::{InspectionEnvelope, InspectionSubject};
+        format!(
+            "{}\nwindow id=0 rows=24 cols=80\n",
+            InspectionEnvelope {
+                revision: 3,
+                subject: InspectionSubject::Tabs,
+            }
+            .header_line()
+        )
+    }
+
+    const AUDIT: &str = "inspection-source source=presented view=3 window=0 generation=1 geometry=9536910db77ae1d7 compiled-fingerprint=0123456789abcdef capture-serial=8 presentation-revision=9 model-current=true\n";
+
+    #[test]
+    fn qualification_grid_and_presented_identity_are_observed_strictly() {
+        let reading = grid_observation(&tabs(), AUDIT).unwrap();
+        assert_eq!((reading.rows, reading.cols), (24, 80));
+        assert!(reading.presented && reading.current);
+        assert_eq!(reading.capture, 8);
+        for bad in [
+            tabs().replace("cols=80", ""),
+            tabs().replace("rows=24", "rows=0"),
+            tabs().replace("rows=24", "rows=24 rows=25"),
+            format!("{}window id=1 rows=24 cols=80\n", tabs()),
+            "ERR unavailable".into(),
+        ] {
+            assert!(grid_observation(&bad, AUDIT).is_err());
+        }
+        for bad in [
+            AUDIT.replace("geometry=9536910db77ae1d7", "geometry=invalid"),
+            AUDIT.replace("capture-serial=8", ""),
+            AUDIT.replace("view=3", ""),
+            AUDIT.replace("window=0", "window=1"),
+            AUDIT.replace("generation=1", ""),
+            AUDIT.replace("compiled-fingerprint=0123456789abcdef", ""),
+            AUDIT.replace("capture-serial=8", "capture-serial=8 capture-serial=9"),
+            format!("{AUDIT}{AUDIT}"),
+        ] {
+            assert!(grid_observation(&tabs(), &bad).is_err());
+        }
+        let staged =
+            grid_observation(&tabs(), &AUDIT.replace("source=presented", "source=staged")).unwrap();
+        assert!(!staged.presented);
+        let stale = grid_observation(
+            &tabs(),
+            &AUDIT.replace("model-current=true", "model-current=false"),
+        )
+        .unwrap();
+        assert!(!stale.current);
+    }
+
+    #[test]
+    fn explicit_grid_cases_are_ceiling_projections_not_pixel_acceptance() {
+        assert_eq!(projected_grid(318, 516), Ok((22, 33)));
+        assert_eq!(projected_grid(584, 348), Ok((15, 63)));
+        assert_eq!(projected_grid(1095, 696), Ok((30, 119)));
+        assert!(projected_grid(24, 516).is_err());
+        assert!(projected_grid(318, 12).is_err());
+    }
+}
+
+fn cursor_ready_to_press(text: &str, point: (i32, i32)) -> Result<bool, String> {
+    let fields = measure::fields(text.trim());
+    for (name, expected) in [
+        ("left_down", "0"),
+        ("target-owned", "1"),
+        ("cursor-owned", "1"),
+        ("foreground", "1"),
+    ] {
+        if one_field(&fields, name) != Some(expected) {
+            return Err(format!(
+                "actual cursor {name} is held, unknown or not owned; no native press"
+            ));
+        }
+    }
+    let actual = one_field(&fields, "cursor")
+        .and_then(|value| value.split_once(','))
+        .and_then(|(x, y)| Some((x.parse::<i32>().ok()?, y.parse::<i32>().ok()?)))
+        .ok_or("actual cursor coordinates are unknown or malformed; no native press")?;
+    Ok(actual == point)
+}
+
+fn actual_cursor_button(text: &str, point: (i32, i32), down: bool) -> bool {
+    let fields = measure::fields(text.trim());
+    let expected = format!("{},{}", point.0, point.1);
+    one_field(&fields, "target-owned") == Some("1")
+        && one_field(&fields, "left_down") == Some(if down { "1" } else { "0" })
+        && one_field(&fields, "cursor") == Some(expected.as_str())
+        && one_field(&fields, "cursor-owned") == Some("1")
+        && one_field(&fields, "foreground") == Some("1")
+}
+
+fn monitor_contains(monitor: desk::Rect, window: desk::Rect) -> bool {
+    window.width() > 0
+        && window.height() > 0
+        && window.l >= monitor.l
+        && window.t >= monitor.t
+        && window.r <= monitor.r
+        && window.b <= monitor.b
+}
+
+#[cfg(test)]
+mod actual_cursor_tests {
+    use super::*;
+
+    #[test]
+    fn requested_point_is_not_actual_cursor_ownership() {
+        let raw = "target-owned=1 left_down=0 cursor=100,200 cursor-owned=1 foreground=1";
+        assert!(actual_cursor_button(raw, (100, 200), false));
+        assert!(!actual_cursor_button(raw, (101, 200), false));
+        assert!(!actual_cursor_button(raw, (100, 200), true));
+        assert_eq!(cursor_ready_to_press(raw, (100, 200)), Ok(true));
+        assert_eq!(cursor_ready_to_press(raw, (101, 200)), Ok(false));
+        for bad in [
+            raw.replace("left_down=0", "left_down=1"),
+            raw.replace("left_down=0", "left_down=unknown"),
+            raw.replace("target-owned=1", "target-owned=0"),
+            raw.replace("cursor-owned=1", "cursor-owned=0"),
+            raw.replace("foreground=1", "foreground=0"),
+            raw.replace("cursor=100,200", "cursor=unknown"),
+            raw.replace("cursor=100,200", "cursor=100,broken"),
+            format!("{raw} left_down=0"),
+        ] {
+            assert!(cursor_ready_to_press(&bad, (100, 200)).is_err(), "{bad}");
+        }
+        for bad in [
+            raw.replace("cursor=100,200", "cursor=unknown"),
+            raw.replace("cursor-owned=1", "cursor-owned=0"),
+            raw.replace("foreground=1", "foreground=0"),
+            format!("{raw} cursor=100,200"),
+            format!("{raw} left_down=1"),
+            format!("{raw} target-owned=0"),
+            "target-owned=1 left_down=0".into(),
+        ] {
+            assert!(!actual_cursor_button(&bad, (100, 200), false));
+        }
+        let monitor = desk::Rect {
+            l: 800,
+            t: 0,
+            r: 2720,
+            b: 1200,
+        };
+        assert!(monitor_contains(
+            monitor,
+            desk::Rect {
+                l: 816,
+                t: 16,
+                r: 1950,
+                b: 820
+            }
+        ));
+        assert!(!monitor_contains(
+            monitor,
+            desk::Rect {
+                l: 26,
+                t: 26,
+                r: 1160,
+                b: 830
+            }
+        ));
+        assert!(!monitor_contains(
+            monitor,
+            desk::Rect {
+                l: 816,
+                t: 16,
+                r: 1950,
+                b: 1220
+            }
+        ));
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NativeMapping {
+    view: u64,
+    logical: (i32, i32),
+    client: (i32, i32),
+    origin: (i32, i32),
+}
+
+fn integer_coordinate(value: &str) -> Option<i32> {
+    let value = value.parse::<f64>().ok()?;
+    (value.is_finite()
+        && value.fract() == 0.0
+        && value >= f64::from(i32::MIN)
+        && value <= f64::from(i32::MAX))
+    .then_some(value as i32)
+}
+
+fn native_mapping(raw: &str, view: &str, key: &str, scale: f64) -> Result<NativeMapping, String> {
+    if scale != 1.0 || !raw.trim().starts_with("OK ") || raw.trim().lines().count() != 1 {
+        return Err("native mapping requires one scale-one application pointer status".into());
+    }
+    let fields = measure::fields(raw.trim());
+    let parse = || -> Option<NativeMapping> {
+        if one_field(&fields, "at")? != "native"
+            || one_field(&fields, "view")? != view
+            || one_field(&fields, "key")? != key
+        {
+            return None;
+        }
+        let view = view.parse::<u64>().ok().filter(|value| *value > 0)?;
+        let logical = (
+            integer_coordinate(one_field(&fields, "x")?)?,
+            integer_coordinate(one_field(&fields, "y")?)?,
+        );
+        let (x, y) = one_field(&fields, "px")?.split_once(',')?;
+        let client = (x.parse::<i32>().ok()?, y.parse::<i32>().ok()?);
+        let origin = (
+            client.0.checked_sub(logical.0)?,
+            client.1.checked_sub(logical.1)?,
+        );
+        Some(NativeMapping {
+            view,
+            logical,
+            client,
+            origin,
+        })
+    };
+    parse().ok_or_else(|| "application native mapping is missing, ambiguous or does not match the exact view/control".into())
+}
+
+impl NativeMapping {
+    fn screen(self, client_origin: (i32, i32)) -> Result<(i32, i32), String> {
+        client_origin
+            .0
+            .checked_add(self.client.0)
+            .zip(client_origin.1.checked_add(self.client.1))
+            .ok_or_else(|| "native screen coordinate overflow".into())
+    }
+
+    fn inverse(self, screen: (i32, i32), client_origin: (i32, i32)) -> Option<(i32, i32)> {
+        Some((
+            screen
+                .0
+                .checked_sub(client_origin.0)?
+                .checked_sub(self.origin.0)?,
+            screen
+                .1
+                .checked_sub(client_origin.1)?
+                .checked_sub(self.origin.1)?,
+        ))
+    }
+}
+
+fn released_owned_target(raw: &str) -> bool {
+    let fields = measure::fields(raw.trim());
+    one_field(&fields, "left_down") == Some("0")
+        && one_field(&fields, "target-owned") == Some("1")
+        && one_field(&fields, "foreground") == Some("1")
+        && one_field(&fields, "cursor")
+            .and_then(|value| value.split_once(','))
+            .is_some_and(|(x, y)| x.parse::<i32>().is_ok() && y.parse::<i32>().is_ok())
+        && matches!(one_field(&fields, "cursor-owned"), Some("0" | "1"))
+        && one_field(&fields, "owned-hwnd")
+            .and_then(|value| u64::from_str_radix(value, 16).ok())
+            .is_some_and(|value| value != 0)
+}
+
+#[cfg(test)]
+mod native_mapping_tests {
+    use super::*;
+
+    #[test]
+    fn returned_native_coordinates_supply_both_transform_directions() {
+        let raw = "OK at=native view=3 x=425.0 y=126.0 key=settings/control/flag px=425,164";
+        let mapped = native_mapping(raw, "3", "settings/control/flag", 1.0).unwrap();
+        assert_eq!(mapped.origin, (0, 38));
+        assert_eq!(mapped.screen((20, 40)), Ok((445, 204)));
+        assert_eq!(mapped.inverse((445, 204), (20, 40)), Some((425, 126)));
+        let other = native_mapping(
+            &raw.replace("px=425,164", "px=437,193"),
+            "3",
+            "settings/control/flag",
+            1.0,
+        )
+        .unwrap();
+        assert_eq!(other.origin, (12, 67));
+        assert_eq!(
+            other.inverse(other.screen((7, 9)).unwrap(), (7, 9)),
+            Some((425, 126))
+        );
+        for bad in [
+            raw.replace("at=native", "at=terminal"),
+            raw.replace("OK ", "ERR "),
+            format!("{raw} at=native"),
+            format!("{raw} key=settings/control/flag"),
+            format!("{raw} px=425,164"),
+            raw.replace("view=3", "view=4"),
+            raw.replace("key=settings/control/flag", "key=settings/control/other"),
+            raw.replace("x=425.0", "x=NaN"),
+            raw.replace("x=425.0", "x=inf"),
+            raw.replace("x=425.0", "x=2147483648.0"),
+            raw.replace("x=425.0", "x=-2147483648.0")
+                .replace("px=425,164", "px=2147483647,164"),
+            raw.replace("y=126.0", "y=126.5"),
+            raw.replace("px=425,164", "px=unknown"),
+            raw.replace("px=425,164", ""),
+            format!("{raw} view=3"),
+            format!("{raw} x=425.0"),
+            format!("{raw}\n{raw}"),
+        ] {
+            assert!(
+                native_mapping(&bad, "3", "settings/control/flag", 1.0).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(native_mapping(raw, "3", "settings/control/flag", 2.0).is_err());
+        assert!(mapped.screen((i32::MAX, i32::MAX)).is_err());
+        assert_eq!(
+            mapped.inverse((i32::MIN, i32::MIN), (i32::MAX, i32::MAX)),
+            None
+        );
+        assert!(
+            native_mapping(
+                &raw.replace("view=3", "view=0"),
+                "0",
+                "settings/control/flag",
+                1.0
+            )
+            .is_err()
+        );
+
+        let up =
+            "target-owned=1 foreground=1 left_down=0 owned-hwnd=ab12 cursor=10,20 cursor-owned=0";
+        assert!(released_owned_target(up));
+        for bad in [
+            up.replace("left_down=0", "left_down=1"),
+            up.replace("owned-hwnd=ab12", "owned-hwnd=0"),
+            format!("{up} left_down=0"),
+            up.replace("foreground=1", "foreground=0"),
+        ] {
+            assert!(!released_owned_target(&bad));
+        }
     }
 }

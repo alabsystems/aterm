@@ -583,7 +583,13 @@ fn collect_spans(node: &UiNode, top: f32, spans: &mut Vec<Span>) {
     }
 }
 
-fn wrapped(key: &str, text: &str, width: f32, role: SemanticRole, style: StyleRef) -> UiNode {
+pub(crate) fn wrapped(
+    key: &str,
+    text: &str,
+    width: f32,
+    role: SemanticRole,
+    style: StyleRef,
+) -> UiNode {
     let (px, face) = crate::native_ui::text_paint_metrics(role, style);
     let line_height = (px * 1.6).ceil();
     let mut lines = Vec::new();

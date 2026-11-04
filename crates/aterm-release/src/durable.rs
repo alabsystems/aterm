@@ -31,7 +31,7 @@ pub(crate) fn deadline_after(wait: std::time::Duration) -> std::time::Instant {
 }
 
 /// Opens a regular file at `path` in non-blocking mode, refusing symlinks and special files.
-pub(crate) fn open_regular_file(path: &Path) -> std::io::Result<File> {
+fn open_regular_file_with_meta(path: &Path) -> std::io::Result<(File, std::fs::Metadata)> {
     #[cfg(not(unix))]
     if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
         return Err(std::io::Error::new(
@@ -40,13 +40,19 @@ pub(crate) fn open_regular_file(path: &Path) -> std::io::Result<File> {
         ));
     }
     let file = astream_sys::open_nonblocking(path, astream_sys::Links::Refuse)?;
-    if !file.metadata()?.is_file() {
+    let meta = file.metadata()?;
+    if !meta.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "not a regular file",
         ));
     }
-    Ok(file)
+    Ok((file, meta))
+}
+
+/// Opens a regular file at `path` in non-blocking mode, refusing symlinks and special files.
+pub(crate) fn open_regular_file(path: &Path) -> std::io::Result<File> {
+    open_regular_file_with_meta(path).map(|(file, _)| file)
 }
 
 /// Default upper bound (256 MiB) for release file and log reads.
@@ -55,8 +61,14 @@ pub(crate) const MAX_RELEASE_FILE_BYTES: u64 = 256 * 1024 * 1024;
 /// Reads up to `max` bytes from a regular file at `path`, refusing symlinks and FIFOs.
 pub(crate) fn read_regular_bytes(path: &Path, max: u64) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
-    let file = open_regular_file(path)?;
-    let cap = usize::try_from(max.min(64 * 1024)).unwrap_or(64 * 1024);
+    let (file, meta) = open_regular_file_with_meta(path)?;
+    if meta.len() > max {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            "file exceeds bound",
+        ));
+    }
+    let cap = usize::try_from(meta.len().min(max).saturating_add(1)).unwrap_or(0);
     let mut buf = Vec::with_capacity(cap);
     file.take(max.saturating_add(1)).read_to_end(&mut buf)?;
     if u64::try_from(buf.len()).unwrap_or(u64::MAX) > max {

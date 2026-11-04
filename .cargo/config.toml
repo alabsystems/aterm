@@ -60,6 +60,11 @@ rustflags = ["-Zthreads=4"]
 [unstable]
 checksum-freshness = true
 
+# Development source dependencies use the same authenticated Git transport as
+# normal repository pulls. No caller-specific Git or credential wrapper needed.
+[net]
+git-fetch-with-cli = true
+
 # EVERY WINDOWS EXECUTABLE RUNS AS ITS INVOKER. Windows' installer detection
 # asks elevation of an unmanifested executable whose name says `update`,
 # `install`, `setup` or `patch` (os error 740, "The requested operation requires

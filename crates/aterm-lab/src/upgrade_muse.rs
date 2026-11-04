@@ -371,7 +371,7 @@ fn muse_reply_whole(session: &str) -> bool {
 
 /// [`muse_reply_whole`] of the session file at `path`; `Err` names a file that could not be read.
 fn slow_reply_whole(path: &Path) -> Result<bool, String> {
-    std::fs::read_to_string(path)
+    crate::util::read_regular_text(path)
         .map(|text| muse_reply_whole(&text))
         .map_err(|e| format!("{}: {e}", path.display()))
 }

@@ -41,11 +41,11 @@ fn malformed_automatic_source_is_a_refusal_and_preserves_account_records() {
             format!("email,computer,{member},{alias}\nnew@example.test,m16,{value},0\n"),
             "ambiguous",
         )];
+        // A stored `class` word is no input (design §0), so it refuses nothing:
+        // `fleet_assignment_conforms_and_unsafe_coercions_are_detected` holds that.
         for (fields, diagnostic) in [
             ("machines=['m16', 17]", "`machines`"),
             ("machines=['m16', 'unassigned']", "`machines`"),
-            ("machines=['m16']\nclass='sharedd'", "`class`"),
-            ("machines=['m16']\nclass=false", "`class`"),
         ] {
             sources.push((
                 if cli == Cli::Claude {

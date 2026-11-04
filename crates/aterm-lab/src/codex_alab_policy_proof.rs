@@ -198,7 +198,7 @@ pub(super) fn legs(proof: &mut Proof, package: &Path) -> Result<(), Fail> {
     let account_stable = all.iter().all(|leg| {
         let rows = proof.requests(leg.name);
         !leg.home.join("auth.json").exists()
-            && std::fs::read_to_string(leg.home.join("config.toml"))
+            && crate::util::read_regular_text(&leg.home.join("config.toml"))
                 .ok()
                 .as_deref()
                 == Some(codex_config(proof.port, &leg.proj, &leg.home, CONFIG_EXTRA).as_str())

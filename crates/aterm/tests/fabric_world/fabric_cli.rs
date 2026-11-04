@@ -58,17 +58,27 @@ impl Scratch {
             std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600))
                 .expect("chmod 600");
         }
-        let cap: String = [
-            "rw,p=n-00000000000000aa:/f/t1/pub/n-00000000000000aa/>",
-            "ro:/f/t1/>",
-        ]
-        .iter()
-        .map(|g| {
-            let c = astream_cap::mint(SECRET, g).expect("mint");
-            astream_cap::capfile::format_line(&c.filter, &c.tag) + "\n"
-        })
-        .collect();
-        harness::write_cap(&dir.path().join("node.cap"), cap);
+        // The node's own ring, minted from its ceiling as `aterm fabric on` mints it, and beside
+        // it a reader's ring bound to no principal, so the report reads the whole fleet. One ring
+        // holding both is wider than the node's ceiling, which the report names as a warning
+        // (`enable::wider_than_ceiling`); a reader's ring in a file of its own publishes as no
+        // one, and is not named.
+        let node = astream_cap::GrantCeiling::aterm_node_ring("t1", "n-00000000000000aa")
+            .expect("a node ring")
+            .rules();
+        for (name, grants) in [
+            ("node.cap", node),
+            ("reader.cap", vec!["ro:/f/t1/>".to_string()]),
+        ] {
+            let cap: String = grants
+                .iter()
+                .map(|g| {
+                    let c = astream_cap::mint(SECRET, g).expect("mint");
+                    astream_cap::capfile::format_line(&c.filter, &c.tag) + "\n"
+                })
+                .collect();
+            harness::write_cap(&dir.path().join(name), cap);
+        }
         Self { dir }
     }
 
@@ -81,7 +91,8 @@ impl Scratch {
     }
 
     /// The bridge command, in the spelling `aterm fabric on` writes
-    /// (`aterm link serve`) or the argv0 alias's (`aterm-link serve`).
+    /// (`aterm link serve`) or the argv0 alias's (`aterm-link serve`), holding the node's ring
+    /// and the reader's.
     fn command(&self, sock: &str, alias: bool) -> String {
         let program = if alias {
             "/usr/local/bin/aterm-link serve".to_string()
@@ -89,8 +100,9 @@ impl Scratch {
             "/usr/local/bin/aterm link serve".to_string()
         };
         format!(
-            "{program} --fleet t1 --broker {sock} --cap-file {} --state {}",
+            "{program} --fleet t1 --broker {sock} --cap-file {} --cap-file {} --state {}",
             self.path("node.cap"),
+            self.path("reader.cap"),
             self.path("link")
         )
     }
@@ -292,6 +304,77 @@ fn the_secret_beside_the_socket_guards_it_and_the_report_measures_the_guard() {
         );
         assert_eq!(arr(&v, "warnings").is_empty(), guarded, "{out}");
     }
+}
+
+/// **A NODE'S RING WIDER THAN ITS CEILING IS NAMED, AND THE NODE'S OWN IS NOT**
+/// (DESIGN-aterm-fabric §14 Q5). The bridge command's cap file holds the node's ring, minted
+/// from astream's ceiling, then that ring and one unbound `rw:/f/t1/>` under the same secret,
+/// then the eight grants an aterm before D08 (`49b5230d88`) minted: against a guarded broker
+/// the report warns of the wide ring alone, naming the ceiling check's first violation. With
+/// the node's own ring in the first file and that `rw:/f/t1/>` alone in the command's second,
+/// in the reader's place, the report names the second file: the bridge attaches both as one
+/// ring.
+#[test]
+fn a_node_ring_wider_than_its_ceiling_is_named_by_the_report() {
+    let s = Scratch::new("wide");
+    let _broker = Broker::serve(&s.sock(), &format!("{}.log", s.sock()), &[]);
+    let cmd = s.command(&s.sock(), true);
+    let node = "n-00000000000000aa";
+    let rules = astream_cap::GrantCeiling::aterm_node_ring("t1", node)
+        .expect("a node ring")
+        .rules();
+    let ring = |grants: &[String]| {
+        let lines: String = grants
+            .iter()
+            .map(|g| {
+                let c = astream_cap::mint(SECRET, g).expect("mint");
+                astream_cap::capfile::format_line(&c.filter, &c.tag) + "\n"
+            })
+            .collect();
+        harness::write_cap(Path::new(&s.path("node.cap")), lines);
+        let (_, out, err) = fabric(&s, Some(&cmd), &["--json"]);
+        let v = json(&out);
+        assert_eq!(v["broker"]["guarded"].as_bool(), Some(true), "{out}\n{err}");
+        arr(&v, "warnings")
+            .iter()
+            .filter_map(|w| w.as_str().map(str::to_string))
+            .filter(|w| w.contains(aterm_link::enable::WIDER_RING))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ring(&rules), Vec::<String>::new(), "the node's own ring");
+    let mut wide = rules.clone();
+    wide.push("rw:/f/t1/>".to_string());
+    let named = ring(&wide);
+    assert!(
+        named.len() == 1
+            && named[0].starts_with(&format!("cap file {}: ", s.path("node.cap")))
+            && named[0].contains("ring[6]")
+            && named[0].contains("rw:/f/t1/>"),
+        "{named:?}"
+    );
+    let mut earlier = rules.clone();
+    earlier.extend([
+        format!("ro:/f/t1/term/{node}/>"),
+        format!("rw,p={node}:/f/t1/term/{node}/*/screen"),
+    ]);
+    assert_eq!(
+        ring(&earlier),
+        Vec::<String>::new(),
+        "the ring an earlier aterm minted, which `on` mints over"
+    );
+    let god = astream_cap::mint(SECRET, "rw:/f/t1/>").expect("mint");
+    harness::write_cap(
+        Path::new(&s.path("reader.cap")),
+        astream_cap::capfile::format_line(&god.filter, &god.tag) + "\n",
+    );
+    let named = ring(&rules);
+    assert!(
+        named.len() == 1
+            && named[0].starts_with(&format!("cap file {}: ", s.path("reader.cap")))
+            && named[0].contains("ring[0]")
+            && named[0].contains("rw:/f/t1/>"),
+        "the god cap alone in the second file: {named:?}"
+    );
 }
 
 /// **THE TIER NAMED IS READ OFF THE BROKER'S PROCESS, THE TIER SERVED OFF ITS
@@ -1027,7 +1110,7 @@ fn a_live_broker_is_read_for_real_and_the_env_overrides_the_file() {
     assert_eq!(v["config"]["command"].as_str(), Some(env_cmd.as_str()));
     assert_eq!(
         arr(&v["config"], "cap_files")[0]["grants"].as_u64(),
-        Some(2)
+        Some(6)
     );
     let b = &v["broker"];
     assert_eq!(b["reachable"].as_bool(), Some(true));
@@ -1300,7 +1383,9 @@ fn every_view_names_a_rows_own_offset_across_a_clock_change() {
     std::fs::write(&zone_file, tzif).expect("fixed timezone");
     let fixed_zone = format!(":{zone_file}");
     let _broker = Broker::spawn(&s);
-    let cap: String = aterm_link::enable::person_grants("t1", PERSON)
+    let cap: String = astream_cap::GrantCeiling::aterm_person_ring("t1", PERSON)
+        .expect("a person ring")
+        .rules()
         .iter()
         .map(|g| {
             let c = astream_cap::mint(SECRET, g).expect("mint");

@@ -131,7 +131,7 @@ pub fn label_is_ours(label: &str, own: &str) -> bool {
 }
 
 /// `aterm keeper <args>`.
-#[must_use]
+#[must_use = "return or inspect the keeper command's exit status"]
 pub fn main_entry(args: Vec<OsString>, version: &str) -> ExitCode {
     let first = args.first().map(|a| a.to_string_lossy().into_owned());
     if matches!(first.as_deref(), None | Some("-h" | "--help" | "help")) {

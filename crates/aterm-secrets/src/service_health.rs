@@ -172,7 +172,7 @@ pub fn server(url: &str, health: &HealthRequirement) -> Result<()> {
         crate::transport::fetch_records(url, &[], None, std::time::Duration::from_secs(5), None)?;
     let mut store = crate::membership_log::Store::for_vault(&health.vault)?;
     store.ingest(&bytes)?;
-    let inventory = store.inventory();
+    let inventory = store.complete_inventory();
     if health.records.is_empty()
         || health
             .records

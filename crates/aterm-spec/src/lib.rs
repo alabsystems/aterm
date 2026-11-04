@@ -26,6 +26,8 @@ pub mod host;
 pub mod interp;
 pub use aterm_spec_anchor::registry;
 pub mod rng;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub mod subprocess_lane;
 #[cfg(test)]
 mod test_models;
 pub mod verify;

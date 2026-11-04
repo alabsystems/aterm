@@ -459,7 +459,7 @@ impl Stub {
                 .args
                 .tool_file
                 .as_ref()
-                .and_then(|p| std::fs::read_to_string(p).ok())
+                .and_then(|p| crate::util::read_regular_text(p).ok())
                 .and_then(|t| J::parse(&t).ok());
             let f = (method, path, blen, mode, model);
             match script.and_then(|s| tool_turn(body, &s)) {

@@ -35,6 +35,7 @@ impl OperationId {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum AppKind {
+    Allocation,
     Mail,
     About,
     Settings,
@@ -48,6 +49,7 @@ pub(crate) enum AppKind {
 impl AppKind {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
+            Self::Allocation => "allocation",
             Self::Mail => "mail",
             Self::About => "about",
             Self::Settings => "settings",
@@ -62,6 +64,7 @@ impl AppKind {
     /// Human-facing name, spelled as the apps' own tooltips spell it (`"Markdown · {uri}"`), so a tab's install-time tooltip never changes case on first refresh.
     pub(crate) const fn display_name(self) -> &'static str {
         match self {
+            Self::Allocation => "Allocation",
             Self::Mail => "Mail",
             Self::About => "About aterm",
             Self::Settings => "Settings",
@@ -76,6 +79,7 @@ impl AppKind {
     /// The tab icon this app kind wears.
     pub(crate) const fn icon(self) -> AppIcon {
         match self {
+            Self::Allocation => AppIcon::SystemState,
             Self::Mail => AppIcon::Mail,
             Self::About => AppIcon::About,
             Self::Settings => AppIcon::Settings,
@@ -165,6 +169,7 @@ impl CommonViewState {
 }
 
 pub(crate) enum AppViewState {
+    Allocation(Box<crate::native_allocation::AllocationViewState>),
     Mail(Box<crate::native_mail::MailViewState>),
     About(Box<crate::native_about::AboutViewState>),
     Settings(Box<crate::native_settings::SettingsViewState>),
@@ -178,6 +183,7 @@ pub(crate) enum AppViewState {
 impl AppViewState {
     pub(crate) const fn kind(&self) -> AppKind {
         match self {
+            Self::Allocation(_) => AppKind::Allocation,
             Self::Mail(_) => AppKind::Mail,
             Self::About(_) => AppKind::About,
             Self::Settings(_) => AppKind::Settings,
@@ -191,6 +197,7 @@ impl AppViewState {
 
     pub(crate) fn common(&self) -> &CommonViewState {
         match self {
+            Self::Allocation(view) => &view.common,
             Self::Mail(view) => &view.common,
             Self::About(view) => &view.common,
             Self::Settings(view) => &view.common,
@@ -211,6 +218,7 @@ impl AppViewState {
 
     pub(crate) fn common_mut(&mut self) -> &mut CommonViewState {
         match self {
+            Self::Allocation(view) => &mut view.common,
             Self::Mail(view) => &mut view.common,
             Self::About(view) => &mut view.common,
             Self::Settings(view) => &mut view.common,
@@ -510,6 +518,7 @@ pub(crate) struct RecoveryApp {
 }
 
 pub(crate) enum NativeApp {
+    Allocation(Box<crate::native_allocation::AllocationApp>),
     Mail(Box<crate::native_mail::MailApp>),
     About(Box<crate::native_about::AboutApp>),
     /// Boxed: the one Settings controller carries every page's projection and dwarfs the document apps, which are the many instances (as its view state is boxed in [`AppViewState::Settings`]).
@@ -549,6 +558,7 @@ pub(crate) struct AppVTable {
 impl NativeApp {
     pub(crate) const fn vtable(&self) -> &'static AppVTable {
         match self {
+            Self::Allocation(_) => &allocation_vtable::VTABLE,
             Self::Mail(_) => &mail_vtable::VTABLE,
             Self::About(_) => &about_vtable::VTABLE,
             Self::Settings(_) => &settings_vtable::VTABLE,
@@ -569,7 +579,7 @@ impl NativeApp {
             Self::Mail(_) | Self::About(_) | Self::Settings(_) | Self::SystemState(_) => None,
             Self::Markdown(app) => Some(app.document),
             Self::Editor(app) => Some(app.document),
-            Self::Recovery(_) | Self::Workers(_) => None,
+            Self::Recovery(_) | Self::Workers(_) | Self::Allocation(_) => None,
         }
     }
 
@@ -728,6 +738,13 @@ macro_rules! define_app_vtable {
 }
 
 define_app_vtable!(about_vtable, About, About, AppKind::About, "about");
+define_app_vtable!(
+    allocation_vtable,
+    Allocation,
+    Allocation,
+    AppKind::Allocation,
+    "allocation"
+);
 define_app_vtable!(mail_vtable, Mail, Mail, AppKind::Mail, "mail");
 define_app_vtable!(
     settings_vtable,
@@ -2870,6 +2887,7 @@ impl NativeRuntime {
             | AppViewState::Markdown(_)
             | AppViewState::Editor(_)
             | AppViewState::Recovery(_)
+            | AppViewState::Allocation(_)
             | AppViewState::Workers(_) => {}
         }
         self.views.insert(view, state);
@@ -3090,6 +3108,29 @@ impl NativeRuntime {
         }
     }
 
+    /// Publish independent immutable observations to every Allocation view.
+    pub(crate) fn publish_allocation(
+        &mut self,
+        instance: AppInstanceId,
+        leases: Option<Arc<crate::native_allocation::ObservedCpu>>,
+        machine: Option<Arc<aterm_vitals::Snapshot>>,
+        machine_at: Option<std::time::Instant>,
+    ) {
+        let Some(NativeApp::Allocation(app)) = self.instances.get_mut(&instance) else {
+            return;
+        };
+        app.leases = leases;
+        app.machine = machine;
+        app.machine_at = machine_at;
+        for state in self.views.values_mut() {
+            if matches!(state, AppViewState::Allocation(_)) {
+                let common = state.common_mut();
+                common.presentation_revision = common.presentation_revision.wrapping_add(1);
+                state.touch();
+            }
+        }
+    }
+
     /// Give one window's Workers page the rows as they stand ([`crate::app_workers`]). Whether
     /// anything it shows moved.
     pub(crate) fn publish_workers(
@@ -3178,6 +3219,7 @@ impl NativeRuntime {
             | NativeApp::Markdown(_)
             | NativeApp::Editor(_)
             | NativeApp::Recovery(_)
+            | NativeApp::Allocation(_)
             | NativeApp::Workers(_) => None,
         }) else {
             return false;
@@ -3211,6 +3253,7 @@ impl NativeRuntime {
             | NativeApp::Markdown(_)
             | NativeApp::Editor(_)
             | NativeApp::Recovery(_)
+            | NativeApp::Allocation(_)
             | NativeApp::Workers(_) => None,
         }) else {
             return false;
@@ -3234,6 +3277,7 @@ impl NativeRuntime {
             | NativeApp::Markdown(_)
             | NativeApp::Editor(_)
             | NativeApp::Recovery(_)
+            | NativeApp::Allocation(_)
             | NativeApp::Workers(_) => None,
         }) else {
             return false;
@@ -3257,6 +3301,7 @@ impl NativeRuntime {
             | NativeApp::Markdown(_)
             | NativeApp::Editor(_)
             | NativeApp::Recovery(_)
+            | NativeApp::Allocation(_)
             | NativeApp::Workers(_) => None,
         }) else {
             return false;
@@ -3427,6 +3472,7 @@ impl NativeRuntime {
                 | AppViewState::Markdown(_)
                 | AppViewState::Editor(_)
                 | AppViewState::Recovery(_)
+                | AppViewState::Allocation(_)
                 | AppViewState::Workers(_) => {
                     continue;
                 }
@@ -3450,6 +3496,7 @@ impl NativeRuntime {
                 | AppViewState::SystemState(_)
                 | AppViewState::Markdown(_)
                 | AppViewState::Recovery(_)
+                | AppViewState::Allocation(_)
                 | AppViewState::Workers(_) => {}
             }
         }
@@ -3553,6 +3600,7 @@ impl NativeRuntime {
             | NativeApp::Markdown(_)
             | NativeApp::Editor(_)
             | NativeApp::Recovery(_)
+            | NativeApp::Allocation(_)
             | NativeApp::Workers(_) => None,
         }
     }
@@ -3575,6 +3623,7 @@ impl NativeRuntime {
             | NativeApp::SystemState(_)
             | NativeApp::Markdown(_)
             | NativeApp::Recovery(_)
+            | NativeApp::Allocation(_)
             | NativeApp::Workers(_) => None,
         }
     }
@@ -3716,6 +3765,7 @@ impl NativeRuntime {
                 | NativeApp::Settings(_)
                 | NativeApp::SystemState(_)
                 | NativeApp::Recovery(_)
+                | NativeApp::Allocation(_)
                 | NativeApp::Workers(_) => None,
             })
             .collect()
@@ -3738,6 +3788,7 @@ impl NativeRuntime {
                 | NativeApp::Settings(_)
                 | NativeApp::SystemState(_)
                 | NativeApp::Recovery(_)
+                | NativeApp::Allocation(_)
                 | NativeApp::Workers(_) => None,
             })
             .collect::<Vec<_>>();
@@ -8512,6 +8563,7 @@ mod markdown_reader_tests {
                 | AppKind::Settings
                 | AppKind::SystemState
                 | AppKind::Recovery
+                | AppKind::Allocation
                 | AppKind::Workers => {
                     unreachable!()
                 }

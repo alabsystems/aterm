@@ -133,6 +133,13 @@ pub struct BrokerHealth {
     pub parked_tails: u64,
     /// The flushes the log has issued since it opened ([`FlushCounts`]).
     pub flushes: FlushCounts,
+    /// The flushes the writing PROCESS had asked astream-sys for when it wrote the
+    /// snapshot, since it started, by kind (`astream_sys::flush_tally`: full, barrier
+    /// and plain calls): the log's own and every other flush the process finishes
+    /// through astream-sys, the embedding program's own flushes too. A count of calls,
+    /// not of what any caller meant by them, so a refused barrier and the full flush
+    /// issued in its place are one of each.
+    pub process_flushes: astream_sys::FlushTally,
     /// `Some(reason)` while the log is POISONED: it refuses every write until it is
     /// reopened ([`Broker::poisoned`](crate::Broker::poisoned)).
     pub poisoned: Option<String>,
@@ -168,6 +175,7 @@ impl Default for BrokerHealth {
             active_conns: 0,
             parked_tails: 0,
             flushes: FlushCounts::default(),
+            process_flushes: astream_sys::FlushTally::default(),
             poisoned: None,
         }
     }
@@ -261,7 +269,7 @@ fn one_line(text: &str) -> String {
 
 impl BrokerHealth {
     /// The counters, by their key in the file.
-    fn counts(&self) -> [(&'static str, u64); 18] {
+    fn counts(&self) -> [(&'static str, u64); 21] {
         [
             ("written_at_ms", self.written_at_ms),
             ("base", self.base),
@@ -281,6 +289,9 @@ impl BrokerHealth {
             ("flush_skipped", self.flushes.skipped),
             ("flush_failed", self.flushes.failed),
             ("rules", u64::from(self.served.rules)),
+            ("process_flush_full", self.process_flushes.full),
+            ("process_flush_barrier", self.process_flushes.barrier),
+            ("process_flush_plain", self.process_flushes.plain),
         ]
     }
 
@@ -459,6 +470,18 @@ impl BrokerHealth {
                     });
                     25
                 }
+                "process_flush_full" => {
+                    h.process_flushes.full = num()?;
+                    26
+                }
+                "process_flush_barrier" => {
+                    h.process_flushes.barrier = num()?;
+                    27
+                }
+                "process_flush_plain" => {
+                    h.process_flushes.plain = num()?;
+                    28
+                }
                 "reason" => {
                     reason = Some(v.to_string());
                     continue;
@@ -467,7 +490,7 @@ impl BrokerHealth {
             };
             seen |= 1u32 << bit;
         }
-        if seen != (1u32 << 26) - 1 {
+        if seen != (1u32 << 29) - 1 {
             return None;
         }
         // A horizon belongs to Ordered alone, as on the wire.
@@ -698,6 +721,11 @@ mod tests {
                 skipped: 2,
                 failed: 1,
             },
+            process_flushes: astream_sys::FlushTally {
+                full: 11,
+                barrier: 13,
+                plain: 17,
+            },
             poisoned: Some("a flush failed (EIO)\nwith records".to_string()),
         }
     }
@@ -713,6 +741,12 @@ mod tests {
         let mut want = h.clone();
         want.poisoned = Some("a flush failed (EIO) with records".to_string());
         assert_eq!(BrokerHealth::parse(&text), Some(want));
+        assert!(
+            text.contains(
+                "\nprocess_flush_full=11\nprocess_flush_barrier=13\nprocess_flush_plain=17\n"
+            ),
+            "the process's tally, each kind under its own key: {text}"
+        );
         let mut healthy = sample();
         healthy.poisoned = None;
         let ht = healthy.render();

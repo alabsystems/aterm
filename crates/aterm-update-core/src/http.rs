@@ -103,8 +103,9 @@ fn curl_fetch_until(
     ) -> std::thread::JoinHandle<Vec<u8>> {
         std::thread::spawn(move || {
             let mut bytes = Vec::new();
-            if let Some(mut pipe) = pipe {
-                let _ = pipe.read_to_end(&mut bytes);
+            if let Some(pipe) = pipe {
+                use std::io::Read as _;
+                let _ = pipe.take(256 * 1024 * 1024).read_to_end(&mut bytes);
             }
             bytes
         })

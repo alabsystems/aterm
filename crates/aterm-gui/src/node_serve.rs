@@ -842,7 +842,7 @@ fn node_vault_paths(
 }
 
 /// Foreground entry point for `aterm node serve` (`systems.alab.aterm-node`, C20–C23).
-#[must_use]
+#[must_use = "return or inspect the node service's exit status"]
 pub fn run_node_serve() -> ExitCode {
     crate::descriptor_limit::raise_descriptor_limit_for_node();
     let Some(state_dir) = aterm_types::dirs::state_dir() else {
@@ -953,7 +953,7 @@ fn spawn_claims_upkeep(relay_dir: PathBuf, stop: Arc<AtomicBool>) {
 }
 
 /// Run the node job supervision loop with explicit paths and seams.
-#[must_use]
+#[must_use = "return or inspect the configured node service's exit status"]
 pub fn run_node_serve_with(mut cfg: NodeServeConfig) -> ExitCode {
     if !cfg!(test) {
         crate::qos::set_self(crate::qos::Role::Background);

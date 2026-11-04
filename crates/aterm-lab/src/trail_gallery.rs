@@ -908,14 +908,14 @@ pub fn checkouts(repo: &Path) -> Vec<PathBuf> {
     let common = if dotgit.is_dir() {
         Some(dotgit)
     } else {
-        std::fs::read_to_string(&dotgit)
+        crate::util::read_regular_text(&dotgit)
             .ok()
             .and_then(|t| {
                 let g = t.trim().strip_prefix("gitdir:")?.trim().to_string();
                 Some(joined(repo, &g))
             })
             .and_then(|gitdir| {
-                let c = std::fs::read_to_string(gitdir.join("commondir")).ok()?;
+                let c = crate::util::read_regular_text(&gitdir.join("commondir")).ok()?;
                 Some(joined(&gitdir, c.trim()))
             })
     };
@@ -929,7 +929,7 @@ pub fn checkouts(repo: &Path) -> Vec<PathBuf> {
     }
     if let Ok(entries) = std::fs::read_dir(common.join("worktrees")) {
         for e in entries.flatten() {
-            if let Ok(g) = std::fs::read_to_string(e.path().join("gitdir"))
+            if let Ok(g) = crate::util::read_regular_text(&e.path().join("gitdir"))
                 && let Some(wt) = joined(&e.path(), g.trim()).parent()
             {
                 out.push(wt.to_path_buf());
@@ -1564,7 +1564,7 @@ impl Shot<'_> {
         }
         let reply = self.request(&["settings", "card", "clean"], ReplyShape::Counted);
         let twin = if reply.code == 0 {
-            std::fs::read(self.path(&format!("{frame}.png")))
+            crate::util::read_regular_file(&self.path(&format!("{frame}.png")))
                 .map_err(|e| e.to_string())
                 .and_then(|lit| card_clean_twin(&lit, &reply.stdout))
         } else {
@@ -1715,7 +1715,7 @@ impl Shot<'_> {
         }
         // The frames are judged on the caret's pane: its grid, not the
         // window's (the window's is kept as `window.dims.txt`).
-        let window = std::fs::read_to_string(self.path("dims.txt")).unwrap_or_default();
+        let window = crate::util::read_regular_text(&self.path("dims.txt")).unwrap_or_default();
         match pane_dims(&window, &panes.stdout) {
             Some(pane) => {
                 let _ = std::fs::write(self.path("window.dims.txt"), &window);

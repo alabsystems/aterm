@@ -301,10 +301,10 @@ pub fn survey_cell_logged(
     let mut facts = facts_with_paths(root, &graph, &paths);
     for (id, package) in resolved_git {
         let mut fact = measure_directory(root, package.directory);
-        if crate::provenance::is_first_party_git(root, &package.source) {
+        if crate::provenance::is_first_party_git(root, &id.name, &package.source) {
             fact.is_third_party = false;
             log.push_str(&format!(
-                "    {id}: first-party Git source, same repository owner and full pinned commit\n"
+                "    {id}: reviewed original Git component, same repository owner and full pinned commit\n"
             ));
         }
         facts.insert(id, fact);

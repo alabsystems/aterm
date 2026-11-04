@@ -237,7 +237,9 @@ impl Fixture {
         let mut child = cmd.spawn().map_err(|e| e.to_string())?;
         let status = reap(&mut child, HANG, Reap::Child)?;
         let wanted = format!("{}\n", atpkg::build_admit::HOP_CAPABILITY);
-        if !status.success() || fs::read_to_string(&out).ok().as_deref() != Some(wanted.as_str()) {
+        if !status.success()
+            || crate::util::read_regular_text(&out).ok().as_deref() != Some(wanted.as_str())
+        {
             return Err(format!(
                 "lab image did not answer the exact shim-hop capability ({status}); {}",
                 log.display()
@@ -312,7 +314,7 @@ impl Fixture {
                         build.log.display()
                     ));
                 }
-                let Some(script_pid) = fs::read_to_string(&build.ready)
+                let Some(script_pid) = crate::util::read_regular_text(&build.ready)
                     .ok()
                     .and_then(|text| text.trim().parse::<i32>().ok())
                 else {

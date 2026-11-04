@@ -1531,7 +1531,7 @@ pub fn cmd_aos_search(args: &[String]) -> Res {
         .as_ref()
         .map(|p| {
             let path = from_caller(p);
-            std::fs::read_to_string(&path)
+            crate::util::read_regular_text(std::path::Path::new(&path))
                 .map_err(|e| Fail::usage(format!("aos-search: --plans {path}: {e}")))
         })
         .transpose()?;

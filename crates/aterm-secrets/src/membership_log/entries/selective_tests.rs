@@ -286,14 +286,14 @@ fn unrelated_eligible_payload_errors_still_refuse_named_reads() {
                 audience,
                 epoch,
                 salt: [25; 32],
-                ciphertext: vec![26; 17],
+                ciphertext: vec![26; 17].into(),
             }
         } else {
             Body::Put {
                 audience,
                 epoch,
                 salt: [25; 32],
-                ciphertext: vec![26; 17],
+                ciphertext: vec![26; 17].into(),
             }
         };
         let corrupt = fixture.log.draft(&fixture.actor, 5, body);
@@ -333,7 +333,7 @@ fn named_reads_keep_unaddressed_payload_skip_and_addressed_wrap_errors() {
             audience,
             epoch: inaccessible,
             salt: [25; 32],
-            ciphertext: vec![26; 17],
+            ciphertext: vec![26; 17].into(),
         },
     );
     fixture.keep(bad_put);
@@ -344,7 +344,7 @@ fn named_reads_keep_unaddressed_payload_skip_and_addressed_wrap_errors() {
         Body::Wrap {
             epoch: inaccessible,
             recipient: fixture.identity.recipient(),
-            capsule: vec![27; 32],
+            capsule: vec![27; 32].into(),
         },
     );
     fixture.keep(bad_wrap);
@@ -450,7 +450,7 @@ fn no_locker_admission_still_validates_addressed_payloads() {
             audience: EpochAudience::Everyone,
             epoch,
             salt: [25; 32],
-            ciphertext: vec![26; 17],
+            ciphertext: vec![26; 17].into(),
         },
     );
     fixture.keep(corrupt);

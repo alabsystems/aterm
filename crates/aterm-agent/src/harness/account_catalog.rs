@@ -60,8 +60,25 @@ pub fn install_reader(reader: impl Fn(&Path) -> Result<Catalog, String> + Send +
     let _ = READER.set(Box::new(reader));
 }
 
+/// The Commons catalog under `home` as the installed reader reads it; `None` with no reader, no
+/// home, or no catalog set up there ([`read_with`]).
 pub(crate) fn read(home: Option<&Path>) -> Option<Result<Catalog, String>> {
-    READER.get().zip(home).map(|(reader, home)| reader(home))
+    read_with(READER.get().map(|reader| &**reader), home)
+}
+
+/// [`read`] through `reader`: `None` where there is none, no home is known, or the home holds no
+/// secrets directory (`~/.config/aterm/secrets`), the machine having set up no catalog, which is
+/// no failure to read one; a directory that is there and cannot be read stays the reader's
+/// error, which a report calls unavailable. Off Unix aterm keeps no secrets client, so no
+/// catalog is set up there.
+fn read_with(reader: Option<&Reader>, home: Option<&Path>) -> Option<Result<Catalog, String>> {
+    let (reader, home) = reader.zip(home)?;
+    #[cfg(unix)]
+    let absent = std::fs::symlink_metadata(aterm_secrets::client::Paths::for_home(home).dir)
+        .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+    #[cfg(not(unix))]
+    let absent = true;
+    (!absent).then(|| reader(home))
 }
 
 impl Catalog {
@@ -256,6 +273,27 @@ fn text_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A HOME WITH NO SECRETS DIRECTORY KEEPS NO CATALOG, SO NO REPORT CALLS ONE UNAVAILABLE:
+    /// `read_with` gives `None` there, not the reader's error. CONTROL: once the directory is
+    /// there, the reader's error stands (a catalog set up and not read is unavailable), and with
+    /// no home known there is none either.
+    #[cfg(unix)]
+    #[test]
+    fn a_home_with_no_secrets_directory_keeps_no_catalog() {
+        let tmp = aterm_tempfile::tempdir().expect("a scratch home");
+        let home = tmp.path();
+        let reader: &Reader = &|_: &Path| Err("proposals: unreadable".to_owned());
+        assert_eq!(read_with(Some(reader), Some(home)), None);
+        let dir = aterm_secrets::client::Paths::for_home(home).dir;
+        std::fs::create_dir_all(&dir).expect("the secrets directory");
+        assert_eq!(
+            read_with(Some(reader), Some(home)),
+            Some(Err("proposals: unreadable".to_owned())),
+            "CONTROL: a catalog set up and not read is unavailable"
+        );
+        assert_eq!(read_with(Some(reader), None), None, "CONTROL: no home");
+    }
 
     pub(super) fn account() -> Account {
         Account {

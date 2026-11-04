@@ -1676,6 +1676,80 @@ fn with_reader(app: &mut crate::App, board: &'static JobsBoard) -> Receiver<Msg>
     rx
 }
 
+#[test]
+fn allocation_delayed_handover_keeps_the_worker_observation_time() {
+    let mut host = VitalsHost::default();
+    let now = Instant::now();
+    let read = now - Duration::from_secs(20);
+    let snapshot = Arc::new(Snapshot {
+        seq: 1,
+        ..Snapshot::default()
+    });
+    let leases = Arc::new(crate::native_allocation::ObservedCpu {
+        at: read,
+        value: aterm_capacity::CpuObservation::Absent,
+    });
+    hand_over_allocation(&host.latest, &snapshot, vec![], read, Some(leases));
+    assert!(host.adopt(now));
+    assert_eq!(host.sampled_at, Some(read));
+    assert_eq!(host.cpu_leases.as_ref().unwrap().at, read);
+    assert_eq!(host.landed_at, Some(now));
+}
+
+#[test]
+fn allocation_visible_timer_invalidates_age_without_a_new_sample() {
+    static BOARD: JobsBoard = JobsBoard::new();
+    let mut app = crate::App::headless_for_test();
+    let rx = with_reader(&mut app, &BOARD);
+    app.open_allocation(false).unwrap();
+    let (instance, view) = app.active_native_view(crate::WindowId(0)).unwrap();
+    let now = Instant::now();
+    let read = now - Duration::from_secs(20);
+    app.vitals.cpu_leases = Some(Arc::new(crate::native_allocation::ObservedCpu {
+        at: read,
+        value: aterm_capacity::CpuObservation::Absent,
+    }));
+    app.vitals.sampled_at = Some(read);
+    app.publish_allocation();
+    let before = app
+        .native_runtime
+        .view_state(view)
+        .unwrap()
+        .common()
+        .content_epoch;
+    let before_stamp = app.native_ui_compile_stamp(crate::WindowId(0)).unwrap();
+    app.service_vitals(now);
+    assert!(read_req(&rx, "visible Allocation requests the existing worker").allocation);
+    assert!(
+        app.native_runtime
+            .view_state(view)
+            .unwrap()
+            .common()
+            .content_epoch
+            > before
+    );
+    assert!(
+        app.native_ui_compile_stamp(crate::WindowId(0))
+            .unwrap()
+            .presentation_revision
+            > before_stamp.presentation_revision,
+        "the cache key used by retained native frames must advance even without a new sample"
+    );
+    let crate::native_app::NativeApp::Allocation(page) = app.native_runtime.app(instance).unwrap()
+    else {
+        panic!("Allocation")
+    };
+    assert_eq!(
+        page.leases.as_ref().unwrap().at,
+        read,
+        "refresh must not stamp an old sample fresh"
+    );
+    let compiled = app.compiled_native_ui(crate::WindowId(0)).unwrap();
+    assert!(format!("{compiled:?}").contains("Stale"));
+    app.windows.get_mut(&crate::WindowId(0)).unwrap().occluded = true;
+    assert!(!app.vitals_request(Duration::from_secs(1), false).allocation);
+}
+
 fn read_req(rx: &Receiver<Msg>, why: &str) -> Box<Request> {
     rx.try_iter()
         .find_map(|m| match m {

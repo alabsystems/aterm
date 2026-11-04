@@ -236,12 +236,12 @@ pub(crate) fn attribution_transition(
     let root = tmp_dir("report-attribution");
     let env = env_at(&root);
     let roster = |many: bool| {
-        let one = accounts::append_row("", "main", Class::Dedicated, None).unwrap();
+        let one = accounts::append_row("", "main", Class::Preferred, None).unwrap();
         Roster::parse(&if many {
             accounts::append_row(
                 &one,
                 "second",
-                Class::Dedicated,
+                Class::Preferred,
                 Some(&crate::harness::host_path::abs("/second")),
             )
             .unwrap()

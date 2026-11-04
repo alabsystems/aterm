@@ -209,6 +209,7 @@ struct Fake {
     /// The `y.tab.c` the fake `make bash` compiled.
     parser: RefCell<Vec<u8>>,
     bindgen_answers: String,
+    bindgen_dependencies_missing: bool,
     rustup_answers: String,
     zip_files: Vec<(&'static str, Vec<u8>)>,
     zip_links: Vec<(&'static str, PathBuf)>,
@@ -236,6 +237,7 @@ impl Fake {
             patched: RefCell::default(),
             parser: RefCell::default(),
             bindgen_answers: format!("wasm-bindgen {}\n", crate::wasm_glue::BINDGEN),
+            bindgen_dependencies_missing: false,
             rustup_answers: "rustup 1.29.2 (d8c92c676 2026-10-21)\n".into(),
             zip_files: vec![(
                 "chrome-headless-shell-mac-arm64/chrome-headless-shell",
@@ -316,6 +318,18 @@ impl Host for Fake {
         let a: Vec<&str> = args.iter().map(String::as_str).collect();
         let program = spawn.program.to_string_lossy();
         match a.as_slice() {
+            ["fetch", "--manifest-path", manifest, rest @ ..] => {
+                let text = std::fs::read_to_string(manifest).unwrap();
+                assert!(text.contains(&format!(
+                    "wasm-bindgen = \"={}\"",
+                    crate::wasm_glue::BINDGEN
+                )));
+                if rest == ["--offline"] && self.bindgen_dependencies_missing {
+                    Err("the pinned library is not cached".into())
+                } else {
+                    Ok(String::new())
+                }
+            }
             ["-c", "-f", out, from] if program == place::TAR => {
                 std::fs::copy(from.trim_start_matches('@'), out).map_err(|e| e.to_string())?;
                 Ok(String::new())
@@ -1266,7 +1280,11 @@ fn record_alone_fetches_wasm_bindgen() {
     };
     assert_eq!(run(&record, &m, &host, &mut |_| {}), crate::exit::PASS);
     assert!(host.fetched.borrow().is_empty(), "the rest stayed in place");
-    let installs = host.spawned("/stage2/bin/targo");
+    let installs: Vec<_> = host
+        .spawned("/stage2/bin/targo")
+        .into_iter()
+        .filter(|s| s.args.get(1).is_some_and(|a| a == "install"))
+        .collect();
     assert_eq!(installs.len(), 1, "{installs:#?}");
     let words: Vec<String> = installs[0]
         .args
@@ -1323,7 +1341,10 @@ fn a_bindgen_found_in_place_is_rebuilt_and_never_run() {
         State::Placed(found.clone())
     );
     assert_eq!(
-        host.spawned("/stage2/bin/targo").len(),
+        host.spawned("/stage2/bin/targo")
+            .iter()
+            .filter(|s| s.args.get(1).is_some_and(|a| a == "install"))
+            .count(),
         1,
         "built at the pin"
     );
@@ -1347,6 +1368,32 @@ fn a_bindgen_found_in_place_is_rebuilt_and_never_run() {
     assert_eq!(stamp.anchor, "crates.io");
     assert!(!dir.join(".crates2.json").exists(), "the found copy went");
     assert!(matches!(check(row, &m, &Fake::new()), State::Present(_)));
+}
+
+#[test]
+fn a_placed_bindgen_still_fetches_missing_oracle_dependencies() {
+    let home = aterm_tempfile::tempdir().unwrap();
+    let m = machine(home.path());
+    let row = super::row("wasm-bindgen").unwrap();
+    let t = target(row, &m).unwrap();
+    std::fs::create_dir_all(t.dir.join("bin")).unwrap();
+    std::fs::write(t.dir.join(&t.exe), "placed CLI").unwrap();
+    place::write_stamp(&t.dir, &t.stamp(row.name, None, "crates.io", None)).unwrap();
+    let mut host = Fake::new();
+    host.bindgen_dependencies_missing = true;
+    assert!(matches!(
+        provide(row, &m, &host, &mut |_| {}),
+        State::Present(_)
+    ));
+    let spawns = host.spawned("/stage2/bin/targo");
+    assert_eq!(
+        spawns.len(),
+        2,
+        "fetch the library without rebuilding the CLI"
+    );
+    assert!(spawns[0].args.iter().any(|a| a == "--offline"));
+    assert!(!spawns[1].args.iter().any(|a| a == "--offline"));
+    assert!(spawns.iter().all(|s| s.args[0] == "fetch"));
 }
 
 #[test]

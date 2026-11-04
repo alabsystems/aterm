@@ -101,15 +101,16 @@ tests/round_trip.rs	malformed_literal_length_overruns_output_errors	decode-rejec
 tests/round_trip.rs	malformed_match_length_overruns_output_errors	decode-rejects-malformed	
 ```
 
+## 3. Coverage
+
+- All 17 live `#[test]` functions across `src/block/` (6), `src/fastcpy.rs` (1),
+  `tests/fuzz_decode_never_panics.rs` (3), and `tests/round_trip.rs` (7) map to the 12 specs in §1.
+- Every regression test (`compress::test_bug`, the `malformed_*` tests, the corrupt integer run) is
+  an instance of a spec above.
+
 ## 4. Tests that are not spec samples
 
-`block::const_helper_tests::lz4_block_const_helpers_invariants` (`src/block/mod.rs`) has no row in
-§2 and samples no spec. It checks the block constants, the token and size-header encoders against
-their decoders, and two `DecompressError` accessors; the encode/decode pairs are round-trips that
-want rows of their own.
-
-Every regression test (`compress::test_bug`, the `malformed_*` tests, the corrupt integer run) is
-an instance of a spec above.
+None: `src/block/mod.rs::lz4_block_const_helpers_invariants` is mapped in §2 (`prepend-size-header`).
 
 ## 5. Implied specs that look wrong, or disagree with the code
 

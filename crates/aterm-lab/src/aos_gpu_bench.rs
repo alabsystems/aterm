@@ -2520,7 +2520,7 @@ impl Bench {
         cond.gpu_after = aterm_sysprobe::gpu();
         let _ = std::fs::write(runs_dir.join(format!("{id}.stdout")), &m.stdout);
         let _ = std::fs::write(runs_dir.join(format!("{id}.stderr")), &m.stderr);
-        let summary = std::fs::read_to_string(&summary_path)
+        let summary = crate::util::read_regular_text(&summary_path)
             .map_err(|e| format!("cannot read {}: {e}", summary_path.display()))
             .and_then(|t| parse_summary(&t));
         let mut run = Run {

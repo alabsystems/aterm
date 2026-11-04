@@ -86,7 +86,7 @@ impl Drop for World {
 /// One headless instance, SIGKILLed by its pid and reaped on drop.
 struct Proc {
     child: Child,
-    _lifeline: aterm_uds::lifeline::Lifeline,
+    _lifeline: launch_isolation::Lifeline,
     sock: String,
     tag: String,
 }

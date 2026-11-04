@@ -544,7 +544,7 @@ pub fn finish(cmd: &mut Command, stdin: Option<&str>) -> Out {
 /// The last `n` lines of the file at `path`.
 #[must_use]
 pub fn tail(path: &Path, n: usize) -> String {
-    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let text = crate::util::read_regular_text(path).unwrap_or_default();
     let lines: Vec<&str> = text.lines().collect();
     lines[lines.len().saturating_sub(n)..].join("\n")
 }

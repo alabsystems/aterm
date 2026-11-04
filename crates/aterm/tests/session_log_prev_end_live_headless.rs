@@ -34,7 +34,7 @@ impl Drop for World {
 
 struct Proc {
     child: Child,
-    _lifeline: aterm_uds::lifeline::Lifeline,
+    _lifeline: launch_isolation::Lifeline,
     sock: String,
 }
 

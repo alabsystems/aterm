@@ -1195,7 +1195,7 @@ impl Log {
             Body::Wrap {
                 epoch,
                 recipient,
-                capsule,
+                capsule: capsule.into(),
             },
         ))
     }
@@ -1239,7 +1239,7 @@ impl Log {
                 audience: target_aud,
                 epoch,
                 salt,
-                ciphertext,
+                ciphertext: ciphertext.into(),
             },
         ))
     }
@@ -1286,7 +1286,7 @@ impl Log {
                 audience: EpochAudience::Commons,
                 epoch,
                 salt,
-                ciphertext,
+                ciphertext: ciphertext.into(),
             },
         ))
     }
@@ -1331,7 +1331,7 @@ impl Log {
                 audience,
                 epoch,
                 salt,
-                ciphertext,
+                ciphertext: ciphertext.into(),
             },
         ))
     }
@@ -3556,7 +3556,7 @@ mod tests {
                 Body::Wrap {
                     epoch,
                     recipient: t.id2.recipient(),
-                    capsule,
+                    capsule: capsule.into(),
                 },
             );
             hold(&mut side_2, wrap, &t.w9, t.inc9);
@@ -4071,7 +4071,7 @@ mod tests {
             Body::Wrap {
                 epoch: split.epoch,
                 recipient: t.id2.recipient(),
-                capsule: vec![0x5a; 64],
+                capsule: vec![0x5a; 64].into(),
             },
         );
         hold(&mut healed, garbage, &t.w9, t.inc9);

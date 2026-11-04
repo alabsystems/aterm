@@ -856,7 +856,7 @@ pub fn admit_by_proof(paths: &Paths, proven: &Proven<'_>, now_ms: u64) -> crate:
     };
     if !signed.is_empty() {
         store.ingest(&encode_records(&signed))?;
-        fsx::write_atomic(&paths.records_file(), &store.encode(), 0o600)?;
+        super::write_records(paths, &store)?;
     }
     let allowed = device.with_seed(|seed| Allowed::sign(binding, &name, seed))?;
     let bundle = log_bundle(

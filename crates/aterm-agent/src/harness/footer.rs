@@ -3574,6 +3574,37 @@ fn model_effort_segment(facts: &FooterFacts, stubs: bool) -> Option<Segment> {
 }
 
 impl FooterFacts {
+    /// Whether this pane's session policy explicitly withdrew future recovery authority.
+    #[must_use]
+    pub fn account_forecasts_paused(&self) -> bool {
+        self.account_progress_view()
+            .is_some_and(|progress| progress.forecasts_paused)
+    }
+
+    /// Why this pane cannot currently promise future recovery. A busy observation alone
+    /// does not establish session Off, and global rotation Off retains its pool semantics.
+    #[must_use]
+    pub fn account_forecast_refusal(&self) -> Option<super::outlook::Refusal> {
+        if self.account_forecasts_paused() {
+            Some(super::outlook::Refusal::SessionPaused)
+        } else if self.account_progress_busy {
+            Some(super::outlook::Refusal::ObserverBusy)
+        } else {
+            None
+        }
+    }
+
+    /// The pane's outlook display, retaining raw pool evidence for a permitted later read.
+    #[must_use]
+    pub fn glance_view(&self) -> Option<std::borrow::Cow<'_, super::outlook::Glance>> {
+        let glance = self.glance.as_ref()?;
+        Some(if self.account_forecast_refusal().is_some() {
+            std::borrow::Cow::Owned(glance.observations())
+        } else {
+            std::borrow::Cow::Borrowed(glance)
+        })
+    }
+
     /// Reconcile account observations with a still-standing typed transcript limit.
     /// Without a recovery observation, only that limit and its provider reset are
     /// known. An available recovery decision remains authoritative; an older idle
@@ -3601,6 +3632,9 @@ impl FooterFacts {
                 std::borrow::Cow::Owned(view)
             }
         };
+        if view.phase == ProgressPhase::Paused {
+            view.to_mut().forecasts_paused = true;
+        }
         if view.phase == super::account_progress::ProgressPhase::Paused
             && view.wall.is_none()
             && let Some(wall) = self.usage.as_ref().and_then(|usage| usage.wall.as_ref())
@@ -3687,7 +3721,9 @@ fn fact_segments(facts: &FooterFacts, stubs: bool) -> Vec<Segment> {
         .and_then(|s| s.email.as_deref())
         .map(|email| email_name(email).unwrap_or(email).to_owned());
     let headed = email.is_some();
-    let weekly = weekly_segment(facts, headed, facts.glance.as_ref());
+    let glance_view = facts.glance_view();
+    let glance = glance_view.as_deref();
+    let weekly = weekly_segment(facts, headed, glance);
     // The outlook's parts (docs/DESIGN-accounts-outlook-2026-10-25.md §2) join the unit the
     // email or the week leads; with neither, each stands behind its own mark.
     let led = headed || weekly.is_some();
@@ -3698,10 +3734,7 @@ fn fact_segments(facts: &FooterFacts, stubs: bool) -> Vec<Segment> {
             Segment::plain(mark, text)
         }
     };
-    let glance = facts
-        .glance
-        .as_ref()
-        .filter(|_| facts.subscription.is_some());
+    let glance = glance.filter(|_| facts.subscription.is_some());
     [
         plain(
             WALL_MARK,
@@ -4345,7 +4378,7 @@ fn plain_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
                     && !(mark == ACCOUNT_MARK && segment.mark == WEEKLY_MARK && segment.joined)
             });
             if mark == OUTLOOK_MARK
-                && facts.glance.is_some()
+                && facts.glance_view().is_some()
                 && let Some(weekly) = rung.iter_mut().find(|segment| segment.mark == WEEKLY_MARK)
                 && let Some(plain) = weekly_segment(facts, weekly.joined, None)
             {
@@ -4498,7 +4531,7 @@ fn subscription_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
     // the 5-hour part, the long words, half the bar, a verdict that is neither a stop nor a
     // wall, the reset (a kept verdict at its shortest), the bar. A unit with no outlook narrows
     // as it always did: its name is cut before its week's words go short.
-    if let Some(glance) = facts.glance.as_ref() {
+    if let Some(glance) = facts.glance_view() {
         rung.retain(|segment| segment.mark != FIVE_MARK);
         push(&mut out, &rung);
         let verdict = glance.verdict.as_ref();
@@ -4564,7 +4597,7 @@ fn subscription_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
     // Below the unit's narrowest form the outlook gives way before the account does: a kept
     // verdict outlasts the week's figure, then the account stands alone, so a pane too narrow
     // for the outlook's unit still names the account wherever it would with no outlook.
-    if facts.glance.is_some() && narrow.iter().any(|s| s.mark == ACCOUNT_MARK) {
+    if facts.glance_view().is_some() && narrow.iter().any(|s| s.mark == ACCOUNT_MARK) {
         for keep in [
             &[WALL_MARK, ACCOUNT_MARK, OUTLOOK_MARK][..],
             &[WALL_MARK, ACCOUNT_MARK],

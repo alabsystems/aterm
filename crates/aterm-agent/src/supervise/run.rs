@@ -395,11 +395,18 @@ pub struct IdlePoint {
     /// ([`super::policy::turn_end::TurnEndState::replies_stop`], as the decision at this point read
     /// it), so a carry-on owed here types nothing either: a relaunch is no one else's turn.
     pub replies_held: bool,
+    /// A line the loop wrote stands held in custody (ATERM-KI-1101-3), and what the loop has judged
+    /// of it ([`LineHeld`]): `None` where no line is held. The loop says it at an idle point and at
+    /// a break of the agent's own background work while the line stands, and offers no break's
+    /// fact at all then ([`IdleHost::at_background_fact`]).
+    pub line_held: Option<LineHeld>,
 }
 
+pub use super::custody::LineHeld;
+
 /// A tape spells a point as it did before [`IdlePoint::held`], [`IdlePoint::theirs`],
-/// [`IdlePoint::carry_only`] and [`IdlePoint::replies_held`] were there whenever none of them
-/// says anything, so a tape recorded before them still replays.
+/// [`IdlePoint::carry_only`], [`IdlePoint::replies_held`] and [`IdlePoint::line_held`] were there
+/// whenever none of them says anything, so a tape recorded before them still replays.
 impl std::fmt::Debug for IdlePoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut d = f.debug_struct("IdlePoint");
@@ -415,6 +422,9 @@ impl std::fmt::Debug for IdlePoint {
         }
         if self.replies_held {
             d.field("replies_held", &true);
+        }
+        if let Some(held) = &self.line_held {
+            d.field("line_held", held);
         }
         d.finish()
     }
@@ -2292,8 +2302,10 @@ pub struct Session<'a, C: Ctl> {
     /// ([`turn_end_loop::Custody`]): one per session, kept past turns it outlasts and new points.
     custody: Option<turn_end_loop::Custody>,
     /// The restart in place asked for a line held in custody since the last act submitted
-    /// ([`super::policy::turn_end::Restart::InputLost`]), made or not: a loss after it waits.
-    input_lost: Option<turn_end_loop::LostRestart>,
+    /// ([`super::policy::turn_end::Restart::InputLost`]), once the host made or refused it (or
+    /// answered none): a loss after it waits ([`super::custody::Restarts`]). A host's deferral
+    /// (`wait:…`) records nothing here, so the next loss asks again, on the restart's back-off.
+    input_lost: super::custody::Restarts,
     /// What a write's held-text note last read of the input (`(seq, at, word)`: the content seq
     /// the write left, when, and `status`'s `input=` word), for the custody its echo's give-up may
     /// take it into ([`Self::note_text_held`]).
@@ -2652,7 +2664,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             launch_status: approval_loop::LaunchStatus::default(),
             input_unread_at: None,
             custody: None,
-            input_lost: None,
+            input_lost: super::custody::Restarts::default(),
             held_note: None,
             hand_taken: None,
             launch_used: None,
@@ -5329,11 +5341,11 @@ impl<'a, C: Ctl> Session<'a, C> {
             self.question_done(turn.screen.seq, review)?;
         }
         if worked {
-            // A line held in custody goes with the turn once `status` reads the input clear; one
-            // still unread outlasts it, its text and writer kept for its draw.
-            self.custody_turned(turn.screen.seq, review)?;
+            // The worker worked: the lines the loop left are gone, and a line held in custody is
+            // looked at on the point's read, after them, so a draw hands it back to its writer.
             self.left_line = None;
             self.own_line = None;
+            self.custody_after_work(&turn, review)?;
             self.left_went = None;
             self.unauthoritative_held = false;
             self.stall_withheld = false;
@@ -7589,6 +7601,7 @@ impl<C: Ctl> Session<'_, C> {
             // The status this step read first ([`Self::foreground_program`]) is the person's and
             // the driver's word, as at a break's own write.
             let guards = self.occupancy_guards(self.fx.mono(), &opts.policy, &point.screen.rows);
+            let line_held = self.custody_holds_host(point.screen.seq, review);
             let at = IdlePoint {
                 done_under_land: self.autopilot(opts) == Autopilot::Land
                     && self.turn_end.concluded(),
@@ -7597,6 +7610,7 @@ impl<C: Ctl> Session<'_, C> {
                 carry_only,
                 replies_held: !self.fx.replay_lacks_host_door("host.carry_owed")
                     && self.replies_stopped,
+                line_held,
             };
             let step = host.at_idle_on(at);
             if let Some(step) = &step {
@@ -8557,6 +8571,9 @@ pub(super) use wall_confirm::words_kind;
 mod wall_memory;
 #[path = "woken_turn.rs"]
 mod woken_turn;
+/// The dark wake's cap, which a line held in custody waits to at most
+/// ([`super::custody::CUSTODY_CAP`]).
+pub(crate) use turn_end_loop::DARK_WAKE_CAP;
 /// Re-exports composer cursor-row guard constructors.
 pub(crate) use turn_end_loop::composer_guard;
 pub use turn_end_loop::standing_rules;

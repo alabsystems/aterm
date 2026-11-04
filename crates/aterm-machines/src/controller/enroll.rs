@@ -1029,7 +1029,7 @@ pub fn own_exe() -> Result<PathBuf, String> {
 }
 
 /// Runs `aterm machines enroll`.
-#[must_use]
+#[must_use = "handle or propagate the command's exit status"]
 pub fn main(sys: &dyn System, paths: &Paths, args: &[String], tty: bool) -> ExitCode {
     let args = match parse_args(sys, args) {
         Ok(a) => a,
