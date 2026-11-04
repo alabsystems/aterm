@@ -41,7 +41,7 @@ fn child(root: &Path) {
 }
 
 struct Owned {
-    child: Option<std::process::Child>,
+    child: Option<Child>,
     live: Option<group::Live>,
     audit: Option<group::custody_audit::Scope>,
     directory: Option<aterm_tempfile::TempDir>,
@@ -157,7 +157,7 @@ impl Owned {
         }
     }
 
-    fn hand_off(&mut self, mut child: std::process::Child, error: io::Error) -> io::Result<()> {
+    fn hand_off(&mut self, mut child: Child, error: io::Error) -> io::Result<()> {
         self.handed_off = true;
         let directory = self.directory.take();
         aterm_uds::reaper::hand_off(move || {

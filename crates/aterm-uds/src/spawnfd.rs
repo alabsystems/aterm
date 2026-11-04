@@ -1758,10 +1758,28 @@ pub use no_fork::{Child, Command, Rusage, Stdio};
 mod birth;
 pub use birth::{BirthAttempt, BirthKey, NotSpawned, ObservedSpawned, SpawnFailure, Spawned};
 
-/// A [`Command`] for `program`.
+/// The process's hook naming an inherited variable that has gone stale since its start
+/// ([`register_stale_inherited_var`]).
+static STALE_INHERITED_VAR: std::sync::OnceLock<fn() -> Option<&'static str>> =
+    std::sync::OnceLock::new();
+
+/// Register `hook`, asked at each [`command`]: a variable it names is removed from that child's
+/// environment (a later `env` on the command still sets it). The one executable registers the
+/// Command Line Tools shim's `DEVELOPER_DIR` once the tools arrive while it runs, which it cannot
+/// take out of its own environment once it has threads. Only the first registration holds.
+pub fn register_stale_inherited_var(hook: fn() -> Option<&'static str>) {
+    let _ = STALE_INHERITED_VAR.set(hook);
+}
+
+/// A [`Command`] for `program`, without the variable a registered hook calls stale
+/// ([`register_stale_inherited_var`]).
 #[must_use]
 pub fn command(program: impl AsRef<OsStr>) -> Command {
-    Command::new(program)
+    let mut command = Command::new(program);
+    if let Some(var) = STALE_INHERITED_VAR.get().and_then(|hook| hook()) {
+        command.env_remove(var);
+    }
+    command
 }
 
 /// Request a parent-death tie ([`crate::tether`]), killed outright or crashed included, for a

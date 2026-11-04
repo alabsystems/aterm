@@ -494,6 +494,18 @@ impl Host {
     }
 
     fn replay_events(take: &Take, knobs: Knobs, recorded: Vec<(u64, Rec)>) -> Self {
+        Self::replay_until(take, knobs, recorded, None)
+    }
+
+    /// [`Self::replay_events`] cut at `until` ms: the events before it and every present to it.
+    /// A present reads only the events before it, so each shot is the one the whole replay
+    /// draws at that ms; `None` replays every event and a second past the last.
+    fn replay_until(
+        take: &Take,
+        knobs: Knobs,
+        recorded: Vec<(u64, Rec)>,
+        until: Option<u64>,
+    ) -> Self {
         let mut h = Self::new(take, knobs);
         let mut events: Vec<(u64, Rec)> = recorded
             .into_iter()
@@ -504,6 +516,9 @@ impl Host {
             .collect();
         events.sort_by_key(|(ms, _)| *ms);
         for (ms, ev) in events {
+            if until.is_some_and(|u| ms >= u) {
+                break;
+            }
             h.run_to(ms);
             match ev {
                 Rec::In(b) if b.as_slice() == b"\x1b[99;5u" => break,
@@ -511,7 +526,7 @@ impl Host {
                 Rec::Out(b) => h.feed(&b),
             }
         }
-        let end = h.ms() + 1_000;
+        let end = until.unwrap_or(h.ms() + 1_000);
         h.run_to(end);
         h
     }
@@ -520,19 +535,34 @@ impl Host {
 /// The shots of `TAKES[take]` replayed under `knobs`, replayed once in the suite: every test
 /// that reads that host reads the one replay (a replay is a function of its take and knobs).
 fn replayed(take: usize, knobs: Knobs) -> &'static [Shot] {
-    type Replays = Vec<((usize, Knobs), &'static OnceLock<Vec<Shot>>)>;
+    replayed_as(take, knobs, false)
+}
+
+/// [`replayed`], the long insert's dictation typed as keys when `by_keys`
+/// ([`long_insert_by_keys`]): a replay is a function of its take, knobs and events, so every
+/// test that reads a host with the dictation typed as keys reads the one replay too.
+fn replayed_as(take: usize, knobs: Knobs, by_keys: bool) -> &'static [Shot] {
+    type Replays = Vec<((usize, Knobs, bool), &'static OnceLock<Vec<Shot>>)>;
     static REPLAYS: Mutex<Replays> = Mutex::new(Vec::new());
+    let key = (take, knobs, by_keys);
     let cell = {
         let mut replays = REPLAYS.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(&(_, cell)) = replays.iter().find(|(key, _)| *key == (take, knobs)) {
+        if let Some(&(_, cell)) = replays.iter().find(|(k, _)| *k == key) {
             cell
         } else {
             let cell: &'static OnceLock<Vec<Shot>> = Box::leak(Box::new(OnceLock::new()));
-            replays.push(((take, knobs), cell));
+            replays.push((key, cell));
             cell
         }
     };
-    cell.get_or_init(|| Host::replay(&TAKES[take], knobs).shots)
+    cell.get_or_init(|| {
+        if by_keys {
+            assert_eq!(take, 3, "only the long insert's dictation is typed as keys");
+            Host::replay_events(&TAKES[take], knobs, long_insert_by_keys()).shots
+        } else {
+            Host::replay(&TAKES[take], knobs).shots
+        }
+    })
 }
 
 type SyntheticTake = fn() -> Vec<(u64, Rec)>;
@@ -2156,19 +2186,22 @@ fn long_insert_by_keys() -> Vec<(u64, Rec)> {
 /// bounds once they stopped.
 #[test]
 fn the_arrow_keys_walk_the_caret_not_the_cat_to_the_far_margin() {
-    for (frame_ms, brand) in [(8u64, false), (16, false), (8, true), (16, true)] {
+    let hosts = [(8u64, false), (16, false), (8, true), (16, true)];
+    let seen = crate::common::par_map(&hosts, |&(frame_ms, brand)| {
         let knobs = Knobs {
             frame_ms,
             chips: brand,
             brand,
             ..Knobs::SHIPPED
         };
-        let h = Host::replay_events(&TAKES[3], knobs, long_insert_by_keys());
-        let walk: Vec<_> = flights_of(&h.shots)
+        let walk: Vec<_> = flights_of(replayed_as(3, knobs, true))
             .into_iter()
             .filter(|(at, ..)| (7_500..12_180).contains(at))
             .map(|(at, from, landed, to)| (at, from, (landed.col.round(), landed.row), to))
             .collect();
+        (frame_ms, brand, walk)
+    });
+    for (frame_ms, brand, walk) in seen {
         assert!(
             walk.len() <= 2 && walk.iter().all(|(_, _, (col, _), _)| *col <= 100.0),
             "{frame_ms} ms a frame, harness {brand}: flights from the dictation's end to the \
@@ -2188,19 +2221,20 @@ fn the_arrow_keys_walk_the_caret_not_the_cat_to_the_far_margin() {
 /// NEGATIVE CONTROL (as run before the fix): no present carried; nine hops.
 #[test]
 fn the_composers_rule_carries_the_cat_it_grows_under() {
-    for frame_ms in [8u64, 16] {
+    let seen = crate::common::par_map(&[8u64, 16], |&frame_ms| {
         let knobs = Knobs {
             frame_ms,
             chips: true,
             brand: true,
             ..Knobs::SHIPPED
         };
-        let h = Host::replay_events(&TAKES[3], knobs, long_insert_by_keys());
-        let carried = h
-            .shots
+        let carried = replayed_as(3, knobs, true)
             .iter()
             .filter(|s| (2_300..7_700).contains(&s.ms) && s.reason == "content-ride")
             .count();
+        (frame_ms, carried)
+    });
+    for (frame_ms, carried) in seen {
         assert!(
             carried >= 4,
             "{frame_ms} ms a frame: the dictation's growing composer carried the cat on \
@@ -2725,13 +2759,7 @@ fn no_flight_is_a_hop_on_the_spot() {
         }
     }
     let seen = crate::common::par_map(&runs, |&(take, knobs, keys)| {
-        let typed;
-        let shots: &[Shot] = if keys {
-            typed = Host::replay_events(&TAKES[take], knobs, long_insert_by_keys()).shots;
-            &typed
-        } else {
-            replayed(take, knobs)
-        };
+        let shots = replayed_as(take, knobs, keys);
         let hops = shots
             .windows(2)
             .enumerate()
@@ -3331,7 +3359,12 @@ fn a_caret_at_rest_sends_a_far_cat_once_to_its_seat() {
         }
     }
     let seen = crate::common::par_map(&runs, |&knobs| {
-        let h = Host::replay_events(&TAKES[3], knobs, long_insert_as_recorded());
+        let h = Host::replay_until(
+            &TAKES[3],
+            knobs,
+            long_insert_as_recorded(),
+            Some(8_390 + 2_000),
+        );
         let mut out = Vec::new();
         for (i, w) in h.shots.windows(2).enumerate() {
             if !(w[1].frame.action == PetAction::Leap && w[0].frame.action != PetAction::Leap)
@@ -3340,12 +3373,12 @@ fn a_caret_at_rest_sends_a_far_cat_once_to_its_seat() {
                 continue;
             }
             let rose = (w[0].frame.col, w[0].frame.row);
-            if let Some(down) = h.shots[i + 1..]
+            // Cut 2 s past the window, past any bound's air time: a flight still up is a failure.
+            let down = h.shots[i + 1..]
                 .iter()
                 .find(|s| s.frame.action != PetAction::Leap)
-            {
-                out.push((w[1].ms, rose, (down.frame.col, down.frame.row)));
-            }
+                .map(|s| (s.frame.col, s.frame.row));
+            out.push((w[1].ms, rose, down));
         }
         (
             format!(
@@ -3356,15 +3389,15 @@ fn a_caret_at_rest_sends_a_far_cat_once_to_its_seat() {
         )
     });
     for (label, flights) in seen {
-        let on_the_spot = flights
-            .iter()
-            .any(|&(_, (c0, r0), (c1, r1))| (r1 - r0).abs() < 0.5 && (c1 - c0).abs() < 3.0);
+        let on_the_spot = flights.iter().any(|&(_, (c0, r0), to)| {
+            to.is_some_and(|(c1, r1)| (r1 - r0).abs() < 0.5 && (c1 - c0).abs() < 3.0)
+        });
         assert!(
             flights.len() <= 1
                 && !on_the_spot
                 && flights
                     .iter()
-                    .all(|&(_, _, (_, row))| (row - 59.0).abs() < 0.5),
+                    .all(|&(_, _, to)| to.is_some_and(|(_, row)| (row - 59.0).abs() < 0.5)),
             "{label}: flights from the dictation's end to the arrow keys (ms, from, to): \
              {flights:?}"
         );

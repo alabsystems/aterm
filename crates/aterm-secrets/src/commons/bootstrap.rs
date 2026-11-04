@@ -1811,12 +1811,14 @@ impl Bootstrap {
                 "historical roster has another local trust binding",
             ));
         }
-        if access.is_log_backed()
-            && let Some(past) = access.historical_from_log(journal, &self.device.identity, basis)?
-        {
-            return Ok(past);
-        }
-        match access.historical(journal, &self.device.identity, basis) {
+        // A log-era Commons epoch this device holds no `Wrap` of (one from before it joined)
+        // opens through the handoff it was given, as an older control node does.
+        let native = match access.historical_from_log(journal, &self.device.identity, basis) {
+            Ok(Some(past)) => Ok(past),
+            Ok(None) => access.historical(journal, &self.device.identity, basis),
+            Err(error) => Err(error),
+        };
+        match native {
             Ok(past) => Ok(past),
             Err(error) => match self.cached_handoff(basis)? {
                 Some(handoff) => handoff.open(journal, access, &self.device.identity),
@@ -1873,8 +1875,8 @@ impl Bootstrap {
         // Native custody already retains these keys. Avoid spending a handoff
         // slot or doing a durable write for redundant transport.
         if access
-            .historical_from_log(journal, &self.device.identity, *handoff.source())?
-            .is_some()
+            .historical_from_log(journal, &self.device.identity, *handoff.source())
+            .is_ok_and(|past| past.is_some())
             || access
                 .historical(journal, &self.device.identity, *handoff.source())
                 .is_ok()

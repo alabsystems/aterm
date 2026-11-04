@@ -108,9 +108,10 @@ pub fn dialog_kind(owner: &str) -> &'static str {
     match owner {
         "nehelper" => "Local Network",
         "CoreServicesUIAgent" => "Gatekeeper",
-        "Install Command Line Developer Tools" | "Install Command Line Tools" => {
-            "Xcode install stub"
-        }
+        // macOS 27 names the installer's windows `Install Command Line Developer`, cut short
+        // (nux round 9's devtools-control row, the census on a guest without the tools); an
+        // older macOS names them whole.
+        o if o.starts_with("Install Command Line") => APPLE_DEVTOOLS_DIALOG,
         "SecurityAgent" => "authorization",
         "UserNotificationCenter" => "consent",
         "universalAccessAuthWarn" => "Accessibility",
@@ -153,6 +154,73 @@ pub fn dialogs(census: &Census, since_ms: u64) -> Vec<Dialog> {
         }
     }
     out
+}
+
+/// The kind [`dialog_kind`] gives Apple's developer-tools install dialog, the one `/usr/bin/git`
+/// and the other `/usr/bin` stubs raise on a Mac without the Command Line Tools.
+pub const APPLE_DEVTOOLS_DIALOG: &str = "Xcode install stub";
+
+/// The dialogs among `dialogs` that are Apple's developer-tools install dialog
+/// ([`APPLE_DEVTOOLS_DIALOG`]). Pure.
+#[must_use]
+pub fn apple_devtools_dialogs(dialogs: &[Dialog]) -> Vec<&Dialog> {
+    dialogs
+        .iter()
+        .filter(|d| d.kind == APPLE_DEVTOOLS_DIALOG)
+        .collect()
+}
+
+/// The `setup=` rows whose press opens a grant macOS lets only a person give: a privacy switch in
+/// System Settings (Full Disk Access, Developer Tools, Accessibility), macOS's own Local Network
+/// alert, and the debugger's administrator password (the SamplingTools authorization). aterm
+/// offers each (`;offered:`) and never answers it; it waits on a press for one only once a person
+/// asked for the batch.
+pub const MACOS_PERSON_ROWS: [&str; 5] = ["fda", "devtools", "lan", "ax", "debugger"];
+
+/// The rows after `key:` in a `setup=` field (`;needs:<row,...>` or `;offered:<row,...>`,
+/// aterm's `system_state_access::setup_field`). Pure.
+#[must_use]
+pub fn setup_rows<'a>(field: &'a str, key: &str) -> Vec<&'a str> {
+    field
+        .split(';')
+        .filter_map(|part| part.strip_prefix(key)?.strip_prefix(':'))
+        .flat_map(|rows| rows.split(','))
+        .filter(|row| !row.is_empty())
+        .collect()
+}
+
+/// What a first launch's `setup=` readings asked of the person, each row once in the order first
+/// seen: the rows that waited on a press (`;needs:`) and the macOS grants on offer (`;offered:`).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Presses {
+    pub needs: Vec<String>,
+    pub offered: Vec<String>,
+}
+
+impl Presses {
+    /// Take one `setup=` field into the tally.
+    pub fn see(&mut self, field: &str) {
+        for (key, into) in [("needs", &mut self.needs), ("offered", &mut self.offered)] {
+            for row in setup_rows(field, key) {
+                if !into.iter().any(|seen| seen == row) {
+                    into.push(row.to_owned());
+                }
+            }
+        }
+    }
+
+    /// The presses aterm could have made itself: every row that waited on a press while nobody
+    /// asked for anything (`person` false: a grant macOS requires is offered then, never waited
+    /// on), or, once a person at the console asked for the batch, each such row but the grants
+    /// only a person gives ([`MACOS_PERSON_ROWS`]).
+    #[must_use]
+    pub fn avoidable(&self, person: bool) -> Vec<&str> {
+        self.needs
+            .iter()
+            .map(String::as_str)
+            .filter(|row| !person || !MACOS_PERSON_ROWS.contains(row))
+            .collect()
+    }
 }
 
 /// One input the person posted, with the idle clock read just before and after it, and the time
@@ -684,6 +752,37 @@ pub fn completed_at(looks: &[Look]) -> Option<u64> {
         .map(|l| l.at_ms)
 }
 
+impl std::fmt::Display for Record {
+    /// `state=<s> done=<stages|none> running=<stage|none>`, each stage by its name.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let done: Vec<&str> = (0..6)
+            .map(|i| 1u64 << i)
+            .filter(|bit| self.done & bit != 0)
+            .map(stage_name)
+            .collect();
+        write!(
+            f,
+            "state={} done={} running={}",
+            self.state,
+            if done.is_empty() {
+                "none".to_owned()
+            } else {
+                done.join(",")
+            },
+            self.running.map_or("none", stage_name)
+        )
+    }
+}
+
+/// The last progress record the watch read, if it read one.
+#[must_use]
+pub fn last_record(looks: &[Look]) -> Option<Record> {
+    looks
+        .iter()
+        .rev()
+        .find_map(|l| l.text.as_deref().and_then(read_record))
+}
+
 /// The value of `setup=` in `aterm ctl status`' line; `None` from a build without the field.
 #[must_use]
 pub fn setup_field(status: &str) -> Option<&str> {
@@ -702,6 +801,36 @@ pub fn first_session(ls: &str) -> Option<&str> {
         let local = fields.next()?.parse::<u32>().ok();
         pid.and(local).and(fields.next())
     })
+}
+
+/// The shells a first tab runs: what `program=` names for a tab at its prompt.
+const SHELLS: [&str; 7] = ["zsh", "bash", "fish", "sh", "dash", "ksh", "tcsh"];
+
+/// Each listed session's sid and `program=` value, in `aterm ctl ls`' order ([`first_session`]'s
+/// lines; `-` for a line without the field). Pure.
+#[must_use]
+pub fn session_programs(ls: &str) -> Vec<(&str, &str)> {
+    ls.lines()
+        .filter_map(|line| {
+            let sid = first_session(line)?;
+            let program = line
+                .split_whitespace()
+                .find_map(|kv| kv.strip_prefix("program="))
+                .unwrap_or("-");
+            Some((sid, program))
+        })
+        .collect()
+}
+
+/// The sid of the first listed session whose foreground is a shell ([`SHELLS`]): the tab a
+/// typed line runs in: a tab listed before it may run another program (a Command Line Tools
+/// tab running `aterm init`, an agent), which a typed line must never reach. Pure.
+#[must_use]
+pub fn shell_session(ls: &str) -> Option<&str> {
+    session_programs(ls)
+        .into_iter()
+        .find(|(_, program)| SHELLS.contains(program))
+        .map(|(sid, _)| sid)
 }
 
 /// Where setup stands in one look at the guest: `setup=` (8b NUX-5) and the progress record, and
@@ -748,6 +877,22 @@ impl Reading {
             Some(field) => field == "done" || field.starts_with("done;"),
             None => self.record.as_ref().is_some_and(|r| r.state == "completed"),
         }
+    }
+
+    /// Whether setup has only the vault left while the Secrets stage runs: the join's look for
+    /// a vault, which keeps trying for macOS's Local Network answer for up to
+    /// [`aterm_secrets::client::PATIENT_LOOK_MAX`] by its own design. Pure.
+    #[must_use]
+    pub fn vault_look(&self) -> bool {
+        self.setup
+            .as_deref()
+            .and_then(|field| field.strip_prefix("pending:"))
+            .is_some_and(|rest| rest.split(';').next() == Some("vault"))
+            && self
+                .record
+                .as_ref()
+                .and_then(|r| r.running)
+                .is_some_and(|bit| stage_name(bit) == "Secrets")
     }
 
     /// What it says, on one line: what [`Stall`] compares.
@@ -812,9 +957,18 @@ impl Stall {
             return Waited::Done;
         }
         let said = reading.said();
+        // The vault's look bounds its own wait; the hang detector counts from that bound on.
+        let limit_ms = if reading.vault_look() {
+            self.limit_ms.saturating_add(
+                u64::try_from(aterm_secrets::client::PATIENT_LOOK_MAX.as_millis())
+                    .unwrap_or(u64::MAX),
+            )
+        } else {
+            self.limit_ms
+        };
         match &self.last {
             Some((last, acts, since)) if *last == said && *acts == reading.acts => {
-                if now_ms.saturating_sub(*since) >= self.limit_ms {
+                if now_ms.saturating_sub(*since) >= limit_ms {
                     Waited::Stalled {
                         stood: said,
                         since_ms: *since,
@@ -984,6 +1138,21 @@ mod tests {
             "a stage still running across looks started once"
         );
         assert_eq!(completed_at(&looks), Some(12000));
+        assert_eq!(
+            last_record(&looks).map(|r| r.to_string()).as_deref(),
+            Some("state=completed done=Workstation,Spotlight,Permissions running=none")
+        );
+        // A watch that ended pending names what it said last, absent looks after it aside.
+        let (pending, _) = read_watch(&format!(
+            "at 1 {}\nat 2 absent\n",
+            rec("pending", 6, Some(8))
+        ));
+        assert_eq!(completed_at(&pending), None);
+        assert_eq!(
+            last_record(&pending).map(|r| r.to_string()).as_deref(),
+            Some("state=pending done=Spotlight,Permissions running=Secrets")
+        );
+        assert_eq!(last_record(&read_watch("at 1 absent\n").0), None);
         assert_eq!(stage_name(4), "Permissions");
         let (resumed, _) = read_watch(&format!(
             "at 1 {}\nat 2 {}\nat 3 {}\n",
@@ -1190,6 +1359,28 @@ mod tests {
     }
 
     #[test]
+    fn a_typed_line_goes_to_the_first_shell_never_the_tab_listed_first() {
+        // A first launch with the Command Line Tools tab listed ahead of the shell's.
+        let ls = "763 0 s-aaaaaaaaaaaaaaaaaaaa - alive ~ meta=0 path=live program=aterm agent=-\n\
+                  763 1 s-bbbbbbbbbbbbbbbbbbbb - alive ~ meta=0 path=live program=zsh agent=-\n";
+        assert_eq!(shell_session(ls), Some("s-bbbbbbbbbbbbbbbbbbbb"));
+        // The negative control: the first listed is the one `first_session` picks.
+        assert_eq!(first_session(ls), Some("s-aaaaaaaaaaaaaaaaaaaa"));
+        assert_eq!(
+            session_programs(ls),
+            vec![
+                ("s-aaaaaaaaaaaaaaaaaaaa", "aterm"),
+                ("s-bbbbbbbbbbbbbbbbbbbb", "zsh")
+            ]
+        );
+        // No shell listed, and a line with no program= at all: no tab to type in.
+        let none = "763 0 s-aaaaaaaaaaaaaaaaaaaa - alive ~ meta=0 program=aterm\n\
+                    763 1 s-cccccccccccccccccccc - alive ~ meta=0\n";
+        assert_eq!(shell_session(none), None);
+        assert_eq!(session_programs(none)[1], ("s-cccccccccccccccccccc", "-"));
+    }
+
+    #[test]
     fn setup_reads_its_status_field_and_falls_back_to_the_record() {
         let line = "OK sid=1 fleet=off setup=pending:fda,devtools fabric=absent";
         assert_eq!(setup_field(line), Some("pending:fda,devtools"));
@@ -1270,6 +1461,109 @@ mod tests {
             stages.see(110_000, &running(2)),
             Waited::Stalled { .. }
         ));
+    }
+
+    /// The vault's own look bounds its wait: with only the vault left and the Secrets stage
+    /// running, the hang detector counts from the look's bound on, and from a minute anywhere
+    /// else (the negative control: the same reading with another stage running stalls at once).
+    #[test]
+    fn the_vaults_bounded_look_is_waited_out_before_the_hang_detector_counts() {
+        let look = aterm_secrets::client::PATIENT_LOOK_MAX.as_millis() as u64;
+        let reading = |setup: &str, bit| Reading {
+            setup: Some(setup.to_owned()),
+            record: Some(Record {
+                state: "pending".into(),
+                done: 6,
+                running: Some(bit),
+            }),
+            acts: 0,
+        };
+        let vault = reading("pending:vault", 8);
+        assert!(vault.vault_look());
+        assert!(reading("pending:vault;needs:vault", 8).vault_look());
+        assert!(
+            !reading("pending:vault,repos", 8).vault_look(),
+            "more than the vault left"
+        );
+        assert!(
+            !reading("pending:vault", 16).vault_look(),
+            "another stage runs"
+        );
+        let mut wait = Stall::new(STALL_MS);
+        assert_eq!(wait.see(0, &vault), Waited::Moving);
+        assert_eq!(wait.see(STALL_MS + look - 1, &vault), Waited::Moving);
+        assert!(matches!(
+            wait.see(STALL_MS + look, &vault),
+            Waited::Stalled { .. }
+        ));
+        let other = reading("pending:vault", 16);
+        let mut control = Stall::new(STALL_MS);
+        assert_eq!(control.see(0, &other), Waited::Moving);
+        assert!(matches!(
+            control.see(STALL_MS, &other),
+            Waited::Stalled { .. }
+        ));
+    }
+
+    /// A press aterm could have made is a row that waited on one (`;needs:`) while nobody asked
+    /// for anything; once a person asked for macOS's batch, the grants only a person gives are
+    /// theirs. Grants on offer are no press. Negative control: a run whose readings name none.
+    #[test]
+    fn presses_are_the_rows_that_waited_on_one_and_offers_are_not() {
+        assert_eq!(
+            setup_rows("pending:vault,repos;needs:repos", "needs"),
+            ["repos"]
+        );
+        assert_eq!(
+            setup_rows("done;asking:vault;offered:fda,debugger", "offered"),
+            ["fda", "debugger"]
+        );
+        assert!(setup_rows("done;offered:fda", "needs").is_empty());
+        let mut presses = Presses::default();
+        for field in [
+            "pending",
+            "pending:vault;needs:debugger",
+            "pending:vault,repos;needs:repos,debugger",
+            "done;asking:vault;offered:fda",
+        ] {
+            presses.see(field);
+        }
+        assert_eq!(presses.needs, ["debugger", "repos"]);
+        assert_eq!(presses.offered, ["fda"]);
+        assert_eq!(presses.avoidable(false), ["debugger", "repos"]);
+        assert_eq!(presses.avoidable(true), ["repos"]);
+        let mut none = Presses::default();
+        none.see("pending:vault");
+        none.see("done;asking:vault;offered:debugger");
+        assert!(none.avoidable(false).is_empty(), "CONTROL: {none:?}");
+    }
+
+    /// Apple's developer-tools dialog is told from every other window the census lists.
+    #[test]
+    fn apples_developer_tools_dialog_is_picked_out_of_the_census() {
+        let c = read_census(
+            "census 1000 every=250 windows=0\n\
+             new 2000 40 800 0 900x644 UserNotificationCenter\n\
+             new 3000 44 77 0 300x80 Install Command Line Developer Tools\n",
+        );
+        let all = dialogs(&c, 1000);
+        let apple = apple_devtools_dialogs(&all);
+        assert_eq!(apple.len(), 1);
+        assert_eq!(apple[0].first_ms, 2000);
+        let quiet = read_census(
+            "census 1000 every=250 windows=0\nnew 2000 40 800 0 900x644 UserNotificationCenter\n",
+        );
+        assert!(apple_devtools_dialogs(&dialogs(&quiet, 1000)).is_empty());
+        // The name macOS 27 gave the installer's window, as the control row's census read it.
+        assert_eq!(
+            dialog_kind("Install Command Line Developer"),
+            APPLE_DEVTOOLS_DIALOG
+        );
+        assert_eq!(
+            dialog_kind("Install Command Line Tools"),
+            APPLE_DEVTOOLS_DIALOG
+        );
+        assert_eq!(dialog_kind("Installer"), "other");
     }
 
     /// The person's and the processes' records as the guest helper writes them, from a run

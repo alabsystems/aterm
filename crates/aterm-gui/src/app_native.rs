@@ -2867,6 +2867,9 @@ impl App {
         self.dispatch_native_target_event(wid, native.instance, view, event)
     }
 
+    /// Every input reaches a native app's reducer here. A person-only press no person is known to
+    /// stand behind is refused before anything of it is taken, whichever way it came: a control,
+    /// a palette command or an accessibility request ([`App::person_only_press_refusal`]).
     fn dispatch_native_target_event(
         &mut self,
         wid: WindowId,
@@ -2874,6 +2877,12 @@ impl App {
         view: crate::tab_model::ViewId,
         event: AppEvent,
     ) -> Result<EventResult, String> {
+        if let AppEvent::Action(invocation) = &event
+            && let Some(refusal) = self.person_only_press_refusal(&invocation.id)
+        {
+            aterm_log::info!("native: a press refused: {refusal}");
+            return Err(refusal);
+        }
         // A scroll the person asked for (a wheel, a page key) moves the page
         // under a still pointer while they watch it: what the pointer rests on
         // afterwards is theirs to press (`app_mouse::NativePointerRest`).

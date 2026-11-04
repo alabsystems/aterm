@@ -2755,6 +2755,8 @@ mod tests {
             next_look.normalized(),
             "FadeOut completion releases the parked look onto the hidden frame"
         );
+        assert_eq!(c.look, next_look.normalized());
+        assert!(c.pending_look.is_none());
         assert!(!c.is_active());
         for i in 0..120 {
             c.on_key(gone + Duration::from_millis(i * 60), true);

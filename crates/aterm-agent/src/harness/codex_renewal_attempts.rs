@@ -57,9 +57,121 @@ pub struct ReceiptWriter<'a> {
     _guard: &'a accounts::Lock,
 }
 
+/// The trusted native host's retained kernel evidence for a cancelled attempt.
+/// Implementations must recheck process-group closure, drained input, and the
+/// absence of an executed or admitted successor for this exact preparation.
+/// A receipt, PID lookup, or serialized observation alone is not this proof.
+pub trait NativeCancellationProof {
+    fn closed_without_successor(&self, prepare: &super::super::native_act::Prepare) -> bool;
+}
+
 impl<'a> ReceiptWriter<'a> {
     pub(super) fn held(env: &'a Env, guard: &'a accounts::Lock) -> Self {
         Self { env, _guard: guard }
+    }
+
+    /// Retire pool deduplication only after the matching root is durably
+    /// consumed, or retired without ever attempting native execution. A crash
+    /// between terminal publication and cleanup is retried by the next reader.
+    pub fn retire_pool_record(&self, expected: &Receipt) -> Result<bool, &'static str> {
+        let terminal = (expected.phase == Phase::Consumed
+            && expected.accepted_turn.as_deref() == Some(expected.intent.wall.as_str()))
+            || (expected.phase == Phase::Retired && !expected.launch_attempted);
+        self.retire_terminal_pool_record(expected, terminal)
+    }
+
+    /// Retire a cancelled, signalled attempt without rewriting its effect history.
+    pub fn retire_cancelled_pool_record(
+        &self,
+        expected: &Receipt,
+        proof: &impl NativeCancellationProof,
+    ) -> Result<bool, &'static str> {
+        if expected.phase != Phase::Retired
+            || !expected.revoked
+            || expected.current_attempt.is_some()
+            || expected.candidate.is_some()
+            || expected.successor_pid.is_some()
+            || expected.successor_birth.is_some()
+            || expected.accepted_turn.is_some()
+            || read_cancellation(self.env, expected)?.is_none()
+        {
+            return Err("cancelled-rotation-not-terminal");
+        }
+        let Some(super::super::native_act::Request::Prepare(prepare)) =
+            super::super::native_act::Request::parse(&expected.native_prepare)
+        else {
+            return Err("cancelled-rotation-recipe");
+        };
+        self.retire_terminal_pool_record(expected, proof.closed_without_successor(&prepare))
+    }
+
+    /// A launched rollback retires only with the matching native completion
+    /// ledger. A retired receipt or a captured launcher alone is insufficient.
+    pub fn retire_rolled_back_pool_record(
+        &self,
+        expected: &Receipt,
+        opts: &super::super::upgrade_drive::Opts,
+    ) -> Result<bool, &'static str> {
+        if opts.state != self.env.state || self.env.home.as_ref() != Some(&opts.home) {
+            return Err("rollback-store-mismatch");
+        }
+        let recipe = match read_active_attempt(self.env, expected)? {
+            Some(attempt) => attempt.native_prepare,
+            None => expected.native_prepare.clone(),
+        };
+        let Some(super::super::native_act::Request::Prepare(prepare)) =
+            super::super::native_act::Request::parse(&recipe)
+        else {
+            return Err("rollback-recipe");
+        };
+        let state = super::super::upgrade_drive::load(opts, &format!("renewal-{}", prepare.id))
+            .ok_or("rollback-completion-missing")?;
+        let terminal = state.native_coordination
+            && state.native_rollback
+            && state.native_completed_prepare.as_deref() == Some(&prepare)
+            && state
+                .native_observation
+                .as_ref()
+                .is_some_and(|observed| expected.matches_completed_rollback(&prepare, observed));
+        self.retire_terminal_pool_record(expected, terminal)
+    }
+
+    fn retire_terminal_pool_record(
+        &self,
+        expected: &Receipt,
+        terminal: bool,
+    ) -> Result<bool, &'static str> {
+        if expected.intent.purpose != super::Purpose::WeeklyQuota {
+            return Ok(false);
+        }
+        if !terminal || super::read_receipt(self.env, &expected.id).as_ref() != Some(expected) {
+            return Err("rotation-not-terminal");
+        }
+        let binding = super::super::codex_rotation::receipt_binding(expected)?;
+        let store = self
+            .env
+            .accounts_store_for(accounts::Cli::Codex)
+            .ok_or("store")?;
+        let mut removed = false;
+        store
+            .transact_logins_held(self._guard, self.env.now, &mut None, |_, logins| {
+                match logins.native_rotations.get(&expected.id) {
+                    None => return Ok(Vec::new()),
+                    Some(current) if current != &binding => {
+                        return Err("rotation binding changed".into());
+                    }
+                    Some(_) => {}
+                }
+                logins.pending_native_retirement = Some(accounts::NativeRotationRetirement::new(
+                    &expected.id,
+                    &binding,
+                ));
+                logins.native_rotations.remove(&expected.id);
+                removed = true;
+                Ok(Vec::new())
+            })
+            .map_err(|_| "rotation-retirement")?;
+        Ok(removed)
     }
 
     /// Construct a proposed immutable child. The native predecessor can be the
@@ -384,6 +496,7 @@ fn current_reference(receipt: &Receipt) -> AttemptRef {
 pub(super) fn same_intent(left: &Receipt, right: &Receipt) -> bool {
     left.id == right.id
         && left.intent == right.intent
+        && left.destination == right.destination
         && left.sid == right.sid
         && left.old_pid == right.old_pid
         && left.old_birth == right.old_birth

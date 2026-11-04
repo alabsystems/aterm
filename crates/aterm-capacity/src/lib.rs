@@ -54,6 +54,9 @@
     feature(macro_attr)
 )]
 
+#[cfg(test)]
+aterm_durable::plain_durable_flushes_in_tests!();
+
 use std::path::PathBuf;
 use std::time::Duration;
 

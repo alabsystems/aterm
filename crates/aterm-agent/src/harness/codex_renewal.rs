@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A same-account renewal follows a native binding, never a caller-supplied path.
-//! This module supplies no terminal or process-mutation authority.
+//! Identity-bound account recovery metadata and same-account renewal selection.
+//! No caller-supplied path establishes a binding, and this module supplies no
+//! terminal or process-mutation authority.
 
 use super::{accounts, accounts_sync, cli::Env, codex_app_login, self_claimed};
 use serde::{Deserialize, Serialize};
@@ -37,8 +38,38 @@ fn hex(word: &str, size: usize) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Purpose {
+    #[default]
+    Login,
+    WeeklyQuota,
+}
+
+impl Purpose {
+    fn is_login(&self) -> bool {
+        *self == Self::Login
+    }
+
+    pub fn marker(self) -> &'static str {
+        match self {
+            Self::Login => "renewal",
+            Self::WeeklyQuota => "rotation",
+        }
+    }
+
+    pub fn rule(self) -> &'static str {
+        match self {
+            Self::Login => "login-back@v1",
+            Self::WeeklyQuota => "usage-rotate@v1",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Intent {
+    #[serde(default, skip_serializing_if = "Purpose::is_login")]
+    pub purpose: Purpose,
     pub thread: String,
     pub wall: String,
     pub identity: Identity,
@@ -54,6 +85,14 @@ pub enum Request {
 
 impl Request {
     pub fn parse(line: &str) -> Option<Self> {
+        Self::parse_for(line, Purpose::Login)
+    }
+
+    pub fn parse_rotation(line: &str) -> Option<Self> {
+        Self::parse_for(line, Purpose::WeeklyQuota)
+    }
+
+    fn parse_for(line: &str, purpose: Purpose) -> Option<Self> {
         let mut words = line.split_ascii_whitespace();
         let verb = words.next()?;
         let mut fields = BTreeMap::new();
@@ -66,15 +105,20 @@ impl Request {
         match verb {
             "prepare" if fields.len() == 4 => {
                 let thread = *fields.get("thread")?;
-                let wall = *fields.get("wall")?;
-                let account = *fields.get("account")?;
-                let user = *fields.get("user")?;
+                let (wall_key, account_key, user_key) = match purpose {
+                    Purpose::Login => ("wall", "account", "user"),
+                    Purpose::WeeklyQuota => ("turn", "source_account", "source_user"),
+                };
+                let wall = *fields.get(wall_key)?;
+                let account = *fields.get(account_key)?;
+                let user = *fields.get(user_key)?;
                 (self_claimed::is_uuid(thread)
                     && self_claimed::is_uuid(wall)
                     && hex(account, 64)
                     && hex(user, 64))
                 .then(|| {
                     Self::Prepare(Intent {
+                        purpose,
                         thread: thread.into(),
                         wall: wall.into(),
                         identity: Identity {
@@ -261,7 +305,7 @@ pub fn commit_receipt(env: &Env, expected: &Receipt) -> Result<Option<Receipt>, 
     if expected.phase != Phase::Ready {
         return Err("not-ready");
     }
-    with_successor(env, &expected.old_auth, &expected.intent.identity, |next| {
+    with_selected(env, expected, |next| {
         if !expected.matches_successor(next)
             || read_receipt(env, &expected.id).as_ref() != Some(expected)
         {
@@ -274,12 +318,54 @@ pub fn commit_receipt(env: &Env, expected: &Receipt) -> Result<Option<Receipt>, 
     })
 }
 
+pub fn with_selected<T>(
+    env: &Env,
+    receipt: &Receipt,
+    use_selected: impl FnOnce(&Successor) -> Result<T, &'static str>,
+) -> Result<Option<T>, &'static str> {
+    with_selected_writer(env, receipt, |next, _| use_selected(next))
+}
+
+/// Retry terminal pool-record cleanup independently of selected credentials:
+/// consumption has already closed native execution authority.
+pub fn retire_pool_record(env: &Env, receipt: &Receipt) -> Result<Option<bool>, &'static str> {
+    with_receipt_writer(env, |writer| writer.retire_pool_record(receipt))
+}
+
+pub fn with_selected_writer<T>(
+    env: &Env,
+    receipt: &Receipt,
+    use_selected: impl FnOnce(&Successor, &ReceiptWriter<'_>) -> Result<T, &'static str>,
+) -> Result<Option<T>, &'static str> {
+    match receipt.intent.purpose {
+        Purpose::Login => with_successor_writer(
+            env,
+            &receipt.old_auth,
+            &receipt.intent.identity,
+            use_selected,
+        ),
+        Purpose::WeeklyQuota => {
+            super::codex_rotation::with_selected_writer(env, receipt, use_selected)
+        }
+    }
+}
+
 impl Intent {
+    pub fn marker<'a>(&self, record: &'a aterm_json::Value) -> &'a aterm_json::Value {
+        &record["owed"][self.purpose.marker()]
+    }
+
+    pub fn matches_history(&self, history: &History) -> bool {
+        match self.purpose {
+            Purpose::Login => history.auth_wall,
+            Purpose::WeeklyQuota => history.usage_wall,
+        }
+    }
     /// The native record is read only after its process identity and resume
     /// command were validated by the host. No bare request establishes a wall.
     pub fn matches_record(&self, record: &aterm_json::Value, receipt: Option<&str>) -> bool {
         let owed = &record["owed"];
-        let renewal = &owed["renewal"];
+        let renewal = self.marker(record);
         record["sessionId"].as_str() == Some(&self.thread)
             && matches!(record["status"].as_str(), Some("idle" | "waiting"))
             && record["draftEmpty"].as_bool() == Some(true)
@@ -288,7 +374,7 @@ impl Intent {
             && owed["thread"].as_str() == Some(&self.thread)
             && owed["nativeOrigin"]["turnId"].as_str() == Some(&self.wall)
             && owed["nativeOrigin"]["phase"].as_str() == Some("complete")
-            && owed["rule"].as_str() == Some("login-back@v1")
+            && owed["rule"].as_str() == Some(self.purpose.rule())
             && renewal["openaiScope"].as_bool() == Some(true)
             && matches!(
                 renewal.get("local"),
@@ -376,8 +462,8 @@ impl Candidate {
 #[path = "codex_renewal_attempts.rs"]
 mod attempts;
 pub use attempts::{
-    Attempt, AttemptRef, Cancellation, CancellationKind, ReceiptWriter, read_active_attempt,
-    read_attempt, read_cancellation, with_receipt_writer,
+    Attempt, AttemptRef, Cancellation, CancellationKind, NativeCancellationProof, ReceiptWriter,
+    read_active_attempt, read_attempt, read_cancellation, with_receipt_writer,
 };
 
 /// Durable metadata only. Native command and operation persistence are retained
@@ -385,6 +471,10 @@ pub use attempts::{
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Receipt {
+    /// A quota move must name a different account. Login renewals have no
+    /// destination field and retain their existing same-identity requirement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<Identity>,
     pub id: String,
     pub intent: Intent,
     pub sid: String,
@@ -409,6 +499,19 @@ pub struct Receipt {
 }
 
 impl Receipt {
+    pub fn target_identity(&self) -> Option<&Identity> {
+        match (self.intent.purpose, &self.destination) {
+            (Purpose::Login, None) => Some(&self.intent.identity),
+            (Purpose::WeeklyQuota, Some(target))
+                if hex(&target.account, 64)
+                    && hex(&target.user, 64)
+                    && target.account != self.intent.identity.account =>
+            {
+                Some(target)
+            }
+            _ => None,
+        }
+    }
     /// The immutable logical binding, independent of mutable attempt progress.
     pub fn same_intent(&self, other: &Self) -> bool {
         attempts::same_intent(self, other)
@@ -423,6 +526,22 @@ impl Receipt {
         candidate
             .matches_exec(process?, prepare)
             .then_some(candidate.forward)
+    }
+
+    /// The completed native rollback must name this exact restored process,
+    /// with no accepted recovery turn. This observes closure, not execution authority.
+    fn matches_completed_rollback(
+        &self,
+        prepare: &super::native_act::Prepare,
+        observed: &super::native_observe::SavedObservation,
+    ) -> bool {
+        let restored = &observed.registration.vendor;
+        self.phase == Phase::Retired
+            && self.launch_attempted
+            && self.accepted_turn.is_none()
+            && self.successor_pid == Some(restored.pid)
+            && self.successor_birth == Some(restored.birth)
+            && self.exec_candidate(Some(restored), prepare) == Some(false)
     }
 
     /// A later native restart may carry the pending action to a new process.
@@ -515,11 +634,14 @@ impl Receipt {
         self.old_auth == next.old_auth
             && self.new_auth == next.new_auth
             && self.generation == next.generation
-            && self.intent.identity == next.identity
+            && self.target_identity() == Some(&next.identity)
             && self.row_stamp == row_stamp(&next.row)
     }
 
     pub fn reply(&self) -> String {
+        let Some(target) = self.target_identity() else {
+            return "ERR account recovery invalid identity transition\n".into();
+        };
         let state = match self.phase {
             Phase::Ready => "ready",
             Phase::Committing => "waiting",
@@ -527,6 +649,18 @@ impl Receipt {
             Phase::Consumed => "consumed",
             Phase::Retired => "retired",
         };
+        if self.intent.purpose == Purpose::WeeklyQuota {
+            return format!(
+                "OK codex-rotation state={state} id={} thread={} turn={} source_account={} source_user={} target_account={} target_user={}\n",
+                self.id,
+                self.intent.thread,
+                self.intent.wall,
+                self.intent.identity.account,
+                self.intent.identity.user,
+                target.account,
+                target.user,
+            );
+        }
         format!(
             "OK codex-renewal state={state} id={} thread={} wall={} account={} user={}\n",
             self.id,
@@ -540,7 +674,10 @@ impl Receipt {
     /// Bind acceptance once. Repeating the same durable native turn is safe;
     /// another turn or a receipt that never committed cannot consume it.
     pub fn consume(&mut self, turn: &str) -> bool {
-        if !self_claimed::is_uuid(turn) || turn != self.intent.wall {
+        if self.target_identity().is_none()
+            || !self_claimed::is_uuid(turn)
+            || turn != self.intent.wall
+        {
             return false;
         }
         match self.phase {
@@ -576,7 +713,8 @@ pub fn read_receipt(env: &Env, id: &str) -> Option<Receipt> {
     }
     (receipt.id == id
         && hex(&receipt.intent.identity.account, 64)
-        && hex(&receipt.intent.identity.user, 64))
+        && hex(&receipt.intent.identity.user, 64)
+        && receipt.target_identity().is_some())
     .then_some(receipt)
 }
 
@@ -615,6 +753,12 @@ pub fn read_index(path: &Path) -> Result<Option<String>, &'static str> {
 /// Caller holds the Codex store writer guard, also serializing concurrent
 /// prepare, commit and consume for this receipt.
 pub fn write_receipt(env: &Env, receipt: &Receipt) -> Result<(), &'static str> {
+    if receipt.target_identity().is_none()
+        || !hex(&receipt.intent.identity.account, 64)
+        || !hex(&receipt.intent.identity.user, 64)
+    {
+        return Err("receipt-identity-transition");
+    }
     let path = receipt_path(env, &receipt.id).ok_or("receipt-id")?;
     let parent = path.parent().ok_or("receipt-path")?;
     aterm_types::fs_restricted::ensure_private_dir(parent).map_err(|_| "receipt-directory")?;
@@ -852,6 +996,9 @@ pub(super) fn drive_connection(
 pub struct History {
     pub starts: u64,
     pub auth_wall: bool,
+    /// A native usage-limit failure. The host must additionally establish a
+    /// weekly included-usage wall before preparing an account rotation.
+    pub usage_wall: bool,
     pub latest_is_wall: bool,
 }
 
@@ -903,6 +1050,7 @@ fn history_lines(reader: impl std::io::BufRead, intent: &Intent) -> Option<Histo
     let mut starts = 0;
     let mut current = String::new();
     let mut auth = false;
+    let mut usage = false;
     let mut ended = false;
     for line in reader.lines() {
         let line = line.ok()?;
@@ -921,14 +1069,17 @@ fn history_lines(reader: impl std::io::BufRead, intent: &Intent) -> Option<Histo
                     starts += 1
                 }
                 auth = false;
+                usage = false;
                 ended = false;
             }
             "error" if current == intent.wall => {
                 auth = native_login_error(event);
+                usage = event["codex_error_info"].as_str() == Some("usage_limit_exceeded");
             }
             "task_complete" | "turn_complete" if event["turn_id"].as_str() == Some(&current) => {
                 if let Some(error) = event.get("error") {
                     auth = native_login_error(error);
+                    usage = error["codex_error_info"].as_str() == Some("usage_limit_exceeded");
                 }
                 ended = true;
             }
@@ -938,6 +1089,7 @@ fn history_lines(reader: impl std::io::BufRead, intent: &Intent) -> Option<Histo
     Some(History {
         starts,
         auth_wall: auth && ended && current == intent.wall,
+        usage_wall: usage && ended && current == intent.wall,
         latest_is_wall: current == intent.wall,
     })
 }
@@ -1030,6 +1182,7 @@ mod tests {
 
     fn intent() -> Intent {
         Intent {
+            purpose: Default::default(),
             thread: THREAD.into(),
             wall: WALL.into(),
             identity: Identity::from_native("workspace", "user"),
@@ -1078,6 +1231,7 @@ mod tests {
             History {
                 starts: 1,
                 auth_wall: true,
+                usage_wall: false,
                 latest_is_wall: true
             }
         );
@@ -1148,6 +1302,51 @@ mod tests {
         let text = event(aterm_json::json!({"type":"task_started","turn_id":WALL}))
             + &event(aterm_json::json!({"type":"turn_started","turn_id":WALL}));
         assert_eq!(history_lines(text.as_bytes(), &intent()).unwrap().starts, 2);
+    }
+
+    #[test]
+    fn quota_requests_and_markers_cannot_be_used_as_same_account_renewals() {
+        let mut quota = intent();
+        quota.purpose = Purpose::WeeklyQuota;
+        let request = format!(
+            "prepare thread={THREAD} turn={WALL} source_account={} source_user={}",
+            quota.identity.account, quota.identity.user,
+        );
+        assert_eq!(
+            Request::parse_rotation(&request),
+            Some(Request::Prepare(quota.clone()))
+        );
+        assert!(Request::parse(&request).is_none());
+        assert!(Request::parse_rotation(&(request + " target=/arbitrary/login")).is_none());
+        let record = aterm_json::json!({
+            "sessionId": THREAD, "status": "waiting", "draftEmpty": true,
+            "autopilot": "active", "owed": {
+                "thread": THREAD, "mode": "cruise", "rule": "usage-rotate@v1",
+                "nativeOrigin": {"turnId": WALL, "phase": "complete"},
+                "rotation": {"openaiScope": true, "account": quota.identity.account,
+                    "user": quota.identity.user, "receipt": null}
+            }
+        });
+        assert!(quota.matches_record(&record, None));
+        assert!(!intent().matches_record(&record, None));
+    }
+
+    #[test]
+    fn quota_history_is_typed_and_separate_from_authentication_failure() {
+        let mut quota = intent();
+        quota.purpose = Purpose::WeeklyQuota;
+        let start = event(aterm_json::json!({"type":"task_started", "turn_id": WALL}));
+        let error =
+            event(aterm_json::json!({"type":"error", "codex_error_info":"usage_limit_exceeded"}));
+        let done = event(aterm_json::json!({"type":"task_complete", "turn_id": WALL}));
+        let history = history_lines(format!("{start}{error}{done}").as_bytes(), &quota).unwrap();
+        assert!(quota.matches_history(&history));
+        assert!(!intent().matches_history(&history));
+        let unfinished = history_lines(format!("{start}{error}").as_bytes(), &quota).unwrap();
+        assert!(!quota.matches_history(&unfinished));
+        let prose = event(aterm_json::json!({"type":"error", "message":"usage_limit_exceeded"}));
+        let untyped = history_lines(format!("{start}{prose}{done}").as_bytes(), &quota).unwrap();
+        assert!(!quota.matches_history(&untyped));
     }
 
     #[test]
@@ -1390,6 +1589,7 @@ mod tests {
     }
     fn receipt() -> Receipt {
         Receipt {
+            destination: None,
             id: "ab".repeat(16),
             intent: intent(),
             sid: "s-fixture".into(),
@@ -1412,6 +1612,36 @@ mod tests {
             current_attempt: None,
             revoked: false,
         }
+    }
+
+    #[test]
+    fn receipt_requires_an_explicit_distinct_quota_destination() {
+        let original = receipt();
+        assert_eq!(original.target_identity(), Some(&original.intent.identity));
+        let value = aterm_json::to_value(&original).unwrap();
+        assert!(value.get("destination").is_none());
+        assert!(value["intent"].get("purpose").is_none());
+        assert_eq!(aterm_json::from_value::<Receipt>(value).unwrap(), original);
+
+        let target = Identity::from_native("next-workspace", "next-user");
+        let mut quota = original.clone();
+        quota.intent.purpose = Purpose::WeeklyQuota;
+        assert!(quota.target_identity().is_none());
+        quota.destination = Some(quota.intent.identity.clone());
+        assert!(quota.target_identity().is_none());
+        quota.destination = Some(target.clone());
+        assert_eq!(quota.target_identity(), Some(&target));
+        let reply = quota.reply();
+        assert!(reply.starts_with("OK codex-rotation state=ready "));
+        assert_eq!(reply.split_whitespace().count(), 10);
+        assert!(reply.contains(&format!("target_account={}", target.account)));
+        assert!(!reply.contains("/old/") && !reply.contains("/new/"));
+        let mut changed = quota.clone();
+        changed.destination = Some(Identity::from_native("third", "user"));
+        assert!(!quota.same_intent(&changed));
+        let mut renewal = original;
+        renewal.destination = Some(target);
+        assert!(renewal.target_identity().is_none());
     }
 
     #[test]
@@ -1663,6 +1893,33 @@ mod tests {
         };
         assert!(receipt.matches_descendant(&completed, &observed, &descendant, true));
         assert!(!receipt.matches_descendant(&completed, &observed, &descendant, false));
+        let mut back = completed.clone();
+        if let NativePlan::Restart {
+            forward, rollback, ..
+        } = &mut back.plan
+        {
+            *rollback = Some(forward.clone());
+        }
+        let mut restored_prefix = descendant.clone();
+        restored_prefix.image = launcher.clone();
+        let mut retired = receipt.clone();
+        retired.phase = Phase::Retired;
+        retired.launch_attempted = true;
+        retired.accepted_turn = None;
+        retired.successor_pid = Some(descendant.pid);
+        retired.successor_birth = Some(descendant.birth);
+        retired.candidate = Some(Candidate::of(&restored_prefix, false));
+        assert!(retired.matches_completed_rollback(&back, &observed));
+        for change in 0..4 {
+            let mut invalid = retired.clone();
+            match change {
+                0 => invalid.successor_birth = Some(descendant.birth + 1),
+                1 => invalid.candidate.as_mut().unwrap().forward = true,
+                2 => invalid.accepted_turn = Some(invalid.intent.wall.clone()),
+                _ => invalid.phase = Phase::Committing,
+            }
+            assert!(!invalid.matches_completed_rollback(&back, &observed));
+        }
         let mut forged = descendant.clone();
         forged.birth += 1;
         assert!(!receipt.matches_descendant(&completed, &observed, &forged, true));

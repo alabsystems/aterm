@@ -48,13 +48,22 @@ impl Corpus {
     }
 }
 
-/// Write `mb` MiB of `corpus` (whole units; the last may cross the target).
+/// Write `mb` MiB of `unit` repeated (whole units; the last may cross the target): a `cat`
+/// corpus (`Corpus::unit`) or a `vte-marks` one.
+///
+/// # Errors
+/// An empty `unit`, which repeats to nothing, or a write that fails.
 pub(crate) fn generate(
-    corpus: Corpus,
+    unit: &[u8],
     mb: u64,
     out: &mut impl std::io::Write,
 ) -> std::io::Result<u64> {
-    let unit = corpus.unit().as_bytes();
+    if unit.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "an empty unit repeats to nothing",
+        ));
+    }
     let target = mb * 1024 * 1024;
     let mut written = 0u64;
     let mut block = Vec::with_capacity(1 << 20);
@@ -81,7 +90,8 @@ pub(crate) fn corpus_file(corpus: Corpus, mb: u64) -> Result<PathBuf, String> {
         let mut f = std::io::BufWriter::new(
             std::fs::File::create(&part).map_err(|e| format!("{}: {e}", part.display()))?,
         );
-        generate(corpus, mb, &mut f).map_err(|e| format!("{}: {e}", part.display()))?;
+        generate(corpus.unit().as_bytes(), mb, &mut f)
+            .map_err(|e| format!("{}: {e}", part.display()))?;
         f.flush().map_err(|e| format!("{}: {e}", part.display()))?;
         std::fs::rename(&part, &path).map_err(|e| format!("{}: {e}", path.display()))?;
     }
@@ -330,7 +340,7 @@ mod tests {
     fn a_corpus_is_whole_units_reaching_the_target() {
         for corpus in [Corpus::Ascii, Corpus::Unicode] {
             let mut out = Vec::new();
-            let n = generate(corpus, 1, &mut out).expect("generates");
+            let n = generate(corpus.unit().as_bytes(), 1, &mut out).expect("generates");
             let unit = corpus.unit().len() as u64;
             assert_eq!(n, out.len() as u64);
             assert!(

@@ -121,9 +121,7 @@ fn a_processs_ids_start_and_age_are_the_ones_ps_prints() {
     let (own_id, led_id) = (own.id(), led.id());
     let _ = own.kill();
     let _ = own.wait();
-    let mut led = led;
-    let _ = led.kill();
-    let _ = led.wait();
+    led.end();
     assert_eq!(ids(own_id), None, "reaped: no process");
     assert_eq!(ps(&["-o", "pid=", "-p", &own_id.to_string()]), None);
     assert_eq!(kernel_start(led_id), None);
@@ -135,29 +133,15 @@ fn the_terminals_owner_and_opener_are_the_ones_ps_reads() {
     use aterm_sysprobe::kproc;
     use std::ffi::OsStr;
     let me = std::process::id();
-    let mut led = tty_agent(&[], None);
+    let led = tty_agent(&[], None);
     let mut plain = parked().spawn().expect("spawn");
     let dir = scratch("pty-sleep");
-    let log = dir.join("pty-host.log");
-    let mut script = pty_host(&["/bin/sleep", "120"].map(OsStr::new), &log)
-        .spawn()
-        .expect("spawn the pty host");
-    let start = Instant::now();
-    let slept = loop {
-        host_lives(&mut script, &log, "the pty host's sleep");
-        if let Some((pid, _, _)) = table()
-            .into_iter()
-            .find(|(_, pp, name)| *pp == script.id() && name == "sleep")
-        {
-            break pid;
-        }
-        assert!(
-            start.elapsed() < HANG,
-            "the pty host's sleep: not within {HANG:?}; the pty host said:\n{}",
-            host_said(&log)
-        );
-        std::thread::yield_now();
-    };
+    let mut script = PtyHost::spawn(
+        &["/bin/sleep", "120"].map(OsStr::new),
+        &dir.join("pty-host.log"),
+        &[],
+    );
+    let slept = script.hosted("the pty host's sleep");
     let host = ps_name(script.id()).expect("the host, as ps names it");
     let walk = |rows: &[kproc::Record]| -> BTreeMap<u32, Option<u32>> {
         let t: Vec<(u32, u32, String, String)> = rows
@@ -201,12 +185,10 @@ fn the_terminals_owner_and_opener_are_the_ones_ps_reads() {
         assert_eq!(got, want, "the opener");
     }
     let script_id = script.id();
-    let _ = led.kill();
-    let _ = led.wait();
-    for c in [&mut script, &mut plain] {
-        let _ = c.kill();
-        let _ = c.wait();
-    }
+    led.end();
+    script.end("the pty host, asked to end");
+    let _ = plain.kill();
+    let _ = plain.wait();
     assert_eq!(
         live[0].1.as_ref().map(|(o, _)| *o),
         Some(me),

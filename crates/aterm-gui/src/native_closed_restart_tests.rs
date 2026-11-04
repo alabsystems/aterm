@@ -106,6 +106,12 @@ fn restart_watch_precedes_signal_and_closed_proof_survives_completion() {
         .expect("retained kernel proof");
     assert_eq!(proof.predecessor, original);
     assert!(proof.quiescent(&facts));
+    assert!(!proof.cancelled_without_successor(&original, &facts));
+    proof.retire();
+    assert!(proof.cancelled_without_successor(&original, &facts));
+    let mut other = original.clone();
+    other.id = "ef".repeat(16);
+    assert!(!proof.cancelled_without_successor(&other, &facts));
     assert_eq!(
         facts.watch_count.load(Ordering::SeqCst),
         1,
@@ -118,6 +124,7 @@ fn restart_watch_precedes_signal_and_closed_proof_survives_completion() {
         .unwrap()
         .insert(7000, process(7000, 400, 4242, 400, 90));
     assert!(!proof.quiescent(&facts));
+    assert!(!proof.cancelled_without_successor(&original, &facts));
 }
 
 #[test]

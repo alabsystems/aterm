@@ -1630,6 +1630,8 @@ fn a_thousand_record_sybil_quorum_flood_evaluates_without_cubic_passes() {
     );
 }
 
+mod reach;
+mod record_budgets;
 pub(super) mod weigh;
 
 /// A `[everyone]` entry.

@@ -241,7 +241,12 @@ fn setup_field_names_what_is_left_and_done_once_the_plan_finished() {
             observed(accessibility, Standing::NeedsYou, None),
         ],
     );
-    assert_eq!(setup_field(&pending), "pending:fda,devtools,vault");
+    // `;needs:` names only the rows that wait on a press: Developer Tools waits and the vault
+    // failed, so neither is one.
+    assert_eq!(
+        setup_field(&pending),
+        "pending:fda,devtools,vault;needs:fda"
+    );
     let finished = SetupStatus {
         finished: true,
         ..status(

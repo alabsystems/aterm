@@ -50,7 +50,7 @@ const RETRY_FAILED: Duration = Duration::from_secs(15);
 
 /// Whether this process may hold a lab: a release build outside a build tool's tests, with no
 /// scratch state root.
-fn holds() -> bool {
+pub(crate) fn holds() -> bool {
     !cfg!(debug_assertions)
         && std::env::var_os("CARGO_MANIFEST_DIR").is_none()
         && std::env::var_os("ATERM_STATE_HOME").is_none()
@@ -58,7 +58,7 @@ fn holds() -> bool {
 }
 
 /// Whether `aterm.toml` at `config` turns the roster source off (`[alab] roster = false`).
-fn turned_off(config: &Path) -> bool {
+pub(crate) fn turned_off(config: &Path) -> bool {
     let Ok(Some(bytes)) = aterm_secrets::fsx::read_aterm_config(config, 1024 * 1024) else {
         return false;
     };

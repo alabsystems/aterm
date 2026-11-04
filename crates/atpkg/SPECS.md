@@ -2329,38 +2329,9 @@ Actions:
    - **Resolved:** `tree.rs::tree_root_changes_on_any_mutation` (recompute-both-sides content/add/mode mutations) is narrowed and renamed to `tree.rs::tree_root_declared_uses_stored_mode_on_posix_and_declared_otherwise`, checking `tree_root_declared`'s `HAS_POSIX_MODES` vs `!HAS_POSIX_MODES` rule directly against the pinned cross-version `GOLDEN` vector.
    - `atpkg-publish`'s `artifact/relocate.rs::machine_local_classification_covers_both_oses` samples `lineage::stock_location`
      for most of its cases.
-
-**Vacuous or host-dependent passes.**
-- `extract.rs::probe_stages_its_directories_0755_under_an_open_umask` and
-  `flow_tests.rs::probe_an_install_under_an_open_umask` are child halves that pass at once when their
-  env var is unset, yet §2 names them primary samples.
-- `progress.rs::pid_alive_reads_an_unsignalable_foreign_pid_as_alive` never reaches its EPERM branch
-  as root, and its reaped-child check can see a reused pid.
-
-**Timing where a count belongs.** `activate.rs::a_reconcile_relays_an_alias_or_twin_whose_bytes_differ_and_then_writes_nothing`
-and several `compat.rs` tests judge "a second pass writes nothing" by mtime equality after a 20 ms
-sleep, which depends on timestamp resolution; a write counter would be exact.
-
-**Prose pinned in behaviour tests.** These pin sentences the specs keep only the structure of:
-`cli.rs::an_unserved_architecture_and_a_removal_are_facts_an_exclusion_is_not` (aterm-gui's
-`toolchain_words.rs` quotes the same sentence, so it should be a shared constant);
-`cli_tests.rs::the_marker_payloads_are_byte_stable` and the pin and rollback line tests; the
-`meter.rs` renders; the `vendor_direct/lane.rs` verdict sentences; and `devtools.rs::the_words_pair_the_drag_with_plus_and_say_should_until_d14`, which
-overlaps aterm-gui's `devtools_helper` tests. The `state.rs` row spellings are the exception: they
-are the cross-version `status.toml` wire format, which `state-row-roundtrip` should take as a written
-definition.
-
-**Unsampled row.** §2 names no test for `toolchain-remedy-labels`, though aterm-toolchain's unmapped
-`discovery.rs::a_toolchain_lacking_the_formatter_and_lint_takes_the_managed_builds` checks its tippy
-and trustfmt labels.
-
-**Oversized tests.**
-- `cli_tests.rs::which_names_the_copy_that_runs_and_shadowing_is_read_per_path` is one ~340-line
-  test; split it along `which-line-denotation` and `shadow-reconcile-says-never-records`.
-- `tree.rs::tree_root_changes_on_any_mutation` asserts only that roots differ, so it stays green if
-  the digest, framing or sort changes; the pinned vectors cover more.
-- atpkg-publish's `artifact/relocate.rs::machine_local_classification_covers_both_oses` mostly samples
-  `lineage::stock_location` (`lineage-check-compiler-admission`).
+9. **Unsampled row.** §2 names no test for `toolchain-remedy-labels`, though `aterm-toolchain`'s unmapped
+   `discovery.rs::a_toolchain_lacking_the_formatter_and_lint_takes_the_managed_builds` checks its tippy
+   and trustfmt labels.
 
 ## 6. Proof order
 

@@ -244,9 +244,10 @@ pub const INTRO: &str = "aterm init: installing Apple's Command Line Tools (git,
 /// The password prompt (`sudo -p`), in the tab and outside it.
 pub const TAB_PROMPT: &str = "Mac password: ";
 
-/// The tab's last line once the tools are installed.
-pub const TAB_INSTALLED: &str = "Successfully completed: Apple's Command Line Tools are installed. \
-                                 You can close this tab.";
+/// The tab's last line once the tools are installed; the window then closes the tab unless it is
+/// its window's last (`aterm-gui`'s `App::developer_tools_install_ended`).
+pub const TAB_INSTALLED: &str =
+    "Successfully completed: Apple's Command Line Tools are installed. This tab closes by itself.";
 
 /// Where the tab's own words go (its terminal), and why its install did not finish, once the
 /// item knows: what [`CommandLineTools::in_tab`] speaks through.

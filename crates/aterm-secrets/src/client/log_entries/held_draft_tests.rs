@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::commons::binding::Request;
-use crate::membership_log::MAX_RECORDS;
+use crate::membership_log::MAX_HELD_RECORDS;
 
 fn member(tag: u8) -> ([u8; 32], [u8; 16], MemberId, Entrant) {
     let seed = [tag; 32];
@@ -54,7 +54,7 @@ fn accepted_publication_keeps_its_whole_draft_or_preserves_the_recovery_file() {
     let (peer_seed, peer_incarnation, peer, peer_founder) = member(2);
     let mut base =
         Log::new(Record::found(&[7; 32], vec![founder, peer_founder], 1_000).unwrap()).unwrap();
-    while base.held_count() < MAX_RECORDS - 2 {
+    while base.held_count() < MAX_HELD_RECORDS - 2 {
         name(&mut base, &actor, &seed, incarnation);
     }
     let mut after_draft = base.clone();
@@ -66,7 +66,7 @@ fn accepted_publication_keeps_its_whole_draft_or_preserves_the_recovery_file() {
         heads: after_draft.heads(),
     };
     let incoming = name(&mut base, &peer, &peer_seed, peer_incarnation);
-    assert_eq!(base.held_count(), MAX_RECORDS - 1);
+    assert_eq!(base.held_count(), MAX_HELD_RECORDS - 1);
 
     // An ordinary publish has already been accepted. Concurrent peer ingress
     // consumed one of the two slots its held draft needs before local retention.

@@ -169,6 +169,14 @@ pub fn mailbox_obs(
 }
 
 /// The lab rules over `cells`, then every generic finding.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "FleetMachineAssignment",
+        action = "Follow",
+        project = "aterm_db::alab::view::tests::follow_transition"
+    )
+)]
 pub fn lab(cells: &Cells) -> (Vec<Finding>, Vec<check::Finding>) {
     let projections: BTreeMap<&str, Projection> = COLLECTIONS
         .iter()

@@ -102,8 +102,7 @@ pub(crate) use log_entries::local_swarm_roster_for_log_held;
 pub use log_entries::{
     admin_mirror_log, admit_member_in_log, check_log_commons_enrollment, configure_log_member,
     enroll_commons_member_in_log, keyed_epochs_environment, local_swarm_roster_for_log,
-    member_denied_by_roster, publish_local_node_key, reconcile_commons_log, remove_member_in_log,
-    trusted_commons_log,
+    member_denied_by_roster, publish_local_node_key, remove_member_in_log, trusted_commons_log,
 };
 pub use mailbox_index::{
     mailbox_component_held, read_mailbox_component, refresh_mailbox_component_index,
@@ -124,7 +123,7 @@ pub use remove::{
     revoke_by_log, tend_epochs, tend_epochs_at, undo_offers, undo_removals, vault_admin_named,
 };
 #[cfg(any(test, debug_assertions))]
-pub use remove::{test_put_everyone, test_remove_unposted};
+pub use remove::{test_put_everyone, test_remove_unposted, test_tend_at};
 pub use retirement::{
     Retirement, Revocation, StolenRevocation, admin_retire, admin_revoke, admin_revoke_stolen,
     machine_named_in_vault, repair_half_done_revokes, rotate_fleet_code_text,
@@ -2481,6 +2480,19 @@ pub enum Look {
 }
 
 const LOOK_PAUSE: Duration = Duration::from_secs(2);
+
+/// How long one try of the look before a join or a sync ([`look`]'s `wait`) waits for the vault.
+pub const REACH_WAIT: Duration = Duration::from_secs(30);
+
+/// How long that look keeps trying ([`look`]'s `patience`) while macOS holds this app's lookups
+/// and LAN connects for a person's answer to its Local Network question.
+pub const CONSENT_WAIT: Duration = Duration::from_secs(3 * 60);
+
+/// The longest a [`look`] with [`CONSENT_WAIT`]'s patience and [`REACH_WAIT`]'s tries runs: the
+/// patience, then one last try and its pause. A watcher of a setup that runs one waits this long
+/// before its own hang detector starts to count.
+pub const PATIENT_LOOK_MAX: Duration =
+    Duration::from_secs(CONSENT_WAIT.as_secs() + REACH_WAIT.as_secs() + LOOK_PAUSE.as_secs());
 
 trait Tries {
     fn get(&mut self, url: &str, wait: Duration) -> Result<transport::Answer, transport::Unheard>;
@@ -11693,6 +11705,28 @@ mod tests {
     use super::*;
 
     const HANG_DETECTOR: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn config_debug_omits_nested_url_credentials() {
+        let query = "synthetic-vault-query-credential";
+        let fragment = "synthetic-vault-fragment-credential";
+        for url in [
+            format!("https://vault.example/v1/alab?token={query}#{fragment}"),
+            format!("https://{query}@vault.example/v1/alab#{fragment}"),
+        ] {
+            let config = Config {
+                source: Source::Url(url),
+                name: "alab".to_owned(),
+                signer: None,
+                followed: Vec::new(),
+                host: "test-machine".to_owned(),
+            };
+            for shown in [format!("{config:?}"), format!("{config:#?}")] {
+                assert!(!shown.contains(query));
+                assert!(!shown.contains(fragment));
+            }
+        }
+    }
 
     /// A wait after an error ends at the change the kernel tells of, not at a later look: the
     /// kernel's word that the routes changed 7 s in ends a minute's wait there. A message that

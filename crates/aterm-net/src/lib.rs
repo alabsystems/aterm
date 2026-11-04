@@ -7,6 +7,9 @@
 
 //! Fleet TLS 1.3 transport, mutual handshake, membership, and peer survey/drive client.
 
+#[cfg(test)]
+aterm_durable::plain_durable_flushes_in_tests!();
+
 use aterm_codec::hex;
 
 /// TLS 1.3 transport with RFC 5705 keying-material exporter and stream relay.

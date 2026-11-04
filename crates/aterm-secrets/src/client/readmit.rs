@@ -51,8 +51,10 @@
 //! - Off the home ALab LAN, a member signs at most [`AUTOMATIC_PER_HOUR`] such admissions an
 //!   hour, and no member signs one once the log holds [`PROVEN_PER_DAY`] `Admit`s of
 //!   [`Evidence::Manual`] from the last day; a Mac on the LAN takes neither share, as the LAN is
-//!   the admission. No member signs one once the log is [`PROVEN_FILL`] full, and a node id the
-//!   fleet book binds to another seat's key takes no new seat.
+//!   the admission. No member signs one once either of the log's record budgets is
+//!   [`PROVEN_FILL`] full, nor one whose whole batch (its `Admit`, a moved seat's `Remove`, and
+//!   the `Wrap`s) would pass any bound of the log, and a node id the fleet book binds to another
+//!   seat's key takes no new seat.
 //! - Nothing is kept unless the evaluator, run over the signed records, seats the new key under
 //!   the label decided, with the node key it proved.
 
@@ -64,8 +66,8 @@ use super::*;
 use crate::commons::binding::Request;
 use crate::members::Allowed;
 use crate::membership_log::{
-    Body, Entrant, EpochAudience, Evidence, Kind, Log, MAX_RECORDS, MemberId, NodeStanding, Record,
-    RecordId, Signer, encode_records,
+    Body, Budget, Entrant, EpochAudience, Evidence, Kind, Log, MemberId, NodeStanding, Record,
+    RecordCounts, RecordId, Signer, encode_records,
 };
 
 /// How long after a seat took a new key it may take another by proof: two Macs that hold one
@@ -80,9 +82,15 @@ pub const AUTOMATIC_PER_HOUR: usize = 4;
 /// every member reads alike from the log, so ~86 members' hourly shares cannot add up to
 /// hundreds of seats a day for one holder of the fleet's key.
 pub const PROVEN_PER_DAY: usize = 8;
-/// The share of [`MAX_RECORDS`] past which no member lets a Mac in by proof: the log grows and is
-/// never pruned, and a full log takes no `Admit`, `Remove` or `Put` again, so the last quarter
-/// is kept for what people do.
+/// The share of each of the log's record budgets, the weighed one and the keyed one
+/// ([`crate::membership_log::RecordBudgets`]), past which no member lets a Mac in by proof: the
+/// log grows and is never pruned, and a full budget takes no record of its kinds again (a full
+/// weighed budget no `Admit` or `Remove`, a full keyed one no `Wrap` or `Put`), so the last
+/// quarter of each is kept for what people do. The held total keeps no share back: an
+/// admission's whole batch need only fit under it ([`decide`]). So the quarters are kept whole
+/// only where the held total is the two budgets together: while
+/// [`crate::membership_log::MAX_HELD_RECORDS`] is less than their two shares together, proof
+/// admissions may fill the log to it, and the log then takes no `Remove`, `Put` or rotation.
 pub const PROVEN_FILL: (usize, usize) = (3, 4);
 
 /// The record-budget condition for a new admission by proof. This is only one
@@ -90,25 +98,55 @@ pub const PROVEN_FILL: (usize, usize) = (3, 4);
 /// an already admitted member, or a separate Commons enrollment exchange.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProofAdmissionCapacity {
+    /// Causally complete weighed records (`Genesis`, `Admit`, `Remove`) in the observed log.
+    pub weighed_records: usize,
+    /// At this many weighed records and above, new proof admissions leave the rest of the
+    /// weighed budget to other operations: [`PROVEN_FILL`] of it.
+    pub weighed_limit: usize,
+    /// Causally complete keyed records (every other kind) in the observed log.
+    pub keyed_records: usize,
+    /// At this many keyed records and above, new proof admissions leave the rest of the keyed
+    /// budget to other operations: [`PROVEN_FILL`] of it.
+    pub keyed_limit: usize,
     /// Causally complete records in the observed log, excluding waiting records.
-    pub complete_records: usize,
-    /// At this count and above, new proof admissions leave the remaining records
-    /// reserved for other operations.
-    pub exclusive_record_limit: usize,
-    /// Whether the record budget permits considering a new proof. All other
-    /// admission checks still apply.
+    pub held_records: usize,
+    /// The most records the log holds in all: a hard bound an admission's whole batch must fit
+    /// under, with no share kept back.
+    pub held_cap: usize,
+    /// Whether neither budget is [`PROVEN_FILL`] full, so a new proof may be considered. All
+    /// other admission checks still apply, the fit of the admission's whole batch among them.
     pub within_limit: bool,
 }
 
 impl ProofAdmissionCapacity {
-    /// Inspect the same complete record count and predicate as [`decide`].
+    /// Inspect the same complete record counts and predicate as [`decide`].
     #[must_use]
     pub fn observe(log: &Log) -> Self {
-        let complete_records = log.held_count();
+        let counts = log.counts();
+        let budgets = log.budgets();
+        let reserve = |budget: usize| (budget * PROVEN_FILL.0).div_ceil(PROVEN_FILL.1);
+        let weighed_limit = reserve(budgets.weighed);
+        let keyed_limit = reserve(budgets.keyed);
         Self {
-            complete_records,
-            exclusive_record_limit: (MAX_RECORDS * PROVEN_FILL.0).div_ceil(PROVEN_FILL.1),
-            within_limit: room_for_proven(complete_records),
+            weighed_records: counts.weighed,
+            weighed_limit,
+            keyed_records: counts.keyed,
+            keyed_limit,
+            held_records: counts.held(),
+            held_cap: budgets.held,
+            within_limit: counts.weighed < weighed_limit && counts.keyed < keyed_limit,
+        }
+    }
+
+    /// The budget that is [`PROVEN_FILL`] full, the weighed one first; `None` where neither is.
+    #[must_use]
+    pub const fn reserved(&self) -> Option<Budget> {
+        if self.weighed_records >= self.weighed_limit {
+            Some(Budget::Weighed)
+        } else if self.keyed_records >= self.keyed_limit {
+            Some(Budget::Keyed)
+        } else {
+            None
         }
     }
 }
@@ -369,11 +407,6 @@ fn manual_this_day(log: &Log, now_ms: u64) -> usize {
         .count()
 }
 
-/// Whether a log of `records` records still has room for a Mac let in by proof ([`PROVEN_FILL`]).
-const fn room_for_proven(records: usize) -> bool {
-    records * PROVEN_FILL.1 < MAX_RECORDS * PROVEN_FILL.0
-}
-
 /// The label `seat` claimed: its genesis entry's, else its `Admit`'s.
 fn claimed_label(log: &Log, seat: &MemberId) -> Option<String> {
     if let Body::Genesis { founders, .. } = log.genesis().body()
@@ -389,8 +422,17 @@ fn claimed_label(log: &Log, seat: &MemberId) -> Option<String> {
 }
 
 /// What the log says the member `me` may do with `proven` at `now_ms` (its clock): the rule in
-/// the module's head, read from `log` alone, so every member decides one proof alike.
-pub(super) fn decide(log: &Log, me: &MemberId, proven: &Proven<'_>, now_ms: u64) -> Decision {
+/// the module's head, read from `log` alone, so every member decides one proof alike. `wraps` is
+/// how many `Wrap`s an admission by `me` signs beside its `Admit` ([`Log::admission_wraps`]): an
+/// admission whose whole batch would pass a bound of the log, its bytes counted at each record
+/// kind's longest ([`Kind::most_bytes`]), is refused here, before any of it is signed.
+pub(super) fn decide(
+    log: &Log,
+    me: &MemberId,
+    proven: &Proven<'_>,
+    wraps: usize,
+    now_ms: u64,
+) -> Decision {
     let refuse = |why: &str| Decision::Refuse(why.to_owned());
     if now_ms == 0 {
         return refuse("this member's clock is not set");
@@ -432,13 +474,14 @@ pub(super) fn decide(log: &Log, me: &MemberId, proven: &Proven<'_>, now_ms: u64)
              Mac comes in by itself tomorrow",
         );
     }
-    if !ProofAdmissionCapacity::observe(log).within_limit {
-        return refuse(
-            "the membership log is three quarters full, and the rest is kept for what people do: \
-             a person decides",
-        );
+    if let Some(budget) = ProofAdmissionCapacity::observe(log).reserved() {
+        return Decision::Refuse(format!(
+            "the membership log's {} fill three quarters of their budget, and the rest is kept \
+             for what people do: a person decides",
+            budget.counts()
+        ));
     }
-    match membership.node(&node) {
+    let decision = match membership.node(&node) {
         NodeStanding::Member(seat) => {
             let Some(held) = membership.get(&seat) else {
                 return refuse("the seat this node key names is gone");
@@ -522,11 +565,10 @@ pub(super) fn decide(log: &Log, me: &MemberId, proven: &Proven<'_>, now_ms: u64)
                 .iter()
                 .find(|f| f.node_key == Some(node))
             {
-                return Decision::Founder {
+                Decision::Founder {
                     label: founder.label.clone(),
-                };
-            }
-            if proven.fleet {
+                }
+            } else if proven.fleet {
                 Decision::Fleet
             } else if proven.lan {
                 Decision::Lan
@@ -537,6 +579,36 @@ pub(super) fn decide(log: &Log, me: &MemberId, proven: &Proven<'_>, now_ms: u64)
         NodeStanding::Retired(_) => refuse("a member replaced this node key with another"),
         NodeStanding::Contested => refuse("two seats hold this node key: a person decides"),
         NodeStanding::Removed(_) => refuse("the vault removed this node key: a person decides"),
+    };
+    // The weighed records it signs: a moved seat's `Remove`, then the `Admit`.
+    let weighed: &[Kind] = match &decision {
+        Decision::Replace { .. } => &[Kind::Remove, Kind::Admit],
+        Decision::Founder { .. } | Decision::Fleet | Decision::Lan => &[Kind::Admit],
+        Decision::Already | Decision::Refuse(_) => return decision,
+    };
+    let batch = RecordCounts {
+        weighed: weighed.len(),
+        keyed: wraps,
+    };
+    // Its bytes are not known before it is signed: each record at its kind's longest.
+    let bytes = weighed
+        .iter()
+        .map(|kind| kind.most_bytes())
+        .sum::<usize>()
+        .saturating_add(wraps.saturating_mul(Kind::Wrap.most_bytes()));
+    match log.passed_by(batch, bytes) {
+        None => decision,
+        Some(Budget::Bytes) => Decision::Refuse(format!(
+            "the membership log nears its limit of record bytes: this admission's {} records, \
+             at their longest, would pass it, so none of them is signed",
+            batch.held()
+        )),
+        Some(budget) => Decision::Refuse(format!(
+            "the membership log is full: this admission's {} records would pass its limit of {}, \
+             so none of them is signed",
+            batch.held(),
+            budget.counts()
+        )),
     }
 }
 
@@ -611,12 +683,14 @@ fn pre_possession_pass(
     else {
         return Err(Some(NOT_HERE.to_owned()));
     };
-    if log.audience_left_out(&EpochAudience::Everyone, &me)
-        || held_audiences(&log, &opened, &me).is_none()
-    {
+    if log.audience_left_out(&EpochAudience::Everyone, &me) {
         return Err(Some(NOT_HERE.to_owned()));
     }
-    match decide(&log, &me, proven, now_ms) {
+    let Some(audiences) = held_audiences(&log, &opened, &me) else {
+        return Err(Some(NOT_HERE.to_owned()));
+    };
+    let wraps = Log::admission_wraps(&opened, &audiences).len();
+    match decide(&log, &me, proven, wraps, now_ms) {
         Decision::Refuse(why) => Err(Some(why)),
         decision => Ok(decision),
     }
@@ -734,7 +808,8 @@ pub fn admit_by_proof(paths: &Paths, proven: &Proven<'_>, now_ms: u64) -> crate:
     let Some(audiences) = held_audiences(&log, &opened, &me) else {
         return Ok(Readmit::NotHere);
     };
-    let decision = decide(&log, &me, proven, now_ms);
+    let wraps = Log::admission_wraps(&opened, &audiences).len();
+    let decision = decide(&log, &me, proven, wraps, now_ms);
     if let Decision::Refuse(why) = decision {
         return Ok(Readmit::Refused(why));
     }

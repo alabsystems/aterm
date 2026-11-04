@@ -36,6 +36,7 @@ pub(crate) use observe_control::serve as serve_observation;
 #[path = "codex_renewal_control.rs"]
 mod renewal;
 pub(crate) use renewal::serve as serve_codex_renewal;
+pub(crate) use renewal::serve_rotation as serve_codex_rotation;
 pub(crate) use renewal::{cancel_owner as cancel_renewal_owner, pending as renewal_pending};
 
 /// A cancelled native cohort is positively closed and its exact original shell
@@ -73,6 +74,16 @@ pub(crate) fn cancelled_native_shell_front(ctx: &crate::SessionCtx, master: i32)
             && kernel.process(shell.pid).as_ref() == Some(shell)
             && kernel.foreground(master) == Some(shell.group)
     })
+}
+
+#[cfg(unix)]
+#[path = "codex_exec_handoff_control.rs"]
+mod exec_handoff;
+#[cfg(unix)]
+pub(crate) use exec_handoff::serve as serve_codex_exec_handoff;
+#[cfg(not(unix))]
+pub(crate) fn serve_codex_exec_handoff(_: &Arc<crate::SessionCtx>, _: i32, _: &str) -> String {
+    DENIED.into()
 }
 
 const DENIED: &str = "ERR denied native operation authority\n";
@@ -132,9 +143,12 @@ impl Clock {
 
 #[derive(Debug, Default)]
 pub(crate) struct Operations {
+    #[cfg(unix)]
+    exec_prepare: Option<Arc<exec_handoff::Preparation>>,
     observations: Arc<Mutex<crate::native_observe::Store>>,
     renewal_seals: BTreeMap<String, renewal::Seal>,
     renewal_services: BTreeMap<String, Arc<renewal::Service>>,
+    rotation_prepare: Option<Arc<renewal::RotationPreparation>>,
     by_id: BTreeMap<String, Arc<Mutex<Operation>>>,
     completed: std::collections::VecDeque<String>,
     coordinated_connections: std::collections::BTreeSet<u64>,
@@ -2228,14 +2242,14 @@ fn serve_by(
             return DENIED.into();
         }
     }
-    if matches!(request, Request::Resume(..)) {
+    if let Request::Resume(_, phase, _, _) = &request {
         let seal = operation
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .authority
             .renewal
             .clone();
-        if seal.as_ref().is_some_and(|seal| !seal.continuing()) {
+        if seal.as_ref().is_some_and(|seal| !seal.continuing(*phase)) {
             return DENIED.into();
         }
     }

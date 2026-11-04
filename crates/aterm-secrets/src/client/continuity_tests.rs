@@ -154,6 +154,7 @@ fn on_lan(log: &Log, mac: Mac, tag: u8, name: &str, at: u64) -> Decision {
             fresh: true,
             book: CURRENT,
         },
+        0,
         at,
     )
 }
@@ -284,6 +285,7 @@ fn a_split_the_node_key_proves_is_recorded_for_a_person_since_a_remove_cannot_fo
                     fresh: true,
                     book: CURRENT,
                 },
+                0,
                 T0 + 2 * DAY,
             ),
             Decision::Refuse(why) if why.starts_with("two seats hold this node key")

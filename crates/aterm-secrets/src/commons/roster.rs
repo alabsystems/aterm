@@ -530,18 +530,7 @@ impl Access {
                 "historical Commons epoch is not wrapped to this device",
             ));
         };
-        let mut members: Vec<Member> = bindings
-            .into_iter()
-            .filter(|b| {
-                *b.network() == self.trust.network && *b.authority() == self.trust.authority
-            })
-            .map(|binding| Member {
-                binding,
-                role: Role::Writer,
-            })
-            .collect();
-        members.sort_by(|a, b| a.binding.cmp(&b.binding));
-        members.dedup_by(|a, b| a.binding.actor() == b.binding.actor());
+        let members = self.log_writers(bindings);
         if let Ok(mut cache) = HISTORICAL_CACHE.lock() {
             if cache.len() >= 16 {
                 cache.pop_front();
@@ -555,6 +544,85 @@ impl Access {
             source: basis,
             generation,
             members,
+            key: SecretBytes::from(key.as_slice()),
+            log_paths: Some(paths.clone()),
+            log_heads_digest: self.log_heads_digest,
+            local_recipient: Some(self.local().binding.recipient()),
+        }))
+    }
+
+    /// The writers of a log-era Commons epoch in this network, by binding, one per actor.
+    fn log_writers(&self, bindings: Vec<Binding>) -> Vec<Member> {
+        let mut members: Vec<Member> = bindings
+            .into_iter()
+            .filter(|b| {
+                *b.network() == self.trust.network && *b.authority() == self.trust.authority
+            })
+            .map(|binding| Member {
+                binding,
+                role: Role::Writer,
+            })
+            .collect();
+        members.sort_by(|a, b| a.binding.cmp(&b.binding));
+        members.dedup_by(|a, b| a.binding.actor() == b.binding.actor());
+        members
+    }
+
+    /// A log-era Commons epoch `source` opened with `key`, a history handoff's: `None` where
+    /// this observation is not log-backed or the log holds no such epoch (a control journal
+    /// node's id instead). The log's signed `Epoch` must commit to `key`, and `source` must be
+    /// `under` (the handoff's issuance) or in its causal past; its writers come from the log, as
+    /// for a member that holds its own `Wrap`.
+    ///
+    /// # Errors
+    /// This is not the current local membership, the log is unavailable or holds `source` only
+    /// pending its parents, or `key` is not `source`'s key or `source` is not in the issuance's
+    /// past.
+    pub(super) fn historical_from_log_with_key(
+        &self,
+        journal: &Journal,
+        identity: &Identity,
+        source: [u8; 32],
+        under: [u8; 32],
+        key: &[u8; 32],
+    ) -> Result<Option<Historical>> {
+        use crate::membership_log::history::{HistoryView, RecordState};
+        let Some(paths) = &self.log_paths else {
+            return Ok(None);
+        };
+        if !self.is_current(journal) || self.local().binding.recipient() != identity.recipient() {
+            return Err(Error::new(
+                "history handoff requires current local membership",
+            ));
+        }
+        let Some((log, _heads_digest)) = crate::client::trusted_commons_log(paths, self.trust)?
+        else {
+            return Err(Error::new("Commons membership log is unavailable"));
+        };
+        let view = HistoryView::new(&log);
+        let lease = view.lease_complete()?;
+        let epoch = match lease.record(&source)? {
+            RecordState::Complete(epoch) => epoch,
+            RecordState::Pending => {
+                return Err(Error::new("historical Commons epoch is not complete"));
+            }
+            RecordState::Absent => return Ok(None),
+        };
+        let Some((generation, bindings)) = lease.historical_commons_writers(&epoch)? else {
+            return Ok(None);
+        };
+        if !lease.commons_epoch_key_under(&epoch, &under, key)? {
+            return Err(Error::new(
+                "history handoff key does not open its Commons epoch under its issuance",
+            ));
+        }
+        Ok(Some(Historical {
+            trust: self.trust,
+            head: self.head,
+            basis: self.basis,
+            source,
+            generation,
+            members: self.log_writers(bindings),
             key: SecretBytes::from(key.as_slice()),
             log_paths: Some(paths.clone()),
             log_heads_digest: self.log_heads_digest,

@@ -2439,7 +2439,7 @@ impl Stamp {
         let skew = wall.checked_sub(i64::try_from(dt).ok()?)?;
         let limit = GAP_CADENCES * u64::from(then.cadence_ms.max(self.cadence_ms));
         ((-SLEEP_SKEW_MS..=SLEEP_SKEW_MS).contains(&skew) && dt <= limit)
-            .then(|| dt as f64 / 1000.0)
+            .then_some(dt as f64 / 1000.0)
     }
 }
 
@@ -2496,7 +2496,7 @@ impl Session {
         let dt = read_ms.checked_sub(self.read_ms).filter(|&d| d > 0)? as f64 / 1000.0;
         let out = t.out_total.checked_sub(self.out)? as f64;
         let input = t.in_total.checked_sub(self.input)? as f64;
-        (out <= TOKENS_CAP_PER_S * dt).then(|| (out / dt * 60.0, input / dt * 60.0))
+        (out <= TOKENS_CAP_PER_S * dt).then_some((out / dt * 60.0, input / dt * 60.0))
     }
 }
 
@@ -4154,7 +4154,7 @@ impl Rows {
             rx_err_ps: rx_err as f64 / d,
             tx_err_ps: tx_err as f64 / d,
             rx_drop_ps: rx_drop as f64 / d,
-            tx_drop_ps: any_tx_drop.then(|| tx_drop as f64 / d),
+            tx_drop_ps: any_tx_drop.then_some(tx_drop as f64 / d),
         });
         let window_ns = dt.filter(|_| measured).map(|d| (d * 1e9).round() as u64);
         let state = if !any_up && links.iter().any(|l| !l.loopback) {

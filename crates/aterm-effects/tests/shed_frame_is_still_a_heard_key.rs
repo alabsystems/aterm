@@ -213,8 +213,7 @@ fn a_shed_tick_keeps_the_keyed_click_ledger() {
     }
     assert_eq!(
         banked[0], banked[1],
-        "the shed path must bank exactly what the LIT path banks — the bound \
-         is pre-existing, not something the split opened (shed {}, lit {})",
+        "shed and lit ticks must bank identical click credit (shed {}, lit {})",
         banked[0], banked[1]
     );
 }

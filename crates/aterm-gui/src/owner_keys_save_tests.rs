@@ -285,15 +285,20 @@ fn a_recovered_drafts_owner_keys_are_saved_by_no_persons_save() {
 /// A SAVE QUEUED BEHIND ONE IN FLIGHT IS REPLAYED FOR WHOEVER ASKED: a control client's Save of
 /// the person's note, asked while the person's theme edit is being written, is replayed as the
 /// control client's when that write lands, so the `occupancy = "prompt"` the person typed in
-/// between waits for the person's own Save; a person's Save merged into the queue makes the
-/// replay the person's.
+/// between waits for the person's own Save; so is an accessibility client's Save; a person's
+/// Save merged into the queue makes the replay the person's.
 /// NEGATIVE CONTROL: with the queue forgetting who asked (`QueueDropsSource`), the control
 /// client's replay writes it.
 #[test]
 fn a_queued_save_is_replayed_for_whoever_asked() {
     const THEME: &str = "window_theme = \"dark\"\n";
     const NOTE: &str = "# the person's note\n";
-    for (person_too, planted) in [(false, false), (true, false), (false, true)] {
+    for (asker, person_too, planted) in [
+        (Unvouched::Controller, false, false),
+        (Unvouched::Controller, true, false),
+        (Unvouched::Controller, false, true),
+        (Unvouched::Assistive, false, false),
+    ] {
         let dir = aterm_tempfile::tempdir().unwrap();
         let (mut app, path, document) = manual(dir.path());
         let (_, view) = app.active_native_view(WID).unwrap();
@@ -301,7 +306,13 @@ fn a_queued_save_is_replayed_for_whoever_asked() {
         let held = app.hold_document_save_for_test(document);
         // An edit past the save in flight, so the queued save has something to replay.
         append(&mut app, false, NOTE);
-        let queue = |app: &mut App| save(app, true).expect("queued behind the save in flight");
+        let queue = |app: &mut App| {
+            match asker {
+                Unvouched::Assistive => app.with_assistive_source(|app| save(app, false)),
+                _ => save(app, true),
+            }
+            .expect("queued behind the save in flight");
+        };
         if planted {
             fault::with(Fault::QueueDropsSource, || queue(&mut app));
         } else {
@@ -312,7 +323,7 @@ fn a_queued_save_is_replayed_for_whoever_asked() {
             save(&mut app, false).expect("the person's Save, queued too");
         }
         let landed = app.land_held_document_save_for_test(document, view, held);
-        let case = format!("person_too={person_too} planted={planted}");
+        let case = format!("asker={asker:?} person_too={person_too} planted={planted}");
         if person_too || planted {
             landed.expect(&case);
             assert_eq!(
@@ -387,6 +398,7 @@ fn the_fence_decides_from_the_saves_provenance_and_both_texts() {
     for provenance in [
         Provenance::new(true, None),
         Provenance::new(false, Some(Unvouched::Controller)),
+        Provenance::new(false, Some(Unvouched::Assistive)),
         Provenance::new(false, Some(Unvouched::Recovered)),
     ] {
         assert!(provenance.fenced(), "{provenance:?}");
@@ -616,6 +628,190 @@ fn a_discard_leaves_no_control_clients_edit_for_undo_or_redo_to_bring_back() {
                 let _clean = save(&mut app, false);
                 assert_eq!(on_disk(&path), DISK, "{case}");
             }
+        }
+    }
+}
+
+/// AN ACCESSIBILITY CLIENT'S EDIT IS NOT SAVED BY A PERSON'S SAVE: `occupancy = "prompt"` put
+/// in the buffer through the window's accessibility tree (`setAccessibilitySelectedText:`, which
+/// a tab's program sends with aterm's own Accessibility grant, as a screen reader does) is
+/// refused by the person's Save, the file unchanged, until Discard Changes and Reload from Disk
+/// gives the person the buffer back.
+/// NEGATIVE CONTROL: the same insertion as the person's own gesture saves.
+#[cfg(a11y_tree)]
+#[test]
+fn an_accessibility_clients_edit_reaches_the_file_by_no_persons_save() {
+    for assistive in [true, false] {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let (mut app, path, document) = manual(dir.path());
+        let (_, view) = app.active_native_view(WID).unwrap();
+        app.dispatch_native_event(WID, AppEvent::EditorCommand(EditorCommand::EndOfBuffer))
+            .unwrap();
+        if assistive {
+            let request = app.accessibility_request_for_test(
+                WID,
+                view,
+                "editor/buffer",
+                aterm_a11y::model::Action::ReplaceSelectedText,
+                Some(aterm_a11y::model::ActionData::Value(PROMPT.into())),
+            );
+            app.on_accessibility_action(WID, request);
+        } else {
+            app.dispatch_native_event(WID, AppEvent::InsertText(PROMPT.to_string()))
+                .unwrap();
+        }
+        let case = format!("assistive={assistive}");
+        assert_eq!(
+            app.document_store.snapshot(document).unwrap().text.as_ref(),
+            format!("{DISK}{PROMPT}"),
+            "{case}: the insertion reached the buffer"
+        );
+        let saved = save(&mut app, false);
+        if assistive {
+            assert_eq!(
+                saved,
+                Err(fenced(
+                    Provenance::new(false, Some(Unvouched::Assistive)),
+                    &app,
+                    document
+                )),
+                "{case}"
+            );
+            assert_eq!(
+                on_disk(&path),
+                DISK,
+                "{case}: the refused save wrote nothing"
+            );
+            app.discard_document_changes(document, view).unwrap();
+            append(&mut app, false, PROMPT);
+            save(&mut app, false).expect("the person's own edit, after the discard");
+        } else {
+            saved.expect(&case);
+        }
+        assert_eq!(on_disk(&path), format!("{DISK}{PROMPT}"), "{case}");
+    }
+}
+
+/// AN ACCESSIBILITY CLIENT'S SAVE KEEPS THE OWNER'S KEYS: the person's `occupancy = "prompt"`
+/// saved by an accessibility client's press of the Editor's Save button is refused, the file
+/// unchanged.
+/// NEGATIVE CONTROL: the person's own press of the same button writes it.
+#[cfg(a11y_tree)]
+#[test]
+fn an_accessibility_clients_save_keeps_the_owners_keys() {
+    const SAVE_BUTTON: &str = "editor/save-button";
+    for assistive in [true, false] {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let (mut app, path, document) = manual(dir.path());
+        let (_, view) = app.active_native_view(WID).unwrap();
+        append(&mut app, false, PROMPT);
+        let case = format!("assistive={assistive}");
+        if assistive {
+            let request = app.accessibility_request_for_test(
+                WID,
+                view,
+                SAVE_BUTTON,
+                aterm_a11y::model::Action::Click,
+                None,
+            );
+            app.on_accessibility_action(WID, request);
+            let status = match app.native_runtime.view_state(view) {
+                Some(crate::native_app::AppViewState::Editor(state)) => state.status.clone(),
+                _ => panic!("the Editor view is live"),
+            };
+            assert_eq!(
+                status,
+                Some(fenced(Provenance::new(true, None), &app, document)),
+                "{case}: the fence refused the save"
+            );
+            assert_eq!(
+                on_disk(&path),
+                DISK,
+                "{case}: the refused save wrote nothing"
+            );
+            assert_eq!(app.document_store.dirty(document), Some(true), "{case}");
+        } else {
+            app.dispatch_native_control_action(
+                WID,
+                view,
+                crate::native_ui::UiKey::new(SAVE_BUTTON),
+                crate::native_app::ActionInvocation {
+                    id: crate::native_ui::ActionId::new("editor/save"),
+                    value: None,
+                },
+                false,
+            )
+            .expect(&case);
+            assert_eq!(on_disk(&path), format!("{DISK}{PROMPT}"), "{case}");
+        }
+    }
+}
+
+/// A PALETTE PASTE AN ACCESSIBILITY CLIENT CHOSE IS NO PERSON'S EDIT: the palette posts its Edit
+/// rows to the event loop, so the origin it posts carries the marks of the gesture that chose
+/// the row and the row runs under them at the wake ([`App::run_posted_menu_action`]). The
+/// clipboard's `occupancy = "prompt"` pasted by a row a palette Click through the window's
+/// accessibility tree chose (taken under the mark [`App::on_accessibility_action`] sets) is
+/// refused by the person's Save, the file unchanged.
+/// NEGATIVE CONTROL: the same row the person chose pastes, and the person's Save writes it.
+#[test]
+fn a_palette_paste_an_accessibility_client_chose_is_no_persons_edit() {
+    use crate::app_take_over::GestureMarks;
+    use crate::menu::MenuAction;
+    for assistive in [true, false] {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let (mut app, path, document) = manual(dir.path());
+        app.dispatch_native_event(WID, AppEvent::EditorCommand(EditorCommand::EndOfBuffer))
+            .unwrap();
+        let origin = if assistive {
+            app.with_assistive_source(|app| app.palette_menu_origin(WID))
+        } else {
+            app.palette_menu_origin(WID)
+        }
+        .expect("a palette origin");
+        let case = format!("assistive={assistive}");
+        assert_eq!(
+            origin.assistive(),
+            assistive,
+            "{case}: the chooser's mark rides the post"
+        );
+        crate::control::PBPASTE_STUB.with(|board| *board.borrow_mut() = Some(PROMPT.to_string()));
+        app.run_posted_menu_action(
+            MenuAction::Paste,
+            Some(origin),
+            GestureMarks::default(),
+            |app, action| {
+                app.fence_menu_action(action);
+                if !app.divert_menu_action_around_rename(action) {
+                    app.paste_into_front_field();
+                }
+            },
+        );
+        crate::control::PBPASTE_STUB.with(|board| *board.borrow_mut() = None);
+        assert_eq!(
+            app.document_store.snapshot(document).unwrap().text.as_ref(),
+            format!("{DISK}{PROMPT}"),
+            "{case}: the paste reached the buffer"
+        );
+        let saved = save(&mut app, false);
+        if assistive {
+            assert_eq!(
+                saved,
+                Err(fenced(
+                    Provenance::new(false, Some(Unvouched::Assistive)),
+                    &app,
+                    document
+                )),
+                "{case}"
+            );
+            assert_eq!(
+                on_disk(&path),
+                DISK,
+                "{case}: the refused save wrote nothing"
+            );
+        } else {
+            saved.expect(&case);
+            assert_eq!(on_disk(&path), format!("{DISK}{PROMPT}"), "{case}");
         }
     }
 }

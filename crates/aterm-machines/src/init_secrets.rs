@@ -249,11 +249,11 @@ pub const PROBE_WAIT: Duration = aterm_secrets::client::PROBE_DEADLINE;
 pub const CHECK_WAIT: Duration = Duration::from_secs(3);
 
 /// How long the look before a join or a sync waits for the vault ([`SecretsOps::reachable`]).
-pub const REACH_WAIT: Duration = Duration::from_secs(30);
+pub const REACH_WAIT: Duration = aterm_secrets::client::REACH_WAIT;
 
 /// How long that look keeps trying while macOS holds this app's lookups and LAN connects for a
 /// person's answer to its Local Network question.
-pub const CONSENT_WAIT: Duration = Duration::from_secs(3 * 60);
+pub const CONSENT_WAIT: Duration = aterm_secrets::client::CONSENT_WAIT;
 
 static CONSENT_SPENT: AtomicBool = AtomicBool::new(false);
 

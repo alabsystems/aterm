@@ -77,13 +77,8 @@ fn write_ascii_run_styled_clears_stale_extras_entries() {
 
     grid.set_cursor(0, 0);
     let mut last = None;
-    grid.write_ascii_run_styled(
-        b"abcd",
-        PackedColor::indexed(2),
-        PackedColor::DEFAULT_BG,
-        CellFlags::BOLD,
-        &mut last,
-    );
+    let colors = Cell::convert_colors(PackedColor::indexed(2), PackedColor::DEFAULT_BG);
+    grid.write_ascii_run_styled_packed(b"abcd", colors, CellFlags::BOLD, &mut last);
 
     assert_eq!(grid.cell(0, 1).unwrap().char(), 'b');
     assert_eq!(grid.extras().len(), 0, "styled run must remove stale entry");

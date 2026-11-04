@@ -6490,7 +6490,7 @@ fn health_of(shared: &Shared) -> crate::health::BrokerHealth {
         active_conns: count64(stats.active_conns),
         parked_tails: count64(stats.parked_tails),
         flushes,
-        process_flushes: astream_sys::flush_tally(),
+        process_flushes: Some(astream_sys::flush_tally()),
         poisoned,
     }
 }

@@ -17,6 +17,11 @@ pub(super) use continuation::{closed_predecessor, stage as stage_continuation};
 #[path = "codex_renewal_service.rs"]
 mod service;
 pub(super) use service::Service;
+#[path = "codex_rotation_control.rs"]
+mod rotation;
+pub(super) use rotation::Preparation as RotationPreparation;
+#[cfg(unix)]
+pub(super) use rotation::observe_exec;
 #[cfg(all(test, unix))]
 pub(super) use service::append_child as fixture_append_child;
 pub(crate) use service::{cancel_owner, pending};
@@ -63,7 +68,7 @@ fn human_grace_elapsed(ctx: &crate::SessionCtx, seconds: u32, now: u64) -> bool 
         .is_none_or(|age| age >= u64::from(seconds) * 1000)
 }
 
-fn human_grace_ready(ctx: &crate::SessionCtx, env: &Env) -> bool {
+pub(super) fn human_grace_ready(ctx: &crate::SessionCtx, env: &Env) -> bool {
     let seconds = if let Some(policy) = ctx.native_policy.config() {
         policy.human_grace_s
     } else {
@@ -78,7 +83,6 @@ fn human_grace_ready(ctx: &crate::SessionCtx, env: &Env) -> bool {
 }
 
 impl Seal {
-    #[cfg(all(unix, debug_assertions))]
     pub(super) fn receipt_id(&self) -> &str {
         &self.receipt.id
     }
@@ -183,7 +187,7 @@ impl Seal {
     /// A recorded Signal may have ended the source process. Subsequent
     /// mutations still need today's hold and account policy, without asking
     /// that intentionally ended process to be alive again.
-    pub(super) fn continuing(&self) -> bool {
+    pub(super) fn continuing(&self, phase: ImagePhase) -> bool {
         if !self.current()
             || self
                 .ctx
@@ -211,19 +215,12 @@ impl Seal {
         {
             return false;
         }
-        renewal::with_successor(&env, &receipt.old_auth, &receipt.intent.identity, |next| {
-            if receipt.matches_successor(next) {
-                Ok(())
-            } else {
-                Err("changed")
-            }
-        })
-        .is_ok_and(|ready| ready.is_some())
+        account_phase_allowed(&env, &receipt, phase)
     }
 
     pub(super) fn preflight(&self) -> bool {
         if self.continuation.is_some() {
-            return self.continuing();
+            return self.continuing(ImagePhase::Forward);
         }
         if !self.current()
             || !self.proof.alive()
@@ -261,13 +258,13 @@ impl Seal {
             return false;
         }
         if !renewal::history(&copy.home, &receipt.intent).is_some_and(|history| {
-            history.auth_wall
-                && record["owed"]["renewal"]["starts"].as_u64() == Some(history.starts)
+            receipt.intent.matches_history(&history)
+                && receipt.intent.marker(&record)["starts"].as_u64() == Some(history.starts)
         }) {
             return false;
         }
 
-        renewal::with_successor(&env, &receipt.old_auth, &receipt.intent.identity, |next| {
+        renewal::with_selected(&env, &receipt, |next| {
             if receipt.matches_successor(next) {
                 Ok(())
             } else {
@@ -395,7 +392,7 @@ fn make_prepare(
 }
 
 pub(crate) fn serve(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> String {
-    let result = serve_inner(ctx, master, line);
+    let result = serve_inner(ctx, master, line, renewal::Purpose::Login);
     #[cfg(all(unix, any(test, debug_assertions)))]
     {
         let verb = match renewal::Request::parse(line) {
@@ -428,8 +425,35 @@ pub(crate) fn serve(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> St
     result
 }
 
-fn serve_inner(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> String {
-    let Some(request) = renewal::Request::parse(line) else {
+pub(crate) fn serve_rotation(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> String {
+    let result = serve_inner(ctx, master, line, renewal::Purpose::WeeklyQuota);
+    #[cfg(all(unix, any(test, debug_assertions)))]
+    ctx.native_policy
+        .renewal_control_observed(&aterm_json::json!({
+            "kind":"rotation", "verb":line.split_ascii_whitespace().next(),
+            "reply":result.trim(), "humanSeq":ctx.human_input.seq(),
+            "monotonicUs":aterm_agent::harness::native_act::monotonic_us()
+        }));
+    if let Some(rest) = result.strip_prefix("OK codex-renewal ") {
+        format!("OK codex-rotation {rest}")
+    } else if let Some(rest) = result.strip_prefix("ERR codex-renewal ") {
+        format!("ERR codex-rotation {rest}")
+    } else {
+        result
+    }
+}
+
+fn serve_inner(
+    ctx: &Arc<crate::SessionCtx>,
+    master: i32,
+    line: &str,
+    purpose: renewal::Purpose,
+) -> String {
+    let request = match purpose {
+        renewal::Purpose::Login => renewal::Request::parse(line),
+        renewal::Purpose::WeeklyQuota => renewal::Request::parse_rotation(line),
+    };
+    let Some(request) = request else {
         return "ERR codex-renewal invalid request\n".into();
     };
     let Some((proof, copy)) = current_claim(ctx, master) else {
@@ -444,6 +468,13 @@ fn serve_inner(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> String 
     let Some(resume) = copy.resume.as_ref().ok() else {
         return "OK codex-renewal state=waiting\n".into();
     };
+    if let renewal::Request::Commit(id)
+    | renewal::Request::Status(id)
+    | renewal::Request::Consume { id, .. } = &request
+        && renewal::read_receipt(&env, id).is_some_and(|receipt| receipt.intent.purpose != purpose)
+    {
+        return "ERR codex-renewal wrong recovery purpose\n".into();
+    }
     match request {
         renewal::Request::Prepare(intent) => {
             if ctx.fabric.hold().is_some() || !human_grace_ready(ctx, &env) {
@@ -453,10 +484,14 @@ fn serve_inner(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> String 
                 return "ERR codex-renewal wall changed\n".into();
             }
             if !renewal::history(&copy.home, &intent).is_some_and(|history| {
-                history.auth_wall
-                    && current["owed"]["renewal"]["starts"].as_u64() == Some(history.starts)
+                intent.matches_history(&history)
+                    && intent.marker(&current)["starts"].as_u64() == Some(history.starts)
             }) {
                 return "ERR codex-renewal native wall changed\n".into();
+            }
+
+            if purpose == renewal::Purpose::WeeklyQuota {
+                return rotation::prepare(ctx, &env, &proof, &copy, &current, intent);
             }
 
             let Some(process) = Process::observe(proof.pid) else {
@@ -516,6 +551,7 @@ fn serve_inner(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> String 
                 )
                 .ok_or("plan")?;
                 let receipt = Receipt {
+                    destination: None,
                     id,
                     intent: intent.clone(),
                     sid: ctx.self_id.as_str().into(),
@@ -601,6 +637,9 @@ fn retire_stale_ready_bound(
     record: &aterm_json::Value,
     expected: &Receipt,
 ) -> Result<Option<Receipt>, &'static str> {
+    if expected.intent.purpose == renewal::Purpose::WeeklyQuota {
+        return rotation::retire_stale_ready(ctx, env, proof, record, expected);
+    }
     if expected.phase != Phase::Ready
         || !same_native_host(expected)
         || expected.sid != ctx.self_id.as_str()
@@ -624,7 +663,7 @@ fn retire_stale_ready_bound(
     if !retired.retire_stale_ready(authority.revision(), ctx.human_input.seq(), now_ms()) {
         return Ok(None);
     }
-    renewal::with_successor(env, &expected.old_auth, &expected.intent.identity, |next| {
+    renewal::with_selected(env, expected, |next| {
         if !expected.matches_successor(next) {
             return Err("selection-changed");
         }
@@ -664,13 +703,13 @@ fn commit(
     {
         return "ERR codex-renewal receipt changed\n".into();
     }
-    if !same_native_host(&receipt) || receipt.phase != Phase::Ready {
-        return receipt_reply(&receipt);
-    }
     match retire_stale_ready_bound(ctx, env, proof, current, &receipt) {
         Ok(Some(retired)) => return receipt_reply(&retired),
         Err(_) => return "ERR codex-renewal record unavailable\n".into(),
         Ok(None) => {}
+    }
+    if !same_native_host(&receipt) || receipt.phase != Phase::Ready {
+        return receipt_reply(&receipt);
     }
     if now_ms() >= receipt.expires_ms
         || ctx.human_input.seq() != receipt.human_seq
@@ -706,7 +745,23 @@ fn commit(
             return "ERR codex-renewal capacity\n".into();
         }
     }
+    if receipt.intent.purpose == renewal::Purpose::WeeklyQuota
+        && rotation::commit_pool(ctx, env, &receipt).is_err()
+    {
+        return rotation::retire_ready(ctx, env, proof, current, &receipt)
+            .ok()
+            .flatten()
+            .map_or_else(
+                || "OK codex-renewal state=waiting\n".into(),
+                |retired| retired.reply(),
+            );
+    }
     let Ok(Some(committing)) = renewal::commit_receipt(env, &receipt) else {
+        if receipt.intent.purpose == renewal::Purpose::WeeklyQuota
+            && let Ok(Some(retired)) = rotation::retire_ready(ctx, env, proof, current, &receipt)
+        {
+            return retired.reply();
+        }
         return "ERR codex-renewal selection changed\n".into();
     };
     receipt = committing;
@@ -991,7 +1046,12 @@ fn status(
         if receipt.exec_candidate(Some(process), &prepare).is_some()
             && auth == *expected
             && resume.session == receipt.intent.thread
-            && identity.as_ref() == Some(&receipt.intent.identity)
+            && identity.as_ref()
+                == if candidate.forward {
+                    receipt.target_identity()
+                } else {
+                    Some(&receipt.intent.identity)
+                }
         {
             let Ok(Some(_guard)) = store.acquire_bounded() else {
                 return receipt_reply(&receipt);
@@ -1014,7 +1074,7 @@ fn status(
         && matches!(receipt.phase, Phase::Committed | Phase::Consumed)
         && resume.session == receipt.intent.thread
         && (receipt.phase == Phase::Consumed
-            || current["owed"]["renewal"]["receipt"].as_str() == Some(id))
+            || receipt.intent.marker(current)["receipt"].as_str() == Some(id))
         && let Some(process) = process.as_ref()
         && (Some(process.pid) != receipt.successor_pid
             || Some(process.birth) != receipt.successor_birth)
@@ -1028,7 +1088,7 @@ fn status(
                     .ok()??;
             aterm_agent::harness::codex_app_login::renewal_identity(home)
         });
-        if identity.as_ref() != Some(&receipt.intent.identity) {
+        if identity.as_ref() != receipt.target_identity() {
             return "ERR codex-renewal identity changed\n".into();
         }
         let Ok(Some(_guard)) = store.acquire_bounded() else {
@@ -1060,7 +1120,7 @@ fn status(
         && matches!(receipt.phase, Phase::Ready | Phase::Committing)
         && Process::observe(receipt.old_pid).is_none_or(|old| old.birth != receipt.old_birth)
         && current_auth == receipt.old_auth
-        && current["owed"]["renewal"]["receipt"].as_str() == Some(id);
+        && receipt.intent.marker(current)["receipt"].as_str() == Some(id);
     if same_session && abandoned_before_launch {
         let identity = current_auth.parent().and_then(|home| {
             let _auth =
@@ -1087,7 +1147,7 @@ fn status(
     let awaiting_forward = receipt.phase == Phase::Committing
         && resume.codex_auth_path.as_deref().map(std::path::Path::new)
             == Some(receipt.new_auth.as_path())
-        && current["owed"]["renewal"]["receipt"].as_str() == Some(id);
+        && receipt.intent.marker(current)["receipt"].as_str() == Some(id);
     if same_session && awaiting_forward {
         return receipt_reply(&receipt);
     }
@@ -1099,6 +1159,11 @@ fn status(
         && resume.codex_auth_path.as_deref().map(std::path::Path::new)
             == Some(receipt.old_auth.as_path());
     if same_session && rolled_back {
+        if let Some(options) = opts(env, sid) {
+            let _ = renewal::with_receipt_writer(env, |writer| {
+                writer.retire_rolled_back_pool_record(&receipt, &options)
+            });
+        }
         return receipt_reply(&receipt);
     }
     if !same_session || !(source || successor) {
@@ -1137,7 +1202,7 @@ fn status(
         if !human_grace_ready(ctx, env) {
             return DENIED.into();
         }
-        if !renewal::with_successor(env, &receipt.old_auth, &receipt.intent.identity, |next| {
+        if !renewal::with_selected(env, &receipt, |next| {
             if receipt.matches_successor(next) {
                 Ok(())
             } else {
@@ -1154,12 +1219,12 @@ fn status(
                     .ok()??;
             aterm_agent::harness::codex_app_login::renewal_identity(home)
         });
-        if !successor || identity.as_ref() != Some(&receipt.intent.identity) {
+        if !successor || identity.as_ref() != receipt.target_identity() {
             return "ERR codex-renewal identity changed\n".into();
         }
     }
     if let renewal::Request::Consume { turn, .. } = request {
-        let marker = &current["owed"]["renewal"];
+        let marker = receipt.intent.marker(current);
         if !successor
             || !renewal::history(&copy.home, &receipt.intent).is_some_and(|history| {
                 history.latest_is_wall
@@ -1172,6 +1237,11 @@ fn status(
             || marker["accepted"].as_bool() != Some(true)
             || marker["account"].as_str() != Some(&receipt.intent.identity.account)
             || marker["user"].as_str() != Some(&receipt.intent.identity.user)
+            || (receipt.intent.purpose == renewal::Purpose::WeeklyQuota
+                && receipt.target_identity().is_none_or(|target| {
+                    marker["destination"]["account"].as_str() != Some(&target.account)
+                        || marker["destination"]["user"].as_str() != Some(&target.user)
+                }))
         {
             return "ERR codex-renewal acceptance changed\n".into();
         }
@@ -1186,6 +1256,11 @@ fn status(
         if renewal::write_receipt(env, &receipt).is_err() {
             return "ERR codex-renewal record unavailable\n".into();
         }
+    }
+    if receipt.intent.purpose == renewal::Purpose::WeeklyQuota
+        && matches!(receipt.phase, Phase::Consumed | Phase::Retired)
+    {
+        let _cleanup = renewal::retire_pool_record(env, &receipt);
     }
     receipt_reply(&receipt)
 }
@@ -1304,7 +1379,19 @@ pub(super) fn execute_recorded(operation: &Arc<Mutex<Operation>>, phase: ImagePh
     {
         return false;
     }
-    renewal::with_successor(&env, &receipt.old_auth, &receipt.intent.identity, |next| {
+    account_phase_allowed(&env, &receipt, phase)
+}
+
+fn account_phase_allowed(env: &Env, receipt: &Receipt, phase: ImagePhase) -> bool {
+    if phase == ImagePhase::Rollback && receipt.intent.purpose == renewal::Purpose::WeeklyQuota {
+        return aterm_agent::harness::codex_rotation::with_rollback_writer(
+            env,
+            receipt,
+            |_| Ok(()),
+        )
+        .is_ok_and(|ready| ready.is_some());
+    }
+    renewal::with_selected(env, receipt, |next| {
         if receipt.matches_successor(next) {
             Ok(())
         } else {
@@ -1377,8 +1464,10 @@ mod tests {
             },
         };
         let receipt = Receipt {
+            destination: None,
             id: prepare.id.clone(),
             intent: Intent {
+                purpose: Default::default(),
                 thread: "019a4b54-5fa1-7123-8123-123456789abc".into(),
                 wall: "019a4b54-5fa2-7123-8123-123456789abc".into(),
                 identity: renewal::Identity::from_native("account", "user"),
@@ -1414,6 +1503,85 @@ mod tests {
             continuation: None,
             fresh_snapshot: None,
         }
+    }
+
+    #[test]
+    fn codex_renewal_terminal_rollback_keeps_service_until_completion_is_persisted() {
+        let handle = crate::session_store::test_handle_on(8893, -1);
+        let ctx = Arc::clone(&handle.ctx);
+        install(&ctx, 71, &[Scope::Relaunch]);
+        let directory = aterm_tempfile::tempdir().unwrap();
+        let mut seed = seal(&ctx);
+        seed.env.home = Some(directory.path().join("home"));
+        seed.env.state = directory.path().join("state");
+        seed.env.config = Some(directory.path().join("aterm.toml"));
+        seed.receipt.intent.purpose = renewal::Purpose::WeeklyQuota;
+        seed.receipt.destination = Some(renewal::Identity::from_native("target", "user"));
+        seed.receipt.phase = Phase::Retired;
+        seed.receipt.launch_attempted = true;
+        let NativePlan::Restart { process, .. } = &seed.prepare.plan else {
+            panic!("restart")
+        };
+        seed.receipt.candidate = Some(renewal::Candidate::of(process, false));
+        seed.receipt.successor_pid = Some(process.pid);
+        seed.receipt.successor_birth = Some(process.birth);
+        seed.receipt.native_prepare =
+            aterm_agent::harness::native_act::Request::prepare(seed.prepare.clone())
+                .encode()
+                .unwrap();
+        let id = seed.receipt.id.clone();
+        renewal::with_receipt_writer(&seed.env, |_| {
+            renewal::write_receipt(&seed.env, &seed.receipt)
+        })
+        .unwrap();
+        ctx.fenced_writes
+            .native
+            .lock()
+            .unwrap()
+            .renewal_services
+            .insert(id.clone(), Arc::new(Service::new(seed)));
+        assert!(!service::observe_terminal(&ctx, &id));
+        assert!(
+            ctx.fenced_writes
+                .native
+                .lock()
+                .unwrap()
+                .renewal_services
+                .contains_key(&id)
+        );
+    }
+
+    #[test]
+    fn codex_renewal_unknown_terminal_operation_keeps_launch_uncertainty() {
+        let handle = crate::session_store::test_handle_on(8894, -1);
+        let ctx = Arc::clone(&handle.ctx);
+        install(&ctx, 71, &[Scope::Relaunch]);
+        let directory = aterm_tempfile::tempdir().unwrap();
+        let mut seed = seal(&ctx);
+        seed.env.home = Some(directory.path().join("home"));
+        seed.env.state = directory.path().join("state");
+        seed.env.config = Some(directory.path().join("aterm.toml"));
+        seed.receipt.intent.purpose = renewal::Purpose::WeeklyQuota;
+        seed.receipt.destination = Some(renewal::Identity::from_native("target", "user"));
+        seed.receipt.phase = Phase::Retired;
+        seed.receipt.launch_attempted = true;
+        seed.receipt.revoked = true;
+        seed.receipt.native_prepare =
+            aterm_agent::harness::native_act::Request::prepare(seed.prepare.clone())
+                .encode()
+                .unwrap();
+        let id = seed.receipt.id.clone();
+        let env = seed.env.clone();
+        renewal::with_receipt_writer(&env, |_| renewal::write_receipt(&env, &seed.receipt))
+            .unwrap();
+        ctx.fenced_writes
+            .native
+            .lock()
+            .unwrap()
+            .renewal_services
+            .insert(id.clone(), Arc::new(Service::new(seed)));
+        assert!(!service::observe_terminal(&ctx, &id));
+        assert!(renewal::read_receipt(&env, &id).unwrap().launch_attempted);
     }
 
     #[test]

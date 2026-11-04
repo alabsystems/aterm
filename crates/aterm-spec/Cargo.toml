@@ -34,6 +34,11 @@ aterm-uds.workspace = true
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
+# Descriptor-backed pool identity uses Windows' 128-bit FILE_ID_INFO through the shared dirfd
+# boundary instead of unstable std metadata extensions.
+[target.'cfg(windows)'.dependencies]
+aterm-dirfd.workspace = true
+
 [features]
 # Every test that discharges a model through a tiered helper also runs the Trust
 # checkers and must agree with the interpreter: `targo --unverified test

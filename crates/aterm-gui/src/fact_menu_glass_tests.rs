@@ -235,6 +235,14 @@ fn a_controllers_enter_on_a_fact_copy_row_copies_nothing() {
     press_fact(&mut app, wid, session, Fact::Path, MouseButton::Right);
     let i = row_of(&app, "fact-menu/path/copy-path");
     app.autopilot_menu.as_mut().expect("open").highlight = Some(i);
+    menu_frame(&mut app, wid);
+    let menu = app.autopilot_menu.as_ref().expect("painted copy menu");
+    let rect = menu.rect.expect("copy action has painted geometry");
+    assert!(
+        menu.viewport
+            .range(menu.rows.len(), rect.h.saturating_sub(2))
+            .contains(&i)
+    );
     let enter = crate::control::parse_key("enter").expect("a key");
     let _ = app.input(wid, enter, crate::input::Source::Controller);
     assert!(app.autopilot_menu.is_none(), "chosen and closed");

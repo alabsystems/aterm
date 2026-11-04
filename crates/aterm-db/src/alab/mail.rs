@@ -137,6 +137,14 @@ pub fn listed_base(
 }
 
 /// Whether following `pk`'s alias links returns to an address already followed.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "FleetMachineAssignment",
+        action = "Follow",
+        project = "aterm_db::alab::view::tests::follow_transition"
+    )
+)]
 pub fn alias_cycle(addresses: &Projection, pk: &str) -> bool {
     let mut seen = BTreeSet::from([pk]);
     let mut at = pk;
@@ -152,6 +160,14 @@ pub fn alias_cycle(addresses: &Projection, pk: &str) -> bool {
 /// The effective mailbox of address `pk`. `routes` answers for an address on a Mac that holds
 /// `ai-mailbox.toml`, and nothing elsewhere. A link to a retired or absent address, or a cycle,
 /// is left and read past: `check` reports it.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "FleetMachineAssignment",
+        action = "Follow",
+        project = "aterm_db::alab::view::tests::follow_transition"
+    )
+)]
 pub fn effective(
     addresses: &Projection,
     observed: &Observed,

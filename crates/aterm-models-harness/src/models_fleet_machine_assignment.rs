@@ -32,13 +32,22 @@ use aterm_spec::derive::Model;
 ///    A sync names a new row by the lab and never renames one; a migration renames only from the
 ///    legacy label, only once settled, and every legacy row once settled, the default login's
 ///    too. `minted`, `resynced`, `misnamed`, `early` and `stale` record the opposite.
-/// 4. **An alias resolves to one effective mailbox** (`mailbox_routes::resolve_index` with
-///    `alab_roster::{mailbox_of, mail_targets}`). One login address: `lm` the lab decides the
-///    mailbox its codes arrive in and a route has that login, `own` a route names the address,
-///    `link` it is an alias (`alias_of`) of an address a route names, `dom` a `*@domain` route
-///    matches. `res` is the route the login reads its codes from (0 not resolved since the last
-///    change, 1 the lab's mailbox, 2 its own, 3 its link's, 4 the domain's, 5 none): the lab's
-///    mailbox first, then the address's own route, then its link's, then a pattern.
+/// 4. **An alias chain resolves to one effective mailbox** (`aterm-db`'s `alab::mail::{effective,
+///    alias_cycle}`, `LabView::{aliases, mailboxes}` and `checks::lab`, then
+///    `mailbox_routes::resolve_index` with `alab_roster::{mailbox_of, mail_targets}`). One login
+///    address `ann` and the chain its `alias_of` links make in the registry: `link` ann is an alias
+///    of `hub` (1) or of itself (2, a self-link: a cycle of one), `hop` hub is an alias of `root` (1) or of ann again (2, a cycle), `hg` and `rg` hub
+///    and root are retired, `lm` ann's own `mailbox` column is set, `mb` root's is. Routes on this
+///    Mac: `own` one names ann, `rh` one names hub, `rr` one names root, `dom` a `*@domain` one
+///    matches. A read of the registry (`Follow`, `fol`) gives the chain the harness is handed:
+///    `t1` hub is its first address, `t2` it has a second (root, or ann round a cycle); `eff` the
+///    lab's mailbox for ann (0 none, 1 ann's own, 2 root's, reached through the chain); `frt` and
+///    `fcy` `check` reports `alias-of-retired` and `alias-cycle`. The chain is followed to its
+///    end, never into a retired address and never round a cycle back to the alias, and `check`
+///    reports exactly the broken link and the cycle. `res` is the route the login reads its codes
+///    from (0 not resolved since the last change, 1 the lab's mailbox, 2 its own, 3 hub's, 4
+///    root's, 5 the domain's, 6 none): the lab's mailbox first, then the address's own route,
+///    then the chain's routes nearest first, then a pattern.
 ///
 /// Mutants: 1 to 3 a malformed machine list is admitted, 4 a stored class word is read and an
 /// unknown one refuses the row, 5 a scalar list is refused, 6 to 8 an admitted list is not the
@@ -49,8 +58,13 @@ use aterm_spec::derive::Model;
 /// login is named after the machine, 22 a migration renames an owner's
 /// label, 23 a migration renames before the registry is settled, 24 a sync renames a row to its
 /// lab label, 25 a sync renames the default login's legacy row, 26 a settled migration skips the
-/// default login's legacy row, 31 the address's own route beats the lab's mailbox, 32 the alias link beats the
-/// address's own route, 33 a domain route beats the alias link.
+/// default login's legacy row, 31 the address's own route beats the lab's mailbox, 32 a chain
+/// link's route beats the address's own, 33 a domain route beats the chain, 34 the farther link's
+/// route beats the nearer's, 35 the chain is followed one link only, 36 a retired address is
+/// followed, 37 the chain lists the alias itself round a cycle, 38 the chain's mailbox beats the
+/// alias's own, 39 the effective mailbox is read through a retired link, 40 `check` reports a
+/// retired target only on the alias's own link, 41 `check` reports no cycle, 42 `check` reports
+/// no self-link.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn fleet_machine_assignment_model() -> Model {
@@ -63,7 +77,10 @@ pub fn fleet_machine_assignment_model() -> Model {
             var dropped = 0; var unasked = 0; var misordered = 0;
             var lbl = 0; var dflt = 0; var settled = 0;
             var minted = 0; var resynced = 0; var misnamed = 0; var early = 0; var stale = 0;
-            var lm = 0; var own = 0; var link = 0; var dom = 0; var res = 0;
+            var lm = 0; var link = 0; var hop = 0; var hg = 0; var rg = 0; var mb = 0;
+            var own = 0; var rh = 0; var rr = 0; var dom = 0;
+            var fol = 0; var t1 = 0; var t2 = 0; var eff = 0; var frt = 0; var fcy = 0;
+            var res = 0;
 
             action ChooseFile when (area == 0) { area = 1; }
             action ChooseOrder when (area == 0) { area = 2; }
@@ -145,20 +162,65 @@ pub fn fleet_machine_assignment_model() -> Model {
                 early = if Buggy == 23 && lbl == 1 && settled == 0 {1} else {early};
             }
 
-            // 4. Mail: the lab's rows and this Mac's mailbox routes, then the resolution a
-            // login's code fetch makes.
-            action LabMailbox when (area == 4 && lm == 0) { lm = 1; res = 0; }
+            // 4. Mail: the lab's rows (each a registry change, read again by `Follow`) and this
+            // Mac's mailbox routes, then the resolution a login's code fetch makes.
+            action LabMailbox when (area == 4 && lm == 0) {
+                lm = 1; fol = 0; t1 = 0; t2 = 0; eff = 0; frt = 0; fcy = 0; res = 0;
+            }
+            action AliasLink when (area == 4 && link == 0) {
+                link = 1; fol = 0; t1 = 0; t2 = 0; eff = 0; frt = 0; fcy = 0; res = 0;
+            }
+            action SelfLink when (area == 4 && link == 0) {
+                link = 2; fol = 0; t1 = 0; t2 = 0; eff = 0; frt = 0; fcy = 0; res = 0;
+            }
+            action ChainLink when (area == 4 && link == 1 && hop == 0) {
+                hop = 1; fol = 0; t1 = 0; t2 = 0; eff = 0; frt = 0; fcy = 0; res = 0;
+            }
+            action CycleLink when (area == 4 && link == 1 && hop == 0) {
+                hop = 2; fol = 0; t1 = 0; t2 = 0; eff = 0; frt = 0; fcy = 0; res = 0;
+            }
+            action RetireHub when (area == 4 && hg == 0) {
+                hg = 1; fol = 0; t1 = 0; t2 = 0; eff = 0; frt = 0; fcy = 0; res = 0;
+            }
+            action RetireRoot when (area == 4 && rg == 0) {
+                rg = 1; fol = 0; t1 = 0; t2 = 0; eff = 0; frt = 0; fcy = 0; res = 0;
+            }
+            action RootMailbox when (area == 4 && mb == 0) {
+                mb = 1; fol = 0; t1 = 0; t2 = 0; eff = 0; frt = 0; fcy = 0; res = 0;
+            }
             action OwnRoute when (area == 4 && own == 0) { own = 1; res = 0; }
-            action AliasLink when (area == 4 && link == 0) { link = 1; res = 0; }
+            action HubRoute when (area == 4 && rh == 0) { rh = 1; res = 0; }
+            action RootRoute when (area == 4 && rr == 0) { rr = 1; res = 0; }
             action DomainRoute when (area == 4 && dom == 0) { dom = 1; res = 0; }
-            action Resolve when (area == 4 && res == 0) {
-                res = if Buggy == 31 && own == 1 {2}
+            action Follow when (area == 4 && fol == 0) {
+                fol = 1;
+                t1 = if link == 1 && (hg == 0 || Buggy == 36) {1} else {0};
+                t2 = if Buggy == 35 {0}
+                    else {if link == 1 && (hg == 0 || Buggy == 36)
+                        && ((hop == 1 && (rg == 0 || Buggy == 36)) || (hop == 2 && Buggy == 37))
+                        {1} else {0}};
+                eff = if Buggy == 38
+                        && link == 1 && hg == 0 && hop == 1 && rg == 0 && mb == 1 {2}
                     else {if lm == 1 {1}
-                    else {if Buggy == 32 && link == 1 {3}
+                    else {if link == 1 && (hg == 0 || Buggy == 39) && hop == 1 && rg == 0
+                        && mb == 1 {2} else {0}}};
+                frt = if link == 1 && hg == 1 {1}
+                    else {if Buggy == 40 {0}
+                    else {if link == 1 && hop == 1 && rg == 1 {1} else {0}}};
+                fcy = if hop == 2 && hg == 0 && Buggy == 41 {0}
+                    else {if link == 2 && Buggy == 42 {0}
+                    else {if (hop == 2 && hg == 0) || link == 2 {1} else {0}}};
+            }
+            action Resolve when (area == 4 && fol == 1 && res == 0) {
+                res = if Buggy == 31 && own == 1 {2}
+                    else {if eff > 0 {1}
+                    else {if Buggy == 32 && t1 == 1 && rh == 1 {3}
                     else {if own == 1 {2}
-                    else {if Buggy == 33 && dom == 1 {4}
-                    else {if link == 1 {3}
-                    else {if dom == 1 {4} else {5}}}}}}};
+                    else {if Buggy == 33 && dom == 1 {5}
+                    else {if Buggy == 34 && t2 == 1 && hop == 1 && rr == 1 {4}
+                    else {if t1 == 1 && rh == 1 {3}
+                    else {if t2 == 1 && hop == 1 && rr == 1 {4}
+                    else {if dom == 1 {5} else {6}}}}}}}}};
             }
 
             invariant ValidMachines: case == 0 || case > 3 || accepted == 0;
@@ -172,10 +234,32 @@ pub fn fleet_machine_assignment_model() -> Model {
             invariant RenameOnlyFromLegacy: misnamed == 0;
             invariant RenameOnlyOnceSettled: early == 0;
             invariant SettledMigrationRenamesLegacy: stale == 0;
-            invariant LabMailboxFirst: res == 0 || lm == 0 || res == 1;
-            invariant OwnRouteBeforeLink: res == 0 || lm == 1 || own == 0 || res == 2;
-            invariant LinkBeforePattern:
-                res == 0 || lm == 1 || own == 1 || link == 0 || res == 3;
+            invariant ChainFollowedToItsEnd: if fol == 1 && link == 1 && hg == 0 {
+                t1 == 1 && (hop == 0 || hop == 2 || rg == 1 || t2 == 1)
+            } else { 1 == 1 };
+            invariant RetiredNeverFollowed: if fol == 1 && (hg == 1 || (hop == 1 && rg == 1)) {
+                t2 == 0 && (hg == 0 || t1 == 0)
+            } else { 1 == 1 };
+            invariant CycleStops: if fol == 1 && hop == 2 { t2 == 0 }
+                else {if fol == 1 && link == 2 { t1 == 0 && t2 == 0 } else { 1 == 1 }};
+            invariant EffectiveFollowsChain: if fol == 1 {
+                eff == if lm == 1 {1}
+                    else {if link == 1 && hg == 0 && hop == 1 && rg == 0 && mb == 1 {2} else {0}}
+            } else { 1 == 1 };
+            invariant BrokenLinkReported: if fol == 1 {
+                frt == if link == 1 && (hg == 1 || (hop == 1 && rg == 1)) {1} else {0}
+            } else { 1 == 1 };
+            invariant CycleReported: if fol == 1 {
+                fcy == if (hop == 2 && hg == 0) || link == 2 {1} else {0}
+            } else { 1 == 1 };
+            invariant LabMailboxFirst: res == 0 || eff == 0 || res == 1;
+            invariant OwnRouteBeforeLink: res == 0 || eff > 0 || own == 0 || res == 2;
+            invariant NearestLinkFirst:
+                res == 0 || eff > 0 || own == 1 || t1 == 0 || rh == 0 || res == 3;
+            invariant LinkBeforePattern: if res > 0 && eff == 0 && own == 0
+                && ((t1 == 1 && rh == 1) || (t2 == 1 && hop == 1 && rr == 1)) {
+                res == 3 || res == 4
+            } else { 1 == 1 };
         }
     }
 }

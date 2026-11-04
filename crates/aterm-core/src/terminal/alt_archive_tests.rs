@@ -466,6 +466,7 @@ fn alt_archive_pool_conformance_real_archives_project_onto_model() {
 fn a_live_session_joins_the_process_budget_and_leaves_when_it_closes() {
     let process_pool = AltArchiveBudget::process();
     assert_eq!(process_pool.total(), ALT_ARCHIVE_TOTAL_BUDGET);
+    assert_eq!(process_pool.min_share(), ALT_ARCHIVE_MIN_SHARE);
 
     let mut process_session = Terminal::new(25, COLS);
     process_session.set_alt_archive_enabled(true);

@@ -5,7 +5,7 @@
 //! xterm keyboard modifier/format options (XTMODKEYS/XTFMTKEYS).
 
 /// xterm keyboard modifier/format state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct XtermKeyboardState {
     /// modifyOtherKeys value (Pp=4 for XTMODKEYS).
@@ -121,23 +121,47 @@ impl XtermKeyboardState {
     }
 }
 
+impl Default for XtermKeyboardState {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// `Default` (derive) is DISABLED (None) while `new()` is enabled at
-    /// level 0, and the two answer the query differently: disabled reports no
-    /// value parameter (`CSI > 4 m`), enabled an explicit 0.
+    /// NEGATIVE CONTROL: `Default::default()`, `new()`, `reset()`, and `#[serde(default)]`
+    /// all produce `(Some(0), 0)` (`\x1b[>4;0m`), while `disable_modify_other_keys()` and an
+    /// explicit `"modify_other_keys":null` payload remain distinct at `(None, 0)` (`\x1b[>4m`).
     #[test]
-    fn test_default_vs_new_divergence() {
+    fn test_default_matches_new_and_reset() {
         let default = XtermKeyboardState::default();
         let new = XtermKeyboardState::new();
-        assert_eq!(default.modify_other_keys(), None);
+        let mut reset = XtermKeyboardState::new();
+        reset.disable_modify_other_keys();
+        assert_eq!(reset.modify_other_keys(), None);
+        assert_eq!(reset.query_modify_other_keys_response(), "\x1b[>4m");
+
+        reset.reset();
+        assert_eq!(default, new);
+        assert_eq!(default, reset);
+        assert_eq!(default.modify_other_keys(), Some(0));
         assert_eq!(default.format_other_keys(), 0);
-        assert_eq!(new.modify_other_keys(), Some(0));
-        assert_eq!(new.format_other_keys(), 0);
-        assert_eq!(default.query_modify_other_keys_response(), "\x1b[>4m");
+        assert_eq!(default.query_modify_other_keys_response(), "\x1b[>4;0m");
         assert_eq!(new.query_modify_other_keys_response(), "\x1b[>4;0m");
+
+        #[cfg(feature = "serde")]
+        {
+            #[derive(serde::Deserialize)]
+            struct Holder {
+                #[serde(default)]
+                xterm_keyboard: XtermKeyboardState,
+            }
+            let omitted: Holder = aterm_json::from_str("{}").expect("deserializes omitted field");
+            assert_eq!(omitted.xterm_keyboard, XtermKeyboardState::new());
+        }
     }
 
     #[test]

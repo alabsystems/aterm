@@ -10,6 +10,34 @@ use std::time::Duration;
 
 const USERINFO: &str = "https://openidconnect.googleapis.com/v1/userinfo";
 
+/// Only a canonical 401 requests credential renewal. Other failures retain their cause.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Error {
+    CredentialRejected,
+    Refused(&'static str),
+}
+
+impl Error {
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::CredentialRejected => "Google rejected the current credential",
+            Self::Refused(message) => message,
+        }
+    }
+}
+
+impl From<&'static str> for Error {
+    fn from(message: &'static str) -> Self {
+        Self::Refused(message)
+    }
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
 /// Provider-confirmed identity. Cached CLI metadata is never an input to this proof.
 pub struct GoogleProfile {
     pub email: String,
@@ -42,22 +70,25 @@ fn profile(value: &Value, expected: &str) -> Result<GoogleProfile, &'static str>
 }
 
 /// Accept only a successful canonical response with a verified, exact configured email.
-fn response(status: u16, body: &[u8], expected: &str) -> Result<GoogleProfile, &'static str> {
+fn response(status: u16, body: &[u8], expected: &str) -> Result<GoogleProfile, Error> {
+    if status == 401 {
+        return Err(Error::CredentialRejected);
+    }
     if status != 200 || body.len() > 64 * 1024 {
-        return Err("Google refused the account verification request");
+        return Err("Google refused the account verification request".into());
     }
     let value = aterm_json::from_slice(body).map_err(|_| "Google profile is unreadable")?;
-    profile(&value, expected)
+    profile(&value, expected).map_err(Error::Refused)
 }
 
 /// Bounded bearer request. Redirects are not followed; tokens never enter a URL or diagnostic.
-pub fn read(token: &str, expected: &str, wait: Duration) -> Result<GoogleProfile, &'static str> {
+pub fn read(token: &str, expected: &str, wait: Duration) -> Result<GoogleProfile, Error> {
     if wait.is_zero()
         || token.is_empty()
         || token.len() > 64 * 1024
         || !token.bytes().all(|b| (0x21..=0x7e).contains(&b))
     {
-        return Err("Invalid Google account verification request");
+        return Err("Invalid Google account verification request".into());
     }
     let mut header = b"Bearer ".to_vec();
     header.extend_from_slice(token.as_bytes());
@@ -75,6 +106,29 @@ pub fn read(token: &str, expected: &str, wait: Duration) -> Result<GoogleProfile
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_canonical_unauthorized_is_a_renewal_signal() {
+        assert!(matches!(
+            response(401, b"", "owner@gmail.com"),
+            Err(Error::CredentialRejected)
+        ));
+        for status in [200, 302, 403, 429, 500, 503] {
+            assert!(matches!(
+                response(status, b"", "owner@gmail.com"),
+                Err(Error::Refused(_))
+            ));
+        }
+        let other = br#"{"sub":"1234","email":"other@gmail.com","email_verified":true}"#;
+        assert!(matches!(
+            response(200, other, "owner@gmail.com"),
+            Err(Error::Refused(_))
+        ));
+        assert!(matches!(
+            read("", "owner@gmail.com", Duration::ZERO),
+            Err(Error::Refused(_))
+        ));
+    }
 
     #[test]
     fn canonical_google_identity_requires_verified_exact_account() {

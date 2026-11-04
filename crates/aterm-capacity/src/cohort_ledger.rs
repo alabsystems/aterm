@@ -16,6 +16,7 @@ use aterm_uds::spawnfd::{BirthAttempt, BirthKey, NotSpawned, Spawned};
 
 #[path = "cohort_checkpoint.rs"]
 mod checkpoint;
+
 use checkpoint::{Anchor, Capture, Transaction};
 
 #[derive(Debug)]
@@ -1128,21 +1129,21 @@ thread_local! {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::{Claim, Fixed, Polled, Reading, Waiter};
     use aterm_uds::spawnfd::{self, Child, Stdio};
     use std::os::unix::fs::DirBuilderExt as _;
 
-    struct Fixture {
+    pub(crate) struct Fixture {
         _scratch: checkpoint::TestWorld,
-        namespace: Namespace,
-        ledger: Ledger,
+        pub(crate) namespace: Namespace,
+        pub(crate) ledger: Ledger,
         machine: Fixed,
     }
 
     impl Fixture {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             let scratch = checkpoint::TestWorld::new("cohort");
             let home = scratch.path().join("home");
             std::fs::DirBuilder::new()
@@ -1159,7 +1160,7 @@ mod tests {
             }
         }
 
-        fn claim(&self) -> Claim {
+        pub(crate) fn claim(&self) -> Claim {
             match Waiter::enter(&self.ledger, &self.machine, Need::new("cohort").mem_gib(30))
                 .unwrap()
                 .poll(&self.machine)

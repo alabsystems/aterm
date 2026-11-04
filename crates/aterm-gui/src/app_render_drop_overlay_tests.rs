@@ -3,8 +3,7 @@
 
 use super::{
     DROP_WASH_ALPHA, OverlayGlow, apply_drop_overlay, apply_drop_overlay_at, apply_host_chrome_at,
-    blend_rgb, composite_tray, composite_tray_at, composite_tray_quad_at, drop_border_px,
-    tray_quad_below_y,
+    blend_rgb, composite_tray, composite_tray_at, composite_tray_quad_at, tray_quad_below_y,
 };
 
 #[test]
@@ -351,7 +350,7 @@ fn border_is_accent_heavy_interior_is_faint() {
         "border should be nearer the accent than the interior"
     );
     assert_eq!(interior, blend_rgb(0, accent, DROP_WASH_ALPHA));
-    assert!(drop_border_px(w, h) >= 2);
+    assert!(aterm_gpu::drop_border_px(w as u32, h as u32) >= 2);
 }
 
 #[test]

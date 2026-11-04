@@ -2595,10 +2595,12 @@ mod tests {
         assert_eq!(t.spill_len(), 0, "0/0 chrome: identity — no band, no bytes");
         assert_eq!(t.spill_rev(), 0);
 
+        const TRAIL_MS: u32 = 400;
+        const FRAME_MS: f64 = 16.0;
         let (pad, head) = (12usize, 30usize);
         t.set_chrome(pad as u16, head as u16)
             .expect("admitted geometry");
-        t.set_cursor_glow(true, "water", None, None, 400, 64, 1.0, 2.0, true);
+        t.set_cursor_glow(true, "water", None, None, TRAIL_MS, 64, 1.0, 2.0, true);
         fill_frame(&mut t);
         for (ch, bytes) in [('a', b"a"), ('b', b"b"), ('c', b"c")] {
             assert!(
@@ -2623,7 +2625,7 @@ mod tests {
                 lit_frame = true;
                 break;
             }
-            t.advance_effects(16.0);
+            t.advance_effects(FRAME_MS);
             fill_frame(&mut t);
         }
         let (w, h) = t.cpu.frame_size(t.rows, t.cols);
@@ -2683,11 +2685,17 @@ mod tests {
 
         t.effects.set_serious(true);
         t.process(b"\x1b[1;30Hz");
-        const DRAIN_FRAMES: usize = 125;
+        let max_life_s = aterm_effects::cursor_glow::scaled_typed_life(
+            aterm_effects::cursor_glow::CursorGlow::WATER_CHAIN_LIFE_MAX,
+            aterm_effects::cursor_glow::typed_life_scale(std::time::Duration::from_millis(
+                u64::from(TRAIL_MS),
+            )),
+        );
+        let drain_frames = ((f64::from(max_life_s) * 1000.0) / FRAME_MS).ceil() as usize + 1;
         let mut drained_at = None;
         let mut last_quads = usize::MAX;
-        for i in 0..DRAIN_FRAMES {
-            t.advance_effects(16.0);
+        for i in 0..drain_frames {
+            t.advance_effects(FRAME_MS);
             fill_frame(&mut t);
             let band_lit = t
                 .spill
@@ -2713,14 +2721,14 @@ mod tests {
         }
         assert!(
             drained_at.is_some(),
-            "the earned aurora still had {last_quads} quads after {DRAIN_FRAMES} frames \
+            "the earned aurora still had {last_quads} quads after {drain_frames} frames \
              ({} ms): an unwitnessed leap retires the wake and the remaining light must \
              fade on its own envelope, not persist",
-            DRAIN_FRAMES * 16
+            (drain_frames as f64) * FRAME_MS
         );
 
         let ptr = t.spill_ptr();
-        t.advance_effects(16.0);
+        t.advance_effects(FRAME_MS);
         fill_frame(&mut t);
         assert_eq!(t.spill_ptr(), ptr, "same geometry ⇒ the export never moves");
 

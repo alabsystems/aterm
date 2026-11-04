@@ -248,7 +248,7 @@ None remain (the 4 historical non-spec tests were deleted during the 2026-10-16.
 2. ~~**A source-text census stands in for a behavioural spec.**~~ Fixed: `sink::every_production_master_write_is_ledgered`
    (an `include_str!` line count) is gone; `Shared::ledgered` and `Shared::ledgered_nonparking` write the
    bracket around every production master write, so `sink-ledger-complete` holds by construction.
-3. **A heap-plateau sampler in `tests/spill_bound.rs`.** (Stale `wait_for_room=false` prose fixed 2026-10-28 to name `Room::NoWait` and `write_frame_nonparking`.) The test remains a heap-plateau sampler (20 ms samples, 8 stable) rather than a direct check of `|Spill|`; the spec `spill-bound` states the bound on `|Spill|` itself.
+3. ~~**A heap-plateau sampler in `tests/spill_bound.rs`.**~~ Fixed: `tests/spill_bound.rs` now synchronizes deterministically on `Seam::{DrainPark, FrameLock, SpillCapPark}`, asserts `SinkWriter::SPILL_CAP <= sink.spilled_bytes() <= SinkWriter::SPILL_CAP + FRAME + 12` alongside the heap ceiling, and severs/joins the producer and pipe descriptors cleanly.
 4. ~~**A timing-dependent precondition.**~~ Fixed: `sink::a_stop_reaches_a_paste_parked_on_a_tty_that_is_not_draining`
    synchronizes deterministically on `Seam::WriterPark` (`parked_after(&parks)`) before requesting a stop.
 5. ~~**A test-only accessor.**~~ Fixed 2026-10-28: `WriteReceiptError::accepted()` (`#[cfg(test)]`) is removed;

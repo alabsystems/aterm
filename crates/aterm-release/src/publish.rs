@@ -7781,6 +7781,17 @@ fn cut_roster_seq(ctx: &CutCtx) -> Result<Option<u64>> {
         .roster_seq)
 }
 
+/// The roster document this cut publishes: the signing profile's, which `stage_roster_assets`
+/// writes into `dist/` only later (a pair left there by an earlier generation never ships), or,
+/// for a recovered cut that rebuilt its pair from the published release, that pair.
+fn shipped_roster(ctx: &CutCtx) -> Option<Vec<u8>> {
+    match &ctx.roster {
+        Some(document) => Some(document.bytes.clone()),
+        None if ctx.attaches_roster() => fs::read(ctx.dist.join(roster::ROSTER_ASSET)).ok(),
+        None => None,
+    }
+}
+
 fn best_published(ctx: &CutCtx) -> Result<Option<u64>> {
     let scanned = verify::scan_published(&ctx.slug, true)?;
     let best = scanned.first();
@@ -7799,7 +7810,7 @@ fn best_published(ctx: &CutCtx) -> Result<Option<u64>> {
     };
     let observed_roster_seq = observed_roster.as_ref().map(|(seq, _)| *seq);
     let carried = cut_roster_seq(ctx)?;
-    if let Ok(local_roster) = fs::read(ctx.dist.join(roster::ROSTER_ASSET)) {
+    if let Some(local_roster) = shipped_roster(ctx) {
         machines::roster_lineage_agrees(&local_roster, carried, observed_roster.as_ref())
             .map_err(Error::new)?;
     }
@@ -9387,6 +9398,38 @@ mod roster_wiring_tests {
             .iter()
             .filter_map(|p| p.file_name()?.to_str().map(str::to_string))
             .collect()
+    }
+
+    #[test]
+    fn the_lineage_check_reads_the_roster_this_cut_ships_not_a_dist_leftover() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let mut cut = ctx(Some("m3"));
+        cut.dist = tmp.path().to_path_buf();
+        fs::write(
+            cut.dist.join(roster::ROSTER_ASSET),
+            b"an earlier generation",
+        )
+        .unwrap();
+        cut.roster = Some(machines::RosterDocument {
+            bytes: b"the profile's generation".to_vec(),
+            signature: Vec::new(),
+        });
+        assert_eq!(
+            shipped_roster(&cut).as_deref(),
+            Some(&b"the profile's generation"[..])
+        );
+        cut.roster = None;
+        assert_eq!(
+            shipped_roster(&cut).as_deref(),
+            Some(&b"an earlier generation"[..]),
+            "a recovered cut ships the pair it rebuilt in dist/"
+        );
+        cut.signature_machine_id = None;
+        assert_eq!(
+            shipped_roster(&cut),
+            None,
+            "an unrostered cut ships no roster"
+        );
     }
 
     #[test]

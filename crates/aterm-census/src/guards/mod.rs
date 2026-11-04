@@ -38,6 +38,7 @@ mod mirror_rows;
 mod mktemp;
 mod rules;
 mod rustup_keg;
+mod seam_caller;
 mod shown_term;
 mod slog_inert;
 mod stock_label;
@@ -75,6 +76,7 @@ pub const GUARDS: &[Rule] = &[
     rules::RENDERER_TERMINAL,
     rules::DEV_READ,
     debug_seam::DEBUG_SEAM,
+    seam_caller::SEAM_CALLER,
     rules::INPUT_PROBE,
     graph::TEST_APPKIT_DOOR,
     graph::SHARED_APPLICATION,

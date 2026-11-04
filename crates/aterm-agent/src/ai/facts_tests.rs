@@ -34,6 +34,29 @@ fn gather_with(
 }
 
 #[test]
+fn agy_keyring_and_file_backend_have_distinct_login_evidence() {
+    use crate::ai::connector::AGY;
+    let b = machine(&["agy"]);
+    let ordinary = gather_with(&b, &[], &[], &AGY);
+    assert!(ordinary.hidden_store);
+    let ssh = [("SSH_CONNECTION", "127.0.0.1 1 127.0.0.1 22")];
+    let missing = gather_with(&b, &ssh, &[], &AGY);
+    assert!(!missing.hidden_store);
+    assert!(missing.login_file.is_none());
+    let token = b
+        .home
+        .join(".gemini/antigravity-cli/antigravity-oauth-token");
+    std::fs::create_dir_all(token.parent().unwrap()).unwrap();
+    std::fs::write(
+        &token,
+        b"synthetic native footprint, not authentication proof",
+    )
+    .unwrap();
+    assert!(gather_with(&b, &ssh, &[], &AGY).login_file.is_some());
+    assert!(gather_with(&b, &[], &[], &AGY).hidden_store);
+}
+
+#[test]
 fn a_linked_codex_names_its_package_without_reusing_a_stale_installed_version() {
     const OWN: &str = "0.1.0-dev.13917+codex.0.165.0.g1aef4a3bf";
     const CLIENT: &str = "0.166.0-dev.13917+g1aef4a3bf";

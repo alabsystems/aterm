@@ -2006,7 +2006,8 @@ impl CursorGlow {
     const BEAM_CHAIN_GAP_MAX: f32 = 0.75;
     const BEAM_CHAIN_LIFE_MAX: f32 = 1.2;
     const WATER_CHAIN_KEYS: f32 = 4.0;
-    const WATER_CHAIN_LIFE_MAX: f32 = 1.2;
+    /// Maximum unscaled typed-chain spark lifetime for [`GlowStyle::Water`](crate::cursor_fx::GlowStyle::Water), in seconds.
+    pub const WATER_CHAIN_LIFE_MAX: f32 = 1.2;
 
     /// Returns the last visible cursor cell owned by this engine.
     #[inline]

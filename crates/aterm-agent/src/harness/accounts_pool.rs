@@ -205,6 +205,351 @@ pub struct LoginEnv {
     pub value: Option<String>,
 }
 
+/// A native Google worker with its canonical proof and selected pool binding retained.
+#[cfg(unix)]
+pub struct GooglePoolWorker {
+    worker: super::agy_signin::VerifiedGoogleWorker,
+    row: Row,
+    generation: u64,
+    principal: [u8; 32],
+    selection: GoogleSelection,
+    config_dir: std::path::PathBuf,
+    state: std::path::PathBuf,
+    home: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GoogleSelection {
+    mode: Mode,
+    pinned: bool,
+    active: Option<String>,
+    pending_pin: Option<accounts::PinRequest>,
+}
+
+#[cfg(unix)]
+impl GoogleSelection {
+    fn read(seat: &Seat<'_>, state: &accounts::State) -> Result<Self, String> {
+        let (config, issues) = crate::supervise::config::SupervisorConfig::from_path(Some(
+            &seat.config_dir.join("aterm.toml"),
+        ));
+        if !issues.is_empty() {
+            return Err(
+                "Native Google worker selection configuration is unavailable or invalid".into(),
+            );
+        }
+        Ok(Self {
+            mode: config.accounts_for(Cli::Agy.program()),
+            pinned: state.pinned,
+            active: if state.pinned {
+                state.active.clone()
+            } else {
+                None
+            },
+            pending_pin: state.pending_pin.clone(),
+        })
+    }
+
+    fn permits(&self, row: &Row, state: &accounts::State, now: i64) -> Result<(), String> {
+        if row.held_by.is_some()
+            || (self.pinned && self.active.as_deref() != Some(row.label.as_str()))
+            || self
+                .pending_pin
+                .as_ref()
+                .is_some_and(|pin| pin.label() != row.label)
+        {
+            return Err(
+                "Native Google worker no longer matches its permitted account selection".into(),
+            );
+        }
+        state.lease_verdict(&row.label, now).map_err(|why| {
+            format!(
+                "Native Google worker account cannot execute: {}",
+                why.as_str()
+            )
+        })
+    }
+}
+
+#[cfg(unix)]
+impl GooglePoolWorker {
+    /// Recheck the selected row and native grant immediately before launch.
+    pub fn starter(&self) -> Result<&super::worker::Starter, String> {
+        let seat = Seat {
+            config_dir: &self.config_dir,
+            state: &self.state,
+            home: &self.home,
+            now: aterm_time::unix_secs()
+                .and_then(|now| i64::try_from(now).ok())
+                .ok_or("Account clock is unavailable")?,
+        };
+        let snapshot = pool_snapshot(&seat, Cli::Agy)?;
+        let selection = GoogleSelection::read(&seat, &snapshot.state)?;
+        if selection != self.selection {
+            return Err("Native Google worker account selection changed".into());
+        }
+        selection.permits(&self.row, &snapshot.state, seat.now)?;
+        let (roster, logins) = (snapshot.roster, snapshot.logins);
+        let binding = logins.labels.get(&self.row.label);
+        if roster.row(&self.row.label) != Some(&self.row)
+            || logins
+                .labels
+                .get(&self.row.label)
+                .map(|binding| binding.renewal_generation)
+                != Some(self.generation)
+            || binding.and_then(|binding| binding.google_principal) != Some(self.principal)
+            || binding.and_then(|binding| binding.identity_proof_for(&self.row))
+                != Some(accounts::Proof::Status)
+        {
+            return Err("Native Google worker account binding changed".into());
+        }
+        login_env(Cli::Agy, &self.row, &self.home).map_err(|error| error.to_string())?;
+        self.worker.starter().map_err(str::to_owned)
+    }
+
+    /// Installation/admission must preserve the exact verified launch environment.
+    pub fn check_admitted(&self, admitted: &super::worker::Admitted) -> Result<(), String> {
+        if self.starter()? != admitted.starter() {
+            return Err("Native Google worker changed during admission".into());
+        }
+        Ok(())
+    }
+}
+
+/// Verify a published native account, renewing a canonical rejected credential once.
+/// Each canonical check has a thirty-second budget. Staged renewal uses the common
+/// bounded native sign-in budget and retains its publication and authority guards.
+#[cfg(unix)]
+pub fn prepare_google_worker(
+    seat: &Seat<'_>,
+    program: &Path,
+    starter: super::worker::Starter,
+) -> Result<Option<GooglePoolWorker>, String> {
+    recover_google_worker_with(
+        seat,
+        starter,
+        |row, profile| {
+            super::agy_signin::verify_google_existing(
+                program,
+                seat.state,
+                &row.label,
+                row.email
+                    .as_deref()
+                    .ok_or("Native Google row has no expected email")?,
+                profile,
+                std::time::Instant::now() + Duration::from_secs(30),
+            )
+        },
+        |row, logins| {
+            let raw = seat.roster(Cli::Agy)?;
+            let own_dir = raw
+                .row(&row.label)
+                .ok_or("Native Google account was removed")?
+                .dir
+                .as_deref();
+            let path = seat.config_dir.join(Cli::Agy.accounts().roster_file);
+            let result = super::cli::renew_one_for(
+                Cli::Agy,
+                seat.now,
+                &super::cli::LiveAccounts,
+                &seat.store(Cli::Agy),
+                (row, &path, logins),
+                own_dir,
+                &mut io::sink(),
+                &mut io::sink(),
+            );
+            if result == super::cli::Renewal::Renewed {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Native Google staged renewal did not complete: {result:?}"
+                ))
+            }
+        },
+    )
+}
+
+#[cfg(unix)]
+fn recover_google_worker_with(
+    seat: &Seat<'_>,
+    mut starter: super::worker::Starter,
+    mut verify: impl FnMut(
+        &Row,
+        &Path,
+    ) -> Result<
+        super::agy_signin::VerifiedGoogleGrant,
+        super::google_profile::Error,
+    >,
+    renew: impl FnOnce(&Row, &accounts::Logins) -> Result<(), String>,
+) -> Result<Option<GooglePoolWorker>, String> {
+    let started = std::time::Instant::now();
+    let captured = pool_snapshot(seat, Cli::Agy)?;
+    let selection = GoogleSelection::read(seat, &captured.state)?;
+    let mut rejected = None;
+    let first = prepare_google_worker_with(seat, starter.clone(), |row, profile| {
+        if captured.roster.row(&row.label) != Some(row) {
+            return Err("Native Google account changed before verification".into());
+        }
+        match verify(row, profile) {
+            Ok(grant) => Ok(grant),
+            Err(super::google_profile::Error::CredentialRejected) => {
+                rejected = Some(row.clone());
+                Err("Google rejected the current credential".into())
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    });
+    let Some(row) = rejected else {
+        return first;
+    };
+    // Drop the failed verification's profile claim before staging. A policy change
+    // or another renewal wins; neither permits authentication on this stale scope.
+    let current = pool_snapshot(seat, Cli::Agy)?;
+    if current.roster.row(&row.label) != Some(&row)
+        || current.logins.labels.get(&row.label) != captured.logins.labels.get(&row.label)
+        || GoogleSelection::read(seat, &current.state)? != selection
+    {
+        return Err("Native Google account changed before renewal".into());
+    }
+    let now = || {
+        seat.now
+            .saturating_add(i64::try_from(started.elapsed().as_secs()).unwrap_or(i64::MAX))
+    };
+    selection.permits(&row, &current.state, now())?;
+    renew(&row, &captured.logins)?;
+    let renewed = pool_snapshot(seat, Cli::Agy)?;
+    let next = renewed
+        .roster
+        .row(&row.label)
+        .ok_or("Renewed Google account is unavailable")?;
+    let mut policy = next.clone();
+    policy.dir = row.dir.clone();
+    policy.was = row.was.clone();
+    let previous = captured
+        .logins
+        .labels
+        .get(&row.label)
+        .ok_or("Google binding is unavailable")?;
+    let binding = renewed
+        .logins
+        .labels
+        .get(&row.label)
+        .ok_or("Renewed Google binding is unavailable")?;
+    if policy != row
+        || binding.google_principal != previous.google_principal
+        || binding.renewal_generation == previous.renewal_generation
+        || GoogleSelection::read(seat, &renewed.state)? != selection
+    {
+        return Err("Native Google account changed during renewal".into());
+    }
+    selection.permits(next, &renewed.state, now())?;
+    let home = next
+        .dir
+        .as_deref()
+        .ok_or("Renewed Google home is unavailable")?;
+    for (key, value) in &mut starter.env {
+        if key == "HOME" {
+            *value = home.to_owned();
+        }
+    }
+    // A second rejection terminates this attempt; never recurse into authentication.
+    let worker = prepare_google_worker_with(seat, starter, |row, profile| {
+        if row != next {
+            return Err("Renewed Google account changed before verification".into());
+        }
+        verify(row, profile).map_err(|error| error.to_string())
+    })?
+    .ok_or("Renewed Google profile lost its pool binding")?;
+    if worker.selection != selection
+        || worker.generation != binding.renewal_generation
+        || worker.principal
+            != previous
+                .google_principal
+                .ok_or("Google subject is unavailable")?
+    {
+        return Err("Renewed Google account changed before launch".into());
+    }
+    Ok(Some(worker))
+}
+
+#[cfg(unix)]
+fn prepare_google_worker_with(
+    seat: &Seat<'_>,
+    starter: super::worker::Starter,
+    verify: impl FnOnce(&Row, &Path) -> Result<super::agy_signin::VerifiedGoogleGrant, String>,
+) -> Result<Option<GooglePoolWorker>, String> {
+    let mut homes = starter.env.iter().filter(|(key, _)| key == "HOME");
+    let Some((_, home)) = homes.next() else {
+        return Ok(None);
+    };
+    if homes.next().is_some() {
+        return Err("Native Google worker carries ambiguous home variables".into());
+    }
+    let snapshot = pool_snapshot(seat, Cli::Agy)?;
+    let (roster, logins) = (snapshot.roster, snapshot.logins);
+    let actual_home = Path::new(home).canonicalize().ok();
+    let same_home = |path: &Path| {
+        path == Path::new(home)
+            || actual_home
+                .as_ref()
+                .is_some_and(|actual| path.canonicalize().ok().as_ref() == Some(actual))
+    };
+    let mut rows = roster.rows.iter().filter(|row| {
+        row.dir
+            .as_deref()
+            .is_some_and(|dir| same_home(Path::new(dir)))
+    });
+    let Some(row) = rows.next() else {
+        let root = seat.store(Cli::Agy).logins_dir();
+        if Path::new(home).starts_with(&root)
+            || actual_home
+                .as_ref()
+                .zip(root.canonicalize().ok())
+                .is_some_and(|(home, root)| home.starts_with(root))
+        {
+            return Err("Native Google profile has no current pool binding".into());
+        }
+        return Ok(None);
+    };
+    if rows.next().is_some() {
+        return Err("Native Google profile belongs to multiple pool rows".into());
+    }
+    let selection = GoogleSelection::read(seat, &snapshot.state)?;
+    selection.permits(row, &snapshot.state, seat.now)?;
+    let binding = logins
+        .labels
+        .get(&row.label)
+        .ok_or("Native Google pool binding is unavailable")?;
+    let principal = binding
+        .google_principal
+        .ok_or("Native Google account requires staged renewal before launch")?;
+    if binding.identity_proof_for(row) != Some(accounts::Proof::Status) {
+        return Err("Native Google account identity requires staged renewal before launch".into());
+    }
+    login_env(Cli::Agy, row, seat.home).map_err(|error| error.to_string())?;
+    let profile = row
+        .dir
+        .as_deref()
+        .ok_or("Native Google pool home is unavailable")?;
+    let grant = verify(row, Path::new(profile))?;
+    if grant.account_label() != row.label || grant.profile().principal != principal {
+        return Err("Native Google worker does not match its retained provider identity".into());
+    }
+    let worker = grant.prepare_worker(starter).map_err(str::to_owned)?;
+    let result = GooglePoolWorker {
+        worker,
+        row: row.clone(),
+        generation: binding.renewal_generation,
+        principal,
+        selection,
+        config_dir: seat.config_dir.into(),
+        state: seat.state.into(),
+        home: seat.home.into(),
+    };
+    result.starter()?;
+    Ok(Some(result))
+}
+
 /// Check the stored identity evidence for this row without modifying its login.
 /// A dedicated Claude login retains its own sign-in profile; the default login
 /// uses the user's profile and legacy path. Missing claims are not a contradiction.
@@ -335,7 +680,7 @@ fn row_home(cli: Cli, row: &Row, home: &Path) -> Option<std::path::PathBuf> {
 }
 
 /// A managed pool's policy, bindings and budget state captured under the account writer lock.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct PoolSnapshot {
     roster: Roster,
     logins: accounts::Logins,
@@ -1874,7 +2219,7 @@ pub fn account_pool_recovery_environment() {}
 
 /// A running session of a pooled CLI, as [`session_move`] asks about it.
 #[derive(Debug, Clone)]
-pub struct Session<'a> {
+pub struct Session<'a, R = PoolRelaunch<'a>> {
     /// Its CLI.
     pub cli: Cli,
     /// Its tab's session id (the canary a rotation names).
@@ -1890,8 +2235,9 @@ pub struct Session<'a> {
     /// The caller's `accounts =` snapshot from `aterm.toml`; a move requires it to
     /// agree with the current file before preparing a command.
     pub mode: Mode,
-    /// How its relaunch line is spelled.
-    pub relaunch: PoolRelaunch<'a>,
+    /// Launch representation: shell relaunch details, or `()` when the native
+    /// caller builds an exact command without a shell.
+    pub relaunch: R,
 }
 
 /// One session attribution inside the pool's writer transaction. The caller may drop
@@ -1922,15 +2268,16 @@ impl SessionNote<'_> {
 
 /// What [`session_move`] decided.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Moved {
+pub struct Moved<T = String> {
     /// The advice.
     pub advice: Advice,
-    /// The relaunch line a move writes; `None` for every other advice.
-    pub line: Option<String>,
+    /// The prepared dispatch payload; ordinary plans carry a shell line and
+    /// native exec plans carry an exact typed command. `None` on refusal.
+    pub line: Option<T>,
 }
 
-impl Moved {
-    fn stay(why: StayWhy) -> Moved {
+impl<T> Moved<T> {
+    fn stay(why: StayWhy) -> Self {
         Moved {
             advice: Advice::Stay(why),
             line: None,
@@ -1941,12 +2288,13 @@ impl Moved {
 /// A pooled session's advice and prepared command, before any rotation is admitted.
 /// Dropping the plan retains usage evidence but does not reserve a canary or spend
 /// the rotation breaker. An executor consumes it only after accepting the handoff.
-pub struct SessionPlan {
+#[derive(Clone)]
+pub struct SessionPlan<T = String> {
     advice: Advice,
-    prepared: Option<PreparedMove>,
+    prepared: Option<PreparedMove<T>>,
 }
 
-impl std::fmt::Debug for SessionPlan {
+impl<T> std::fmt::Debug for SessionPlan<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SessionPlan")
             .field("advice", &self.advice)
@@ -1955,16 +2303,23 @@ impl std::fmt::Debug for SessionPlan {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct MoveContext {
     cli: Cli,
     sid: String,
     supervisor: Supervisor,
     point: Point,
     mode: Mode,
+    authority: MoveAuthority,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
+enum MoveAuthority {
+    Window,
+    NativeCodexQuota,
+}
+
+#[derive(Clone, Debug)]
 struct MoveLocation {
     config_dir: std::path::PathBuf,
     state: std::path::PathBuf,
@@ -1990,18 +2345,18 @@ impl MoveLocation {
     }
 }
 
-#[derive(Debug)]
-struct PreparedMove {
+#[derive(Clone, Debug)]
+struct PreparedMove<T> {
     location: MoveLocation,
     source: MoveContext,
     before: PoolSnapshot,
     who: accounts::ProcessLogin,
     excluded: std::collections::BTreeSet<String>,
     configured_mode: Mode,
-    line: String,
+    line: T,
 }
 
-impl SessionPlan {
+impl<T> SessionPlan<T> {
     fn stay(why: StayWhy) -> Self {
         Self {
             advice: Advice::Stay(why),
@@ -2013,6 +2368,42 @@ impl SessionPlan {
     #[must_use]
     pub fn advice(&self) -> &Advice {
         &self.advice
+    }
+
+    /// The captured source and destination rows, for constructing a native
+    /// handoff. These are observations, not execution authority: commit must
+    /// revalidate them and the native host must validate its process and turn.
+    pub fn selected_rows(&self) -> Option<(&Row, &Row)> {
+        let prepared = self.prepared.as_ref()?;
+        let Advice::Move { to, .. } = &self.advice else {
+            return None;
+        };
+        let roster = &prepared.before.roster;
+        let source = prepared.who.me(roster).label()?;
+        Some((roster.row(source)?, roster.row(to)?))
+    }
+
+    /// The prepared dispatch metadata. Reading it does not commit selection or
+    /// authorize execution; the native host can bind it to its receipt first.
+    #[must_use]
+    pub fn prepared_command(&self) -> Option<&T> {
+        self.prepared.as_ref().map(|prepared| &prepared.line)
+    }
+
+    /// The selected login generation in the same observation as the prepared
+    /// rows. Cloning a plan copies observations, never its commit authority.
+    pub fn selected_generation(&self) -> Option<u64> {
+        let prepared = self.prepared.as_ref()?;
+        let Advice::Move { to, .. } = &self.advice else {
+            return None;
+        };
+        Some(
+            prepared
+                .before
+                .logins
+                .get(to)
+                .map_or(0, |binding| binding.renewal_generation),
+        )
     }
 
     /// Admit a prepared move at the executor's current time. Policy, both login
@@ -2028,23 +2419,49 @@ impl SessionPlan {
             project = "aterm_agent::harness::accounts_pool::tests::planning::planning_transition"
         )
     )]
-    pub fn commit(self, now: i64) -> Moved {
+    pub fn commit(self, now: i64) -> Moved<T> {
+        self.commit_as(now, None)
+    }
+
+    /// Commit a native quota handoff exactly once across receipt retries. The
+    /// host binds its private receipt to both identities and process evidence.
+    #[must_use]
+    pub fn commit_native(self, now: i64, id: &str, binding: &str) -> Moved<T> {
+        if !accounts::native_rotation_key(id, binding)
+            || !self.prepared.as_ref().is_some_and(|prepared| {
+                matches!(prepared.source.authority, MoveAuthority::NativeCodexQuota)
+            })
+        {
+            return Moved::stay(StayWhy::NothingDue);
+        }
+        self.commit_as(now, Some((id, binding)))
+    }
+
+    fn commit_as(self, now: i64, native: Option<(&str, &str)>) -> Moved<T> {
         let Self { advice, prepared } = self;
         let Some(prepared) = prepared else {
             return Moved { advice, line: None };
         };
         let seat = prepared.location.at(now);
-        if finish_move(
-            &seat,
-            &prepared.source,
-            &prepared.before,
-            &prepared.who,
-            &advice,
-            &prepared.excluded,
-            prepared.configured_mode,
-        )
-        .is_err()
-        {
+        if native.is_some() {
+            if finish_move(&seat, &prepared, &advice, native, false).is_err() {
+                return Moved::stay(StayWhy::NothingDue);
+            }
+            let Advice::Move { to, .. } = &advice else {
+                return Moved::stay(StayWhy::NothingDue);
+            };
+            // Release the account writer before claiming through the shared
+            // machine store, then revalidate the complete move before commit.
+            if !matches!(
+                seat.claim(prepared.source.cli, super::claims::Act::Claim(to)),
+                super::claims::Touched::Claimed
+                    | super::claims::Touched::Held
+                    | super::claims::Touched::NotApplicable
+            ) {
+                return Moved::stay(StayWhy::NothingDue);
+            }
+        }
+        if finish_move(&seat, &prepared, &advice, native, true).is_err() {
             return Moved::stay(StayWhy::NothingDue);
         }
         Moved {
@@ -2105,6 +2522,85 @@ pub fn session_plan(
     let owned_seat = location.at(seat.now);
     let seat = &owned_seat;
     session_plan_using(seat, s, |row| prepare_session_line(seat, s, row), note)
+}
+
+/// Prepare a self-supervised Codex weekly-quota move using the normal pool's
+/// policy and commit-time revalidation. The caller must first verify the native
+/// failed turn and its credential identity. This function grants no process
+/// mutation authority and performs no restart.
+///
+/// The window's ordinary path still refuses self-supervised sessions. Only the
+/// native host can combine this plan with its separately validated handoff.
+#[must_use]
+pub fn native_quota_plan(
+    seat: &Seat<'_>,
+    session: &Session<'_>,
+    note: impl FnOnce(SessionNote<'_>),
+) -> SessionPlan {
+    native_quota_plan_admitting(seat, session, note, |_| true)
+}
+
+/// Native proposal preparation may require a fresh authenticated usage read
+/// before accepting a candidate. Rejected candidates use the existing bounded
+/// preparation-failure exclusion logic; they allocate no rotation or canary.
+pub(super) fn native_quota_plan_admitting(
+    seat: &Seat<'_>,
+    session: &Session<'_>,
+    note: impl FnOnce(SessionNote<'_>),
+    mut admit: impl FnMut(&Row) -> bool,
+) -> SessionPlan {
+    native_quota_plan_preparing(seat, session, note, |seat, row| {
+        admit(row)
+            .then(|| prepare_session_line(seat, session, row))
+            .flatten()
+    })
+}
+
+/// Prepare a native exec command with the same roster, quota, identity and
+/// commit-time checks as interactive account rotation. The host supplies the
+/// exact typed command after its authenticated candidate read. This does not
+/// grant execution or change the caller's account.
+#[cfg(unix)]
+#[must_use]
+pub fn native_exec_quota_plan<R>(
+    seat: &Seat<'_>,
+    session: &Session<'_, R>,
+    note: impl FnOnce(SessionNote<'_>),
+    mut prepare: impl FnMut(&Row) -> Option<super::codex_exec_handoff::ExecCommand>,
+) -> SessionPlan<super::codex_exec_handoff::ExecCommand> {
+    native_quota_plan_preparing(seat, session, note, |seat, row| {
+        let command = prepare(row)?;
+        let expected = row_home(Cli::Codex, row, seat.home)?.join("auth.json");
+        (Path::new(&command.auth_path) == expected && command.encode().is_some()).then_some(command)
+    })
+}
+
+fn native_quota_plan_preparing<T, R>(
+    seat: &Seat<'_>,
+    session: &Session<'_, R>,
+    note: impl FnOnce(SessionNote<'_>),
+    mut prepare: impl FnMut(&Seat<'_>, &Row) -> Option<T>,
+) -> SessionPlan<T> {
+    if session.cli != Cli::Codex || session.supervisor != Supervisor::Own {
+        return SessionPlan::stay(StayWhy::OtherSupervisor);
+    }
+    if !matches!(&session.point, Point::Wall { window, at: Some(at) }
+        if window == "seven_day" && *at <= seat.now)
+    {
+        return SessionPlan::stay(StayWhy::NothingDue);
+    }
+    let Ok(location) = MoveLocation::capture(seat) else {
+        return SessionPlan::stay(StayWhy::NothingDue);
+    };
+    let owned_seat = location.at(seat.now);
+    let seat = &owned_seat;
+    session_plan_with(
+        seat,
+        session,
+        |row| prepare(seat, row),
+        note,
+        MoveAuthority::NativeCodexQuota,
+    )
 }
 
 fn prepare_session_line(seat: &Seat<'_>, s: &Session<'_>, row: &Row) -> Option<String> {
@@ -2173,15 +2669,25 @@ fn session_move_using(
 fn session_plan_using(
     seat: &Seat<'_>,
     s: &Session<'_>,
-    mut prepare: impl FnMut(&Row) -> Option<String>,
+    prepare: impl FnMut(&Row) -> Option<String>,
     note: impl FnOnce(SessionNote<'_>),
 ) -> SessionPlan {
+    session_plan_with(seat, s, prepare, note, MoveAuthority::Window)
+}
+
+fn session_plan_with<T, R>(
+    seat: &Seat<'_>,
+    s: &Session<'_, R>,
+    mut prepare: impl FnMut(&Row) -> Option<T>,
+    note: impl FnOnce(SessionNote<'_>),
+    authority: MoveAuthority,
+) -> SessionPlan<T> {
     let Ok(location) = MoveLocation::capture(seat) else {
         return SessionPlan::stay(StayWhy::NothingDue);
     };
     let owned_seat = location.at(seat.now);
     let seat = &owned_seat;
-    if s.supervisor == Supervisor::Own {
+    if s.supervisor == Supervisor::Own && matches!(authority, MoveAuthority::Window) {
         return SessionPlan::stay(StayWhy::OtherSupervisor);
     }
     let Ok(mut roster) = seat.bound_roster(s.cli) else {
@@ -2252,17 +2758,30 @@ fn session_plan_using(
     };
     let (advice, line) = loop {
         let candidates = without_failed_preparations(state, &excluded);
-        let advice = accounts::advise_session(
-            s.cli,
-            s.supervisor,
-            roster,
-            &candidates,
-            &enrolled,
-            &me,
-            &point,
-            s.mode,
-            seat.now,
-        );
+        let advice = if matches!(authority, MoveAuthority::NativeCodexQuota) {
+            accounts::advise_for(
+                s.cli,
+                roster,
+                &candidates,
+                &enrolled,
+                &me,
+                &point,
+                s.mode,
+                seat.now,
+            )
+        } else {
+            accounts::advise_session(
+                s.cli,
+                s.supervisor,
+                roster,
+                &candidates,
+                &enrolled,
+                &me,
+                &point,
+                s.mode,
+                seat.now,
+            )
+        };
         let Advice::Move { to, .. } = &advice else {
             return if saw_line_failure {
                 no_line(&advice)
@@ -2301,6 +2820,7 @@ fn session_plan_using(
                 supervisor: s.supervisor,
                 point,
                 mode: s.mode,
+                authority,
             },
             before: snapshot,
             who,
@@ -2396,15 +2916,18 @@ pub fn account_pool_planning_environment() {}
         project = "aterm_agent::harness::accounts_pool::tests::canary::canary_transition"
     )
 )]
-fn finish_move(
+fn finish_move<T>(
     seat: &Seat<'_>,
-    session: &MoveContext,
-    before: &PoolSnapshot,
-    who: &accounts::ProcessLogin,
+    prepared: &PreparedMove<T>,
     advice: &Advice,
-    excluded: &std::collections::BTreeSet<String>,
-    configured_mode: Mode,
+    native: Option<(&str, &str)>,
+    commit: bool,
 ) -> Result<(), String> {
+    let session = &prepared.source;
+    let before = &prepared.before;
+    let who = &prepared.who;
+    let excluded = &prepared.excluded;
+    let configured_mode = prepared.configured_mode;
     let Advice::Move {
         to,
         rotates,
@@ -2432,17 +2955,33 @@ fn finish_move(
             return Err("account policy or login changed while preparing a move".into());
         }
     }
-    if *takes_canary
-        && (before.state.active != current.state.active
-            || before.state.canary != current.state.canary)
-    {
-        return Err("canary changed while preparing a move".into());
-    }
     if seat.keyring_held(session.cli)
         || session.mode != configured_mode
         || seat.mode_for(session.cli) != configured_mode
     {
         return Err("account routing changed while preparing a move".into());
+    }
+    if let Some((id, binding)) = native
+        && let Some(committed) = current.logins.native_rotations.get(id)
+    {
+        if committed != binding {
+            return Err("native receipt is already bound to another handoff".into());
+        }
+        let target = current.roster.row(to).ok_or("target account disappeared")?;
+        if current.state.active.as_deref() != Some(to.as_str())
+            || current.state.pinned != before.state.pinned
+            || !accounts::condition(target, &current.state, true, seat.now).fresh()
+        {
+            return Err("native handoff selection is no longer usable".into());
+        }
+        check_login_identity(session.cli, target, seat.home).map_err(|why| why.to_string())?;
+        return Ok(());
+    }
+    if *takes_canary
+        && (before.state.active != current.state.active
+            || before.state.canary != current.state.canary)
+    {
+        return Err("canary changed while preparing a move".into());
     }
     check_failed_preparations(before, &current, excluded)?;
     let own_proven = current.state.active.as_deref() == Some(from)
@@ -2463,17 +3002,30 @@ fn finish_move(
     let candidates = without_failed_preparations(&current.state, excluded);
     let enrolled = accounts::enrolled_in(session.cli, &current.roster, seat.home);
     let me = who.me(&current.roster);
-    let fresh = accounts::advise_session(
-        session.cli,
-        session.supervisor,
-        &current.roster,
-        &candidates,
-        &enrolled,
-        &me,
-        &session.point,
-        session.mode,
-        seat.now,
-    );
+    let fresh = if matches!(session.authority, MoveAuthority::NativeCodexQuota) {
+        accounts::advise_for(
+            session.cli,
+            &current.roster,
+            &candidates,
+            &enrolled,
+            &me,
+            &session.point,
+            session.mode,
+            seat.now,
+        )
+    } else {
+        accounts::advise_session(
+            session.cli,
+            session.supervisor,
+            &current.roster,
+            &candidates,
+            &enrolled,
+            &me,
+            &session.point,
+            session.mode,
+            seat.now,
+        )
+    };
     if fresh != *advice {
         return Err("account advice changed while preparing a move".into());
     }
@@ -2483,7 +3035,10 @@ fn finish_move(
         seat.home,
     )
     .map_err(|why| why.to_string())?;
-    if *rotates || *takes_canary {
+    if !commit {
+        return Ok(());
+    }
+    if *rotates || *takes_canary || native.is_some() {
         let path = seat.config_dir.join(session.cli.accounts().roster_file);
         store.transact_pool_logins_held(
             &held,
@@ -2493,32 +3048,43 @@ fn finish_move(
             |raw, state, logins| {
                 current.require_policy(raw, logins)?;
                 let event = if *rotates {
-                    accounts::begin_rotation(
-                        state,
-                        &current.roster,
-                        &enrolled,
-                        current.state.active.as_deref(),
-                        accounts::Mover {
-                            sid: &session.sid,
-                            account: from,
-                        },
-                        to,
-                        seat.now,
+                    Some(
+                        accounts::begin_rotation(
+                            state,
+                            &current.roster,
+                            &enrolled,
+                            current.state.active.as_deref(),
+                            accounts::Mover {
+                                sid: &session.sid,
+                                account: from,
+                            },
+                            to,
+                            seat.now,
+                        )
+                        .map_err(|lost| format!("{lost:?}"))?,
                     )
-                    .map_err(|lost| format!("{lost:?}"))?
-                } else {
+                } else if *takes_canary {
                     if state.active.as_deref() != Some(to.as_str()) {
                         return Err("canary account changed before admission".into());
                     }
-                    accounts::take_canary(
-                        state,
-                        current.state.canary.as_ref(),
-                        &session.sid,
-                        seat.now,
+                    Some(
+                        accounts::take_canary(
+                            state,
+                            current.state.canary.as_ref(),
+                            &session.sid,
+                            seat.now,
+                        )
+                        .ok_or_else(|| "canary changed before admission".to_owned())?,
                     )
-                    .ok_or_else(|| "canary changed before admission".to_owned())?
+                } else {
+                    None
                 };
-                Ok(vec![event])
+                if let Some((id, binding)) = native {
+                    logins
+                        .native_rotations
+                        .insert(id.to_owned(), binding.to_owned());
+                }
+                Ok(event.into_iter().collect())
             },
         )?;
     }
@@ -2641,9 +3207,9 @@ pub fn account_pool_identity_environment() {}
         project = "aterm_agent::harness::accounts_pool::tests::commit::commit_transition"
     )
 )]
-fn record_session(
+fn record_session<R>(
     seat: &Seat<'_>,
-    session: &Session<'_>,
+    session: &Session<'_, R>,
     who: &accounts::ProcessLogin,
     row: &accounts::Row,
     note: impl FnOnce(SessionNote<'_>),
@@ -2909,3 +3475,7 @@ pub fn account_pool_observation_environment() {}
 #[cfg(test)]
 #[path = "accounts_pool_tests.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+#[path = "accounts_pool_google_worker_tests.rs"]
+mod google_worker_tests;

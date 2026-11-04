@@ -366,17 +366,28 @@ pub fn current() -> Option<Arc<Meter>> {
 }
 
 /// This thread's stage meter ([`current`]) until the answer drops, when the one before comes
-/// back.
+/// back. The guard stays on the thread that made it: dropped on another, it would restore
+/// that thread's meter and leave this one's in place for whatever runs here next.
 #[must_use = "the meter is this thread's only while the guard lives"]
 pub struct Metering {
     before: Option<Arc<Meter>>,
+    /// A TLS restoration guard stays on the thread where it was installed.
+    _thread: std::marker::PhantomData<*mut ()>,
 }
 
 /// Make `meter` this thread's stage meter ([`current`]) until the answer drops: a stage's own
-/// thread, and each worker thread it hands children to (the test run's pool).
+/// thread, and each worker thread it hands children to (the test run's pool). A worker makes
+/// its own guard from the stage's meter; the guard itself never crosses threads:
+///
+/// ```compile_fail,E0277
+/// // The guard sent to another thread, whose meter its drop would restore instead.
+/// let guard = aterm_verify::memory::metering(None);
+/// std::thread::spawn(move || drop(guard));
+/// ```
 pub fn metering(meter: Option<Arc<Meter>>) -> Metering {
     Metering {
         before: CURRENT.with(|c| c.replace(meter)),
+        _thread: std::marker::PhantomData,
     }
 }
 
@@ -401,17 +412,29 @@ pub fn cover() -> Option<Arc<str>> {
 }
 
 /// This thread's stage cover marker ([`cover`]) until the answer drops, when the one before comes
-/// back.
+/// back. The guard stays on the thread that made it: dropped on another, it would restore
+/// that thread's marker and leave this one's in place for whatever runs here next.
 #[must_use = "the marker is this thread's only while the guard lives"]
 pub struct Covering {
     before: Option<Arc<str>>,
+    /// A TLS restoration guard stays on the thread where it was installed.
+    _thread: std::marker::PhantomData<*mut ()>,
 }
 
 /// Make `marker` this thread's stage cover marker ([`cover`]) until the answer drops: a stage's
 /// own thread, and each worker thread it hands children to, as [`metering`] does its meter.
+/// A worker makes its own guard from the stage's marker; the guard itself never crosses
+/// threads:
+///
+/// ```compile_fail,E0277
+/// // The guard sent to another thread, whose marker its drop would restore instead.
+/// let guard = aterm_verify::memory::covering(None);
+/// std::thread::spawn(move || drop(guard));
+/// ```
 pub fn covering(marker: Option<Arc<str>>) -> Covering {
     Covering {
         before: COVER.with(|c| c.replace(marker)),
+        _thread: std::marker::PhantomData,
     }
 }
 

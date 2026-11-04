@@ -67,19 +67,6 @@ impl Grid {
         }
     }
 
-    /// Tab forward by n stops (CHT, CSI Ps I).
-    #[inline]
-    #[cfg(test)]
-    pub fn tab_n(&mut self, n: u16) {
-        for _ in 0..n {
-            let col = self.storage.cursor.col;
-            self.tab();
-            if self.storage.cursor.col == col {
-                break;
-            }
-        }
-    }
-
     /// Margin-aware tab forward by n stops (DECLRMM).
     ///
     /// A step's target is a function of the cursor column alone (its row, the margins and the
@@ -139,19 +126,6 @@ impl Grid {
             }
         }
         self.storage.cursor.col = row_u16(left_bound);
-    }
-
-    /// Back tab by n stops.
-    #[inline]
-    #[cfg(test)]
-    pub fn back_tab_n(&mut self, n: u16) {
-        for _ in 0..n {
-            let col = self.storage.cursor.col;
-            self.back_tab();
-            if self.storage.cursor.col == col {
-                break;
-            }
-        }
     }
 
     /// Margin-aware back tab by n stops (see [`Grid::back_tab_margin`]), stopping at the first

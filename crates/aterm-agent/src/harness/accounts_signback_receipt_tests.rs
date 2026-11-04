@@ -1053,12 +1053,12 @@ fn default_heal_rechecks_identity_after_the_status_check() {
 }
 
 #[test]
-fn receipt_capacity_tracks_live_accounts_after_eviction() {
+fn sign_in_receipts_survive_the_addition_of_more_accounts() {
     let root = aterm_tempfile::TempDir::new().unwrap();
     let store = accounts::Store::at(root.path());
-    for index in 0..=accounts::MAX_ACCOUNTS {
+    for index in 0..=96 {
         let label = format!("account-{index}");
-        let at = NOW + i64::try_from(index).unwrap();
+        let at = NOW + i64::from(index);
         store
             .transact_logins(at, &mut None, |state, logins| {
                 accounts::note_auth(state, &label, accounts::Auth::SignedOut, at);
@@ -1067,15 +1067,12 @@ fn receipt_capacity_tracks_live_accounts_after_eviction() {
             .unwrap();
     }
     let logins = store.load_logins(NOW + 100).unwrap().0;
-    assert_eq!(
-        logins.sign_in_clock,
-        u64::try_from(accounts::MAX_ACCOUNTS + 1).unwrap()
-    );
-    assert_eq!(logins.sign_in_receipts.len(), accounts::MAX_ACCOUNTS);
-    assert!(!logins.sign_in_receipts.contains_key("account-0"));
+    assert_eq!(logins.sign_in_clock, u64::try_from(96 + 1).unwrap());
+    assert_eq!(logins.sign_in_receipts.len(), 96 + 1);
+    assert!(logins.sign_in_receipts.contains_key("account-0"));
     assert!(
         logins
             .sign_in_receipts
-            .contains_key(&format!("account-{}", accounts::MAX_ACCOUNTS))
+            .contains_key(&format!("account-{}", 96))
     );
 }

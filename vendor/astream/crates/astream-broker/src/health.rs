@@ -138,8 +138,10 @@ pub struct BrokerHealth {
     /// and plain calls): the log's own and every other flush the process finishes
     /// through astream-sys, the embedding program's own flushes too. A count of calls,
     /// not of what any caller meant by them, so a refused barrier and the full flush
-    /// issued in its place are one of each.
-    pub process_flushes: astream_sys::FlushTally,
+    /// issued in its place are one of each. `None` in a snapshot an older build wrote
+    /// (one from before the tally joined the file, under the same header): the counts
+    /// are unknown, never zero.
+    pub process_flushes: Option<astream_sys::FlushTally>,
     /// `Some(reason)` while the log is POISONED: it refuses every write until it is
     /// reopened ([`Broker::poisoned`](crate::Broker::poisoned)).
     pub poisoned: Option<String>,
@@ -175,10 +177,20 @@ impl Default for BrokerHealth {
             active_conns: 0,
             parked_tails: 0,
             flushes: FlushCounts::default(),
-            process_flushes: astream_sys::FlushTally::default(),
+            process_flushes: None,
             poisoned: None,
         }
     }
+}
+
+/// The keys of [`BrokerHealth::process_flushes`], each with its count: written together
+/// or (by an older build) not at all.
+fn tally_counts(t: &astream_sys::FlushTally) -> [(&'static str, u64); 3] {
+    [
+        ("process_flush_full", t.full),
+        ("process_flush_barrier", t.barrier),
+        ("process_flush_plain", t.plain),
+    ]
 }
 
 /// Whether the broker that wrote a `<log>.health` still serves its log
@@ -269,7 +281,7 @@ fn one_line(text: &str) -> String {
 
 impl BrokerHealth {
     /// The counters, by their key in the file.
-    fn counts(&self) -> [(&'static str, u64); 21] {
+    fn counts(&self) -> [(&'static str, u64); 18] {
         [
             ("written_at_ms", self.written_at_ms),
             ("base", self.base),
@@ -289,15 +301,13 @@ impl BrokerHealth {
             ("flush_skipped", self.flushes.skipped),
             ("flush_failed", self.flushes.failed),
             ("rules", u64::from(self.served.rules)),
-            ("process_flush_full", self.process_flushes.full),
-            ("process_flush_barrier", self.process_flushes.barrier),
-            ("process_flush_plain", self.process_flushes.plain),
         ]
     }
 
     /// The file's text: its first line, `astream-broker-health 1` (the format's
-    /// version), then one `key=value` line each, the poison's reason (when there is one)
-    /// last. Every key [`parse`](Self::parse) needs is always written.
+    /// version), then one `key=value` line each, the process's flush tally when it is
+    /// known, the poison's reason (when there is one) last. Every key
+    /// [`parse`](Self::parse) needs is always written.
     #[must_use]
     pub fn render(&self) -> String {
         let mut out = String::with_capacity(512);
@@ -322,6 +332,11 @@ impl BrokerHealth {
         for (k, v) in self.counts() {
             kv(k, &v.to_string());
         }
+        if let Some(tally) = &self.process_flushes {
+            for (k, v) in tally_counts(tally) {
+                kv(k, &v.to_string());
+            }
+        }
         match &self.poisoned {
             Some(why) => {
                 kv("poisoned", "yes");
@@ -333,9 +348,11 @@ impl BrokerHealth {
     }
 
     /// The snapshot in `text`, or `None` for text that is not one this build reads:
-    /// another first line (another format, or a file cut short), a key it writes
+    /// another first line (another format, or a file cut short), a key it needs
     /// missing, or a value that does not parse. Keys it does not know are skipped, so a
-    /// later build that adds one is still read.
+    /// later build that adds one is still read. The process's flush tally is the one
+    /// fact an older build under this header did not write: its three keys are all
+    /// present (`process_flushes` is `Some`) or all absent (`None`), never some of them.
     #[must_use]
     pub fn parse(text: &str) -> Option<BrokerHealth> {
         let mut lines = text.lines();
@@ -343,8 +360,10 @@ impl BrokerHealth {
             return None;
         }
         let mut h = BrokerHealth::default();
-        // Every key `render` writes but `reason` (present exactly when poisoned).
+        // Every key `render` writes but `reason` (present exactly when poisoned) and the
+        // tally's (bits 26 to 28, all or none).
         let mut seen = 0u32;
+        let mut tally = astream_sys::FlushTally::default();
         let mut poisoned = None;
         let mut reason = None;
         let mut horizon = None;
@@ -471,15 +490,15 @@ impl BrokerHealth {
                     25
                 }
                 "process_flush_full" => {
-                    h.process_flushes.full = num()?;
+                    tally.full = num()?;
                     26
                 }
                 "process_flush_barrier" => {
-                    h.process_flushes.barrier = num()?;
+                    tally.barrier = num()?;
                     27
                 }
                 "process_flush_plain" => {
-                    h.process_flushes.plain = num()?;
+                    tally.plain = num()?;
                     28
                 }
                 "reason" => {
@@ -490,9 +509,16 @@ impl BrokerHealth {
             };
             seen |= 1u32 << bit;
         }
-        if seen != (1u32 << 29) - 1 {
+        const NEEDED: u32 = (1u32 << 26) - 1;
+        const TALLY: u32 = 0b111 << 26;
+        if seen & NEEDED != NEEDED {
             return None;
         }
+        h.process_flushes = match seen & TALLY {
+            TALLY => Some(tally),
+            0 => None,
+            _ => return None,
+        };
         // A horizon belongs to Ordered alone, as on the wire.
         h.served.horizon_ms = match (h.served.requested, horizon) {
             (Tier::Ordered, Some(ms)) => ms,
@@ -529,12 +555,18 @@ pub fn read_health(log: impl AsRef<Path>) -> io::Result<Option<HealthRead>> {
             .take(READ_MAX)
             .read_to_string(&mut text)?;
         let Some(health) = BrokerHealth::parse(&text) else {
+            let first = text.lines().next().unwrap_or("");
+            let why = if first == HEADER {
+                // This build's own format: the header is no clue, the facts are.
+                format!("its format ({HEADER:?}) with a fact missing or one that does not parse")
+            } else {
+                format!("first line {first:?}")
+            };
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "{}: not a broker health snapshot this build reads (first line {:?})",
-                    path.display(),
-                    text.lines().next().unwrap_or("")
+                    "{}: not a broker health snapshot this build reads ({why})",
+                    path.display()
                 ),
             ));
         };
@@ -721,11 +753,11 @@ mod tests {
                 skipped: 2,
                 failed: 1,
             },
-            process_flushes: astream_sys::FlushTally {
+            process_flushes: Some(astream_sys::FlushTally {
                 full: 11,
                 barrier: 13,
                 plain: 17,
-            },
+            }),
             poisoned: Some("a flush failed (EIO)\nwith records".to_string()),
         }
     }
@@ -765,12 +797,35 @@ mod tests {
             BrokerHealth::parse(&ht.replace(HEADER, "astream-broker-health 2")),
             None
         );
-        let dropped: String = ht
-            .lines()
-            .filter(|l| !l.starts_with("parked_tails="))
-            .map(|l| format!("{l}\n"))
-            .collect();
-        assert_eq!(BrokerHealth::parse(&dropped), None, "a key missing");
+        let without = |prefixes: &[&str]| -> String {
+            ht.lines()
+                .filter(|l| !prefixes.iter().any(|p| l.starts_with(p)))
+                .map(|l| format!("{l}\n"))
+                .collect()
+        };
+        assert_eq!(
+            BrokerHealth::parse(&without(&["parked_tails="])),
+            None,
+            "a key missing"
+        );
+        // A broker built before the tally joined the file writes the same header and no
+        // tally: read, its tally unknown (never zero), and it renders the same text back.
+        let older = without(&["process_flush_"]);
+        let mut unknown = healthy.clone();
+        unknown.process_flushes = None;
+        assert_eq!(BrokerHealth::parse(&older), Some(unknown.clone()));
+        assert_eq!(unknown.render(), older, "no tally, no tally keys");
+        for key in [
+            "process_flush_full=",
+            "process_flush_barrier=",
+            "process_flush_plain=",
+        ] {
+            assert_eq!(
+                BrokerHealth::parse(&without(&[key])),
+                None,
+                "a tally without {key} is no writer's"
+            );
+        }
         assert_eq!(
             BrokerHealth::parse(&ht.replace("records=8", "records=eight")),
             None
@@ -837,6 +892,20 @@ mod tests {
         let err = read_health(&log).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("bus.log.health"), "{err}");
+        assert!(
+            err.to_string().contains("first line \"not a snapshot\""),
+            "{err}"
+        );
+        // This build's header over a fact that does not parse: the error says so, and
+        // does not quote the header as if it were another format.
+        std::fs::write(health_path(&log), h.render().replace("head=9", "head=nine")).unwrap();
+        let err = read_health(&log).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string()
+                .contains("a fact missing or one that does not parse"),
+            "{err}"
+        );
     }
 
     /// A link planted at the temp's name is not written through: the temp is created

@@ -1144,7 +1144,7 @@ mod tests {
         std::fs::write(root.join("JetBrainsMono-Bold.ttf"), with_weight(700)).unwrap();
         std::fs::write(root.join("NotoColorEmoji.ttf"), b"not read").unwrap();
         std::fs::write(root.join("notes.txt"), b"not a font").unwrap();
-        let files = Catalog::scan(std::slice::from_ref(&root), Limits::default()).files;
+        let files = Catalog::scan(std::slice::from_ref(&*root), Limits::default()).files;
         let regular = root.join("JetBrainsMono-Regular.ttf");
         let families = monospace_families_in(&files, &[regular.to_string_lossy().into_owned()]);
         assert!(
@@ -1158,7 +1158,6 @@ mod tests {
         assert!(families.automatic_has_ligatures);
         assert_eq!(families.emoji, ["NotoColorEmoji"]);
         assert_eq!(families.bold.len(), 1, "{families:?}");
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn with_family(name: &str) -> Vec<u8> {
@@ -1190,14 +1189,13 @@ mod tests {
         let root = fixture("hidden");
         std::fs::write(root.join("Placeholder.ttf"), with_family(".LastResort")).unwrap();
         std::fs::write(root.join("SFNSMono.ttf"), with_family(".SF NS Mono")).unwrap();
-        let files = Catalog::scan(std::slice::from_ref(&root), Limits::default()).files;
+        let files = Catalog::scan(std::slice::from_ref(&*root), Limits::default()).files;
         let families = monospace_families_in(&files, &[]);
         assert_eq!(families.installed, ["SF Mono"], "{families:?}");
         assert!(crate::is_hidden_face_name(".LastResort"));
         assert!(!crate::is_hidden_face_name(".SF NS Mono"));
         assert_eq!(crate::public_face_name(".SF NS Mono"), "SF Mono");
         assert_eq!(crate::public_face_name(".LastResort"), ".LastResort");
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1207,7 +1205,7 @@ mod tests {
         std::fs::write(root.join("JetBrainsMono-Regular.ttf"), JETBRAINS).unwrap();
         let batch = resolve_and_admit_in_dirs(
             &[("JetBrains Mono".to_string(), FaceTarget::REGULAR)],
-            std::slice::from_ref(&root),
+            std::slice::from_ref(&*root),
             Limits::default(),
         );
         let admitted = batch.get(0).unwrap().as_ref().expect("the family resolves");
@@ -1216,7 +1214,6 @@ mod tests {
             "resolved {}",
             admitted.path
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A family installed as a variable face plus links that name its weights
@@ -1235,12 +1232,12 @@ mod tests {
         }
         let request = [("JetBrains Mono".to_string(), FaceTarget::REGULAR)];
         let batch =
-            resolve_and_admit_in_dirs(&request, std::slice::from_ref(&root), Limits::default());
+            resolve_and_admit_in_dirs(&request, std::slice::from_ref(&*root), Limits::default());
         let admitted = batch.get(0).unwrap().as_ref().expect("the family resolves");
         assert_eq!(admitted.path, file.to_string_lossy());
         assert_eq!(
             super::super::resolve_by_name_table_in(
-                Catalog::scan(std::slice::from_ref(&root), Limits::default()).files,
+                Catalog::scan(std::slice::from_ref(&*root), Limits::default()).files,
                 "jetbrainsmono",
                 FaceTarget::REGULAR,
             )
@@ -1256,7 +1253,7 @@ mod tests {
             std::os::unix::fs::symlink("elsewhere.bin", root.join(alias)).unwrap();
         }
         let batch =
-            resolve_and_admit_in_dirs(&request, std::slice::from_ref(&root), Limits::default());
+            resolve_and_admit_in_dirs(&request, std::slice::from_ref(&*root), Limits::default());
         let admitted = batch
             .get(0)
             .unwrap()
@@ -1267,7 +1264,7 @@ mod tests {
             "{}",
             admitted.path
         );
-        std::fs::remove_dir_all(&root).unwrap();
+        drop(root);
 
         let store = fixture("linked-weights-store");
         let (bold, regular) = (
@@ -1289,7 +1286,7 @@ mod tests {
             std::os::unix::fs::symlink(&target, &link).unwrap();
             let batch = resolve_and_admit_in_dirs(
                 &request,
-                std::slice::from_ref(&profile),
+                std::slice::from_ref(&*profile),
                 Limits::default(),
             );
             let admitted = batch.get(0).unwrap().as_ref().expect("the family resolves");
@@ -1301,7 +1298,7 @@ mod tests {
             );
             assert_eq!(
                 super::super::resolve_by_name_table_in(
-                    Catalog::scan(std::slice::from_ref(&profile), Limits::default()).files,
+                    Catalog::scan(std::slice::from_ref(&*profile), Limits::default()).files,
                     "jetbrainsmono",
                     FaceTarget::REGULAR,
                 )
@@ -1311,8 +1308,6 @@ mod tests {
                 "{target:?}"
             );
         }
-        std::fs::remove_dir_all(&profile).unwrap();
-        std::fs::remove_dir_all(&store).unwrap();
     }
 
     #[test]
@@ -1327,7 +1322,7 @@ mod tests {
         std::fs::write(nested.join("Regular.ttf"), JETBRAINS).unwrap();
         std::fs::write(&regular, JETBRAINS).unwrap();
         std::fs::write(system.join("Regular.ttf"), JETBRAINS).unwrap();
-        let roots = [user.clone(), system.clone()];
+        let roots = [user.to_path_buf(), system.to_path_buf()];
         let request = [("JetBrains Mono".to_string(), FaceTarget::REGULAR)];
         let winner = |batch: &Batch| batch.get(0).unwrap().as_ref().unwrap().path.clone();
         let batch = resolve_and_admit_in_dirs(&request, &roots, Limits::default());
@@ -1340,8 +1335,6 @@ mod tests {
         std::fs::remove_file(&regular).unwrap();
         let batch = resolve_and_admit_in_dirs(&request, &roots, Limits::default());
         assert_eq!(winner(&batch), bold.to_string_lossy().into_owned());
-        std::fs::remove_dir_all(user).unwrap();
-        std::fs::remove_dir_all(system).unwrap();
     }
 
     #[cfg(unix)]
@@ -1352,7 +1345,7 @@ mod tests {
         let replacement = root.join(".replacement");
         std::fs::write(&path, JETBRAINS).unwrap();
         std::fs::write(&replacement, with_weight(700)).unwrap();
-        std::fs::File::open(&root)
+        std::fs::File::open(&*root)
             .unwrap()
             .set_times(
                 std::fs::FileTimes::new().set_modified(
@@ -1361,7 +1354,7 @@ mod tests {
             )
             .unwrap();
         let before_mtime = dir_mtime(&root).unwrap();
-        let roots = [root.clone()];
+        let roots = [root.to_path_buf()];
         let automatic = [path.to_string_lossy().into_owned()];
         let memo = std::sync::Mutex::new(None);
         let first = memoized_monospace_families(&roots, &automatic, &memo);
@@ -1385,7 +1378,6 @@ mod tests {
             1,
             "the replacement is now a bold face despite the identical file list"
         );
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     const JB_REGULAR: &[u8] = include_bytes!("../assets/bundled/JetBrainsMono-Regular.ttf");
@@ -1416,7 +1408,7 @@ mod tests {
         std::fs::write(by_name.join("Mono.ttc"), &collection).unwrap();
         let by_stem = fixture("collection-by-stem");
         std::fs::write(by_stem.join("JetBrainsMono.ttc"), &collection).unwrap();
-        for root in [&by_name, &by_stem] {
+        for root in [&*by_name, &*by_stem] {
             let roots = std::slice::from_ref(root);
             assert_eq!(
                 resolved_face(roots, "JetBrains Mono", FaceTarget::REGULAR).1,
@@ -1441,14 +1433,12 @@ mod tests {
             );
         }
         let (_, index) = resolved_face(
-            std::slice::from_ref(&by_name),
+            std::slice::from_ref(&*by_name),
             "JetBrains Mono",
             FaceTarget::REGULAR,
         );
         let face = aterm_font::Face::parse(&collection, index).unwrap();
         assert_eq!(face.weight().to_number(), 400);
-        let _ = std::fs::remove_dir_all(by_name);
-        let _ = std::fs::remove_dir_all(by_stem);
     }
 
     #[test]
@@ -1459,7 +1449,7 @@ mod tests {
             ttc_of(&[JB_REGULAR, JB_BOLD, JB_ITALIC, JB_BOLD_ITALIC]),
         )
         .unwrap();
-        let files = Catalog::scan(std::slice::from_ref(&root), Limits::default()).files;
+        let files = Catalog::scan(std::slice::from_ref(&*root), Limits::default()).files;
         let families = monospace_families_with_bundled(&files, &[], &[]);
         assert_eq!(families.installed, ["JetBrains Mono"], "{families:?}");
         assert_eq!(families.bold, ["JetBrains Mono Bold"], "{families:?}");
@@ -1469,7 +1459,7 @@ mod tests {
             ["JetBrains Mono Bold Italic"],
             "{families:?}"
         );
-        let roots = std::slice::from_ref(&root);
+        let roots = std::slice::from_ref(&*root);
         for (slot, (name, index)) in [
             (&families.bold[0], 1),
             (&families.italic[0], 2),
@@ -1491,12 +1481,10 @@ mod tests {
 
         let bold_first = fixture("collection-bold-first");
         std::fs::write(bold_first.join("Mono.ttc"), ttc_of(&[JB_BOLD, JB_REGULAR])).unwrap();
-        let files = Catalog::scan(std::slice::from_ref(&bold_first), Limits::default()).files;
+        let files = Catalog::scan(std::slice::from_ref(&*bold_first), Limits::default()).files;
         let families = monospace_families_with_bundled(&files, &[], &[]);
         assert_eq!(families.installed, ["JetBrains Mono"], "{families:?}");
         assert_eq!(families.bold, ["JetBrains Mono Bold"], "{families:?}");
-        let _ = std::fs::remove_dir_all(root);
-        let _ = std::fs::remove_dir_all(bold_first);
     }
 
     fn without_gsub(bytes: &[u8]) -> Vec<u8> {
@@ -1532,8 +1520,6 @@ mod tests {
                 Some(true)
             );
         }
-        let _ = std::fs::remove_dir_all(with);
-        let _ = std::fs::remove_dir_all(without);
     }
 
     #[test]
@@ -1547,7 +1533,7 @@ mod tests {
         let resolve = |max_name_bytes| {
             resolve_and_admit_in_dirs(
                 &[("Budget Mono".to_string(), FaceTarget::REGULAR)],
-                std::slice::from_ref(&root),
+                std::slice::from_ref(&*root),
                 Limits {
                     max_name_bytes,
                     ..Limits::default()
@@ -1565,14 +1551,13 @@ mod tests {
             "{:?}",
             batch.stats
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn an_installed_family_remains_installed_when_it_also_is_bundled() {
         let root = fixture("installed-and-bundled");
         std::fs::write(root.join("Regular.ttf"), JETBRAINS).unwrap();
-        let files = Catalog::scan(std::slice::from_ref(&root), Limits::default()).files;
+        let files = Catalog::scan(std::slice::from_ref(&*root), Limits::default()).files;
         let families = monospace_families_with_bundled(
             &files,
             &[],
@@ -1583,18 +1568,29 @@ mod tests {
         );
         assert!(families.installed.iter().any(|f| f == "JetBrains Mono"));
         assert_eq!(families.bundled, ["Other Bundled Face"]);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
-    fn fixture(label: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "aterm-font-catalog-{label}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        root
+    struct Fixture {
+        _dir: aterm_tempfile::TempDir,
+        path: PathBuf,
+    }
+
+    impl std::ops::Deref for Fixture {
+        type Target = PathBuf;
+
+        fn deref(&self) -> &Self::Target {
+            &self.path
+        }
+    }
+
+    fn fixture(label: &str) -> Fixture {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix(&format!("aterm-font-catalog-{label}-"))
+            .suffix(".noindex")
+            .tempdir()
+            .expect("create font_catalog fixture tempdir");
+        let path = dir.path().to_path_buf();
+        Fixture { _dir: dir, path }
     }
 
     #[test]
@@ -1604,8 +1600,8 @@ mod tests {
         std::fs::create_dir_all(&vendor).unwrap();
         std::fs::write(vendor.join("a.ttf"), b"a").unwrap();
         let absent_root = fixture("memo-later");
-        std::fs::remove_dir_all(&absent_root).unwrap();
-        let roots = vec![root.clone(), absent_root.clone()];
+        std::fs::remove_dir_all(&*absent_root).unwrap();
+        let roots = vec![root.to_path_buf(), absent_root.to_path_buf()];
         // Pin the directory's mtime so the next entry moves it at any clock granularity.
         #[cfg(unix)]
         let vendor_dir = std::fs::File::open(&vendor);
@@ -1638,7 +1634,7 @@ mod tests {
         assert_eq!(grown, vec![vendor.join("a.ttf"), vendor.join("b.ttf")]);
         assert!(walked, "an entry added deep in the tree is a miss");
 
-        std::fs::create_dir_all(&absent_root).unwrap();
+        std::fs::create_dir_all(&*absent_root).unwrap();
         std::fs::write(absent_root.join("c.otf"), b"c").unwrap();
         let (with_root, walked) = memoized_font_files_walked(&roots);
         assert_eq!(
@@ -1654,8 +1650,6 @@ mod tests {
         let (remembered, walked) = memoized_font_files_walked(&roots);
         assert_eq!(remembered, with_root);
         assert!(!walked, "and the new state is remembered");
-        std::fs::remove_dir_all(root).unwrap();
-        std::fs::remove_dir_all(absent_root).unwrap();
     }
 
     #[test]
@@ -1666,7 +1660,7 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("f.ttf"), b"f").unwrap();
         }
-        let roots = vec![root.clone()];
+        let roots = vec![root.to_path_buf()];
         let start = std::sync::Barrier::new(8);
         let answers: Vec<(Vec<PathBuf>, bool)> = std::thread::scope(|s| {
             let handles: Vec<_> = (0..8)
@@ -1683,7 +1677,6 @@ mod tests {
         assert_eq!(walks, 1, "{walks} concurrent callers walked the same tree");
         assert!(answers.iter().all(|(files, _)| files.len() == 64));
         assert!(answers.windows(2).all(|w| w[0].0 == w[1].0));
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1696,13 +1689,12 @@ mod tests {
             ("ExampleMono".to_string(), FaceTarget::REGULAR),
         ];
         let batch =
-            resolve_and_admit_in_dirs(&requests, std::slice::from_ref(&root), Limits::default());
+            resolve_and_admit_in_dirs(&requests, std::slice::from_ref(&*root), Limits::default());
         let first = batch.get(0).unwrap().as_ref().unwrap();
         let second = batch.get(1).unwrap().as_ref().unwrap();
         assert_eq!(first.path, path.to_string_lossy());
         assert!(Arc::ptr_eq(&first.bytes, &second.bytes));
         assert_eq!(batch.stats.dirs, 1);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1721,7 +1713,7 @@ mod tests {
             ),
         ];
         let batch =
-            resolve_and_admit_in_dirs(&requests, std::slice::from_ref(&root), Limits::default());
+            resolve_and_admit_in_dirs(&requests, std::slice::from_ref(&*root), Limits::default());
         let by_name = batch.get(0).unwrap().as_ref().unwrap();
         assert_eq!(by_name.path, installed.to_string_lossy(), "installed wins");
         assert_eq!(&by_name.bytes[..], b"installed jetbrains mono");
@@ -1730,7 +1722,7 @@ mod tests {
 
         std::fs::remove_file(&installed).unwrap();
         let batch =
-            resolve_and_admit_in_dirs(&requests, std::slice::from_ref(&root), Limits::default());
+            resolve_and_admit_in_dirs(&requests, std::slice::from_ref(&*root), Limits::default());
         for entry in &batch.entries {
             let admitted = entry.result.as_ref().unwrap();
             assert_eq!(
@@ -1744,7 +1736,6 @@ mod tests {
                 crate::bundled::face_for_id(crate::bundled::JETBRAINS_ID).unwrap()
             );
         }
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1790,7 +1781,7 @@ mod tests {
         let requests = (0..12)
             .map(|i| (format!("Missing {i}"), FaceTarget::REGULAR))
             .collect::<Vec<_>>();
-        let batch = resolve_and_admit_in_dirs(&requests, std::slice::from_ref(&root), limits);
+        let batch = resolve_and_admit_in_dirs(&requests, std::slice::from_ref(&*root), limits);
         assert!(batch.stats.dirs <= limits.max_dirs);
         assert!(batch.stats.entries <= limits.max_entries);
         assert!(batch.stats.font_files <= limits.max_font_files);
@@ -1806,7 +1797,6 @@ mod tests {
                 .unwrap_err()
                 .contains("request limit")
         );
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1834,6 +1824,5 @@ mod tests {
                 .contains("aggregate-byte")
         );
         assert!(batch.stats.aggregate_bytes <= limits.max_aggregate_bytes);
-        std::fs::remove_dir_all(root).unwrap();
     }
 }

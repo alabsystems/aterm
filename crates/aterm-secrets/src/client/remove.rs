@@ -14,11 +14,13 @@
 //!   The `[everyone]` reseal carries the revoke cascade (the Mac's roster row and pool slots, a new
 //!   fleet code, and on `--stolen` the roster's deny-lists). It returns the entries the Mac could read, for rotation
 //!   at the provider, and on `--stolen` the one `NEEDS YOU:` line (C25).
-//! - [`tend_epochs`] is the coverage rule on every vault pass: where removals on two sides of a
-//!   split left two newest epochs, or a newest epoch is still wrapped to a Mac the log removed
-//!   (a quorum `Remove` voided the remover's rotation), one member mints one higher epoch that
-//!   covers them ([`log_entries::coalesce_concurrent_commons_epochs`], the rule F18's Commons
-//!   handshake runs too).
+//! - [`tend_epochs`] is the coverage rule on every vault pass, and the only automatic re-key:
+//!   where removals on two sides of a split left two newest epochs, or a newest epoch is still
+//!   wrapped to a Mac the log removed (a quorum `Remove` voided the remover's rotation, or the
+//!   remover's rotation has not arrived), one member mints one higher epoch that covers them
+//!   ([`log_entries::coalesce_concurrent_commons_epochs`]), in the turn
+//!   [`Log::rekey_dues`] gives it: the remover first, everyone else after a grace. A Commons
+//!   exchange signs nothing.
 //! - [`removed_notes`] names each Mac the log removed, by whom and when, so a removed Mac that asks
 //!   again shows as removed, not new, and a person's "Allow again" restores a plain removal
 //!   ([`super::admit`]). A Mac a quorum removed is not restored by one person's Allow.
@@ -33,9 +35,9 @@ use super::log_entries::{self, AuthorCtx, Rotation};
 use super::*;
 use crate::commons::bootstrap::Device;
 use crate::membership_log::{
-    Body, EpochAudience, Kind, Log, MemberId, Record, RecordId, Store, Undo,
+    Body, EpochAudience, Kind, Log, MemberId, Record, RecordId, RekeyDue, Store, Turn, Undo,
+    audience_tag,
 };
-use aterm_digest::Sha256;
 
 /// What [`remove_member`] did.
 #[derive(Debug)]
@@ -1246,8 +1248,8 @@ fn undo_target(
     })
 }
 
-/// What the epoch tender remembers between passes: which newest epochs it last saw due, and when
-/// it first saw them.
+/// What the epoch tender remembers between passes ([`TendMark`]): when each audience first became
+/// due here, and when this Mac first saw each newest epoch, and saw it settled.
 fn epoch_mark_file(paths: &Paths) -> PathBuf {
     paths.dir.join("epoch-tend")
 }
@@ -1364,8 +1366,6 @@ pub fn reseal_waits(paths: &Paths) -> crate::Result<Vec<String>> {
     Ok(lines)
 }
 
-const EPOCH_RANK_DOMAIN: &[u8] = b"aterm/members/epoch-rank/1\0";
-
 /// [`tend_epochs_at`] at the wall clock, and what it signed posted to every server this Mac
 /// reaches: the subscriber's pass after it pulls records. Best effort: a pass that fails here
 /// tries again on the next.
@@ -1395,16 +1395,49 @@ pub(super) fn tend_epochs_by(
     Ok(signed)
 }
 
-/// The coverage rule (§3.3.7, keychain "Epochs") on a vault pass: where `[everyone]` or Commons
-/// has two or more newest epochs, or a newest epoch is still wrapped to a Mac the log removed
-/// ([`Log::rotation_due`]), the member ranked `k` among those that hold the newest epochs (by
-/// `SHA-256(domain ‖ actor ‖ the newest epochs)`) mints one higher epoch covering them once `k`
-/// [`log_entries::GAP_STEP_MS`] have passed since this Mac first saw them due, as wrap gaps are
-/// spread. F21's reseal (rule 5) runs the same way: where an audience has an uncovered keyed epoch,
-/// its holders join the ranked Macs, the signers of its dependents first, and its id joins the
-/// key; a ranked Mac that cannot open every epoch involved signs nothing, and the next rank acts.
-/// It looks without the state lock and takes it only to sign. Returns the records it signed,
-/// already in this Mac's records.
+#[cfg(test)]
+thread_local! {
+    /// The negative control of the ranks: while set, every member's turn is the first, at once,
+    /// as every Mac's exchange-time repair once minted.
+    pub(super) static UNRANKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `me`'s turn for `due` ([`RekeyDue::turn`]).
+fn turn_of(
+    due: &RekeyDue,
+    membership: &crate::membership_log::Membership,
+    me: &MemberId,
+) -> Option<Turn> {
+    #[cfg(test)]
+    if UNRANKED.with(std::cell::Cell::get) {
+        return Some(Turn {
+            rank: 0,
+            after_grace: false,
+        });
+    }
+    due.turn(membership, me)
+}
+
+/// The re-keys of a vault pass (§3.3.7, keychain "Epochs"; F21 rule 5), one minter per due:
+/// for each audience [`Log::rekey_dues`] names (a newest epoch still wrapped to a Mac the log
+/// removed, two or more newest epochs that are not twins, or an uncovered keyed epoch to
+/// reseal), this Mac mints one higher epoch covering the newest ones once its turn
+/// ([`RekeyDue::turn`]) comes:
+/// - the audience's clock starts when this Mac first sees it due, and holds while it stays due,
+///   whatever new head arrives; it clears only once the audience is due no more;
+/// - a remover acts its rank's [`log_entries::GAP_STEP_MS`] after the clock; every other Mac
+///   waits [`log_entries::REMOVER_GRACE_MS`] more, for the remover's own rotation to arrive;
+///   with no remover that can carry the audience, its carriers rank with no grace;
+/// - a rank's steps count from the later of the clock and when this Mac first saw every newest
+///   epoch settled, so a head that settles late does not put every rank past due at once;
+/// - an epoch another Mac minted whose batch this Mac may hold only a prefix of
+///   ([`Log::unsettled`]) holds the audience, until it settles or
+///   [`log_entries::SETTLE_GRACE_MS`] after this Mac first saw it (a minter whose batch ends in
+///   `Wrap`s and falls silent).
+///
+/// A ranked Mac that cannot open every newest epoch signs nothing, and the next rank acts a step
+/// later. It looks without the state lock and takes it only to sign, looking again under it.
+/// Returns the records it signed, already in this Mac's records.
 ///
 /// # Errors
 /// Local state cannot be read or written, or a record fails to open or sign.
@@ -1418,6 +1451,86 @@ pub fn tend_epochs_at(paths: &Paths, now_ms: u64) -> crate::Result<Vec<Record>> 
     let Some(identity) = read_identity(paths)? else {
         return Ok(Vec::new());
     };
+    let dues = log.rekey_dues();
+    if dues.is_empty() {
+        let _ = std::fs::remove_file(epoch_mark_file(paths));
+        return Ok(Vec::new());
+    }
+    let Some((me, _, _)) = log_entries::open_local_member_signer(paths, log)? else {
+        return Ok(Vec::new());
+    };
+    let earlier = read_tend_mark(paths);
+    let (mark, ready) = ready_rekeys(log, &me, &earlier, now_ms);
+    write_tend_mark(paths, &mark)?;
+    if ready.is_empty() {
+        return Ok(Vec::new());
+    }
+    tend_ready_epochs(paths, now_ms, &identity, &mark)
+}
+
+/// Compute ranks and settledness on the same log snapshot that authoring will use.
+fn ready_rekeys(
+    log: &Log,
+    me: &MemberId,
+    earlier: &TendMark,
+    now_ms: u64,
+) -> (TendMark, Vec<EpochAudience>) {
+    let mut mark = TendMark::default();
+    let membership = log.membership();
+    let mut ready = Vec::new();
+    for due in &log.rekey_dues() {
+        let tag = audience_tag(&due.audience);
+        // A clock set back since never puts first sight in the future.
+        let first = earlier.due.get(&tag).copied().unwrap_or(now_ms).min(now_ms);
+        mark.due.insert(tag, first);
+        let unsettled = log_entries::unsettled_of_others(log, &due.newest, me);
+        let mut from = first;
+        let mut settled = true;
+        for epoch in &due.newest {
+            if log.get(epoch).is_some_and(|record| record.actor() == me) {
+                continue;
+            }
+            let (seen, was) = earlier.seen.get(epoch).copied().unwrap_or((now_ms, 0));
+            let seen = seen.min(now_ms);
+            let at = if !unsettled.contains(epoch) {
+                if was == 0 { now_ms } else { was.min(now_ms) }
+            } else if now_ms >= seen.saturating_add(log_entries::SETTLE_GRACE_MS) {
+                seen.saturating_add(log_entries::SETTLE_GRACE_MS)
+            } else {
+                settled = false;
+                0
+            };
+            let kept = if unsettled.contains(epoch) { 0 } else { at };
+            mark.seen.insert(*epoch, (seen, kept));
+            from = from.max(at);
+        }
+        let Some(turn) = turn_of(due, &membership, me) else {
+            continue;
+        };
+        let spread =
+            log_entries::GAP_STEP_MS.saturating_mul(u64::try_from(turn.rank).unwrap_or(u64::MAX));
+        let grace = if turn.after_grace {
+            log_entries::REMOVER_GRACE_MS
+        } else {
+            0
+        };
+        let at = first
+            .saturating_add(grace)
+            .saturating_add(spread)
+            .max(from.saturating_add(spread));
+        if settled && now_ms >= at {
+            ready.push(due.audience.clone());
+        }
+    }
+    (mark, ready)
+}
+
+fn tend_ready_epochs(
+    paths: &Paths,
+    now_ms: u64,
+    identity: &Identity,
+    mark: &TendMark,
+) -> crate::Result<Vec<Record>> {
     let me_recipient = identity.recipient();
     let active_recipients_of = |log: &Log| -> crate::Result<BTreeSet<Recipient>> {
         let local_roster = log_entries::local_swarm_roster_for_log(paths, log)?;
@@ -1440,69 +1553,31 @@ pub fn tend_epochs_at(paths: &Paths, now_ms: u64) -> crate::Result<Vec<Record>> 
             .map(|(_, m)| m.binding.recipient())
             .collect())
     };
-    let active = active_recipients_of(log)?;
-    let hosts_due = log.hosts_rotation_due(&me_recipient);
-    if !log.rotation_due(&me_recipient, &active) && hosts_due.is_empty() {
-        let _ = std::fs::remove_file(epoch_mark_file(paths));
-        return Ok(Vec::new());
-    }
-    let Some((me, _, _)) = log_entries::open_local_member_signer(paths, log)? else {
-        return Ok(Vec::new());
-    };
-    let Some(opened) = log.open_audience_entries(&identity)? else {
-        return Ok(Vec::new());
-    };
-    let audiences: Vec<EpochAudience> = [EpochAudience::Everyone, EpochAudience::Commons]
-        .into_iter()
-        .chain(hosts_due.into_iter().map(EpochAudience::Hosts))
-        .collect();
-    // §3.3.7's coverage rule, apart from F21 rule 5's reseal: only then do the Macs that hold a
-    // newest epoch but no uncovered keyed one take ranks. A host list due with no uncovered keyed
-    // epoch of its own is due by the coverage rule.
-    let coverage = log.coverage_due(&me_recipient, &active)
-        || audiences.iter().any(|aud| {
-            matches!(aud, EpochAudience::Hosts(_)) && !opened.uncovered_keyed.contains_key(aud)
-        });
-    let TendRanks {
-        key,
-        uncovered,
-        order,
-    } = tend_ranks(log, &opened, &audiences, &active, coverage);
-    let rank = order
-        .iter()
-        .position(|actor| *actor == me)
-        .unwrap_or(order.len());
-    let first = read_epoch_mark(paths)
-        .filter(|(seen, _)| *seen == key)
-        .map_or(now_ms, |(_, at)| at.min(now_ms));
-    fsx::write_atomic(
-        &epoch_mark_file(paths),
-        format!("{} {first}\n", aterm_codec::hex::encode_lower(&key)).as_bytes(),
-        0o600,
-    )?;
-    let due = first.saturating_add(
-        log_entries::GAP_STEP_MS.saturating_mul(u64::try_from(rank).unwrap_or(u64::MAX)),
-    );
-    if now_ms < due {
-        return Ok(Vec::new());
-    }
-    let (minted, _, ()) = log_entries::author_and_commit_records(paths, |store| {
+    let (minted, _, resealed) = log_entries::author_and_commit_records(paths, |store| {
         let Some(mut log) = store.log().cloned() else {
-            return Ok((Vec::new(), ()));
+            return Ok((Vec::new(), false));
         };
         let active = active_recipients_of(&log)?;
-        let coalesce = log.rotation_due(&me_recipient, &active);
-        if !coalesce && log.hosts_rotation_due(&me_recipient).is_empty() {
-            return Ok((Vec::new(), ()));
+        if !active.contains(&me_recipient) {
+            return Ok((Vec::new(), false));
         }
         let Some((actor, device, incarnation)) =
             log_entries::open_local_member_signer(paths, &log)?
         else {
-            return Ok((Vec::new(), ()));
+            return Ok((Vec::new(), false));
         };
-        let Some(opened) = log.open_audience_entries(&identity)? else {
-            return Ok((Vec::new(), ()));
+        // A pull or a retry may have changed the due's heads, carriers or membership.
+        // Recheck every scheduling prerequisite before signing from this observation.
+        let (_, still) = ready_rekeys(&log, &actor, mark, now_ms);
+        if still.is_empty() {
+            return Ok((Vec::new(), false));
+        }
+        let Some(opened) = log.open_audience_entries(identity)? else {
+            return Ok((Vec::new(), false));
         };
+        let resealing = still
+            .iter()
+            .any(|audience| log_entries::reseal_ready(&opened, audience));
         let mut minted = Vec::new();
         device.with_seed(|writer_seed| {
             let author = AuthorCtx {
@@ -1511,135 +1586,110 @@ pub fn tend_epochs_at(paths: &Paths, now_ms: u64) -> crate::Result<Vec<Record>> 
                 incarnation,
                 authored_ms: now_ms,
             };
-            if coalesce {
-                log_entries::coalesce_concurrent_commons_epochs(
-                    &mut log,
-                    &opened,
-                    &author,
-                    &active,
-                    &mut minted,
-                    true,
-                )?;
-            }
+            log_entries::coalesce_concurrent_commons_epochs(
+                &mut log,
+                &opened,
+                &author,
+                &active,
+                &mut minted,
+                &still,
+            )?;
             log_entries::rotate_host_lists(
                 &mut log,
                 &opened,
                 &author,
                 &BTreeSet::new(),
                 &mut minted,
+                Some(&still),
             )
             .map(|_| ())
         })?;
-        Ok((minted, ()))
+        Ok((minted, resealing))
     })?;
     if !minted.is_empty() {
-        let _ = std::fs::remove_file(epoch_mark_file(paths));
         // F21 rule 8: a reseal of an uncovered keyed epoch records what each removed Mac could
         // read while it was out, for a person to rotate at its provider.
-        if !uncovered.is_empty()
+        if resealed
             && let Some(store) = trusted_store(paths)?
             && let Some(log) = store.log()
         {
-            record_read_after_cutoff(paths, log, &identity)?;
+            record_read_after_cutoff(paths, log, identity)?;
         }
     }
     Ok(minted)
 }
 
-/// Who acts first on a tend ([`tend_ranks`]): the rank key, the uncovered keyed epochs in it, and
-/// the members ranked, first to act first.
-pub(super) struct TendRanks {
-    /// `SHA-256` of the newest epochs of the audiences tended, then their uncovered keyed epochs.
-    pub(super) key: [u8; 32],
-    /// The uncovered keyed epochs (F21 rule 4) of those audiences a current member holds.
-    pub(super) uncovered: Vec<RecordId>,
-    /// The members ranked: the active members not left out of `[everyone]` that hold one of
-    /// `uncovered` (F21 rule 5), and where `coverage` (§3.3.7's rule is due too) those that hold
-    /// a newest epoch there; the signers of `uncovered`'s dependents first, then by
-    /// `SHA-256(EPOCH_RANK_DOMAIN ‖ actor ‖ key)`.
-    pub(super) order: Vec<MemberId>,
+/// Each held epoch can name at most one due audience and one seen clock. A `due` line
+/// takes at most 90 bytes and a `seen` line 112 (64 hex digits per id, 20 decimal digits
+/// per timestamp, prefixes, spaces and newline). Keep every clock a bounded log can
+/// produce: forgetting an oversized mark would restart its grace on every pass.
+const MAX_TEND_MARK: usize = crate::membership_log::MAX_HELD_RECORDS * (90 + 112);
+
+/// One read of [`epoch_mark_file`] ([`tend_epochs_at`]): each due audience's clock by
+/// [`audience_tag`], and each newest epoch another Mac minted, by id, with when this Mac first
+/// saw it and when it first saw it settled (zero while it is not).
+#[derive(Default)]
+struct TendMark {
+    due: BTreeMap<[u8; 32], u64>,
+    seen: BTreeMap<RecordId, (u64, u64)>,
 }
 
-/// The ranks of a tend of `audiences` on `log` as `opened` reads it, among `active`. A Mac that
-/// holds no key of an uncovered keyed epoch never takes a rank a reseal alone made: it could not
-/// reseal, and each rank ahead of the first holder delays the reseal one `GAP_STEP_MS`.
-pub(super) fn tend_ranks(
-    log: &Log,
-    opened: &crate::membership_log::entries::OpenedAudienceEntries,
-    audiences: &[EpochAudience],
-    active: &BTreeSet<Recipient>,
-    coverage: bool,
-) -> TendRanks {
-    let mut newest: Vec<RecordId> = audiences
-        .iter()
-        .flat_map(|aud| opened.maximal_epochs.get(aud).cloned().unwrap_or_default())
-        .collect();
-    newest.sort_unstable();
-    // F21 rule 5: the uncovered keyed epochs of those audiences join the rank key, and their
-    // holders the Macs ranked, the signers of their dependents first.
-    let membership = log.membership();
-    let keyed: Vec<crate::membership_log::Keyed> = log
-        .keyed_epochs()
-        .into_iter()
-        .filter(|k| {
-            !k.covered
-                && audiences.contains(&k.audience)
-                && k.holders.iter().any(|h| membership.contains(h))
-        })
-        .collect();
-    let mut uncovered: Vec<RecordId> = keyed.iter().map(|k| k.epoch).collect();
-    uncovered.sort_unstable();
-    let keyed_holders: BTreeSet<MemberId> = keyed
-        .iter()
-        .flat_map(|k| k.holders.iter().copied())
-        .collect();
-    let signers: BTreeSet<MemberId> = keyed
-        .iter()
-        .flat_map(|k| k.dependents.iter())
-        .filter_map(|d| log.get(d).map(|r| *r.actor()))
-        .collect();
-    let key = Sha256::digest([newest.concat(), uncovered.concat()].concat());
-    let mut holders: Vec<(bool, [u8; 32], MemberId)> = membership
-        .members()
-        .iter()
-        .filter(|(actor, m)| {
-            active.contains(&m.binding.recipient())
-                && !log.audience_left_out(&EpochAudience::Everyone, actor)
-                && (keyed_holders.contains(*actor)
-                    || coverage
-                        && newest.iter().any(|id| {
-                            opened
-                                .wrapped_recipients
-                                .get(id)
-                                .is_some_and(|set| set.contains(&m.binding.recipient()))
-                        }))
-        })
-        .map(|(actor, _)| {
-            let mut buf = EPOCH_RANK_DOMAIN.to_vec();
-            buf.extend_from_slice(actor);
-            buf.extend_from_slice(&key);
-            (!signers.contains(actor), Sha256::digest(&buf), *actor)
-        })
-        .collect();
-    holders.sort();
-    TendRanks {
-        key,
-        uncovered,
-        order: holders.into_iter().map(|(_, _, actor)| actor).collect(),
+/// [`TendMark`] from its lines, `due <tag> <ms>` and `seen <epoch> <ms> <ms>`; a line of another
+/// shape is skipped.
+fn read_tend_mark(paths: &Paths) -> TendMark {
+    let mut mark = TendMark::default();
+    let Ok(Some(bytes)) = fsx::read_private(&epoch_mark_file(paths), MAX_TEND_MARK) else {
+        return mark;
+    };
+    let Ok(text) = std::str::from_utf8(bytes.as_slice()) else {
+        return mark;
+    };
+    let hex = |word: &str| {
+        let mut out = [0u8; 32];
+        (word.len() == 64 && aterm_codec::hex::decode_into(word.as_bytes(), &mut out))
+            .then_some(out)
+    };
+    let ms = |word: &str| {
+        (!word.is_empty() && word.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| word.parse::<u64>().ok())
+            .flatten()
+    };
+    for line in text.lines() {
+        let words: Vec<&str> = line.split_ascii_whitespace().collect();
+        match words.as_slice() {
+            ["due", tag, at] => {
+                if let (Some(tag), Some(at)) = (hex(tag), ms(at)) {
+                    mark.due.insert(tag, at);
+                }
+            }
+            ["seen", epoch, seen, settled] => {
+                if let (Some(epoch), Some(seen), Some(settled)) =
+                    (hex(epoch), ms(seen), ms(settled))
+                {
+                    mark.seen.insert(epoch, (seen, settled));
+                }
+            }
+            _ => {}
+        }
     }
+    mark
 }
 
-fn read_epoch_mark(paths: &Paths) -> Option<([u8; 32], u64)> {
-    let bytes = fsx::read_private(&epoch_mark_file(paths), 256).ok()??;
-    let text = std::str::from_utf8(bytes.as_slice()).ok()?;
-    let (key, at) = text.trim().split_once(' ')?;
-    let mut out = [0u8; 32];
-    (key.len() == 64
-        && aterm_codec::hex::decode_into(key.as_bytes(), &mut out)
-        && !at.is_empty()
-        && at.bytes().all(|b| b.is_ascii_digit()))
-    .then_some(())?;
-    Some((out, at.parse().ok()?))
+fn write_tend_mark(paths: &Paths, mark: &TendMark) -> crate::Result<()> {
+    let mut text = String::new();
+    for (tag, at) in &mark.due {
+        text.push_str(&format!(
+            "due {} {at}\n",
+            aterm_codec::hex::encode_lower(tag)
+        ));
+    }
+    for (epoch, (seen, settled)) in &mark.seen {
+        text.push_str(&format!(
+            "seen {} {seen} {settled}\n",
+            aterm_codec::hex::encode_lower(epoch)
+        ));
+    }
+    fsx::write_atomic(&epoch_mark_file(paths), text.as_bytes(), 0o600)
 }
 
 /// A person's `aterm members remove <who>` on this Mac, kept on this Mac: [`remove_member`] with
@@ -1665,13 +1715,13 @@ pub fn test_remove_unposted(paths: &Paths, who: &str) -> crate::Result<usize> {
 }
 
 /// A member's write of the `[everyone]` entry `name` through the log, sealed under the one newest
-/// `[everyone]` epoch this Mac holds and signed with its device key: the stand-in for a member's
-/// writer that F8's lane and the tests put a value with after a removal. Returns the epoch it
-/// sealed under.
+/// `[everyone]` epoch this Mac holds, or the lowest id among newest [`secure_twins`] as a writer
+/// seals, and signed with its device key: the stand-in for a member's writer that F8's lane and
+/// the tests put a value with after a removal. Returns the epoch it sealed under.
 ///
 /// # Errors
 /// This Mac holds no trusted log, is no member, opens no `[everyone]` epoch, or holds two newest
-/// ones (the coverage rule has not run), or a record fails to sign or keep.
+/// ones that are not twins (the coverage rule has not run), or a record fails to sign or keep.
 #[cfg(any(test, debug_assertions))]
 pub fn test_put_everyone(paths: &Paths, name: &str, value: &[u8]) -> crate::Result<RecordId> {
     if trusted_store(paths)?.is_none() {
@@ -1693,11 +1743,24 @@ pub fn test_put_everyone(paths: &Paths, name: &str, value: &[u8]) -> crate::Resu
             .get(&EpochAudience::Everyone)
             .cloned()
             .unwrap_or_default();
-        let [epoch] = newest.as_slice() else {
-            return Err(Error::new(format!(
-                "{} newest [everyone] epochs: the coverage rule has not run",
-                newest.len()
-            )));
+        let removed = log.removed_recipients();
+        let epoch = match newest.as_slice() {
+            [one] => one,
+            twins
+                if crate::membership_log::secure_twins(
+                    twins,
+                    &opened.wrapped_recipients,
+                    &removed,
+                ) =>
+            {
+                twins.iter().min().unwrap_or(&twins[0])
+            }
+            _ => {
+                return Err(Error::new(format!(
+                    "{} newest [everyone] epochs: the coverage rule has not run",
+                    newest.len()
+                )));
+            }
         };
         let key = opened
             .unwrapped_keys
@@ -1726,6 +1789,20 @@ pub fn test_put_everyone(paths: &Paths, name: &str, value: &[u8]) -> crate::Resu
         let _ = post_records_to_servers(paths);
     }
     Ok(epoch)
+}
+
+/// One automatic pass of a vault's re-keys at `now_ms`, kept on this Mac: the wrap-gap closer
+/// ([`log_entries::close_wrap_gaps`]) and then the epoch tender ([`tend_epochs_at`]), as the
+/// subscriber runs them after it pulls records, with nothing posted. The stand-in other crates'
+/// tests run where a Mac's subscriber would. Returns the records it signed.
+///
+/// # Errors
+/// As [`tend_epochs_at`].
+#[cfg(any(test, debug_assertions))]
+pub fn test_tend_at(paths: &Paths, now_ms: u64) -> crate::Result<Vec<Record>> {
+    let mut signed = log_entries::close_wrap_gaps(paths, now_ms)?;
+    signed.extend(tend_epochs_at(paths, now_ms)?);
+    Ok(signed)
 }
 
 /// One member as `aterm members list` prints it ([`member_list`]).

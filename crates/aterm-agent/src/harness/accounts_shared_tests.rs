@@ -178,7 +178,7 @@ fn beginning_shared_preparation_fences_old_unpublished_login_checkpoints() {
 }
 
 #[test]
-fn fencing_keeps_removed_labels_absent_and_refuses_an_overfull_binding_table() {
+fn fencing_keeps_removed_labels_absent_and_preserves_large_binding_tables() {
     let before = Logins::default();
     let mut first = before.clone();
     first.shared.begin(intent(1), None).unwrap();
@@ -194,13 +194,14 @@ fn fencing_keeps_removed_labels_absent_and_refuses_an_overfull_binding_table() {
     assert!(!next.labels.contains_key("m3.2"));
     assert!(next.labels.contains_key("new-label"));
     let mut full = Logins::default();
-    for n in 0..super::super::MAX_ACCOUNTS {
+    for n in 0..96 {
         full.labels
             .insert(format!("full-{n}"), super::super::Binding::default());
     }
     let mut after = full.clone();
     after.shared.begin(intent(1), None).unwrap();
-    assert!(advance_renewal_generations(&full, &mut after, &[]).is_err());
+    advance_renewal_generations(&full, &mut after, &[]).unwrap();
+    assert_eq!(after.labels.len(), 97);
 }
 
 #[test]

@@ -3552,7 +3552,11 @@ fn weekly_into(
     sub.weekly_gap = seat.filter(|_| sub.weekly.is_none()).map(|seat| {
         if tapped {
             let stale = reading.is_some_and(|f| now.saturating_sub(f.at) > USAGE_SHOWN_S);
-            if stale {
+            if reading
+                .is_some_and(|f| aterm_agent::harness::profile::usage_read_age(f.at, now).is_none())
+            {
+                WeeklyGap::ClockInvalid
+            } else if stale {
                 WeeklyGap::Stale
             } else {
                 WeeklyGap::NoReply
@@ -3670,8 +3674,9 @@ struct StoreWeek {
 /// The store's figures of `acct`'s week at `now`, whatever their age: its usage-tap figure
 /// (`windows["seven_day"]`, not cut by a limit reset since) and its sample's
 /// ([`accounts::Sample::week`]), each while its window runs. A sample's figure is dated by its
-/// weekly observation time (`week_read_at`), else its `at`; [`store_week`] and
-/// `fact_menu::account_menu_rows_from` judge the age.
+/// weekly observation time (`week_read_at`), else its `at`. An unknown clock or
+/// reading beyond the display skew is excluded before comparing sources;
+/// [`store_week`] and `fact_menu::account_menu_rows_from` judge older history.
 pub(crate) fn store_figures(acct: &accounts::Account, now: i64) -> [Option<WeeklyFigure>; 2] {
     let window = acct.windows.get(accounts::WEEK_LIMIT);
     let tapped = window
@@ -3689,7 +3694,12 @@ pub(crate) fn store_figures(acct: &accounts::Account, now: i64) -> [Option<Weekl
             at: sample.week_read_at.unwrap_or(sample.at),
         })
     });
-    [tapped, sampled]
+    [tapped, sampled].map(|figure| {
+        figure.filter(|figure| {
+            aterm_agent::harness::profile::usage_read_age(figure.at, now).is_some()
+                && window.is_none_or(|window| window.admits_reading(figure.at))
+        })
+    })
 }
 
 /// [`StoreWeek`] of `acct` at `now`: the store's figures under the same age rule as the

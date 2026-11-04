@@ -275,6 +275,87 @@ fn a_cli_sync_from_a_settled_lab_migrates_the_label_and_keeps_the_login() {
     );
 }
 
+/// `accounts sync --cli kimi alab` on a Mac the lab names that prefers no Kimi account is no
+/// error: it adds nothing, keeps every row, says so (`prefers_none`), and still clears the
+/// `held_by` an old `ai-pool.toml` left. Another source naming no row of this machine's stays an
+/// error, since there it means the wrong machine or the wrong file.
+/// NEGATIVE CONTROL: with the `!lab_fleet` term removed from `sync_cli_with_replan`'s empty-fleet
+/// refusal, the sync fails (`no active Kimi accounts found for machine`).
+#[test]
+fn a_cli_sync_from_a_lab_that_prefers_nothing_here_keeps_every_row_and_clears_holds() {
+    let root = aterm_tempfile::TempDir::new().unwrap();
+    let (home, state_dir, config) = (
+        root.path().join("home"),
+        root.path().join("state"),
+        root.path().join("config"),
+    );
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&config).unwrap();
+    let toml = config.join("aterm.toml");
+    fs::write(&toml, "").unwrap();
+    let cli = Cli::Kimi;
+    let region = accounts::Vendor {
+        region: Some(crate::ai::connector::Region::Global),
+        ..accounts::Vendor::default()
+    };
+    let roster_path = accounts::roster_beside_for(&toml, cli).unwrap();
+    let store = accounts::Store::at_for(&state_dir, cli, &home);
+    let login = store.logins_dir().join("kimi-eeeeee");
+    fs::create_dir_all(&login).unwrap();
+    let rows = vec![Row {
+        label: "kimi-eeeeee".into(),
+        dir: Some(login.to_str().unwrap().to_owned()),
+        email: Some(email("eve")),
+        vendor: region,
+        held_by: Some("m3".into()),
+        ..Row::default()
+    }];
+    fs::write(
+        &roster_path,
+        accounts::append_rows_for(cli, "", &rows).unwrap(),
+    )
+    .unwrap();
+    let lab = Lab {
+        me: Some("m16".into()),
+        settled: true,
+        accounts: vec![LabAccount {
+            cli,
+            vendor: region,
+            ..lab_account("eve", "kimi-eeeeee", &[("m20", Some(1))])
+        }],
+        aliases: BTreeMap::new(),
+        mailboxes: BTreeMap::new(),
+        places: Default::default(),
+    };
+    let fetch = |_: &Env, _: &str| -> Result<String, String> { panic!("the lab is the source") };
+    let synced = alab_roster::with_lab(lab, || {
+        sync_cli_with_replan(
+            cli,
+            (&home, &state_dir, &toml),
+            (Some(alab_roster::SOURCE), None),
+            NOW,
+            (&fetch, &[]),
+            || {},
+        )
+    });
+    let Ok(CliSync::Synced(synced)) = synced else {
+        panic!("an empty lab fleet is no error: {synced:?}");
+    };
+    assert!(
+        synced.prefers_none,
+        "the report says the lab prefers nothing here"
+    );
+    assert!(synced.added.is_empty());
+    let roster = Roster::load_for(cli, &roster_path).unwrap();
+    let row = roster.row("kimi-eeeeee").expect("the row stays");
+    assert_eq!(
+        row.held_by, None,
+        "an old pool's hold does not outlive its source"
+    );
+    assert_eq!(row.dir.as_deref(), login.to_str());
+    assert_eq!(row.class, Class::Pool, "preferred elsewhere");
+}
+
 /// A scratch HOME for Claude Code's sync as the upkeep and `accounts sync` run it
 /// ([`sync_accounts_with`]), with an empty `aterm.toml` and, where `default` names one, a default
 /// login signed in as that address.
@@ -521,7 +602,7 @@ fn the_default_login_takes_its_lab_label_and_an_unknown_one_none() {
 /// (`a moved browser is due`); with its `room` gate removed, the full roster is due
 /// (`a full roster is not due`).
 #[test]
-fn the_lab_trigger_sees_a_moved_browser_and_a_full_roster() {
+fn the_lab_trigger_sees_a_moved_browser_and_growth_of_a_large_roster() {
     let bed = Bed::new(None);
     let gil = bed.login("claude-gggggg");
     bed.seed(&[Row {
@@ -573,9 +654,13 @@ fn the_lab_trigger_sees_a_moved_browser_and_a_full_roster() {
             alab_roster::sync_due(Cli::Claude, &full.roster, |_| false)
         })
     };
-    full.seed(&rows(accounts::MAX_ACCOUNTS));
-    assert!(!due(&lab), "a full roster is not due");
-    full.seed(&rows(accounts::MAX_ACCOUNTS - 1));
+    full.seed(&rows(96));
+    assert!(due(&lab), "a large roster still imports a new account");
+    full.sync(&lab).unwrap();
+    assert_eq!(full.roster().rows.len(), 97);
+    assert!(full.roster().row("kept-0").is_some());
+    assert!(full.roster().row("kept-95").is_some());
+    full.seed(&rows(96 - 1));
     assert!(due(&lab), "a roster with room is due");
 }
 
@@ -659,10 +744,12 @@ fn the_first_adds_main_is_the_default_login_under_the_lab() {
 /// neither Claude Code's sync inputs nor a CLI's, the sheet counts as no fleet source and names
 /// nothing, and the init trigger asks the lab, which is satisfied by a roster that holds what it
 /// prefers. With no lab held, the same edit moves both digests, as it always did; while the lab
-/// is pending (held, not read yet) the sheet is no fleet source either.
+/// is pending (held, not read yet) the sheet is no fleet source either, and an edit to it moves
+/// no CLI's inputs.
 /// NEGATIVE CONTROL: with `sync_inputs`' `lab_chosen` arm removed, the sheet edit moves Claude
 /// Code's inputs under the lab (`reads no sheet`); with `has_fleet_source`'s `sheet_read_here`
-/// gate removed, the sheet is a source (`no fleet source`).
+/// gate removed, the sheet is a source (`no fleet source`); with `cli_sync_inputs` reading the
+/// sheet ungated, the pending digest moves (`while the lab is not read yet`).
 #[test]
 fn a_mac_the_lab_names_reads_no_sheet_in_its_upkeep() {
     let root = aterm_tempfile::TempDir::new().unwrap();
@@ -718,10 +805,18 @@ fn a_mac_the_lab_names_reads_no_sheet_in_its_upkeep() {
     assert_ne!(moved_claude, bare_claude, "with no lab the sheet is read");
     assert_ne!(moved_kimi, bare_kimi);
     assert!(has_fleet_source(&home.join(".secrets")));
-    alab_roster::while_pending(|| {
+    let pending_kimi = alab_roster::while_pending(|| {
         assert!(
             !has_fleet_source(&home.join(".secrets")),
             "a lab not read yet reads no sheet"
         );
+        digests().1
     });
+    edit("email,computer,claude,kimi\nthree@example.test,m22,1,global\n");
+    assert_ne!(digests().1, moved_kimi, "with no lab the edit moves it");
+    assert_eq!(
+        alab_roster::while_pending(|| digests().1),
+        pending_kimi,
+        "a CLI's upkeep reads no sheet while the lab is not read yet"
+    );
 }

@@ -1676,7 +1676,7 @@ tests/unicode_content_generation.rs	unicode_bulk_and_fragmented_writes_advance_c
    - `tests/tab_stops_across_grid_seams.rs::an_adopted_session_keeps_the_configured_scrollback_limit` (and the alt twin) are retention tests filed in a TBC-3 suite; `tests/chunked_process_equivalence.rs::xtversion_reports_the_shared_application_identity` is a single reply-format test in a chunking suite.
    - **Resolved — `tests/mem_budget.rs::engine_retained_heap_within_budget`:** false `'retains ZERO additional heap'` claim removed; doc and assertion state the 96 KiB ceiling and 8 KiB grid-reuse bound.
 2. **Tests that exercise cfg(test)-only twins instead of the production path**
-   - `AltArchiveBudget::{total, min_share}` and `Terminal::block_eviction_read_count` are cfg(test)-only getters that subsumed tests depend on; the replacing specs need them, or a model view, outside cfg(test).
+   - **Resolved — `AltArchiveBudget::{total, min_share}` and `Terminal::block_eviction_read_count`:** exposed as public getters outside `#[cfg(test)]` so specs and callers observe pool parameters and block-eviction read counts directly on the shipped types.
 3. **Tests weaker than the spec they imply**
    - **Resolved — `callback_setters.rs::offloaded_resize_{primary,alt_screen}_*`:** both tests now compare scrollback line count, retained history and visible rows, and cursor coordinates against a synchronous `Terminal::resize`.
    - **Resolved — `tests/conformance_read_image_seq.rs::host_bumped_seq_is_the_run_ahead_stamp_the_engine_stamp_never_is`:** keeps `snap` immutable (`let mut snap` removed) and removes the redundant `<=` after `assert_eq!`.

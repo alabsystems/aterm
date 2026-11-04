@@ -9036,6 +9036,9 @@ mod inbox_hold {
     /// a `connected` one names no reason, whatever the bridge reports beside the read (a link
     /// that flaps while its broker shuts down). Read apart, a `stalled` came with the `-` of the
     /// link that was up a moment before (`link_state`'s killed broker, aterm's fabric world).
+    /// NEGATIVE CONTROL: load `LINK.state` before taking `LINK.link` in [`fabric_link_status`]:
+    /// the reader sees a torn line within its first move or two in each of ten runs (2026-11-03),
+    /// so the 500 `MOVES` leave a wide margin.
     #[test]
     fn fabric_status_reads_its_state_and_reason_as_one_moment() {
         with_link(|| {
@@ -9059,7 +9062,7 @@ mod inbox_hold {
                 ("stalled", "closed", Some(2))
             );
 
-            const MOVES: usize = 20_000;
+            const MOVES: usize = 500;
             let done = std::sync::atomic::AtomicBool::new(false);
             let torn = std::thread::scope(|scope| {
                 let reader = scope.spawn(|| {

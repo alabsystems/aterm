@@ -4,12 +4,17 @@
 //! THE TALLY COUNTS WHAT THE SEAM RECORDS. Every flush aterm-durable makes is one of
 //! astream-sys's calls (`aterm_durable::ASTREAM_COUNTS` says `all`), so
 //! `astream_sys::flush_tally` moves by exactly the flushes `aterm_durable::seam` records,
-//! kind by kind. One test in a binary of its own, because the tally is process-wide: here
-//! nothing else flushes while it reads.
+//! kind by kind, but for the one the seam records and no OS takes: a directory's on Windows,
+//! which has no flush of one (`Flush::dir`). One test in a binary of its own, because the
+//! tally is process-wide: here nothing else flushes while it reads. The binary takes the
+//! flushes aterm ships whatever test mark it inherits (`shipped_durable_flushes_in_tests!`),
+//! so the full flush /dev/null refuses is the real one.
 
 use std::io::Write as _;
 
 use aterm_durable::{Flush, seam};
+
+aterm_durable::shipped_durable_flushes_in_tests!();
 
 /// What `astream_sys::flush_tally` moved by between two readings: `(full, barrier, plain)`.
 fn moved(before: astream_sys::FlushTally, after: astream_sys::FlushTally) -> (u64, u64, u64) {
@@ -22,7 +27,8 @@ fn moved(before: astream_sys::FlushTally, after: astream_sys::FlushTally) -> (u6
 
 /// An in-process durable replace (the new copy flushed in full, data then all, renamed over
 /// the old, the directory's entry flushed in full) moves `full` by exactly the three durable
-/// flushes the seam records and nothing else; an ordered write moves `barrier` by the one
+/// flushes the seam records and nothing else (two on Windows, which notes the entry's flush
+/// and makes none); an ordered write moves `barrier` by the one
 /// ordered flush the seam records on Apple targets, where the barrier is its own call, and
 /// `full` elsewhere, where it is a full flush. NEGATIVE CONTROL: a flush that calls the OS
 /// directly (`File::sync_all`, `File::sync_data`), as `primitive::full` and
@@ -33,6 +39,10 @@ fn moved(before: astream_sys::FlushTally, after: astream_sys::FlushTally) -> (u6
 #[test]
 fn the_tally_moves_by_exactly_the_flushes_the_seam_records() {
     assert_eq!(aterm_durable::ASTREAM_COUNTS, "all");
+    assert!(
+        !aterm_durable::durable_flushes_are_plain(),
+        "this binary judges the full flushes aterm ships, never a test mark's fsync(2)"
+    );
     let dir = aterm_tempfile::Builder::new()
         .prefix("aterm-durable-tally-")
         .tempdir()
@@ -59,9 +69,11 @@ fn the_tally_moves_by_exactly_the_flushes_the_seam_records() {
         [Flush::Durable; 3],
         "the replace's flushes, as asked"
     );
+    // Windows has no flush of a directory: `Flush::dir` notes the entry's and makes none.
+    let replace = if cfg!(windows) { (2, 0, 0) } else { (3, 0, 0) };
     assert_eq!(
         moved(before, after),
-        (3, 0, 0),
+        replace,
         "each durable flush the seam recorded is one full flush counted: {before:?} -> {after:?}"
     );
 

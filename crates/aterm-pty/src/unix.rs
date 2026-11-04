@@ -152,6 +152,8 @@ fn open_pts_slave(master: libc::c_int) -> io::Result<libc::c_int> {
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     const NAME_STEP: &str = "ptsname_r";
     let name = pts_name(master).map_err(|err| pty_step_failed(NAME_STEP, err))?;
+    #[cfg(all(test, target_os = "macos"))]
+    let name = pty_race::opening_slave(name);
     // SAFETY: `name` is a NUL-terminated pts path; `open` reads it and returns a fresh fd or -1.
     let slave = unsafe {
         libc::open(
@@ -160,12 +162,20 @@ fn open_pts_slave(master: libc::c_int) -> io::Result<libc::c_int> {
         )
     };
     if slave < 0 {
-        return Err(pty_step_failed(
-            "open of the slave",
-            io::Error::last_os_error(),
-        ));
+        return Err(pty_step_failed(SLAVE_OPEN, io::Error::last_os_error()));
     }
     Ok(slave)
+}
+
+/// The step [`open_pts_slave`] names when the open of the slave by its name fails.
+const SLAVE_OPEN: &str = "open of the slave";
+
+/// Whether `err` is [`open_pts_slave`]'s open of the slave by name finding no node there
+/// (ENOENT), as under ATERM-KI-1028-4's pty churn ([`open_pty_pair_cloexec`]).
+fn slave_node_gone(err: &io::Error) -> bool {
+    err.get_ref()
+        .and_then(|e| e.downcast_ref::<PtyOpenError>())
+        .is_some_and(|e| e.step == SLAVE_OPEN && e.os.raw_os_error() == Some(libc::ENOENT))
 }
 
 fn fd_is_cloexec_or_make_it(fd: libc::c_int) -> bool {
@@ -237,9 +247,37 @@ fn open_ptmx(mut open: impl FnMut(libc::c_int) -> libc::c_int) -> io::Result<lib
     }
 }
 
+/// How many ptys whose slave's node is gone as it opens one pty open replaces before it is an
+/// error ([`open_pty_pair_cloexec`]).
+const GONE_SLAVE_REPLACEMENTS: usize = 1;
+
+/// Opens a `(master, slave)` pty pair, both ends close-on-exec, `termp` and `winp` applied to
+/// the slave.
+///
+/// On Apple the slave opens by its name, and under ATERM-KI-1028-4's pty churn that open can
+/// find no node there (ENOENT): a new pty left with no `/dev` node, as macOS 27.0.1 was seen to
+/// leave one while its master was held, or an open racing the revoke of a terminal on the same
+/// device, which `vn_open_auth` gives up on with ENOENT. Such a pty is held open while one fresh
+/// pair opens, then closed: XNU hands out the lowest free number, so closed first, its number
+/// would go straight to the fresh pair. A second is an error naming both. (Linux opens the slave
+/// through `TIOCGPTPEER`, by name only where a kernel predates it.)
+///
+/// # Errors
+/// The failed step's own error (`posix_openpt`, `FD_CLOEXEC`, `grantpt`, `unlockpt`, the slave's
+/// name or its open), with nothing left open; for a second pty whose slave's node was gone, or
+/// the replacement's own failure, that error naming the gone one, the gone ptys closed.
 fn open_pty_pair_cloexec(
     termp: Option<&libc::termios>,
     winp: Option<&libc::winsize>,
+) -> io::Result<(libc::c_int, libc::c_int)> {
+    open_pty_pair_replacing(termp, winp, GONE_SLAVE_REPLACEMENTS)
+}
+
+/// [`open_pty_pair_cloexec`], replacing up to `replacements` ptys whose slave's node is gone.
+fn open_pty_pair_replacing(
+    termp: Option<&libc::termios>,
+    winp: Option<&libc::winsize>,
+    replacements: usize,
 ) -> io::Result<(libc::c_int, libc::c_int)> {
     // SAFETY: `posix_openpt` takes only a flag word and returns a fresh fd or -1.
     let master = open_ptmx(|flags| unsafe { libc::posix_openpt(flags) })?;
@@ -273,6 +311,30 @@ fn open_pty_pair_cloexec(
 
     let slave = match open_pts_slave(master) {
         Ok(s) => s,
+        Err(err) if slave_node_gone(&err) => {
+            let gone = format!(
+                "{}, whose slave's open found no node (ENOENT), as under heavy pty churn \
+                 (ATERM-KI-1028-4)",
+                pty_label(master)
+            );
+            // Opened while `master` still holds the gone pty's number, so never on it.
+            let fresh = replacements
+                .checked_sub(1)
+                .map(|left| open_pty_pair_replacing(termp, winp, left));
+            // SAFETY: closing the master we opened above, once the fresh pair (if any) is open;
+            // no slave exists for it.
+            unsafe {
+                libc::close(master);
+            }
+            return match fresh {
+                Some(Ok(pair)) => Ok(pair),
+                Some(Err(err)) => Err(io::Error::new(
+                    err.kind(),
+                    format!("{err} (opening a pty in place of {gone})"),
+                )),
+                None => Err(io::Error::new(err.kind(), format!("{err}: {gone}"))),
+            };
+        }
         Err(err) => {
             // SAFETY: closing the master we opened above; no slave exists yet.
             unsafe {
@@ -793,10 +855,11 @@ fn pty_label(master: libc::c_int) -> String {
 
 /// Why the pty of `master` and `slave` cannot carry a shell, read in the parent before a fork:
 /// its slave descriptor is dead (`fstat` or `tcgetattr` fails) or, on macOS, its node is gone by
-/// name. Under heavy pty churn XNU can remove a new pty's `/dev/ttys…` node while another
-/// process's pty that held the same minor finishes tearing down, which kills every descriptor
-/// of the slave (ATERM-KI-1028-4); a pooled pty, opened well before its spawn, is the widest
-/// window. `None`: the pty answered all of it.
+/// name. Under heavy pty churn a new pty can be left with no `/dev/ttys…` node of its own (XNU
+/// frees a number before it removes the old pty's node, and `devfs_make_node` finds the name
+/// taken), and on macOS 27.0.1 such a slave's descriptors were seen to die under a spawn
+/// (ATERM-KI-1028-4); a pooled pty, opened well before its spawn, is the widest window.
+/// `None`: the pty answered all of it.
 fn dead_pty(master: libc::c_int, slave: libc::c_int) -> Option<String> {
     // SAFETY: `st` is a zeroed plain-integer out-param that `fstat` fills from `slave`.
     let fstat_ok = unsafe {
@@ -867,8 +930,8 @@ fn replace_dead_pty(
     if deaths.len() > DEAD_PTY_REPLACEMENTS {
         return Err(io::Error::other(format!(
             "every pty opened for this shell died before the shell could use it ({}): under \
-             heavy pty churn macOS can remove a new pty's /dev node while another process's \
-             pty on the same number finishes tearing down (ATERM-KI-1028-4)",
+             heavy pty churn macOS can leave a new pty with no /dev node of its own, or kill its \
+             slave, as another pty on the same number finishes tearing down (ATERM-KI-1028-4)",
             deaths.join("; then ")
         )));
     }
@@ -1051,6 +1114,137 @@ pub fn spawn_session_leader_on_pty(
     }
 }
 
+/// Ends the session that `leader`, spawned by [`spawn_session_leader_on_pty`] onto the pty of
+/// `master`, leads, and closes that pty, `master` last: one `SIGKILL` to the pty's foreground
+/// group (a shell's job); a `SIGKILL` to the leader's own group (on Apple again, paced, until
+/// the kernel finds no member of it left to signal or [`END_KILL_CAP`] has passed); the leader
+/// reaped; all while `said` takes what the master gives (on Apple a session leader's exit first
+/// waits for its terminal's output to drain, which reading the master lets it finish); then the
+/// caller's `slave` closed and the master read to its end (no process holds the slave any
+/// more); then `master` closed. The session's other groups (a shell's background jobs) are the
+/// caller's to end: on Linux one that holds the slave keeps the master from its end. A pty torn
+/// down by the exit of a process nobody waits on (its session leader, left running when its
+/// master closed) frees its number at a moment no one chooses, and XNU frees a number before it
+/// removes that pty's `/dev` node: a pty given the number in between is left with no node of its
+/// own (`devfs_make_node` finds the name taken), as ATERM-KI-1028-4 records. A leader the caller
+/// has already reaped is not signalled, nor is its terminal's foreground: its pid, and the group
+/// it led, may name other processes now.
+///
+/// # Errors
+/// `fcntl`'s, making the master nonblocking; `Other` for a leader pid `pid_t` cannot hold; the
+/// first master read or `waitpid` that failed; `TimedOut` when the leader is not reaped, or the
+/// master gives no end, `within` from the call. On every error `slave` and `master` close as the
+/// call returns, the leader reaped or not.
+#[cfg(any(test, debug_assertions))]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn end_session_on_pty(
+    master: std::os::fd::OwnedFd,
+    slave: Option<std::os::fd::OwnedFd>,
+    leader: &mut std::process::Child,
+    within: std::time::Duration,
+    said: &mut dyn FnMut(&[u8]),
+) -> io::Result<std::process::ExitStatus> {
+    use std::os::fd::AsRawFd as _;
+    use std::time::{Duration, Instant};
+    let start = Instant::now();
+    let until = start + within;
+    let fd = master.as_raw_fd();
+    set_nonblocking(fd, true)?;
+    let pid = libc::pid_t::try_from(leader.id()).map_err(io::Error::other)?;
+    if leader.try_wait()?.is_none() {
+        // SAFETY: `tcgetpgrp` is a read-only ioctl on the master this call owns.
+        let front = unsafe { libc::tcgetpgrp(fd) };
+        if front > 1 && front != pid {
+            // SAFETY: a plain syscall taking no pointer; `front` > 1 names one group, the one the
+            // pty named its foreground just now, while the session's leader is unreaped.
+            unsafe {
+                libc::kill(-front, libc::SIGKILL);
+            }
+        }
+        // One signal reaches every member on Linux, whose fork restarts when a group signal
+        // lands during it. XNU's fork does not: a child forked as the signal lands joins the
+        // group unsignalled, so on Apple the group is signalled again until the kernel finds no
+        // member to signal (`EPERM` once only zombies are left, the leader, unreaped until this
+        // loop ends, among them; `ESRCH` once none are), as
+        // `aterm_uds::process::kill_group_until_empty` does; the master is read between rounds.
+        let cap = (start + END_KILL_CAP).min(until);
+        let mut pause = Duration::from_millis(1);
+        loop {
+            drain_master(fd, said)?;
+            // SAFETY: a plain syscall taking no pointer; `pid` > 1 leads its own group
+            // (`setsid`), and, unreaped, keeps that group's id from naming any other.
+            let signalled = unsafe { libc::kill(-pid, libc::SIGKILL) } == 0;
+            if !cfg!(target_vendor = "apple") || !signalled || Instant::now() >= cap {
+                break;
+            }
+            std::thread::sleep(pause);
+            pause = (pause * 2).min(END_KILL_PAUSE);
+        }
+    }
+    let status = loop {
+        drain_master(fd, said)?;
+        if let Some(status) = leader.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= until {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("the session leader {pid} was not reaped within {within:?}"),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    drop(slave);
+    while !drain_master(fd, said)? {
+        if Instant::now() >= until {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "{}: its slave was still open {within:?} after its end began",
+                    pty_label(fd)
+                ),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    drop(master);
+    Ok(status)
+}
+
+/// How long [`end_session_on_pty`] signals a session leader's group that has not emptied: a
+/// member `SIGKILL` cannot end (one stuck in the kernel) is left to the kernel after this.
+#[cfg(any(test, debug_assertions))]
+const END_KILL_CAP: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The longest pause between two of [`end_session_on_pty`]'s signals to a group.
+#[cfg(any(test, debug_assertions))]
+const END_KILL_PAUSE: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Read the nonblocking master `fd`, each read's bytes to `said`, until it has nothing more now
+/// or sixteen reads have: `true` at its end (no process holds the slave: `read` answers 0 on
+/// Apple, `EIO` on Linux), `false` while its slave is open.
+#[cfg(any(test, debug_assertions))]
+#[cfg_attr(trust_verify, trust::skip)]
+fn drain_master(fd: libc::c_int, said: &mut dyn FnMut(&[u8])) -> io::Result<bool> {
+    let mut buf = [0_u8; 4096];
+    for _ in 0..16 {
+        match usize::try_from(read(fd, &mut buf)) {
+            Ok(0) => return Ok(true),
+            Ok(n) => said(&buf[..n]),
+            Err(_) => {
+                let err = io::Error::last_os_error();
+                match err.raw_os_error() {
+                    Some(libc::EINTR) => {}
+                    Some(libc::EAGAIN) => return Ok(false),
+                    Some(libc::EIO) => return Ok(true),
+                    _ => return Err(err),
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// What this thread's spawns forked onto (tests): the name of each pty a spawn forked a child
 /// onto, in order, read in the parent before the fork.
 #[cfg(test)]
@@ -1078,8 +1272,9 @@ pub(crate) mod spawn_trace {
 /// slave's name kills every descriptor of it as XNU's race does (`fstat` fails with EBADF,
 /// `tcgetattr` fails, `login_tty`'s `TIOCSCTTY` says ENOENT; measured on macOS 27.0), though it
 /// leaves the node in place; the node's removal itself, which no test can do to `/dev`, is
-/// shown to the parent's check by a name that names nothing ([`gone_by_name`]). It applies only
-/// to spawns from the thread that set it, so every other test's spawn runs as it is.
+/// shown to the parent's check, and to a new pty's slave as it opens, by a name that names
+/// nothing ([`gone_by_name`], [`slave_opens_gone`]). It applies only to spawns and opens from
+/// the thread that set it, so every other test's run as they are.
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) mod pty_race {
     use std::cell::{Cell, RefCell};
@@ -1091,7 +1286,9 @@ pub(crate) mod pty_race {
         static FRESH: Cell<u32> = const { Cell::new(0) };
         static GONE_BY_NAME: Cell<u32> = const { Cell::new(0) };
         static OPEN_FAILS: Cell<u32> = const { Cell::new(0) };
+        static SLAVE_OPENS_GONE: Cell<u32> = const { Cell::new(0) };
         static STRUCK_FRESH: RefCell<Vec<CString>> = const { RefCell::new(Vec::new()) };
+        static STRUCK_OPENS: RefCell<Vec<CString>> = const { RefCell::new(Vec::new()) };
     }
 
     unsafe extern "C" {
@@ -1127,6 +1324,29 @@ pub(crate) mod pty_race {
         take_one(&OPEN_FAILS)
     }
 
+    /// On each of this thread's next `n` opens of a new pty's slave by its name, open a name
+    /// that names nothing: the pty's node gone as its slave opens (ENOENT).
+    pub(crate) fn slave_opens_gone(n: u32) {
+        SLAVE_OPENS_GONE.with(|c| c.set(n));
+    }
+
+    /// The names of the ptys whose slave's open [`slave_opens_gone`] struck since the last take.
+    pub(crate) fn take_struck_opens() -> Vec<CString> {
+        STRUCK_OPENS.with(|s| std::mem::take(&mut *s.borrow_mut()))
+    }
+
+    /// In the open of a new pty's slave, the name it opens: `name`, or on a struck open `name`
+    /// with `.gone` after it, which names nothing.
+    pub(super) fn opening_slave(name: CString) -> CString {
+        if !take_one(&SLAVE_OPENS_GONE) {
+            return name;
+        }
+        STRUCK_OPENS.with(|s| s.borrow_mut().push(name.clone()));
+        let mut gone = name.into_bytes();
+        gone.extend_from_slice(b".gone");
+        CString::new(gone).unwrap_or_default()
+    }
+
     /// This thread's seam, all of it off, and its record of struck fresh ptys cleared.
     pub(crate) fn reset() {
         in_children(0);
@@ -1134,7 +1354,9 @@ pub(crate) mod pty_race {
         in_fresh(0);
         gone_by_name(0);
         fresh_opens_fail(0);
+        slave_opens_gone(0);
         let _ = take_struck_fresh();
+        let _ = take_struck_opens();
     }
 
     /// The names of the fresh ptys [`in_fresh`] killed since the last take.

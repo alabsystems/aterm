@@ -39,9 +39,11 @@ pub(crate) struct ActRequest {
     pub(crate) value: Option<String>,
 }
 
-/// The Settings actions `act` presses for no control client, each with the buttons its refusal
-/// names: a person presses them in the window. Refused by the action's prefix before any view
-/// is read, so a page that does not show the button yet refuses it the same way.
+/// The Settings actions only a person's own click or key presses, each with the buttons its
+/// refusal names. `act` refuses them by the action's prefix before any view is read, so a page
+/// that does not show the button yet refuses it the same way; every press of a native control
+/// no person is known to stand behind (a control client's key or click, an accessibility
+/// client's request) is refused them as it is dispatched ([`App::person_only_press_refusal`]).
 const PERSON_ONLY_PREFIXES: [(&str, &str); 2] = [
     (
         crate::native_settings::MACOS_ACCESS_GESTURE_PREFIX,
@@ -53,12 +55,31 @@ const PERSON_ONLY_PREFIXES: [(&str, &str); 2] = [
     ),
 ];
 
-/// Why `act` refuses `action` ([`PERSON_ONLY_PREFIXES`]); `None` for every other action.
-fn person_only_refusal(action: &str) -> Option<String> {
+/// The buttons `action` is one of where it is a person-only press ([`PERSON_ONLY_PREFIXES`]);
+/// `None` for every other action.
+fn person_only_buttons(action: &str) -> Option<&'static str> {
     PERSON_ONLY_PREFIXES
         .iter()
         .find(|(prefix, _)| action.starts_with(prefix))
-        .map(|(_, buttons)| format!("`act` does not press {buttons}; press them in the window"))
+        .map(|(_, buttons)| *buttons)
+}
+
+/// Why `act` refuses `action` ([`PERSON_ONLY_PREFIXES`]); `None` for every other action.
+fn person_only_refusal(action: &str) -> Option<String> {
+    person_only_buttons(action)
+        .map(|buttons| format!("`act` does not press {buttons}; press them in the window"))
+}
+
+impl App {
+    /// Why the gesture being dispatched does not press `action`: it is a person-only press
+    /// ([`PERSON_ONLY_PREFIXES`]) and no person is known to stand behind the gesture
+    /// ([`App::gesture_unvouched`]). `None` for a person's own press and for every other action.
+    pub(crate) fn person_only_press_refusal(&self, action: &ActionId) -> Option<String> {
+        self.gesture_unvouched()?;
+        person_only_buttons(action.as_str()).map(|buttons| {
+            format!("{buttons} take a person's own click or key; press them in the window")
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2271,6 +2292,102 @@ mod tests {
             .is_ok_and(|acted| acted.contains(toggle)),
             "a harness action off the list is pressed"
         );
+    }
+
+    /// A PERSON-ONLY BUTTON TAKES A PERSON'S OWN PRESS: Settings ▸ Security's Full Disk Access
+    /// button pressed through the window's accessibility tree (a tab's program reaches it with
+    /// aterm's own Accessibility grant) is refused by the list `act` refuses it by, and so is a
+    /// control client's key or click on it, the page left as it was. The refusal stands where
+    /// every input meets the page's reducer, so the action dispatched as a palette command
+    /// dispatches it, under either mark, is refused too.
+    /// NEGATIVE CONTROL: the person's own press of it is taken.
+    #[cfg(a11y_tree)]
+    #[test]
+    fn a_person_only_button_is_pressed_by_no_accessibility_or_control_client() {
+        use crate::native_app::{ActionInvocation, AppViewState};
+        use crate::native_settings::{MACOS_ACCESS_OPEN_FDA, SettingsRoute};
+        #[derive(Clone, Copy, Debug)]
+        enum By {
+            Assistive,
+            Controller,
+            Person,
+        }
+        let wid = WindowId(0);
+        for by in [By::Assistive, By::Controller, By::Person] {
+            let mut app = App::headless_for_test();
+            if let Some(window) = app.windows.get_mut(&wid) {
+                window.cols = 160;
+                window.rows = 60;
+            }
+            assert!(app.open_settings_tab(SettingsRoute::Security));
+            app.control_security_posture(&crate::security_posture::Asked::Stage(Some(
+                "denied".to_string(),
+            )))
+            .unwrap();
+            let (_, view) = app.active_native_view(wid).unwrap();
+            let feedback = |app: &App| match app.native_runtime.view_state(view) {
+                Some(AppViewState::Settings(state)) => state.feedback.clone(),
+                _ => panic!("the Settings view is live"),
+            };
+            let before = feedback(&app);
+            let id = ActionId::new(MACOS_ACCESS_OPEN_FDA);
+            let command = |app: &mut App| {
+                app.dispatch_native_view_event(
+                    wid,
+                    view,
+                    crate::native_app::AppEvent::Action(ActionInvocation {
+                        id: id.clone(),
+                        value: None,
+                    }),
+                )
+            };
+            let press = |app: &mut App| {
+                app.dispatch_native_control_action(
+                    wid,
+                    view,
+                    UiKey::new(MACOS_ACCESS_OPEN_FDA),
+                    ActionInvocation {
+                        id: id.clone(),
+                        value: None,
+                    },
+                    false,
+                )
+            };
+            match by {
+                By::Assistive => {
+                    let request = app.accessibility_request_for_test(
+                        wid,
+                        view,
+                        MACOS_ACCESS_OPEN_FDA,
+                        aterm_a11y::model::Action::Click,
+                        None,
+                    );
+                    app.on_accessibility_action(wid, request);
+                    let refusal =
+                        app.with_assistive_source(|app| app.person_only_press_refusal(&id));
+                    assert!(refusal.is_some(), "the list names the button");
+                    assert_eq!(app.with_assistive_source(press).err(), refusal);
+                    assert_eq!(app.with_assistive_source(command).err(), refusal);
+                }
+                By::Controller => {
+                    let refusal =
+                        app.with_controller_mark(true, |app| app.person_only_press_refusal(&id));
+                    assert!(refusal.is_some(), "the list names the button");
+                    assert_eq!(app.with_controller_mark(true, press).err(), refusal);
+                    assert_eq!(app.with_controller_mark(true, command).err(), refusal);
+                }
+                By::Person => {
+                    assert_eq!(app.person_only_press_refusal(&id), None);
+                    assert_eq!(press(&mut app), Ok(EventResult::Handled));
+                }
+            }
+            let after = feedback(&app);
+            if matches!(by, By::Person) {
+                assert!(after.is_some() && after != before, "the press was taken");
+            } else {
+                assert_eq!(after, before, "{by:?}: the page is as it was");
+            }
+        }
     }
 
     #[test]

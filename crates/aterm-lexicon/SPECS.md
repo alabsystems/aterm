@@ -329,6 +329,24 @@ tests/tricks_alloc.rs	compiling_the_embedded_vocabulary_peaks_under_2_mib	builti
   arbitrary input. That holds 31 tests together. They are worth proving only after the build
   and scan contracts are proved, because then the evaluation runs on the reflected code
   rather than on a copy.
+- No spec here is blocked only by gap 0. Every one needs at least non-scalar carriers (gap 1), E6 body
+  widening (gap 3), quantified clauses (gap 5), or build-script codegen (gap 9). So the order goes by
+  the smallest set of gaps beyond 0:
+
+| gap | specs |
+|---|---|
+| 0 | 42 (prerequisite for all; closed locally by seal `150efe4a`, owner-gated) |
+| 1 | 39 |
+| 2 | 14 |
+| 3 | 38 |
+| 4 | 4 |
+| 5 | 28 |
+| 7 | 37 |
+| 8 | 3 |
+| 9 | 13 |
+| 12 | 1 |
+| 13 | 9 |
+| 14 | 2 |
 
 ## 4. Tests that are not spec samples
 
@@ -380,45 +398,3 @@ Numbered as §1 and §2 cite them.
     - `serde_corpus.rs::lexicon_documents_answer_as_recorded` compares against a recorded file (`crates/aterm-json/test_support/serde_corpus.rs`).
     - Each recorded answer embeds conflict-message text and the `Debug` output of `TrickRow`, so rewording a message fails it with no decode change.
     - `toml-schema-decoding` is the law; the recorded equality is only its instance on the corpus.
-
-**5.2 Precomposed and decomposed text fold alike only on `dom(base)`.** A precomposed letter
-outside `base_letter`'s table (every Vietnamese ả ạ ố ồ ẽ ị …) folds to itself, while its NFD form
-folds to the bare base, so NFD-emitted Vietnamese never matches a precomposed lexicon or tricks
-surface, nor the reverse. No test covers it. `fold-decomposition-invariant` carries the domain
-restriction; the alternative is to widen the table to Latin Extended Additional.
-
-No spec here is blocked only by gap 0. Every one needs at least non-scalar carriers (gap 1), E6 body
-widening (gap 3), quantified clauses (gap 5), or build-script codegen (gap 9). So the order goes by
-the smallest set of gaps beyond 0.
-
-**5.4 The dictionary tests need the host's word list.**
-`english_fold_collisions::no_unambiguous_surface_is_an_ordinary_english_word`,
-`english_fold_collisions::no_english_word_transits_an_unambiguous_profanity_prefix` and
-`tricks::no_ungated_non_english_surface_is_an_english_dictionary_word` read Webster's Second
-(`/usr/share/dict/web2`), the list their allowlists are curated against, and end COULD NOT RUN
-where it is absent, as on most Linux hosts. They become a spec once the list is vendored.
-
-**5.6 A weak assertion.** `src/fold.rs::keeps_indic_marks` asserts
-`folded.contains('\u{093F}') || folded.chars().count() >= 4`, which passes even if the matras were
-stripped and other characters remained. It should assert `fold("बिल्ली") = "बिल्ली"`.
-
-**5.7 Lang trimming is inconsistent.** `intern_lang` trims the lang code, but ambiguous gating
-(`Langs::enabled(&e.lang)`) and the data-language set `Langs::note_unknown` checks use the raw
-string. An entry with lang `" ro "` interns as `ro` but is never un-gated by `languages = ["ro"]`,
-and `["ro"]` is then reported as naming nothing. No test covers it. Trimming once at decode would
-make `ambiguous-gating` and `lang-interning` speak of the same string.
-
-| gap | specs |
-|---|---|
-| 0 | 42 (prerequisite for all; closed locally by seal `150efe4a`, owner-gated) |
-| 1 | 39 |
-| 2 | 14 |
-| 3 | 38 |
-| 4 | 4 |
-| 5 | 28 |
-| 7 | 37 |
-| 8 | 3 |
-| 9 | 13 |
-| 12 | 1 |
-| 13 | 9 |
-| 14 | 2 |

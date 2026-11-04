@@ -27,8 +27,25 @@
 //! with the line), refuses (`RestartUnmade`) or defers (`RestartDeferred`, asked again); with a
 //! restart already answered, or with no restart lane (`Lane = 0`: relaunch off, no host, a host
 //! that makes none for the program), it waits, lost for good to the loop (`WaitsLost`, `lost`),
-//! and the host is told so. The host types (`HostTypes`) and makes its upgrade's move, which ends the agent's
-//! process (`HostUpgrades`), only where no line is held or the line held is lost.
+//! and the host is told so. The host types (`HostTypes`) and makes its upgrade's move, which ends
+//! the agent's process (`HostUpgrades`), only where no line is held or the line held is lost.
+//!
+//! `dlg` is a box over the composer (`DialogShows`, `DialogGoes`: a permission box, a question),
+//! or anything else under which no read can say what the composer holds (no composer drawn, as
+//! under a full-screen view, or its glyph's cell unread): the line may stand drawn under it
+//! (`q = 1`) or not. Under it the look settles only a draw a break kept, a person's keys and the
+//! line's draw are unseen, a turn after the line neither settles nor outlasts it (its evidence,
+//! `ran`, is kept for the next read that can say), the gate holds every line's write, as a box is
+//! no rest, and no restart is asked; the custody lets the loop's own answer to the box, a key
+//! fenced on its row (a dialog's Enter or Esc), pass only once an earlier or this gate's `status`
+//! read found the input clear (`AnswersBox`, which leaves `held = 1`), proving the worker read the
+//! line. `answered` records that normal custody permission as well as its mutant. It does not mean
+//! the key reached or closed the box: input queued behind a line already proved read is held by the
+//! session's next gate, and `DialogGoes` is the environment's later observation that the box went.
+//! An unread line, or one no earlier input word proved read and no current word can say of, holds
+//! the key at custody. The line stays held for the read after a key that goes. The loop's writes
+//! and a draw's Enter are fenced on the
+//! composer's rows, so none is made under it; the program's end takes its box with it.
 //!
 //! Its laws:
 //!
@@ -43,6 +60,15 @@
 //!   again.
 //! - `TheHostWaitsOnALineThatMayCome`: the host never types behind a line that stands (one
 //!   queued, or read within its minute).
+//! - `ADrawnLineGoesBackToItsWriter`: a line drawn in the composer while it is held goes back to
+//!   its writer (`LookDrawn`), so its Enter is the act that wrote it, never a person's draft's, nor
+//!   a key no writer gave (`stray`): the custody never ends on it otherwise (a turn settles only a
+//!   line no read shows), and the loop's key that is no line's goes only to a box over the
+//!   composer (`AnswersBox`), never to the composer the line is drawn in.
+//! - `ABoxAnswerFollowsARead`: custody never permits a box's answer while the held line may still
+//!   be queued; an earlier or fresh clear input read must first prove the worker read it. Both the
+//!   normal and mutant transitions write `answered`; the law relates that observation to the real
+//!   custody state rather than a mutant-only error flag.
 //!
 //! What the model takes as given, the code's premises, which no bind checks: the session's input
 //! is one queue, read in order, so a clear read proves the line read, and input queued behind it
@@ -59,8 +85,13 @@
 //! (a crash, an exit), which may come at any state; the host's upgrade is `HostUpgrades`.
 //! That no writer writes while the custody stands (`cust == 0` on the writes) is the session's
 //! own checks (`Session::custody_gate`, the occupancy guards' draft, the accounts probe's
-//! `PendingInput`), held by the loop's tests, not by the bind. The dues, the doubling wait, the
-//! records and their thinning are the loop's tests' too.
+//! `PendingInput`, the survey's `0`), held by the loop's tests, not by the bind; that none is
+//! made under a box (`dlg == 0` on the writes and on `Enters`) is the writes' fences on the
+//! composer's rows, that a box goes with its program (`dlg = 0` at its end) is the program's, and
+//! that a key custody permits reaches the box and closes it (`DialogGoes`) is the answer's fence on
+//! the box's own row and the session's later gates. Input queued behind a line already proved read
+//! is held by the ordinary unread-input gate after this one; with no proof the custody itself holds
+//! the key. The dues, the doubling wait, the records and their thinning are the loop's tests' too.
 //!
 //! The mutants: a look settles the line on a read that shows none of it (`SettleOnMove`); a
 //! clear read settles it with no turn read running (`SettleWithoutTurn`); a turn settles it on
@@ -69,7 +100,11 @@
 //! second loss is restarted again (`RestartAgain`); the host types behind a line that stands
 //! (`HostOverStands`); a writer writes while the line stands (`WriteWhileHeld`); the restart is
 //! made for a line read while input behind it is unread (`RestartBehind`); the host's upgrade
-//! moves behind a line that stands (`UpgradeOverStands`). The Tier-1 bind is
+//! moves behind a line that stands (`UpgradeOverStands`); a turn settles the line on a read that
+//! cannot say what the composer holds, under a box (`TurnSettlesUnderDialog`); a key that is no
+//! line's goes where no box is over the composer, and enters or clears a line drawn there
+//! (`AnswersComposer`); a box's key goes without an earlier or fresh clear input read
+//! (`AnswersWithoutRead`). The Tier-1 bind is
 //! `aterm-agent/tests/conformance_custody.rs`, over the pure core `supervise::custody`.
 
 use aterm_spec::derive::Model;
@@ -104,8 +139,12 @@ pub fn line_custody_model() -> Model {
             var shell = 0;
             var hb = 0;
             var bq = 0;
+            var dlg = 0;
+            var stray = 0;
+            var answered = 0;
 
-            action WritesQueued when (cust == 0 && st == 0) {
+            action WritesQueued when (cust == 0 && st == 0 && dlg == 0) {
+                answered = 0;
                 twice = if (q > 0) { 1 } else { twice };
                 q = 4;
                 tp = 0;
@@ -115,7 +154,8 @@ pub fn line_custody_model() -> Model {
                 cust = 1;
                 held = if (Served == 1) { 0 } else { 2 };
             }
-            action WritesRead when (cust == 0 && st == 0) {
+            action WritesRead when (cust == 0 && st == 0 && dlg == 0) {
+                answered = 0;
                 twice = if (q > 0) { 1 } else { twice };
                 q = 3;
                 tp = 0;
@@ -125,13 +165,13 @@ pub fn line_custody_model() -> Model {
                 cust = 1;
                 held = if (Served == 1) { 1 } else { 2 };
             }
-            action Types when (cust == 0 && st == 0) {
+            action Types when (cust == 0 && st == 0 && dlg == 0) {
                 twice = if (q > 0) { 1 } else { twice };
                 st = 2;
                 restart = 0;
                 asks = 0;
             }
-            action Enters when (st == 1 && q == 1) {
+            action Enters when (st == 1 && q == 1 && dlg == 0) {
                 q = 0;
                 st = 2;
                 restart = 0;
@@ -167,15 +207,35 @@ pub fn line_custody_model() -> Model {
                 tp = 0;
                 pk = 0;
                 bq = 0;
+                dlg = 0;
                 moved = if (cust == 1) { 1 } else { moved };
                 st = if (st == 1) { 0 } else { st };
             }
             action Stirs when (rest == 1) { rest = 0; }
             action Rests when (rest == 0) { rest = 1; }
+            action DialogShows when (cust == 1 && dlg == 0) {
+                dlg = 1;
+                answered = 0;
+            }
+            action DialogGoes when (dlg == 1) {
+                dlg = 0;
+                answered = 0;
+            }
+            action AnswersBox when (
+                cust == 1 && asked == 0 && dlg == 1
+                    && (held == 1 || (Served == 1 && 4 > q && bq == 0))
+            ) {
+                held = 1;
+                answered = 1;
+            }
 
-            action LookDrawn when (cust == 1 && asked == 0 && pk == 0 && (q == 1 || drawn == 1)) {
+            action LookDrawn when (
+                cust == 1 && asked == 0
+                    && ((dlg == 0 && pk == 0 && (q == 1 || drawn == 1)) || (dlg == 1 && drawn == 1))
+            ) {
                 st = if (q == 1) { 1 } else { 0 };
                 cust = 0;
+                answered = 0;
                 held = 0;
                 ripe = 0;
                 ran = 0;
@@ -183,9 +243,11 @@ pub fn line_custody_model() -> Model {
                 lost = 0;
                 moved = 0;
             }
-            action LookPerson when (cust == 1 && asked == 0 && pk == 1) {
+            action LookPerson when (cust == 1 && asked == 0 && dlg == 0 && pk == 1) {
+                stray = if (q == 1) { 1 } else { stray };
                 pk = 0;
                 cust = 0;
+                answered = 0;
                 held = 0;
                 ripe = 0;
                 ran = 0;
@@ -193,11 +255,15 @@ pub fn line_custody_model() -> Model {
                 lost = 0;
                 moved = 0;
             }
-            action BreakKeepsDraw when (cust == 1 && asked == 0 && q == 1 && pk == 0 && drawn == 0) {
+            action BreakKeepsDraw when (
+                cust == 1 && asked == 0 && dlg == 0 && q == 1 && pk == 0 && drawn == 0
+            ) {
                 drawn = 1;
             }
             action SeesEnded when (cust == 1 && asked == 0 && moved == 1) {
+                stray = if (q == 1) { 1 } else { stray };
                 cust = 0;
+                answered = 0;
                 held = 0;
                 ripe = 0;
                 ran = 0;
@@ -206,10 +272,12 @@ pub fn line_custody_model() -> Model {
                 moved = 0;
             }
             action TurnSettles when (
-                cust == 1 && asked == 0 && ran == 1 && Served == 1 && 4 > q && (q == 0 || q > 1)
-                    && pk == 0 && bq == 0
+                cust == 1 && asked == 0 && ran == 1 && Served == 1 && dlg == 0 && 4 > q
+                    && (q == 0 || q > 1) && pk == 0 && bq == 0
             ) {
+                stray = if (q == 1) { 1 } else { stray };
                 cust = 0;
+                answered = 0;
                 held = 0;
                 ripe = 0;
                 ran = 0;
@@ -218,15 +286,16 @@ pub fn line_custody_model() -> Model {
                 moved = 0;
             }
             action TurnOutlasted when (
-                cust == 1 && asked == 0 && ran == 1 && (Served == 0 || q == 4 || bq == 1)
-                    && (q == 0 || q > 1) && pk == 0
+                cust == 1 && asked == 0 && ran == 1 && dlg == 0
+                    && (Served == 0 || q == 4 || bq == 1) && (q == 0 || q > 1) && pk == 0
             ) {
                 ran = 0;
                 held = if (Served == 1) { if (held == 1) { 1 } else { 0 } } else { held };
             }
             action GateHolds when (
-                cust == 1 && asked == 0 && (q == 0 || q > 1) && pk == 0 && drawn == 0
-                    && moved == 0 && (held == 0 || held == 2 || ripe == 0 || rest == 0 || bq == 1)
+                cust == 1 && asked == 0 && drawn == 0 && moved == 0
+                    && (dlg == 1 || ((q == 0 || q > 1) && pk == 0))
+                    && (held == 0 || held == 2 || ripe == 0 || rest == 0 || bq == 1 || dlg == 1)
             ) {
                 held = if (Served == 0) {
                     held
@@ -235,14 +304,14 @@ pub fn line_custody_model() -> Model {
                 };
             }
             action AsksRestart when (
-                cust == 1 && asked == 0 && (q == 0 || q > 1) && pk == 0 && drawn == 0
+                cust == 1 && asked == 0 && dlg == 0 && (q == 0 || q > 1) && pk == 0 && drawn == 0
                     && moved == 0 && held == 1 && ripe == 1 && rest == 1 && bq == 0
                     && restart == 0 && Lane == 1
             ) {
                 asked = 1;
             }
             action WaitsLost when (
-                cust == 1 && asked == 0 && (q == 0 || q > 1) && pk == 0 && drawn == 0
+                cust == 1 && asked == 0 && dlg == 0 && (q == 0 || q > 1) && pk == 0 && drawn == 0
                     && moved == 0 && held == 1 && ripe == 1 && rest == 1 && bq == 0
                     && (restart > 0 || Lane == 0)
             ) {
@@ -255,9 +324,11 @@ pub fn line_custody_model() -> Model {
                 tp = 0;
                 pk = 0;
                 bq = 0;
+                dlg = 0;
                 asked = 0;
                 restart = 1;
                 cust = 0;
+                answered = 0;
                 held = 0;
                 ripe = 0;
                 ran = 0;
@@ -280,6 +351,7 @@ pub fn line_custody_model() -> Model {
                 tp = 0;
                 pk = 0;
                 bq = 0;
+                dlg = 0;
                 moved = if (cust == 1) { 1 } else { moved };
                 st = if (st == 1) { 0 } else { st };
             }
@@ -289,6 +361,7 @@ pub fn line_custody_model() -> Model {
                     && drawn == 0
             ) {
                 cust = 0;
+                answered = 0;
                 held = 0;
                 ripe = 0;
                 ran = 0;
@@ -301,6 +374,7 @@ pub fn line_custody_model() -> Model {
                     && (q == 0 || q > 1) && pk == 0 && bq == 0
             ) {
                 cust = 0;
+                answered = 0;
                 held = 0;
                 ripe = 0;
                 ran = 0;
@@ -313,6 +387,7 @@ pub fn line_custody_model() -> Model {
                     && (Served == 0 || q == 4 || bq == 1) && pk == 0
             ) {
                 cust = 0;
+                answered = 0;
                 held = 0;
                 ripe = 0;
                 ran = 0;
@@ -321,21 +396,21 @@ pub fn line_custody_model() -> Model {
                 moved = 0;
             }
             action RestartUnread when (
-                Buggy == 4 && cust == 1 && asked == 0 && (q == 0 || q > 1) && pk == 0
+                Buggy == 4 && cust == 1 && asked == 0 && dlg == 0 && (q == 0 || q > 1) && pk == 0
                     && drawn == 0 && moved == 0 && held == 0 && rest == 1 && restart == 0
                     && Lane == 1
             ) {
                 asked = 1;
             }
             action LostWithinMinute when (
-                Buggy == 5 && cust == 1 && asked == 0 && (q == 0 || q > 1) && pk == 0
+                Buggy == 5 && cust == 1 && asked == 0 && dlg == 0 && (q == 0 || q > 1) && pk == 0
                     && drawn == 0 && moved == 0 && held == 1 && ripe == 0 && rest == 1
                     && bq == 0 && (restart > 0 || Lane == 0)
             ) {
                 lost = 1;
             }
             action RestartAgain when (
-                Buggy == 6 && cust == 1 && asked == 0 && (q == 0 || q > 1) && pk == 0
+                Buggy == 6 && cust == 1 && asked == 0 && dlg == 0 && (q == 0 || q > 1) && pk == 0
                     && drawn == 0 && moved == 0 && held == 1 && ripe == 1 && rest == 1
                     && bq == 0 && restart > 0
             ) {
@@ -348,7 +423,7 @@ pub fn line_custody_model() -> Model {
                 twice = if (q > 0) { 1 } else { twice };
             }
             action RestartBehind when (
-                Buggy == 9 && cust == 1 && asked == 0 && (q == 0 || q > 1) && pk == 0
+                Buggy == 9 && cust == 1 && asked == 0 && dlg == 0 && (q == 0 || q > 1) && pk == 0
                     && drawn == 0 && moved == 0 && held == 1 && ripe == 1 && rest == 1
                     && bq == 1 && restart == 0 && Lane == 1
             ) {
@@ -360,14 +435,45 @@ pub fn line_custody_model() -> Model {
                 tp = 0;
                 pk = 0;
                 bq = 0;
+                dlg = 0;
                 moved = 1;
                 st = if (st == 1) { 0 } else { st };
+            }
+            action TurnSettlesUnderDialog when (
+                Buggy == 11 && cust == 1 && asked == 0 && ran == 1 && Served == 1 && dlg == 1
+                    && 4 > q && bq == 0
+            ) {
+                stray = if (q == 1) { 1 } else { stray };
+                cust = 0;
+                answered = 0;
+                held = 0;
+                ripe = 0;
+                ran = 0;
+                drawn = 0;
+                lost = 0;
+                moved = 0;
+            }
+            action AnswersComposer when (
+                Buggy == 12 && cust == 1 && asked == 0 && dlg == 0
+                    && (held == 1 || (Served == 1 && 4 > q && bq == 0))
+            ) {
+                stray = if (q == 1) { 1 } else { stray };
+                q = if (q == 1) { 0 } else { q };
+                held = 1;
+            }
+            action AnswersWithoutRead when (
+                Buggy == 13 && cust == 1 && asked == 0 && dlg == 1
+                    && (Served == 0 || ((held == 0 || held == 2) && (q == 4 || bq == 1)))
+            ) {
+                answered = 1;
             }
 
             invariant NoTwoCopies: twice == 0;
             invariant ARestartHandsTheShellNothing: shell == 0;
             invariant OneRestartPerLine: 2 > asks;
             invariant TheHostWaitsOnALineThatMayCome: hb == 0;
+            invariant ADrawnLineGoesBackToItsWriter: stray == 0;
+            invariant ABoxAnswerFollowsARead: answered == 0 || cust == 0 || held == 1;
         }
     }
 }

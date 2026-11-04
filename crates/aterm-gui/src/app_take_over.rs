@@ -44,6 +44,17 @@ fn hold_unix_now() -> u64 {
 #[cfg(any(target_os = "macos", test))]
 const AGENTS_LIVE_TTL: Duration = Duration::from_secs(2);
 
+/// The marks of a gesture whose dispatch posts the rest of its work to the event loop (a palette
+/// row, a menu item): the post carries them ([`App::gesture_marks`]) and the posted half runs
+/// under them ([`App::with_gesture_marks`]), so no mark ends at the hop.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct GestureMarks {
+    /// A control client's gesture ([`AgentsState::controller_gesture`]).
+    pub(crate) controller: bool,
+    /// An accessibility client's request ([`AgentsState::assistive_gesture`]).
+    pub(crate) assistive: bool,
+}
+
 /// The window side of the Agents rows, one field on the App.
 #[derive(Debug, Default)]
 pub(crate) struct AgentsState {
@@ -71,6 +82,12 @@ pub(crate) struct AgentsState {
     /// The gesture being dispatched is a control client's: any input verb (`key`, `text`,
     /// `paste`, `mouse`) through [`App::input_to_session`], a `pointer`, `act` or `invoke`.
     pub(crate) controller_gesture: bool,
+    /// The gesture being dispatched came through the window's accessibility tree
+    /// ([`App::with_assistive_source`]). No person is known to stand behind it for the owner's
+    /// keys ([`crate::owner_keys_save`]) or a person-only press
+    /// ([`App::person_only_press_refusal`]); everywhere else a screen reader's press is the
+    /// person's.
+    pub(crate) assistive_gesture: bool,
     /// How many control-client gestures were dispatched in this process
     /// ([`App::with_gesture_source`] with `controller` set), anywhere. System
     /// State reads it when it takes a page action, so no control client's
@@ -762,6 +779,52 @@ impl App {
         let out = f(self);
         self.agents.controller_gesture = prior;
         out
+    }
+
+    /// Run `f` with the dispatch marked as an accessibility client's request
+    /// ([`AgentsState::assistive_gesture`]), restoring the mark after.
+    pub(crate) fn with_assistive_source<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let prior = std::mem::replace(&mut self.agents.assistive_gesture, true);
+        let out = f(self);
+        self.agents.assistive_gesture = prior;
+        out
+    }
+
+    /// The marks of the gesture being dispatched, for a post to the event loop to carry
+    /// ([`GestureMarks`]).
+    pub(crate) const fn gesture_marks(&self) -> GestureMarks {
+        GestureMarks {
+            controller: self.agents.controller_gesture,
+            assistive: self.agents.assistive_gesture,
+        }
+    }
+
+    /// Run `f` under `marks`, a gesture's marks a post carried ([`Self::gesture_marks`]): a
+    /// control client's as [`Self::with_gesture_source`] runs one, an accessibility client's as
+    /// [`Self::with_assistive_source`] does.
+    pub(crate) fn with_gesture_marks<R>(
+        &mut self,
+        marks: GestureMarks,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        if marks.assistive {
+            self.with_assistive_source(|app| app.with_gesture_source(marks.controller, f))
+        } else {
+            self.with_gesture_source(marks.controller, f)
+        }
+    }
+
+    /// Who stands behind the gesture being dispatched where no person at the window is known
+    /// to: a control client ([`Self::person_gesture_refused`]) or an accessibility client
+    /// ([`AgentsState::assistive_gesture`]). `None` for a person's own.
+    pub(crate) const fn gesture_unvouched(&self) -> Option<crate::owner_keys_save::Unvouched> {
+        if self.agents.controller_gesture {
+            Some(crate::owner_keys_save::Unvouched::Controller)
+        } else if self.agents.assistive_gesture {
+            Some(crate::owner_keys_save::Unvouched::Assistive)
+        } else {
+            None
+        }
     }
 
     /// Run `f` with the dispatch marked as a control client's when `controller` is set, keeping a

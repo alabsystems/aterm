@@ -131,7 +131,7 @@ impl Cell {
             }
             out.over |= c.over;
         }
-        out.mean = (weight > 0.0).then(|| sum / weight);
+        out.mean = (weight > 0.0).then_some(sum / weight);
         out
     }
 }

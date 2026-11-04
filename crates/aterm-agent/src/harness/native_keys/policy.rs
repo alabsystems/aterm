@@ -6,7 +6,7 @@
 //! source and member binding must be checked by the composing executable.
 
 use super::Provider;
-use crate::harness::{accounts, ai_pool};
+use crate::harness::ai_pool;
 use std::collections::BTreeSet;
 
 pub const ENTRY: &str = "ai-native-pool.toml";
@@ -202,9 +202,6 @@ impl Policy {
                     return Err("more than one automatic native subject for a provider".into());
                 }
                 policy.assignments.push(assignment);
-                if policy.assignments.len() > accounts::MAX_ACCOUNTS {
-                    return Err("too many native policy assignments".into());
-                }
             }
         }
         Ok(policy)
@@ -248,9 +245,6 @@ impl Policy {
         {
             *row = assignment;
         } else {
-            if self.assignments.len() == accounts::MAX_ACCOUNTS {
-                return Err("native policy is full".into());
-            }
             self.assignments.push(assignment);
         }
         Ok(())

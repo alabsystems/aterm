@@ -2090,6 +2090,62 @@ fn a_failed_push_deploys_nothing_and_the_next_run_finishes_the_job() {
     assert_eq!(failed_child(ended, &out).0, "git push");
 }
 
+/// Another machine's sync, pushed to `lab`'s origin past its checkout: it rewrites
+/// releases.html, a page every sync owns. Returns origin's new tip.
+fn another_machines_sync(lab: &Lab, releases: &str) -> String {
+    let peer = lab.root.join("peer");
+    lab.git.ok(
+        &lab.root,
+        &[
+            "clone",
+            "-q",
+            &lab.origin.to_string_lossy(),
+            &peer.to_string_lossy(),
+        ],
+    );
+    std::fs::write(peer.join("web/site/public/releases.html"), releases).unwrap();
+    lab.git.commit_all(&peer, "site: another machine's sync");
+    lab.git.ok(&peer, &["push", "-q", "origin", "main"]);
+    lab.origin_main()
+}
+
+#[test]
+fn a_sync_on_a_checkout_another_machine_moved_past_builds_on_origins_tip() {
+    let theirs = "another machine's release notes\n";
+    let lab = Lab::new();
+    let peer_tip = another_machines_sync(&lab, theirs);
+    let mut world = lab.fake("releases-fat.json");
+    let (ended, out) = lab.run(&mut world);
+    deployed(&ended, &out);
+    assert_eq!(lab.head(), lab.origin_main());
+    assert_eq!(
+        lab.git.ok(&lab.site_root, &["rev-parse", "HEAD^"]),
+        peer_tip,
+        "the sync commit sits on the other machine's: {out}"
+    );
+    assert_ne!(lab.page("releases.html"), theirs);
+    assert_eq!(lab.status(), "");
+
+    let lab = Lab::new();
+    another_machines_sync(&lab, theirs);
+    let before = lab.head();
+    let mut world = lab.fake("releases-fat.json");
+    let opts = Options {
+        dry_run: true,
+        ..Options::default()
+    };
+    let (ended, out) = lab.sync(&opts, &lab.env(), &mut world);
+    assert!(
+        matches!(ended, Ok(Outcome::Planned { .. })),
+        "{ended:?}\n{out}"
+    );
+    assert!(
+        out.contains("a real sync first fast-forwards to origin main"),
+        "{out}"
+    );
+    assert_eq!(lab.head(), before, "a dry run leaves HEAD");
+}
+
 #[test]
 fn a_failed_pull_and_its_remedy_end_in_a_deploy_and_an_owed_commit_is_shipped_once() {
     let latest = Options {

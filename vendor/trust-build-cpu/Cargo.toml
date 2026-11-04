@@ -8,7 +8,7 @@ description = "Native per-unit CPU leases shared by Trust builds and aterm"
 
 [package.metadata.aterm-origin]
 project = "Trust"
-commit = "afda6b4602be9bebc79e3ec20ad2aba40449bd7f"
+commit = "4cfdfb2c23be00fcd895c78756de77f3b7f0c04d"
 path = "crates/trust-build-cpu"
 
 [target.'cfg(unix)'.dependencies]

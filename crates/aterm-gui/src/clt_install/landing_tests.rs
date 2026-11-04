@@ -2416,3 +2416,36 @@ fn compiler_arrival_resolves_dismissed_and_pending_missing_tools() {
     app.publish_system_state(status);
     assert!(!app.owes_exception(&key), "the pending cause already ended");
 }
+
+/// Once its program said the tools are installed (exit 0), the tab closes by itself, so no tab is
+/// left for a person to close (nux round 9, item 12). The negative control: the same end in a tab
+/// that is its window's last leaves it open, since closing it would end the window.
+#[test]
+fn the_tab_closes_itself_once_it_installed_them_but_never_ends_its_window() {
+    let wid = WindowId(0);
+    let mut app = App::headless_for_test();
+    app.set_system_state_handlers_for_test(crate::InitialSetupHandlers::inert_for_test());
+    let tools = app.next_session_id;
+    app.push_stub_tab(wid, crate::stub_session(tools));
+    assert_eq!(app.windows[&wid].tab_set.len(), 2);
+    app.workstation_setup.developer_tools_session = vec![Terminal::running(tools, false, None)];
+    app.workstation_setup.developer_tools_attempt = Some(tools);
+    app.developer_tools_install_ended(tools, Some(aterm_pty::ChildExit::Code(0)));
+    assert_eq!(
+        app.windows[&wid].tab_set.len(),
+        1,
+        "the tools' tab closed by itself"
+    );
+
+    let mut alone = App::headless_for_test();
+    alone.set_system_state_handlers_for_test(crate::InitialSetupHandlers::inert_for_test());
+    assert_eq!(alone.windows[&wid].tab_set.len(), 1);
+    alone.workstation_setup.developer_tools_session = vec![Terminal::running(0, false, None)];
+    alone.workstation_setup.developer_tools_attempt = Some(0);
+    alone.developer_tools_install_ended(0, Some(aterm_pty::ChildExit::Code(0)));
+    assert_eq!(
+        alone.windows[&wid].tab_set.len(),
+        1,
+        "CONTROL: a window's last tab stays"
+    );
+}

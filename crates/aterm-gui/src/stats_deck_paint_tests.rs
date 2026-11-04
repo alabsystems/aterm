@@ -1388,10 +1388,9 @@ fn the_cause_clause_folds_before_load_and_after_busiest() {
     let sep = " \u{b7} ";
     let [wide_w, mid_w, between_w, owner_w] =
         [487.0, 242.0, 183.0, 162.0].map(|d| full_with_details(d, &m));
-    let drawn = |sc: Scene, w: f64, form: DeckForm| -> Option<(Vec<String>, Vec<Boxed>)> {
-        let laid = laid(sc, w, 2.0, form, &m, false);
-        let (col, top, cell) = cpu_details(w, form, &m)?;
-        let texts = texts_in(&laid, col, top - 1.0, top + cell + 1.0);
+    let details_in = |laid: &Laid, at: (Col, f64, f64)| -> (Vec<String>, Vec<Boxed>) {
+        let (col, top, cell) = at;
+        let texts = texts_in(laid, col, top - 1.0, top + cell + 1.0);
         let marks = laid
             .boxes
             .iter()
@@ -1403,7 +1402,11 @@ fn the_cause_clause_folds_before_load_and_after_busiest() {
             })
             .cloned()
             .collect();
-        Some((texts, marks))
+        (texts, marks)
+    };
+    let drawn = |sc: Scene, w: f64, form: DeckForm| -> Option<(Vec<String>, Vec<Boxed>)> {
+        let at = cpu_details(w, form, &m)?;
+        Some(details_in(&laid(sc, w, 2.0, form, &m, false), at))
     };
     let (wide, marks) = drawn(Scene::Trouble, wide_w, DeckForm::Full).expect("Details");
     assert_eq!(
@@ -1503,19 +1506,31 @@ fn the_cause_clause_folds_before_load_and_after_busiest() {
         "no clause where no Details column shows"
     );
 
+    // The Details fold by their column's width alone: each width the plans give the CPU's
+    // Details column is laid once, at the narrowest deck giving it, on words read once per form.
+    let snaps = [Scene::Calm, Scene::Trouble].map(scene);
     let mut seen = 0;
     for form in [DeckForm::Full, DeckForm::Folded] {
-        for w in (160..=5120).step_by(7).map(f64::from) {
-            if let Some((calm, marks)) = drawn(Scene::Calm, w, form) {
-                assert!(
-                    calm.iter().all(|t| !t.starts_with("Spotlight"))
-                        && marks.iter().all(|b| b.text != "cause"),
-                    "Calm holds no cause, {form:?} {w} pt: {calm:?}"
-                );
-            }
-            let Some((texts, marks)) = drawn(Scene::Trouble, w, form) else {
+        let inputs = snaps.each_ref().map(|snap| scene_input(snap, form));
+        let words = inputs.each_ref().map(|input| DeckWords::new(input, &m));
+        let mut widths: Vec<u64> = Vec::new();
+        for w in (160..=5120).map(f64::from) {
+            let Some(details) = cpu_details(w, form, &m) else {
                 continue;
             };
+            if widths.contains(&details.0.w.to_bits()) {
+                continue;
+            }
+            widths.push(details.0.w.to_bits());
+            let [(calm, calm_marks), (texts, marks)] = [0, 1].map(|i| {
+                let laid = lay(&geom(w, 2.0, form), &inputs[i], &words[i], &m, false);
+                details_in(&laid, details)
+            });
+            assert!(
+                calm.iter().all(|t| !t.starts_with("Spotlight"))
+                    && calm_marks.iter().all(|b| b.text != "cause"),
+                "Calm holds no cause, {form:?} {w} pt: {calm:?}"
+            );
             let at = |p: &dyn Fn(&str) -> bool| texts.iter().position(|t| p(t.as_str()));
             let load = at(&|t| t.starts_with("load") || t.starts_with("8 waiting"));
             let cause = at(&|t| t.starts_with("Spotlight"));
@@ -1568,41 +1583,74 @@ fn layout_ignores_data() {
     }
 }
 
+/// No two core squares touch, at 1x and 2x, in both forms, on 18 cores and on 128. A Cores row's
+/// squares come from its table's rows and Cores mode alone (the rows' cell; the mode's side and
+/// pitch, on a lattice whose origin is a whole device px), so the first and last width of each
+/// (rows, mode) the plans give from 300 to 2600 pt stand for every width of it.
 #[test]
 fn core_squares_never_touch() {
     let m = FaceMetrics::helvetica_neue();
-    let mut squares = 0;
+    let mut drew: Vec<(DeckForm, CoresMode)> = Vec::new();
     for sc in [Scene::Calm, Scene::Worst] {
+        let snap = scene(sc);
         for form in [DeckForm::Full, DeckForm::Folded] {
+            let input = scene_input(&snap, form);
+            let words = DeckWords::new(&input, &m);
+            let clusters = words.clusters();
+            // (ground_only, the Cores row's table rows, its mode) -> its first and last width.
+            type Class = (bool, Rows, CoresMode);
+            let mut classes: Vec<(Class, (f64, f64))> = Vec::new();
+            for w in (300..=2600).map(f64::from) {
+                let class = match form {
+                    DeckForm::Full => {
+                        let p = plan::plan_full(w, &m);
+                        let mode = p.cores_mode(&clusters, &m).unwrap_or(CoresMode::CountOnly);
+                        (p.ground_only, p.rows, mode)
+                    }
+                    DeckForm::Folded => {
+                        let p = plan::plan_folded(w, &m);
+                        let b = p.blocks[1];
+                        (p.ground_only, b.rows, b.cores_mode(&clusters, &m))
+                    }
+                };
+                match classes.iter_mut().find(|(c, _)| *c == class) {
+                    Some((_, (_, last))) => *last = w,
+                    None => classes.push((class, (w, w))),
+                }
+            }
             for s in [1.0, 2.0] {
-                for w in (300..=2600).step_by(13).map(f64::from) {
-                    let laid = laid(sc, w, s, form, &m, true);
-                    for b in laid.boxes.iter().filter(|b| b.kind == BoxKind::Core) {
-                        let [x0, y0, x1, y1] = b.r.map(|v| px(v, s));
-                        let inside: Vec<(f32, f32, f32, f32)> = laid
-                            .prims
-                            .iter()
-                            .filter_map(|p| match *p {
-                                DrawPrim::Panel { x, y, w, h, .. }
-                                    if x >= x0 - 1.0
-                                        && y >= y0 - 1.0
-                                        && x + w <= x1 + 1.0
-                                        && y + h <= y1 + 1.0 =>
-                                {
-                                    Some((x, y, w, h))
+                for &((_, _, mode), (first, last)) in &classes {
+                    for w in [first, last] {
+                        let laid = lay(&geom(w, s, form), &input, &words, &m, true);
+                        for b in laid.boxes.iter().filter(|b| b.kind == BoxKind::Core) {
+                            let [x0, y0, x1, y1] = b.r.map(|v| px(v, s));
+                            let inside: Vec<(f32, f32, f32, f32)> = laid
+                                .prims
+                                .iter()
+                                .filter_map(|p| match *p {
+                                    DrawPrim::Panel { x, y, w, h, .. }
+                                        if x >= x0 - 1.0
+                                            && y >= y0 - 1.0
+                                            && x + w <= x1 + 1.0
+                                            && y + h <= y1 + 1.0 =>
+                                    {
+                                        Some((x, y, w, h))
+                                    }
+                                    _ => None,
+                                })
+                                .collect();
+                            for (i, a) in inside.iter().enumerate() {
+                                for c in &inside[i + 1..] {
+                                    let gap_x = (c.0 - (a.0 + a.2)).max(a.0 - (c.0 + c.2));
+                                    let gap_y = (c.1 - (a.1 + a.3)).max(a.1 - (c.1 + c.3));
+                                    assert!(
+                                        gap_x >= 1.0 || gap_y >= 1.0,
+                                        "{sc:?} {form:?} {w} pt at {s}×: {a:?} touches {c:?}"
+                                    );
                                 }
-                                _ => None,
-                            })
-                            .collect();
-                        squares += inside.len();
-                        for (i, a) in inside.iter().enumerate() {
-                            for c in &inside[i + 1..] {
-                                let gap_x = (c.0 - (a.0 + a.2)).max(a.0 - (c.0 + c.2));
-                                let gap_y = (c.1 - (a.1 + a.3)).max(a.1 - (c.1 + c.3));
-                                assert!(
-                                    gap_x >= 1.0 || gap_y >= 1.0,
-                                    "{sc:?} {form:?} {w} pt at {s}×: {a:?} touches {c:?}"
-                                );
+                            }
+                            if !inside.is_empty() && !drew.contains(&(form, mode)) {
+                                drew.push((form, mode));
                             }
                         }
                     }
@@ -1610,7 +1658,13 @@ fn core_squares_never_touch() {
             }
         }
     }
-    assert!(squares > 10_000, "CONTROL: {squares} squares drawn");
+    let modes: Vec<CoresMode> = drew.iter().map(|d| d.1).collect();
+    for want in [CoresMode::Big, CoresMode::Stack, CoresMode::Tiny] {
+        assert!(
+            modes.contains(&want),
+            "CONTROL: no {want:?} squares drawn: {drew:?}"
+        );
+    }
 }
 
 /// The disk's run is its used space with the maximum (`1.11 of 2.00 TB used`), where a run stands;

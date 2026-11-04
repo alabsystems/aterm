@@ -9,6 +9,120 @@ use std::cell::{Cell, RefCell};
 const NOW: i64 = 1_790_000_000;
 const OWNER: &str = "owner@example.test";
 
+#[cfg(unix)]
+#[test]
+fn native_google_publication_retains_and_rechecks_its_typed_proof() {
+    struct NativeHost<'a> {
+        world: &'a World,
+        mutation: u8,
+        called: Cell<bool>,
+    }
+    impl AccountsHost for NativeHost<'_> {
+        fn stdin_is_terminal(&self) -> bool {
+            false
+        }
+        fn auth_status(&self, _: &str) -> Result<Captured, String> {
+            unreachable!()
+        }
+        fn unaskable(&self) -> Option<String> {
+            None
+        }
+        fn login(&self, _: Option<&str>) -> Result<i32, String> {
+            unreachable!()
+        }
+        fn now(&self) -> i64 {
+            NOW
+        }
+        fn vendor_sign_in(&self, _: &Request<'_>) -> Drove {
+            panic!("native Google must not use the generic sign-in driver")
+        }
+        fn native_google_sign_in(
+            &self,
+            req: &Request<'_>,
+        ) -> Result<crate::harness::agy_signin::VerifiedGoogleGrant, String> {
+            self.called.set(true);
+            let state = self.world.store.dir.parent().unwrap();
+            let proof =
+                crate::harness::agy_signin::publication_fixture(state, req.staging, "main", OWNER);
+            match self.mutation {
+                1 => std::fs::write(proof.path().unwrap(), b"changed-after-verification").unwrap(),
+                2 => std::fs::write(state.join("google-identities.toml"), "").unwrap(),
+                3 => return Err("provider refused authorization".into()),
+                5 => {
+                    let history = req.staging.join(".gemini/antigravity-cli/conversations");
+                    std::fs::remove_file(&history).unwrap();
+                    std::fs::create_dir(&history).unwrap();
+                    std::fs::write(history.join("kept.db"), b"native private history").unwrap();
+                }
+                _ => {}
+            }
+            Ok(proof)
+        }
+    }
+    for mutation in 0..=5 {
+        let world = World::new(Cli::Agy);
+        let state = world.store.dir.parent().unwrap();
+        aterm_secrets::fsx::write_atomic(
+            &state.join("google-identities.toml"),
+            b"[[identities]]\nid='one'\nemail='owner@example.test'\n[[bindings]]\nprovider='agy'\naccount='main'\nidentity='one'\nexpected_email='owner@example.test'\n",
+            0o600,
+        ).unwrap();
+        if mutation == 4 {
+            world
+                .store
+                .transact_logins(NOW, &mut None, |_, logins| {
+                    accounts::note_google_identity(logins, "main", OWNER, [2; 32]);
+                    Ok(Vec::new())
+                })
+                .unwrap();
+        }
+        let host = NativeHost {
+            world: &world,
+            mutation,
+            called: Cell::new(false),
+        };
+        let before = world.store.load_logins(NOW).unwrap().0;
+        let original_dir = before
+            .labels
+            .get("main")
+            .and_then(|binding| binding.dir.clone());
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let result =
+            run_accounts_login_for(Cli::Agy, &world.env, &host, "main", &mut out, &mut err);
+        assert!(host.called.get(), "{}", String::from_utf8_lossy(&err));
+        assert_eq!(
+            result == ExitCode::SUCCESS,
+            mutation == 0,
+            "{}{}",
+            String::from_utf8_lossy(&out),
+            String::from_utf8_lossy(&err)
+        );
+        let after = world.store.load_logins(NOW).unwrap().0;
+        if mutation == 0 {
+            assert_eq!(after.labels["main"].google_principal, Some([1; 32]));
+            assert_ne!(
+                after
+                    .labels
+                    .get("main")
+                    .and_then(|binding| binding.dir.as_ref()),
+                original_dir.as_ref()
+            );
+        } else {
+            if mutation == 4 {
+                assert_eq!(after.labels["main"].google_principal, Some([2; 32]));
+            }
+            assert_eq!(
+                after
+                    .labels
+                    .get("main")
+                    .and_then(|binding| binding.dir.as_ref()),
+                original_dir.as_ref()
+            );
+        }
+    }
+}
+
 struct World {
     root: Tmp,
     env: Env,

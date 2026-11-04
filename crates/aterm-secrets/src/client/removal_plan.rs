@@ -7,11 +7,12 @@
 //! together before the envelope is sent.
 
 use super::*;
-use crate::membership_log::{Record, Store};
+use crate::membership_log::{Record, RecordCounts, Store};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Footprint {
-    pub(super) complete_records: usize,
+    /// Complete records, by the budget each counts against.
+    pub(super) complete: RecordCounts,
     pub(super) stored_records: usize,
     pub(super) encoded_bytes: usize,
 }
@@ -19,7 +20,9 @@ pub(super) struct Footprint {
 impl Footprint {
     fn of(store: &Store) -> Self {
         Self {
-            complete_records: store.log().map_or(0, |log| log.held_count()),
+            complete: store
+                .log()
+                .map_or_else(RecordCounts::default, |log| log.counts()),
             stored_records: store.len(),
             encoded_bytes: store.encoded_len(),
         }
@@ -55,6 +58,11 @@ pub(super) enum Committed {
     Done(Option<retirement::Retirement>),
 }
 
+/// Keep every one of `records` in `store` as a complete record, or refuse the batch whole. The
+/// planner drafted each into a log of the same records file under the same budgets, whose
+/// `Log::insert` refuses one past any of them as `MembershipCapacity`, naming the budget
+/// (`plan_error` keeps that text), so a batch that reaches this fits them; what this still
+/// refuses is a record the store does not keep complete.
 fn retain_complete(store: &mut Store, records: &[Record]) -> crate::Result<()> {
     store.ingest_records(records.to_vec())?;
     if records.iter().any(|record| !store.holds(record.id())) {

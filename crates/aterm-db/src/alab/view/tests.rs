@@ -4,6 +4,7 @@
 //! LabView over hand-built rows; every address is synthetic (`example.test`).
 
 use super::*;
+use crate::alab::checks;
 use crate::{
     database::Change,
     typed::{
@@ -206,6 +207,232 @@ fn the_lab_places_an_address_in_a_mailbox_only_by_its_own_rows() {
     assert_eq!(placed.len(), 2, "{placed:?}");
     assert_eq!(placed.get(&addr("ann")).map(String::as_str), Some("mb-hub"));
     assert_eq!(placed.get(&addr("al")).map(String::as_str), Some("mb-hub"));
+}
+
+/// The registry rows a `FleetMachineAssignment` mail-area `state` stands for, for the login `ann`
+/// and its chain: `ann` an alias of `hub` where `link` is 1 or of itself where it is 2, `hub` one of `root` where `hop` is 1 or of
+/// `ann` where it is 2, `hub` and `root` retired where `hg` and `rg`, and `ann`'s and `root`'s
+/// own `mailbox` set where `lm` and `mb`. Every address has a row, so a link always lands on one.
+fn chain_cells(state: &aterm_spec::interp::State) -> Cells {
+    let pk = |local: &str| keys::address_pk(&format!("{local}@example.test")).unwrap();
+    let mut all = Vec::new();
+    for (local, gone) in [("ann", 0), ("hub", state["hg"]), ("root", state["rg"])] {
+        all.push(put(
+            &ADDRESS,
+            &pk(local),
+            "addr",
+            json!(format!("{local}@example.test")),
+        ));
+        let row = if gone == 1 { "retired" } else { "live" };
+        all.push(put(&ADDRESS, &pk(local), "row", json!(row)));
+    }
+    match state["link"] {
+        1 => all.push(put(&ADDRESS, &pk("ann"), "alias_of", json!(pk("hub")))),
+        2 => all.push(put(&ADDRESS, &pk("ann"), "alias_of", json!(pk("ann")))),
+        _ => {}
+    }
+    match state["hop"] {
+        1 => all.push(put(&ADDRESS, &pk("hub"), "alias_of", json!(pk("root")))),
+        2 => all.push(put(&ADDRESS, &pk("hub"), "alias_of", json!(pk("ann")))),
+        _ => {}
+    }
+    if state["lm"] == 1 {
+        all.push(put(&ADDRESS, &pk("ann"), "mailbox", json!("mb-ann")));
+    }
+    if state["mb"] == 1 {
+        all.push(put(&ADDRESS, &pk("root"), "mailbox", json!("mb-root")));
+    }
+    cells(all)
+}
+
+/// The `Follow` step's outputs from the chain the harness is handed (`aliases`), the lab's
+/// mailbox for `ann` (`mailboxes`) and the findings `check` reports, onto `state`; `None` for a
+/// chain no model state names. The whole chain is read: none, `hub`, or `hub` then the address
+/// `hub` links to in `state` (`root` where `hop` is 1, `ann` round the cycle where it is 2), so a
+/// chain that skips or repeats an address (`[root]` past a retired `hub`, `[ann]` round a
+/// self-link) reads as no step at all.
+fn follow_project(
+    state: &aterm_spec::interp::State,
+    chain: &[String],
+    mailbox: Option<&str>,
+    findings: &[checks::Finding],
+) -> Option<aterm_spec::interp::State> {
+    let addr = |local: &str| format!("{local}@example.test");
+    let second = match state["hop"] {
+        1 => Some(addr("root")),
+        2 => Some(addr("ann")),
+        _ => None,
+    };
+    let (t1, t2) = match chain {
+        [] => (0, 0),
+        [first] if *first == addr("hub") => (1, 0),
+        [first, next] if *first == addr("hub") && Some(next) == second.as_ref() => (1, 1),
+        _ => return None,
+    };
+    let mut next = state.clone();
+    next.insert("fol", 1);
+    next.insert("t1", t1);
+    next.insert("t2", t2);
+    let eff = match mailbox {
+        None => 0,
+        Some("mb-ann") => 1,
+        Some("mb-root") => 2,
+        Some(other) => panic!("a mailbox the bed never gives: {other}"),
+    };
+    next.insert("eff", eff);
+    let kind = |kind: &str| i64::from(findings.iter().any(|f| f.kind == kind));
+    next.insert("frt", kind("alias-of-retired"));
+    next.insert("fcy", kind("alias-cycle"));
+    Some(next)
+}
+
+/// The mail area's projection of `action` in this crate: `Follow` is a read of the registry rows
+/// the state stands for, as the harness's lab is filled ([`LabView::aliases`],
+/// [`LabView::mailboxes`]) and as `check` reads them ([`checks::lab`]). The rows themselves, the
+/// routes and the resolution are the harness's (`aterm-agent`'s
+/// `alab_roster::assignment_tests::an_alias_resolves_to_one_effective_mailbox`), so the walk takes
+/// the model's one step for each.
+pub(crate) fn follow_transition(
+    state: &aterm_spec::interp::State,
+    action: &str,
+) -> aterm_spec::interp::State {
+    if action == "Follow" {
+        let cells = chain_cells(state);
+        let view = LabView::read(&cells, &OwnedRead::default(), &OwnedRead::default(), None);
+        let chain = view
+            .aliases()
+            .remove("ann@example.test")
+            .unwrap_or_default();
+        let placed = view.mailboxes();
+        let mailbox = placed.get("ann@example.test").map(String::as_str);
+        return follow_project(state, &chain, mailbox, &checks::lab(&cells).0)
+            .unwrap_or_else(|| panic!("a chain no state names: {chain:?} from {state:?}"));
+    }
+    let model = aterm_models_harness::fleet_machine_assignment_model();
+    let [next] = &model.successors(action, state)[..] else {
+        panic!("{action} is no deterministic mail step at {state:?}");
+    };
+    next.clone()
+}
+
+/// An alias chain resolves to one effective mailbox (§0, §6): every read of the registry a
+/// `FleetMachineAssignment` mail-area state stands for is a model `Follow` successor. The chain
+/// the harness is handed goes to its end, never into a retired address and never round a cycle
+/// back to the alias, and an alias of itself is handed no chain; the lab's mailbox is the alias's own, else the chain's end's; and `check`
+/// reports exactly a link to a retired address (`alias-of-retired`) and a cycle (`alias-cycle`),
+/// a self-link included.
+/// NEGATIVE CONTROLS: a reader of the raw `alias_of` cells (no liveness) hands over a retired
+/// `hub`, breaking `RetiredNeverFollowed`; a reader that steps past a retired link instead of
+/// stopping there hands over `[root]`, which no `Follow` successor names; a check of the alias's own link alone misses a live
+/// `hub` linked to a retired `root`, breaking `BrokenLinkReported`. Neither is a `Follow`
+/// successor. Run against the code, `alias_targets` without its `live()` filter, `alias_targets`
+/// stepping past a retired link, `alias_targets` with an empty seen set (`[ann]` round a
+/// self-link) and `checks::lab` without its `alias_cycle` arm each fail the walk.
+#[test]
+fn an_alias_chain_takes_the_harness_models_steps() {
+    let model = aterm_models_harness::fleet_machine_assignment_model();
+    let states: Vec<_> = aterm_spec::interp::reachable_states(&model)
+        .into_iter()
+        .filter(|state| state["area"] == 4)
+        .collect();
+    assert!(states.len() > 1000, "{} mail states", states.len());
+    let mut follows = 0;
+    for state in &states {
+        for action in &model.actions {
+            if !model.action_enabled(action.name, state) {
+                continue;
+            }
+            follows += usize::from(action.name == "Follow");
+            let next = follow_transition(state, action.name);
+            assert!(
+                model.successors(action.name, state).contains(&next),
+                "{} from {state:?} steps to {next:?}",
+                action.name
+            );
+        }
+    }
+    assert!(follows > 500, "{follows} reads");
+
+    let bed = |want: &[(&str, i64)]| {
+        states
+            .iter()
+            .find(|s| s["fol"] == 0 && want.iter().all(|(k, v)| s[*k] == *v))
+            .expect("the unread bed")
+            .clone()
+    };
+    let refused =
+        |state: &aterm_spec::interp::State, next: aterm_spec::interp::State, law: &str| {
+            assert!(!model.check_invariant(law, &next), "{law}: {next:?}");
+            assert!(!model.successors("Follow", state).contains(&next));
+        };
+    // A reader of the raw cells: every `alias_of` followed, live or not, until a repeat.
+    let retired_hub = bed(&[("link", 1), ("hg", 1), ("hop", 1), ("rg", 0)]);
+    let cells = chain_cells(&retired_hub);
+    let rows = cell::project(&ADDRESS, &cells);
+    let mut raw = Vec::new();
+    let mut at = keys::address_pk("ann@example.test").unwrap();
+    let mut seen = BTreeSet::from([at.clone()]);
+    while let Some(next) = rows.rows.get(&at).and_then(|row| text(row, "alias_of")) {
+        if !seen.insert(next.clone()) {
+            break;
+        }
+        raw.extend(rows.rows.get(&next).and_then(|row| text(row, "addr")));
+        at = next;
+    }
+    let view = LabView::read(&cells, &OwnedRead::default(), &OwnedRead::default(), None);
+    let placed = view.mailboxes();
+    let mailbox = placed.get("ann@example.test").map(String::as_str);
+    let found = checks::lab(&cells).0;
+    refused(
+        &retired_hub,
+        follow_project(&retired_hub, &raw, mailbox, &found).expect("hub then root"),
+        "RetiredNeverFollowed",
+    );
+    // A reader that steps past a retired link: `[root]`, a chain no state names.
+    let mut skipping = Vec::new();
+    let mut at = keys::address_pk("ann@example.test").unwrap();
+    let mut seen = BTreeSet::from([at.clone()]);
+    while let Some(next) = rows.rows.get(&at).and_then(|row| text(row, "alias_of")) {
+        if !seen.insert(next.clone()) {
+            break;
+        }
+        let row = rows.rows.get(&next).expect("every address has a row");
+        if row.live() {
+            skipping.extend(text(row, "addr"));
+        }
+        at = next;
+    }
+    assert_eq!(skipping, ["root@example.test"]);
+    assert_eq!(
+        follow_project(&retired_hub, &skipping, mailbox, &found),
+        None
+    );
+    // A check of the alias's own link alone.
+    let retired_root = bed(&[("link", 1), ("hg", 0), ("hop", 1), ("rg", 1)]);
+    let cells = chain_cells(&retired_root);
+    let view = LabView::read(&cells, &OwnedRead::default(), &OwnedRead::default(), None);
+    let chain = view
+        .aliases()
+        .remove("ann@example.test")
+        .unwrap_or_default();
+    let placed = view.mailboxes();
+    let ann = keys::address_pk("ann@example.test").unwrap();
+    let own_only: Vec<_> = checks::lab(&cells)
+        .0
+        .into_iter()
+        .filter(|f| f.pks.first() == Some(&ann))
+        .collect();
+    refused(
+        &retired_root,
+        follow_project(
+            &retired_root,
+            &chain,
+            placed.get("ann@example.test").map(String::as_str),
+            &own_only,
+        )
+        .expect("the live chain"),
+        "BrokenLinkReported",
+    );
 }
 
 /// `place` rows read beside the preferences (unix: the journal is).

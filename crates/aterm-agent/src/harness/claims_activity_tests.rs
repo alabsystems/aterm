@@ -59,6 +59,45 @@ impl Lab {
 }
 
 #[test]
+fn shared_claim_entrypoint_publishes_codex_and_refuses_a_second_machine() {
+    for cli in super::super::CLAIMED_CLIS {
+        let first = Lab::new();
+        let second = Lab::new();
+        for lab in [&first, &second] {
+            let secrets = lab.root.path().join(".secrets");
+            std::fs::create_dir(&secrets).unwrap();
+            std::fs::write(secrets.join(crate::harness::ai_pool::AI_POOL_FILE), "").unwrap();
+        }
+        let first_table = std::sync::Arc::new(Replica::new("aa01"));
+        let second_table = std::sync::Arc::new(Replica::new("bb02"));
+        let claim = |lab: &Lab, table: std::sync::Arc<Replica>| {
+            super::super::with_table(table, || {
+                super::super::touch(
+                    lab.root.path(),
+                    &lab.root.path().join("state"),
+                    Some(&lab.roster),
+                    cli,
+                    Act::Claim("alpha"),
+                    NOW,
+                )
+            })
+        };
+        assert_eq!(claim(&first, first_table.clone()), Touched::Claimed);
+        let identity = LeaseKey::for_cli(
+            cli,
+            Some(crate::ai::connector::Region::Global),
+            "shared@example.test",
+        )
+        .unwrap();
+        assert!(first_table.row("aa01").unwrap().claim(&identity).is_some());
+        second_table.merge(&first_table);
+        assert!(matches!(claim(&second, second_table.clone()),
+            Touched::HeldElsewhere(holder) if holder.machine == "aa01"));
+        assert!(second_table.row("bb02").is_none());
+    }
+}
+
+#[test]
 fn roster_and_table_reads_share_the_account_writer_lock() {
     use super::super::{Table, Tabled, touch_reading};
 
@@ -835,8 +874,8 @@ fn local_clock_floor_never_expires_a_peer_and_large_skew_refuses_publication() {
 }
 
 #[test]
-fn a_known_unwritable_or_full_table_does_not_record_unused_candidates() {
-    use super::super::{Claim, MAX_CLAIMS, Table, Tabled};
+fn a_known_unwritable_table_does_not_record_unused_candidates() {
+    use super::super::{Table, Tabled};
     struct ReadOnly<'a>(&'a Replica);
     impl Table for ReadOnly<'_> {
         fn read(&self, home: &Path) -> Result<Tabled, String> {
@@ -848,51 +887,28 @@ fn a_known_unwritable_or_full_table_does_not_record_unused_candidates() {
             panic!("read only")
         }
     }
-    for full in [false, true] {
-        let lab = Lab::new();
-        if full {
-            lab.table
-                .write(
-                    lab.root.path(),
-                    &Row {
-                        machine: "aa01".into(),
-                        label: "m1".into(),
-                        counter: 1,
-                        until: NOW + super::super::HORIZON_S,
-                        claims: (0..MAX_CLAIMS)
-                            .map(|i| Claim {
-                                key: LeaseKey::new("claude", &format!("busy{i}@example.test"))
-                                    .unwrap(),
-                                kind: Kind::Lease,
-                                since: NOW,
-                            })
-                            .collect(),
-                    },
-                )
-                .unwrap();
-        }
-        let read_only = ReadOnly(&lab.table);
-        let table: &dyn Table = if full { &lab.table } else { &read_only };
-        let result = touch_on(
-            table,
-            lab.root.path(),
-            &lab.root.path().join("first"),
-            Some(&lab.roster),
-            Cli::Claude,
-            Act::Claim("alpha"),
-            NOW,
-        );
-        assert!(matches!(result, Touched::Unrecorded(_)), "{result:?}");
-        assert!(
-            lab.state("first")
-                .load(NOW)
-                .unwrap()
-                .0
-                .claimed_at
-                .is_empty()
-        );
-        assert!(!Held::take(lab.root.path()).unwrap().live(&key(), NOW));
-    }
+    let lab = Lab::new();
+    let read_only = ReadOnly(&lab.table);
+    let table: &dyn Table = &read_only;
+    let result = touch_on(
+        table,
+        lab.root.path(),
+        &lab.root.path().join("first"),
+        Some(&lab.roster),
+        Cli::Claude,
+        Act::Claim("alpha"),
+        NOW,
+    );
+    assert!(matches!(result, Touched::Unrecorded(_)), "{result:?}");
+    assert!(
+        lab.state("first")
+            .load(NOW)
+            .unwrap()
+            .0
+            .claimed_at
+            .is_empty()
+    );
+    assert!(!Held::take(lab.root.path()).unwrap().live(&key(), NOW));
 }
 
 #[test]
@@ -973,30 +989,30 @@ fn delayed_observers_do_not_rewind_expiry_or_gain_older_seniority() {
 }
 
 #[test]
-fn full_activity_refuses_new_keys_without_evicting_fresh_evidence() {
+fn activity_uses_byte_budget_without_evicting_fresh_evidence() {
     let mut book = Book {
         machine: "aa01".into(),
         at: NOW,
         entries: BTreeMap::new(),
     };
-    for i in 0..MAX_ENTRIES {
-        book.note(
-            LeaseKey::new("claude", &format!("a{i}@example.test")).unwrap(),
+    for i in 0..4097 {
+        book.entries.insert(
+            LeaseKey::new("codex", &format!("a{i}@example.test")).unwrap(),
             NOW + 1,
-        )
-        .unwrap();
+        );
     }
-    let before = book.clone();
-    assert!(book.note(key(), NOW + 2).is_err());
-    assert_eq!(book, before);
-    let first = book.entries.keys().next().unwrap().clone();
-    book.note(first.clone(), NOW + 3).unwrap();
-    assert_eq!(
-        book.entries[&first],
-        NOW + 3,
-        "full books still refresh existing evidence"
-    );
+    book.note(key(), NOW + 2).unwrap();
     assert_eq!(Book::decode(&book.encode().unwrap()).unwrap(), book);
+    book.machine = "x".repeat(MAX_BYTES);
+    let before = book.clone();
+    assert!(
+        book.note(
+            LeaseKey::new("codex", "extra@example.test").unwrap(),
+            NOW + 3
+        )
+        .is_err()
+    );
+    assert_eq!(book, before);
 }
 
 #[test]
@@ -1117,7 +1133,7 @@ pub(crate) fn observation_transition(
     state: &aterm_spec::interp::State,
     action: &str,
 ) -> aterm_spec::interp::State {
-    use super::super::{Claim, HORIZON_S, MAX_CLAIMS, Table, Tabled};
+    use super::super::{Table, Tabled};
     let mut output = state.clone();
     match action {
         "Prepare" => {
@@ -1156,27 +1172,6 @@ pub(crate) fn observation_transition(
                 own.until = NOW + 1;
                 lab.table.write(lab.root.path(), &own).unwrap();
             }
-            if state["fault"] == 4 {
-                lab.table
-                    .write(
-                        lab.root.path(),
-                        &Row {
-                            machine: "aa01".into(),
-                            label: "m1".into(),
-                            counter: 1,
-                            until: NOW + HORIZON_S,
-                            claims: (0..MAX_CLAIMS)
-                                .map(|i| Claim {
-                                    key: LeaseKey::new("claude", &format!("busy{i}@example.test"))
-                                        .unwrap(),
-                                    kind: Kind::Lease,
-                                    since: NOW,
-                                })
-                                .collect(),
-                        },
-                    )
-                    .unwrap();
-            }
             struct Gate<'a> {
                 table: &'a Replica,
                 writable: bool,
@@ -1203,17 +1198,7 @@ pub(crate) fn observation_transition(
                         2 => 48 * 3600,
                         _ => 0,
                     },
-                entries: if state["fault"] == 4 {
-                    lab.table
-                        .row("aa01")
-                        .unwrap()
-                        .claims
-                        .into_iter()
-                        .map(|claim| (claim.key, NOW + IDLE_S))
-                        .collect()
-                } else {
-                    BTreeMap::new()
-                },
+                entries: BTreeMap::new(),
             });
             if state["fault"] == 2 {
                 std::fs::create_dir(held.dir.join(FILE)).unwrap();
@@ -1225,7 +1210,7 @@ pub(crate) fn observation_transition(
             };
             let table = Gate {
                 table: &lab.table,
-                writable: state["fault"] != 3,
+                writable: state["fault"] != 3 && state["fault"] != 4,
             };
             let mut local = accounts::State::default();
             if state["prepared"] == 1 {

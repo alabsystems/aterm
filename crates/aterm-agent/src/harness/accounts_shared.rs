@@ -4,9 +4,7 @@
 //! Retained local custody of shared-account preparations. The root adapter
 //! verifies authority; this state enforces local consumption and pin retention.
 
-use super::{
-    EMAIL_MAX, LABEL_MAX, MAX_ACCOUNTS, Row, admissible_label, dir_refusal, email_refusal,
-};
+use super::{EMAIL_MAX, LABEL_MAX, Row, admissible_label, dir_refusal, email_refusal};
 use aterm_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -347,9 +345,6 @@ impl State {
         }) {
             return Err("shared preparation would replace another retained source".into());
         }
-        if !self.pins.contains_key(&intent.source) && self.pins.len() == MAX_ACCOUNTS {
-            return Err("shared account pin capacity reached".into());
-        }
         let old = self.pins.get(&intent.source);
         let mut labels = old.map(|p| p.labels.clone()).unwrap_or_default();
         let mut identities = old.map(|p| p.identities.clone()).unwrap_or_default();
@@ -544,7 +539,7 @@ impl State {
     pub(super) fn from_json(value: &Value) -> Result<Self, String> {
         let rows = value
             .as_array()
-            .filter(|rows| !rows.is_empty() && rows.len() <= MAX_ACCOUNTS)
+            .filter(|rows| !rows.is_empty())
             .ok_or_else(|| "invalid shared account pins".to_owned())?;
         let mut state = Self::default();
         for row in rows {

@@ -288,7 +288,7 @@ pub struct TerminalCheckpoint {
     pub rows: u16,
     /// Grid cols.
     pub cols: u16,
-    /// Main-grid body: `serialize_lines(grid.checkpoint_lines())` (scrollback-then-visible).
+    /// Main-grid body: `serialize_lines(grid.checkpoint_lines_bounded(..))` (scrollback-then-visible).
     pub grid: Vec<u8>,
     /// How many of `grid`'s leading line records are scrollback (`grid` holds `history_lines + rows` records), carried so the consumer can bound its allocation from the authenticated meta before decoding.
     pub history_lines: u32,

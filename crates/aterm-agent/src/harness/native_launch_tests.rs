@@ -271,12 +271,12 @@ impl Fixture {
             watch: None,
             reaped: false,
         };
-        fixture.accept(until)?;
+        fixture.accept(until, case.starts_with("account-"))?;
         fixture.body("launcher-body", until)?;
         Ok(fixture)
     }
 
-    fn accept(&mut self, until: Instant) -> io::Result<()> {
+    fn accept(&mut self, until: Instant, account: bool) -> io::Result<()> {
         let listener = self.listener.as_ref().expect("listener");
         let stream = loop {
             readable(listener.as_raw_fd(), libc::POLLIN, until)?;
@@ -304,10 +304,21 @@ impl Fixture {
         if line(&mut wire.stream, &mut wire.buffer, until)? != format!("AUTH {TOKEN}\n") {
             return Err(io::Error::other("wrong AUTH"));
         }
-        assert_eq!(
-            wire.request(until)?,
-            Request::Attach(binding(), ImagePhase::Forward)
-        );
+        if account {
+            assert_eq!(
+                line(&mut wire.stream, &mut wire.buffer, until)?,
+                format!(
+                    "@{SID} codex-exec-handoff attach id={} cap={}\n",
+                    binding().id,
+                    binding().capability
+                )
+            );
+        } else {
+            assert_eq!(
+                wire.request(until)?,
+                Request::Attach(binding(), ImagePhase::Forward)
+            );
+        }
         let captured =
             Process::observe(self.child.id()).ok_or_else(|| io::Error::other("unread helper"))?;
         if captured.parent != std::process::id()
@@ -697,6 +708,15 @@ fn native_launcher_helper() {
     let socket = std::env::var(SOCKET_ENV).expect("private fixture socket");
     println!("\nlauncher-body pid={}", std::process::id());
     std::io::stdout().flush().expect("helper body proof");
+    if std::env::var(CASE_ENV).is_ok_and(|case| case.starts_with("account-")) {
+        let invocation = super::codex_exec_handoff::Invocation {
+            socket,
+            session: SID.into(),
+            binding: binding(),
+        };
+        let _refusal = super::codex_exec_handoff::entry(&invocation.arguments().unwrap());
+        std::process::exit(126);
+    }
     let b = binding();
     let arguments = [
         "native-launch".into(),
@@ -719,7 +739,10 @@ fn native_launcher_helper() {
 #[test]
 #[ignore = "fixed in-place target of the bounded one-shot launcher fixture"]
 fn native_exec_stdio_target() {
-    if std::env::var(CASE_ENV).as_deref() != Ok("stdio") {
+    if !matches!(
+        std::env::var(CASE_ENV).as_deref(),
+        Ok("stdio" | "account-stdio")
+    ) {
         return;
     }
     println!("\nexec-stdio-body pid={}", std::process::id());
@@ -731,6 +754,19 @@ fn native_exec_stdio_target() {
         .read_exact(&mut input)
         .expect("preserved stdin");
     assert_eq!(&input, b"finish\n");
+    if std::env::var(CASE_ENV).as_deref() == Ok("account-stdio") {
+        assert!(
+            std::env::var("CODEX_AUTH_PATH")
+                .unwrap()
+                .ends_with("selected-auth.json")
+        );
+        assert_eq!(
+            std::env::var(super::codex_exec_handoff::HANDOFF_ENV).unwrap(),
+            format!("{}.{}", binding().id, binding().capability)
+        );
+        eprintln!("account-image-stderr pid={}", std::process::id());
+        std::process::exit(17);
+    }
 }
 
 #[test]
@@ -772,4 +808,104 @@ fn native_launcher_lost_go_ack_never_execs() {
 #[test]
 fn native_launcher_keeps_stdio_identity_and_closes_its_control_fd_at_exec() {
     exercise(Case::Stdio).expect("stdio/CLOEXEC fixture");
+}
+
+#[test]
+fn account_image_launcher_preserves_process_stdio_and_exit_status() {
+    account_image_case("account-stdio").expect("cooperative account image");
+}
+
+#[test]
+fn account_image_launcher_denied_or_lost_execute_never_runs_target() {
+    account_image_case("account-denied").expect("denied account image");
+    account_image_case("account-lost").expect("lost account image acknowledgement");
+}
+
+fn account_image_case(case: &str) -> io::Result<()> {
+    use super::codex_exec_handoff::{ExecCommand, Reply as AccountReply};
+    let until = Instant::now() + HANG;
+    let deadline = native_act::monotonic_us().unwrap() + 60_000_000;
+    let mut fixture = Fixture::spawn(case, until)?;
+    let original = selected(Case::Stdio, &fixture.world)?;
+    let auth = fixture.world.join("selected-auth.json");
+    std::fs::write(&auth, b"{}")?;
+    let command = ExecCommand {
+        argv0: "codex-account-fixture".into(),
+        image: original.image,
+        program: original.program,
+        argv: original.argv,
+        auth_path: auth.to_str().unwrap().into(),
+        cwd: None,
+    };
+    fixture.peer.as_mut().unwrap().write(
+        AccountReply::Launch { command, deadline }
+            .encode()
+            .unwrap()
+            .as_bytes(),
+        until,
+    )?;
+    let peer = fixture.peer.as_mut().unwrap();
+    assert_eq!(
+        line(&mut peer.stream, &mut peer.buffer, until)?,
+        format!(
+            "@{SID} codex-exec-handoff execute id={} cap={}\n",
+            binding().id,
+            binding().capability
+        )
+    );
+    let before = aterm_uds::process::read_identity(fixture.child.id() as i32)
+        .and_then(|identity| identity.idversion)
+        .unwrap();
+    match case {
+        "account-denied" => peer.write(b"ERR denied account image\n", until)?,
+        "account-lost" => {
+            peer.write(b"OK codex-exec-handoff state=execute deadline_us=", until)?;
+            drop(fixture.peer.take());
+        }
+        "account-stdio" => {
+            peer.write(
+                AccountReply::Execute { deadline }
+                    .encode()
+                    .unwrap()
+                    .as_bytes(),
+                until,
+            )?;
+            fixture.body("exec-stdio-body", until)?;
+            assert_eq!(
+                atpkg::caller_shell::process_args(fixture.child.id())
+                    .unwrap()
+                    .argv[0],
+                "codex-account-fixture",
+                "the launcher preserves the original argv[0]"
+            );
+            fixture.peer.as_mut().unwrap().eof(until)?;
+            assert_eq!(
+                Process::observe(fixture.child.id()).as_ref(),
+                fixture.captured.as_ref()
+            );
+            let after = aterm_uds::process::read_identity(fixture.child.id() as i32)
+                .and_then(|identity| identity.idversion)
+                .unwrap();
+            assert_ne!(before, after, "the target must be a real in-place exec");
+            fixture
+                .child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(b"finish\n")?;
+        }
+        _ => unreachable!(),
+    }
+    let status = fixture.wait(until)?;
+    assert_eq!(
+        status.code(),
+        Some(if case == "account-stdio" { 17 } else { 126 })
+    );
+    if case == "account-stdio" {
+        assert!(
+            std::fs::read_to_string(fixture.world.join("helper-stderr.txt"))?
+                .contains(&format!("account-image-stderr pid={}", fixture.child.id()))
+        );
+    }
+    Ok(())
 }

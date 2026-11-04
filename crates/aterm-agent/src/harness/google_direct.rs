@@ -59,14 +59,13 @@ pub(super) struct Context<'a> {
 
 pub(super) fn approve(
     request: &Authorization,
-    credentials: &mut Credentials,
     ctx: &Context<'_>,
     deadline: Instant,
 ) -> Result<Code, Error> {
     if !(ctx.current)() {
         return Err(Error::Configuration);
     }
-    credentials.check_current().map_err(Error::Credentials)?;
+    let mut credentials: Option<Credentials> = None;
     let mut browser = MemoryBrowser::start(ctx.identity, ctx.state, Some(ctx.home), deadline)
         .map_err(Error::Browser)?;
     match browser.restore_session(ctx.home) {
@@ -88,7 +87,9 @@ pub(super) fn approve(
         if !(ctx.current)() {
             return Err(Error::Configuration);
         }
-        credentials.check_current().map_err(Error::Credentials)?;
+        if let Some(credentials) = credentials.as_mut() {
+            credentials.check_current().map_err(Error::Credentials)?;
+        }
         for url in browser.navigation_commits(&page).map_err(Error::Browser)? {
             if url.split(['?', '#']).next() == Some("https://antigravity.google/oauth-callback") {
                 return request.callback(&url).map_err(|_| Error::Callback);
@@ -123,35 +124,42 @@ pub(super) fn approve(
         if oauth::bot_check(&view) {
             return Err(Error::SecurityCheck);
         }
-        let email = credentials.email().to_owned();
-        let result = credentials
-            .with_google_page(&view.url, |password, totp| {
-                let otp = totp.and_then(|secret| {
-                    aterm_time::unix_secs().and_then(|now| oauth::generate_totp_at(secret, now))
-                });
-                let authenticator = if totp_sent {
-                    Authenticator::Submitted
-                } else {
-                    otp.as_deref()
-                        .map(Authenticator::Ready)
-                        .unwrap_or(Authenticator::Unavailable)
-                };
-                let script = SecretBytes::from(google_federation::google_action(
-                    &email,
-                    password,
-                    authenticator,
-                    identifier_sent,
-                    password_sent,
-                    ctx.identity
-                        .verification_email()
-                        .map(|target| (target, mail_code.as_ref().and_then(SecretBytes::as_str))),
-                    mail_sent,
-                ));
-                browser.evaluate(&page, script.as_str().unwrap_or_default(), true)
-            })
-            .map_err(Error::Credentials)?
-            .map_err(Error::Browser)?;
+        let mut act = |password: Option<&str>, totp: Option<&str>| {
+            let otp = totp.and_then(|secret| {
+                aterm_time::unix_secs().and_then(|now| oauth::generate_totp_at(secret, now))
+            });
+            let authenticator = if totp_sent {
+                Authenticator::Submitted
+            } else {
+                otp.as_deref()
+                    .map(Authenticator::Ready)
+                    .unwrap_or(Authenticator::Unavailable)
+            };
+            let script = SecretBytes::from(google_federation::google_action(
+                ctx.identity.email(),
+                password,
+                authenticator,
+                identifier_sent,
+                password_sent,
+                ctx.identity
+                    .verification_email()
+                    .map(|target| (target, mail_code.as_ref().and_then(SecretBytes::as_str))),
+                mail_sent,
+            ));
+            browser.evaluate(&page, script.as_str().unwrap_or_default(), true)
+        };
+        let result = match credentials.as_mut() {
+            Some(credentials) => credentials
+                .with_google_page(&view.url, |password, totp| act(Some(password), totp))
+                .map_err(Error::Credentials)?,
+            None => act(None, None),
+        }
+        .map_err(Error::Browser)?;
         match result.as_str() {
+            Some("credentials") => {
+                credentials =
+                    Some(Credentials::load(ctx.identity, ctx.home).map_err(Error::Credentials)?);
+            }
             Some("identifier") => identifier_sent = true,
             Some("password") => password_sent = true,
             Some("totp") => totp_sent = true,

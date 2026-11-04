@@ -48,8 +48,8 @@ pub const ACCOUNTS_FILE: &str = "accounts.toml";
 /// The variable a relaunch line carries to choose the login.
 pub const LOGIN_ENV: &str = "CLAUDE_SECURESTORAGE_CONFIG_DIR";
 
-/// The most rows one roster carries, and the most accounts a state keeps.
-pub const MAX_ACCOUNTS: usize = 32;
+/// The most peer names retained in a clock observation or machine alias list.
+pub const MAX_PEER_NAMES: usize = 32;
 
 /// The longest label.
 pub const LABEL_MAX: usize = 64;
@@ -80,12 +80,6 @@ pub const PREPARED_STATE_SCHEMA: u64 = 2;
 
 /// The most walls kept per account (the vendor names six limit types).
 pub const MAX_WALLS: usize = 8;
-
-/// The most sessions kept, newest first.
-pub const MAX_SESSIONS: usize = 256;
-
-/// The most rotation times kept (the bound itself is at most twice [`MAX_ACCOUNTS`] an hour).
-pub const MAX_ROTATIONS: usize = 128;
 
 /// The longest session id, machine id, window name and `held` word kept.
 pub const WORD_MAX: usize = 64;
@@ -543,7 +537,7 @@ impl Roster {
     /// # Errors
     ///
     /// Each names the row and the reason: the text is not TOML; an unknown top-level key or
-    /// table; `account` is not `[[account]]` rows; more than [`MAX_ACCOUNTS`] rows; a row with an
+    /// table; `account` is not `[[account]]` rows; text exceeding [`MAX_ROSTER_BYTES`]; a row with an
     /// unknown key, with no label, an inadmissible one ([`RESERVED_LABEL`] by name) or a repeated
     /// one, with no class or one that is neither `dedicated` nor `shared`, with a `dir` that is
     /// not a string, is relative, holds a control character, is longer than [`DIR_MAX`] bytes or
@@ -565,6 +559,9 @@ impl Roster {
     /// Duplicate email addresses are scoped to one provider realm.
     pub fn parse_for(cli: Cli, text: &str) -> Result<Roster, String> {
         let file = cli.accounts().roster_file;
+        if text.len() as u64 > MAX_ROSTER_BYTES {
+            return Err(format!("{file}: roster exceeds {MAX_ROSTER_BYTES} bytes"));
+        }
         let doc = aterm_toml::from_str::<aterm_toml::Value>(text).map_err(|e| {
             format!(
                 "{file}: not valid TOML ({})",
@@ -598,12 +595,6 @@ impl Roster {
                 ));
             }
         };
-        if items.len() > MAX_ACCOUNTS {
-            return Err(format!(
-                "{file}: {} rows; a roster holds at most {MAX_ACCOUNTS}",
-                items.len()
-            ));
-        }
         let mut rows: Vec<Row> = Vec::with_capacity(items.len());
         for (i, item) in items.iter().enumerate() {
             let row = row_of(cli, item, i + 1)?;
@@ -1105,7 +1096,7 @@ pub fn append_row(
 /// # Errors
 ///
 /// A row would not admit, `existing` does not admit, or the whole does not (a repeated label,
-/// `dir` or `email`, a second row with no `dir`, more than [`MAX_ACCOUNTS`] rows), each as
+/// `dir` or `email`, a second row with no `dir`, text exceeding [`MAX_ROSTER_BYTES`]), each as
 /// [`Roster::parse`] names it, so nothing is written that the next read refuses. A roster that
 /// defines `account` inline (`account = [ { … } ]`, or `account = []`) refuses too, since an
 /// `[[account]]` table cannot extend that array: the refusal carries every row to add by hand
@@ -1696,6 +1687,8 @@ pub(super) struct RenewalCheckpoint {
     pub checked_at: i64,
     pub subscription: Option<String>,
     pub proved_by: Option<Proof>,
+    pub google_principal: Option<[u8; 32]>,
+    pub google_grant_digest: Option<[u8; 32]>,
     pub parent: RenewalParent,
 }
 
@@ -1763,6 +1756,75 @@ pub(super) fn write_renewal_checkpoint_for(
     checked_at: i64,
     logins: &Logins,
 ) -> io::Result<()> {
+    write_checkpoint(
+        cli,
+        region,
+        label,
+        email,
+        staging_text,
+        subscription,
+        proved_by,
+        None,
+        None,
+        checked_at,
+        logins,
+    )
+}
+
+/// A native Google checkpoint can only be made while its verified capability is current.
+#[cfg(unix)]
+pub(super) fn write_google_renewal_checkpoint(
+    label: &str,
+    staging: &str,
+    grant: &super::agy_signin::VerifiedGoogleGrant,
+    checked_at: i64,
+    logins: &Logins,
+) -> io::Result<()> {
+    if grant.account_label() != label {
+        return Err(io::Error::other(
+            "Google proof describes another account label",
+        ));
+    }
+    let path = grant.path().map_err(io::Error::other)?;
+    if path != Path::new(staging).join(".gemini/antigravity-cli/antigravity-oauth-token") {
+        return Err(io::Error::other(
+            "Google proof does not describe this staging home",
+        ));
+    }
+    let profile = grant.profile();
+    require_google_principal(logins, label, profile.principal).map_err(io::Error::other)?;
+    write_checkpoint(
+        Cli::Agy,
+        None,
+        label,
+        &profile.email,
+        staging,
+        None,
+        Some(Proof::Status),
+        Some(profile.principal),
+        Some(grant.digest().map_err(io::Error::other)?),
+        checked_at,
+        logins,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "checkpoint fields and the locked parent are explicit at publication"
+)]
+fn write_checkpoint(
+    cli: Cli,
+    region: Option<Region>,
+    label: &str,
+    email: &str,
+    staging_text: &str,
+    subscription: Option<&str>,
+    proved_by: Option<Proof>,
+    google_principal: Option<[u8; 32]>,
+    google_grant_digest: Option<[u8; 32]>,
+    checked_at: i64,
+    logins: &Logins,
+) -> io::Result<()> {
     let staging = Path::new(staging_text);
     std::fs::canonicalize(staging)?;
     let checkpoint = RenewalCheckpoint {
@@ -1773,9 +1835,16 @@ pub(super) fn write_renewal_checkpoint_for(
         checked_at,
         subscription: subscription.map(str::to_owned),
         proved_by,
+        google_principal,
+        google_grant_digest,
         parent: RenewalParent::capture(logins, label),
     };
-    if !checkpoint.valid() || (cli == Cli::Kimi) != region.is_some() {
+    if !checkpoint.valid()
+        || (cli == Cli::Kimi) != region.is_some()
+        || (cli == Cli::Agy) != google_principal.is_some()
+        || (cli == Cli::Agy) != google_grant_digest.is_some()
+        || (cli == Cli::Agy && proved_by != Some(Proof::Status))
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "invalid renewal checkpoint scope",
@@ -1784,7 +1853,13 @@ pub(super) fn write_renewal_checkpoint_for(
     let mut doc = Map::new();
     doc.insert(
         "schema".into(),
-        Value::from(if region.is_some() { 3 } else { 2 }),
+        Value::from(if google_principal.is_some() {
+            4
+        } else if region.is_some() {
+            3
+        } else {
+            2
+        }),
     );
     doc.insert("program".into(), Value::from(cli.id()));
     if let Some(region) = region {
@@ -1805,6 +1880,18 @@ pub(super) fn write_renewal_checkpoint_for(
     );
     if let Some(proof) = checkpoint.proved_by {
         doc.insert("proved_by".into(), Value::from(proof.as_str()));
+    }
+    if let Some(principal) = checkpoint.google_principal {
+        doc.insert(
+            "google_principal".into(),
+            Value::from(aterm_codec::hex::encode_lower(&principal)),
+        );
+    }
+    if let Some(digest) = checkpoint.google_grant_digest {
+        doc.insert(
+            "google_grant_digest".into(),
+            Value::from(aterm_codec::hex::encode_lower(&digest)),
+        );
     }
     let text = Value::Object(doc).to_string();
     if text.len() as u64 > RENEWAL_CHECKPOINT_MAX {
@@ -1866,8 +1953,9 @@ pub(super) fn read_renewal_checkpoint_for(
         return None;
     }
     let region = match (doc.get("schema")?.as_u64()?, cli) {
-        (2, cli) if cli != Cli::Kimi => None,
+        (2, cli) if !matches!(cli, Cli::Kimi | Cli::Agy) => None,
         (3, Cli::Kimi) => Some(Region::parse(doc.get("region")?.as_str()?)?),
+        (4, Cli::Agy) => None,
         _ => return None,
     };
     let checkpoint = RenewalCheckpoint {
@@ -1884,6 +1972,16 @@ pub(super) fn read_renewal_checkpoint_for(
             None | Some(Value::Null) => None,
             Some(value) => Some(Proof::parse(value.as_str()?)?),
         },
+        google_principal: if cli == Cli::Agy {
+            Some(google_principal(doc.get("google_principal")?)?)
+        } else {
+            None
+        },
+        google_grant_digest: if cli == Cli::Agy {
+            Some(google_principal(doc.get("google_grant_digest")?)?)
+        } else {
+            None
+        },
         parent: RenewalParent {
             generation: match doc.get("parent_generation")? {
                 Value::Null => None,
@@ -1893,6 +1991,10 @@ pub(super) fn read_renewal_checkpoint_for(
         },
     };
     (checkpoint.valid()
+        && (cli != Cli::Agy || checkpoint.proved_by == Some(Proof::Status))
+        && checkpoint
+            .google_grant_digest
+            .is_none_or(|digest| native_google_digest(staging) == Some(digest))
         && checkpoint.checked_at <= now
         && std::fs::canonicalize(&checkpoint.dir).ok()?.as_path() == actual_dir)
         .then_some(checkpoint)
@@ -1908,6 +2010,12 @@ pub(super) fn checkpoint_current(
 ) -> bool {
     let account = state.accounts.get(&row.label);
     proof.parent.matches(logins, &row.label)
+        && proof
+            .google_principal
+            .is_none_or(|principal| require_google_principal(logins, &row.label, principal).is_ok())
+        && proof
+            .google_grant_digest
+            .is_none_or(|digest| native_google_digest(Path::new(&proof.dir)) == Some(digest))
         && !account.is_some_and(|a| a.auth_at.is_some_and(|at| at >= proof.checked_at))
         && !logins.labels.get(&row.label).is_some_and(|binding| {
             binding.renewed_at.iter().chain(binding.ended_at.iter())
@@ -1926,6 +2034,10 @@ pub(super) fn checkpoint_identity_matches(cli: Cli, row: &Row, proof: &RenewalCh
     };
     row.vendor.region == proof.region
         && (cli != Cli::Codex || proof.proved_by == Some(Proof::Status))
+        && (cli != Cli::Agy
+            || (proof.proved_by == Some(Proof::Status)
+                && proof.google_principal.is_some()
+                && proof.google_grant_digest.is_some()))
         && expected.is_some_and(|email| email_matches(email, &proof.email))
 }
 
@@ -1989,6 +2101,8 @@ pub struct Binding {
     pub proved_email: Option<String>,
     /// The login directory whose identity was checked.
     pub proved_dir: Option<String>,
+    /// Canonical Google subject digest checked for this exact email and login directory.
+    pub google_principal: Option<[u8; 32]>,
     /// The remaining human step of a renewal, cleared by a successful sign-in.
     pub sign_in_task: Option<SignInTask>,
     /// How the row's last automatic sign-in ended and the routes it tried
@@ -2163,6 +2277,7 @@ impl Default for Binding {
             proved_by: None,
             proved_email: None,
             proved_dir: None,
+            google_principal: None,
             sign_in_task: None,
             sign_in_attempt: None,
         }
@@ -2234,6 +2349,27 @@ impl Binding {
     }
 }
 
+/// Transaction-local permission to forget one terminal native receipt. The
+/// receipt writer constructs this only after validating durable terminal state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeRotationRetirement {
+    id: String,
+    binding: String,
+}
+
+impl NativeRotationRetirement {
+    pub(super) fn new(id: &str, binding: &str) -> Self {
+        Self {
+            id: id.into(),
+            binding: binding.into(),
+        }
+    }
+
+    fn matches(&self, id: &str, binding: &str) -> bool {
+        self.id == id && self.binding == binding
+    }
+}
+
 /// Machine-local `logins.json` map from account label to [`Binding`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Logins {
@@ -2254,6 +2390,12 @@ pub struct Logins {
     /// Retained shared authority and consumed preparation generations. Ordinary
     /// metadata edits cannot remove these pins or lower their high-water marks.
     pub shared: shared::State,
+    /// Native handoffs already charged to the pool, keyed by their private
+    /// receipt. The digest binds the receipt to its source and destination.
+    pub native_rotations: BTreeMap<String, String>,
+    /// Consumed by the transaction guard, never serialized.
+    #[doc(hidden)]
+    pub pending_native_retirement: Option<NativeRotationRetirement>,
 }
 
 impl Logins {
@@ -2264,9 +2406,7 @@ impl Logins {
     }
 
     fn entry(&mut self, label: &str) -> Option<&mut Binding> {
-        if !admissible_label(label)
-            || (!self.labels.contains_key(label) && self.labels.len() >= MAX_ACCOUNTS)
-        {
+        if !admissible_label(label) {
             return None;
         }
         Some(self.labels.entry(label.to_owned()).or_default())
@@ -2278,14 +2418,35 @@ impl Logins {
         let mut o = Map::new();
         o.insert(
             "schema".to_owned(),
-            Value::from(if self.shared.is_empty() {
-                LOGINS_SCHEMA
-            } else {
-                4
-            }),
+            Value::from(
+                if self
+                    .labels
+                    .values()
+                    .any(|binding| binding.google_principal.is_some())
+                {
+                    6
+                } else if !self.native_rotations.is_empty() {
+                    5
+                } else if self.shared.is_empty() {
+                    LOGINS_SCHEMA
+                } else {
+                    4
+                },
+            ),
         );
         if !self.shared.is_empty() {
             o.insert("shared".into(), self.shared.to_json());
+        }
+        if !self.native_rotations.is_empty() {
+            o.insert(
+                "native_rotations".into(),
+                Value::Object(
+                    self.native_rotations
+                        .iter()
+                        .map(|(id, binding)| (id.clone(), Value::from(binding.clone())))
+                        .collect(),
+                ),
+            );
         }
         o.insert(
             "generation_clock".to_owned(),
@@ -2342,6 +2503,12 @@ impl Logins {
                 if let Some(dir) = &b.proved_dir {
                     m.insert("proved_dir".into(), Value::from(dir.clone()));
                 }
+                if let Some(principal) = b.google_principal {
+                    m.insert(
+                        "google_principal".into(),
+                        Value::from(aterm_codec::hex::encode_lower(&principal)),
+                    );
+                }
                 if let Some(task) = b.sign_in_task {
                     let mut pending = Map::new();
                     pending.insert("action".into(), Value::from(task.action.as_str()));
@@ -2375,17 +2542,19 @@ impl Logins {
         }
         let schema = doc.get("schema").and_then(Value::as_u64);
         let legacy = match schema {
-            Some(4) => false,
+            Some(4..=6) => false,
             Some(2 | LOGINS_SCHEMA) => false,
             Some(1) => true,
             Some(other) => {
                 return Err(Unread::NotOurs(format!(
-                    "schema {other}; this build reads schemas 1, 2, {LOGINS_SCHEMA} and 4"
+                    "schema {other}; this build reads schemas 1, 2, {LOGINS_SCHEMA}, 4, 5 and 6"
                 )));
             }
             None => return Err(Unread::NotOurs("names no schema".to_string())),
         };
-        let shared = if schema == Some(4) {
+        let shared = if schema == Some(4)
+            || (matches!(schema, Some(5 | 6)) && doc.get("shared").is_some())
+        {
             shared::State::from_json(&doc["shared"]).map_err(Unread::NotOurs)?
         } else {
             if doc.get("shared").is_some() {
@@ -2395,13 +2564,29 @@ impl Logins {
             }
             shared::State::default()
         };
+        let mut native_rotations = BTreeMap::new();
+        if schema == Some(5) || (schema == Some(6) && doc.get("native_rotations").is_some()) {
+            let entries = doc
+                .get("native_rotations")
+                .and_then(Value::as_object)
+                .filter(|entries| !entries.is_empty())
+                .ok_or_else(|| Unread::NotOurs("missing native rotation receipts".into()))?;
+            for (id, value) in entries {
+                let binding = value
+                    .as_str()
+                    .filter(|binding| native_rotation_key(id, binding))
+                    .ok_or_else(|| Unread::NotOurs("invalid native rotation receipt".into()))?;
+                native_rotations.insert(id.clone(), binding.to_owned());
+            }
+        } else if doc.get("native_rotations").is_some() {
+            return Err(Unread::NotOurs(
+                "native rotation receipts require their guarded schema".into(),
+            ));
+        }
         let entries = doc
             .get("labels")
             .and_then(Value::as_object)
             .ok_or_else(|| Unread::NotOurs("labels is not an object".to_string()))?;
-        if entries.len() > MAX_ACCOUNTS {
-            return Err(Unread::NotOurs("too many binding labels".to_string()));
-        }
         let mut labels = BTreeMap::new();
         for (label, value) in entries {
             if !admissible_label(label) || !value.is_object() {
@@ -2502,6 +2687,12 @@ impl Logins {
                     .and_then(Value::as_str)
                     .filter(|dir| dir_refusal(dir).is_none())
                     .map(str::to_owned),
+                google_principal: match v.get("google_principal") {
+                    None | Some(Value::Null) => None,
+                    Some(value) => Some(google_principal(value).ok_or_else(|| {
+                        Unread::NotOurs("invalid Google principal digest".into())
+                    })?),
+                },
                 sign_in_task,
                 sign_in_attempt,
             };
@@ -2509,6 +2700,17 @@ impl Logins {
                 return Err(Unread::NotOurs(format!(
                     "binding `{label}` successful publication exceeds its generation"
                 )));
+            }
+            if binding.google_principal.is_some()
+                && (schema != Some(6)
+                    || binding.proved_by != Some(Proof::Status)
+                    || binding.proved_email.is_none()
+                    || binding.proved_dir.is_none()
+                    || binding.proved_dir != binding.dir)
+            {
+                return Err(Unread::NotOurs(
+                    "Google principal has no guarded scoped identity".into(),
+                ));
             }
             labels.insert(label.clone(), binding);
         }
@@ -2539,7 +2741,6 @@ impl Logins {
         if let Some(value) = doc.get("sign_in_receipts") {
             let entries = value
                 .as_object()
-                .filter(|entries| entries.len() <= MAX_ACCOUNTS)
                 .ok_or_else(|| Unread::NotOurs("invalid sign-in receipts".into()))?;
             for (label, value) in entries {
                 let receipt = value
@@ -2557,8 +2758,21 @@ impl Logins {
             sign_in_receipts,
             pending_sign_in_invalidations: BTreeSet::new(),
             shared,
+            native_rotations,
+            pending_native_retirement: None,
         })
     }
+}
+
+/// Private handoff identifiers and their binding digests use canonical hex.
+pub(super) fn native_rotation_key(id: &str, binding: &str) -> bool {
+    let hex = |value: &str, len| {
+        value.len() == len
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    };
+    hex(id, 32) && hex(binding, 64)
 }
 
 /// Allocate at most one new generation per affected label in this publication. Renewals,
@@ -2578,6 +2792,20 @@ fn advance_renewal_generations(
     after: &mut Logins,
     events: &[Event],
 ) -> Result<(), String> {
+    let retirement = after.pending_native_retirement.take();
+    if before.native_rotations.iter().any(|(id, binding)| {
+        after.native_rotations.get(id) != Some(binding)
+            && !(!after.native_rotations.contains_key(id)
+                && retirement
+                    .as_ref()
+                    .is_some_and(|permit| permit.matches(id, binding)))
+    }) || after
+        .native_rotations
+        .iter()
+        .any(|(id, binding)| !native_rotation_key(id, binding))
+    {
+        return Err("account edit would erase or alter a native rotation receipt".into());
+    }
     if !after.shared.extends(&before.shared) {
         return Err(
             "account edit would erase shared custody or consumed preparation history".into(),
@@ -2614,9 +2842,6 @@ fn advance_renewal_generations(
             if !current_target {
                 continue;
             }
-            if after.labels.len() >= MAX_ACCOUNTS {
-                return Err("shared preparation exceeds local binding capacity".into());
-            }
             after.labels.insert(label.clone(), Binding::default());
         }
         changed.insert(label);
@@ -2633,6 +2858,7 @@ fn advance_renewal_generations(
                             || a.proved_by != b.proved_by
                             || a.proved_email != b.proved_email
                             || a.proved_dir != b.proved_dir
+                            || a.google_principal != b.google_principal
                             || a.renewal_generation != b.renewal_generation
                     }
                     (None, None) => false,
@@ -2656,6 +2882,7 @@ fn advance_renewal_generations(
                     && binding.proved_by.is_none()
                     && binding.proved_email.is_none()
                     && binding.proved_dir.is_none()
+                    && binding.google_principal.is_none()
                     && binding.renewal_generation == 0
             });
         let next = clock.checked_add(1).ok_or_else(|| {
@@ -2684,7 +2911,7 @@ fn advance_renewal_generations(
 }
 
 /// Derive in-place receipts after credential fences have been normalized. Prune
-/// evicted or removed account records before checking space for new successes.
+/// explicitly removed account records before recording new successes.
 fn advance_sign_in_receipts(
     before: &Logins,
     after: &mut Logins,
@@ -2716,6 +2943,7 @@ fn advance_sign_in_receipts(
                         && binding.proved_by.is_none()
                         && binding.proved_email.is_none()
                         && binding.proved_dir.is_none()
+                        && binding.google_principal.is_none()
                 }
                 (Some(old), Some(new)) => old.renewal_generation == new.renewal_generation,
                 (Some(_), None) => false,
@@ -2724,11 +2952,8 @@ fn advance_sign_in_receipts(
         .map(|event| event.account.clone())
         .collect();
     for label in signed_in {
-        if !admissible_label(&label)
-            || (!after.sign_in_receipts.contains_key(&label)
-                && after.sign_in_receipts.len() >= MAX_ACCOUNTS)
-        {
-            return Err("sign-in receipt exceeds local account capacity".into());
+        if !admissible_label(&label) {
+            return Err("sign-in receipt has an invalid account label".into());
         }
         after.sign_in_clock = after
             .sign_in_clock
@@ -3149,6 +3374,7 @@ pub fn note_renewed(
     binding.proved_by = None;
     binding.proved_email = None;
     binding.proved_dir = None;
+    binding.google_principal = None;
     binding.sign_in_task = None;
     binding.clear_failed_sign_in();
     binding.subscription = subscription
@@ -3166,6 +3392,7 @@ pub fn note_proof(logins: &mut Logins, label: &str, proof: Proof) {
         binding.proved_by = Some(proof);
         binding.proved_email = None;
         binding.proved_dir = None;
+        binding.google_principal = None;
     }
 }
 
@@ -3180,6 +3407,63 @@ pub fn note_identity(logins: &mut Logins, label: &str, proof: Proof, email: Opti
     {
         binding.proved_email = Some(email.to_owned());
         binding.proved_dir = binding.dir.clone();
+    }
+}
+
+fn google_principal(value: &Value) -> Option<[u8; 32]> {
+    let text = value.as_str()?;
+    let mut digest = [0; 32];
+    (text.len() == 64 && aterm_codec::hex::decode_into(text.as_bytes(), &mut digest))
+        .then_some(digest)
+}
+
+#[cfg(unix)]
+fn native_google_digest(staging: &Path) -> Option<[u8; 32]> {
+    let path = staging.join(".gemini/antigravity-cli/antigravity-oauth-token");
+    let bytes = aterm_secrets::fsx::read_private(&path, 64 * 1024).ok()??;
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut digest = aterm_digest::Sha256::new();
+    digest.update(bytes.as_slice());
+    Some(digest.finalize())
+}
+
+#[cfg(not(unix))]
+fn native_google_digest(_staging: &Path) -> Option<[u8; 32]> {
+    None
+}
+
+/// Refuse replacing a retained Google subject with another canonical subject.
+pub(super) fn require_google_principal(
+    logins: &Logins,
+    label: &str,
+    principal: [u8; 32],
+) -> Result<(), String> {
+    if logins
+        .labels
+        .get(label)
+        .and_then(|binding| binding.google_principal)
+        .is_some_and(|old| old != principal)
+    {
+        return Err("canonical Google subject changed for this account".into());
+    }
+    Ok(())
+}
+
+/// Retain the canonical Google subject with the same scoped identity evidence.
+pub(super) fn note_google_identity(
+    logins: &mut Logins,
+    label: &str,
+    email: &str,
+    principal: [u8; 32],
+) {
+    note_identity(logins, label, Proof::Status, Some(email));
+    if let Some(binding) = logins.labels.get_mut(label)
+        && binding.proved_email.as_deref() == Some(email)
+        && binding.proved_dir.is_some()
+    {
+        binding.google_principal = Some(principal);
     }
 }
 
@@ -3469,12 +3753,68 @@ pub fn forget_account(state: &mut State, logins: &mut Logins, label: &str) {
     logins
         .pending_sign_in_invalidations
         .insert(label.to_owned());
-    state.accounts.remove(label);
+    if let Some(account) = state.accounts.remove(label)
+        && let Some(pk) = account.pk.clone()
+    {
+        remember_forgotten(state, pk, account);
+    }
     state.leases.remove(label);
     state.home_accounts.remove(label);
     if let Some(binding) = logins.labels.get_mut(label) {
         binding.served_at = None;
     }
+}
+
+/// Keep what this Mac observed of a forgotten row under its account key ([`State::forgotten`]),
+/// its login word left behind (it was this row's login directory's). The snapshot's byte budget
+/// bounds publication without silently dropping an account's quota observations.
+pub(crate) fn remember_forgotten(state: &mut State, pk: String, mut account: Account) {
+    account.auth = Auth::Unseen;
+    account.auth_at = None;
+    account.pk = Some(pk.clone());
+    if let Some(held) = state.forgotten.remove(&pk) {
+        fill_observations(&mut account, held);
+    }
+    state.forgotten.insert(pk, account);
+}
+
+/// Move every observation [`fill_observations`] carries out of `account` into a row of their own,
+/// leaving `account` its key and its login's machine-local word (`auth`, `auth_at`), which are
+/// the login directory's, not the account's.
+pub(crate) fn take_observations(account: &mut Account) -> Account {
+    let observed = std::mem::take(account);
+    account.pk.clone_from(&observed.pk);
+    account.auth = observed.auth;
+    account.auth_at = observed.auth_at;
+    observed
+}
+
+/// Give `into` every observation it lacks from `from`: a field it already holds stays, since it
+/// was observed of this row; each wall and window it has none of is taken.
+pub(crate) fn fill_observations(into: &mut Account, from: Account) {
+    fn fill<T>(slot: &mut Option<T>, from: Option<T>) {
+        if slot.is_none() {
+            *slot = from;
+        }
+    }
+    for (window, wall) in from.walls {
+        into.walls.entry(window).or_insert(wall);
+    }
+    for (window, fig) in from.windows {
+        into.windows.entry(window).or_insert(fig);
+    }
+    fill(&mut into.sample, from.sample);
+    fill(&mut into.sample_context, from.sample_context);
+    fill(&mut into.before, from.before);
+    fill(&mut into.offer, from.offer);
+    fill(&mut into.cleared_at, from.cleared_at);
+    fill(&mut into.ran_at, from.ran_at);
+    fill(&mut into.credits, from.credits);
+    fill(&mut into.credits_day, from.credits_day);
+    fill(&mut into.warned_session, from.warned_session);
+    fill(&mut into.warned_week, from.warned_week);
+    fill(&mut into.key, from.key);
+    fill(&mut into.keyed_at, from.keyed_at);
 }
 
 /// Newest observation or scoped clearing of a single vendor quota-limit type.
@@ -3739,7 +4079,13 @@ impl WindowFig {
     /// Returns whether this reading was served before an in-window limit reset.
     #[must_use]
     pub fn cut(&self) -> bool {
-        self.epoch_at.is_some_and(|epoch| self.at < epoch)
+        !self.admits_reading(self.at)
+    }
+
+    /// Whether a reading at `at` is on or after this window's retained refill barrier.
+    #[must_use]
+    pub fn admits_reading(&self, at: i64) -> bool {
+        self.epoch_at.is_none_or(|epoch| at >= epoch)
     }
 
     /// Utilization percentage rounded half-up to a whole integer.
@@ -4071,24 +4417,6 @@ impl Account {
             .filter(|cleared| at < *cleared)
             .max()
     }
-
-    fn touched(&self) -> i64 {
-        self.walls
-            .values()
-            .map(|w| w.at)
-            .chain(self.sample.as_ref().map(|s| s.at))
-            .chain(self.offer.as_ref().map(|o| o.at))
-            .chain(self.auth_at)
-            .chain(self.cleared_at)
-            .chain(self.keyed_at)
-            .chain(self.ran_at)
-            .chain(self.credits.as_ref().map(Credits::at))
-            .chain(self.warned_session.as_ref().map(|w| w.at))
-            .chain(self.warned_week.as_ref().map(|w| w.at))
-            .chain(self.windows.values().map(|w| w.at))
-            .max()
-            .unwrap_or(i64::MIN)
-    }
 }
 
 /// Machine-local record of which account a supervised session is running on.
@@ -4292,6 +4620,11 @@ pub struct State {
     /// Machine-local: this Mac's clock where its peers read it Split or Off at its last claims
     /// read (`docs/DESIGN-fluid-swarm-2026-10-28.md` F22), until the record's `until`.
     pub clock: Option<Clock>,
+    /// Observation: what this Mac had observed of each row it forgot ([`forget_account`]), by
+    /// the account's lab key (`ac-<16hex>`), so a row that comes back for the same account under
+    /// any label takes its walls, readings and last session again ([`super::journal::learn_with`])
+    /// rather than starting blind. The snapshot's byte budget bounds publication.
+    pub forgotten: BTreeMap<String, Account>,
 }
 
 impl Default for State {
@@ -4320,6 +4653,7 @@ impl Default for State {
             unrecorded: false,
             claimed_at: BTreeMap::new(),
             clock: None,
+            forgotten: BTreeMap::new(),
         }
     }
 }
@@ -4874,6 +5208,17 @@ impl State {
             c.insert("until".to_owned(), Value::from(clock.until));
             o.insert("claims_clock".to_owned(), Value::Object(c));
         }
+        if !self.forgotten.is_empty() {
+            o.insert(
+                "forgotten".to_owned(),
+                Value::Object(
+                    self.forgotten
+                        .iter()
+                        .map(|(pk, a)| (pk.clone(), account_json(a)))
+                        .collect(),
+                ),
+            );
+        }
         aterm_json::to_string(&Value::Object(o)).unwrap_or_else(|_| String::from("{}"))
     }
 
@@ -4905,10 +5250,9 @@ impl State {
             .into_iter()
             .flatten()
             .filter(|(k, v)| admissible_label(k) && v.is_object())
-            .take(MAX_ACCOUNTS)
             .map(|(k, v)| (k.clone(), account_of(v, now)))
             .collect();
-        let mut sessions: Vec<(String, SessionRow)> = doc
+        let sessions: Vec<(String, SessionRow)> = doc
             .get("sessions")
             .and_then(Value::as_object)
             .into_iter()
@@ -4924,8 +5268,6 @@ impl State {
                 ))
             })
             .collect();
-        sessions.sort_by(|a, b| b.1.at.cmp(&a.1.at).then_with(|| a.0.cmp(&b.0)));
-        sessions.truncate(MAX_SESSIONS);
         let mut rotations: Vec<i64> = doc
             .get("rotations")
             .and_then(Value::as_array)
@@ -4934,8 +5276,6 @@ impl State {
             .filter_map(Value::as_i64)
             .collect();
         rotations.sort_unstable();
-        let extra = rotations.len().saturating_sub(MAX_ROTATIONS);
-        rotations.drain(..extra);
         let probe = doc.get("probe").and_then(|c| {
             Some(ProbeClaim {
                 account: label(c.get("account"))?,
@@ -4973,7 +5313,6 @@ impl State {
             .into_iter()
             .flatten()
             .filter(|(k, v)| admissible_label(k) && v.is_object())
-            .take(MAX_ACCOUNTS)
             .filter_map(|(k, v)| {
                 Some((
                     k.clone(),
@@ -4992,18 +5331,14 @@ impl State {
             .flatten()
             .filter_map(Value::as_str)
             .filter(|s| admissible_label(s))
-            .take(MAX_ACCOUNTS)
             .map(str::to_owned)
             .collect();
         let swarm_label = word(doc.get("swarm_label"), WORD_MAX);
         let mut prepared_accounts = BTreeSet::new();
         if let Some(value) = doc.get("prepared_accounts") {
-            let labels = value
-                .as_array()
-                .filter(|labels| labels.len() <= MAX_ACCOUNTS)
-                .ok_or_else(|| {
-                    Unread::NotOurs("invalid prepared-account execution holds".into())
-                })?;
+            let labels = value.as_array().ok_or_else(|| {
+                Unread::NotOurs("invalid prepared-account execution holds".into())
+            })?;
             for value in labels {
                 let label = value
                     .as_str()
@@ -5025,7 +5360,7 @@ impl State {
             .into_iter()
             .flatten()
             .filter_map(|v| word(Some(v), WORD_MAX))
-            .take(MAX_ACCOUNTS)
+            .take(MAX_PEER_NAMES)
             .collect();
         swarm_aliases.sort();
         swarm_aliases.dedup();
@@ -5040,7 +5375,6 @@ impl State {
             .flatten()
             .filter(|(label, _)| admissible_label(label))
             .filter_map(|(label, at)| Some((label.clone(), at.as_i64()?)))
-            .take(MAX_ACCOUNTS)
             .collect();
         // A record past its `until` says nothing, so it is not kept.
         let clock = doc.get("claims_clock").and_then(|c| {
@@ -5061,12 +5395,24 @@ impl State {
                     .as_array()?
                     .iter()
                     .filter_map(|p| word(Some(p), WORD_MAX))
-                    .take(MAX_ACCOUNTS)
+                    .take(MAX_PEER_NAMES)
                     .collect(),
                 until: int(c.get("until"))?,
             })
             .filter(|clock| clock.until > now)
         });
+        let forgotten: BTreeMap<String, Account> = doc
+            .get("forgotten")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+            .filter(|(pk, v)| super::journal::Key::new(pk).is_some() && v.is_object())
+            .map(|(pk, v)| {
+                let mut account = account_of(v, now);
+                account.pk = Some(pk.clone());
+                (pk.clone(), account)
+            })
+            .collect();
         Ok(State {
             schema: SCHEMA,
             machine: doc
@@ -5106,6 +5452,7 @@ impl State {
             unrecorded,
             claimed_at,
             clock,
+            forgotten,
         })
     }
 
@@ -5405,8 +5752,8 @@ pub fn sign_in_next(
         .map(|row| (row.label.clone(), row.email.is_some()))
 }
 
-/// Returns the first signed-out or un-enrolled roster row with an email (`Dedicated` before
-/// `Shared`) that would give a session on `me` a usable target if renewed.
+/// Returns the first signed-out or un-enrolled roster row with an email (`Preferred` before
+/// `Pool`: this Mac's preferred rows first, an order and no limit) that would give a session on `me` a usable target if renewed.
 #[must_use]
 pub fn renew_next(
     roster: &Roster,
@@ -6747,14 +7094,6 @@ fn account_mut<'a>(state: &'a mut State, label: &str) -> Option<&'a mut Account>
     if !admissible_label(label) {
         return None;
     }
-    if !state.accounts.contains_key(label) && state.accounts.len() >= MAX_ACCOUNTS {
-        let stalest = state
-            .accounts
-            .iter()
-            .min_by_key(|(_, a)| a.touched())
-            .map(|(k, _)| k.clone())?;
-        state.accounts.remove(&stalest);
-    }
     Some(state.accounts.entry(label.to_owned()).or_default())
 }
 
@@ -7254,17 +7593,6 @@ pub fn note_session(
                 .filter(|h| !h.is_empty()),
         },
     );
-    while state.sessions.len() > MAX_SESSIONS {
-        let Some(oldest) = state
-            .sessions
-            .iter()
-            .min_by(|a, b| a.1.at.cmp(&b.1.at).then_with(|| a.0.cmp(b.0)))
-            .map(|(k, _)| k.clone())
-        else {
-            break;
-        };
-        state.sessions.remove(&oldest);
-    }
     out
 }
 
@@ -7731,8 +8059,6 @@ pub fn begin_rotation(
         .rotations
         .retain(|t| recent(*t, now, ROTATION_WINDOW_S));
     state.rotations.push(now);
-    let extra = state.rotations.len().saturating_sub(MAX_ROTATIONS);
-    state.rotations.drain(..extra);
     Ok(Event::new(now, Kind::Rotate, &from)
         .with_to(to)
         .with_sid(&sid))
@@ -8331,7 +8657,7 @@ impl Store {
 
     /// The user home whose `.aterm/logins/<cli>` holds this store's logins ([`Store::at_for`]);
     /// `None` for Claude Code's store.
-    fn user_home(&self) -> Option<&Path> {
+    pub(super) fn user_home(&self) -> Option<&Path> {
         if self.cli == Cli::Claude {
             return None;
         }
@@ -8949,9 +9275,15 @@ impl Store {
         )
     )]
     pub fn save_logins(&self, logins: &Logins) -> io::Result<()> {
-        self.ensure()?;
         let mut text = logins.to_json();
         text.push('\n');
+        if text.len() as u64 > MAX_LOGINS_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "login snapshot exceeds its readable size bound",
+            ));
+        }
+        self.ensure()?;
         super::upgrade_models::write_atomic_before_publish(&self.logins_file(), &text, || {
             self.retain_witness(&self.logins_witness_file())
         })?;
@@ -9142,8 +9474,8 @@ impl Store {
     /// A missing snapshot cannot become a fresh state while that witness survives. Transaction
     /// callers must first load successfully; restoring known-good state may call this directly.
     /// # Errors
-    /// The directory or witness cannot be opened, the witness is not a regular file, or a
-    /// write, rename or durability flush failed. A failure after preparation may leave the
+    /// The snapshot exceeds its readable byte bound, the directory or witness cannot be
+    /// opened, the witness is not a regular file, or a write, rename or durability flush failed. A failure after preparation may leave the
     /// witness without a snapshot, which reads refuse until an explicit snapshot restore succeeds.
     #[cfg_attr(
         any(test, debug_assertions),
@@ -9170,9 +9502,15 @@ impl Store {
         )
     )]
     pub fn save(&self, state: &State) -> io::Result<()> {
-        self.ensure()?;
         let mut text = state.to_json();
         text.push('\n');
+        if text.len() as u64 > MAX_STATE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "account snapshot exceeds its readable size bound",
+            ));
+        }
+        self.ensure()?;
         super::upgrade_models::write_atomic_before_publish(&self.state_file(), &text, || {
             self.retain_witness(&self.state_witness_file())
         })?;

@@ -5587,39 +5587,14 @@ impl App {
         wid: WindowId,
         delta: MouseScrollDelta,
     ) -> Option<(WheelDir, i32)> {
-        match delta {
-            MouseScrollDelta::LineDelta(x, y) => {
-                let axis = wheel_axis(f64::from(x), f64::from(y), 0.0)?;
-                let ws = self.windows.get_mut(&wid)?;
-                match axis {
-                    WheelAxis::Horizontal => {
-                        let (positive, n) =
-                            bank_scroll_lines(&mut ws.scroll_residual_x, f64::from(x))?;
-                        Some((horizontal_dir(positive), n))
-                    }
-                    WheelAxis::Vertical => {
-                        let (up, n) = bank_scroll_lines(&mut ws.scroll_residual, f64::from(y))?;
-                        Some((vertical_dir(up), n))
-                    }
-                }
-            }
-            MouseScrollDelta::PixelDelta(p) => {
-                let axis = wheel_axis(p.x, p.y, f64::EPSILON)?;
-                let (cw, ch) = self.win_cell_size(wid);
-                let (cw, ch) = (cw.max(1) as f64, ch.max(1) as f64);
-                let ws = self.windows.get_mut(&wid)?;
-                match axis {
-                    WheelAxis::Horizontal => {
-                        let (positive, n) = bank_scroll_lines(&mut ws.scroll_residual_x, p.x / cw)?;
-                        Some((horizontal_dir(positive), n))
-                    }
-                    WheelAxis::Vertical => {
-                        let (up, n) = bank_scroll_lines(&mut ws.scroll_residual, p.y / ch)?;
-                        Some((vertical_dir(up), n))
-                    }
-                }
-            }
-        }
+        let cell = self.win_cell_size(wid);
+        let ws = self.windows.get_mut(&wid)?;
+        wheel_notches_in(
+            delta,
+            cell,
+            &mut ws.scroll_residual_x,
+            &mut ws.scroll_residual,
+        )
     }
 
     /// `MouseWheel` -> when an app is tracking the mouse, report wheel up/down at the cell under the pointer.
@@ -5635,6 +5610,29 @@ impl App {
         delta: MouseScrollDelta,
         phase: TouchPhase,
     ) {
+        if self
+            .autopilot_menu
+            .as_ref()
+            .is_some_and(|menu| menu.wid == wid)
+        {
+            crate::input_hint::arm();
+            self.fence_pointer_license(wid);
+            let cell = self.win_cell_size(wid);
+            let menu = self
+                .autopilot_menu
+                .as_mut()
+                .expect("the menu owns this wheel event");
+            let notches = wheel_notches_in(
+                delta,
+                cell,
+                &mut menu.wheel_residual_x,
+                &mut menu.wheel_residual,
+            );
+            if let Some((dir, lines)) = notches {
+                self.autopilot_menu_wheel(wid, dir, lines);
+            }
+            return;
+        }
         self.on_mouse_wheel_inner(wid, delta);
         if matches!(delta, MouseScrollDelta::PixelDelta(_))
             && matches!(phase, TouchPhase::Ended | TouchPhase::Cancelled)
@@ -6035,6 +6033,34 @@ fn bank_scroll_lines(residual: &mut f64, delta: f64) -> Option<(bool, i32)> {
     *residual -= whole;
     let n = whole.abs() as i32;
     (n > 0).then_some((whole > 0.0, n))
+}
+
+/// Apply the same units and axis policy to independently owned gesture banks.
+fn wheel_notches_in(
+    delta: MouseScrollDelta,
+    (cw, ch): (usize, usize),
+    horizontal: &mut f64,
+    vertical: &mut f64,
+) -> Option<(WheelDir, i32)> {
+    let (axis, x, y) = match delta {
+        MouseScrollDelta::LineDelta(x, y) => (
+            wheel_axis(f64::from(x), f64::from(y), 0.0)?,
+            f64::from(x),
+            f64::from(y),
+        ),
+        MouseScrollDelta::PixelDelta(p) => (
+            wheel_axis(p.x, p.y, f64::EPSILON)?,
+            p.x / cw.max(1) as f64,
+            p.y / ch.max(1) as f64,
+        ),
+    };
+    match axis {
+        WheelAxis::Horizontal => bank_scroll_lines(horizontal, x)
+            .map(|(positive, lines)| (horizontal_dir(positive), lines)),
+        WheelAxis::Vertical => {
+            bank_scroll_lines(vertical, y).map(|(up, lines)| (vertical_dir(up), lines))
+        }
+    }
 }
 
 fn pet_wake_wanted(

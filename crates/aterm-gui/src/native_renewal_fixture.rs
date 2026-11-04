@@ -25,12 +25,16 @@ pub struct NativeRenewalFixture {
     pub cwd: PathBuf,
     pub auth_path: PathBuf,
     pub successor_auth_path: Option<PathBuf>,
+    #[serde(default)]
+    pub additional_auth_paths: Vec<PathBuf>,
     pub args: Vec<String>,
     pub env: std::collections::BTreeMap<String, String>,
     pub guardian_socket: Option<PathBuf>,
     pub adopt: Option<NativeRenewalAdoption>,
     pub human_grace_s: Option<u32>,
     pub continue_policy: Option<bool>,
+    #[serde(default)]
+    pub weekly_quota: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -334,6 +338,10 @@ pub fn run_native_renewal_host_fixture(config: NativeRenewalFixture) -> Result<(
             .successor_auth_path
             .as_ref()
             .is_some_and(|path| !path.starts_with(&config.root))
+        || config
+            .additional_auth_paths
+            .iter()
+            .any(|path| !path.starts_with(&config.root))
     {
         return Err("fixture paths must remain in the owned root".into());
     }
@@ -351,17 +359,50 @@ pub fn run_native_renewal_host_fixture(config: NativeRenewalFixture) -> Result<(
     std::fs::create_dir_all(roster.parent().ok_or("fixture roster parent")?)
         .map_err(|e| e.to_string())?;
     if config.adopt.is_none() {
-        aterm_uds::atomic_file::write(
-            &roster,
-            format!(
-                "[[account]]\nlabel='main'\nclass='dedicated'\ndir={}\nemail={}\n",
-                aterm_toml::Value::from(old_home.to_str().ok_or("fixture old home")?),
-                aterm_toml::Value::from(email.as_str())
-            )
-            .as_bytes(),
-            0o600,
-        )
-        .map_err(|e| e.to_string())?;
+        let mut roster_text = format!(
+            "[[account]]\nlabel='main'\nclass='dedicated'\ndir={}\nemail={}\n",
+            aterm_toml::Value::from(old_home.to_str().ok_or("fixture old home")?),
+            aterm_toml::Value::from(email.as_str()),
+        );
+        if config.weekly_quota {
+            let next = config
+                .successor_auth_path
+                .as_ref()
+                .ok_or("quota fixture successor")?;
+            for (index, auth_path) in std::iter::once(next)
+                .chain(config.additional_auth_paths.iter())
+                .enumerate()
+            {
+                let home = auth_path.parent().ok_or("quota fixture successor")?;
+                let email = aterm_agent::harness::codex_app_login::read_account_email(home)
+                    .ok_or("quota fixture successor email")?;
+                let label = if index == 0 {
+                    "target".into()
+                } else {
+                    format!("target-{index}")
+                };
+                roster_text.push_str(&format!(
+                    "\n[[account]]\nlabel={label:?}\nclass='dedicated'\ndir={}\nemail={}\n",
+                    aterm_toml::Value::from(home.to_str().ok_or("quota fixture successor path")?),
+                    aterm_toml::Value::from(email.as_str()),
+                ));
+            }
+            let path = env.config.as_deref().ok_or("quota fixture config")?;
+            aterm_uds::atomic_file::write(path, format!(
+                "[harness]\naccounts='early'\nrelaunch=true\nresume_limits=true\nhuman_grace_s={}\n",
+                config.human_grace_s.unwrap_or(0),
+            ).as_bytes(), 0o600).map_err(|e| e.to_string())?;
+        }
+        aterm_uds::atomic_file::write(&roster, roster_text.as_bytes(), 0o600)
+            .map_err(|e| e.to_string())?;
+        if config.weekly_quota {
+            env.accounts_store_for(aterm_agent::harness::accounts::Cli::Codex)
+                .ok_or("quota fixture store")?
+                .transact(env.now, &mut None, |state| {
+                    state.active = Some("main".into());
+                    Ok(Vec::new())
+                })?;
+        }
     }
 
     let mut builder = crate::quiet_driver_event_loop_builder::<Wake>();
@@ -485,6 +526,11 @@ pub fn run_native_renewal_host_fixture(config: NativeRenewalFixture) -> Result<(
             images: vec![image],
         }],
         aterm_agent::supervise::SupervisorConfig {
+            accounts: if config.weekly_quota {
+                aterm_agent::harness::accounts::Mode::Early
+            } else {
+                aterm_agent::supervise::SupervisorConfig::default().accounts
+            },
             continue_policy: config.continue_policy.unwrap_or(false),
             human_grace_s: config.human_grace_s.unwrap_or(0),
             ..Default::default()
@@ -493,6 +539,17 @@ pub fn run_native_renewal_host_fixture(config: NativeRenewalFixture) -> Result<(
     )
     .map_err(str::to_owned)?
     .with_renewal_fault_root(config.root.clone());
+    let policy = if config.weekly_quota {
+        let root = config.root.join("fixture-ca.der");
+        let metadata = std::fs::symlink_metadata(&root).map_err(|_| "fixture TLS root missing")?;
+        if !metadata.is_file() || metadata.len() > 64 * 1024 {
+            return Err("fixture TLS root invalid".into());
+        }
+        let der = std::fs::read(root).map_err(|_| "fixture TLS root unreadable")?;
+        policy.with_quota_rotation().with_quota_roots(vec![der])
+    } else {
+        policy
+    };
     let ctx = Arc::get_mut(&mut handle.ctx).ok_or("fixture shared too soon")?;
     ctx.sink = Arc::new(aterm_session::sink::SinkWriter::new(master));
     ctx.install_fixture_policy(policy)
@@ -747,6 +804,15 @@ pub fn run_native_renewal_host_fixture(config: NativeRenewalFixture) -> Result<(
                 && !config.root.join("renewed").exists()
                 && let Some(next) = &config.successor_auth_path
             {
+                if config.weekly_quota {
+                    aterm_uds::atomic_file::write(
+                        &config.root.join("renewed"),
+                        b"quota-probe-open\n",
+                        0o600,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    continue;
+                }
                 let next_home = next.parent().ok_or("fixture successor home")?;
                 let identity = aterm_agent::harness::codex_app_login::renewal_identity(old_home)
                     .ok_or("fixture old identity")?;

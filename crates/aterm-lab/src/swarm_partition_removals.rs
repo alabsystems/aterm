@@ -20,9 +20,11 @@
 //! The removals are the aterm under test's CLI in each Mac's world. Between acts the lab carries
 //! every Mac's records to every other ([`client::save_records`]), as the subscribers' pulls
 //! would, so no act waits on a pull. The tender runs in each Mac's agent on the wall clock,
-//! ranked so one Mac mints at once and the next a gap step (60 s) later; the lab runs the
-//! tender's pass itself at a clock [`TEND_AHEAD`] gap steps on, so the rank spread does not hold
-//! the lane, round the Macs until none finds a rotation due ([`TEND_ROUNDS`] rounds at most).
+//! ranked so one Mac mints at once and the next a gap step (60 s) later, and a Mac that removed
+//! no one waits a ten-step grace on a removal's re-key; the lab runs the tender's pass itself
+//! at a clock [`TEND_AHEAD`] gap steps further on each round, so neither the grace nor the rank
+//! spread holds the lane, round the Macs until none can carry a re-key due ([`TEND_ROUNDS`]
+//! rounds at most).
 //!
 //! Then F21's split (§4.1 F21): the lab cuts island A (a1, a2, a3) off from island B (b1, b2,
 //! b3) again with the lane's own cut ([`split::Cut`]), which every process of each island
@@ -56,7 +58,7 @@ use std::time::Instant;
 
 use aterm_secrets::age::Recipient;
 use aterm_secrets::client::{self, Paths};
-use aterm_secrets::membership_log::{Log, MemberId, RecordId};
+use aterm_secrets::membership_log::{EpochAudience, Log, MemberId, RecordId};
 use aterm_secrets::text::Audience;
 
 use super::commons::Mac;
@@ -70,7 +72,7 @@ const PUTTER: &str = "a2";
 pub const VALUE_NAME: &str = "f16-after-undo";
 /// The value: synthetic.
 const VALUE: &[u8] = b"f16 lab value put after the quorum undo";
-/// How many gap steps on the lab runs the tender's pass.
+/// How many gap steps further on each round of the lab's tender pass runs.
 const TEND_AHEAD: u64 = 10;
 /// The most rounds of the tender's pass round every Mac.
 const TEND_ROUNDS: usize = 4;
@@ -113,7 +115,8 @@ pub struct MacEnd {
     pub undone: bool,
     /// Its log has b2 out by a quorum.
     pub remover_out_by_quorum: bool,
-    /// It finds a rotation due (two newest epochs, or a newest one wrapped to a Mac now out).
+    /// It can carry a re-key due ([`Log::rekey_dues`]: two newest epochs, or a newest one wrapped
+    /// to a Mac now out).
     pub rotation_due: bool,
     /// It reads the value, as it was put.
     pub reads_value: bool,
@@ -169,7 +172,7 @@ pub struct KeptEnd {
     pub keyed: bool,
     /// Its log finds b3's epoch covered by a full reseal.
     pub covered: bool,
-    /// It finds a rotation or a reseal due.
+    /// It can carry a rotation or a reseal due ([`Log::rekey_dues`]).
     pub rotation_due: bool,
 }
 
@@ -755,14 +758,15 @@ fn drive(
         }
     }
 
-    // The tender's pass, at a clock TEND_AHEAD gap steps on, until no Mac finds a rotation due.
-    let ahead = aterm_time::unix_millis()
-        .unwrap_or(0)
-        .saturating_add(TEND_AHEAD * GAP_STEP_MS);
+    // The tender's pass, at a clock TEND_AHEAD gap steps further on each round, until no Mac
+    // can carry a re-key due.
+    let base = aterm_time::unix_millis().unwrap_or(0);
     for round in 1..=TEND_ROUNDS {
         if !macs.iter().any(|m| rotation_due(&m.paths)) {
             break;
         }
+        let steps = u64::try_from(round).unwrap_or(u64::MAX) * TEND_AHEAD;
+        let ahead = base.saturating_add(steps.saturating_mul(GAP_STEP_MS));
         for m in macs {
             if let Ok(signed) = client::tend_epochs_at(&m.paths, ahead)
                 && !signed.is_empty()
@@ -1041,7 +1045,7 @@ fn keyed_write(
                 .collect();
             end.member = active.contains(&me);
             end.cut_member = membership.contains(&cut_actor);
-            end.rotation_due = end.member && log.rotation_due(&me, &active);
+            end.rotation_due = end.member && carries_rekey(&log, &me);
             let keyed = log
                 .keyed_epochs()
                 .into_iter()
@@ -1153,13 +1157,23 @@ fn rotation_due(paths: &Paths) -> bool {
     let (Some(log), Some(me)) = (log_of(paths), recipient_of(paths)) else {
         return false;
     };
+    carries_rekey(&log, &me)
+}
+
+/// Whether the member `me` names can carry a re-key `log` has due for `[everyone]` or Commons
+/// ([`Log::rekey_dues`]).
+fn carries_rekey(log: &Log, me: &Recipient) -> bool {
     let membership = log.membership();
-    let active: std::collections::BTreeSet<Recipient> = membership
-        .members()
-        .values()
-        .map(|m| m.binding.recipient())
-        .collect();
-    active.contains(&me) && log.rotation_due(&me, &active)
+    log.rekey_dues().iter().any(|due| {
+        matches!(
+            due.audience,
+            EpochAudience::Everyone | EpochAudience::Commons
+        ) && due.carriers.iter().any(|actor| {
+            membership
+                .get(actor)
+                .is_some_and(|m| m.binding.recipient() == *me)
+        })
+    })
 }
 
 fn read_end(m: &Mac, remover: &MemberId) -> MacEnd {
@@ -1182,14 +1196,7 @@ fn read_end(m: &Mac, remover: &MemberId) -> MacEnd {
         .any(|member| member.binding.recipient() == me);
     end.undone = membership.quorums().iter().any(|q| q.member == *remover);
     end.remover_out_by_quorum = membership.removal(remover).is_some_and(|r| r.quorum);
-    end.rotation_due = end.member && {
-        let active = membership
-            .members()
-            .values()
-            .map(|member| member.binding.recipient())
-            .collect();
-        log.rotation_due(&me, &active)
-    };
+    end.rotation_due = end.member && carries_rekey(&log, &me);
     end.reads_value = log
         .open_audience_entries(&identity)
         .ok()

@@ -527,6 +527,15 @@ fn the_report_and_its_doctor_say_what_the_broker_says_of_its_log() {
         Some(u64::from(broker.pid())),
         "{out}"
     );
+    // The broker process's flush tally, each kind its own count, as the holds row quotes it.
+    for kind in ["full", "barrier", "plain"] {
+        assert!(
+            health["snapshot"]["process_flushes"][kind]
+                .as_u64()
+                .is_some(),
+            "{kind} in {out}"
+        );
+    }
     assert!(ours(&v).is_empty(), "{out}");
     let (_, doctor, _) = fabric(&s, Some(&cmd), &["doctor"]);
     assert!(

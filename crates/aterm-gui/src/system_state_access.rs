@@ -584,7 +584,9 @@ pub(crate) fn lan_ask(interfaces: &[LanInterface], ipv6_network: bool) -> Option
 /// `status`'s `setup=` (pure): where this Mac's setup stands, from the last status the worker
 /// published (its progress record and its prompt-free readings), so a `status` costs no probe.
 /// `pending:<row,...>` names each managed row that needs a person, waits, failed or, while the
-/// run goes, still differs (`fda`, `devtools`, `vault`, … [`setup_word`]); `done` once the plan
+/// run goes, still differs (`fda`, `devtools`, `vault`, … [`setup_word`]), then `;needs:<row,...>`
+/// for those of them that wait on a person's press (their reading is Needs you), so a reader
+/// tells a press from a wait without the page; `done` once the plan
 /// finished or a person cancelled it with none of those left, or once System State's headline
 /// says this Mac is set up ([`crate::system_state::Headline::set_up`]) before its run finished,
 /// nothing left for anyone to do now; then `;asking:<row,...>` names each stage the run's last
@@ -600,6 +602,7 @@ pub(crate) fn setup_field(status: &SetupStatus) -> String {
         .map_or_else(Selection::none, |plan| plan.selection);
     let ended = status.finished || status.cancelled;
     let mut pending: Vec<&str> = Vec::new();
+    let mut needs: Vec<&str> = Vec::new();
     for observation in
         status.observations_for(status.plan.as_ref().map(|plan| plan.vault_url.as_str()))
     {
@@ -610,11 +613,13 @@ pub(crate) fn setup_field(status: &SetupStatus) -> String {
             _ => false,
         };
         let word = setup_word(observation.subject);
-        if left
-            && crate::system_state::manages(selection, observation.subject)
-            && !pending.contains(&word)
-        {
-            pending.push(word);
+        if left && crate::system_state::manages(selection, observation.subject) {
+            if !pending.contains(&word) {
+                pending.push(word);
+            }
+            if observation.standing == Standing::NeedsYou && !needs.contains(&word) {
+                needs.push(word);
+            }
         }
     }
     // What the page says: a run going, a step that waits or failed, or a row not read yet keeps
@@ -638,7 +643,12 @@ pub(crate) fn setup_field(status: &SetupStatus) -> String {
         }
     };
     if !pending.is_empty() {
-        format!("pending:{}", pending.join(","))
+        let needs = if needs.is_empty() {
+            String::new()
+        } else {
+            format!(";needs:{}", needs.join(","))
+        };
+        format!("pending:{}{needs}", pending.join(","))
     } else if ended {
         format!("done{}", offered())
     } else if set_up() {

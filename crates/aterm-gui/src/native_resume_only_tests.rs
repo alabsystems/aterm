@@ -93,8 +93,10 @@ fn world_with_retirement(local: u64, retired: bool) -> World {
         )];
     }
     let root = recovery::Receipt {
+        destination: None,
         id: original.id.clone(),
         intent: recovery::Intent {
+            purpose: Default::default(),
             thread: "019a4b54-5fa1-7123-8123-123456789abc".into(),
             wall: "019a4b54-5fa2-7123-8123-123456789abc".into(),
             identity,

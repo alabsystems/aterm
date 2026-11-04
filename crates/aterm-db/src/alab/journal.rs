@@ -25,6 +25,7 @@
 
 pub mod event;
 pub mod place;
+pub mod seen;
 pub mod spool;
 
 pub(crate) mod book;

@@ -20,21 +20,11 @@ const PEER_BUDGET: Duration = Duration::from_secs(2);
 /// Hard cap on one reply line — a facts row is a few hundred bytes; a
 /// newline-less flood hits this long before the budget matters.
 const MAX_LINE_BYTES: u64 = 64 * 1024;
-/// Reply line-count cap: a header claiming more is REFUSED (not clamped — a
-/// clamp would leave unread lines desyncing every later reply).
+/// Maximum session rows accepted from one peer; account facts have no row quota.
 const MAX_SESSIONS_PER_PEER: usize = 1024;
-/// The lines a reply's facts carry beside its sessions, at most: an `account`
-/// line for each row of every pooled CLI's roster, full, and the
-/// `server_heard` lines of a vault it serves.
-const MAX_FACTS_LINES: usize = aterm_agent::harness::accounts::Cli::ALL.len()
-    * aterm_agent::harness::accounts::MAX_ACCOUNTS
-    + MAX_HEARD_LINES;
-/// The `server_heard` lines of one vault ([`MAX_FACTS_LINES`]).
-#[cfg(unix)]
-const MAX_HEARD_LINES: usize = aterm_secrets::server::MAX_HEARD;
-/// No vault is served off unix.
-#[cfg(not(unix))]
-const MAX_HEARD_LINES: usize = 0;
+/// Bound an entire survey reply by bytes, rather than assuming an account count.
+/// Each line contains at least its newline, so this also bounds the frame count.
+const MAX_REPLY_BYTES: usize = 8 * 1024 * 1024;
 
 /// One scan at a time: menu-open spam coalesces onto the in-flight scan (its
 /// result is at most a menu-track old, and the NEXT open kicks a fresh one).
@@ -293,7 +283,7 @@ fn summarize_peer_within(pid: u32, sock: &str, budget: Duration) -> Option<Sibli
         .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))?
         .parse()
         .ok()?;
-    if count > MAX_SESSIONS_PER_PEER + 1 + MAX_FACTS_LINES {
+    if count > MAX_REPLY_BYTES {
         // Refuse, never clamp: reading fewer lines than the peer sent would
         // leave the leftovers desyncing every later reply on this stream.
         return None;
@@ -301,10 +291,18 @@ fn summarize_peer_within(pid: u32, sock: &str, budget: Duration) -> Option<Sibli
     let mut sessions = 0;
     let mut needs = Vec::new();
     let mut published = true;
+    let mut bytes = 0usize;
     for _ in 0..count {
         let line = read_bounded_line(&stream, &mut reader, deadline)?;
+        bytes = bytes.checked_add(line.len())?;
+        if bytes > MAX_REPLY_BYTES {
+            return None;
+        }
         if let Some((need, publishes)) = parse_session_row(&line) {
             sessions += 1;
+            if sessions > MAX_SESSIONS_PER_PEER {
+                return None;
+            }
             published &= publishes;
             needs.extend(need);
         }
@@ -472,12 +470,16 @@ mod tests {
             let sock = dir.join("peer.sock");
             std::fs::write(dir.join("aterm.token"), "feedbeef\n").unwrap();
             let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+            let accounts: String = (0..8192)
+                .map(|i| format!("account cli=codex label=account-{i} condition=usable\n"))
+                .collect();
             let reply = format!(
-                "OK 4\ninstance pid=9 host=h version=1 sessions=3 level=facts cut=0\n\
+                "OK {}\ninstance pid=9 host=h version=1 sessions=3 level=facts cut=0\n\
                  session local=0 sid=s-op state=alive program=zsh role=- attention=1{needs}\n\
                  session local=1 sid=s-w state=alive program=zsh role=- attention=-{}\n\
-                 session local=2 sid=s-x state=exited program=zsh role=- attention=-{needs}\n",
-                if published { " needs=-" } else { "" }
+                 session local=2 sid=s-x state=exited program=zsh role=- attention=-{needs}\n{accounts}",
+                4 + 8192,
+                if published { " needs=-" } else { "" },
             );
             let server = std::thread::spawn(move || {
                 let (conn, _) = listener.accept().unwrap();

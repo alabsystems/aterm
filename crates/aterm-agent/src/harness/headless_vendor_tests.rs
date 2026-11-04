@@ -444,6 +444,50 @@ const SINCE: i64 = 1_792_790_000;
 /// Fri, 23 Oct 2026 23:20:00 +0000: after [`SINCE`].
 const AFTER: &str = "Fri, 23 Oct 2026 23:20:00 +0000";
 
+#[test]
+fn codex_and_claude_share_the_mailbox_reader_with_separate_sender_scopes() {
+    use super::super::accounts::Cli;
+    let recipient = "owner@proton.me";
+    let message = |sender: &str, code: &str| {
+        format!(
+            "From: {sender}\r\nTo: {recipient}\r\nDate: {AFTER}\r\nSubject: Sign-in verification\r\n\r\nYour verification code is {code}.\r\n"
+        )
+    };
+    let anthropic = message("login@anthropic.com", "123456");
+    let openai = message("noreply@tm.openai.com", "654321");
+    for order in [[Cli::Claude, Cli::Codex], [Cli::Codex, Cli::Claude]] {
+        let (root, maildir) = maildir_with(&[("claude.eml", &anthropic), ("codex.eml", &openai)]);
+        let mailbox = MailboxConfig {
+            dir: Some(maildir),
+            seen_file: Some(root.path().join("seen")),
+            since: Some(SINCE),
+            ..Default::default()
+        };
+        for cli in order {
+            let approver = VendorApprover::with_mailbox(
+                cli,
+                "shared-reader",
+                root.path(),
+                root.path(),
+                mailbox.clone(),
+            );
+            let expected = if cli == Cli::Codex {
+                "654321"
+            } else {
+                "123456"
+            };
+            assert_eq!(
+                poll_mailbox_config_for_credential(
+                    approver.mailbox.as_ref().expect("shared mailbox"),
+                    Some(recipient),
+                    aterm_spec::wait::MUST_HAPPEN,
+                ),
+                Ok(MailboxCredential::Otp(expected.into())),
+            );
+        }
+    }
+}
+
 /// A vendor sign-in's mailbox read takes the vendor's own mail sent after the sign-in began,
 /// and nothing else: another service's code is never typed into the vendor's page, nor marked
 /// consumed.

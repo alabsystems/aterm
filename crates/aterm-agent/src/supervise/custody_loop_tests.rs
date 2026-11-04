@@ -896,6 +896,420 @@ fn a_held_line_drawn_in_a_busy_spell_is_handed_back_to_its_writer() {
     }
 }
 
+/// A Claude Code permission box after `said`, drawn where the composer was, as Claude Code draws
+/// one: no composer shows under it, so no read can say what the composer holds while it stands.
+fn boxed(said: &str) -> Vec<String> {
+    rows(&[
+        &format!("⏺ {said}"),
+        "",
+        "⏺ Bash(git log --oneline -5)",
+        "",
+        &"─".repeat(120),
+        " Bash command",
+        "",
+        "   git log --oneline -5",
+        "   Show the five most recent commits",
+        "",
+        " Do you want to proceed?",
+        " ❯ 1. Yes",
+        "   2. Yes, and don’t ask again for: git log *",
+        "   3. No",
+        "",
+        " Esc to cancel · Tab to amend",
+    ])
+}
+
+/// A HELD LINE DRAWN UNDER A READ THAT CANNOT SAY IS HANDED BACK TO ITS WRITER ONCE A READ CAN
+/// (ATERM-KI-1101-3): the worker read the continuation and drew none of it, so it is held; a turn
+/// of its own then runs and the line draws in its composer, but the read the busy spell ends on
+/// cannot say what the composer holds: a permission box stands over it at the point, or, at a
+/// break of the spell, the composer's glyph cell is unread. Such a read is no evidence for the
+/// turn's settle either: the line stands held, the turn's evidence kept, and the box is answered
+/// as any box is, the custody holding none of it (handed to the person, or, with the person's
+/// quiet read stamped, pressed by the loop: its digit goes while the line stands held). Once a
+/// read can say, the composer shows the line, which is handed back: `is drawn`, never `went with
+/// a turn`, entered once as the act that wrote it, never waited on as a person's draft or written
+/// twice. Negative control by mutation: `custody::Line::turned` taking a read that cannot say for
+/// one that shows none of the line (the planted `CustodyTurnUnreadable`, armed always): `went
+/// with a turn` at the box or the break, and the drawn line waited on as a person's draft, never
+/// entered.
+#[test]
+fn a_held_line_drawn_under_a_read_that_cannot_say_is_handed_back_once_one_can() {
+    const OTHER: &str = "Ran the suite again; one failure left.";
+    for (tag, spell, unread, quiet) in [
+        (
+            "boxed-at-point",
+            vec![busy_screen(), boxed(OTHER), typed_in(OTHER, LINE)],
+            None,
+            false,
+        ),
+        (
+            "boxed-answered-at-point",
+            vec![busy_screen(), boxed(OTHER), typed_in(OTHER, LINE)],
+            None,
+            true,
+        ),
+        (
+            "unread-at-break",
+            vec![busy_screen(), break_with(LINE), typed_in(OTHER, LINE)],
+            Some(3),
+            false,
+        ),
+    ] {
+        let run = lost_run(tag, spell, "relaunched", |m, policy| {
+            policy.human_grace_s = 120;
+            m.unmoved_after_send = Some(Duration::from_secs(65));
+            for at in [3, 4] {
+                m.screen_cols.insert(at, 2 + LINE.len());
+                m.cell_attrs_on.insert(at, "none");
+            }
+            m.cell_unread_on.extend(unread);
+            if quiet {
+                // Every read stamped quiet: the box's digit is the loop's to press.
+                m.human = vec!["null"];
+            }
+        });
+        let (t, noted) = (&run.t, &run.noted);
+        let pressed =
+            t.m.requests
+                .iter()
+                .any(|r| r.starts_with("key ") && r.contains("git\\x20log") && r.ends_with(" 1"));
+        assert_eq!(
+            pressed,
+            quiet,
+            "{tag}: the box answered by the loop where the read is stamped quiet: {}",
+            t.evidence()
+        );
+        assert!(held_formed(noted).is_some(), "{tag}: held: {noted:#?}");
+        assert!(
+            settled(noted, Settles::Drawn) && !settled(noted, Settles::Turn),
+            "{tag}: drawn, not gone with the turn: {noted:#?}\n{}",
+            t.evidence()
+        );
+        assert!(
+            !noted.iter().any(|l| l.starts_with("WAITING ")
+                && l.contains(crate::supervise::policy::turn_end::PERSON_TYPING)),
+            "{tag}: the loop's own line, no person's draft: {noted:#?}"
+        );
+        assert_eq!(
+            (lines_sent(t), t.enters().len()),
+            (1, 1),
+            "{tag}: written once, entered once: {noted:#?}\n{}",
+            t.evidence()
+        );
+        assert!(run.host.said("restart:").is_empty(), "{tag}: {noted:#?}");
+    }
+}
+
+/// A TURN'S EVIDENCE KEPT UNDER A BOX SETTLES A DROPPED LINE AT THE NEXT READ THAT CAN SAY
+/// (ATERM-KI-1101-3): the worker read the continuation and drew none of it, so it is held; a turn
+/// of its own runs and ends on a permission box over the composer, which keeps the turn's evidence
+/// as it stands; the box goes with no turn read running after it, and the point it leaves shows the
+/// composer empty. That point's look weighs the kept turn on its read and one `status` read:
+/// `went with a turn`, so the point writes afresh, entered once, and no restart in place is asked
+/// for a line a turn ran after. Negative control by mutation: the kept turn dropped from
+/// `Session::custody_look_on`: the line read and undrawn a minute on is restarted for
+/// (`restart:input-lost`).
+#[test]
+fn a_turn_kept_under_a_box_settles_a_dropped_line_once_a_read_can_say() {
+    const OTHER: &str = "Ran the suite again; one failure left.";
+    let run = lost_run(
+        "boxed-then-dropped",
+        vec![
+            busy_screen(),
+            boxed(OTHER),
+            ended(OTHER),
+            typed_in(OTHER, LINE),
+        ],
+        "relaunched",
+        |m, _| {
+            m.unmoved_after_send = Some(Duration::from_secs(65));
+            // The empty point stands past the read line's minute, so a gate that lost the turn
+            // reads it again at rest.
+            m.stands.insert(4, Duration::from_secs(30));
+            m.screen_cols.insert(5, 2 + LINE.len());
+            m.cell_attrs_on.insert(5, "none");
+        },
+    );
+    let (t, noted) = (&run.t, &run.noted);
+    assert!(held_formed(noted).is_some(), "held: {noted:#?}");
+    assert!(
+        settled(noted, Settles::Turn),
+        "the kept turn settled it: {noted:#?}\n{}",
+        t.evidence()
+    );
+    assert!(
+        run.host.said("restart:").is_empty(),
+        "no restart for a line a turn ran after: {noted:#?}"
+    );
+    assert_eq!(
+        (lines_sent(t), t.enters().len()),
+        (2, 1),
+        "written afresh at the point, entered once: {noted:#?}\n{}",
+        t.evidence()
+    );
+}
+
+/// What a line held after a turn read running comes to on one read, `rows` with the cursor past
+/// `typed`, taken at the point a busy spell ends on (`Session::custody_after_work`) or at a break
+/// of its own background work (`Session::host_steps_in_background`), every `cell` read failing
+/// where `unread`: whether it stands held, and the journal.
+fn turn_read_on(
+    rows: Vec<String>,
+    typed: &str,
+    unread: bool,
+    at_break: bool,
+) -> (bool, Vec<String>) {
+    let mut m = Mock::new(vec![
+        busy_screen(),
+        ended(SAID),
+        typed_in(SAID, LINE),
+        busy_screen(),
+    ]);
+    m.gen_fence = true;
+    m.sends_gen = true;
+    m.human_seq = Some(0);
+    m.help = FENCED_HELP.to_string();
+    m.unmoved_after_send = Some(Duration::from_secs(120));
+    m.cell_attrs = "none";
+    m.cell_unreadable = unread;
+    let mut s = virtual_session(&mut m, None);
+    s.setup.background_settle = Duration::ZERO;
+    let point = s.await_turn(Duration::from_secs(60)).expect("the turn end");
+    let mut heard = Heard::default();
+    s.type_text_written(&point, LINE, RULE_CONTINUE, &mut heard)
+        .expect("the act");
+    assert!(s.custody.is_some(), "held: {:#?}", heard.noted);
+    let seq = point.screen.seq + 10;
+    s.took(seq, None, &mut heard);
+    let screen = Screen {
+        seq,
+        cursor_col: 2 + typed.chars().count(),
+        human_seq: Some(0),
+        ..read_screen(rows)
+    };
+    if at_break {
+        let mut since = None;
+        s.host_steps_in_background(&screen, &mut since, None, &mut heard)
+            .expect("the break's step");
+    } else {
+        let turn = s.turn_of(screen);
+        s.custody_after_work(&turn, &mut heard)
+            .expect("the point's look");
+    }
+    let held = s.custody.is_some();
+    drop(s);
+    (held, heard.noted)
+}
+
+/// EVERY READ THAT CANNOT SAY WHAT THE COMPOSER HOLDS LEAVES A LINE HELD AFTER A TURN AS IT
+/// STANDS (ATERM-KI-1101-3, [`Session::custody_turned`]): at the point a busy spell ends on, a box
+/// over the composer, no composer drawn, and the line drawn under a glyph cell unread; at a break,
+/// the line drawn under a glyph cell unread. None settles it (`went with a turn`), as a read that
+/// shows none of the line does once `status` reads the input clear. Controls: that read settles
+/// it at the point and at the break, and a read that shows the line settles it drawn.
+#[test]
+fn a_read_that_cannot_say_leaves_a_line_held_after_a_turn_as_it_stands() {
+    const OTHER: &str = "Ran the suite again; one failure left.";
+    let mut bare = ended(OTHER);
+    bare.truncate(4);
+    for (tag, rows, typed, unread, at_break) in [
+        ("boxed-at-point", boxed(OTHER), "", false, false),
+        ("no-composer-at-point", bare, "", false, false),
+        ("unread-at-point", typed_in(OTHER, LINE), LINE, true, false),
+        ("unread-at-break", break_with(LINE), LINE, true, true),
+    ] {
+        let (held, noted) = turn_read_on(rows, typed, unread, at_break);
+        assert!(
+            held && !noted.iter().any(|l| l.contains(LINE_SETTLED)),
+            "{tag}: held as it stands: {noted:#?}"
+        );
+    }
+    for (tag, at_break) in [("none-at-point", false), ("none-at-break", true)] {
+        let rows = if at_break {
+            break_with("")
+        } else {
+            ended(OTHER)
+        };
+        let (held, noted) = turn_read_on(rows, "", false, at_break);
+        assert!(
+            !held && settled(&noted, Settles::Turn),
+            "{tag}: went with the turn: {noted:#?}"
+        );
+    }
+    let (held, noted) = turn_read_on(typed_in(OTHER, LINE), LINE, false, false);
+    assert!(
+        !held && settled(&noted, Settles::Drawn),
+        "drawn: {noted:#?}"
+    );
+}
+
+/// A TURN KEPT UNDER A BOX IS WEIGHED AT THE NEXT POINT'S LOOK, WHATEVER THAT POINT DECIDES
+/// (ATERM-KI-1101-3, [`Session::custody_look`]): the worker read the continuation and drew none of
+/// it, so it is held; a turn of its own runs and the busy spell ends on a permission box over the
+/// composer, which keeps the turn's evidence; the box goes with no turn read running after it, and
+/// the new point's read shows the composer empty, `status` reading the input clear. That point's
+/// look weighs the kept turn (`went with a turn`) before the policy decides anything, so the host
+/// offered the point is told no line is held whether or not the point writes a line (only a line's
+/// write reaches the gate). Controls: the box still over the composer at that point keeps the line
+/// held; with no turn read running since the write, the empty composer settles nothing. Negative
+/// controls: the point's look a look alone, as before (the kept turn weighed only at a spell's end,
+/// a break and the gate), and by mutation the kept turn dropped from `Session::custody_look_on`:
+/// the line stands held at the empty point (`LineHeld::Stands`), as the host is told.
+#[test]
+fn a_turn_kept_under_a_box_is_weighed_at_the_next_points_look() {
+    const OTHER: &str = "Ran the suite again; one failure left.";
+    for (tag, then, ran, settles) in [
+        ("box-gone", ended(OTHER), true, true),
+        ("box-stands", boxed(OTHER), true, false),
+        ("no-turn", ended(OTHER), false, false),
+    ] {
+        let mut m = Mock::new(vec![
+            busy_screen(),
+            ended(SAID),
+            typed_in(SAID, LINE),
+            busy_screen(),
+        ]);
+        m.gen_fence = true;
+        m.sends_gen = true;
+        m.human_seq = Some(0);
+        m.help = FENCED_HELP.to_string();
+        m.unmoved_after_send = Some(Duration::from_secs(120));
+        m.cell_attrs = "none";
+        let opts = SuperviseOpts {
+            policy: SupervisorConfig {
+                human_grace_s: 0,
+                ..owners_policy()
+            },
+            ..auto(900)
+        };
+        let mut s = virtual_session(&mut m, None);
+        s.setup.background_settle = Duration::ZERO;
+        let point = s.await_turn(Duration::from_secs(60)).expect("the turn end");
+        let mut heard = Heard::default();
+        s.type_text_written(&point, LINE, RULE_CONTINUE, &mut heard)
+            .expect("the act");
+        assert!(s.custody.is_some(), "{tag}: held: {:#?}", heard.noted);
+        let seq = point.screen.seq + 10;
+        if ran {
+            s.took(seq, None, &mut heard);
+        }
+        let at_box = Screen {
+            seq,
+            cursor_col: 2,
+            human_seq: Some(0),
+            ..read_screen(boxed(OTHER))
+        };
+        let spell_end = s.turn_of(at_box);
+        s.custody_after_work(&spell_end, &mut heard)
+            .expect("the spell's end");
+        assert_eq!(
+            s.custody_line_held(),
+            Some(LineHeld::Stands),
+            "{tag}: held under the box: {:#?}",
+            heard.noted
+        );
+        let next = Screen {
+            seq: seq + 1,
+            cursor_col: 2,
+            human_seq: Some(0),
+            ..read_screen(then)
+        };
+        let next = s.turn_of(next);
+        s.turn_end_looked(&next, None, &opts, &mut heard)
+            .expect("the point's decision");
+        let told = s.custody_line_held();
+        drop(s);
+        assert_eq!(
+            (told, settled(&heard.noted, Settles::Turn)),
+            if settles {
+                (None, true)
+            } else {
+                (Some(LineHeld::Stands), false)
+            },
+            "{tag}: the point's look: {:#?}",
+            heard.noted
+        );
+    }
+}
+
+/// A HELD LINE HOLDS THE SURVEY'S 0 UNTIL IT SETTLES (ATERM-KI-1101-3): Claude Code's rating card
+/// is open over an empty composer while the continuation is held. Its `0` is a loop writer's key
+/// like any other: queued behind a line the worker has yet to read, or pressed as a line it read
+/// draws, it may land in the composer beside the line. So it waits while the line is held, and goes
+/// once the custody settles. Negative control by mutation: the custody's hold dropped from
+/// `Session::survey`: the `0` pressed while the line is held.
+#[test]
+fn a_held_line_holds_the_surveys_0_until_it_settles() {
+    let card = with_survey(ended(SAID));
+    let mut m = Mock::new(vec![busy_screen(), ended(SAID), card.clone(), card]);
+    m.gen_fence = true;
+    m.sends_gen = true;
+    m.human_seq = Some(0);
+    m.help = FENCED_HELP.to_string();
+    m.unmoved_after_send = Some(Duration::from_secs(120));
+    m.cell_attrs = "none";
+    let opts = surveys(
+        SuperviseOpts {
+            policy: SupervisorConfig {
+                human_grace_s: 0,
+                ..owners_policy()
+            },
+            ..auto(900)
+        },
+        true,
+    );
+    let mut s = virtual_session(&mut m, None);
+    s.setup.background_settle = Duration::ZERO;
+    s.set_survey_settle(Duration::ZERO);
+    let point = s.await_turn(Duration::from_secs(60)).expect("the turn end");
+    let mut heard = Heard::default();
+    s.type_text_written(&point, LINE, RULE_CONTINUE, &mut heard)
+        .expect("the act");
+    assert!(s.custody.is_some(), "held: {:#?}", heard.noted);
+    // The screen moves on from the write's stand to the card.
+    s.fx.sleep(Duration::from_secs(130));
+    let read = s.screen().expect("the card's read");
+    assert!(
+        read.rows
+            .iter()
+            .any(|r| r.starts_with("● How is Claude doing")),
+        "the card: {:#?}",
+        read.rows
+    );
+    let at = s.turn_of(read);
+    let mut survey = Survey::Closed;
+    s.survey(&at, &opts, &mut survey, false, &mut heard)
+        .expect("the card's look");
+    assert_eq!(
+        survey,
+        Survey::Closed,
+        "the 0 waits on the line held: {:#?}",
+        heard.noted
+    );
+    s.custody_ended(at.screen.seq, Settles::Person, &mut heard);
+    s.survey(&at, &opts, &mut survey, false, &mut heard)
+        .expect("the card's look once the line settled");
+    drop(s);
+    assert!(
+        matches!(
+            survey,
+            Survey::Tried {
+                pressed: Some(_),
+                ..
+            }
+        ),
+        "the 0 goes once the line settled: {survey:?} {:#?}",
+        heard.noted
+    );
+    let zeros: Vec<&String> = m
+        .presses()
+        .into_iter()
+        .filter(|r| r.ends_with(" 0"))
+        .collect();
+    assert_eq!(zeros.len(), 1, "one 0: {:?}", m.requests);
+}
+
 /// A HELD LINE DRAWN AT A BREAK AND GONE BY THE POINT IS DRAWN, NEVER LOST (ATERM-KI-1101-3): the
 /// worker read the continuation and drew none of it, so it is held; at a break of its own
 /// background work the line draws in its composer, and by the point the spell ends on the
@@ -1137,4 +1551,162 @@ fn a_held_line_is_settled_at_a_break_by_what_settles_it_at_a_point() {
         "{:#?}",
         none.noted
     );
+}
+
+/// A DIALOG'S ANSWER GOES PAST A LINE HELD UNDER IT ONLY AFTER THE LINE IS KNOWN READ
+/// (ATERM-KI-1101-3, [`custody::answer_goes`]): with the continuation held in custody, and a turn
+/// read running after it or not, Claude Code's `/login` dialog over the composer gets the loop's
+/// fenced key only where `status` proved the line read. With no input word, the key is held: it
+/// may still sit behind the queued line. The line stays held for the read after a key that goes.
+#[test]
+fn a_dialogs_answer_only_after_the_held_line_is_known_read() {
+    use crate::supervise::policy::login::{RULE_LOGIN_DONE, RULE_LOGIN_OVER_LIMIT};
+    use aterm_phase::prompt::fixtures::{LOGIN_PICKER, LOGIN_SUCCESS, screen};
+    let success = screen(LOGIN_SUCCESS);
+    let row = success
+        .iter()
+        .find(|row| row.contains("Login successful"))
+        .expect("the success row")
+        .clone();
+    let confirm = TurnEndAction::Confirm {
+        rule_id: RULE_LOGIN_DONE,
+        row,
+    };
+    let cancel = TurnEndAction::Cancel {
+        rule_id: RULE_LOGIN_OVER_LIMIT,
+    };
+    for (tag, dialog, action, key) in [
+        ("login-done", success, confirm, "login-done@v1 enter at "),
+        (
+            "over-limit",
+            screen(LOGIN_PICKER),
+            cancel,
+            "login-over-limit@v1 esc at ",
+        ),
+    ] {
+        for (input, first_goes, input_by_write) in [
+            (INPUT_CLEAR, true, vec![]),
+            (
+                "input=- input_bytes=- input_wait_ms=- fg_rss_mb=-",
+                false,
+                vec![
+                    (
+                        ECHO_HANG + Duration::from_secs(100),
+                        "input=- input_bytes=- input_wait_ms=- fg_rss_mb=-",
+                    ),
+                    (Duration::MAX, INPUT_CLEAR),
+                ],
+            ),
+            (
+                INPUT_PENDING,
+                false,
+                vec![
+                    (ECHO_HANG + Duration::from_secs(100), INPUT_PENDING),
+                    (Duration::MAX, INPUT_CLEAR),
+                ],
+            ),
+            (
+                "read-then-pending",
+                false,
+                vec![
+                    (Duration::from_secs(30), INPUT_CLEAR),
+                    (ECHO_HANG + Duration::from_secs(100), INPUT_PENDING),
+                    (Duration::MAX, INPUT_CLEAR),
+                ],
+            ),
+            (
+                "read-then-unknown",
+                true,
+                vec![
+                    (Duration::from_secs(30), INPUT_CLEAR),
+                    (
+                        ECHO_HANG + Duration::from_secs(100),
+                        "input=- input_bytes=- input_wait_ms=- fg_rss_mb=-",
+                    ),
+                    (Duration::MAX, INPUT_CLEAR),
+                ],
+            ),
+        ] {
+            for ran in [true, false] {
+                let mut m = Mock::new(vec![
+                    busy_screen(),
+                    ended(SAID),
+                    dialog.clone(),
+                    dialog.clone(),
+                ]);
+                m.gen_fence = true;
+                m.sends_gen = true;
+                m.human_seq = Some(0);
+                m.help = FENCED_HELP.to_string();
+                m.unmoved_after_send = Some(Duration::from_secs(120));
+                m.cell_attrs = "none";
+                m.input = INPUT_CLEAR;
+                // The first dialog gate is about 150 seconds after the line was sent. Its retry
+                // is one custody step later, after each non-clear status script turns clear. The
+                // The last two cases first prove the line read. Later pending input is still held
+                // by the ordinary unread-input gate; a later unknown word cannot revoke proof
+                // that the line, which precedes it in the one input queue, was already consumed.
+                m.input_by_write = input_by_write.clone();
+                let opts = SuperviseOpts {
+                    policy: SupervisorConfig {
+                        human_grace_s: 0,
+                        ..owners_policy()
+                    },
+                    ..auto(900)
+                };
+                let mut s = virtual_session(&mut m, None);
+                s.setup.background_settle = Duration::ZERO;
+                let point = s.await_turn(Duration::from_secs(60)).expect("the turn end");
+                let mut heard = Heard::default();
+                s.type_text_written(&point, LINE, RULE_CONTINUE, &mut heard)
+                    .expect("the act");
+                assert!(s.custody.is_some(), "{tag}: held: {:#?}", heard.noted);
+                if ran {
+                    s.took(point.screen.seq + 1, None, &mut heard);
+                }
+                s.fx.sleep(Duration::from_secs(90));
+                let read = s.screen().expect("the dialog's read");
+                let at = s.turn_of(read);
+                s.turn_end_execute(&at, action.clone(), &opts, &[], &mut heard)
+                    .expect("carried out");
+                let typed = |heard: &Heard| {
+                    heard
+                        .said
+                        .iter()
+                        .chain(&heard.noted)
+                        .filter(|l| l.starts_with("TYPED ") && l.contains(&format!(" rule={key}")))
+                        .count()
+                };
+                assert_eq!(
+                    typed(&heard),
+                    usize::from(first_goes),
+                    "{tag} (input {input}, ran {ran}): first dialog gate: {:#?}",
+                    [&heard.said, &heard.noted]
+                );
+                assert!(
+                    s.custody.is_some(),
+                    "{tag} (input {input}, ran {ran}): custody after first gate: {:#?}",
+                    [&heard.said, &heard.noted]
+                );
+                if !first_goes {
+                    s.fx.sleep(CUSTODY_STEP);
+                    let read = s.screen().expect("the dialog's clear-input retry");
+                    let at = s.turn_of(read);
+                    s.turn_end_execute(&at, action.clone(), &opts, &[], &mut heard)
+                        .expect("carried out after the line was read");
+                }
+                assert_eq!(
+                    typed(&heard),
+                    1,
+                    "{tag} (input {input}, ran {ran}): exactly one dialog key: {:#?}",
+                    [&heard.said, &heard.noted]
+                );
+                assert!(
+                    s.custody.is_some(),
+                    "{tag} (input {input}, ran {ran}): the line stands after the key: {:#?}",
+                    [&heard.said, &heard.noted]
+                );
+            }
+        }
+    }
 }

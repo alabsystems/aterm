@@ -300,7 +300,8 @@ pub(super) const UNDRAWN_INPUT_HANG: Duration = Duration::from_secs(60);
 /// joined to it), handed to the [`LeftLine`] and [`OwnLine`] it was written as; a person's keys
 /// drawn after it (in order, their text came after the line); a turn read running after it
 /// ([`custody::Line::ran`]), once `status` reads the input clear on a read that shows none of it
-/// ([`Session::custody_turned`]); or its program's end, a restart's or any other. A move of the
+/// ([`Session::custody_turned`]; a read that cannot say what the composer holds keeps the turn's
+/// evidence for the next that can); or its program's end, a restart's or any other. A move of the
 /// screen, a new point, an epoch, a stall's thaw, an edge, an Off park, or a busy spell with no
 /// turn read running in it (a break's reads, a frame being drawn) settles nothing. A line the
 /// worker read ([`custody::Held::Read`]) and drew none of [`ECHO_HANG`] on, at rest, gets a
@@ -2876,7 +2877,7 @@ impl<C: Ctl> Session<'_, C> {
         opts: &SuperviseOpts,
         review: &mut dyn Review,
     ) -> Result<TurnEndAction, Fail> {
-        self.custody_look(point, review);
+        self.custody_look(point, review)?;
         let at = super::occupancy_loop::LookAt::Point;
         self.left_look_at(&point.screen, at, Some(&opts.policy), Some(review));
         self.turn_end_at_point(point, worked, opts)
@@ -3405,7 +3406,7 @@ impl<C: Ctl> Session<'_, C> {
         if self.review_key(&turn) != self.review_key(seen) || self.point_model_moved(&turn) {
             return Ok(Again::Moved);
         }
-        self.custody_look(&turn, review);
+        self.custody_look(&turn, review)?;
         if self.left_line_went_on(&turn.screen, review) || self.left_went_holds(&turn) {
             return Ok(Again::Not);
         }
@@ -4796,20 +4797,48 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// A LOOK AT A LINE HELD IN [`Custody`] AT THE POINT `seen`: how it settled, if it did
-    /// (`None`: it stands held, or this read cannot say), as the core's look at a point says
-    /// ([`custody::Line::look`]): its draw on this read, or as a break of the spell saw it drawn
-    /// ([`custody::Line::drawn`]) where this read shows none of it, or a person's keys drawn after
-    /// it. Its draw hands it to the [`LeftLine`] and [`OwnLine`] it was written as, so the look
-    /// that decides a line left decides it and its Enter is its writer's
-    /// ([`Self::left_line_look`]): one drawn at a break and gone since is a line left that went,
-    /// or that someone cleared, as the break's read showed it, never a line lost. Nothing else
-    /// settles it here.
-    pub(super) fn custody_look(&mut self, seen: &Turn, review: &mut dyn Review) -> Option<Settles> {
-        let shows = self.custody_shows(&seen.screen)?;
-        let c = self.custody.as_mut()?;
-        let custody::Look::Settled(settles, stands) = c.line.look(&shows, custody::At::Point)
-        else {
-            return None;
+    /// (`None`: it stands held), as the core's look at a point says ([`custody::Line::look`]):
+    /// its draw on this read, or as a break of the spell saw it drawn ([`custody::Line::drawn`])
+    /// where this read shows none of it, or a person's keys drawn after it. Its draw hands it to
+    /// the [`LeftLine`] and [`OwnLine`] it was written as, so the look that decides a line left
+    /// decides it and its Enter is its writer's ([`Self::left_line_look`]): one drawn at a break
+    /// and gone since is a line left that went, or that someone cleared, as the break's read
+    /// showed it, never a line lost. Where the look settles nothing and a turn read running since
+    /// the write waits on a read that shows none of the line ([`custody::Line::weighs`]: a read
+    /// that cannot say what the composer holds, a dialog over it, kept the turn's evidence), one
+    /// fresh `status` read decides it ([`Self::custody_turned`]). Every look at a point is this
+    /// one (a new point's, a point decided again, a handed point's moved read, the point a busy
+    /// spell ends on, the gate's), so a turn kept under a dialog is weighed on the first point's
+    /// read after it that can say, before the host is offered that point and whatever the policy
+    /// then decides there.
+    pub(super) fn custody_look(
+        &mut self,
+        seen: &Turn,
+        review: &mut dyn Review,
+    ) -> Result<Option<Settles>, Fail> {
+        let Some(shows) = self.custody_shows(&seen.screen) else {
+            return Ok(None);
+        };
+        self.custody_look_on(seen, &shows, review)
+    }
+
+    /// [`Self::custody_look`] on what the read `seen` shows of the line held (`shows`, from
+    /// [`Self::custody_shows`]).
+    fn custody_look_on(
+        &mut self,
+        seen: &Turn,
+        shows: &custody::Shows,
+        review: &mut dyn Review,
+    ) -> Result<Option<Settles>, Fail> {
+        let Some(c) = self.custody.as_mut() else {
+            return Ok(None);
+        };
+        let custody::Look::Settled(settles, stands) = c.line.look(shows, custody::At::Point) else {
+            let weighs = c.line.weighs(shows);
+            if weighs && self.custody_turned(seen.screen.seq, shows, review)? {
+                return Ok(Some(Settles::Turn));
+            }
+            return Ok(None);
         };
         if settles == Settles::Drawn {
             let own = c.own();
@@ -4826,7 +4855,7 @@ impl<C: Ctl> Session<'_, C> {
             }
         }
         self.custody_ended(seen.screen.seq, settles, review);
-        Some(settles)
+        Ok(Some(settles))
     }
 
     /// The line held in [`Custody`] settled at content seq `seq`, as `settles` says: one `NOTE`
@@ -4854,16 +4883,24 @@ impl<C: Ctl> Session<'_, C> {
         ));
     }
 
-    /// A TURN WAS READ RUNNING AFTER A LINE HELD IN [`Custody`] ([`custody::Line::ran`]), and a
-    /// read at content seq `seq` shows none of the line (at the point a busy spell ended on,
-    /// [`Self::custody_after_work`], or at a break, [`Self::custody_at_break`]; each looks first,
-    /// as a line drawn went with no turn): one fresh `status` read, which settles the line where
-    /// it reads the input clear ([`custody::Line::turned`]); a line still unread, or one no read
-    /// can say of, outlasts the turn ([`custody::Line::outlasted`]) and waits for another turn
-    /// read running.
-    pub(super) fn custody_turned(&mut self, seq: u64, review: &mut dyn Review) -> Result<(), Fail> {
+    /// A TURN WAS READ RUNNING AFTER A LINE HELD IN [`Custody`] ([`custody::Line::ran`]), and the
+    /// look at the read at content seq `seq`, which shows `shows` of it, settled nothing (at a
+    /// point, [`Self::custody_look`], or at a break, [`Self::custody_at_break`]; each looks first,
+    /// as a line drawn went with no turn): one fresh `status` read, whose input word decides it as
+    /// the core says ([`custody::Line::turned`]): on a read that shows none of it, the input clear
+    /// settles it (`went with a turn`), and a line still unread, or one no word can say of,
+    /// outlasts the turn ([`custody::Line::outlasted`]) and waits for another turn read running;
+    /// on a read that cannot say what the composer holds (a dialog over it, no composer drawn, a
+    /// glyph's cell unread), under which the line may stand drawn, nothing moves, the turn's
+    /// evidence kept for the next read that can say. Whether it settled.
+    pub(super) fn custody_turned(
+        &mut self,
+        seq: u64,
+        shows: &custody::Shows,
+        review: &mut dyn Review,
+    ) -> Result<bool, Fail> {
         if self.custody.is_none() {
-            return Ok(());
+            return Ok(false);
         }
         let r = self.call(&["status"])?;
         if self.unserved(&r) {
@@ -4873,15 +4910,21 @@ impl<C: Ctl> Session<'_, C> {
             .ok()
             .then(|| crate::supervise::screen::status_field(&r.stdout, "input"))
             .flatten();
-        if let Some(settles) = self.custody.as_ref().and_then(|c| c.line.turned(word)) {
-            self.custody_ended(seq, settles, review);
-            return Ok(());
-        }
         let now = self.fx.mono();
-        if let Some(c) = self.custody.as_mut() {
-            c.line.outlasted(word, now);
-        }
-        Ok(())
+        let Some(c) = self.custody.as_mut() else {
+            return Ok(false);
+        };
+        Ok(match c.line.turned(word, shows) {
+            custody::Turned::Settles => {
+                self.custody_ended(seq, Settles::Turn, review);
+                true
+            }
+            custody::Turned::Outlasts => {
+                c.line.outlasted(word, now);
+                false
+            }
+            custody::Turned::Stands => false,
+        })
     }
 
     /// A LOOK AT A LINE HELD IN [`Custody`] AT A BREAK of the agent's own background work, on the
@@ -4895,7 +4938,10 @@ impl<C: Ctl> Session<'_, C> {
     /// rest of what settles a line at a point settles it here: a person's keys
     /// ([`custody::Line::look`]), its program's end ([`Self::custody_process_ended`]), and a turn
     /// read running since its write ([`custody::Line::ran`]) once `status` reads the input clear
-    /// ([`Self::custody_turned`]). A line that stands held holds every break's line behind it as
+    /// on a read that shows none of it ([`Self::custody_turned`]); a break whose read cannot say
+    /// what the composer holds (a glyph's cell unread) reads no `status` for it and keeps the
+    /// turn's evidence for the next read that can ([`custody::Line::weighs`]). A line that stands
+    /// held holds every break's line behind it as
     /// behind a draft ([`Session::write_guards`]), and the host's step there
     /// (`IdlePoint::line_held`), through the spell, until one of these settles it or the point
     /// the spell ends on looks at it, where the gate decides what the look leaves
@@ -4923,33 +4969,31 @@ impl<C: Ctl> Session<'_, C> {
             self.custody_ended(screen.seq, Settles::Ended, review);
             return Ok(());
         }
-        if self.custody.as_ref().is_some_and(|c| c.line.ran()) {
-            self.custody_turned(screen.seq, review)?;
+        if self.custody.as_ref().is_some_and(|c| c.line.weighs(&shows)) {
+            self.custody_turned(screen.seq, &shows, review)?;
         }
         Ok(())
     }
 
     /// A LOOK AT A LINE HELD IN [`Custody`] AT THE POINT `seen` A BUSY SPELL ENDED ON (the loop's
-    /// worked arm, once the lines the loop left are dropped), before anything else of the point:
-    /// drawn there, in the spell's turn or at a break of it (shown there still, or cleared since),
-    /// it is handed back to the [`LeftLine`] and [`OwnLine`] it was written as, so its Enter is
-    /// its writer's; under a person's keys it is theirs ([`Self::custody_look`]). A line no read
-    /// of the spell showed goes with a turn read running since its write
-    /// ([`custody::Line::ran`]) once `status` reads the input clear ([`Self::custody_turned`]); a
-    /// spell with no such turn (a break's reads alone, a frame being drawn) settles nothing, and
-    /// the point's gate decides it ([`Self::custody_gate`]), its restart in place included.
+    /// worked arm, once the lines the loop left are dropped), before anything else of the point
+    /// ([`Self::custody_look`]): drawn there, in the spell's turn or at a break of it (shown there
+    /// still, or cleared since), it is handed back to the [`LeftLine`] and [`OwnLine`] it was
+    /// written as, so its Enter is its writer's; under a person's keys it is theirs. A line no
+    /// read of the spell showed goes with a turn read running since its write
+    /// ([`custody::Line::ran`]) once `status` reads the input clear, where this read shows none
+    /// of it ([`Self::custody_turned`]); where it cannot say what the composer holds (a dialog
+    /// over it, no composer drawn, a glyph's cell unread), the line may stand drawn under it, and
+    /// the turn's evidence is kept for the next read that can say: the next point's look, or the
+    /// next spell's end or break. A spell with no such turn (a break's reads alone, a frame being
+    /// drawn) settles nothing, and the point's gate decides it ([`Self::custody_gate`]), its
+    /// restart in place included.
     pub(super) fn custody_after_work(
         &mut self,
         seen: &Turn,
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
-        if self.custody_look(seen, review).is_some() {
-            return Ok(());
-        }
-        if self.custody.as_ref().is_some_and(|c| c.line.ran()) {
-            self.custody_turned(seen.screen.seq, review)?;
-        }
-        Ok(())
+        self.custody_look(seen, review).map(drop)
     }
 
     /// WHAT A LINE HELD IN [`Custody`] LETS THE HOST DO at the idle point at content seq `seq`
@@ -4989,16 +5033,20 @@ impl<C: Ctl> Session<'_, C> {
     /// WHETHER A LINE HELD IN [`Custody`] HOLDS `action`'s WRITE AT `point` (`rule`, the act's),
     /// and the restart in place it may take instead: the one gate every write a point decides goes
     /// through, beside [`Self::left_went_holds`]. The line looked at on the judged read first
-    /// ([`Self::custody_look`]): drawn there, a write the policy decided on a read that took it for
-    /// no line of the loop's is held, and the point decided again soon; its Enter goes. Then one
-    /// ordinary `status` read ([`Self::foreground_program`], so a stall's word reaches the stall
-    /// look) moves what is known of it ([`custody::Line::gate_read`]), and another process in the
-    /// tab is its program ended. A line the worker read [`ECHO_HANG`] ago and still reads clear,
-    /// where the policy wants to write a line now, is read again in order, `status` then the
-    /// screen (a draw that came before the clear read shows on the screen after it): still
-    /// undrawn and at rest ([`Self::custody_at_rest`], [`custody::Rest::gate`]), it is
-    /// [`CustodyGate::Lost`]. Every other hold journals one `SKIPPED` record per change and
-    /// re-arms its due ([`Self::custody_rearm`]).
+    /// ([`Self::custody_look`], a turn kept under a dialog weighed there where the read can say):
+    /// drawn there, a write the policy decided on a read that took it for no line of the loop's is
+    /// held, and the point decided again soon; its Enter goes. Then one ordinary `status` read
+    /// ([`Self::foreground_program`], so a stall's word reaches the stall look) moves what is
+    /// known of it ([`custody::Line::gate_read`]), and another process in the tab is its program
+    /// ended. A key that answers a box over the composer (a dialog's Enter or Esc) goes past the
+    /// line only once `status` proves the worker read it, and the line stands held for the read
+    /// after the box ([`custody::answer_goes`]); without that proof the key may be queued behind
+    /// the line and is held too. A line the worker read
+    /// [`ECHO_HANG`] ago and still reads clear, where the policy wants to write a line now, is
+    /// read again in order, `status` then the screen (a draw that came before the clear read
+    /// shows on the screen after it): still undrawn and at rest ([`Self::custody_at_rest`],
+    /// [`custody::Rest::gate`]), it is [`CustodyGate::Lost`]. Every other hold journals one
+    /// `SKIPPED` record per change and re-arms its due ([`Self::custody_rearm`]).
     fn custody_gate(
         &mut self,
         point: &Turn,
@@ -5006,11 +5054,11 @@ impl<C: Ctl> Session<'_, C> {
         (rule, opts): (&str, &SuperviseOpts),
         review: &mut dyn Review,
     ) -> Result<CustodyGate, Fail> {
-        if self.custody.is_none() {
+        let Some(shows) = self.custody_shows(&point.screen) else {
             return Ok(CustodyGate::Free);
-        }
+        };
         let seq = point.screen.seq;
-        if let Some(settles) = self.custody_look(point, review) {
+        if let Some(settles) = self.custody_look_on(point, &shows, review)? {
             if settles == Settles::Drawn && !matches!(action, TurnEndAction::Submit { .. }) {
                 self.redecide_soon(CUSTODY_DRAWN);
                 return Ok(CustodyGate::Hold);
@@ -5034,6 +5082,9 @@ impl<C: Ctl> Session<'_, C> {
                 | TurnEndAction::Submit { .. }
         );
         let read = c.line.gate_read(word.as_deref(), writes_a_line, now);
+        if !writes_a_line && custody::answer_goes(c.line.held(), &shows) {
+            return Ok(CustodyGate::Free);
+        }
         let word = word.unwrap_or_else(|| "-".to_string());
         if read == custody::GateRead::Holds {
             let said = custody::hold_said(c.line.held(), &word);
@@ -5043,7 +5094,7 @@ impl<C: Ctl> Session<'_, C> {
         }
         let screen = self.screen()?;
         let fresh = self.turn_of(screen);
-        if self.custody_look(&fresh, review).is_some() {
+        if self.custody_look(&fresh, review)?.is_some() {
             self.redecide_soon(CUSTODY_DRAWN);
             return Ok(CustodyGate::Hold);
         }

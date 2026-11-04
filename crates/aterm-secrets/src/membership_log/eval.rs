@@ -83,6 +83,7 @@
 //! current node key is that member's, and one that is two members' is contested; else a key a
 //! member bound and has since replaced is retired; every other key is unknown.
 
+use super::reach::Reach;
 use super::{Body, Entrant, Founder, Kind, MemberId, Record, RecordId};
 use crate::age::Recipient;
 use crate::commons::binding::Binding;
@@ -90,9 +91,45 @@ use aterm_digest::Sha256;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-mod ancestry;
-pub(super) use ancestry::Ancestry;
 mod weigh;
+
+/// What the evaluator reads: a log's held records (the genesis first, each after its parents),
+/// each one's index by id, and their reachability, all as [`super::Log`] owns them.
+#[derive(Clone, Copy)]
+pub(super) struct History<'a> {
+    pub(super) records: &'a [Record],
+    pub(super) at: &'a BTreeMap<RecordId, usize>,
+    pub(super) reach: &'a Reach,
+}
+
+/// A slice of records indexed as a log indexes them, for the tests that evaluate one directly.
+#[cfg(test)]
+pub(super) struct Indexed {
+    at: BTreeMap<RecordId, usize>,
+    reach: Reach,
+}
+
+#[cfg(test)]
+impl Indexed {
+    /// Index `records`, the genesis first and each after its parents.
+    pub(super) fn of(records: &[Record]) -> Self {
+        let mut at = BTreeMap::new();
+        let mut reach = Reach::default();
+        for (i, record) in records.iter().enumerate() {
+            reach.push(record.parents().iter().map(|p| at[p]));
+            at.insert(*record.id(), i);
+        }
+        Self { at, reach }
+    }
+
+    pub(super) fn history<'a>(&'a self, records: &'a [Record]) -> History<'a> {
+        History {
+            records,
+            at: &self.at,
+            reach: &self.reach,
+        }
+    }
+}
 
 #[cfg(any(test, debug_assertions))]
 pub(super) fn allocation_probe(dense: bool) -> usize {
@@ -101,14 +138,13 @@ pub(super) fn allocation_probe(dense: bool) -> usize {
 
 #[cfg(any(test, debug_assertions))]
 pub(super) fn with_authorization_allocation_probe(
-    records: &[Record],
+    history: History<'_>,
     count: usize,
     observe: impl FnOnce(&mut dyn FnMut() -> usize),
 ) {
     assert!(count > 0);
-    let ancestry = Ancestry::new(records);
-    let session = ancestry.session();
-    let graph = Graph::new(records, &session);
+    let records = history.records;
+    let graph = Graph::new(history);
     for at in 1..records.len() {
         assert!(graph.before(0, at));
     }
@@ -148,7 +184,7 @@ pub(super) fn with_authorization_allocation_probe(
 }
 
 #[cfg(test)]
-mod ancestry_tests;
+mod dense_oracle_tests;
 #[cfg(test)]
 mod relation_baseline_tests;
 
@@ -363,23 +399,20 @@ impl<'a> Seat<'a> {
 /// Evaluate `records`: a log's held records, the genesis first and each after its parents.
 #[cfg(test)]
 pub(super) fn evaluate(records: &[Record]) -> Membership {
-    let ancestry = Ancestry::new(records);
-    evaluate_with(records, &ancestry)
+    evaluate_with(Indexed::of(records).history(records))
 }
 
-pub(super) fn evaluate_with(records: &[Record], ancestry: &Arc<Ancestry>) -> Membership {
-    let session = ancestry.session();
-    Graph::new(records, &session).evaluate(&mut Memo::new())
+pub(super) fn evaluate_with(history: History<'_>) -> Membership {
+    Graph::new(history).evaluate(&mut Memo::new())
 }
 
 /// How many authorization passes evaluating `records` runs: one for each set of candidates whose
 /// void records it weighs under.
 #[cfg(test)]
 pub(super) fn authorization_passes(records: &[Record]) -> usize {
-    let ancestry = Ancestry::new(records);
-    let session = ancestry.session();
+    let indexed = Indexed::of(records);
     let mut memo = Memo::new();
-    let _ = Graph::new(records, &session).evaluate(&mut memo);
+    let _ = Graph::new(indexed.history(records)).evaluate(&mut memo);
     memo.len()
 }
 
@@ -425,10 +458,9 @@ impl WeighCost {
 /// weighed apart, then in pairs by the walk, and the quorums' signers.
 #[cfg(test)]
 pub(super) fn weigh_cost(records: &[Record]) -> WeighCost {
-    let ancestry = Ancestry::new(records);
-    let session = ancestry.session();
+    let indexed = Indexed::of(records);
     let mut scratch = AuthScratch::new(records.len());
-    let _ = Graph::new(records, &session).evaluate_in(&mut Memo::new(), &mut scratch);
+    let _ = Graph::new(indexed.history(records)).evaluate_in(&mut Memo::new(), &mut scratch);
     WeighCost::of(&scratch)
 }
 
@@ -437,9 +469,8 @@ pub(super) fn weigh_cost(records: &[Record]) -> WeighCost {
 /// cutoff (`evaluate` adds a pass per quorum for its signers on top, not counted here).
 #[cfg(test)]
 pub(super) fn weigh_cost_by_pairs(records: &[Record]) -> WeighCost {
-    let ancestry = Ancestry::new(records);
-    let session = ancestry.session();
-    let graph = Graph::new(records, &session);
+    let indexed = Indexed::of(records);
+    let graph = Graph::new(indexed.history(records));
     let mut scratch = AuthScratch::new(records.len());
     let candidates = graph.candidates();
     let _ = graph.accepted_by_pairs(&candidates, &mut Memo::new(), &mut scratch);
@@ -463,9 +494,8 @@ pub(super) type NamedRelations = (
 /// (`by_pairs`) from the pair loop the walk replaced.
 #[cfg(test)]
 pub(super) fn weigh_relations(records: &[Record], by_pairs: bool) -> NamedRelations {
-    let ancestry = Ancestry::new(records);
-    let session = ancestry.session();
-    let graph = Graph::new(records, &session);
+    let indexed = Indexed::of(records);
+    let graph = Graph::new(indexed.history(records));
     let mut scratch = AuthScratch::new(records.len());
     let candidates = graph.candidates();
     let mut memo = Memo::new();
@@ -496,7 +526,8 @@ pub(super) fn weigh_relations(records: &[Record], by_pairs: bool) -> NamedRelati
 #[derive(Debug)]
 pub(super) struct Effective {
     counts: Vec<bool>,
-    ancestry: Arc<Ancestry>,
+    /// The evaluated log's index as it stood: its chunks, shared with the log's own.
+    reach: Reach,
     #[cfg(test)]
     oracle: Option<Vec<Bits>>,
     keyed: Vec<bool>,
@@ -516,7 +547,7 @@ impl Effective {
         if let Some(past) = &self.oracle {
             return past[b].get(a);
         }
-        self.ancestry.before(a, b)
+        self.reach.before(a, b)
     }
 
     /// Whether record `index` is a keyed `Epoch`: it does not count, yet a counting `Put` or
@@ -538,52 +569,33 @@ impl Effective {
     }
 }
 
-/// Compute [`Effective`] over `records` (genesis first, each after its parents).
-pub(super) fn effective_records(records: &[Record], ancestry: &Arc<Ancestry>) -> Effective {
-    let session = ancestry.session();
-    Graph::new(records, &session).effective()
+/// Compute [`Effective`] over `history`'s records.
+pub(super) fn effective_records(history: History<'_>) -> Effective {
+    Graph::new(history).effective()
 }
 
-/// Founding `Genesis` or effective `Admit` [`RecordId`] that grants `binding` a seat in `records`,
-/// excluding actors taken out for good by an effective quorum `Remove`.
-pub(super) fn historical_seat_entry(
-    records: &[Record],
-    ancestry: &Arc<Ancestry>,
-    binding: &Binding,
-) -> Option<RecordId> {
-    let session = ancestry.session();
-    Graph::new(records, &session).historical_seat_entry(binding)
+/// Founding `Genesis` or effective `Admit` [`RecordId`] that grants `binding` a seat in
+/// `history`, excluding actors taken out for good by an effective quorum `Remove`.
+pub(super) fn historical_seat_entry(history: History<'_>, binding: &Binding) -> Option<RecordId> {
+    Graph::new(history).historical_seat_entry(binding)
 }
 
-/// Whether `binding` holds a founding or effective admitted seat in `records`, excluding actors
+/// Whether `binding` holds a founding or effective admitted seat in `history`, excluding actors
 /// taken out for good by an effective quorum `Remove`.
-pub(super) fn has_historical_seat(
-    records: &[Record],
-    ancestry: &Arc<Ancestry>,
-    binding: &Binding,
-) -> bool {
-    historical_seat_entry(records, ancestry, binding).is_some()
+pub(super) fn has_historical_seat(history: History<'_>, binding: &Binding) -> bool {
+    historical_seat_entry(history, binding).is_some()
 }
 
 /// Whether `actor` holds a founding or non-void, authorized, non-cut-off admitted seat in
-/// `records` (including actors later retired by an ordinary or quorum `Remove`).
-pub(super) fn has_known_actor(
-    records: &[Record],
-    ancestry: &Arc<Ancestry>,
-    actor: &MemberId,
-) -> bool {
-    let session = ancestry.session();
-    Graph::new(records, &session).has_known_actor(actor)
+/// `history` (including actors later retired by an ordinary or quorum `Remove`).
+pub(super) fn has_known_actor(history: History<'_>, actor: &MemberId) -> bool {
+    Graph::new(history).has_known_actor(actor)
 }
 
 /// The cutoff of F16's quorum `Remove` of `actor` ([`super::Log::undo_cutoff`]).
-pub(super) fn undo_cutoff(
-    records: &[Record],
-    ancestry: &Arc<Ancestry>,
-    actor: &MemberId,
-) -> Option<RecordId> {
-    let session = ancestry.session();
-    let graph = Graph::new(records, &session);
+pub(super) fn undo_cutoff(history: History<'_>, actor: &MemberId) -> Option<RecordId> {
+    let records = history.records;
+    let graph = Graph::new(history);
     let mut scratch = AuthScratch::new(records.len());
     let plain = graph.authorized(&vec![false; records.len()], &mut Memo::new(), &mut scratch);
     graph
@@ -593,9 +605,9 @@ pub(super) fn undo_cutoff(
 
 /// Where F16's quorum `Remove` of `actor` stands ([`super::Log::undo`]); `took_effect` is left
 /// for the caller, which holds the whole membership.
-pub(super) fn undo(records: &[Record], ancestry: &Arc<Ancestry>, actor: &MemberId) -> Option<Undo> {
-    let session = ancestry.session();
-    let graph = Graph::new(records, &session);
+pub(super) fn undo(history: History<'_>, actor: &MemberId) -> Option<Undo> {
+    let records = history.records;
+    let graph = Graph::new(history);
     let no_void = vec![false; records.len()];
     let mut scratch = AuthScratch::new(records.len());
     let plain = graph.authorized(&no_void, &mut Memo::new(), &mut scratch);
@@ -628,12 +640,10 @@ pub(super) fn undo(records: &[Record], ancestry: &Arc<Ancestry>, actor: &MemberI
 /// Historical Commons writer bindings eligible to authenticate table records sealed under the
 /// effective `Epoch` record at `epoch_index`.
 pub(super) fn historical_bindings_for_epoch(
-    records: &[Record],
-    ancestry: &Arc<Ancestry>,
+    history: History<'_>,
     epoch_index: usize,
 ) -> Option<Vec<Binding>> {
-    let session = ancestry.session();
-    Graph::new(records, &session).historical_bindings_for_epoch(epoch_index)
+    Graph::new(history).historical_bindings_for_epoch(epoch_index)
 }
 
 /// The previous exact all-pairs implementation, retained only as a test oracle.
@@ -672,6 +682,7 @@ impl Bits {
     fn get(&self, at: usize) -> bool {
         (self.0[at / 64] >> (at % 64)) & 1 == 1
     }
+    #[cfg(test)]
     fn union(&mut self, other: &Self) {
         for (word, more) in self.0.iter_mut().zip(&other.0) {
             *word |= *more;
@@ -784,11 +795,12 @@ struct Standing {
     nodes: BTreeMap<MemberId, Vec<usize>>,
 }
 
-struct Graph<'a, 'cache> {
+struct Graph<'a> {
     records: &'a [Record],
     /// Each held record's index, by id.
     at: &'a BTreeMap<RecordId, usize>,
-    ancestry: &'a ancestry::Session<'cache>,
+    /// The log's reachability, which the graph borrows.
+    reach: &'a Reach,
     #[cfg(test)]
     oracle: Option<Vec<Bits>>,
     /// Each `Remove`'s cutoff, by record index.
@@ -806,13 +818,13 @@ struct Graph<'a, 'cache> {
     admits_of: Vec<Vec<usize>>,
 }
 
-impl<'a, 'cache> Graph<'a, 'cache> {
-    fn new(records: &'a [Record], ancestry: &'a ancestry::Session<'cache>) -> Self {
+impl<'a> Graph<'a> {
+    fn new(history: History<'a>) -> Self {
+        let History { records, at, reach } = history;
         assert!(
-            ancestry.matches(records),
-            "ancestry belongs to this ordered history"
+            reach.len() == records.len() && at.len() == records.len(),
+            "the index belongs to this ordered history"
         );
-        let at = ancestry.at();
         let cutoffs: BTreeMap<usize, usize> = records
             .iter()
             .enumerate()
@@ -882,7 +894,7 @@ impl<'a, 'cache> Graph<'a, 'cache> {
         Self {
             records,
             at,
-            ancestry,
+            reach,
             #[cfg(test)]
             oracle: None,
             cutoffs,
@@ -895,15 +907,11 @@ impl<'a, 'cache> Graph<'a, 'cache> {
     }
 
     #[cfg(test)]
-    fn with_oracle(
-        records: &'a [Record],
-        ancestry: &'a ancestry::Session<'cache>,
-        past: Vec<Bits>,
-    ) -> Self {
-        assert_eq!(past.len(), records.len());
+    fn with_oracle(history: History<'a>, past: Vec<Bits>) -> Self {
+        assert_eq!(past.len(), history.records.len());
         Self {
             oracle: Some(past),
-            ..Self::new(records, ancestry)
+            ..Self::new(history)
         }
     }
 
@@ -913,7 +921,7 @@ impl<'a, 'cache> Graph<'a, 'cache> {
         if let Some(past) = &self.oracle {
             return past[b].get(a);
         }
-        self.ancestry.before(a, b)
+        self.reach.before(a, b)
     }
     /// Whether record `a` is record `b` or in its causal past.
     fn upto(&self, a: usize, b: usize) -> bool {
@@ -921,7 +929,7 @@ impl<'a, 'cache> Graph<'a, 'cache> {
         if self.oracle.is_some() {
             return a == b || self.before(a, b);
         }
-        self.ancestry.upto(a, b)
+        self.reach.upto(a, b)
     }
 
     fn union_past_into(&self, b: usize, into: &mut Bits) {
@@ -930,7 +938,7 @@ impl<'a, 'cache> Graph<'a, 'cache> {
             into.union(&past[b]);
             return;
         }
-        self.ancestry.union_past_into(b, into);
+        self.reach.union_past_into(b, &mut into.0);
     }
 
     fn copy_past_into(&self, b: usize, into: &mut Bits) {
@@ -939,7 +947,7 @@ impl<'a, 'cache> Graph<'a, 'cache> {
             into.0.copy_from_slice(&past[b].0);
             return;
         }
-        self.ancestry.copy_past_into(b, into);
+        self.reach.copy_past_into(b, &mut into.0);
     }
 
     fn past_intersects(&self, b: usize, set: &Bits) -> bool {
@@ -947,7 +955,7 @@ impl<'a, 'cache> Graph<'a, 'cache> {
         if let Some(past) = &self.oracle {
             return past[b].0.iter().zip(&set.0).any(|(a, b)| a & b != 0);
         }
-        self.ancestry.past_intersects(b, set)
+        self.reach.past_intersects(b, &set.0)
     }
     fn signer(&self, i: usize) -> &MemberId {
         self.records[i].actor()
@@ -2041,7 +2049,7 @@ impl<'a, 'cache> Graph<'a, 'cache> {
         let usable_wrap = self.usable_wraps(&counts, &dependents);
         Effective {
             counts,
-            ancestry: self.ancestry.owner(),
+            reach: self.reach.clone(),
             #[cfg(test)]
             oracle: self.oracle,
             keyed,

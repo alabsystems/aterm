@@ -73,7 +73,7 @@ fn grok_and_kimi_are_connections() {
 
 #[test]
 fn every_pooled_cli_names_its_row_and_its_own_roster_store_and_seam() {
-    assert_eq!(Cli::ids(), ["claude", "codex", "grok", "kimi"]);
+    assert_eq!(Cli::ids(), ["claude", "codex", "grok", "kimi", "agy"]);
     for cli in Cli::ALL {
         assert_eq!(Cli::parse(cli.id()), Some(cli));
         assert!(std::ptr::eq(
@@ -81,7 +81,7 @@ fn every_pooled_cli_names_its_row_and_its_own_roster_store_and_seam() {
             cli.accounts()
         ));
     }
-    assert_eq!(Cli::parse("agy"), None, "agy has no pool");
+    assert_eq!(Cli::parse("agy"), Some(Cli::Agy));
     assert_eq!(Cli::parse("Claude"), None);
     let claude = Cli::Claude.accounts();
     assert_eq!(
@@ -99,7 +99,8 @@ fn every_pooled_cli_names_its_row_and_its_own_roster_store_and_seam() {
             "accounts.toml",
             "accounts-codex.toml",
             "accounts-grok.toml",
-            "accounts-kimi.toml"
+            "accounts-kimi.toml",
+            "accounts-agy.toml"
         ]
     );
     assert_eq!(

@@ -43,8 +43,8 @@
 //!   system's quit went ahead or as a terminating signal ends it, the node job as it stops with no
 //!   window open. Either row goes to the peers at once ([`touch_pushing`]), since a Mac about to
 //!   sleep or stop may run no later repair round to carry it.
-//! - **Claude Code's accounts.** Only Claude Code's rows are claimed, as only they were leased:
-//!   Claude Code alone has a usage tap to renew a claim, so another CLI's rows stay unclaimed.
+//! - **Providers.** Claude Code and Codex share the machine claim set. Each provider
+//!   records its own session activity; local activity preserves the other provider's claims.
 //! - **A wrong clock** (F22). Every row is placed by its writer's clock, so a Mac whose clock is
 //!   a day or more off writes and reads tables its peers never read or write. The table's read
 //!   says what this Mac's peers make of its clock ([`Tabled::clock`]), which peers it reads as
@@ -91,8 +91,11 @@ pub const SESSION_FRESH_S: i64 = 2 * 60 * 60;
 /// The usage tap reads the table for one account at most this often.
 pub const RECHECK_S: i64 = 5 * 60;
 
-/// The most claims one row holds.
-pub const MAX_CLAIMS: usize = 16;
+/// Providers whose account use participates in the shared machine claim set.
+pub const CLAIMED_CLIS: [Cli; 2] = [Cli::Claude, Cli::Codex];
+
+/// Canonical byte budget shared with the signed claims-table protocol.
+pub const MAX_CLAIM_BYTES: usize = 60 * 1024;
 
 /// The schema version a row carries.
 const ROW_VERSION: u64 = 1;
@@ -134,6 +137,7 @@ impl LeaseKey {
             (Cli::Claude, _) => "claude",
             (Cli::Codex, _) => "codex",
             (Cli::Grok, _) => "grok",
+            (Cli::Agy, _) => "agy",
             (Cli::Kimi, Some(Region::MainlandCn)) => "kimi:mainland-cn",
             (Cli::Kimi, Some(Region::Global) | None) => "kimi:global",
         };
@@ -146,6 +150,7 @@ fn canonical_pool_realm(raw: &str) -> Option<&'static str> {
         "" | "claude" | "anthropic" => Some("claude"),
         "codex" | "openai" => Some("codex"),
         "grok" | "x" | "xai" => Some("grok"),
+        "agy" | "antigravity" => Some("agy"),
         "kimi" | "kimi:global" | "kimi-global" => Some("kimi:global"),
         "kimi:mainland-cn" | "kimi-mainland-cn" | "kimi:cn" | "kimi-cn" => Some("kimi:mainland-cn"),
         _ => None,
@@ -209,6 +214,9 @@ pub struct Row {
 }
 
 impl Row {
+    fn within_budget(&self) -> bool {
+        aterm_json::to_vec(&self.to_value()).is_ok_and(|bytes| bytes.len() <= MAX_CLAIM_BYTES)
+    }
     /// The row's body as the table stores it; the machine is the signer's, so it is not in it.
     #[must_use]
     pub fn to_value(&self) -> Value {
@@ -239,6 +247,13 @@ impl Row {
     /// # Errors
     /// The body is not a row: not an object, no counter or `until`, or no claim list.
     pub fn from_value(machine: &str, body: &Value) -> Result<Self, String> {
+        if aterm_json::to_vec(body)
+            .map_err(|error| error.to_string())?
+            .len()
+            > MAX_CLAIM_BYTES
+        {
+            return Err("claim row exceeds byte budget".into());
+        }
         let object = body
             .as_object()
             .ok_or_else(|| "a claim row is not an object".to_owned())?;
@@ -262,7 +277,7 @@ impl Row {
             .and_then(Value::as_array)
             .ok_or_else(|| "a claim row has no claim list".to_owned())?;
         let mut claims: Vec<Claim> = Vec::new();
-        for item in list.iter().take(MAX_CLAIMS) {
+        for item in list {
             let read = || -> Option<Claim> {
                 let item = item.as_object()?;
                 let key = LeaseKey::new(item.get("pool")?.as_str()?, item.get("email")?.as_str()?)
@@ -494,7 +509,7 @@ pub struct Mine {
 
 /// The row this Mac writes to claim `key` as `kind` at `now`, keeping each other claim `keep`
 /// passes, or `None` where its row already holds just that and is not due again
-/// ([`RENEW_WITHIN_S`]), or has no room for `key` ([`MAX_CLAIMS`]), when its live row does not
+/// ([`RENEW_WITHIN_S`]), or exceeds [`MAX_CLAIM_BYTES`], when its live row does not
 /// hold `key`. A claim the row already holds keeps its `since`; a lapsed row starts every claim
 /// afresh.
 #[must_use]
@@ -519,9 +534,6 @@ pub fn claimed(
     match claims.iter_mut().find(|claim| &claim.key == key) {
         Some(claim) => claim.kind = kind,
         None => {
-            if claims.len() >= MAX_CLAIMS {
-                return None;
-            }
             claims.push(Claim {
                 key: key.clone(),
                 kind,
@@ -537,13 +549,14 @@ pub fn claimed(
     {
         return None;
     }
-    Some(Row {
+    let row = Row {
         machine: me.machine.clone(),
         label: me.label.clone(),
         counter: current.map_or(1, |row| row.counter.saturating_add(1)),
         until: now.saturating_add(HORIZON_S),
         claims,
-    })
+    };
+    row.within_budget().then_some(row)
 }
 
 /// The row this Mac writes to give up each claim `drop` names at `now`, or `None` where its live
@@ -600,6 +613,7 @@ const fn realms(cli: Cli) -> &'static [&'static str] {
         Cli::Claude => &["claude"],
         Cli::Codex => &["codex"],
         Cli::Grok => &["grok"],
+        Cli::Agy => &["agy"],
         Cli::Kimi => &["kimi:global", "kimi:mainland-cn"],
     }
 }
@@ -791,13 +805,13 @@ pub fn holds(skewed: &[SkewedPeer], homes: &[(LeaseKey, String)]) -> Vec<(LeaseK
         .collect()
 }
 
-/// A Claude Code account `ai-pool.toml` names, with a home Mac: its label, its login address's
+/// An account `ai-pool.toml` names, with a home Mac: its label, its login address's
 /// key and its home Mac's label (`warm[0]`).
 pub(crate) type PoolHome = (String, LeaseKey, String);
 
-/// Each Claude Code account `ai-pool.toml` under `home` names with a home Mac ([`PoolHome`]);
+/// Each `cli` account `ai-pool.toml` under `home` names with a home Mac ([`PoolHome`]);
 /// none where the file cannot be read.
-fn pool_homes(home: &std::path::Path) -> Vec<PoolHome> {
+fn pool_homes(home: &std::path::Path, cli: Cli) -> Vec<PoolHome> {
     let path = home.join(".secrets").join(super::ai_pool::AI_POOL_FILE);
     let Some(text) = super::ai_pool::read_bounded_text(&path, 4 * 1024 * 1024) else {
         return Vec::new();
@@ -805,11 +819,11 @@ fn pool_homes(home: &std::path::Path) -> Vec<PoolHome> {
     let Ok(pool) = super::ai_pool::Pool::from_toml(&text, &path.display().to_string()) else {
         return Vec::new();
     };
-    pool.accounts_for_cli(Cli::Claude)
+    pool.accounts_for_cli(cli)
         .into_iter()
         .filter_map(|(account, label)| {
             let home = account.home_mac()?.to_owned();
-            let key = LeaseKey::for_cli(Cli::Claude, account.vendor.region, &account.email).ok()?;
+            let key = LeaseKey::for_cli(cli, account.vendor.region, &account.email).ok()?;
             Some((label, key, home))
         })
         .collect()
@@ -834,17 +848,20 @@ pub(crate) fn home_keys(pool: &[PoolHome], keys: &[(String, LeaseKey)]) -> Vec<(
     homes
 }
 
-/// The claim keys of the Claude Code accounts `ai-pool.toml` under `home` names, each with its
+/// The claim keys of the supported accounts `ai-pool.toml` under `home` names, each with its
 /// home Mac's label ([`home_keys`]), keyed through the accounts' roster file under `home`; a
 /// roster that cannot be read keys them by login alone.
 fn homes_at(home: &std::path::Path) -> Vec<(LeaseKey, String)> {
-    let path = home
-        .join(".config/aterm")
-        .join(Cli::Claude.accounts().roster_file);
-    let keys = Roster::load_for(Cli::Claude, &path)
-        .map(|roster| keys(Cli::Claude, &roster))
-        .unwrap_or_default();
-    home_keys(&pool_homes(home), &keys)
+    CLAIMED_CLIS
+        .into_iter()
+        .flat_map(|cli| {
+            let path = home.join(".config/aterm").join(cli.accounts().roster_file);
+            let keys = Roster::load_for(cli, &path)
+                .map(|roster| keys(cli, &roster))
+                .unwrap_or_default();
+            home_keys(&pool_homes(home, cli), &keys)
+        })
+        .collect()
 }
 
 /// The Commons table the rows ride, as the process that links `aterm-db` installs it
@@ -1242,7 +1259,7 @@ fn touch_using(
                         }
                         None => (
                             Touched::Unrecorded(format!(
-                                "this Mac's claim row holds {MAX_CLAIMS} claims"
+                                "this Mac's claim row exceeds {MAX_CLAIM_BYTES} bytes"
                             )),
                             None,
                         ),
@@ -1407,7 +1424,7 @@ pub fn read_book(home: &std::path::Path) -> Option<(View, Book)> {
 /// store who holds each row's account; either gives up claims whose combined activity across
 /// this home's stores expired. Positive activity is saved before the claim row, under a private
 /// per-home lock. Roster and binding reads share the account state writer lock. Unreadable
-/// records or activity refuse publication. Claims apply to Claude Code where `ai-pool.toml`
+/// records or activity refuse publication. Claims apply to [`CLAIMED_CLIS`] where `ai-pool.toml`
 /// is present and this process has a table ([`install`]).
 pub fn touch(
     home: &std::path::Path,
@@ -1424,9 +1441,9 @@ pub fn touch(
         .unwrap_or(Touched::NotApplicable)
 }
 
-/// Whether claims apply to `cli` under `home`: Claude Code's, where `ai-pool.toml` is present.
+/// Whether claims apply to `cli` under `home`, where `ai-pool.toml` is present.
 fn applies(home: &std::path::Path, cli: Cli) -> bool {
-    cli == Cli::Claude
+    CLAIMED_CLIS.contains(&cli)
         && home
             .join(".secrets")
             .join(super::ai_pool::AI_POOL_FILE)
@@ -1540,7 +1557,7 @@ fn touch_reading(
         let homes = if off {
             Vec::new()
         } else {
-            home_keys(&pool_homes(home), &keys)
+            home_keys(&pool_homes(home, cli), &keys)
         };
         outcome = touch_using(
             table, home, presence, state, cli, &keys, &homes, act, now, activity,

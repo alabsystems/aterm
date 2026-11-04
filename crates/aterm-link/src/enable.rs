@@ -5348,21 +5348,15 @@ const POISONED_LOG_REMEDY: &str = "the broker's log is poisoned and refuses ever
      reopened log (one you run by hand, start again yourself); if it poisons again at once, the \
      disk under its log is failing flushes";
 
-fn quoted_broker_fix(w: &str, again: &str) -> Option<String> {
-    let s = |t: &str| w.contains(t);
-    if !s("supervisor's broker.err") {
-        return None;
-    }
-    Some(if s(crate::cli::NEWER_LOG_REMEDY) {
+fn quoted_broker_fix(last_word: &str, again: &str) -> String {
+    let s = |t: &str| last_word.contains(t);
+    if s(crate::cli::NEWER_LOG_REMEDY) {
         format!(
             "the broker's log holds records in a format newer than this aterm reads: install \
              the aterm release that wrote them (or a later one), then {again} restarts the \
              broker. No repair applies, and the log is untouched"
         )
     } else if s(&format!(": {}", crate::broker_health::POISONED_EXIT_WORDS)) {
-        // The broker left its poisoned log ([`crate::broker_health::poisoned_line`],
-        // whose opening words these are — they survive the quote's cut, which
-        // astream's reason at the line's end does not), and it is not back.
         if s(crate::broker_health::UNSUPERVISED_WORDS) {
             "the broker exited over a poisoned log, and no `aterm fabric on` job runs it: unless \
              something else restarts it, start it again with the command its line names (the \
@@ -5409,196 +5403,192 @@ fn quoted_broker_fix(w: &str, again: &str) -> Option<String> {
              it refuses to open, an address in use, a file it cannot read), fix that first, then \
              {again} restarts it — a restart alone meets the same refusal"
         )
-    })
+    }
 }
 
-/// The fix for one of `aterm fabric`'s warnings, matched on the words the warning is built from.
+/// The fix for one of `aterm fabric`'s warnings, dispatched exhaustively over [`fabric::WarningKind`].
 #[must_use]
-pub fn fix_for(warning: &str, role: &Role) -> String {
-    let w = warning;
-    let s = |t: &str| w.contains(t);
+pub fn fix_for(warning: &fabric::WarningKind, role: &Role) -> String {
     let again = role.again();
-    let quoted = quoted_broker_fix(w, &again);
-    if s("speaks astream protocol") {
-        protocol_remedy(&again)
-    } else if s(fabric::CAP_LAPSED) {
-        renew_remedy(&again)
-    } else if s("does not answer") && quoted.is_some() {
-        quoted.unwrap_or_default()
-    } else if s("does not answer") && s("no record lands")
-        || s("does not answer this report's own probe")
-    {
-        format!("start the broker: {again}")
-    } else if s("runs a replaced build") {
-        format!(
+    match warning {
+        fabric::WarningKind::BrokerProtocolSkew => protocol_remedy(&again),
+        fabric::WarningKind::BrokerCapLapsed => renew_remedy(&again),
+        fabric::WarningKind::BrokerUnreachable { last_word } => match last_word.as_deref() {
+            Some(lw) => quoted_broker_fix(lw, &again),
+            None => format!("start the broker: {again}"),
+        },
+        fabric::WarningKind::ConnectedProbeMismatch => format!("start the broker: {again}"),
+        fabric::WarningKind::BrokerReplacedBuild => format!(
             "{again} restarts it on the build on disk (a broker of this build or later \
              restarts itself within a minute of its executable being replaced)"
-        )
-    } else if s(fabric::POISONED_WARNING) {
-        POISONED_LOG_REMEDY.to_string()
-    } else if s(fabric::FLUSH_FAILED_WARNING) {
-        "check the disk under the broker's log (Disk Utility's First Aid, or the system log's \
-         I/O errors). A failed flush that put acked records at risk poisons the log, which a \
-         broker of this build then exits to reopen: run `aterm fabric` again to see whether \
-         this one did. The count starts again at zero when the broker next opens its log"
-            .to_string()
-    } else if s("checks no capability") {
-        format!(
+        ),
+        fabric::WarningKind::BrokerLogPoisoned => POISONED_LOG_REMEDY.to_string(),
+        fabric::WarningKind::BrokerFlushFailed => {
+            "check the disk under the broker's log (Disk Utility's First Aid, or the system log's \
+             I/O errors). A failed flush that put acked records at risk poisons the log, which a \
+             broker of this build then exits to reopen: run `aterm fabric` again to see whether \
+             this one did. The count starts again at zero when the broker next opens its log"
+                .to_string()
+        }
+        fabric::WarningKind::BrokerUnguarded => format!(
             "{again} rewrites the broker's job and restarts it guarded with the root's mint \
              secret (a broker run by hand: restart it with `--secret-file <root>/mint.secret`)"
-        )
-    } else if s("has not reported its broker link") {
-        format!(
+        ),
+        fabric::WarningKind::BridgeStarting => format!(
             "nothing, if its mail moves (`aterm ctl @<sid> post to=@<sid> kind=note --wait=5000 \
              ping` lands); if it does not, check the broker: {again}"
-        )
-    } else if s("broker link is down") {
-        let reason = w
-            .split("reason=")
-            .nth(1)
-            .and_then(|r| r.split([',', ' ', ')']).next())
-            .unwrap_or("");
-        let cause = match reason {
-            "no-socket" | "refused" => quoted.unwrap_or_else(|| {
-                format!("nothing listens at the broker's socket: {again} starts it")
-            }),
-            "no-ack" => format!("the broker accepts and never answers: {again} restarts it"),
-            "expired" => renew_remedy(&again),
-            "poisoned" => POISONED_LOG_REMEDY.to_string(),
-            "attach" => format!(
-                "the broker refuses this node's cap: move <root>/node.cap aside and run {again}"
-            ),
-            "busy" => "the broker is at its connection limit (`too many connections`) and \
-                       nothing on this node is wrong, so a re-minted cap cannot help: the bridge \
-                       redials under its back-off; if it stays, find what holds the broker's \
-                       connections"
-                .to_string(),
-            "record" => "the broker refuses this node's own will or presence row for good (a \
-                         sequence in its reserved half): the cap is fine and a re-mint cannot \
-                         help — the bridge's stderr names the refusal"
-                .to_string(),
-            "denied" => {
-                "the broker's socket refuses this user: check its owner and mode".to_string()
-            }
-            cut if cut.starts_with("cut-") => {
-                "the broker is up and one subscription (the face after `cut-`) ended: the broker \
-                 ended it, as astream does to a reader that leaves its socket unread past its 30 s \
-                 stream write bound (a bridge stopped or starved that long); or it read nothing \
-                 for its 30 s live read deadline (a broker stalled that long, behind a slow disk \
-                 say); or the link lost that one connection. The bridge's line in the log names \
-                 which end it saw — nothing on the broker needs a restart"
-                    .to_string()
-            }
-            "protocol" => protocol_remedy(&again),
-            "endpoint-grammar" => "the bridge is a build this aterm cannot serve (it lacks a \
-                                   verb the bridge needs): `[fabric] command` names another \
-                                   aterm than this instance's; quit and relaunch this aterm, or \
-                                   point [fabric] command at its build"
-                .to_string(),
-            _ => format!("check the broker: {again}"),
-        };
-        format!("{cause}; the bridge then reconnects on its own")
-    } else if s("bus could not be read") || s("could not be read:") {
-        format!(
+        ),
+        fabric::WarningKind::BridgeLinkDown { reason, last_word } => {
+            let cause = match reason.as_str() {
+                "no-socket" | "refused" => match last_word.as_deref() {
+                    Some(lw) => quoted_broker_fix(lw, &again),
+                    None => format!("nothing listens at the broker's socket: {again} starts it"),
+                },
+                "no-ack" => format!("the broker accepts and never answers: {again} restarts it"),
+                "expired" => renew_remedy(&again),
+                "poisoned" => POISONED_LOG_REMEDY.to_string(),
+                "attach" => format!(
+                    "the broker refuses this node's cap: move <root>/node.cap aside and run {again}"
+                ),
+                "busy" => "the broker is at its connection limit (`too many connections`) and \
+                           nothing on this node is wrong, so a re-minted cap cannot help: the \
+                           bridge redials under its back-off; if it stays, find what holds the \
+                           broker's connections"
+                    .to_string(),
+                "record" => "the broker refuses this node's own will or presence row for good (a \
+                             sequence in its reserved half): the cap is fine and a re-mint cannot \
+                             help — the bridge's stderr names the refusal"
+                    .to_string(),
+                "denied" => {
+                    "the broker's socket refuses this user: check its owner and mode".to_string()
+                }
+                cut if cut.starts_with("cut-") => {
+                    "the broker is up and one subscription (the face after `cut-`) ended: the \
+                     broker ended it, as astream does to a reader that leaves its socket unread \
+                     past its 30 s stream write bound (a bridge stopped or starved that long); or \
+                     it read nothing for its 30 s live read deadline (a broker stalled that long, \
+                     behind a slow disk say); or the link lost that one connection. The bridge's \
+                     line in the log names which end it saw — nothing on the broker needs a restart"
+                        .to_string()
+                }
+                "protocol" => protocol_remedy(&again),
+                "endpoint-grammar" => "the bridge is a build this aterm cannot serve (it lacks a \
+                                       verb the bridge needs): `[fabric] command` names another \
+                                       aterm than this instance's; quit and relaunch this aterm, \
+                                       or point [fabric] command at its build"
+                    .to_string(),
+                _ => format!("check the broker: {again}"),
+            };
+            format!("{cause}; the bridge then reconnects on its own")
+        }
+        fabric::WarningKind::BusUnreadable => format!(
             "the cap file's grants do not cover this fleet, or the broker died mid-read: {again} \
              re-mints the root's cap when it was minted for another fleet or node id, and probes \
              again; it leaves a ring minted under the root's secret for this fleet and node id as \
              it is, so first move <root>/node.cap aside when it was minted by hand and lacks a \
              grant"
-        )
-    } else if s("no [fabric] command") {
-        format!(
+        ),
+        fabric::WarningKind::NoFabricCommand => format!(
             "{again} writes [fabric] command (and the rendezvous file) so the next launch starts \
              a bridge on its own"
-        )
-    } else if s("no node id") {
-        format!("{again} provisions one and mints the cap for it")
-    } else if s("cap file") && s(WIDER_RING) {
-        format!(
+        ),
+        fabric::WarningKind::NoNodeId => {
+            format!("{again} provisions one and mints the cap for it")
+        }
+        fabric::WarningKind::CapWiderRing => format!(
             "{again} gives the bridge one cap file, <root>/node.cap, holding the node's own \
              ring: a wider ring there it keeps aside beside it, whatever secret minted it, and \
              any other cap file the command names it leaves where it is, no longer attached"
-        )
-    } else if s("cap file") && (s("a secret file") || s("read through no link")) {
-        format!(
+        ),
+        fabric::WarningKind::CapUnreadable {
+            owner_or_link_refused: true,
+        } => format!(
             "the file is refused as a cap for what this warning says: do what it names (`chmod \
              600 <cap>`, `chmod -N <cap>`), since whoever could read it could have copied it, or \
              move it aside and run {again}, which mints this node's ring; a bridge aterm runs \
              must satisfy the same owner-only rule at every new start"
-        )
-    } else if s("cap file") {
-        format!(
-            "{again} can re-mint a missing or malformed cap file; permission-refused files are left intact, so restore access before retrying"
-        )
-    } else if s("has no bridge") {
-        format!("{again} arms every running instance")
-    } else if s("bridge is down") {
-        format!(
+        ),
+        fabric::WarningKind::CapUnreadable {
+            owner_or_link_refused: false,
+        } => format!(
+            "{again} can re-mint a missing or malformed cap file; permission-refused files are \
+             left intact, so restore access before retrying"
+        ),
+        fabric::WarningKind::InstanceNoBridge => format!("{again} arms every running instance"),
+        fabric::WarningKind::BridgeDown => format!(
             "aterm relaunches its bridge with back-off; if it stays down, the bridge cannot \
              start — run the [fabric] command by hand to see its error, then {again}"
-        )
-    } else if s("has not answered for the work") {
-        "kill that instance's bridge (`kill <bridge pid>` from the BRIDGES row); aterm relaunches \
-         it"
-        .to_string()
-    } else if s("armed with a different command") {
-        "relaunch that aterm instance: its supervisor reads [fabric] command once, at launch"
-            .to_string()
-    } else if s("stands by") {
-        format!(
+        ),
+        fabric::WarningKind::BridgeStale => {
+            "kill that instance's bridge (`kill <bridge pid>` from the BRIDGES row); aterm \
+             relaunches it"
+                .to_string()
+        }
+        fabric::WarningKind::BridgeDifferentCommand => {
+            "relaunch that aterm instance: its supervisor reads [fabric] command once, at launch"
+                .to_string()
+        }
+        fabric::WarningKind::BridgeStateLocked => format!(
             "{}; it takes the node over on its own once the holder exits",
             crate::bridge::STATE_LOCKED_REMEDY
-        )
-    } else if s("the bus's own presence") {
-        "kill that instance's bridge (`kill <bridge pid>` from the BRIDGES row); aterm relaunches \
-         it and publishes state=live"
-            .to_string()
-    } else if s("is HELD") {
-        let lift = lift_hold_in(w);
-        let origin = w
-            .split_whitespace()
-            .find_map(|t| t.strip_prefix("origin="))
-            .map(|o| o.trim_end_matches([')', ':', ';']));
-        let slots = HoldSlots::of(origin.unwrap_or(""));
-        let lost = s("reason=fabric-lost");
-        let mut remedies: Vec<String> = Vec::new();
-        if slots.person {
-            remedies.push(PERSON_HOLD_LIFT.to_string());
+        ),
+        fabric::WarningKind::ConnectedPresenceMismatch => {
+            "kill that instance's bridge (`kill <bridge pid>` from the BRIDGES row); aterm \
+             relaunches it and publishes state=live"
+                .to_string()
         }
-        if slots.remote {
-            remedies.push(format!(
-                "{REMOTE_HOLD_LIFT}, and once its place answers under another fleet's secret or \
-                 key, so does {lift}"
-            ));
-        }
-        if slots.fleet {
-            remedies.push(
-                match (lost, remedies.is_empty() && !slots.local) {
-                    (true, true) => "it lifts when the bridge reconnects",
-                    (true, false) => "the fleet's lifts when the bridge reconnects",
-                    (false, _) => FLEET_HALT_LIFT,
-                }
-                .to_string(),
-            );
-        }
-        if slots.local {
-            remedies.push(if remedies.is_empty() {
-                lift.clone()
+        fabric::WarningKind::SessionQueryFailed { pid, sock } => format!(
+            "that session closed while the report ran or its instance stopped answering: check \
+             `aterm ctl {} ls`; if the instance does not answer, relaunch it",
+            instance_flag(*pid, sock.as_deref())
+        ),
+        fabric::WarningKind::SessionHeld {
+            sid,
+            pid,
+            sock,
+            origin,
+            fabric_lost,
+        } => {
+            let lift = lift_hold(sid, *pid, sock.as_deref());
+            let slots = HoldSlots::of(origin.as_deref().unwrap_or(""));
+            let mut remedies: Vec<String> = Vec::new();
+            if slots.person {
+                remedies.push(PERSON_HOLD_LIFT.to_string());
+            }
+            if slots.remote {
+                remedies.push(format!(
+                    "{REMOTE_HOLD_LIFT}, and once its place answers under another fleet's secret \
+                     or key, so does {lift}"
+                ));
+            }
+            if slots.fleet {
+                remedies.push(
+                    match (*fabric_lost, remedies.is_empty() && !slots.local) {
+                        (true, true) => "it lifts when the bridge reconnects",
+                        (true, false) => "the fleet's lifts when the bridge reconnects",
+                        (false, _) => FLEET_HALT_LIFT,
+                    }
+                    .to_string(),
+                );
+            }
+            if slots.local {
+                remedies.push(if remedies.is_empty() {
+                    lift.clone()
+                } else {
+                    format!("the owner's local hold beside it lifts with {lift}")
+                });
+            }
+            if !remedies.is_empty() {
+                remedies.join("; ")
             } else {
-                format!("the owner's local hold beside it lifts with {lift}")
-            });
+                format!(
+                    "a local hold lifts with {lift}; a fleet hold lifts when a bridge reconnects \
+                     (reason=fabric-lost) or when the person who set it runs `aterm fabric halt \
+                     --cap-file <their cap> off`"
+                )
+            }
         }
-        if !remedies.is_empty() {
-            remedies.join("; ")
-        } else {
-            format!(
-                "a local hold lifts with {lift}; a fleet hold lifts when a bridge reconnects \
-                 (reason=fabric-lost) or when the person who set it runs `aterm fabric halt \
-                 --cap-file <their cap> off`"
-            )
-        }
-    } else if s(fabric::RETENTION_GAVE_UP) {
-        format!(
+        fabric::WarningKind::RetentionGaveUp => format!(
             "nothing brings those records back: aterm's broker rules keep unread mail {days} \
              days within {} MiB of mail lanes and every other record (a broadcast too) {days} \
              days within {} MiB, and let read mail go with the bulk stream's cut, so a bridge \
@@ -5611,13 +5601,13 @@ pub fn fix_for(warning: &str, role: &Role) -> String {
             crate::broker_rules::MAIL_BYTES >> 20,
             crate::broker_rules::DEFAULT_BYTES >> 20,
             days = crate::broker_rules::MAX_AGE.as_secs() / 86_400,
-        )
-    } else if s("lost") && s("evicted") {
-        "read mail sooner (`aterm ctl @<sid> await inbox since=<id>`) and `inbox seen` what is \
-         handled; the evicted records are still on the bus"
-            .to_string()
-    } else if s(fabric::OVERDUE_UNJUDGED) {
-        format!(
+        ),
+        fabric::WarningKind::SessionInboxEvicted => {
+            "read mail sooner (`aterm ctl @<sid> await inbox since=<id>`) and `inbox seen` what \
+             is handled; the evicted records are still on the bus"
+                .to_string()
+        }
+        fabric::WarningKind::OverdueUnjudged => format!(
             "nothing on the bus is broken: the broker let a reply on the asker's lane go, so \
              status cannot tell whether it answered these asks. The asker's inbox shows the \
              answers it had, `re=` naming the ask's offset (`aterm ctl @<sid> inbox --peek` for \
@@ -5627,40 +5617,46 @@ pub fn fix_for(warning: &str, role: &Role) -> String {
              within {days} days) or the bus moves {span} records past them",
             days = crate::broker_rules::MAX_AGE.as_secs() / 86_400,
             span = fabric::OVERDUE_SCAN_SPAN,
-        )
-    } else if s("passed its deadline") && s("@p passed") {
-        "a person was asked: `aterm fabric inbox --cap-file <their cap>` shows it, and `aterm \
-         fabric post --cap-file <their cap> to=@<sid>@<node> kind=answer re=<off> <text>` \
-         answers it (`aterm link notify --on ask:<person>` pages them next time)"
-            .to_string()
-    } else if s("passed its deadline") {
-        "the session it was sent to has not answered: `aterm ctl @<sid> inbox` shows it, then \
-         `inbox seen <id> handled` (or `refused`)"
-            .to_string()
-    } else if s("unhandled task/ask") {
-        "that session was given work: `aterm ctl @<sid> inbox`, handle it, then `inbox seen <id> \
-         handled` (or `refused`)"
-            .to_string()
-    } else if s("queued post") {
-        format!("arm a bridge ({again}); the outbox drains the moment one attaches")
-    } else if s("did not answer") {
-        "that instance's control thread is wedged or its socket is stale: `aterm ctl instances`, \
-         and relaunch it"
-            .to_string()
-    } else if s("cannot list this machine's aterm instances") {
-        "the control-socket dir could not be read: check $XDG_RUNTIME_DIR / $HOME and the \
-         directory's permissions"
-            .to_string()
-    } else if s("the bus advertises") {
-        "`aterm fabric doctor --retire-ghosts` lists the row; `--yes` publishes `exited` for it \
-         now (a bridge on the node's own state dir retires a row its own earlier runs in \
-         this boot left after five minutes, and one a copy of the state dir left only once its \
-         attach finds that copy's writer-marked will on the bus; unmarked rows need the doctor)"
-            .to_string()
-    } else if s("fleet halt standing") || s("stands on this node with no row on the bus") {
-        FLEET_HALT_LIFT.to_string()
-    } else if s("distinct subjects one node may hold at once") {
-        format!(
+        ),
+        fabric::WarningKind::OverdueWork { to_person: true } => {
+            "a person was asked: `aterm fabric inbox --cap-file <their cap>` shows it, and `aterm \
+             fabric post --cap-file <their cap> to=@<sid>@<node> kind=answer re=<off> <text>` \
+             answers it (`aterm link notify --on ask:<person>` pages them next time)"
+                .to_string()
+        }
+        fabric::WarningKind::OverdueWork { to_person: false } => {
+            "the session it was sent to has not answered: `aterm ctl @<sid> inbox` shows it, then \
+             `inbox seen <id> handled` (or `refused`)"
+                .to_string()
+        }
+        fabric::WarningKind::SessionUnhandledStaleWork => {
+            "that session was given work: `aterm ctl @<sid> inbox`, handle it, then `inbox seen \
+             <id> handled` (or `refused`)"
+                .to_string()
+        }
+        fabric::WarningKind::SessionQueuedPostsNoBridge => {
+            format!("arm a bridge ({again}); the outbox drains the moment one attaches")
+        }
+        fabric::WarningKind::InstanceUnreachable => {
+            "that instance's control thread is wedged or its socket is stale: `aterm ctl \
+             instances`, and relaunch it"
+                .to_string()
+        }
+        fabric::WarningKind::InstanceDiscoveryFailed => {
+            "the control-socket dir could not be read: check $XDG_RUNTIME_DIR / $HOME and the \
+             directory's permissions"
+                .to_string()
+        }
+        fabric::WarningKind::GhostSessionRow => {
+            "`aterm fabric doctor --retire-ghosts` lists the row; `--yes` publishes `exited` for \
+             it now (a bridge on the node's own state dir retires a row its own earlier runs in \
+             this boot left after five minutes, and one a copy of the state dir left only once \
+             its attach finds that copy's writer-marked will on the bus; unmarked rows need the \
+             doctor)"
+                .to_string()
+        }
+        fabric::WarningKind::FleetHaltStanding => FLEET_HALT_LIFT.to_string(),
+        fabric::WarningKind::SubjectBudgetHigh => format!(
             "close the sessions you do not need: five minutes after one leaves, its bridge gives \
              its presence row and the lanes it was mailed on back. If what stays holds the \
              budget (live sessions, and a subject for each topic a session ever broadcast on), \
@@ -5670,22 +5666,25 @@ pub fn fix_for(warning: &str, role: &Role) -> String {
              command), whose bridge starts on the new id with a fresh budget (a killed bridge \
              would come back on the command its aterm armed at launch); mail still queued for \
              the old id is abandoned with it"
-        )
-    } else if s("presence roster has more than") && s("truncated") {
-        "nothing on the bus is wrong: one roster read takes at most that many rows and every \
-         session keeps one until five minutes after it leaves; a session past the cut is still \
-         listed by `aterm ctl ls`"
-            .to_string()
-    } else if s("no rendezvous file") {
-        format!("{again} writes it")
-    } else if s("is another build than the instance") || s("could not parse") {
-        format!(
-            "point [fabric] command at this instance's own aterm ({again} from a shell inside \
-             it) and relaunch, or update the other build; until then mail a line the instance \
-             cannot parse carries waits on the bus"
-        )
-    } else {
-        "see `aterm help fabric`".to_string()
+        ),
+        fabric::WarningKind::RosterTruncated => {
+            "nothing on the bus is wrong: one roster read takes at most that many rows and every \
+             session keeps one until five minutes after it leaves; a session past the cut is \
+             still listed by `aterm ctl ls`"
+                .to_string()
+        }
+        fabric::WarningKind::RendezvousMissing => format!("{again} writes it"),
+        fabric::WarningKind::RendezvousUnreadable => format!(
+            "{again} rewrites the rendezvous file (restore read/write access on the file and its \
+             directory first if permissions refused the read)"
+        ),
+        fabric::WarningKind::BridgeBuildMismatch | fabric::WarningKind::BridgeLaneFaults => {
+            format!(
+                "point [fabric] command at this instance's own aterm ({again} from a shell inside \
+                 it) and relaunch, or update the other build; until then mail a line the instance \
+                 cannot parse carries waits on the bus"
+            )
+        }
     }
 }
 
@@ -5725,18 +5724,6 @@ impl HoldSlots {
             local: has("local"),
         }
     }
-}
-
-fn lift_hold_in(warning: &str) -> String {
-    let (sid, at) = warning
-        .strip_prefix('@')
-        .and_then(|w| w.split_once(" (instance "))
-        .and_then(|(sid, rest)| Some((sid, rest.split_once(") is HELD")?.0)))
-        .unwrap_or_default();
-    let (pid, sock) = at
-        .split_once(", --sock ")
-        .map_or((at, None), |(pid, sock)| (pid, Some(sock)));
-    lift_hold(sid, crate::parse_uint(pid).unwrap_or(0), sock)
 }
 
 fn arm_command(pid: u32, sock: &str, argv: &[String]) -> String {
@@ -6042,15 +6029,22 @@ pub fn doctor(retire_ghosts: bool, yes: bool) -> ExitCode {
             ExitCode::from(2)
         }
         Ok(report) => {
-            let mut warnings = report.warnings.clone();
+            let mut warnings = report.warning_items.clone();
             match Rendezvous::read() {
                 Ok(Some(_)) => {}
-                Ok(None) => warnings.push(format!(
-                    "no rendezvous file at {}: `aterm link ls` needs its flags \
-                     spelled out here",
-                    rendezvous_path().map_or_else(|| "-".to_string(), |p| p.display().to_string())
+                Ok(None) => warnings.push(fabric::Warning::new(
+                    fabric::WarningKind::RendezvousMissing,
+                    format!(
+                        "no rendezvous file at {}: `aterm link ls` needs its flags \
+                         spelled out here",
+                        rendezvous_path()
+                            .map_or_else(|| "-".to_string(), |p| p.display().to_string())
+                    ),
                 )),
-                Err(e) => warnings.push(format!("the rendezvous file is unreadable: {e}")),
+                Err(e) => warnings.push(fabric::Warning::new(
+                    fabric::WarningKind::RendezvousUnreadable,
+                    format!("the rendezvous file is unreadable: {e}"),
+                )),
             }
             println!(
                 "aterm fabric doctor — fleet {} · node {}",
@@ -6083,8 +6077,8 @@ pub fn doctor(retire_ghosts: bool, yes: bool) -> ExitCode {
             }
             println!("  {} warning(s)", warnings.len());
             for w in &warnings {
-                println!("  ! {w}");
-                println!("    fix: {}", fix_for(w, &role));
+                println!("  ! {}", w.text);
+                println!("    fix: {}", fix_for(&w.kind, &role));
             }
             ExitCode::FAILURE
         }
@@ -9320,8 +9314,14 @@ mod tests {
         assert!(set_fabric_command(open, &plain).is_err());
     }
 
+    /// Every [`fabric::WarningKind`] maps to an actionable remedy under every [`Role`], and every
+    /// `aterm fabric on` command in that remedy carries the role's `--fleet`.
+    /// NEGATIVE CONTROL: `SessionQueryFailed` and `RendezvousUnreadable` (which prose substring
+    /// matching previously sent to the generic help fallback or misclassified as `BridgeLaneFaults`)
+    /// receive their own remedies.
     #[test]
     fn every_warning_shape_has_a_fix() {
+        use fabric::WarningKind as W;
         let roles = [
             Role { fleet: None },
             Role {
@@ -9329,120 +9329,128 @@ mod tests {
             },
         ];
         for w in [
-            "the broker at /x does not answer (connect: x): no record lands and none is delivered",
-            "instance 1 says fabric=connected (its bridge's last ack was 3s ago), but the broker at \
-             /tmp/b.sock does not answer this report's own probe",
-            "instance 1's bridge is attached but its broker link is down (fabric=stalled \
-             reason=refused, last ack 3s ago)",
-            "instance 1's bridge is attached but its broker link is down (fabric=stalled \
-             reason=expired, last ack 3s ago)",
-            "the broker at /x refuses this node's cap as lapsed (its grants' `exp=` has passed): \
-             no record of this node lands and none is delivered to it — the broker refused the \
-             ring in /c: x",
-            "instance 1's bridge is attached and has not reported its broker link (fabric=stalled \
-             reason=starting)",
-            "the broker at /x answers but the bus could not be read: head query",
-            "the broker at /x speaks astream protocol 3 and this aterm speaks 2: neither can read \
-             what the other sends, so no record lands and none is delivered",
-            "the broker at /x does not answer (connect: x): no record lands and none is \
-             delivered; its supervisor's broker.err, written 3m ago: open bus.log: refused",
-            "no [fabric] command in /c: this report read instance 1's running bridge",
-            "no node id in /s/node",
-            "cap file /c: the tag is not hex",
-            "cap file /c: wider than this node's ring: ring[6] \"rw:/f/lab/>\" is an unbound \
-             read-write god capability outside ceiling (x)",
-            "cap file /c: /c is mode 0644: a secret file must be readable by its owner alone \
-             (0600 or tighter); run `chmod 600 /c` and treat its contents as exposed",
-            "cap file /c: /c is a symlink: a private ring is read through no link, so name the \
-             file it points at",
-            "instance 1 has no bridge (fabric=absent, not supervised)",
-            "instance 1's bridge is down (fabric=disconnected)",
-            "instance 1's bridge was armed with a different command than x",
-            "instance 2's bridge stands by (fabric=stalled reason=state-locked): instance 1's \
-             bridge holds its state dir /s",
-            "instance 1 says fabric=connected, but the bus's own presence for its node n-a says state=gone",
-            "instance 1 says fabric=connected, but the bus's own presence for its node n-a says \
-             state=live fabric=disconnected",
-            "instance 1's bridge has not answered for the work it was given (fabric=stale, last ack \
-             never)",
-            "ask off=40 from h-andrew to @s-one@n-a passed its deadline 10m ago (dl=600000 ms) with \
-             no answer, report or ack — not yet recorded expired by the asker's bridge",
-            "ask off=41 from s-one@n-a to @h-andrew@p passed its deadline 10m ago (dl=600000 ms) \
-             with no answer, report or ack — the asker's bridge recorded it expired",
-            "h-andrew's fleet halt (reason=stop) stands on this node with no row on the bus: it \
-             was read on a bus log since replaced",
-            "@s-a (instance 1) is HELD (reason=x origin=local)",
-            "@s-a (instance 1) lost 2 message(s): its inbox ring evicted rows",
-            "instance 1: the broker's retention gave up this node's unread mail before its bridge \
-             read it (1 range(s) since the instance started): @10..@42 (3 records)",
-            "@s-a (instance 1): the broker's retention gave up records of its own before it \
-             handled them: its mail lane @50..@60 (`inbox` lane_given_up=)",
-            "@s-a (instance 1) has 1 unhandled task/ask older than 10 min",
-            "2 held ask(s) past their deadline cannot be judged: the bus no longer keeps (or this \
-             cap does not read) every answer, report and ack above them on their asker's lane, so \
-             status cannot say whether they had one",
-            "@s-a (instance 1) has 3 queued post(s) and no working bridge",
-            "instance 1 did not answer (x)",
-            "cannot list this machine's aterm instances: x",
-            "the bus advertises @s-g live on n-a",
-            "h-andrew has a fleet halt standing (reason=stop)",
-            "no rendezvous file at /x",
-            "instance 1's bridge is another build than the instance: bridge a, instance b",
-            "instance 1 could not parse 3 of its bridge's lines (lane_faults=3)",
-            "node n-a holds 3072 of the 4096 distinct subjects one node may hold at once: a \
-             departed session's presence row and the lanes this node wrote to it go back five \
-             minutes after it leaves (its `ev` face once the session-log mirror landed its tail), \
-             but each topic a session broadcast on keeps one subject for good, so what stays is \
-             held by live sessions, every topic face a session of this node ever broadcast on, \
-             mail still owed and the node's own faces; past the bound a new session gets no \
-             presence row and its posts are refused",
-            "the presence roster has more than 4096 rows and the read stopped there (rows=4096+ \
-             truncated): NODES, SESSIONS and every warning drawn from them leave out what lies \
-             past it",
-            "the broker at /x says its log is POISONED (a flush failed): it refuses every write \
-             until the log is reopened, so no record lands; a broker of this build exits within \
-             seconds for its supervisor to reopen it",
-            "the broker at /x says a flush of its log failed 2 time(s) since it opened: the disk \
-             under /x.log is failing writes, and the log was not poisoned when this asked (a \
-             failed flush that put acked records at risk poisons it, and the next report says so)",
+            W::BrokerUnreachable { last_word: None },
+            W::BrokerUnreachable {
+                last_word: Some("written 3m ago: open bus.log: refused".to_string()),
+            },
+            W::ConnectedProbeMismatch,
+            W::BridgeLinkDown {
+                reason: "refused".to_string(),
+                last_word: None,
+            },
+            W::BridgeLinkDown {
+                reason: "expired".to_string(),
+                last_word: None,
+            },
+            W::BridgeLinkDown {
+                reason: "no-ack".to_string(),
+                last_word: None,
+            },
+            W::BridgeLinkDown {
+                reason: "attach".to_string(),
+                last_word: None,
+            },
+            W::BridgeLinkDown {
+                reason: "other".to_string(),
+                last_word: None,
+            },
+            W::BrokerCapLapsed,
+            W::BridgeStarting,
+            W::BusUnreadable,
+            W::BrokerProtocolSkew,
+            W::BrokerReplacedBuild,
+            W::BrokerUnguarded,
+            W::NoFabricCommand,
+            W::NoNodeId,
+            W::CapUnreadable {
+                owner_or_link_refused: false,
+            },
+            W::CapUnreadable {
+                owner_or_link_refused: true,
+            },
+            W::CapWiderRing,
+            W::InstanceNoBridge,
+            W::BridgeDown,
+            W::BridgeDifferentCommand,
+            W::BridgeStateLocked,
+            W::ConnectedPresenceMismatch,
+            W::BridgeStale,
+            W::OverdueWork { to_person: false },
+            W::OverdueWork { to_person: true },
+            W::FleetHaltStanding,
+            W::SessionQueryFailed {
+                pid: 42,
+                sock: None,
+            },
+            W::SessionHeld {
+                sid: "s-a".to_string(),
+                pid: 1,
+                sock: None,
+                origin: Some("local".to_string()),
+                fabric_lost: false,
+            },
+            W::SessionInboxEvicted,
+            W::RetentionGaveUp,
+            W::SessionUnhandledStaleWork,
+            W::OverdueUnjudged,
+            W::SessionQueuedPostsNoBridge,
+            W::InstanceUnreachable,
+            W::InstanceDiscoveryFailed,
+            W::GhostSessionRow,
+            W::RendezvousMissing,
+            W::RendezvousUnreadable,
+            W::BridgeBuildMismatch,
+            W::BridgeLaneFaults,
+            W::SubjectBudgetHigh,
+            W::RosterTruncated,
+            W::BrokerLogPoisoned,
+            W::BrokerFlushFailed,
         ] {
             for role in &roles {
-                let fix = fix_for(w, role);
-                assert_ne!(fix, "see `aterm help fabric`", "no fix for: {w}");
+                let fix = fix_for(&w, role);
+                assert!(!fix.is_empty(), "empty fix for {w:?}");
+                assert_ne!(fix, "see `aterm help fabric`", "no fix for: {w:?}");
                 if role.fleet.is_some() {
                     assert_eq!(
                         fix.matches("`aterm fabric on").count(),
                         fix.matches("`aterm fabric on --fleet lab`").count(),
-                        "{w}: {fix}"
+                        "{w:?}: {fix}"
                     );
                 }
             }
         }
-        assert_eq!(
-            fix_for("something new", &Role::default()),
-            "see `aterm help fabric`"
+        let session_err = fix_for(
+            &W::SessionQueryFailed {
+                pid: 42,
+                sock: None,
+            },
+            &Role::default(),
+        );
+        assert!(
+            session_err.contains("`aterm ctl --pid 42 ls`"),
+            "{session_err}"
+        );
+        assert_ne!(
+            session_err,
+            fix_for(&W::BridgeLaneFaults, &Role::default()),
+            "NEGATIVE CONTROL: a failed session ctl query must not misclassify as BridgeLaneFaults"
+        );
+        let rv_unreadable = fix_for(&W::RendezvousUnreadable, &Role::default());
+        assert!(
+            rv_unreadable.contains("rewrites the rendezvous file"),
+            "{rv_unreadable}"
         );
     }
 
     #[test]
     fn a_refused_log_gets_its_own_remedy_and_a_newer_one_never_a_repair() {
         use std::io::ErrorKind as K;
-        let warning = |last: &str| {
-            format!(
-                "the broker at /r/bus.sock does not answer (connect: x): no record lands and none \
-                 is delivered; its supervisor's broker.err, written 1s ago: aterm link broker: \
-                 {last}"
-            )
+        let warning = |last: &str| fabric::WarningKind::BrokerUnreachable {
+            last_word: Some(format!("written 1s ago: aterm link broker: {last}")),
         };
-        let bridge = |reason: &str, last: Option<&str>| {
-            format!(
-                "instance 1's bridge is attached but its broker link is down (fabric=stalled \
-                 reason={reason}, last ack never): its posts queue and no mail arrives from the \
-                 broker at /r/bus.sock{}",
-                last.map_or_else(String::new, |l| format!(
-                    "; its supervisor's broker.err, written 1s ago: aterm link broker: {l}"
-                ))
-            )
+        let bridge = |reason: &str, last: Option<&str>| fabric::WarningKind::BridgeLinkDown {
+            reason: reason.to_string(),
+            last_word: last.map(|l| format!("written 1s ago: aterm link broker: {l}")),
         };
         let reconnects = "; the bridge then reconnects on its own";
         let line = |kind| crate::cli::log_refusal_remedy(kind, "/r/bus.log").expect("a remedy");
@@ -9491,10 +9499,9 @@ mod tests {
         let role = Role::default();
         let quoted = |last: &str| {
             fix_for(
-                &format!(
-                    "the broker at /r/bus.sock does not answer (connect: x): no record lands and \
-                     none is delivered; its supervisor's broker.err, written 1s ago: {last}"
-                ),
+                &fabric::WarningKind::BrokerUnreachable {
+                    last_word: Some(format!("written 1s ago: {last}")),
+                },
                 &role,
             )
         };
@@ -9530,10 +9537,10 @@ mod tests {
         );
         let down = |reason: &str| {
             fix_for(
-                &format!(
-                    "instance 1's bridge is attached but its broker link is down (fabric=stalled \
-                     reason={reason}, last ack 3s ago)"
-                ),
+                &fabric::WarningKind::BridgeLinkDown {
+                    reason: reason.to_string(),
+                    last_word: None,
+                },
                 &role,
             )
         };
@@ -9552,28 +9559,57 @@ mod tests {
 
     #[test]
     fn a_fix_picks_the_remedy_the_warning_names() {
-        fn fix_for(warning: &str) -> String {
+        fn fix_for(warning: &fabric::WarningKind) -> String {
             super::fix_for(warning, &Role::default())
         }
-        let held = |why: &str| fix_for(&format!("@s-a (instance 1) is HELD ({why})"));
+        let held = |reason: &str, origin: &str| {
+            fix_for(&fabric::WarningKind::SessionHeld {
+                sid: "s-a".to_string(),
+                pid: 1,
+                sock: None,
+                origin: Some(origin.to_string()),
+                fabric_lost: reason == "fabric-lost",
+            })
+        };
+        assert_eq!(held("x", "local"), "`aterm ctl --pid 1 hold s-a off`");
         assert_eq!(
-            held("reason=x origin=local"),
-            "`aterm ctl --pid 1 hold s-a off`"
-        );
-        assert_eq!(
-            fix_for("a session is HELD (reason=x origin=local)"),
+            fix_for(&fabric::WarningKind::SessionHeld {
+                sid: String::new(),
+                pid: 0,
+                sock: None,
+                origin: Some("local".to_string()),
+                fabric_lost: false,
+            }),
             "`aterm ctl --pid <pid> hold <sid> off`"
         );
         assert_eq!(
-            fix_for("@s-a (instance 1, --sock /tmp/at.x/a.sock) is HELD (reason=x origin=local)"),
+            fix_for(&fabric::WarningKind::SessionHeld {
+                sid: "s-a".to_string(),
+                pid: 1,
+                sock: Some("/tmp/at.x/a.sock".to_string()),
+                origin: Some("local".to_string()),
+                fabric_lost: false,
+            }),
             "`aterm ctl --sock /tmp/at.x/a.sock hold s-a off`"
         );
         assert_eq!(
-            fix_for("@s-a (instance 0, --sock /tmp/a b.sock) is HELD (reason=x origin=local)"),
+            fix_for(&fabric::WarningKind::SessionHeld {
+                sid: "s-a".to_string(),
+                pid: 0,
+                sock: Some("/tmp/a b.sock".to_string()),
+                origin: Some("local".to_string()),
+                fabric_lost: false,
+            }),
             "`aterm ctl --sock '/tmp/a b.sock' hold s-a off`"
         );
         assert_eq!(
-            fix_for("@s-a (instance 0, --sock /tmp/a'b.sock) is HELD (reason=x origin=local)"),
+            fix_for(&fabric::WarningKind::SessionHeld {
+                sid: "s-a".to_string(),
+                pid: 0,
+                sock: Some("/tmp/a'b.sock".to_string()),
+                origin: Some("local".to_string()),
+                fabric_lost: false,
+            }),
             "`aterm ctl --sock <sock> hold s-a off`"
         );
         assert_eq!(
@@ -9585,44 +9621,50 @@ mod tests {
             "arm 4242 (`aterm ctl --sock /tmp/at.x/a.sock fabric attach --node n1`)"
         );
         assert_eq!(
-            fix_for("@s-a (instance 0) is HELD (reason=x origin=local)"),
+            fix_for(&fabric::WarningKind::SessionHeld {
+                sid: "s-a".to_string(),
+                pid: 0,
+                sock: None,
+                origin: Some("local".to_string()),
+                fabric_lost: false,
+            }),
             "`aterm ctl --pid <pid> hold s-a off`"
         );
-        let fleet = held("reason=stop origin=fleet");
+        let fleet = held("stop", "fleet");
         assert!(
             fleet.contains("aterm fabric halt") && !fleet.contains("hold s-a off"),
             "{fleet}"
         );
-        let both = held("reason=stop origin=fleet,local");
+        let both = held("stop", "fleet,local");
         assert!(
             both.contains("aterm fabric halt") && both.contains("`aterm ctl --pid 1 hold s-a off`"),
             "{both}"
         );
-        let lost = held("reason=fabric-lost origin=fleet,local");
+        let lost = held("fabric-lost", "fleet,local");
         assert!(
             lost.contains("bridge reconnects") && lost.contains("hold s-a off"),
             "{lost}"
         );
-        let person = held("reason=taken-over origin=person");
+        let person = held("taken-over", "person");
         assert_eq!(person, PERSON_HOLD_LIFT);
-        let beside = held("reason=taken-over origin=person,local");
+        let beside = held("taken-over", "person,local");
         assert!(
             beside.starts_with(PERSON_HOLD_LIFT)
                 && beside.contains("`aterm ctl --pid 1 hold s-a off`"),
             "{beside}"
         );
-        let remote = held("reason=- origin=remote");
+        let remote = held("-", "remote");
         assert!(
             remote.starts_with(REMOTE_HOLD_LIFT)
                 && remote.ends_with("so does `aterm ctl --pid 1 hold s-a off`"),
             "{remote}"
         );
-        let beside = held("reason=- origin=remote,fleet");
+        let beside = held("-", "remote,fleet");
         assert!(
             beside.starts_with(REMOTE_HOLD_LIFT) && beside.contains("aterm fabric halt"),
             "{beside}"
         );
-        let all = held("reason=taken-over origin=person,fleet,local");
+        let all = held("taken-over", "person,fleet,local");
         assert!(
             all.starts_with(PERSON_HOLD_LIFT)
                 && all.contains("aterm fabric halt")
@@ -9631,10 +9673,10 @@ mod tests {
         );
 
         let down = |reason: &str| {
-            fix_for(&format!(
-                "instance 1's bridge is attached but its broker link is down (fabric=stalled \
-                 reason={reason}, last ack 3s ago)"
-            ))
+            fix_for(&fabric::WarningKind::BridgeLinkDown {
+                reason: reason.to_string(),
+                last_word: None,
+            })
         };
         assert!(
             down("expired").contains("has lapsed") && down("expired") != down("attach"),
@@ -9642,15 +9684,14 @@ mod tests {
             down("expired")
         );
         assert!(
-            fix_for(&format!("the broker at /x {}: x", fabric::CAP_LAPSED))
+            fix_for(&fabric::WarningKind::BrokerCapLapsed)
                 .starts_with(&renew_remedy("`aterm fabric on`")),
             "{}",
-            fix_for(&format!("the broker at /x {}: x", fabric::CAP_LAPSED))
+            fix_for(&fabric::WarningKind::BrokerCapLapsed)
         );
-        let skew = "the broker at /x speaks astream protocol 3 and this aterm speaks 2";
         let here = protocol_remedy("`aterm fabric on`");
         assert!(down("protocol").starts_with(&here), "{}", down("protocol"));
-        assert_eq!(fix_for(skew), here);
+        assert_eq!(fix_for(&fabric::WarningKind::BrokerProtocolSkew), here);
         for reason in ["busy", "record", "protocol"] {
             assert!(
                 !down(reason).contains("node.cap aside") && down(reason) != down("other"),
@@ -9663,7 +9704,7 @@ mod tests {
             "{}",
             down("cut-say")
         );
-        let unread = fix_for("the broker at /x answers but the bus could not be read: head query");
+        let unread = fix_for(&fabric::WarningKind::BusUnreadable);
         assert!(
             unread.contains("move <root>/node.cap aside"),
             "a ring for this fleet that lacks a grant passes `on` as already: {unread}"
@@ -10053,7 +10094,7 @@ mod tests {
         let named_wide = named(&wide).expect("doctor names it");
         assert_eq!(named_wide, miss.why, "doctor and `on` say the same");
         let warning = format!("cap file /r/node.cap: {named_wide}");
-        let fix = fix_for(&warning, &Role::default());
+        let fix = fix_for(&fabric::WarningKind::CapWiderRing, &Role::default());
         assert!(
             fix.contains("<root>/node.cap") && fix.contains("keeps aside"),
             "{warning}: {fix}"

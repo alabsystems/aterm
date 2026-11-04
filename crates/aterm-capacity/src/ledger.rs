@@ -23,6 +23,8 @@ use crate::{Need, Patience};
 #[path = "cohort_ledger.rs"]
 mod cohort_ledger;
 #[cfg(all(test, unix))]
+pub(crate) use cohort_ledger::tests::Fixture as CohortFixture;
+#[cfg(all(test, unix))]
 #[path = "cohort_failure_tests.rs"]
 mod failure_tests;
 #[cfg(test)]

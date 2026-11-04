@@ -4,7 +4,10 @@
 use super::super::log_entries_tests::{member_key, newcomer, two_macs};
 use super::*;
 use crate::age;
-use crate::membership_log::{Founder, Root, node_proof_message};
+use crate::membership_log::{
+    Draft, Founder, Inserted, LEGACY_RECORDS, MAX_HELD_RECORDS, RecordBudgets, Root,
+    node_proof_message,
+};
 use ring::signature::{Ed25519KeyPair, KeyPair as _};
 
 const DAY: u64 = 24 * 60 * 60 * 1000;
@@ -144,6 +147,18 @@ fn alab() -> Log {
 }
 
 fn decided(log: &Log, mac: Mac, tag: u8, fleet: bool, at: u64) -> Decision {
+    decided_with_wraps(log, mac, tag, fleet, 0, at)
+}
+
+/// [`decided`] where `ME`'s admission signs `wraps` `Wrap`s beside its `Admit`.
+fn decided_with_wraps(
+    log: &Log,
+    mac: Mac,
+    tag: u8,
+    fleet: bool,
+    wraps: usize,
+    at: u64,
+) -> Decision {
     let request = mac.request();
     decide(
         log,
@@ -157,12 +172,18 @@ fn decided(log: &Log, mac: Mac, tag: u8, fleet: bool, at: u64) -> Decision {
             fresh: false,
             book: CURRENT,
         },
+        wraps,
         at,
     )
 }
 
 /// [`decided`] for a proof from another host on the member's home ALab LAN, with no fleet key.
 fn decided_on_lan(log: &Log, mac: Mac, tag: u8, at: u64) -> Decision {
+    on_lan_with_wraps(log, mac, tag, 0, at)
+}
+
+/// [`decided_on_lan`] where `ME`'s admission signs `wraps` `Wrap`s beside its `Admit`.
+fn on_lan_with_wraps(log: &Log, mac: Mac, tag: u8, wraps: usize, at: u64) -> Decision {
     let request = mac.request();
     decide(
         log,
@@ -176,6 +197,7 @@ fn decided_on_lan(log: &Log, mac: Mac, tag: u8, at: u64) -> Decision {
             fresh: false,
             book: CURRENT,
         },
+        wraps,
         at,
     )
 }
@@ -275,7 +297,7 @@ fn a_seat_moves_by_no_proof_while_a_member_still_runs_0147() {
         },
     };
     assert!(
-        refused(&decide(&log, &ME.id(), &old_member_heard, T0)),
+        refused(&decide(&log, &ME.id(), &old_member_heard, 0, T0)),
         "a 0.147 member heard: the seat stays"
     );
     // What 0.147 would make of the move: its supersede rule (writer key or recipient alone)
@@ -331,7 +353,7 @@ fn a_seat_whose_mac_may_still_run_goes_to_a_person() {
         },
     };
     assert!(
-        refused(&decide(&log, &ME.id(), &elsewhere, T0 + 2 * DAY)),
+        refused(&decide(&log, &ME.id(), &elsewhere, 0, T0 + 2 * DAY)),
         "heard from another address"
     );
     let decision = decided(&log, Mac(12), 2, false, T0 + 2 * DAY);
@@ -590,7 +612,7 @@ fn a_removed_mac_stays_out_whatever_it_proves() {
             ..CURRENT
         },
     };
-    assert!(refused(&decide(&log, &ME.id(), &held_out, T0 + DAY)));
+    assert!(refused(&decide(&log, &ME.id(), &held_out, 0, T0 + DAY)));
 }
 
 /// What else goes to a person: a key two seats hold, this member's own node key, a proof of no
@@ -615,7 +637,7 @@ fn contested_own_and_past_the_hourly_share_go_to_a_person() {
         fresh: false,
         book: CURRENT,
     };
-    assert!(refused(&decide(&log, &ME.id(), &no_key, T0)));
+    assert!(refused(&decide(&log, &ME.id(), &no_key, 0, T0)));
     for (n, tag) in (40..40 + AUTOMATIC_PER_HOUR as u8).enumerate() {
         let at = T0 + n as u64;
         let decision = decided(&log, Mac(tag), tag, true, at);
@@ -635,14 +657,13 @@ fn contested_own_and_past_the_hourly_share_go_to_a_person() {
 
 /// Limits every member reads alike from the log, so the fleet's key cannot fill it: once the log
 /// holds [`PROVEN_PER_DAY`] `Admit`s of `Manual` from the last day (by any signers) no member
-/// lets another Mac in by proof until they age past a day; a log [`PROVEN_FILL`] full takes none;
-/// and a node id the fleet book binds to another seat's key (a VM that re-mints its node key at
-/// each boot) takes no new seat.
+/// lets another Mac in by proof until they age past a day; and a node id the fleet book binds to
+/// another seat's key (a VM that re-mints its node key at each boot) takes no new seat. The
+/// record budgets' share is `proof_waits_below_three_quarters_of_each_budget`'s.
 ///
 /// NEGATIVE CONTROLS: the `PROVEN_PER_DAY` check in `decide` cut: the Mac past the day's limit is
-/// let in and "the day's limit" fails. `room_for_proven` comparing `<=` against the whole of
-/// `MAX_RECORDS`: "three quarters full" fails. The `node_id_seated` check cut: "one seat a node
-/// id" fails.
+/// let in and "the day's limit" fails. The `node_id_seated` check cut: "one seat a node id"
+/// fails.
 #[test]
 fn the_log_holds_a_daily_limit_and_room_for_people() {
     let mut log = alab();
@@ -671,8 +692,6 @@ fn the_log_holds_a_daily_limit_and_room_for_people() {
         Decision::Fleet,
         "a day on, the limit has room again"
     );
-    assert!(room_for_proven(MAX_RECORDS * 3 / 4 - 1));
-    assert!(!room_for_proven(MAX_RECORDS * 3 / 4), "three quarters full");
     let request = Mac(81).request();
     let reborn = Proven {
         request: &request,
@@ -687,43 +706,346 @@ fn the_log_holds_a_daily_limit_and_room_for_people() {
         },
     };
     assert!(
-        refused(&decide(&log, &ME.id(), &reborn, T0 + 2 * DAY)),
+        refused(&decide(&log, &ME.id(), &reborn, 0, T0 + 2 * DAY)),
         "one seat a node id"
     );
 }
 
-#[test]
-fn proof_capacity_observation_matches_the_decision_at_its_boundary() {
-    let mut log = alab();
-    let limit = MAX_RECORDS * PROVEN_FILL.0 / PROVEN_FILL.1;
-    while log.held_count() < limit - 1 {
-        keep(
-            &mut log,
-            ME,
-            T0,
-            Body::Name {
-                name: "capacity-observation".into(),
-            },
-        );
+/// `ME`'s `Name`s, each after the last, until `log` holds `to` records: keyed records, as many
+/// as a test needs, drafted after the previous one rather than from every head.
+fn fill_names(log: &mut Log, to: usize) {
+    if log.held_count() >= to {
+        return;
     }
-    let before = ProofAdmissionCapacity::observe(&log);
-    assert_eq!(before.complete_records, limit - 1);
-    assert_eq!(before.exclusive_record_limit, limit);
-    assert!(before.within_limit);
-    assert_eq!(decided(&log, Mac(99), 99, true, T0), Decision::Fleet);
+    let name = || Body::Name {
+        name: "filler".into(),
+    };
+    let mut last = keep(log, ME, T0, name());
+    while log.held_count() < to {
+        let record = Draft {
+            network: *log.network(),
+            sequence: last.sequence() + 1,
+            previous: Some(*last.id()),
+            parents: vec![*last.id()],
+            authored_ms: T0,
+            body: name(),
+        }
+        .sign(&ME.seed(), ME.incarnation())
+        .unwrap();
+        assert_eq!(log.insert(record.clone()).unwrap(), Inserted::Held);
+        last = record;
+    }
+}
 
+/// `ME` admits `mac` by a person's phrase, which no proof's share counts.
+fn admit_by_phrase(log: &mut Log, mac: Mac, tag: u8) -> Record {
     keep(
-        &mut log,
+        log,
         ME,
         T0,
-        Body::Name {
-            name: "capacity-boundary".into(),
+        Body::Admit {
+            entrant: Entrant {
+                request: mac.request(),
+                node_key: node(tag),
+                name: format!("m{tag}"),
+                label: format!("m{tag}"),
+            },
+            evidence: Evidence::Phrase,
         },
+    )
+}
+
+/// ALab's log as it stood on 2026-11-03, when every member refused a Mac on the home LAN: 36
+/// weighed records (the genesis, 27 `Admit`s, 8 `Remove`s) and 4,035 keyed ones, 4,071 in all.
+/// The keyed records here are `ME`'s `Name`s, which the budgets count as they count `Wrap`s.
+fn live_shape() -> Log {
+    let mut log = alab();
+    for tag in 100..126 {
+        let admit = admit_by_phrase(&mut log, Mac(tag), tag);
+        if tag < 108 {
+            keep(
+                &mut log,
+                ME,
+                T0,
+                Body::Remove {
+                    member: Mac(tag).id(),
+                    cutoff: *admit.id(),
+                },
+            );
+        }
+    }
+    fill_names(&mut log, 4_071);
+    log
+}
+
+/// A Mac on the home LAN comes into a log shaped like ALab's on 2026-11-03 under the production
+/// budgets: its 36 weighed records are far below three quarters of theirs, and its 4,035 keyed
+/// ones below three quarters of theirs, and the Admit with three Wraps fits the held total.
+///
+/// NEGATIVE CONTROL (in the test): the reserve as it was, counted over every kind against one
+/// bound of 4,096 records, refuses this log; and the capacity read with every keyed record
+/// counted as weighed reports the weighed budget three quarters full.
+#[test]
+fn a_lan_mac_comes_into_a_log_shaped_like_alab_on_2026_11_03() {
+    let log = live_shape();
+    assert_eq!(log.budgets(), RecordBudgets::PRODUCTION);
+    assert_eq!(
+        log.counts(),
+        RecordCounts {
+            weighed: 36,
+            keyed: 4_035
+        }
     );
-    let at = ProofAdmissionCapacity::observe(&log);
-    assert_eq!(at.complete_records, limit);
-    assert!(!at.within_limit);
-    assert!(refused(&decided(&log, Mac(99), 99, true, T0)));
+    let capacity = ProofAdmissionCapacity::observe(&log);
+    assert_eq!(
+        (
+            capacity.weighed_limit,
+            capacity.keyed_limit,
+            capacity.held_cap
+        ),
+        (3_072, 9_216, MAX_HELD_RECORDS)
+    );
+    assert!(capacity.within_limit);
+    assert_eq!(capacity.reserved(), None);
+    assert_eq!(
+        on_lan_with_wraps(&log, Mac(200), 200, 3, T0),
+        Decision::Lan,
+        "the LAN Mac is let in"
+    );
+
+    let over_all_kinds = log.held_count() * PROVEN_FILL.1 < LEGACY_RECORDS * PROVEN_FILL.0;
+    assert!(!over_all_kinds, "today's reserve refuses this log");
+    let weighed_as_all = ProofAdmissionCapacity {
+        weighed_records: log.held_count(),
+        ..capacity
+    };
+    assert_eq!(weighed_as_all.reserved(), Some(Budget::Weighed));
+}
+
+/// Under small budgets, a proof is considered while each of the weighed and keyed budgets is
+/// below three quarters full, and refused once either reaches it, with the budget named; the
+/// two count apart, so a full share of one leaves the other's count where it was.
+///
+/// NEGATIVE CONTROL (in the test): one record under each boundary is let in, so the refusals
+/// are the boundary's, not the log's.
+#[test]
+fn proof_waits_below_three_quarters_of_each_budget() {
+    let small = RecordBudgets {
+        weighed: 8,
+        keyed: 8,
+        held: 64,
+    };
+    small.within(|| {
+        // The weighed budget: alab()'s genesis and Admit, then Admits to one short of 6 of 8.
+        let mut log = alab();
+        assert_eq!(
+            log.counts(),
+            RecordCounts {
+                weighed: 2,
+                keyed: 1
+            }
+        );
+        for tag in 100..103 {
+            admit_by_phrase(&mut log, Mac(tag), tag);
+        }
+        let capacity = ProofAdmissionCapacity::observe(&log);
+        assert_eq!((capacity.weighed_records, capacity.weighed_limit), (5, 6));
+        assert_eq!(decided_on_lan(&log, Mac(90), 90, T0), Decision::Lan);
+        admit_by_phrase(&mut log, Mac(103), 103);
+        assert_eq!(
+            ProofAdmissionCapacity::observe(&log).reserved(),
+            Some(Budget::Weighed)
+        );
+        let Decision::Refuse(why) = decided_on_lan(&log, Mac(90), 90, T0) else {
+            panic!("a log whose weighed budget is three quarters full let a Mac in");
+        };
+        assert!(
+            why.contains("weighed records") && why.contains("three quarters"),
+            "{why}"
+        );
+        assert_eq!(log.counts().keyed, 1, "the keyed count is apart");
+
+        // The keyed budget: keyed records to one short of 6 of 8.
+        let mut log = alab();
+        fill_names(&mut log, 3 + 4);
+        let capacity = ProofAdmissionCapacity::observe(&log);
+        assert_eq!((capacity.keyed_records, capacity.keyed_limit), (5, 6));
+        assert_eq!(decided_on_lan(&log, Mac(90), 90, T0), Decision::Lan);
+        fill_names(&mut log, 3 + 5);
+        let Decision::Refuse(why) = decided_on_lan(&log, Mac(90), 90, T0) else {
+            panic!("a log whose keyed budget is three quarters full let a Mac in");
+        };
+        assert!(
+            why.contains("keyed records") && why.contains("three quarters"),
+            "{why}"
+        );
+        assert_eq!(log.counts().weighed, 2, "the weighed count is apart");
+    });
+}
+
+/// An admission whose whole batch (its `Admit` and the `Wrap`s) would pass the held total is
+/// refused by `decide` before anything is signed, with a reason that says the log is full: a Mac
+/// on the LAN, and a founder the genesis lists with no binding whose Mac proved its node key.
+///
+/// NEGATIVE CONTROLS: in the test, the same log takes each batch one record smaller, so the
+/// refusal is the whole batch's: a check of the `Admit` alone would let signing start and stop at
+/// a Wrap. The founder's arm of `decide` returning its decision before the batch is weighed (as
+/// it did): the founder's batch of 3 is let in and its refusal fails.
+#[test]
+fn an_admission_whose_batch_would_pass_the_held_total_is_refused_before_signing() {
+    let small = RecordBudgets {
+        held: 8,
+        ..RecordBudgets::PRODUCTION
+    };
+    small.within(|| {
+        let mut log = alab();
+        fill_names(&mut log, 6);
+        assert!(ProofAdmissionCapacity::observe(&log).within_limit);
+        let founder = Decision::Founder {
+            label: "m5".to_owned(),
+        };
+        for (fits, too_many, admitted) in [
+            (
+                on_lan_with_wraps(&log, Mac(90), 90, 1, T0),
+                on_lan_with_wraps(&log, Mac(90), 90, 2, T0),
+                Decision::Lan,
+            ),
+            (
+                decided_with_wraps(&log, Mac(15), 5, false, 1, T0),
+                decided_with_wraps(&log, Mac(15), 5, false, 2, T0),
+                founder,
+            ),
+        ] {
+            assert_eq!(fits, admitted);
+            let Decision::Refuse(why) = too_many else {
+                panic!("an admission of 3 records into 2 records of room was let in: {admitted:?}");
+            };
+            assert!(
+                why.contains("is full") && why.contains("3 records"),
+                "{admitted:?}: {why}"
+            );
+        }
+    });
+}
+
+/// A Mac on the LAN, in a log whose record bytes leave room for its batch at its longest (the
+/// `Admit` and three `Wrap`s, [`Kind::most_bytes`] each) and no more, is let in; one more `Wrap`
+/// is refused before anything is signed, with a reason that names the record bytes and does not
+/// call the log full.
+///
+/// NEGATIVE CONTROL (in the test): the estimate the batch had before, [`MAX_RECORD`] a record,
+/// passes the byte bound on the very log that lets the Mac in.
+#[test]
+fn an_admission_whose_batch_could_pass_the_record_bytes_is_refused_before_signing() {
+    use crate::membership_log::{MAX_RECORD, MAX_RECORDS_STREAM, Payload, entries};
+
+    let batch = |wraps: usize| Kind::Admit.most_bytes() + wraps * Kind::Wrap.most_bytes();
+    let to = MAX_RECORDS_STREAM - batch(3);
+    let mut log = alab();
+    let (draft, _) = log
+        .draft_epoch(&ME.id(), T0, EpochAudience::Everyone, 1)
+        .unwrap();
+    let epoch = draft.sign(&ME.seed(), ME.incarnation()).unwrap();
+    assert_eq!(log.insert(epoch.clone()).unwrap(), Inserted::Held);
+    // `ME`'s `Put`s, each after the last, with ciphertexts sized to bring the log to `to` bytes.
+    let put = |log: &Log, last: &Record, ciphertext: usize| {
+        Draft {
+            network: *log.network(),
+            sequence: last.sequence() + 1,
+            previous: Some(*last.id()),
+            parents: vec![*last.id()],
+            authored_ms: T0,
+            body: Body::Put {
+                audience: EpochAudience::Everyone,
+                epoch: *epoch.id(),
+                salt: [7; 32],
+                ciphertext: Payload::from(vec![1; ciphertext]),
+            },
+        }
+        .sign(&ME.seed(), ME.incarnation())
+        .unwrap()
+    };
+    let overhead = put(&log, &epoch, 17).bytes().len() - 17;
+    let mut last = epoch.clone();
+    while log.held_bytes() < to {
+        let room = to - log.held_bytes() - overhead;
+        let ciphertext = if room <= entries::MAX_PUT_CIPHERTEXT {
+            room
+        } else {
+            (room - overhead - 17).min(entries::MAX_PUT_CIPHERTEXT)
+        };
+        let record = put(&log, &last, ciphertext);
+        assert_eq!(log.insert(record.clone()).unwrap(), Inserted::Held);
+        last = record;
+    }
+    assert_eq!(log.held_bytes(), to);
+    assert!(log.held_count() < 100, "{}", log.held_count());
+
+    assert_eq!(on_lan_with_wraps(&log, Mac(90), 90, 3, T0), Decision::Lan);
+    let Decision::Refuse(why) = on_lan_with_wraps(&log, Mac(90), 90, 4, T0) else {
+        panic!("an admission past the record bytes at its longest was let in");
+    };
+    assert!(
+        why.contains("record bytes") && why.contains("5 records") && !why.contains("full"),
+        "{why}"
+    );
+
+    let before = RecordCounts {
+        weighed: 1,
+        keyed: 3,
+    };
+    assert_eq!(
+        log.passed_by(before, before.held() * MAX_RECORD),
+        Some(Budget::Bytes),
+        "the old estimate refuses the batch that fits"
+    );
+}
+
+/// End to end on real vault folders: m22, whose log has room for one record, refuses a Mac on the
+/// home LAN whose admission signs an `Admit` and its `Wrap`s, and its records file is unchanged;
+/// under the production budgets the same proof lets the Mac in with more than one record.
+///
+/// NEGATIVE CONTROL (in the test): the run with room shows the batch is more than its `Admit`,
+/// which alone would have fit the one record of room, so only refusing the whole batch up front
+/// keeps signing from starting.
+#[test]
+fn a_proof_whose_batch_cannot_fit_is_refused_with_nothing_signed() {
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
+    let m22 = &macs.m22;
+    let (_, request, _) = newcomer(macs.root.path(), m22, "stranger");
+    let proven = Proven {
+        request: &request,
+        node: node(9),
+        name: "stranger",
+        fleet: false,
+        lan: true,
+        fresh: true,
+        book: CURRENT,
+    };
+    let now = aterm_time::unix_millis().unwrap();
+    let held = load_records(m22).unwrap().len();
+    let before = std::fs::read(m22.records_file()).unwrap();
+    let one_more = RecordBudgets {
+        held: held + 1,
+        ..RecordBudgets::PRODUCTION
+    };
+    let refused = one_more
+        .within(|| admit_by_proof(m22, &proven, now))
+        .expect("decided");
+    let Readmit::Refused(why) = &refused else {
+        panic!("a batch past the held total was signed: {refused:?}");
+    };
+    assert!(why.contains("is full"), "{why}");
+    assert_eq!(std::fs::read(m22.records_file()).unwrap(), before);
+
+    let let_in = admit_by_proof(m22, &proven, now).expect("let in");
+    let Readmit::Let { how, signed, .. } = let_in else {
+        panic!("the stranger is not let in with room: {let_in:?}");
+    };
+    assert!(matches!(how, How::Lan { .. }), "{how:?}");
+    assert!(signed >= 2, "an Admit and its Wraps: {signed}");
+    macs.server.stop();
+    drop(macs.root);
 }
 
 /// 0.147's reader in small: the record framing and the kind and evidence codes v0.147.0's

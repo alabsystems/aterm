@@ -7,8 +7,8 @@
 //!
 //! A pull names [`Store::have`], and a server answers every complete record past the ids named
 //! ([`Store::missing`]). A record this store cannot take (a kind only a newer build writes, a
-//! store at [`super::MAX_RECORDS`] or [`super::MAX_RECORDS_STREAM`], a record
-//! [`super::Log::insert`] refuses) never enters `have`, so every server answered it again on
+//! store at one of its budgets ([`super::RecordBudgets`]) or [`super::MAX_RECORDS_STREAM`], a
+//! record [`super::Log::insert`] refuses) never enters `have`, so every server answered it again on
 //! every pass, up to [`super::MAX_RECORDS_STREAM`] each. [`Untaken`] keeps, for each server, the
 //! heads of what it sent that the store did not take, and the next pull to it names those heads
 //! first ([`Untaken::have`]), so the server counts their causal closure as known.
@@ -40,7 +40,7 @@ use super::store::framed::{FrameReadError, FrameReader, LayoutFrame};
 #[cfg(test)]
 use super::store::frames;
 use super::store::{Frame, readable_mask};
-use super::{MAX_RECORDS, MAX_RECORDS_STREAM, Record, RecordId, Store};
+use super::{MAX_HELD_RECORDS, MAX_RECORDS_STREAM, Record, RecordId, Store};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -135,7 +135,7 @@ impl ReceivedFrames {
         let mut received = Self::empty();
         let mut frames = FrameReader::new();
         loop {
-            if received.sent.0.len() == MAX_RECORDS || input.bytes == MAX_RECORDS_STREAM {
+            if received.sent.0.len() == MAX_HELD_RECORDS || input.bytes == MAX_RECORDS_STREAM {
                 let mut extra = [0];
                 if read_once(&mut input, &mut extra)? == 0 {
                     break;

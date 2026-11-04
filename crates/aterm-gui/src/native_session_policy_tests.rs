@@ -40,6 +40,21 @@ fn fixture() -> FixturePolicy {
 }
 
 #[test]
+fn quota_fixture_rotation_requires_its_live_private_constructor() {
+    let fixture = fixture().with_quota_rotation();
+    let constructors = fixture.constructors();
+    let policy = SessionPolicy {
+        fixture: Some(fixture),
+        ..Default::default()
+    };
+    assert!(!policy.quota_rotation_enabled());
+    constructors.set_enabled(&[Constructor::PrivateRestart]);
+    assert!(policy.quota_rotation_enabled());
+    constructors.set_enabled(&[]);
+    assert!(!policy.quota_rotation_enabled());
+}
+
+#[test]
 fn fixture_catalog_uses_the_shipping_claim_grammar() {
     let policy = SessionPolicy {
         fixture: Some(fixture()),

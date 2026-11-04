@@ -72,6 +72,9 @@ fn post(snapshot: Option<Arc<AccountsSnapshot>>) {
     {
         SNAPSHOT.with(|s| *s.borrow_mut() = snapshot);
     }
+    if let Some(session) = card_with(|card| card.session) {
+        crate::claude_footer::post_changed(session);
+    }
 }
 
 /// The session whose Accounts card is open, and whether the next read looks at the store at
@@ -214,8 +217,11 @@ pub(crate) struct OutlookMemo {
 impl OutlookMemo {
     /// The outlook for Claude Code's pool `roster` at wall second `now` (`instant` on the
     /// monotonic clock). The store's and the logins' stamps are looked at most every
-    /// [`LOOK_EVERY`] (`force`: now) and the store re-read when they or the roster moved; the
-    /// replay runs at most once per [`REPLAY_EVERY_S`]. A move posts a new [`AccountsSnapshot`].
+    /// [`LOOK_EVERY`] (`force`: now) and the store re-read when they or the roster moved,
+    /// or after a failed read; the
+    /// replay runs at most once per [`REPLAY_EVERY_S`]. Incompatible or unreadable inputs
+    /// withdraw a cached forecast at once without spending or resetting that replay slot.
+    /// A move posts a new [`AccountsSnapshot`].
     pub(crate) fn at(
         &mut self,
         instant: Instant,
@@ -225,14 +231,19 @@ impl OutlookMemo {
     ) -> Option<&Outlook> {
         let reads = self.reads.unwrap_or(LIVE);
         let (Some(roster), Some(dir)) = (roster, (reads.state_dir)()) else {
-            if self.held.take().is_some() || self.outlook.take().is_some() {
+            let held = self.held.take().is_some();
+            let outlook = self.outlook.take().is_some();
+            if held || outlook {
                 post(None);
             }
             self.series.clear();
-            self.replayed = None;
             return None;
         };
-        let mut moved = false;
+        let roster_changed = self
+            .held
+            .as_ref()
+            .is_some_and(|held| held.roster != *roster);
+        let mut moved = roster_changed && self.outlook.take().is_some();
         let force = force || card_with(|card| std::mem::take(&mut card.look));
         let look = force
             || self.held.as_ref().is_none_or(|h| h.roster != *roster)
@@ -246,50 +257,50 @@ impl OutlookMemo {
             if self
                 .held
                 .as_ref()
-                .is_none_or(|h| h.roster != *roster || h.stamps != stamps)
+                .is_none_or(|h| h.roster != *roster || h.stamps != stamps || h.read.is_err())
             {
                 self.held = Some(read_held(&store, roster, stamps, now));
                 moved = true;
             }
         }
         let policy = (reads.policy)();
+        let unavailable =
+            roster.rows.is_empty() || self.held.as_ref().is_none_or(|held| held.read.is_err());
+        let policy_changed = self.replayed.is_some_and(|(_, used)| used != policy);
+        if (unavailable || policy_changed) && self.outlook.take().is_some() {
+            moved = true;
+        }
         let due = self
             .replayed
             .is_none_or(|(at, _)| now.saturating_sub(at) >= REPLAY_EVERY_S || now < at);
-        if let Some(held) = self.held.as_ref()
-            && due
+        if due
+            && !roster.rows.is_empty()
+            && let Some(held) = self.held.as_ref()
+            && let Ok((state, enrolled)) = &held.read
         {
             self.replayed = Some((now, policy));
-            self.outlook = match &held.read {
-                Ok((state, enrolled)) if !roster.rows.is_empty() => {
-                    let series = refresh_series(&mut self.series, &dir, roster, &state.machine);
-                    #[cfg(test)]
-                    {
-                        self.replays += 1;
-                    }
-                    Some(Arc::new(outlook::outlook(&outlook::Inputs {
-                        roster,
-                        state,
-                        enrolled,
-                        series: &series,
-                        renewals: &held.renewals,
-                        mode: policy.0,
-                        credits: policy.1,
-                        now,
-                        offset: reads.offset,
-                    })))
-                }
-                _ => None,
-            };
+            let series = refresh_series(&mut self.series, &dir, roster, &state.machine);
+            #[cfg(test)]
+            {
+                self.replays += 1;
+            }
+            self.outlook = Some(Arc::new(outlook::outlook(&outlook::Inputs {
+                roster,
+                state,
+                enrolled,
+                series: &series,
+                renewals: &held.renewals,
+                mode: policy.0,
+                credits: policy.1,
+                now,
+                offset: reads.offset,
+            })));
             moved = true;
         }
         if moved && self.held.is_some() {
             post(Some(Arc::new(AccountsSnapshot {
                 outlook: self.outlook.clone(),
             })));
-            if let Some(session) = card_with(|card| card.session) {
-                crate::claude_footer::post_changed(session);
-            }
         }
         self.outlook.as_deref()
     }

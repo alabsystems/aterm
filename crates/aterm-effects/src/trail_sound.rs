@@ -5624,23 +5624,172 @@ mod tests {
         }
     }
 
+    /// NEGATIVE CONTROL: unpitched percussive/crackle voices (`Mech`, `Typewriter`, `Of(Fire)`)
+    /// keep identical partial frequencies when `walk` changes under a fixed RNG seed.
     #[test]
     fn every_pitched_voice_lands_on_the_melody_note() {
-        for voice in [SoundVoice::Marimba, SoundVoice::Felt] {
+        for voice in [
+            SoundVoice::Marimba,
+            SoundVoice::Felt,
+            SoundVoice::Of(GlowStyle::Lumen),
+        ] {
             let (ts, typed) = family_voices_in(voice, GlowStyle::Lumen, SoundKind::Typed, false);
             assert!(!typed.is_empty(), "{voice:?} speaks");
-            let (t_land, t_enter) = typed[0];
-            assert!(
-                t_enter < t_land,
-                "{voice:?}: a keystroke arrives from below its note: \
-                 {t_enter}->{t_land}"
-            );
             let anchor = palette_for(voice, GlowStyle::Lumen).anchor_hz();
             let expect_t = ts.melody_hz(anchor, ts.walk);
             assert!(
-                (t_land - expect_t).abs() < 0.5,
-                "{voice:?}: the keystroke lands on the melody note in its own register \
-                 ({t_land} vs {expect_t})"
+                typed
+                    .iter()
+                    .any(|&(t_land, t_enter)| t_enter < t_land && (t_land - expect_t).abs() < 0.5),
+                "{voice:?}: upward-gliding voice must land on {expect_t}, got {typed:?}"
+            );
+        }
+
+        let (ts, beam) = family_voices_in(
+            SoundVoice::Of(GlowStyle::Beam),
+            GlowStyle::Lumen,
+            SoundKind::Typed,
+            false,
+        );
+        let expect_beam = ts.melody_hz(330.0, (ts.walk / 2) * 2);
+        assert!(
+            beam.iter().any(|&(t_land, t_enter)| {
+                t_enter > t_land && (t_land - expect_beam).abs() < 0.5
+            }),
+            "Beam: blip must land on {expect_beam} from above, got {beam:?}"
+        );
+
+        for style in [GlowStyle::Phaser, GlowStyle::Classic] {
+            let voice = SoundVoice::Of(style);
+            let (ts, typed) = family_voices_in(voice, GlowStyle::Lumen, SoundKind::Typed, false);
+            let expect_t = ts.melody_hz(392.0, (0.3_f32 * 5.0) as i32);
+            assert!(
+                typed
+                    .iter()
+                    .any(|&(t_land, t_enter)| t_enter > t_land && (t_land - expect_t).abs() < 0.5),
+                "{voice:?}: phaser voice must land on hue degree {expect_t} from above, got {typed:?}"
+            );
+        }
+
+        let (ts, sparkle) = family_voices_in(
+            SoundVoice::Of(GlowStyle::Sparkle),
+            GlowStyle::Lumen,
+            SoundKind::Typed,
+            false,
+        );
+        let sp0 = ts.melody_hz(523.25, ts.walk);
+        let sp1 = ts.melody_hz(523.25, ts.walk + 1);
+        assert!(
+            sparkle.iter().any(|&(t_land, t_enter)| {
+                (t_enter - t_land).abs() < 1e-4
+                    && ((t_land - sp0).abs() < 0.5 || (t_land - sp1).abs() < 0.5)
+            }),
+            "Sparkle: struck chime must sit on {sp0} or {sp1}, got {sparkle:?}"
+        );
+
+        let (ts, comet) = family_voices_in(
+            SoundVoice::Of(GlowStyle::Comet),
+            GlowStyle::Lumen,
+            SoundKind::Typed,
+            false,
+        );
+        let expect_comet = ts.melody_hz(220.0, ts.walk);
+        assert!(
+            comet.iter().any(|&(t_land, t_enter)| {
+                (t_land - expect_comet * 0.97).abs() < 0.5
+                    && (t_enter - expect_comet * 1.04).abs() < 0.5
+            }),
+            "Comet: sweep must bracket {expect_comet}, got {comet:?}"
+        );
+
+        let (ts, water) = family_voices_in(
+            SoundVoice::Of(GlowStyle::Water),
+            GlowStyle::Lumen,
+            SoundKind::Typed,
+            false,
+        );
+        let expect_water = ts.melody_hz(430.0, ts.walk);
+        assert!(
+            water.iter().any(|&(t_land, t_enter)| {
+                (t_land - expect_water * 1.25).abs() < 0.5
+                    && (t_enter - expect_water * 0.85).abs() < 0.5
+            }),
+            "Water: droplet must sweep across {expect_water}, got {water:?}"
+        );
+
+        let (ts, laser) = family_voices_in(
+            SoundVoice::Of(GlowStyle::Laser),
+            GlowStyle::Lumen,
+            SoundKind::Typed,
+            false,
+        );
+        let expect_laser = ts.melody_hz(880.0, ts.walk.min(5));
+        assert!(
+            laser.iter().any(|&(t_land, t_enter)| {
+                (t_land - expect_laser * 0.25).abs() < 0.5 && (t_enter - expect_laser).abs() < 0.5
+            }),
+            "Laser: zap must sweep from {expect_laser} to its two-octave drop, got {laser:?}"
+        );
+
+        for voice in [
+            SoundVoice::RainbowKittyV2,
+            SoundVoice::Of(GlowStyle::RainbowKitty),
+        ] {
+            let mut s = TrailSynth::new(48_000.0, 0xFA_1117);
+            s.push(SoundEvent {
+                voice,
+                ..ev(GlowStyle::Lumen, SoundKind::Typed)
+            });
+            let expect_v2 = penta(
+                RainbowKittyV2Palette::anchor_hz(),
+                i32::from(s.v2.walk()) + i32::from(s.song_key),
+            );
+            assert!(
+                s.voices.iter().any(|v| {
+                    v.on && v.p[0].lvl > 0.0
+                        && v.p[0].glide == 0.0
+                        && (v.p[0].f0 - expect_v2).abs() < 0.5
+                }),
+                "{voice:?}: music-box tine must strike {expect_v2}"
+            );
+        }
+
+        // Negative control: unpitched voices ignore the walk degree.
+        let unpitched_partials = |voice: SoundVoice, forced_walk: i32| -> Vec<(u32, u32)> {
+            let mut s = TrailSynth::new(48_000.0, 0xFA_1117);
+            s.since_event = 0.1;
+            s.since_voice = 1.0;
+            s.song_pulse = 1; // ghost slot so `advance_song` preserves `s.walk`
+            s.walk = forced_walk;
+            s.push(SoundEvent {
+                voice,
+                ..ev(GlowStyle::Lumen, SoundKind::Typed)
+            });
+            assert_eq!(s.walk, forced_walk, "fixture must preserve forced walk");
+            s.voices
+                .iter()
+                .filter(|v| v.on)
+                .flat_map(|v| v.p)
+                .filter(|p| p.lvl > 0.0)
+                .map(|p| (p.f1.to_bits(), p.f0.to_bits()))
+                .collect()
+        };
+        assert_ne!(
+            unpitched_partials(SoundVoice::Marimba, 0),
+            unpitched_partials(SoundVoice::Marimba, 4),
+            "probe must distinguish distinct walk degrees on a pitched voice"
+        );
+        for voice in [
+            SoundVoice::Mech,
+            SoundVoice::Typewriter,
+            SoundVoice::Of(GlowStyle::Fire),
+        ] {
+            let w0 = unpitched_partials(voice, 0);
+            assert!(!w0.is_empty(), "{voice:?} spawns a pitched body partial");
+            assert_eq!(
+                w0,
+                unpitched_partials(voice, 4),
+                "{voice:?}: unpitched voice must be invariant to the melody walk"
             );
         }
     }

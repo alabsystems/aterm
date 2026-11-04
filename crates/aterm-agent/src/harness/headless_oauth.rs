@@ -1595,9 +1595,11 @@ fn mailbox_aliases(
     }
     // Where the lab names this Mac it names every label: each account's lab label, and the
     // legacy label a renamed row's secrets still name (`alab_roster::renames`). No sheet or
-    // fleet file is read then (§0: the sheet is the importer's input alone).
+    // fleet file is read then (§0: the sheet is the importer's input alone), nor while the lab
+    // may name this Mac and could not be read yet (`alab_roster::pending`): the rosters above
+    // still name their rows, and a stale sheet's label-to-address map routes nothing.
     let labels = super::alab_roster::mailbox_labels();
-    if super::alab_roster::names_this_mac() {
+    if !super::accounts_sync::sheet_read_here() {
         for (cli, label, email) in labels {
             note(cli == super::accounts::Cli::Claude, &label, Some(&email));
         }

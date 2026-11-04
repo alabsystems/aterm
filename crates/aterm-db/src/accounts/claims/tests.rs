@@ -243,12 +243,15 @@ fn a_reader_reads_rows_and_writes_none() {
     write(&lab.paths[0], &json!({"counter": 1})).unwrap();
     assert!(write(&lab.paths[1], &json!({"counter": 1})).is_err());
     assert!(write(&lab.paths[0], &json!(["not", "a", "row"])).is_err());
+    let large = json!({"counter": 2, "claims": [], "pad": "x".repeat(MAX_ROW - 256)});
+    write(&lab.paths[0], &large).unwrap();
     let big = "x".repeat(MAX_ROW);
     assert!(write(&lab.paths[0], &json!({"pad": big})).is_err());
     repair_commons(&lab, 6);
     let reader = read(&lab.paths[1]).unwrap();
     assert!(reader.writable.is_err());
     assert_eq!(reader.rows.len(), 1);
+    assert_eq!(reader.rows[0].1, large);
 }
 
 #[test]

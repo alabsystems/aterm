@@ -306,6 +306,7 @@ pub fn child_args(route: &Route, region: Option<Region>) -> Vec<String> {
             out
         }
         Drive::CodexPkce => vec!["login".to_owned()],
+        Drive::NativeGoogle => Vec::new(),
     }
 }
 
@@ -993,6 +994,9 @@ pub fn sign_in_with(
     let Some(signin) = req.signin() else {
         return not_run("this CLI has no sign-in in this build".to_owned());
     };
+    if matches!(req.route.drive, Drive::NativeGoogle) {
+        return not_run("native Google login requires its typed grant driver".into());
+    }
     let Drive::Lines {
         grammar,
         completion,
@@ -1109,6 +1113,7 @@ pub fn calls_back_here(route: &Route) -> bool {
     match &route.drive {
         Drive::Lines { completion, .. } => *completion == Completion::Loopback,
         Drive::CodexPkce => true,
+        Drive::NativeGoogle => false,
     }
 }
 
@@ -1236,6 +1241,9 @@ pub fn login_command(
     let route = login_route(req, over_ssh)?;
     let signin = req.signin();
     let args: Vec<OsString> = match route.drive {
+        Drive::NativeGoogle => {
+            return Err("native Google login requires its typed grant driver".into());
+        }
         Drive::CodexPkce => vec![OsString::from("login")],
         Drive::Lines { .. } => child_args(route, req.row.vendor.region)
             .into_iter()

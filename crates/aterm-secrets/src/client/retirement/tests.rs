@@ -10,7 +10,7 @@ use crate::commons::{binding::Pending, node::Edit, roster::Role};
 /// unstamped envelope after already making the retirement durable.
 #[test]
 fn a_revoke_that_cannot_fit_its_cascade_refuses_before_retirement() {
-    use crate::membership_log::{Body, MAX_RECORDS};
+    use crate::membership_log::{Body, MAX_HELD_RECORDS};
 
     let lab = Lab::new(true, Custody::Founded);
     let paths = &lab.paths[0];
@@ -44,7 +44,7 @@ fn a_revoke_that_cannot_fit_its_cascade_refuses_before_retirement() {
         crate::client::log_entries::draft_retire_in_log(paths, &store, &[target], &excludes)
             .unwrap();
     assert!(!retirement.is_empty());
-    let room = MAX_RECORDS.checked_sub(retirement.len()).unwrap();
+    let room = MAX_HELD_RECORDS.checked_sub(retirement.len()).unwrap();
     let request = owner.request().unwrap();
     owner.device().with_seed(|seed| {
         while store.log().unwrap().held_count() < room {
@@ -81,7 +81,7 @@ fn a_revoke_that_cannot_fit_its_cascade_refuses_before_retirement() {
     );
     assert_eq!(
         load_records(&preview).unwrap().log().unwrap().held_count(),
-        MAX_RECORDS
+        MAX_HELD_RECORDS
     );
     assert!(
         crate::client::log_entries::draft_document_diff(
@@ -138,7 +138,7 @@ fn removal_preflight_reports_the_exact_batch_without_writing_it() {
         crate::client::removal_plan::prepare(paths, &admin, &doc, &identity, &[recipient], None)
             .unwrap();
     let cost = plan.cost;
-    assert!(cost.after.complete_records > cost.before.complete_records);
+    assert!(cost.after.complete.held() > cost.before.complete.held());
     assert!(cost.after.encoded_bytes > cost.before.encoded_bytes);
     assert_eq!(std::fs::read(paths.records_file()).unwrap(), before);
     assert_eq!(std::fs::read(&lab.source).unwrap(), source);
@@ -149,12 +149,87 @@ fn removal_preflight_reports_the_exact_batch_without_writing_it() {
     let committed = load_records(paths).unwrap();
     assert_eq!(
         committed.log().unwrap().held_count(),
-        cost.after.complete_records
+        cost.after.complete.held()
     );
     assert_eq!(committed.len(), cost.after.stored_records);
     assert_eq!(committed.encode().len(), cost.after.encoded_bytes);
     assert!(committed.log().unwrap().recipient_is_removed(&recipient));
     assert_eq!(std::fs::read(&lab.source).unwrap(), source);
+}
+
+/// A removal plan that would pass one of the log's budgets is refused whole, before anything is
+/// written, with that budget named: each budget alone refuses, set one record short of what the
+/// plan needs of it.
+///
+/// NEGATIVE CONTROL (in the test): under budgets with exactly the plan's need of room in each,
+/// the same plan is prepared, so each refusal is its own budget's boundary.
+#[test]
+fn a_removal_plan_that_would_pass_a_budget_is_refused_whole() {
+    use crate::membership_log::{Budget, RecordBudgets};
+
+    let (lab, admin, doc, recipient) = planned_revoke();
+    let paths = &lab.paths[0];
+    let identity = read_identity(paths).unwrap().unwrap();
+    let records = std::fs::read(paths.records_file()).unwrap();
+    let source = std::fs::read(&lab.source).unwrap();
+    let prepare =
+        || crate::client::removal_plan::prepare(paths, &admin, &doc, &identity, &[recipient], None);
+    // Each plan is dropped before the next: it holds the records author lock.
+    let cost = prepare().unwrap().cost;
+    let (was, will) = (cost.before.complete, cost.after.complete);
+    assert!(
+        will.weighed > was.weighed && will.keyed > was.keyed,
+        "{was:?} to {will:?}"
+    );
+    let exact = RecordBudgets {
+        weighed: will.weighed,
+        keyed: will.keyed,
+        held: will.held(),
+    };
+    assert!(
+        exact.within(prepare).is_ok(),
+        "the plan fits budgets with exactly its room"
+    );
+    for (short, budget) in [
+        (
+            RecordBudgets {
+                weighed: will.weighed - 1,
+                ..exact
+            },
+            Budget::Weighed,
+        ),
+        (
+            RecordBudgets {
+                keyed: will.keyed - 1,
+                ..exact
+            },
+            Budget::Keyed,
+        ),
+        (
+            RecordBudgets {
+                held: will.held() - 1,
+                ..exact
+            },
+            Budget::Held,
+        ),
+    ] {
+        let Err(error) = short.within(prepare) else {
+            panic!("a plan past its {budget:?} budget was prepared");
+        };
+        assert_eq!(
+            error.kind(),
+            crate::ErrorKind::MembershipCapacity,
+            "{budget:?}: {error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("limit of {}", budget.counts())),
+            "{budget:?}: {error}"
+        );
+        assert_eq!(std::fs::read(paths.records_file()).unwrap(), records);
+        assert_eq!(std::fs::read(&lab.source).unwrap(), source);
+    }
 }
 
 #[test]

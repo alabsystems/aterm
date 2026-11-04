@@ -116,6 +116,25 @@ impl SessionPolicy {
         cfg!(all(target_os = "macos", target_arch = "aarch64"))
     }
 
+    pub(crate) fn quota_rotation_enabled(&self) -> bool {
+        #[cfg(all(unix, any(test, debug_assertions)))]
+        if let Some(fixture) = &self.fixture {
+            return fixture.quota_rotation
+                && fixture.constructors.enabled(Constructor::PrivateRestart);
+        }
+        // Qualified with the sealed renewal service's native host/provider pair.
+        // Account selection still requires fresh, identity-bound weekly usage.
+        cfg!(all(target_os = "macos", target_arch = "aarch64"))
+    }
+
+    pub(crate) fn quota_fixture_roots(&self) -> Option<Vec<Vec<u8>>> {
+        #[cfg(all(unix, debug_assertions))]
+        if let Some(fixture) = &self.fixture {
+            return fixture.quota_roots.clone();
+        }
+        None
+    }
+
     pub(crate) fn renewal_before_signal(&self) {
         #[cfg(all(unix, any(test, debug_assertions)))]
         if let Some(root) = self
@@ -272,6 +291,8 @@ pub struct FixturePolicy {
     config: Box<SupervisorConfig>,
     constructors: FixtureConstructors,
     renewal_fault_root: Option<std::path::PathBuf>,
+    quota_rotation: bool,
+    quota_roots: Option<Vec<Vec<u8>>>,
 }
 
 #[cfg(all(unix, any(test, debug_assertions)))]
@@ -319,6 +340,8 @@ impl FixturePolicy {
             config: Box::new(config),
             constructors,
             renewal_fault_root: None,
+            quota_rotation: false,
+            quota_roots: None,
         })
     }
 
@@ -327,6 +350,21 @@ impl FixturePolicy {
     #[must_use]
     pub fn with_renewal_fault_root(mut self, root: std::path::PathBuf) -> Self {
         self.renewal_fault_root = Some(root);
+        self
+    }
+
+    /// Enable quota discovery in this isolated Rust fixture. Its private restart
+    /// constructor must also be enabled before the fixture can rotate.
+    #[must_use]
+    pub fn with_quota_rotation(mut self) -> Self {
+        self.quota_rotation = true;
+        self
+    }
+
+    /// Pin the isolated HTTPS usage server's roots for this Rust-only fixture.
+    #[must_use]
+    pub fn with_quota_roots(mut self, roots: Vec<Vec<u8>>) -> Self {
+        self.quota_roots = Some(roots);
         self
     }
 

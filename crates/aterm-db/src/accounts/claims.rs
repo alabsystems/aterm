@@ -45,7 +45,7 @@ use std::{
 };
 
 /// A row's canonical body is at most this long.
-pub const MAX_ROW: usize = 4096;
+pub const MAX_ROW: usize = crate::crypto::MAX_BODY - 4096;
 /// The length of one claims table's period: one table per UTC day. A row written now must lapse
 /// within this long (the harness's `HORIZON_S`) to land in the current day's table.
 pub const EPOCH_S: u64 = 86_400;
@@ -75,13 +75,13 @@ impl Default for Caps {
 }
 
 impl Caps {
-    /// The ring placement's shares: records only, since a claim row is at most [`MAX_ROW`].
+    /// Leave headroom below the store's table and per-writer byte limits.
     const fn shares(self) -> Shares {
         Shares {
             records: self.records,
-            bytes: usize::MAX,
+            bytes: 115 * 1024 * 1024,
             writer_records: self.writer_records,
-            writer_bytes: usize::MAX,
+            writer_bytes: 6 * 1024 * 1024,
         }
     }
 }
@@ -185,7 +185,7 @@ fn canonical(body: &Value) -> Result<Vec<u8>> {
     let bytes =
         aterm_json::to_vec(body).map_err(|_| Error::new("claim row could not be encoded"))?;
     if bytes.len() > MAX_ROW {
-        return Err(Error::new("claim row exceeds 4 KiB"));
+        return Err(Error::new("claim row exceeds its transport byte budget"));
     }
     Ok(bytes)
 }
@@ -392,20 +392,18 @@ fn legacy_logs(
 }
 
 /// Whether this writer has no room left in the day table `epoch` of `logs`.
-fn full(logs: &[(Source, Log)], epoch: u64, actor: Actor, caps: Caps) -> bool {
+fn full(logs: &[(Source, Log)], epoch: u64, caps: Caps, payload: usize) -> bool {
     let (used, needed) = logs
         .iter()
         .find(|(source, _)| *source == Source::Ring(epoch))
         .map_or((Used::default(), 1), |(_, log)| {
-            let (records, writer_records) = log.retained_counts(actor);
-            let used = Used {
-                records,
-                writer_records,
-                ..Used::default()
-            };
-            (used, log.append_records_bound())
+            (log.local_use(), log.append_records_bound())
         });
-    caps.shares().full(&used, needed, 0)
+    caps.shares().full(
+        &used,
+        needed,
+        needed.saturating_mul(ring::record_bytes(payload)),
+    )
 }
 
 /// The day table a row that lapses at `until` goes into: the ring placement (`ring::place`) on the
@@ -491,7 +489,7 @@ pub(crate) fn read_at(paths: &Paths, now: u64, caps: Caps) -> Result<Read> {
                     now,
                     own_epoch(latest.get(&session.actor())),
                     0,
-                    |epoch| full(&logs[..ring], epoch, session.actor(), caps),
+                    |epoch| full(&logs[..ring], epoch, caps, 0),
                 )
                 .map(drop)
             })
@@ -729,7 +727,7 @@ pub(crate) fn write_at(paths: &Paths, body: &Value, now: u64, caps: Caps) -> Res
         ));
     }
     let epoch = target(&state, now, own_epoch(mine), until_of(body), |epoch| {
-        full(&logs[..ring], epoch, session.actor(), caps)
+        full(&logs[..ring], epoch, caps, encoded.len())
     })?;
     let mut store = directory.enroll_ring(&session, &CLAIMS, epoch, now)?;
     crate::documents::application::append(&session, &mut store, &encoded)?;

@@ -733,6 +733,157 @@ fn a_held_working_the_tick_writes_is_closed_by_its_edge() {
     );
 }
 
+/// A stalled sweep must not detach a held claim from the partial rollout's turns.
+/// The second beginning is genuinely unseen by the gate; the first was already shown.
+#[test]
+fn a_delayed_program_tick_keeps_the_observed_claims_rollout_span() {
+    use aterm_slog::{ShortId, TxEvent, TxPos, TxState};
+
+    let mut tab = CodexTab::new();
+    tab.says_at(DONE, 900);
+    tab.sweep_at(1_000);
+    {
+        let mut g = tab.ctx.timeline.lock().unwrap();
+        for i in 1..PROGRAM_BURST {
+            let shown = if i % 2 == 1 {
+                None
+            } else {
+                report(W::Done, None)
+            };
+            g.note_program_state(shown, 1);
+        }
+    }
+    assert_eq!(
+        program_lines(&tab.ctx.timeline).len(),
+        PROGRAM_BURST as usize
+    );
+    let (turns0, _) = tab.turns();
+    tab.says_at(WORKING, 1_008);
+    tab.sweep_at(1_010);
+    assert_eq!(
+        tab.turns(),
+        (turns0, false),
+        "working is held without a token"
+    );
+
+    tab.says_at(DONE, 1_020);
+    tab.says_at(WORKING, 1_030);
+    tab.says_at(DONE, 1_040);
+    // The rollout is read while the main thread is stalled, before its next tick.
+    tab.hand.set(1_050);
+    {
+        let mut g = tab.ctx.timeline.lock().unwrap();
+        let now = g.slog().now();
+        let slog = g.slog_mut();
+        let tracker = &mut slog.agent.as_mut().expect("codex run").tracker;
+        tracker.transcript(
+            &mut slog.log,
+            TxEvent::Bind {
+                len: 0,
+                floor_ms: tab.wall(1_000),
+            },
+            TxPos {
+                fp: 1,
+                id: None,
+                off: 0,
+                wall_ms: tab.wall(1_000),
+            },
+            TxState::Partial,
+            now,
+        );
+        for (index, (ms, event)) in [
+            (
+                1_008,
+                TxEvent::Prompt {
+                    vref: ShortId::new("a").unwrap(),
+                },
+            ),
+            (
+                1_020,
+                TxEvent::TurnEnd {
+                    vdur_ms: 12,
+                    tok_in: 0,
+                    tok_out: 0,
+                },
+            ),
+            (
+                1_030,
+                TxEvent::Prompt {
+                    vref: ShortId::new("b").unwrap(),
+                },
+            ),
+            (
+                1_040,
+                TxEvent::TurnEnd {
+                    vdur_ms: 10,
+                    tok_in: 0,
+                    tok_out: 0,
+                },
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            tracker.transcript(
+                &mut slog.log,
+                event,
+                TxPos {
+                    fp: 1,
+                    id: None,
+                    off: index as u64 + 1,
+                    wall_ms: tab.wall(ms),
+                },
+                TxState::Partial,
+                now,
+            );
+        }
+    }
+    assert_eq!(
+        tab.turns(),
+        (turns0 + 2, false),
+        "two completed rollout spans"
+    );
+    let before = tab.turn_lines();
+    for (id, opened, ended) in [("a", 1_008, 1_020), ("b", 1_030, 1_040)] {
+        assert!(
+            before.iter().any(|line| {
+                line.contains(" open t")
+                    && line.contains(&format!(" vref={id} "))
+                    && line.contains(" src=transcript conf=strong ")
+                    && line.ends_with(&format!(" t={}", tab.wall(opened)))
+            }),
+            "partial rollout opens {id} at its own row: {before:#?}"
+        );
+        assert!(
+            before.iter().any(|line| {
+                line.contains(" close t")
+                    && line.contains(" turn out=done ")
+                    && line.ends_with(&format!(" t={}", tab.wall(ended)))
+            }),
+            "partial rollout closes {id} at its own row: {before:#?}"
+        );
+    }
+    tab.sweep_at(8_000);
+    assert_eq!(
+        tab.turns(),
+        (turns0 + 2, false),
+        "the held first claim and retained second beginning must reuse their spans: {:#?}",
+        tab.turn_lines()
+    );
+    assert_eq!(
+        tab.turn_lines(),
+        before,
+        "no duplicated or redated turn edges"
+    );
+    let programs = program_lines(&tab.ctx.timeline);
+    let flushed = &programs[PROGRAM_BURST as usize];
+    assert!(
+        flushed.contains(" program state=working ")
+            && flushed.ends_with(&format!(" t={}", tab.wall(8_000))),
+        "the mark retains its actual flush time: {flushed}"
+    );
+}
+
 /// THE EDGES' TURNS SPEND THE RUN'S PROGRAM BUCKET: 2,000 sweeps 50 ms apart on the log's clock,
 /// a whole codex turn between each two that no sweep shows, open no more turns than the bucket
 /// pays for (its burst, then one a second: 100 s), and still about one a second.

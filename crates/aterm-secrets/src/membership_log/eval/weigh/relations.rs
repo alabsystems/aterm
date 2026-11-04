@@ -3,15 +3,17 @@
 
 //! Exact quorum relations for the active candidates of one evaluation.
 
-use crate::membership_log::MAX_RECORDS;
+use crate::membership_log::MAX_WEIGHED_RECORDS;
 
 const MAX_BYTES: usize = 1024 * 1024;
-const MAX_CANDIDATES: usize = (MAX_RECORDS - 1) / 2;
+/// The most quorum candidates a log holds: each is a group of at least two `Remove`s, and a log
+/// holds at most [`MAX_WEIGHED_RECORDS`] weighed records, its genesis one of them.
+pub(super) const MAX_CANDIDATES: usize = (MAX_WEIGHED_RECORDS - 1) / 2;
 const ABSENT: usize = usize::MAX;
 type Plane = Vec<Option<Box<[u64]>>>;
 
 /// Two independent relations over explicitly named, sorted active candidate indices.
-/// The fixed payload budget fits every candidate set under the current record limit.
+/// The fixed payload budget fits every candidate set under the weighed record budget.
 /// Plane slots and fixed-width rows are allocated only when they first receive a bit.
 #[derive(Debug, PartialEq, Eq)]
 pub(in crate::membership_log::eval) struct Relations {

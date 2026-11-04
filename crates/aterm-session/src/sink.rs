@@ -428,6 +428,7 @@ pub enum Seam {
     FrameLock,
     WriterPark,
     DrainPark,
+    SpillCapPark,
 }
 
 #[cfg(unix)]
@@ -2484,6 +2485,8 @@ impl Shared {
                         continue;
                     }
                 }
+                #[cfg(any(test, debug_assertions))]
+                self.at_seam(Seam::SpillCapPark);
                 s = match self.drained.wait_timeout(s, recheck) {
                     Ok((guard, _)) => guard,
                     Err(poison) => poison.into_inner().0,

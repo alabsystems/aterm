@@ -62,7 +62,7 @@ fn reply(progress: Option<&AccountProgress>) -> String {
             .unwrap_or("-".into())
     };
     let mut line = format!(
-        "OK recovery version=1 available=1 phase={phase} account={} target={} route={} known={} eligible={} wall={} observed_at={} next_at={} forecasts_paused={} detail_count={}",
+        "OK recovery version=1 available=1 phase={phase} account={} target={} route={} known={} eligible={} wall={} observed_at={} next_at={} forecasts_paused={} detail_count={} login_diagnostic_count={}",
         text(progress.account.as_deref()),
         text(target),
         text(route),
@@ -72,12 +72,21 @@ fn reply(progress: Option<&AccountProgress>) -> String {
         time(Some(progress.observed_at)),
         time(progress.next_at),
         u8::from(progress.forecasts_paused),
-        progress.details.len()
+        progress.details.len(),
+        progress.login_diagnostics.len()
     );
     for (index, detail) in progress.details.iter().enumerate() {
         line.push_str(&format!(
             " detail_{index}={}",
             crate::control::pct_encode(detail)
+        ));
+    }
+    for (index, diagnostic) in progress.login_diagnostics.iter().enumerate() {
+        line.push_str(&format!(
+            " login_diagnostic_{index}_account={} login_diagnostic_{index}_completed_at={} login_diagnostic_{index}_words={}",
+            crate::control::pct_encode(diagnostic.label()),
+            time(Some(diagnostic.completed_at)),
+            crate::control::pct_encode(&diagnostic.words()),
         ));
     }
     line.push('\n');
@@ -132,10 +141,16 @@ mod tests {
         assert_eq!(field(&known, "known"), "2");
         assert_eq!(field(&known, "eligible"), "0");
         assert_eq!(field(&known, "forecasts_paused"), "0");
+        assert_eq!(field(&known, "login_diagnostic_count"), "0");
     }
 
     #[test]
     fn full_details_targets_and_original_times_round_trip_on_one_line() {
+        use aterm_agent::harness::{
+            accounts::Row,
+            accounts_sync::LoginDiagnostic,
+            open_url::{Met, MetWord},
+        };
         let mut progress = AccountProgress::unknown(101);
         progress.next_at = Some(102);
         progress.phase = ProgressPhase::SigningIn {
@@ -144,6 +159,21 @@ mod tests {
         };
         progress.forecasts_paused = true;
         progress.details = vec!["a=b\nsecond line %20".repeat(100), "Last blocker".into()];
+        let diagnostic = LoginDiagnostic::from_exit_for_test(
+            &Row {
+                label: "account two".into(),
+                email: Some("private@example.test".into()),
+                dir: Some("/synthetic/private".into()),
+                ..Row::default()
+            },
+            99,
+            1,
+            Some(Met {
+                word: MetWord::BrowserControl,
+                host: Some("https://must-not-appear.invalid/token".into()),
+            }),
+        );
+        progress.login_diagnostics.push(diagnostic.clone());
         let line = reply(Some(&progress));
         assert_eq!(line.lines().count(), 1);
         assert_eq!(field(&line, "phase"), "signing-in");
@@ -157,5 +187,19 @@ mod tests {
         // Timestamps describe the retained observation, not when this read happened.
         assert_eq!(field(&line, "observed_at"), "101");
         assert_eq!(field(&line, "next_at"), "102");
+        assert_eq!(field(&line, "login_diagnostic_count"), "1");
+        assert_eq!(
+            field(&line, "login_diagnostic_0_account"),
+            diagnostic.label()
+        );
+        assert_eq!(field(&line, "login_diagnostic_0_completed_at"), "99");
+        assert_eq!(field(&line, "login_diagnostic_0_words"), diagnostic.words());
+        for private in [
+            "must-not-appear",
+            "private@example.test",
+            "/synthetic/private",
+        ] {
+            assert!(!line.contains(private));
+        }
     }
 }

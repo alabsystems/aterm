@@ -35,6 +35,15 @@ pub(crate) struct Removal {
     program: PathBuf,
 }
 
+/// This process's registrations and releases, one at a time. Each takes its program's gate
+/// without waiting, so siblings that start together (a bundle's resolve check runs every exposed
+/// binary of one build at once, `flow::bundle_resolve_check`) refused one another, and a release
+/// that met a sibling's registration kept its mark, which then held the build for
+/// [`aterm_uds::deadline::FIRST_EXEC_HANG`] and failed its flip (`docs/measured/
+/// nux-round9-2026-11-02.md`, item 12). Each holds it only around its own gate, never across a
+/// wait, and no removal takes it, so a removal still refuses a start, and is refused, at once.
+static IN_PROCESS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn busy() -> io::Error {
     io::Error::new(
         io::ErrorKind::WouldBlock,
@@ -129,7 +138,8 @@ impl Removal {
     }
 }
 
-/// Hold before spawn. A busy gate or unwritable mark refuses without waiting or starting.
+/// Hold before spawn. A gate another process or a removal holds, or an unwritable mark, refuses
+/// without waiting or starting; this process's other registrations and releases go first.
 /// # Errors
 /// Unknown paths, a busy registration/removal gate, or a mark that cannot be written durably.
 pub fn hold_first_exec(exe: &Path) -> io::Result<FirstExec> {
@@ -151,6 +161,9 @@ pub(super) fn hold_first_exec_at(exe: &Path, awake: Option<u64>) -> io::Result<F
         .parent()
         .ok_or_else(|| io::Error::other("no program"))?
         .to_path_buf();
+    let _turn = IN_PROCESS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _gate = gate(&program)?;
     if self::key(build)? != key {
         return Err(io::Error::other("build alias changed before registration"));
@@ -185,8 +198,12 @@ pub(super) fn hold_first_exec_at(exe: &Path, awake: Option<u64>) -> io::Result<F
 }
 
 impl FirstExec {
-    /// Only this starter's mark goes. Busy gates, replaced names and unknown metadata retain it.
+    /// Only this starter's mark goes. A gate another process or a removal holds, replaced names
+    /// and unknown metadata retain it; this process's other registrations and releases go first.
     pub fn ran(self) {
+        let _turn = IN_PROCESS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Ok(_gate) = gate(&self.program) else {
             return;
         };

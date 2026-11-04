@@ -116,7 +116,7 @@ pub(super) fn poll_cancellation(ctx: &crate::SessionCtx, id: &str) -> Result<boo
     service.persist_cancellation(ctx)
 }
 
-pub(super) fn observe_terminal(ctx: &crate::SessionCtx, id: &str) {
+pub(super) fn observe_terminal(ctx: &crate::SessionCtx, id: &str) -> bool {
     let service = ctx
         .fenced_writes
         .native
@@ -125,9 +125,15 @@ pub(super) fn observe_terminal(ctx: &crate::SessionCtx, id: &str) {
         .renewal_services
         .get(id)
         .cloned();
-    let Some(service) = service else { return };
+    let Some(service) = service else { return true };
     let env = service.seed.environment();
-    if renewal::read_receipt(&env, id).is_some_and(|root| root.phase != Phase::Committing) {
+    let Some(root) = renewal::read_receipt(&env, id) else {
+        return false;
+    };
+    if root.phase != Phase::Committing {
+        if !cleanup_terminal_pool(ctx, &env, &root) {
+            return false;
+        }
         service.finished.store(true, Ordering::Release);
         retire_pins(ctx, &service.seed.intent);
         let (retired_service, retired_seals) = {
@@ -152,7 +158,189 @@ pub(super) fn observe_terminal(ctx: &crate::SessionCtx, id: &str) {
         // leave these outside native history's bounded retirement/reclamation.
         drop(retired_seals);
         drop(retired_service);
+        return true;
     }
+    false
+}
+
+// Completion persistence can follow the restored process's first status call.
+// Keep the service until its own worker can observe that proof and retire the
+// exact pool record, even if the client no longer polls.
+fn cleanup_terminal_pool(ctx: &crate::SessionCtx, env: &Env, root: &Receipt) -> bool {
+    if root.intent.purpose != renewal::Purpose::WeeklyQuota {
+        return true;
+    }
+    if root.phase == Phase::Consumed || (root.phase == Phase::Retired && !root.launch_attempted) {
+        return renewal::retire_pool_record(env, root).is_ok_and(|result| result.is_some());
+    }
+    if root.phase == Phase::Retired
+        && root.candidate.as_ref().is_some_and(|candidate| {
+            !candidate.forward
+                && root.successor_pid == Some(candidate.pid)
+                && root.successor_birth == Some(candidate.birth)
+        })
+    {
+        let Some(options) = opts(env, &root.sid) else {
+            return false;
+        };
+        return renewal::with_receipt_writer(env, |writer| {
+            writer.retire_rolled_back_pool_record(root, &options)
+        })
+        .is_ok_and(|result| result.is_some());
+    }
+    if root.phase == Phase::Retired
+        && root.current_attempt.is_none()
+        && root.candidate.is_none()
+        && root.successor_pid.is_none()
+    {
+        match unstarted_completion(ctx, root) {
+            Unstarted::Pending => return false,
+            Unstarted::Proven => {
+                return renewal::with_receipt_writer(env, |writer| {
+                    if renewal::read_receipt(env, &root.id).as_ref() != Some(root) {
+                        return Err("cancelled-receipt-changed");
+                    }
+                    let mut not_started = root.clone();
+                    not_started.launch_attempted = false;
+                    renewal::write_receipt(env, &not_started)?;
+                    writer.retire_pool_record(&not_started)
+                })
+                .is_ok_and(|result| result.is_some());
+            }
+            Unstarted::Unknown => {
+                if let Some(proof) = cancelled_completion(ctx, root) {
+                    return renewal::with_receipt_writer(env, |writer| {
+                        writer.retire_cancelled_pool_record(root, &proof)
+                    })
+                    .is_ok_and(|result| result.is_some());
+                }
+                if root.revoked {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+struct CancelledCompletion<'a> {
+    ctx: &'a crate::SessionCtx,
+    closed: Arc<ClosedRestart>,
+}
+
+impl renewal::NativeCancellationProof for CancelledCompletion<'_> {
+    fn closed_without_successor(&self, prepare: &Prepare) -> bool {
+        self.closed.cancelled_without_successor(
+            prepare,
+            &super::super::System(&self.ctx.native_policy, false),
+        )
+    }
+}
+
+fn cancelled_completion<'a>(
+    ctx: &'a crate::SessionCtx,
+    root: &Receipt,
+) -> Option<CancelledCompletion<'a>> {
+    let aterm_agent::harness::native_act::Request::Prepare(prepare) =
+        aterm_agent::harness::native_act::Request::parse(&root.native_prepare)?
+    else {
+        return None;
+    };
+    let operation = ctx
+        .fenced_writes
+        .native
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .by_id
+        .get(&prepare.id)
+        .cloned()?;
+    let op = operation.lock().unwrap_or_else(|p| p.into_inner());
+    if op.request != *prepare
+        || op.resume_only
+        || op.phase != super::super::Phase::Completed(Decision::Retired(Retirement::NotGranted))
+        || op.resume_sent
+        || op.custody.is_some()
+        || op.children.iter().any(Option::is_some)
+        || op
+            .completion_drain
+            .as_ref()
+            .is_some_and(|drain| !drain.is_drained())
+        || op
+            .resume_attempt
+            .as_ref()
+            .is_some_and(|attempt| !attempt.settled())
+        || op
+            .authority
+            .renewal
+            .as_ref()
+            .is_none_or(|seal| seal.receipt_id() != root.id)
+    {
+        return None;
+    }
+    Some(CancelledCompletion {
+        ctx,
+        closed: Arc::clone(op.closed_restart.as_ref()?),
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Unstarted {
+    Pending,
+    Proven,
+    Unknown,
+}
+
+fn unstarted_completion(ctx: &crate::SessionCtx, root: &Receipt) -> Unstarted {
+    let Some(aterm_agent::harness::native_act::Request::Prepare(prepare)) =
+        aterm_agent::harness::native_act::Request::parse(&root.native_prepare)
+    else {
+        return Unstarted::Unknown;
+    };
+    let operation = ctx
+        .fenced_writes
+        .native
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .by_id
+        .get(&prepare.id)
+        .cloned();
+    let Some(operation) = operation else {
+        return Unstarted::Unknown;
+    };
+    let op = operation.lock().unwrap_or_else(|p| p.into_inner());
+    if op.request != *prepare
+        || op.resume_only
+        || op
+            .authority
+            .renewal
+            .as_ref()
+            .is_none_or(|seal| seal.receipt_id() != root.id)
+    {
+        return Unstarted::Unknown;
+    }
+    if !matches!(op.phase, super::super::Phase::Completed(_)) {
+        return Unstarted::Pending;
+    }
+    if op.phase != super::super::Phase::Completed(Decision::ProvenNotCommittedRollbackSafe)
+        || op.signal_sent
+        || op.resume_sent
+        || op.children.iter().any(Option::is_some)
+    {
+        return Unstarted::Unknown;
+    }
+    if op.custody.is_some()
+        || op
+            .completion_drain
+            .as_ref()
+            .is_some_and(|drain| !drain.is_drained())
+        || op
+            .resume_attempt
+            .as_ref()
+            .is_some_and(|attempt| !attempt.settled())
+    {
+        return Unstarted::Pending;
+    }
+    Unstarted::Proven
 }
 
 fn retire_pins(ctx: &crate::SessionCtx, intent: &Arc<IntentFence>) {
@@ -216,8 +404,12 @@ fn run_closed(
         let Some(service) = service else { return };
         match poll_cancellation(&ctx, id) {
             Ok(true) => {
-                observe_terminal(&ctx, id);
-                return;
+                if observe_terminal(&ctx, id) {
+                    return;
+                }
+                drop(ctx);
+                pause();
+                continue;
             }
             Err(_) => {
                 drop(ctx);
@@ -233,8 +425,12 @@ fn run_closed(
             continue;
         };
         if root.phase != Phase::Committing || root.revoked || root.accepted_turn.is_some() {
-            observe_terminal(&ctx, id);
-            return;
+            if observe_terminal(&ctx, id) {
+                return;
+            }
+            drop(ctx);
+            pause();
+            continue;
         }
         if !root.same_intent(&service.seed.receipt) {
             service
@@ -367,18 +563,13 @@ pub(in crate::native_act) fn append_child(
             .ok_or("continuation-clock")?,
         ..previous.clone()
     };
-    let published = renewal::with_successor_writer(
-        env,
-        &root.old_auth,
-        &root.intent.identity,
-        |next, writer| {
-            if !root.matches_successor(next) {
-                return Err("continuation-selection-changed");
-            }
-            let attempt = writer.propose(root, &predecessor, &child)?;
-            writer.publish(root, &attempt)
-        },
-    );
+    let published = renewal::with_selected_writer(env, root, |next, writer| {
+        if !root.matches_successor(next) {
+            return Err("continuation-selection-changed");
+        }
+        let attempt = writer.propose(root, &predecessor, &child)?;
+        writer.publish(root, &attempt)
+    });
     match published {
         Ok(Some(current))
             if current.phase == Phase::Committing

@@ -3,8 +3,8 @@
 
 use aterm_spec::derive::Model;
 
-/// Bounded native preparation scheduling: unseen and older mature accounts
-/// precede repeated work, while pruning and capacity preserve other homes.
+/// Native preparation scheduling: unseen and older mature accounts precede
+/// repeated work, while pruning preserves other homes and their cooldowns.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_preparation_queue_model() -> Model {
@@ -34,9 +34,9 @@ pub fn native_preparation_queue_model() -> Model {
                 phase = 5; picked = 1; other = 11;
                 a = if Buggy == 5 {0} else {10}; count = if Buggy == 5 {1} else {2};
             }
-            action Full when (phase == 1) {
-                phase = 6; picked = if Buggy == 6 {2} else {0};
-                count = if Buggy == 6 {2} else {1}; b = if Buggy == 6 {11} else {0};
+            action Grow when (phase == 1) {
+                phase = 6; picked = if Buggy == 6 {0} else {2};
+                count = if Buggy == 6 {1} else {2}; b = if Buggy == 6 {0} else {11};
             }
             action Cooldown when (phase == 1) {
                 phase = 7; picked = if Buggy == 7 {1} else {0};
@@ -67,7 +67,7 @@ pub fn native_preparation_queue_model() -> Model {
             invariant OldestMatureFirst: 3 > phase || phase > 3 || picked == 1;
             invariant RetiredSlotsReclaimed: 4 > phase || phase > 4 || (a == 0 && b == 70 && count == 1);
             invariant HomesAreIndependent: 5 > phase || phase > 5 || (a == 10 && other == 11 && count == 2);
-            invariant ExactCapacity: 6 > phase || phase > 6 || (count == 1 && picked == 0);
+            invariant NewAccountsRemainEligible: 6 > phase || phase > 6 || (count == 2 && picked == 2);
             invariant NoEarlyRetry: 7 > phase || phase > 7 || (picked == 0 && a == 10);
             invariant ExactBoundary: 8 > phase || phase > 8 || (picked == 1 && a == 70);
             invariant FutureStaysCooling: 9 > phase || phase > 9 || (picked == 0 && a == 10);

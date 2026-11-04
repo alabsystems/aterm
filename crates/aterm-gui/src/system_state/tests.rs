@@ -7261,6 +7261,21 @@ fn a_line_says_what_is_true_now_and_now_to_wanted() {
     assert_eq!(secrets.phrase, "Joined · in sync");
     let permissions = line_in(&app, Setting::Permissions);
     assert_eq!(permissions.phrase, "Granted");
+    // A grant on offer is not granted: its line says Offered (nux round 9, item 12), and the
+    // unchanged reading above is the negative control.
+    let mut offered = status_of("set-up");
+    let debugger = Subject::Access(Access::Debugger);
+    let reading = offered
+        .observed
+        .iter_mut()
+        .find(|o| o.subject == debugger)
+        .expect("set-up reads the debugger");
+    reading.standing = Standing::NotNeeded;
+    reading.now = Some("Off".to_owned());
+    reading.note = Some(aterm_types::macos_setup::ACCESS_OFFERED.to_owned());
+    let permissions = line_in(&page_reading(&offered), Setting::Permissions);
+    assert_eq!(permissions.mark, Mark::Done);
+    assert_eq!(permissions.phrase, "Offered");
     let app = page_reading(&status_of("mixed"));
     let (lines, _) = lines_of(&app);
     assert!(

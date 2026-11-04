@@ -480,3 +480,38 @@ fn a_mac_the_lab_names_reads_no_sheet_for_its_mailbox_labels() {
     };
     assert_eq!(with_lab(lab, read), None);
 }
+
+/// While the lab may name this Mac and could not be read yet (`alab_roster::pending`), the sheet
+/// is not read for mailbox labels either: its `kimi-m16` row maps nothing then, though it maps
+/// with no lab held and nothing pending.
+/// NEGATIVE CONTROL: with `mailbox_aliases` gated on `names_this_mac` alone, the sheet's label
+/// maps while pending (`left: Some("sheet-pw") right: None`).
+#[test]
+fn a_pending_lab_reads_no_sheet_for_its_mailbox_labels() {
+    use super::super::alab_roster::while_pending;
+    let home = aterm_tempfile::tempdir().unwrap();
+    for (name, text) in [
+        (
+            ".secrets/ai-mailbox.toml",
+            "[passwords]\nkimi-m16 = \"sheet-pw\"\n",
+        ),
+        (
+            ".secrets/ai-accounts.csv",
+            "email,computer,claude,kimi\nkimi-sheet@example.test,m16,,global\n",
+        ),
+    ] {
+        let path = home.path().join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    let read = || {
+        discover_mailbox_config_files_raw(Some(home.path()), None, None)
+            .password_for(Some("kimi-sheet@example.test"))
+    };
+    assert_eq!(
+        read().as_deref(),
+        Some("sheet-pw"),
+        "nothing pending: the sheet names it"
+    );
+    assert_eq!(while_pending(read), None);
+}

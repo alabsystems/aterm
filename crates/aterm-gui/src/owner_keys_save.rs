@@ -13,10 +13,13 @@
 //! aterm.toml in force whose owner keys differ from the file's is refused when a control client
 //! made the save, or when an edit no person here is known to have made reached the buffer
 //! ([`Unvouched`]); a save queued behind one in flight is replayed under the mark of whoever
-//! asked for it ([`queued_by_controller`]). While the aterm.toml in force names no file, a save
-//! that makes one in the folder it would be made in counts as a save of it, whatever the new
-//! file's name ([`is_in_force`]). Discarding the mark's buffer starts its undo at the file's
-//! text ([`discard_starts_history`]). Every other save goes on as before.
+//! asked for it ([`queued_by_controller`]). An accessibility client's edit or press counts as a
+//! control client's here ([`Unvouched::Assistive`]): every tab's program reaches the window's
+//! accessibility tree with aterm's own grant, so aterm cannot tell its request from a screen
+//! reader's. While the aterm.toml in force names no file, a save that makes one in the folder it
+//! would be made in counts as a save of it, whatever the new file's name ([`is_in_force`]).
+//! Discarding the mark's buffer starts its undo at the file's text ([`discard_starts_history`]).
+//! Every other save goes on as before.
 
 use std::path::{Path, PathBuf};
 
@@ -27,6 +30,11 @@ use aterm_agent::supervise::config::OwnerKeys;
 pub(crate) enum Unvouched {
     /// A control client's gesture made it.
     Controller,
+    /// An accessibility client's request made it (`setAccessibilitySelectedText:`, a press
+    /// through the window's accessibility tree): a person's assistive technology and a program
+    /// holding aterm's Accessibility grant, as every tab's program does through aterm, send the
+    /// same request ([`crate::App::with_assistive_source`]).
+    Assistive,
     /// A journal's draft put it there when the document opened: the process that wrote the
     /// journal knew who typed it, this one does not.
     Recovered,
@@ -40,7 +48,8 @@ pub(crate) struct Provenance {
 }
 
 impl Provenance {
-    /// A save a control client made (`controller_save`) of a buffer `edit` reached.
+    /// A save a control client or an accessibility client made (`controller_save`) of a buffer
+    /// `edit` reached.
     pub(crate) fn new(controller_save: bool, edit: Option<Unvouched>) -> Self {
         Self {
             controller_save: controller_save && !fault::armed(fault::Fault::SaveIgnoresSource),
@@ -75,6 +84,12 @@ impl Provenance {
             (true, _) => "Save blocked · aterm.toml's [harness] occupancy keys are the owner's; \
                           edit them in the window yourself"
                 .to_string(),
+            (false, Some(Unvouched::Assistive)) => {
+                "Save blocked · aterm.toml's [harness] occupancy keys are the owner's, and an \
+                 accessibility client edited this buffer; choose ‘Discard Changes and Reload \
+                 from Disk’, then edit them yourself"
+                    .to_string()
+            }
             (false, Some(Unvouched::Recovered)) => {
                 "Save blocked · aterm.toml's [harness] occupancy keys are the owner's, and this \
                  buffer is a recovered draft; choose ‘Discard Changes and Reload from Disk’, \
@@ -89,8 +104,9 @@ impl Provenance {
     }
 }
 
-/// Whether a save queued behind one in flight is a control client's (`controller`): its replay,
-/// when the one in flight lands, is made under the same mark.
+/// Whether a save queued behind one in flight is a control client's or an accessibility
+/// client's (`controller`): its replay, when the one in flight lands, is made under a control
+/// client's mark.
 pub(crate) fn queued_by_controller(controller: bool) -> bool {
     controller && !fault::armed(fault::Fault::QueueDropsSource)
 }
@@ -196,8 +212,8 @@ pub(crate) mod fault {
     pub(crate) enum Fault {
         /// [`super::Provenance`] takes a control client's save for a person's.
         SaveIgnoresSource,
-        /// [`super::Provenance`] takes a buffer a control client edited, or a recovered draft,
-        /// for one a person typed.
+        /// [`super::Provenance`] takes a buffer a control client or an accessibility client
+        /// edited, or a recovered draft, for one a person typed.
         SaveIgnoresEdits,
         /// A save queued behind one in flight forgets the control client that asked for it.
         QueueDropsSource,

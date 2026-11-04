@@ -193,7 +193,7 @@ fn bound_names(tree: &Tree<'_>) -> Vec<Bound> {
 
 /// The crate a source file is in: its directory (`crates/aterm-netplace/`) and its name in a
 /// path (`aterm_netplace`).
-fn crate_of(rel: &str) -> (String, String) {
+pub(super) fn crate_of(rel: &str) -> (String, String) {
     let mut parts = rel.split('/');
     let (top, name) = (
         parts.next().unwrap_or_default(),
@@ -204,7 +204,7 @@ fn crate_of(rel: &str) -> (String, String) {
 
 /// The module a source file is (`crates/aterm-netplace/src/facts.rs` is `facts`; a `mod.rs` its
 /// directory's; a crate root, `lib.rs` or `main.rs`, its crate's, `-` spelled `_`).
-fn module_of(rel: &str) -> String {
+pub(super) fn module_of(rel: &str) -> String {
     let mut parts = rel.trim_end_matches(".rs").rsplit('/');
     let stem = parts.next().unwrap_or_default();
     match stem {
@@ -218,25 +218,25 @@ fn module_of(rel: &str) -> String {
 }
 
 /// Whether `c` can be part of an identifier.
-fn is_ident(c: char) -> bool {
+pub(super) fn is_ident(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
 /// Whether the `len` bytes of `text` at `at` are a whole word (`SEAM`; not `SEAMS` or
 /// `NO_SEAM`).
-fn whole_word(text: &str, at: usize, len: usize) -> bool {
+pub(super) fn whole_word(text: &str, at: usize, len: usize) -> bool {
     !text[..at].ends_with(is_ident) && !text[at + len..].starts_with(is_ident)
 }
 
 /// Whether `text` names the identifier `name` as a whole word.
-fn names(text: &str, name: &str) -> bool {
+pub(super) fn names(text: &str, name: &str) -> bool {
     text.match_indices(name)
         .any(|(at, _)| whole_word(text, at, name.len()))
 }
 
 /// Whether `attr` (`#[cfg(…)]`) gates what follows out of every release build: its predicate
 /// entails `debug_assertions` or `test`.
-fn release_never_compiles(attr: &str) -> bool {
+pub(super) fn release_never_compiles(attr: &str) -> bool {
     attr.strip_prefix("#[cfg(")
         .and_then(|rest| rest.strip_suffix(")]"))
         .is_some_and(entails_debug_or_test)

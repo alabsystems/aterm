@@ -1791,6 +1791,7 @@ pub mod lan_first_use {
     /// [`through_the_door`] (pure): where a `door` is installed, take the dialog `slot`, note the
     /// ask (`asked`) and `hold` the slot for the question, which gives the pass; a slot another
     /// macOS question holds keeps the use waiting (`None`). With no door the use goes with no pass.
+    #[cfg(not(target_family = "wasm"))]
     fn through_the_door_with<G, T>(
         door: bool,
         slot: impl FnOnce() -> Option<G>,

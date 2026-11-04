@@ -2,7 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! Recipient-bound historical read handoffs. An issuer transports keys, never
-//! asserts past roles: those come from the original authority-signed ciphertext.
+//! asserts past roles: those come from the original authority-signed ciphertext,
+//! or for a log-era Commons epoch from the membership log's signed `Epoch`, whose
+//! commitment the transported key must match.
 //! This implements Commons' whole-epoch history, not keychain candidate rewraps.
 
 use super::{
@@ -122,11 +124,21 @@ impl Handoff {
         if pair.public_key().as_ref() != access.local().binding().writer() {
             return Err(Error::new("history handoff has another issuer key"));
         }
-        let (past, file_key) = match access.historical(journal, identity, source) {
-            Ok(past) => (
-                past,
-                journal.node(&source).unwrap().history_file_key(identity)?,
-            ),
+        // A log-era Commons epoch carries no journal file key: its handoff names a zero one.
+        let native = match access.historical_from_log(journal, identity, source) {
+            Ok(Some(past)) => Ok((past, Zeroizing::new([0; 16]))),
+            Ok(None) => access
+                .historical(journal, identity, source)
+                .and_then(|past| {
+                    Ok((
+                        past,
+                        journal.node(&source).unwrap().history_file_key(identity)?,
+                    ))
+                }),
+            Err(error) => Err(error),
+        };
+        let (past, file_key) = match native {
+            Ok(material) => material,
             Err(error) => {
                 let Some(prior) = inherited.filter(|h| h.source == source) else {
                     return Err(error);
@@ -275,7 +287,9 @@ impl Handoff {
         }
         // The recipient was already admitted at issuance and can open this
         // roster natively. No recursive trust in another handoff is necessary.
-        let issuance = if let Some(from_log) =
+        // Under a log-era issuance the source is a retained control node or a
+        // log-era Commons epoch, which the log checks once the key is open.
+        let (issuance, journal_source) = if let Some(from_log) =
             access.historical_from_log(journal, identity, self.issued_under)?
         {
             let source_valid =
@@ -284,12 +298,7 @@ impl Handoff {
                 } else {
                     journal.retained_payload_node(self.source)
                 };
-            if !source_valid {
-                return Err(Error::new(
-                    "history source is not an ancestor of its issuance",
-                ));
-            }
-            from_log
+            (from_log, source_valid)
         } else {
             let past = access.historical(journal, identity, self.issued_under)?;
             if !journal.selected_ancestor(self.source, self.issued_under) {
@@ -297,7 +306,7 @@ impl Handoff {
                     "history source is not an ancestor of its issuance",
                 ));
             }
-            past
+            (past, true)
         };
         if ![&self.issuer, &self.recipient]
             .iter()
@@ -320,13 +329,23 @@ impl Handoff {
             return Err(Error::new("history handoff plaintext has another context"));
         }
         let file_key: Zeroizing<[u8; 16]> = Zeroizing::new(bytes[36..52].try_into().unwrap());
-        let past = access.historical_with_key(
-            journal,
-            identity,
-            self.source,
-            &file_key,
-            bytes[52..].try_into().unwrap(),
-        )?;
+        let key: &[u8; 32] = bytes[52..].try_into().unwrap();
+        if !journal_source {
+            let Some(past) = access.historical_from_log_with_key(
+                journal,
+                identity,
+                self.source,
+                self.issued_under,
+                key,
+            )?
+            else {
+                return Err(Error::new(
+                    "history source is not an ancestor of its issuance",
+                ));
+            };
+            return Ok((past, file_key));
+        }
+        let past = access.historical_with_key(journal, identity, self.source, &file_key, key)?;
         Ok((past, file_key))
     }
 }

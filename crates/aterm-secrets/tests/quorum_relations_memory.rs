@@ -74,7 +74,7 @@ fn peak_in(run: impl FnOnce() -> usize) -> (usize, usize) {
 
 #[test]
 fn maximum_quorum_relations_keep_empty_storage_linear_and_dense_storage_bounded() {
-    let candidates = (aterm_secrets::membership_log::MAX_RECORDS - 1) / 2;
+    let candidates = (aterm_secrets::membership_log::MAX_WEIGHED_RECORDS - 1) / 2;
     // This covers candidate IDs, reverse mapping, row descriptors, counters, labels and
     // worklist growth. The fixed allowance covers vector and iterator bookkeeping; neither
     // allowance grows with the number of relation edges.

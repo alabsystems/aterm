@@ -2,7 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! `aterm db alab …` (docs/DESIGN-alab-lab-model-2026-11-01.md §0, §8, §9): `import`, `check`,
-//! `adopt`, `roll`, `export`, `prefer` and `unprefer` over `alab/registry`. Every report names keys, columns, counts
+//! `adopt`, `roll`, `export`, `prefer` and `unprefer` over `alab/registry`, and the readers and
+//! owner writers of `verbs` (`machines`, `accounts`, `preferences`, `mail`, `who`, `quota`, `log`,
+//! `signins`, `add`, `retire`, `relabel`, `edit`). Every report names keys, columns, counts
 //! and source coordinates, never a value; addresses are masked unless `--show-addresses` is
 //! given. A sheet's note crosses into its row's `note` only past the note guard. The import's
 //! review (`--review`: a private `$TMPDIR/.ubd/alab-import-*.noindex/` folder opened in amacs and
@@ -70,6 +72,33 @@ pub const USAGE: &str = "aterm db alab — the ALab lab model on Commons (Unix)\
   unprefer <machine> <account>\n\
                     end that preference; nobody is signed out. A machine is its label, an alias\n\
                     or its key; an account its label, legacy label or key, never its address\n\
+  export [--dry-run|--apply]\n\
+                    the files older Macs still read, rendered from the lab and its place rows,\n\
+                    compared with the vault's and (--apply) published in one admin write\n\
+  machines | accounts | preferences | mail\n\
+                    the registry's rows by key and label; mail shows each address by key, the\n\
+                    mailbox its codes arrive in (key and label) and how, never an address\n\
+  machines <machine>\n\
+                    what runs on it: its facts and model, its preferences by rank with each\n\
+                    account's plan and quota, the accounts it runs unpreferred, its latest sum\n\
+  who <account>     who last used it and on which Mac (its clock), from the journal, relays\n\
+                    and the claims ring, and which Macs hold or claim it now\n\
+  quota [<account>] each window's usage, reset, age, Mac and source; never a guessed 0\n\
+  log <account|machine> [--days <n>]\n\
+                    the journal's events about it (or that Mac logged), with this Mac's heard\n\
+                    archive past the window; 14 days unless --days (at most 120)\n\
+  signins           each account's latest sign-in word on each Mac\n\
+  add machine <label> [--model <hw.model>] [--role <word>]\n\
+                    a planned machine, until the Mac registers itself\n\
+  add account <provider>\n\
+                    an account for the address read from stdin (never the command line)\n\
+  retire account|machine <name> [--why <text>]\n\
+                    the row retired, the reason in its note; no login moves, nobody is signed out\n\
+  relabel <machine> <new label>\n\
+                    the new label, the old one kept as an alias\n\
+  edit accounts|preferences|machines|mail\n\
+                    the rows as a grid in amacs, saved cell by cell: a cell that changed\n\
+                    meanwhile reopens with both values; a deleted row retires (a preference ends)\n\
   The sheets default to ~/.secrets/ai-accounts.csv and ~/ai-account-logins.csv, the harness's\n\
   files to ~/.secrets/fleet-accounts.toml, ai-accounts-<cli>.toml and ai-pool.toml, each read\n\
   when present. Addresses are masked unless --show-addresses is given.\n";
@@ -130,8 +159,83 @@ struct Args {
     fleets: Vec<PathBuf>,
     pool: Option<PathBuf>,
     rank: Option<u64>,
+    /// `add machine --model <hw.model>`.
+    model: Option<String>,
+    /// `add machine --role <word>`.
+    role: Option<String>,
+    /// `retire … --why <text>`.
+    why: Option<String>,
+    /// `log … --days <n>`.
+    days: Option<u64>,
     operands: Vec<String>,
 }
+
+/// What a verb reads from and opens beyond the Commons: the import's review opener, the grid
+/// opener `edit` waits on, the stdin `add account` reads its address from, and this Mac's journal
+/// spool, whose heard archive `log` reads (`None`: the window alone).
+pub struct Io<'a> {
+    pub review: Review<'a>,
+    pub open: att::Opener<'a>,
+    pub stdin: &'a mut dyn FnMut() -> Result<String>,
+    pub heard: Option<super::journal::Spool>,
+}
+
+/// The first line of this process's stdin, at most 1 KiB: where `add account` reads its address.
+///
+/// # Errors
+/// Stdin cannot be read or is not UTF-8.
+fn stdin_line() -> Result<String> {
+    first_line(&mut std::io::stdin().lock())
+}
+
+/// The first line `from` gives, at most 1 KiB, returned once its newline arrives (a terminal's
+/// Enter), never waiting for end of input; end of input before a newline ends the line too.
+fn first_line(from: &mut dyn std::io::BufRead) -> Result<String> {
+    use std::io::{BufRead as _, Read as _};
+    let mut bytes = Vec::new();
+    from.take(1024)
+        .read_until(b'\n', &mut bytes)
+        .map_err(|_| Error::new("stdin could not be read"))?;
+    String::from_utf8(bytes).map_err(|_| Error::new("stdin is not UTF-8"))
+}
+
+/// A whole number an option takes.
+fn whole(name: &str, raw: &std::ffi::OsStr) -> Result<u64> {
+    let text = raw
+        .to_str()
+        .ok_or_else(|| Error::new(&format!("{name} is a whole number")))?;
+    if text.is_empty()
+        || (text.len() > 1 && text.starts_with('0'))
+        || !text.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(Error::new(&format!("{name} is a whole number")));
+    }
+    text.parse()
+        .map_err(|_| Error::new(&format!("{name} is a whole number")))
+}
+
+/// The verbs `run` takes.
+const VERBS: [&str; 19] = [
+    "import",
+    "check",
+    "adopt",
+    "prefer",
+    "unprefer",
+    "roll",
+    "export",
+    "machines",
+    "accounts",
+    "preferences",
+    "mail",
+    "who",
+    "quota",
+    "log",
+    "signins",
+    "add",
+    "retire",
+    "relabel",
+    "edit",
+];
 
 fn parse(verb: &str, words: &[String]) -> Result<Args> {
     let mut args = Args::default();
@@ -174,22 +278,40 @@ fn parse(verb: &str, words: &[String]) -> Result<Args> {
                 if args.rank.is_some() {
                     return Err(Error::new("duplicate --rank"));
                 }
-                let raw = value("--rank")?;
+                args.rank = Some(whole("--rank", value("--rank")?.as_os_str())?);
+            }
+            ("log", "--days") => {
+                if args.days.is_some() {
+                    return Err(Error::new("duplicate --days"));
+                }
+                args.days = Some(whole("--days", value("--days")?.as_os_str())?);
+            }
+            ("add" | "retire", option @ ("--model" | "--role" | "--why")) => {
+                let raw = value(option)?;
                 let text = raw
                     .to_str()
-                    .ok_or_else(|| Error::new("--rank is a whole number"))?;
-                if text.is_empty()
-                    || (text.len() > 1 && text.starts_with('0'))
-                    || !text.bytes().all(|b| b.is_ascii_digit())
-                {
-                    return Err(Error::new("--rank is a whole number"));
+                    .filter(|t| !t.is_empty())
+                    .ok_or_else(|| Error::new(&format!("{option} needs a value")))?
+                    .to_owned();
+                let slot = match (verb, option) {
+                    ("add", "--model") => &mut args.model,
+                    ("add", "--role") => &mut args.role,
+                    ("retire", "--why") => &mut args.why,
+                    _ => {
+                        return Err(Error::new(&format!(
+                            "{verb}: unknown option (see `aterm db alab --help`)"
+                        )));
+                    }
+                };
+                if slot.replace(text).is_some() {
+                    return Err(Error::new(&format!("duplicate {option}")));
                 }
-                args.rank = Some(
-                    text.parse()
-                        .map_err(|_| Error::new("--rank is a whole number"))?,
-                );
             }
-            ("prefer" | "unprefer", operand) if !operand.starts_with("--") => {
+            (
+                "prefer" | "unprefer" | "machines" | "who" | "quota" | "log" | "add" | "retire"
+                | "relabel" | "edit",
+                operand,
+            ) if !operand.starts_with("--") => {
                 args.operands.push(operand.to_owned());
             }
             _ => {
@@ -231,23 +353,55 @@ pub fn run(
     review: Review<'_>,
     now_ms: u64,
 ) -> Result<Value> {
+    let mut open = |file: &Path, line: usize| att::amacs(file, line);
+    let mut stdin = stdin_line;
+    let mut io = Io {
+        review,
+        open: &mut open,
+        stdin: &mut stdin,
+        heard: super::journal::Spool::local(),
+    };
+    run_io(paths, words, vendors, &mut io, now_ms)
+}
+
+/// [`run`] with what a verb reads and opens beyond the Commons given ([`Io`]).
+///
+/// # Errors
+/// As [`run`].
+pub fn run_io(
+    paths: &Paths,
+    words: &[String],
+    vendors: Option<&dyn Vendors>,
+    io: &mut Io<'_>,
+    now_ms: u64,
+) -> Result<Value> {
     let verb = words
         .first()
         .map(String::as_str)
         .ok_or_else(|| Error::new("missing alab verb"))?;
-    if !matches!(
-        verb,
-        "import" | "check" | "adopt" | "prefer" | "unprefer" | "roll" | "export"
-    ) {
+    if !VERBS.contains(&verb) {
         return Err(Error::new("unknown alab verb (see `aterm db alab --help`)"));
     }
     let args = parse(verb, &words[1..])?;
+
     match verb {
+        "machines" => verbs::machines(paths, &args, io, now_ms),
+        "accounts" => verbs::accounts(paths),
+        "preferences" => verbs::preferences(paths),
+        "mail" => verbs::mail(paths),
+        "who" => verbs::who(paths, &args, io, now_ms),
+        "quota" => verbs::quota(paths, &args, io, now_ms),
+        "log" => verbs::log(paths, &args, io, now_ms),
+        "signins" => verbs::signins(paths, io, now_ms),
+        "add" => verbs::add(paths, &args, io),
+        "retire" => verbs::retire(paths, &args),
+        "relabel" => verbs::relabel(paths, &args),
+        "edit" => verbs::edit(paths, &args, io),
         "import" => {
             let vendors = vendors.ok_or_else(|| {
                 Error::new("the importer reads the sheets the harness's way; run it as `aterm db alab import`")
             })?;
-            import(paths, &args, vendors, review, now_ms)
+            import(paths, &args, vendors, &mut *io.review, now_ms)
         }
         "check" => {
             let handle = Handle::at(paths.clone(), &att::REGISTRY);
@@ -986,6 +1140,8 @@ fn write_review(plan: &Plan, sheets: &[Sheet], reveal: bool) -> Result<aterm_tem
     }
     Ok(folder)
 }
+
+mod verbs;
 
 #[cfg(test)]
 mod tests;

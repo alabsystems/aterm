@@ -1899,7 +1899,8 @@ impl Planner<'_> {
 
     /// The machine row a label names: a live row by label or alias; else the known Mac it names,
     /// by its row's fleet node or host, or a new row keyed by its node; else a planned
-    /// placeholder keyed by the label. `None` when the label is ambiguous or births are off and
+    /// placeholder keyed by the label ([`keys::planned_machine_pk`]: a retired row holding that key
+    /// leaves it, and the placeholder takes the first free `<label>/<n>`). `None` when the label is ambiguous or births are off and
     /// nothing matched.
     fn machine_for(&mut self, label: Label, at: &Coord) -> Option<String> {
         let stored = label.canonical();
@@ -1923,7 +1924,11 @@ impl Planner<'_> {
         if !self.input.births {
             return None;
         }
-        let pk = keys::machine_pk(&stored);
+        // The label's birth key unless a row holds it (a retired Mac the label named, or one
+        // relabelled away): then the first free `<label>/<n>`, as `add machine` keys it, so the
+        // new preference names a row of its own and the old row's history stays apart.
+        let rows = &self.current[MACHINE.name].rows;
+        let pk = keys::planned_machine_pk(&stored, |pk| rows.contains_key(pk))?;
         self.want(&MACHINE, &pk, "label", json!(stored), at);
         self.want(&MACHINE, &pk, "status", json!("planned"), at);
         Some(pk)
@@ -1973,11 +1978,12 @@ impl Planner<'_> {
         if let Some(mac) = self.known(&label) {
             return match self.known_found(mac) {
                 Ok(Some((pk, _))) => Some(pk),
-                Ok(None) => known_birth(mac),
+                Ok(None) => known_birth(mac, |pk| self.current[MACHINE.name].rows.contains_key(pk)),
                 Err(()) => None,
             };
         }
-        Some(keys::machine_pk(&stored))
+        let rows = &self.current[MACHINE.name].rows;
+        keys::planned_machine_pk(&stored, |pk| rows.contains_key(pk))
     }
 
     /// The row of a known Mac: by fleet node, then host, then its label or an alias among live
@@ -2019,7 +2025,10 @@ impl Planner<'_> {
         let found = found.map(|(pk, _)| pk);
         let pk = match found {
             Some(pk) => pk,
-            None if self.input.births => known_birth(mac)?,
+            None if self.input.births => {
+                let rows = &self.current[MACHINE.name].rows;
+                known_birth(mac, |pk| rows.contains_key(pk))?
+            }
             None => {
                 self.findings.insert(Finding {
                     kind: Kind::Unadopted,
@@ -2561,11 +2570,14 @@ fn valid_hosts(mac: &KnownMac) -> Vec<&str> {
     out
 }
 
-/// The key a known Mac with no row is born under: its fleet node, else its label.
-fn known_birth(mac: &KnownMac) -> Option<String> {
+/// The key a known Mac with no live row is born under: the planned key
+/// ([`keys::planned_machine_pk`]) of its fleet node (`n-<node>`), else of its label. Either
+/// skips a key `held` by a row: a retired row the node or the label once named keeps its
+/// history, and the Mac named again gets a live row of its own.
+fn known_birth(mac: &KnownMac, held: impl Fn(&str) -> bool) -> Option<String> {
     match (valid_node(mac), &mac.label) {
-        (Some(node), _) => Some(keys::machine_pk(&format!("n-{node}"))),
-        (None, Some(label)) => Some(keys::machine_pk(&label.canonical())),
+        (Some(node), _) => keys::planned_machine_pk(&format!("n-{node}"), held),
+        (None, Some(label)) => keys::planned_machine_pk(&label.canonical(), held),
         (None, None) => None,
     }
 }

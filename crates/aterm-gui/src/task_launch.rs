@@ -707,6 +707,67 @@ impl PoolSeat {
     }
 }
 
+fn native_google_agent(agent: aterm_phase::Program) -> bool {
+    use aterm_phase::Program;
+    match agent {
+        Program::Agy => true,
+        Program::Claude
+        | Program::Codex
+        | Program::Grok
+        | Program::Kimi
+        | Program::Muse
+        | Program::Generic => false,
+    }
+}
+
+struct NativeGoogleAdmission {
+    #[cfg(unix)]
+    worker: Option<aterm_agent::harness::accounts_pool::GooglePoolWorker>,
+}
+
+impl NativeGoogleAdmission {
+    fn prepare(
+        agent: aterm_phase::Program,
+        starter: aterm_agent::harness::worker::Starter,
+    ) -> Result<(aterm_agent::harness::worker::Starter, Self), String> {
+        #[cfg(unix)]
+        if native_google_agent(agent) {
+            let parts = PoolSeat::here().ok_or("Native Google pool location is unavailable")?;
+            let program = aterm_agent::harness::login_drive::program_of(
+                aterm_agent::harness::accounts::Cli::Agy,
+                &parts.home,
+            );
+            let worker = aterm_agent::harness::accounts_pool::prepare_google_worker(
+                &parts.seat(),
+                &program,
+                starter.clone(),
+            )?;
+            let starter = match worker.as_ref() {
+                Some(worker) => worker.starter()?.clone(),
+                None => starter,
+            };
+            return Ok((starter, Self { worker }));
+        }
+        let _ = agent;
+        Ok((
+            starter,
+            Self {
+                #[cfg(unix)]
+                worker: None,
+            },
+        ))
+    }
+
+    fn check(&self, admitted: &aterm_agent::harness::worker::Admitted) -> Result<(), String> {
+        #[cfg(unix)]
+        if let Some(worker) = self.worker.as_ref() {
+            return worker.check_admitted(admitted);
+        }
+        let _ = admitted;
+        Ok(())
+    }
+}
+
 fn run_worker_launch(work: &Launch) {
     if work.dialect == Dialect::Fish && !fish_answer(&work.shell) {
         stall(
@@ -722,6 +783,14 @@ fn run_worker_launch(work: &Launch) {
     let (caller, found) = worker_starter_of(work, cli);
     let caller = match pooled_starter_held(work, caller, cli) {
         Ok(caller) => caller,
+        Err(why) => {
+            stall(work, &why);
+            return;
+        }
+    };
+    let _google_mark = native_google_agent(work.agent).then(|| InstallingMark::of(&work.ctx));
+    let (caller, google) = match NativeGoogleAdmission::prepare(work.agent, caller) {
+        Ok(prepared) => prepared,
         Err(why) => {
             stall(work, &why);
             return;
@@ -785,6 +854,9 @@ fn run_worker_launch(work: &Launch) {
                 return;
             };
             let typed = type_at_prompt(work, prompt, |prompt| {
+                if let Err(why) = google.check(&admitted) {
+                    return Ok(Err(Untyped::Refused(why)));
+                }
                 crate::control::control_media::call_main(proxy, |reply| crate::Wake::WorkerLaunch {
                     sid: work.ctx.self_id.clone(),
                     nonce: work.ctx.nonce,

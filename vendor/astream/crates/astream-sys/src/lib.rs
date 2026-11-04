@@ -125,8 +125,9 @@
 //! tolerated state-dir flushes go on without a directory's flush exactly where
 //! [`dir_flush_unavailable`] says so, the broker's own rule, and return any other
 //! failure. [`file_flush_refused`] classifies refusals from a file's selected flush;
-//! whether a writer accepts one is its own durability policy. aterm reaches `fcntl`,
-//! `sysctlbyname` and `poll` (the last through
+//! whether a writer accepts one is its own durability policy. aterm reaches `fcntl`, `fsync`
+//! (through [`plain_fsync`], and [`full_sync`] in a marked test's process tree:
+//! [`TEST_PLAIN_FSYNC_ENV`]), `sysctlbyname` and `poll` (the last through
 //! astream-broker's client, whose `Closer` it bounds both ways on every dial), and
 //! never installs the `SIGHUP` handler. Its private files are held to
 //! the owner rule: aterm-uds's `private_file` judges each file it reads with
@@ -1322,12 +1323,14 @@ mod tests {
         }
     }
 
-    /// The plain flush is its own kind: [`plain_fsync`] raises `plain` and no other count.
-    /// No other test of this binary calls it, so its count is this test's alone; the other
-    /// two kinds only grow, and a plain flush counted as either falls short here.
+    /// Each [`plain_fsync`] call raises `plain` by one. No other test of this binary calls
+    /// it, so that count is this test's alone, and a plain flush counted as `full` or
+    /// `barrier` instead falls short here. That it raises NO other count cannot be read in
+    /// this binary, whose other tests flush concurrently: `tests/flush_tally.rs`, a binary
+    /// of one test, checks every kind exactly.
     #[cfg(unix)]
     #[test]
-    fn a_plain_fsync_is_counted_plain_and_nothing_else() {
+    fn each_plain_fsync_raises_plain_by_one() {
         let dir = std::env::temp_dir().join(format!("astream-sys-plain-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut f = File::create(dir.join("plain")).unwrap();

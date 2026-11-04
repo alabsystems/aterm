@@ -381,7 +381,9 @@ pub fn boot(root: &Path, tag: &str, seams: &[(&str, &str)]) -> (Proc, String) {
     cmd.env(LEDGER_SEAM, &ledger);
     let lifeline = launch_isolation::lifeline(&mut cmd, root);
     let mut ready = headless_boot::arm_ready(&mut cmd, root);
-    let _boot = aterm_spec::subprocess_lane::acquire_boot_permit();
+    let _boot = aterm_spec::subprocess_lane::acquire_boot_permit().unwrap_or_else(|e| {
+        aterm_spec::host::could_not_run(format!("subprocess boot admission refused ({e})"))
+    });
     let spawned = Instant::now();
     let child = match cmd.spawn() {
         Ok(child) => child,

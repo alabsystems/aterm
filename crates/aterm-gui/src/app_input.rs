@@ -9627,7 +9627,7 @@ impl App {
     }
 
     /// Edit's Paste follows the visible field, including an overlay above Find.
-    fn paste_into_front_field(&mut self) {
+    pub(crate) fn paste_into_front_field(&mut self) {
         if self.front().is_some_and(crate::WindowState::overlay_open) {
             self.paste_clipboard();
             return;

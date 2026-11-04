@@ -208,19 +208,21 @@ pub struct UnsettledTake {
     take: VideoTake,
     #[cfg(not(target_arch = "wasm32"))]
     lane: Option<ConvertWorker>,
-    /// Bytes the recording's store held when it finished.
+    /// Bytes the recording's store held when it finished, which the conversion lane's late
+    /// frames count against (wasm32 has no lane).
+    #[cfg(not(target_arch = "wasm32"))]
     store_bytes: usize,
 }
 
 impl From<VideoTake> for UnsettledTake {
     /// A take its conversion lane owes nothing.
     fn from(take: VideoTake) -> Self {
-        let store_bytes = take.frames.iter().map(|frame| frame.rgba.len()).sum();
         Self {
+            #[cfg(not(target_arch = "wasm32"))]
+            store_bytes: take.frames.iter().map(|frame| frame.rgba.len()).sum(),
             take,
             #[cfg(not(target_arch = "wasm32"))]
             lane: None,
-            store_bytes,
         }
     }
 }
@@ -1432,6 +1434,7 @@ impl VideoTap {
             take,
             #[cfg(not(target_arch = "wasm32"))]
             lane,
+            #[cfg(not(target_arch = "wasm32"))]
             store_bytes: self.store_bytes,
         }
     }

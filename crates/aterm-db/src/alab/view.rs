@@ -336,6 +336,14 @@ impl LabView {
     /// complete address list ([`mail::effective`] with no routes, a guess left out). What the
     /// harness's mail routes take before any `receives` pattern (step 11, "a route keyed by
     /// `mailbox`"), on a Mac that can name the mailbox's login.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "FleetMachineAssignment",
+            action = "Follow",
+            project = "aterm_db::alab::view::tests::follow_transition"
+        )
+    )]
     pub fn mailboxes(&self) -> BTreeMap<String, String> {
         self.addresses
             .rows
@@ -350,6 +358,14 @@ impl LabView {
     }
 
     /// Every address with an `alias_of` link, lower-cased, to [`Self::alias_targets`] of it.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "FleetMachineAssignment",
+            action = "Follow",
+            project = "aterm_db::alab::view::tests::follow_transition"
+        )
+    )]
     pub fn aliases(&self) -> BTreeMap<String, Vec<String>> {
         self.addresses
             .rows

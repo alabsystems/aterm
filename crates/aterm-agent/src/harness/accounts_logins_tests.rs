@@ -154,7 +154,7 @@ fn a_row_with_an_email_is_written_as_it_reads_back_and_never_printed() {
 }
 
 #[test]
-fn logins_round_trip_bounded_and_beside_an_untouched_state() {
+fn logins_round_trip_past_the_roster_limit_and_beside_an_untouched_state() {
     let (_, mut logins) = renewed(NOW - DAY);
     note_login_notice(&mut logins, "main", 2, NOW - HOUR);
     note_served_login(&mut logins, "main", NOW - HOUR);
@@ -164,7 +164,7 @@ fn logins_round_trip_bounded_and_beside_an_untouched_state() {
     assert_eq!(Logins::from_json(&text, NOW), Ok(logins.clone()));
 
     let mut labels = Map::new();
-    for i in 0..MAX_ACCOUNTS {
+    for i in 0..96 {
         labels.insert(
             format!("l{i:02}"),
             aterm_json::from_str(&format!(
@@ -187,7 +187,7 @@ fn logins_round_trip_bounded_and_beside_an_untouched_state() {
         NOW,
     )
     .expect("ours");
-    assert_eq!(read.labels.len(), MAX_ACCOUNTS);
+    assert_eq!(read.labels.len(), 96);
     let b = read.labels.values().next().expect("one");
     assert_eq!(b.dir.as_deref(), Some(abs("/s/current").as_str()));
     assert_eq!(b.renewed_at, Some(NOW), "no stamp from the future");

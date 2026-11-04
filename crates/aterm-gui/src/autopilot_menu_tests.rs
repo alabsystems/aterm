@@ -11,6 +11,9 @@ use super::*;
 use crate::claude_lights::{Clock, LandAtGlass, Weekday};
 use crate::{App, WindowId, term_lock};
 
+#[path = "autopilot_menu_viewport_tests.rs"]
+mod viewport_tests;
+
 fn offer(hh: u16, mm: u16, day: Option<Weekday>) -> Option<LandAtGlass> {
     Some(LandAtGlass {
         clock: Clock::of_minute(hh * 60 + mm),
@@ -251,7 +254,7 @@ fn rows_built_again_keep_their_places_and_a_row_that_left_leaves_a_gap() {
         place(&shown, (30, 4), (0..40, 0..120), (120, 40), 1)
     );
     assert!(
-        (0..laid.len()).all(|from| step(&laid, Some(from), true, laid.len()) != Some(cancel)),
+        (0..laid.len()).all(|from| step(&laid, Some(from), true) != Some(cancel)),
         "the keys skip the gap"
     );
     assert_eq!(keep_places(&shown, &shown).as_deref(), Some(&shown[..]));
@@ -287,10 +290,24 @@ fn the_card_hangs_above_the_chip_and_opens_down_only_where_fewer_rows_are_above(
         (1, 9),
         "shorter than the card: a prefix"
     );
-    assert_eq!(row_at(short, 1), None, "the top border");
-    assert_eq!(row_at(short, 2), Some(0));
-    assert_eq!(row_at(short, 8), Some(6));
-    assert_eq!(row_at(short, 9), None, "the bottom border");
+    assert_eq!(
+        row_at(short, MenuViewport::default(), rows.len(), 1),
+        None,
+        "the top border"
+    );
+    assert_eq!(
+        row_at(short, MenuViewport::default(), rows.len(), 2),
+        Some(0)
+    );
+    assert_eq!(
+        row_at(short, MenuViewport::default(), rows.len(), 8),
+        Some(6)
+    );
+    assert_eq!(
+        row_at(short, MenuViewport::default(), rows.len(), 9),
+        None,
+        "the bottom border"
+    );
     let ruled = place(&rows, (6, 0), (0..8, 0..120), (120, 8), 1).unwrap();
     assert_eq!(
         (ruled.row, ruled.h),
@@ -356,7 +373,7 @@ fn the_card_keeps_to_its_panes_rows_and_gives_up_its_padding_first() {
     let tight = super::rows(&named(31));
     let rect = place(&tight, (28, 40), (1..30, 33..64), (64, 30), 1).unwrap();
     assert_eq!((rect.col, rect.w), (33, 31), "as wide as its pane");
-    let painted: Vec<String> = paint(rect, &tight, None, theme)
+    let painted: Vec<String> = paint(rect, &tight, MenuViewport::default(), None, theme)
         .iter()
         .map(|r| text(r))
         .collect();
@@ -385,7 +402,7 @@ fn the_card_keeps_to_its_panes_rows_and_gives_up_its_padding_first() {
         MenuRow::Header("Autopilot \u{b7} tab 1, right pane".to_string())
     );
     let rect = place(&wide, (28, 40), (1..30, 0..100), (100, 30), 1).unwrap();
-    let painted = paint(rect, &wide, None, theme);
+    let painted = paint(rect, &wide, MenuViewport::default(), None, theme);
     assert_eq!(text(&painted[1]).chars().nth(1), Some(' '), "padded");
 }
 
@@ -393,33 +410,47 @@ fn the_card_keeps_to_its_panes_rows_and_gives_up_its_padding_first() {
 fn the_hit_test_and_the_keys_land_only_on_live_choices() {
     let rows = rows(&facts(AutopilotView::Cruise));
     let rect = place(&rows, (30, 10), (0..40, 0..120), (120, 40), 1).unwrap();
-    let at = |i: usize| item_at(rect, &rows, rect.row + 1 + i, rect.col + 3);
+    let at = |i: usize| {
+        item_at(
+            rect,
+            &rows,
+            MenuViewport::default(),
+            rect.row + 1 + i,
+            rect.col + 3,
+        )
+    };
     assert_eq!(at(0), None, "the header");
     assert_eq!(at(1), Some(1), "Cruise");
     assert_eq!(at(4), None, "a rule");
     assert_eq!(
-        item_at(rect, &rows, rect.row, rect.col + 3),
+        item_at(rect, &rows, MenuViewport::default(), rect.row, rect.col + 3),
         None,
         "a border"
     );
     assert_eq!(
-        item_at(rect, &rows, rect.row + 2, rect.col + rect.w),
+        item_at(
+            rect,
+            &rows,
+            MenuViewport::default(),
+            rect.row + 2,
+            rect.col + rect.w
+        ),
         None,
         "off the card"
     );
     let n = rows.len();
-    assert_eq!(step(&rows, None, true, n), Some(1));
-    assert_eq!(step(&rows, Some(3), true, n), Some(5), "over the rule");
-    assert_eq!(step(&rows, Some(n - 1), true, n), Some(1), "wraps");
-    assert_eq!(step(&rows, Some(1), false, n), Some(n - 1), "wraps back");
+    assert_eq!(step(&rows, None, true), Some(1));
+    assert_eq!(step(&rows, Some(3), true), Some(5), "over the rule");
+    assert_eq!(step(&rows, Some(n - 1), true), Some(1), "wraps");
+    assert_eq!(step(&rows, Some(1), false), Some(n - 1), "wraps back");
     let off = super::rows(&facts(AutopilotView::MasterOff));
     let settings = off.len() - 1;
     assert_eq!(
-        step(&off, None, true, off.len()),
+        step(&off, None, true),
         Some(settings),
         "only Settings is live"
     );
-    assert_eq!(step(&off, Some(settings), true, off.len()), Some(settings));
+    assert_eq!(step(&off, Some(settings), true), Some(settings));
     use aterm_types::keyboard::{Key, NamedKey as Nk};
     for (key, want) in [
         (Key::Named(Nk::ArrowUp), MenuKey::Up),
@@ -445,7 +476,7 @@ fn the_card_paints_its_rect_its_check_and_its_disabled_rows() {
     };
     let rows = rows(&facts(AutopilotView::Cruise));
     let rect = place(&rows, (30, 4), (0..40, 0..120), (120, 40), 1).unwrap();
-    let painted = paint(rect, &rows, Some(2), theme);
+    let painted = paint(rect, &rows, MenuViewport::default(), Some(2), theme);
     assert_eq!(painted.len(), rect.h);
     assert!(painted.iter().all(|r| r.len() == rect.w));
     let text = |r: &[RenderCell]| r.iter().map(|c| c.ch).collect::<String>();
@@ -462,7 +493,7 @@ fn the_card_paints_its_rect_its_check_and_its_disabled_rows() {
     assert_ne!(painted[3][3].bg, painted[2][3].bg, "the highlight's ground");
     let off = super::rows(&facts(AutopilotView::MasterOff));
     let rect = place(&off, (30, 4), (0..40, 0..120), (120, 40), 1).unwrap();
-    let painted = paint(rect, &off, None, theme);
+    let painted = paint(rect, &off, MenuViewport::default(), None, theme);
     let cruise = 1 + 2;
     let settings = off.len();
     assert_ne!(
@@ -503,7 +534,7 @@ fn the_setters_note_is_whole_or_absent_and_gives_way_first() {
     assert_eq!(keys(&noted[2..]), keys(&plain[1..]), "every choice kept");
     assert!(!noted[1].selectable());
     assert_eq!(
-        step(&noted, None, true, noted.len()),
+        step(&noted, None, true),
         Some(2),
         "the first choice is lit, never the note"
     );
@@ -2001,6 +2032,10 @@ fn a_readers_cancel_identity_tracks_its_exact_timer_when_the_face_stays() {
             spoken: f.spoken.clone(),
             cancels: f.armed_at_ms,
             highlight: Some(1),
+            viewport: MenuViewport::default(),
+            page_rows: rect.h.saturating_sub(2),
+            wheel_residual: 0.0,
+            wheel_residual_x: 0.0,
             rect: Some(rect),
             laid: None,
             generation: 0,
@@ -2561,16 +2596,20 @@ fn rect_of(app: &App) -> Option<MenuRect> {
 
 fn row_px(app: &App, wid: WindowId, i: usize) -> ((f64, f64), usize) {
     let rect = rect_of(app).expect("painted");
-    let row = rect.row + 1 + i;
+    let menu = app.autopilot_menu.as_ref().unwrap();
+    let visible = menu
+        .viewport
+        .range(menu.rows.len(), rect.h.saturating_sub(2));
+    assert!(visible.contains(&i), "logical row {i} outside {visible:?}");
+    let row = rect.row + 1 + i - visible.start;
     (app.frame_cell_centre(wid, (row, rect.col + 3)), row)
 }
 
 fn key_on(app: &App, row: usize) -> Option<String> {
     let rect = rect_of(app)?;
     let menu = app.autopilot_menu.as_ref()?;
-    keys(&menu.rows)
-        .get(row.checked_sub(rect.row + 1)?)?
-        .clone()
+    let i = row_at(rect, menu.viewport, menu.rows.len(), row)?;
+    keys(&menu.rows).get(i)?.clone()
 }
 
 fn arm_elsewhere(app: &mut App, session: u64) {
@@ -2973,8 +3012,8 @@ fn open_where_a_zoom_moves_a_choice(
             zoom(app, size);
             let found = cells.iter().find_map(|&(i, (x, y))| {
                 let (row, col) = app.frame_cell_at(wid, x, y)?;
-                let j =
-                    item_at(rect, &rows, row, col).filter(|&j| mode_word(&rows, j).is_some())?;
+                let j = item_at(rect, &rows, MenuViewport::default(), row, col)
+                    .filter(|&j| mode_word(&rows, j).is_some())?;
                 (j != i).then_some((size, i, j, (x, y)))
             });
             zoom(app, base);
@@ -3066,7 +3105,7 @@ fn a_card_laid_again_on_a_new_grid_takes_no_press_it_did_not_see() {
         );
         let (row, col) = app.frame_cell_at(wid, x, y).expect("on the frame");
         assert_eq!(
-            item_at(rect, &rows, row, col),
+            item_at(rect, &rows, MenuViewport::default(), row, col),
             Some(now),
             "another choice under the pixel"
         );

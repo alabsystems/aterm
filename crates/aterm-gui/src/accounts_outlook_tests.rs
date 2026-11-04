@@ -231,6 +231,203 @@ fn the_outlook_replays_at_most_once_a_minute() {
     set_dir(None);
 }
 
+#[test]
+fn a_failed_store_read_withdraws_the_forecast_without_spending_a_replay() {
+    let dir = seeded();
+    let roster = roster();
+    let store = accounts::Store::at(dir.path());
+    let source = std::fs::read(store.state_file()).unwrap();
+    let mut memo = OutlookMemo {
+        reads: Some(scratch_reads()),
+        ..Default::default()
+    };
+    let start = Instant::now();
+    assert!(memo.at(start, NOW, Some(&roster), false).is_some());
+    let original = memo.replayed;
+    let rejected_modified = std::fs::metadata(store.state_file())
+        .unwrap()
+        .modified()
+        .unwrap()
+        + Duration::from_secs(1);
+    std::fs::write(store.state_file(), vec![b'!'; source.len()]).unwrap();
+    let set_modified = || {
+        std::fs::File::options()
+            .write(true)
+            .open(store.state_file())
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(rejected_modified))
+            .unwrap();
+    };
+    set_modified();
+    let rejected_stamp = stamp(&store.state_file());
+    for (seconds, wall) in [(10, NOW + 10), (70, NOW + 70)] {
+        assert!(
+            memo.at(
+                start + Duration::from_secs(seconds),
+                wall,
+                Some(&roster),
+                true
+            )
+            .is_none()
+        );
+        assert!(memo.held.as_ref().unwrap().read.is_err());
+        assert!(snapshot().unwrap().outlook.is_none());
+        assert_eq!(memo.replays, 1);
+        assert_eq!(memo.replayed, original, "a refusal is not a replay");
+    }
+    std::fs::write(store.state_file(), source).unwrap();
+    set_modified();
+    assert_eq!(stamp(&store.state_file()), rejected_stamp);
+    assert!(
+        memo.at(
+            start + Duration::from_secs(71),
+            NOW + 71,
+            Some(&roster),
+            false
+        )
+        .is_none(),
+        "a failed read still observes the bounded look interval"
+    );
+    assert!(
+        memo.at(
+            start + Duration::from_secs(80),
+            NOW + 80,
+            Some(&roster),
+            false
+        )
+        .is_some(),
+        "a failed read retries even when the repaired file has the same stamp"
+    );
+    assert_eq!(
+        memo.replays, 2,
+        "recovery uses the last actual replay's clock"
+    );
+    assert!(snapshot().unwrap().outlook.is_some());
+    set_dir(None);
+}
+
+#[test]
+fn losing_or_changing_the_roster_withdraws_without_resetting_the_replay_clock() {
+    let roster = roster();
+    for (input, store_present) in [
+        (None, true),
+        (Some(Roster::default()), true),
+        (
+            Some(Roster {
+                rows: vec![row("replacement", Class::Preferred)],
+            }),
+            true,
+        ),
+        (Some(roster.clone()), false),
+    ] {
+        let dir = seeded();
+        let mut memo = OutlookMemo {
+            reads: Some(scratch_reads()),
+            ..Default::default()
+        };
+        let start = Instant::now();
+        assert!(memo.at(start, NOW, Some(&roster), false).is_some());
+        let original = memo.replayed;
+        if !store_present {
+            set_dir(None);
+        }
+        assert!(
+            memo.at(
+                start + Duration::from_secs(10),
+                NOW + 10,
+                input.as_ref(),
+                true
+            )
+            .is_none(),
+            "input {input:?}, store present {store_present}"
+        );
+        assert!(memo.outlook.is_none(), "the payload itself is withdrawn");
+        assert!(snapshot().is_none_or(|s| s.outlook.is_none()));
+        assert_eq!(memo.replays, 1);
+        assert_eq!(memo.replayed, original);
+        set_dir(Some(dir.path()));
+        assert!(
+            memo.at(
+                start + Duration::from_secs(20),
+                NOW + 20,
+                Some(&roster),
+                true
+            )
+            .is_none(),
+            "restoring input cannot revive or recompute before the slot"
+        );
+        assert_eq!(memo.replays, 1);
+        assert!(
+            memo.at(
+                start + Duration::from_secs(60),
+                NOW + 60,
+                Some(&roster),
+                true
+            )
+            .is_some()
+        );
+        assert_eq!(memo.replays, 2);
+        assert_eq!(memo.held.as_ref().unwrap().roster, roster);
+        set_dir(None);
+    }
+}
+
+#[test]
+fn a_changed_policy_withdraws_forecasts_until_a_fresh_replay() {
+    let changes: [fn() -> (Mode, bool); 2] = [|| (Mode::Off, false), || (Mode::Early, true)];
+    for policy in changes {
+        let dir = seeded();
+        let roster = roster();
+        let mut memo = OutlookMemo {
+            reads: Some(scratch_reads()),
+            ..Default::default()
+        };
+        let start = Instant::now();
+        assert!(memo.at(start, NOW, Some(&roster), false).is_some());
+        let original = memo.replayed;
+        memo.reads = Some(Reads {
+            policy,
+            ..scratch_reads()
+        });
+        assert!(
+            memo.at(
+                start + Duration::from_secs(10),
+                NOW + 10,
+                Some(&roster),
+                false
+            )
+            .is_none()
+        );
+        assert!(snapshot().unwrap().outlook.is_none());
+        assert_eq!(memo.replays, 1);
+        assert_eq!(memo.replayed, original);
+        memo.reads = Some(scratch_reads());
+        assert!(
+            memo.at(
+                start + Duration::from_secs(20),
+                NOW + 20,
+                Some(&roster),
+                false
+            )
+            .is_none(),
+            "restoring policy does not restore the old forecast"
+        );
+        assert_eq!(memo.replays, 1);
+        assert!(
+            memo.at(
+                start + Duration::from_secs(60),
+                NOW + 60,
+                Some(&roster),
+                false
+            )
+            .is_some()
+        );
+        assert_eq!(memo.replays, 2);
+        set_dir(None);
+        drop(dir);
+    }
+}
+
 /// THE TIER THE GATED READ NAMED IS ITS ROW'S PLAN (§4.2): `Max 20x` read for `me` is one `plan`
 /// row of its series, asked once however often the footer resolves; a new tier asks once more;
 /// the next replay counts `me` at that tier. Nothing is asked before the store was read.
@@ -659,6 +856,272 @@ fn paused_outlook_gallery() {
         }
     }
     assert_eq!(files(dir.path()), before_files);
+    std::fs::write(gallery.join("manifest.tsv"), manifest).unwrap();
+    set_dir(None);
+}
+
+#[test]
+fn watching_account_observations_gallery() {
+    use crate::claude_footer::{probe, store_figures};
+    use aterm_agent::harness::account_progress::{AccountProgress, ProgressPhase};
+    use aterm_agent::harness::outlook::{Fresh, Window};
+    use aterm_agent::harness::profile::WeeklyFigure;
+
+    let (gallery, _permit) =
+        crate::scripted_redraw_fixture::gallery_directory("ATERM_ACCOUNT_OBSERVATION_GALLERY");
+    let now = i64::try_from(aterm_time::unix_secs().expect("fixture clock")).unwrap();
+    let sampled_at = now - 20 * 60;
+    let future_at = now + 120;
+    let reset = now + 3 * D;
+    let dir = scratch();
+    let store = accounts::Store::at(dir.path());
+    let (mut state, _) = store.load(now).unwrap();
+    state.active = Some("me".into());
+    for (label, week_pct) in [("me", 25), ("alt1", 50)] {
+        let _ = accounts::note_sample(
+            &mut state,
+            label,
+            accounts::Sample {
+                week_pct: Some(week_pct),
+                week_reset: Some(reset),
+                at: sampled_at,
+                ..Default::default()
+            },
+            now,
+        );
+    }
+    // Model a retained clock-skewed record, not a local tap call (which clamps its clock).
+    state.accounts.get_mut("me").unwrap().windows.insert(
+        accounts::WEEK_LIMIT.into(),
+        WindowFig {
+            pct_x10: 750,
+            reset,
+            at: future_at,
+            by: state.machine.clone(),
+            source: accounts::SOURCE_TAP.into(),
+            epoch_at: None,
+        },
+    );
+    store.save(&state).unwrap();
+    set_dir(Some(dir.path()));
+    let roster = roster();
+    let mut memo = OutlookMemo {
+        reads: Some(scratch_reads()),
+        ..Default::default()
+    };
+    let outlook = memo
+        .at(Instant::now(), now, Some(&roster), false)
+        .unwrap()
+        .clone();
+    let (read, enrolled) = memo.held.as_ref().unwrap().read.clone().unwrap();
+    let account = read.accounts.get("me").unwrap();
+    assert_eq!(account.windows[accounts::WEEK_LIMIT].at, future_at);
+    let [tapped, sampled] = store_figures(account, now);
+    assert!(
+        tapped.is_none(),
+        "the future record is not current evidence"
+    );
+    let admitted = WeeklyFigure::newer(tapped, sampled).expect("older admitted sample");
+    assert_eq!((admitted.at, admitted.used_x10), (sampled_at, 250));
+    let week = outlook
+        .rows
+        .iter()
+        .find(|row| row.label == "me")
+        .unwrap()
+        .window(Window::Week)
+        .unwrap();
+    assert_eq!(week.at, Some(sampled_at));
+    assert_eq!(week.used_x10, Some(250));
+    assert_eq!(week.fresh, Fresh::AsOf);
+    assert_eq!(week.source.unwrap().kind, "usage");
+    let weekly = admitted.words(now).unwrap();
+    let worker_rows = crate::fact_menu::account_menu_rows_from(
+        &roster,
+        &read,
+        &enrolled,
+        true,
+        Some("me"),
+        Some("me@example.test"),
+        crate::fact_menu::SessionWeek {
+            label: Some("me".into()),
+            figure: Some(admitted),
+            ..Default::default()
+        },
+        now,
+    );
+    let mut progress = AccountProgress::unknown(now);
+    progress.phase = ProgressPhase::Watching;
+    progress.account = Some("me".into());
+    progress.known = Some(2);
+    let inventory = aterm_agent::harness::footer::account_progress_text(&progress, false);
+    let facts = FooterFacts {
+        subscription: Some(SubscriptionDisplay {
+            email: Some("me@example.test".into()),
+            plan: Some("Max 20x".into()),
+            weekly: Some(weekly.clone()),
+            weekly_figure: Some(admitted),
+            label: Some("me".into()),
+            ..Default::default()
+        }),
+        account_progress: Some(progress),
+        glance: outlook.glance("me", Some(admitted.used_x10), true),
+        ..facts()
+    };
+    let before_files = files(dir.path());
+    let mut manifest = String::from(
+        "# Synthetic admitted account observations in the actual headless App/Painter; no provider or credentials.\nscene\tcolumns\trows\tfile\n",
+    );
+    let source = std::fs::read(store.state_file()).unwrap();
+    for (scene, unavailable) in [("watching", false), ("unavailable", true)] {
+        let mut facts = facts.clone();
+        let result = if unavailable {
+            std::fs::write(store.state_file(), b"not an account state").unwrap();
+            let instant = Instant::now() + Duration::from_secs(10);
+            assert!(memo.at(instant, now + 10, Some(&roster), true).is_none());
+            let why = memo
+                .held
+                .as_ref()
+                .unwrap()
+                .read
+                .as_ref()
+                .unwrap_err()
+                .clone();
+            facts.glance = memo.glance(
+                (instant, now + 10),
+                Some(&roster),
+                "me",
+                Some(admitted.used_x10),
+                true,
+            );
+            assert!(facts.glance.is_none());
+            Err(why)
+        } else {
+            Ok(worker_rows.clone())
+        };
+        assert_eq!(snapshot().unwrap().outlook.is_none(), unavailable);
+        for cols in [120, 60] {
+            let (mut app, wid, session) = glass_with(&AT_REST, facts.clone());
+            assert!(app.proxy.is_none(), "no live account reader");
+            app.config.serious_mode = Some(true);
+            app.config.cursor_trail = Some(false);
+            app.config.cursor_trail_style = Some("off".into());
+            app.recompute_sparkle();
+            app.pool
+                .get(session)
+                .unwrap()
+                .ctx
+                .timeline
+                .lock()
+                .unwrap()
+                .set_agent_reader_program_for_test(Some(aterm_phase::Program::Claude));
+            if app.windows[&wid].cols != cols {
+                assert!(app.apply_term_resize(wid, probe::ROWS, cols));
+            }
+            let mut screen = probe::screen_at(&AT_REST, probe::ROWS, cols);
+            screen[0] = "SYNTHETIC ACCOUNT OBSERVATIONS · older admitted sample".into();
+            probe::feed(&app, session, &screen);
+            probe::refill(&mut app, wid);
+            let _ = probe::pass(&mut app, wid);
+            let (shown, cwd) = app.shown_facts(session).unwrap();
+            assert_eq!(
+                shown.subscription.as_ref().unwrap().weekly_figure,
+                Some(admitted)
+            );
+            assert_eq!(shown.glance.is_none(), unavailable);
+            let observed = shown.account_progress_view().unwrap();
+            assert_eq!((observed.known, observed.eligible), (Some(2), None));
+            for (said, expected_week) in [
+                (app.fact_title(session, Fact::Account).0, weekly.clone()),
+                (
+                    crate::claude_facts::fact_spoken_of(
+                        &shown,
+                        cwd.as_deref(),
+                        Fact::Account,
+                        aterm_agent::harness::footer::FactMask::default(),
+                    )
+                    .0,
+                    weekly.replace(" · ", ", "),
+                ),
+            ] {
+                assert!(said.contains(&inventory), "{cols}: {said}");
+                assert!(said.contains(&expected_week), "{cols}: {said}");
+            }
+            app.hold_account_menu_reads_for_test();
+            let anchor = app
+                .fact_anchor(wid, session, Fact::Account)
+                .expect("actual account anchor");
+            app.open_fact_menu(wid, session, Fact::Account, anchor, true);
+            assert!(app.complete_account_menu_read_for_test(result.clone()));
+            app.on_claude_footer_changed(session);
+            let rows = &app.autopilot_menu.as_ref().unwrap().rows;
+            if unavailable {
+                assert!(item_labels(rows).is_empty());
+                assert!(!rows.iter().any(|row| matches!(row, MenuRow::Plot { .. })));
+            } else {
+                assert_eq!(item_labels(rows), ["me", "alt1"]);
+            }
+            let png = crate::scripted_redraw_fixture::headless(&mut app, |app| {
+                let (reply, receive) = std::sync::mpsc::channel();
+                app.render_image(crate::control::ImageReq {
+                    handoff: crate::control::ReplyRetentionPermit::from_own_budget(),
+                    target: crate::control_auth::ConfinedImage::in_memory(),
+                    clean: false,
+                    session: None,
+                    want_bytes: true,
+                    want_metadata: false,
+                    frame_metadata: Arc::new(std::sync::OnceLock::new()),
+                    cancel: crate::control::CaptureCancellation::new(),
+                    reply,
+                });
+                receive
+                    .recv_timeout(Duration::from_secs(60))
+                    .unwrap()
+                    .unwrap()
+                    .value
+                    .2
+                    .unwrap()
+            });
+            let file = format!("account-observations-{scene}-{cols}.png");
+            std::fs::write(gallery.join(&file), png).unwrap();
+            let rect = app
+                .autopilot_menu
+                .as_ref()
+                .expect("menu survives capture")
+                .rect
+                .expect("account card painted");
+            let drawn = app.windows[&wid]
+                .input_scratch
+                .cells
+                .iter()
+                .skip(rect.row)
+                .take(rect.h)
+                .map(|row| {
+                    row.iter()
+                        .skip(rect.col)
+                        .take(rect.w)
+                        .map(|cell| cell.ch)
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            let left = format!("{}%", 100 - admitted.used_x10 / 10);
+            assert!(drawn.contains(&left), "{cols}: {drawn}");
+            if unavailable {
+                assert!(
+                    drawn.contains("Account state unavailable"),
+                    "{cols}: {drawn}"
+                );
+            }
+            manifest.push_str(&format!("{scene}\t{cols}\t{}\t{file}\n", probe::ROWS));
+            app.close_autopilot_menu();
+        }
+    }
+    std::fs::write(store.state_file(), source).unwrap();
+    assert_eq!(
+        files(dir.path()),
+        before_files,
+        "capture leaves the input history unchanged"
+    );
     std::fs::write(gallery.join("manifest.tsv"), manifest).unwrap();
     set_dir(None);
 }

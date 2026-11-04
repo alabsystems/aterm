@@ -903,7 +903,7 @@ fn cutoffs_of(log: &Log, who: Mac) -> Vec<RecordId> {
 /// healed by merging), each an admission (a fresh Mac 60% of the time), a removal at a cutoff
 /// the branch holds, a quorum (2 to 4 seated signers removing one Mac at one cutoff), a name, a
 /// split or a merge. Records the log refuses are skipped.
-fn generated_log(seed: u64) -> Log {
+pub(super) fn generated_log(seed: u64) -> Log {
     let mut rng = Rng(seed);
     let founders = [A, B, C, D, E];
     let count = 3 + rng.below(3);
@@ -1020,7 +1020,7 @@ fn permuted(log: &Log, seed: u64) -> Log {
 }
 
 /// Every hand-made log of this file and of the quorum tests it pins, small.
-fn corpus() -> Vec<(String, Log)> {
+pub(super) fn corpus() -> Vec<(String, Log)> {
     let mut logs: Vec<(String, Log)> = vec![
         ("restorer chain".into(), restorer_chain()),
         ("restored late cut".into(), restored_late_cut(false)),
@@ -1105,7 +1105,7 @@ fn admit_chain() -> Log {
 }
 
 /// How many generated logs the differential and order tests read.
-const GENERATED: u64 = 200;
+pub(super) const GENERATED: u64 = 200;
 
 /// The walk finds what the pair loop it replaced finds: the same quorums take effect, and one
 /// undoes and strips another in the same pairs, on every hand-made log and on generated ones;

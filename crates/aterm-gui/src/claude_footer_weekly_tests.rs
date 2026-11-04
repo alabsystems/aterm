@@ -517,6 +517,31 @@ fn the_footer_shows_its_own_taps_week_for_its_own_login_under_the_age_rule() {
     let _ = std::fs::remove_dir_all(root());
 }
 
+#[test]
+fn an_own_tap_with_an_unconfirmed_clock_is_not_an_absent_reply() {
+    fresh("footer-weekly-clock");
+    profile(None);
+    for ahead in [60, 61, 120] {
+        reading(PID as u32, NOW + ahead, (380, RESET), None, None);
+        let shown = read(asks(tapped, armed));
+        if ahead == 60 {
+            assert!(shown.weekly.is_some() && shown.weekly_figure.is_some());
+            assert_eq!(shown.weekly_gap, None);
+        } else {
+            assert!(shown.weekly.is_none() && shown.weekly_figure.is_none());
+            assert_eq!(shown.weekly_gap, Some(WeeklyGap::ClockInvalid));
+        }
+        assert_eq!(
+            tap::Reading::read(&rl(), TAB, PID as u32, START as i64)
+                .unwrap()
+                .0
+                .at,
+            NOW + ahead
+        );
+    }
+    let _ = std::fs::remove_dir_all(root());
+}
+
 /// A PROCESS ON A NAMED LOGIN reads the tap figure its own login's tap wrote (the lone-login
 /// relaunch names that login in the tap's environment as in the process's), never another
 /// login's nor the default one's; and an untapped one is promised a restart only where a

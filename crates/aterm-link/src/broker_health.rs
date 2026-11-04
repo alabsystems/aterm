@@ -95,14 +95,20 @@ pub const POISONED_ROW_WORD: &str = "POISONED";
 
 /// Format what the log holds, who is attached, and the flushes the broker's process has made
 /// (astream's `process_flushes`, `astream_sys::flush_tally` as the snapshot took it: calls, so
-/// a refused barrier and the full flush that answered it are one of each).
+/// a refused barrier and the full flush that answered it are one of each). A snapshot an older
+/// broker wrote carries no tally, and the row says so ([`NO_PROCESS_FLUSHES`]), never zeros.
 #[must_use]
 pub fn holds(h: &astream_broker::BrokerHealth) -> String {
-    let flushed = &h.process_flushes;
+    let flushed = match &h.process_flushes {
+        Some(t) => format!(
+            "{} full, {} barrier and {} plain flush(es) by its process since it started",
+            t.full, t.barrier, t.plain
+        ),
+        None => NO_PROCESS_FLUSHES.to_string(),
+    };
     format!(
         "{} record(s) in {}, {} subject(s), {} pending will(s), {} group commit(s); {} \
-         connection(s), {} parked tail(s); {} full, {} barrier and {} plain flush(es) by its \
-         process since it started",
+         connection(s), {} parked tail(s); {flushed}",
         h.retained_records,
         bytes(h.retained_bytes),
         h.distinct_subjects,
@@ -110,11 +116,13 @@ pub fn holds(h: &astream_broker::BrokerHealth) -> String {
         h.group_commits,
         h.active_conns,
         h.parked_tails,
-        flushed.full,
-        flushed.barrier,
-        flushed.plain,
     )
 }
+
+/// The end of [`holds`] for a snapshot that carries no process tally: one an astream older
+/// than this build's wrote.
+pub const NO_PROCESS_FLUSHES: &str =
+    "its process's flushes not in the snapshot (a broker older than this build)";
 
 /// Whether `read` reflects the broker currently serving the socket.
 #[must_use]
@@ -622,11 +630,11 @@ mod tests {
         health.pid = 7;
         health.written_at_ms = 1_000;
         health.retained_records = 3;
-        health.process_flushes = astream_sys::FlushTally {
+        health.process_flushes = Some(astream_sys::FlushTally {
             full: 11,
             barrier: 13,
             plain: 2,
-        };
+        });
         let read = |writer| HealthRead {
             health: health.clone(),
             writer,
@@ -649,6 +657,11 @@ mod tests {
             "{other}"
         );
         assert!(!other.contains(POISONED_ROW_WORD), "{other}");
+        // An older broker's snapshot: the same facts, its tally unknown, never read as zero.
+        health.process_flushes = None;
+        let older = holds(&health);
+        assert!(older.ends_with(NO_PROCESS_FLUSHES), "{older}");
+        assert!(!older.contains(" full,"), "{older}");
     }
 
     #[test]

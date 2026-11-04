@@ -1075,7 +1075,10 @@ pub fn gather(m: &Machine<'_>, c: &'static Connector) -> Facts {
         },
         _ => (None, None),
     };
-    let hidden_store = storage.is_some_and(CodexAuthStore::hidden);
+    // Native agy normally uses the OS keyring. Only the SSH file-backend route
+    // measured by the native sign-in broker makes its token file authoritative.
+    let hidden_store = storage.is_some_and(CodexAuthStore::hidden)
+        || (c.id == "agy" && (m.var)("SSH_CONNECTION").is_none_or(|value| value.is_empty()));
     let record_scope = storage.map(CodexAuthStore::scope);
     // The Codex a launch aterm makes runs, the one program every judge of a row's own login
     // reads (`worker::codex_launch_program`), here from this machine's atpkg layout.

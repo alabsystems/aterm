@@ -467,6 +467,7 @@ impl PoolAccount {
             (Cli::Claude, _) => "claude",
             (Cli::Codex, _) => "codex",
             (Cli::Grok, _) => "grok",
+            (Cli::Agy, _) => "agy",
             (Cli::Kimi, Some(Region::MainlandCn)) => "kimi:mainland-cn",
             (Cli::Kimi, Some(Region::Global) | None) => "kimi:global",
         }
@@ -912,6 +913,7 @@ fn parse_provider_realm(raw: &str) -> Option<(Cli, Option<Region>)> {
         "claude" | "anthropic" => Some((Cli::Claude, None)),
         "codex" | "openai" => Some((Cli::Codex, None)),
         "grok" | "x" | "xai" => Some((Cli::Grok, None)),
+        "agy" | "antigravity" => Some((Cli::Agy, None)),
         "kimi" => Some((Cli::Kimi, None)),
         "kimi:global" | "kimi-global" => Some((Cli::Kimi, Some(Region::Global))),
         "kimi:mainland-cn" | "kimi-mainland-cn" | "kimi:cn" | "kimi-cn" => {

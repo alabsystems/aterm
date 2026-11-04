@@ -1790,7 +1790,7 @@ fn two_islands_admit_and_remove_then_tables_continue_after_the_heal() {
             bootstrap::{Bootstrap, Device},
             journal::Journal,
         },
-        membership_log::{Entrant, Evidence},
+        membership_log::{Body, Entrant, Evidence},
     };
 
     let join_local = |paths: &Paths, source: &str, host: &str| {
@@ -1836,52 +1836,62 @@ fn two_islands_admit_and_remove_then_tables_continue_after_the_heal() {
         key: key.into(),
         value: Some(aterm_json::json!({ "provider": "claude", "method": "oauth" })),
     };
-    let pair_commons = |a: &Paths, cfg_a: &Path, b: &Paths, cfg_b: &Path, rounds: usize| {
-        let (mut ra, mut rb) = (Repair::default(), Repair::default());
-        for _ in 0..rounds {
-            let ba = Bootstrap::required(a).expect("bootstrap a");
-            let bb = Bootstrap::required(b).expect("bootstrap b");
-            let ea = Endpoint::from_bootstrap(&ba)
-                .expect("endpoint a")
-                .expect("witness a")
-                .with_commons(a.clone(), cfg_a.to_path_buf())
-                .expect("commons a");
-            let eb = Endpoint::from_bootstrap(&bb)
-                .expect("endpoint b")
-                .expect("witness b")
-                .with_commons(b.clone(), cfg_b.to_path_buf())
-                .expect("commons b");
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let addr = listener.local_addr().unwrap();
-            thread::scope(|scope| {
-                let server = scope.spawn(|| {
-                    eb.exchange(
-                        Connection::admit(listener.accept().unwrap().0, Scope::Loopback).unwrap(),
-                        Side::Responder,
-                        &mut rb,
+    // Commons exchanges between `a` and `b`, `rounds` of them; where `checked`, neither side's
+    // table repair reports an application error.
+    let exchange_commons =
+        |a: &Paths, cfg_a: &Path, b: &Paths, cfg_b: &Path, rounds: usize, checked: bool| {
+            let (mut ra, mut rb) = (Repair::default(), Repair::default());
+            for _ in 0..rounds {
+                let ba = Bootstrap::required(a).expect("bootstrap a");
+                let bb = Bootstrap::required(b).expect("bootstrap b");
+                let ea = Endpoint::from_bootstrap(&ba)
+                    .expect("endpoint a")
+                    .expect("witness a")
+                    .with_commons(a.clone(), cfg_a.to_path_buf())
+                    .expect("commons a");
+                let eb = Endpoint::from_bootstrap(&bb)
+                    .expect("endpoint b")
+                    .expect("witness b")
+                    .with_commons(b.clone(), cfg_b.to_path_buf())
+                    .expect("commons b");
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let addr = listener.local_addr().unwrap();
+                thread::scope(|scope| {
+                    let server = scope.spawn(|| {
+                        eb.exchange(
+                            Connection::admit(listener.accept().unwrap().0, Scope::Loopback)
+                                .unwrap(),
+                            Side::Responder,
+                            &mut rb,
+                        )
+                        .expect("responder exchange")
+                    });
+                    ea.exchange(
+                        Connection::connect(addr, Scope::Loopback, aterm_spec::wait::MUST_HAPPEN)
+                            .unwrap(),
+                        Side::Initiator,
+                        &mut ra,
                     )
-                    .expect("responder exchange")
+                    .expect("initiator exchange");
+                    server.join().unwrap();
                 });
-                ea.exchange(
-                    Connection::connect(addr, Scope::Loopback, aterm_spec::wait::MUST_HAPPEN)
-                        .unwrap(),
-                    Side::Initiator,
-                    &mut ra,
-                )
-                .expect("initiator exchange");
-                server.join().unwrap();
-            });
-            assert!(
-                ra.application_error().is_none(),
-                "initiator app error: {:?}",
-                ra.application_error()
-            );
-            assert!(
-                rb.application_error().is_none(),
-                "responder app error: {:?}",
-                rb.application_error()
-            );
-        }
+                if !checked {
+                    continue;
+                }
+                assert!(
+                    ra.application_error().is_none(),
+                    "initiator app error: {:?}",
+                    ra.application_error()
+                );
+                assert!(
+                    rb.application_error().is_none(),
+                    "responder app error: {:?}",
+                    rb.application_error()
+                );
+            }
+        };
+    let pair_commons = |a: &Paths, cfg_a: &Path, b: &Paths, cfg_b: &Path, rounds: usize| {
+        exchange_commons(a, cfg_a, b, cfg_b, rounds, true);
     };
 
     // 1. Negative control: on the v1 authority-roster path (`!is_log_backed()`), independent
@@ -2223,8 +2233,61 @@ fn two_islands_admit_and_remove_then_tables_continue_after_the_heal() {
         .expect("m4 continues writing after removing m3 despite causal parent and Journal fork");
 
     // --- HEAL ---
-    // Pair across the islands over `ACX2`: `sync_acx2_membership` unions `.records` and closes
-    // newcomer `m5`'s `Wrap` gap on `m4`'s rotated `Commons` epoch before table repair!
+    // Pair across the islands over `ACX2`: `sync_acx2_membership` unions `.records` and signs
+    // nothing, so newcomer `m5` holds no `Wrap` of `m4`'s rotated `Commons` epoch and its table
+    // repair cannot open Commons yet. The vault pass each Mac's subscriber runs after it pulls
+    // records closes that gap, its holders one gap step apart by rank (at first sight, then a
+    // hundred steps on), and the next exchanges carry the `Wrap` before table repair.
+    let heal_pairs = || {
+        exchange_commons(&m1, &cfg1, &m4, &cfg4, 2, false);
+        exchange_commons(&m1, &cfg1, &m2, &cfg2, 2, false);
+        exchange_commons(&m2, &cfg2, &m5, &cfg5, 2, false);
+        exchange_commons(&m4, &cfg4, &m5, &cfg5, 2, false);
+    };
+    let held = || -> BTreeSet<[u8; 32]> {
+        [&m1, &m2, &m3, &m4, &m5]
+            .into_iter()
+            .filter_map(|p| load_records(p).ok())
+            .flat_map(|store| {
+                store
+                    .log()
+                    .map(|log| log.records().map(|r| *r.id()).collect::<Vec<_>>())
+                    .unwrap_or_default()
+            })
+            .collect()
+    };
+    let before_heal = held();
+    heal_pairs();
+    assert_eq!(
+        held(),
+        before_heal,
+        "an ACX2 session signs no record: the heal's exchanges only move them"
+    );
+    let m5_recipient = machine_identity(&m5).unwrap().recipient();
+    let healed_at = aterm_time::unix_millis().unwrap_or(0);
+    let mut closed = Vec::new();
+    for at in [healed_at, healed_at + 100 * 60_000] {
+        for p in [&m1, &m2, &m4, &m5] {
+            closed.extend(
+                aterm_secrets::client::test_tend_at(p, at).expect("the vault pass's closer looks"),
+            );
+        }
+        heal_pairs();
+    }
+    let to_m5: Vec<[u8; 32]> = closed
+        .iter()
+        .filter_map(|r| match r.body() {
+            Body::Wrap {
+                epoch, recipient, ..
+            } if *recipient == m5_recipient => Some(*epoch),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !to_m5.is_empty() && to_m5.iter().collect::<BTreeSet<_>>().len() == to_m5.len(),
+        "CONTROL: the heal left m5's Wrap gaps, which the exchange's repair once closed at once; \
+         one ranked holder's vault pass closes each: {to_m5:?}"
+    );
     pair_commons(&m1, &cfg1, &m4, &cfg4, 2);
     pair_commons(&m1, &cfg1, &m2, &cfg2, 2);
     pair_commons(&m2, &cfg2, &m5, &cfg5, 2);
@@ -2520,12 +2583,11 @@ fn multi_round_membership_sync_sends_seats_and_parents_before_children_regardles
 
 /// Every `ACX2` exchange ran at least one round in each of three passes, and each round asked
 /// `MembershipDisk` three times (inventory, selection, batch), each a fresh read of the records
-/// file that verifies every record and walks the log; both reconciles read it again. Converged
-/// peers redial every few seconds with nothing to trade, so every Mac spent that work
-/// continuously, growing with the log. Since 82fe1dc915 a converged exchange reads the file once
-/// through `MembershipDisk` and reconciles once per side; this pins it.
+/// file that verifies every record and walks the log. Converged peers redial every few seconds
+/// with nothing to trade, so every Mac spent that work continuously, growing with the log. Since
+/// 82fe1dc915 a converged exchange reads the file once through `MembershipDisk`; this pins it.
 /// NEGATIVE CONTROL: `MembershipDisk::with_store` reading the file at every call reads it twice
-/// (main before 82fe1dc915 read it nine times and reconciled twice).
+/// (main before 82fe1dc915 read it nine times).
 #[test]
 fn a_converged_membership_exchange_reads_the_records_file_once_per_side() {
     use aterm_secrets::{
@@ -2568,20 +2630,15 @@ fn a_converged_membership_exchange_reads_the_records_file_once_per_side() {
 
     let side = |stream: &mut UnixStream, paths: &Paths, side: Side| {
         let disk = MembershipDisk::new(paths, trust);
-        let mut reconciles = 0usize;
         let report = sync_log_membership(
             stream,
             &disk,
             side,
             &mut MembershipHint::default(),
-            &mut |_| {
-                reconciles += 1;
-                false
-            },
             Instant::now(),
         )
         .unwrap();
-        (report, disk.loads.load(Ordering::Relaxed), reconciles)
+        (report, disk.loads.load(Ordering::Relaxed))
     };
     let (mut sa, mut sb) = UnixStream::pair().unwrap();
     let (initiator, responder) = thread::scope(|s| {
@@ -2589,20 +2646,16 @@ fn a_converged_membership_exchange_reads_the_records_file_once_per_side() {
         let initiator = side(&mut sa, &a, Side::Initiator);
         (initiator, responder.join().unwrap())
     });
-    for (report, loads, reconciles) in [initiator, responder] {
+    for (report, loads) in [initiator, responder] {
         assert_eq!((report.sent, report.received, report.deferred), (0, 0, 0));
         assert_eq!(
             loads, 1,
             "a converged exchange read the records file {loads} times"
         );
-        assert_eq!(
-            reconciles, 1,
-            "a converged exchange reconciled {reconciles} times"
-        );
     }
 }
 
-/// Two Macs whose complete records each fill `MAX_RECORDS`, on branches the other lacks, refuse
+/// Two Macs whose complete records each fill `MAX_HELD_RECORDS`, on branches the other lacks, refuse
 /// every record the other offers: a store at its bound takes no complete record. Each pass still
 /// offered 16 of them a round, in each of up to three rounds (the refusals moved the second
 /// pass), so 48 refused records crossed each way every pass, every few seconds, forever. A peer
@@ -2618,7 +2671,7 @@ fn full_stores_on_different_branches_stop_offering_records_the_other_refused() {
         age::Identity,
         client::{Paths, load_records, save_records},
         commons::binding::Request as BindRequest,
-        membership_log::{Body, Founder, Log, MAX_RECORDS, Record, Root, encode_records},
+        membership_log::{Body, Founder, Log, MAX_HELD_RECORDS, Record, Root, encode_records},
     };
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::Ordering;
@@ -2663,7 +2716,7 @@ fn full_stores_on_different_branches_stop_offering_records_the_other_refused() {
         [(&a, "a", m1, w1, inc1), (&b, "b", m2, w2, inc2)]
     {
         let mut log = Log::new(genesis.clone()).unwrap();
-        for n in 1..MAX_RECORDS {
+        for n in 1..MAX_HELD_RECORDS {
             let name = format!("{tag}-{n}");
             let record = log
                 .draft(&actor, 10_000 + n as u64, Body::Name { name })
@@ -2675,7 +2728,7 @@ fn full_stores_on_different_branches_stop_offering_records_the_other_refused() {
         save_records(paths, &encode_records(&records)).unwrap();
         assert_eq!(
             load_records(paths).unwrap().complete_inventory().len(),
-            MAX_RECORDS
+            MAX_HELD_RECORDS
         );
     }
 
@@ -2686,8 +2739,7 @@ fn full_stores_on_different_branches_stop_offering_records_the_other_refused() {
         let [hint_a, hint_b] = &mut hints;
         let side = |stream: &mut UnixStream, paths: &Paths, side: Side, hint| {
             let disk = MembershipDisk::new(paths, trust);
-            let report =
-                sync_log_membership(stream, &disk, side, hint, &mut |_| false, now).unwrap();
+            let report = sync_log_membership(stream, &disk, side, hint, now).unwrap();
             assert_eq!(
                 (report.sent, report.received),
                 (0, 0),
@@ -2722,7 +2774,7 @@ fn full_stores_on_different_branches_stop_offering_records_the_other_refused() {
     for paths in [&a, &b] {
         assert_eq!(
             load_records(paths).unwrap().complete_inventory().len(),
-            MAX_RECORDS
+            MAX_HELD_RECORDS
         );
     }
 }
@@ -2732,7 +2784,7 @@ fn full_stores_on_different_branches_stop_offering_records_the_other_refused() {
 /// rounds after the busy one offered its children, which the peer parks, waiting for their
 /// parents, without taking them; a hold armed by the one refused round renewed itself on each of
 /// those and walked the rest 16 records a minute. A hold now needs a run of refused rounds that
-/// offered every record the peer lacks (or a peer at `MAX_RECORDS`), so the next pass comes back
+/// offered every record the peer lacks (or a peer at `LEGACY_RECORDS`), so the next pass comes back
 /// round to the parents at once.
 /// NEGATIVE CONTROL: `MembershipHint::settle` proving a hold on a run's first refused round
 /// (`full` taken as `true`) fails "a peer that refused one busy round lacks 56 records a pass
@@ -2800,7 +2852,7 @@ fn a_peer_busy_for_one_round_takes_every_record_on_the_next_pass() {
         let side = |stream: &mut UnixStream, paths: &Paths, side: Side, hint, busy| {
             let disk = MembershipDisk::new(paths, trust);
             disk.busy.store(busy, Ordering::Relaxed);
-            sync_log_membership(stream, &disk, side, hint, &mut |_| false, now).unwrap();
+            sync_log_membership(stream, &disk, side, hint, now).unwrap();
         };
         let (mut sa, mut sb) = UnixStream::pair().unwrap();
         thread::scope(|s| {

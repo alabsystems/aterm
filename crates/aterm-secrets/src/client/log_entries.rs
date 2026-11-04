@@ -8,7 +8,7 @@ use super::*;
 use crate::commons::bootstrap::Device;
 use crate::membership_log::{
     Body, Entrant, EpochAudience, Evidence, Log, MemberId, Record, RecordId, Root, Store,
-    encode_records,
+    encode_records, secure_twins,
 };
 use aterm_digest::Sha256;
 
@@ -1415,31 +1415,6 @@ fn open_local_member_signer_held_until(
     Ok(Some((actor, device, incarnation)))
 }
 
-/// The age recipients of `membership`'s members, less the keys `doc` leaves to approval by code
-/// (`[join]`'s `code-only` lines: a machine an admin let go). Any member can admit a Mac into the
-/// log (F15), so a member the log holds but `[machines]` does not name is one an admin never
-/// saw, not one it revoked.
-fn log_member_recipients(
-    membership: &crate::membership_log::Membership,
-    doc: &Document,
-    roster: Option<&crate::swarm_roster::SwarmRoster>,
-) -> BTreeSet<Recipient> {
-    let code_only: BTreeSet<String> = doc.code_only().into_iter().collect();
-    membership
-        .members()
-        .values()
-        .filter(|member| {
-            !membership
-                .removed_recipients()
-                .contains(&member.binding.recipient())
-                && !membership.member_node_removed(member)
-                && !roster.is_some_and(|r| member_denied_by_roster(r, member))
-        })
-        .map(|member| member.binding.recipient())
-        .filter(|recipient| !code_only.contains(&recipient.to_bech32()))
-        .collect()
-}
-
 fn pending_remove_cutoffs(
     log: &Log,
     actor: &MemberId,
@@ -1978,7 +1953,6 @@ pub(super) fn draft_document_diff_in_store(
         .filter_map(|m| Recipient::parse(&m.recipient).ok())
         .collect();
     let roster = roster_from_doc_or_opened(Some(doc), Some(&opened), Some(&log));
-    let log_recipients = log_member_recipients(&membership, doc, roster.as_ref());
     let everyone_log_recipients: BTreeSet<Recipient> = membership
         .members()
         .iter()
@@ -2154,22 +2128,27 @@ pub(super) fn draft_document_diff_in_store(
                         .keys()
                         .any(|name| doc_map.is_none_or(|m| !m.contains_key(name)))
                 });
-            let reusable_epoch: Option<([u8; 32], [u8; 32])> =
-                if !departed_wrapped && !left_everyone && max_ids.len() == 1 {
-                    opened
-                        .unwrapped_keys
-                        .get(&max_ids[0])
-                        .map(|key| (max_ids[0], **key))
-                } else {
-                    None
-                };
+            let reusable_epoch: Option<([u8; 32], [u8; 32])> = if !departed_wrapped
+                && !left_everyone
+                && let Some(ep_id) = sealing_epoch(&log, &opened, max_ids, &actor)
+            {
+                opened.unwrapped_keys.get(&ep_id).map(|key| (ep_id, **key))
+            } else {
+                None
+            };
 
             if let Some((epoch_id, epoch_key)) = reusable_epoch {
-                // Close any Wrap gaps across all active epochs of this audience that we hold.
+                // Close any Wrap gaps across all active epochs of this audience that we hold,
+                // but those that may be a prefix of another Mac's batch.
+                let active: Vec<RecordId> = active_epochs.iter().copied().collect();
+                let unsettled = unsettled_of_others(&log, &active, &actor);
                 for ep_id in &active_epochs {
                     let Some(ep_key) = opened.unwrapped_keys.get(ep_id) else {
                         continue;
                     };
+                    if unsettled.contains(ep_id) {
+                        continue;
+                    }
                     let already = opened.wrapped_recipients.get(ep_id);
                     for &recipient in &plan_recipients {
                         if already.is_none_or(|set| !set.contains(&recipient)) {
@@ -2348,19 +2327,23 @@ pub(super) fn draft_document_diff_in_store(
                             wrapped.iter().any(|r| !commons_recipients.contains(r))
                         })
                     });
-                let reusable_commons = if !departed_wrapped && max_ids.len() == 1 {
-                    opened
-                        .unwrapped_keys
-                        .get(&max_ids[0])
-                        .map(|key| (max_ids[0], **key))
+                let reusable_commons = if !departed_wrapped
+                    && let Some(ep_id) = sealing_epoch(&log, &opened, max_ids, &actor)
+                {
+                    opened.unwrapped_keys.get(&ep_id).map(|key| (ep_id, **key))
                 } else {
                     None
                 };
                 if let Some((ep_id, ep_key)) = reusable_commons {
+                    let active: Vec<RecordId> = active_epochs.iter().copied().collect();
+                    let unsettled = unsettled_of_others(&log, &active, &actor);
                     for active_id in &active_epochs {
                         let Some(active_key) = opened.unwrapped_keys.get(active_id) else {
                             continue;
                         };
+                        if unsettled.contains(active_id) {
+                            continue;
+                        }
                         let already = opened.wrapped_recipients.get(active_id);
                         for &recipient in &commons_recipients {
                             if already.is_none_or(|set| !set.contains(&recipient)) {
@@ -2446,38 +2429,6 @@ pub(super) fn draft_document_diff_in_store(
                             .sign(writer_seed, incarnation)?;
                         let _ = log.insert(put_rec.clone())?;
                         minted.push(put_rec);
-                    }
-                }
-                // Close any missing wraps on historical `EpochAudience::Commons` epochs for active
-                // bound members so they can decrypt Commons table rows sealed under earlier epochs.
-                let historical_commons: Vec<RecordId> = log
-                    .records()
-                    .skip(1)
-                    .filter_map(|r| match r.body() {
-                        Body::Epoch {
-                            audience: EpochAudience::Commons,
-                            ..
-                        } if !active_epochs.contains(r.id())
-                            && opened.unwrapped_keys.contains_key(r.id()) =>
-                        {
-                            Some(*r.id())
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                for hist_id in historical_commons {
-                    let Some(hist_key) = opened.unwrapped_keys.get(&hist_id) else {
-                        continue;
-                    };
-                    let already = opened.wrapped_recipients.get(&hist_id);
-                    for &recipient in commons_recipients.intersection(&log_recipients) {
-                        if already.is_none_or(|set| !set.contains(&recipient)) {
-                            let wrap_rec = log
-                                .draft_wrap(&actor, authored_ms, hist_id, hist_key, recipient)?
-                                .sign(writer_seed, incarnation)?;
-                            let _ = log.insert(wrap_rec.clone())?;
-                            minted.push(wrap_rec);
-                        }
                     }
                 }
             }
@@ -2899,6 +2850,34 @@ pub(super) fn post_records_best_effort(paths: &Paths, wire: &[u8]) {
     }
 }
 
+/// The epoch a writer seals an audience's next entries under, of `newest` (its causally newest
+/// epochs): its one newest epoch, or the lowest id among [`secure_twins`]. `None` where they are
+/// concurrent with distinct recipient sets (the tender coalesces them), and where one `me` did
+/// not mint may be a prefix of its minter's batch ([`unsettled_of_others`]): the rest of that
+/// batch may wrap a recipient the writer's plan leaves out, so the writer mints a fresh epoch.
+fn sealing_epoch(
+    log: &Log,
+    opened: &crate::membership_log::entries::OpenedAudienceEntries,
+    newest: &[RecordId],
+    me: &MemberId,
+) -> Option<RecordId> {
+    let id = match newest {
+        [one] => *one,
+        _ if secure_twins(
+            newest,
+            &opened.wrapped_recipients,
+            &log.removed_recipients(),
+        ) =>
+        {
+            newest.iter().min().copied()?
+        }
+        _ => return None,
+    };
+    unsettled_of_others(log, newest, me)
+        .is_empty()
+        .then_some(id)
+}
+
 pub(super) struct AuthorCtx<'a> {
     pub(super) actor: &'a MemberId,
     pub(super) writer_seed: &'a [u8; 32],
@@ -2906,7 +2885,38 @@ pub(super) struct AuthorCtx<'a> {
     pub(super) authored_ms: u64,
 }
 
-fn wrap_unwrapped_commons_and_everyone(
+#[cfg(test)]
+thread_local! {
+    /// The negative control of admission's epochs: while set, an admission or enrollment also
+    /// wraps every Commons epoch the signer holds, as the history backfill once did.
+    pub(super) static HISTORY_BACKFILL: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// [`HISTORY_BACKFILL`]'s epochs: `epochs` and, while it is set, every other Commons epoch
+/// `opened` holds the key of.
+#[cfg(test)]
+fn with_history_backfill(
+    log: &Log,
+    opened: &crate::membership_log::entries::OpenedAudienceEntries,
+    mut epochs: Vec<(EpochAudience, RecordId)>,
+) -> Vec<(EpochAudience, RecordId)> {
+    if HISTORY_BACKFILL.with(std::cell::Cell::get) {
+        for id in log.commons_epoch_ids() {
+            if opened.unwrapped_keys.contains_key(&id) && !epochs.iter().any(|(_, e)| *e == id) {
+                epochs.push((EpochAudience::Commons, id));
+            }
+        }
+    }
+    epochs
+}
+
+/// Wrap each [`Log::admission_epochs`] epoch of `[everyone]` and Commons this Mac opens (those
+/// that seal a winning entry, and the newest) to the recipients of its audience that lack a
+/// counting `Wrap` of it. An earlier Commons epoch is not wrapped: a Mac admitted later reads a
+/// Commons row sealed under one through a member's history handoff (`commons::history`, ACHG1),
+/// which `aterm-db`'s table repair asks a peer for.
+fn wrap_admission_epochs(
     log: &mut Log,
     opened: &crate::membership_log::entries::OpenedAudienceEntries,
     author: &AuthorCtx<'_>,
@@ -2914,37 +2924,14 @@ fn wrap_unwrapped_commons_and_everyone(
     everyone_recipients: &BTreeSet<Recipient>,
     minted: &mut Vec<Record>,
 ) -> crate::Result<()> {
-    let mut target_epochs: Vec<(EpochAudience, RecordId)> = Vec::new();
-    for rec in log.records().skip(1) {
-        if let Body::Epoch { audience, .. } = rec.body() {
-            let ep_id = *rec.id();
-            if !opened.unwrapped_keys.contains_key(&ep_id) {
-                continue;
-            }
-            match audience {
-                EpochAudience::Commons => target_epochs.push((EpochAudience::Commons, ep_id)),
-                EpochAudience::Everyone => {
-                    let is_active = opened
-                        .maximal_epochs
-                        .get(&EpochAudience::Everyone)
-                        .is_some_and(|m| m.contains(&ep_id))
-                        || opened
-                            .winning_epochs
-                            .get(&EpochAudience::Everyone)
-                            .is_some_and(|w| w.contains(&ep_id));
-                    if is_active {
-                        target_epochs.push((EpochAudience::Everyone, ep_id));
-                    }
-                }
-                EpochAudience::Hosts(_) => {}
-            }
-        }
-    }
-    for (aud, ep_id) in target_epochs {
+    let epochs = Log::admission_epochs(opened, &[EpochAudience::Everyone, EpochAudience::Commons]);
+    #[cfg(test)]
+    let epochs = with_history_backfill(log, opened, epochs);
+    for (audience, ep_id) in epochs {
         let Some(ep_key) = opened.unwrapped_keys.get(&ep_id) else {
             continue;
         };
-        let recipients = match aud {
+        let recipients = match audience {
             EpochAudience::Commons => commons_recipients,
             EpochAudience::Everyone => everyone_recipients,
             EpochAudience::Hosts(_) => continue,
@@ -3161,7 +3148,7 @@ fn draft_admit_member_in_log(
         } else {
             &recipients
         };
-        wrap_unwrapped_commons_and_everyone(
+        wrap_admission_epochs(
             &mut log,
             &opened,
             &AuthorCtx {
@@ -3595,6 +3582,7 @@ pub(super) fn rotate_after_removal(
             author,
             exclude_recipients,
             minted,
+            None,
         )?);
     }
 
@@ -3647,12 +3635,12 @@ pub(super) fn rotate_after_removal(
     Ok(rotated)
 }
 
-/// Mint the next epoch of every host list this Mac opens whose newest epoch is still wrapped to a
-/// Mac the log removed, or that has two or more newest epochs (the coverage rule, §3.3.7), or that
-/// this Mac reseals under F21's rule 5 ([`reseal_ready`]): wrapped to the recipients it carries
-/// over and resealing the list's current entries ([`reseal_audience`]). Returns each rotated list's
-/// header. A list this Mac cannot open is left to its own members
-/// ([`super::tend_epochs`]).
+/// Mint the next epoch of every host list this Mac opens (each `only` names, where given) whose
+/// newest epoch is still wrapped to a Mac the log removed, or that has two or more newest epochs
+/// that are not [`secure_twins`] (the coverage rule, §3.3.7), or that this Mac reseals under
+/// F21's rule 5 ([`reseal_ready`]): wrapped to the recipients it carries over and resealing the
+/// list's current entries ([`reseal_audience`]). Returns each rotated list's header. A list this
+/// Mac cannot open is left to its own members ([`super::tend_epochs`]).
 ///
 /// # Errors
 /// A record fails to draft, sign or insert.
@@ -3662,6 +3650,7 @@ pub(super) fn rotate_host_lists(
     author: &AuthorCtx<'_>,
     exclude_recipients: &BTreeSet<Recipient>,
     minted: &mut Vec<Record>,
+    only: Option<&[EpochAudience]>,
 ) -> crate::Result<Vec<String>> {
     let mut rotated = Vec::new();
     let removed = log.removed_recipients();
@@ -3684,7 +3673,12 @@ pub(super) fn rotate_host_lists(
                 .is_some_and(|set| !set.is_disjoint(&removed))
         });
         let audience = EpochAudience::Hosts(hosts.clone());
-        if !opens_all || !(wraps_removed || max_ids.len() > 1 || reseal_ready(opened, &audience)) {
+        let concurrent =
+            max_ids.len() > 1 && !secure_twins(&max_ids, &opened.wrapped_recipients, &removed);
+        if only.is_some_and(|only| !only.contains(&audience))
+            || !opens_all
+            || !(wraps_removed || concurrent || reseal_ready(opened, &audience))
+        {
             continue;
         }
         let recipients = carried_audience_recipients(
@@ -3700,33 +3694,6 @@ pub(super) fn rotate_host_lists(
     Ok(rotated)
 }
 
-/// Self-close missing [`Body::Wrap`]s for active members (`§3.3.6`), and when `allow_coalesce` is
-/// `true` and the log holds concurrent [`EpochAudience::Commons`] epochs (`§3.3.7`), mint one
-/// higher `Commons` epoch covering all current heads.
-///
-/// A Commons exchange calls it inside its own bounded deadline (`aterm-db`'s
-/// `sync_log_membership`), so the records it mints go to the vault's source on a thread of their
-/// own ([`post_records_aside`]) and it returns without waiting on the network.
-///
-/// # Errors
-/// Local file I/O or record signing fails.
-pub fn reconcile_commons_log(paths: &Paths, allow_coalesce: bool) -> crate::Result<Vec<Record>> {
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let Some((minted, _, ())) = author_and_commit_records_until(paths, deadline, |store| {
-        Ok((
-            draft_reconcile_commons_log(paths, store, allow_coalesce)?,
-            (),
-        ))
-    })?
-    else {
-        return Ok(Vec::new());
-    };
-    if !minted.is_empty() {
-        post_records_aside(paths, encode_records(&minted));
-    }
-    Ok(minted)
-}
-
 /// [`post_records_best_effort`] on a thread of its own, for a caller inside a bounded exchange:
 /// its POST may wait the transport's whole exchange deadline on a source that takes it and does
 /// not answer, past the exchange's own. The records are already in this Mac's store, so a POST
@@ -3738,127 +3705,6 @@ fn post_records_aside(paths: &Paths, wire: Vec<u8>) {
     let _ = std::thread::Builder::new()
         .name("records-post".to_owned())
         .spawn(move || post_records_best_effort(&paths, &wire));
-}
-
-fn draft_reconcile_commons_log(
-    paths: &Paths,
-    store: &Store,
-    allow_coalesce: bool,
-) -> crate::Result<Vec<Record>> {
-    let Some(mut log) = store.log().cloned() else {
-        return Ok(Vec::new());
-    };
-    if !log.has_commons_epochs() || !commons_log_matches_local_lineage(paths, &log)? {
-        return Ok(Vec::new());
-    }
-    let Some(identity) = super::read_identity(paths)? else {
-        return Ok(Vec::new());
-    };
-    let local_roster = local_swarm_roster_for_log(paths, &log)?;
-    let active_recipients: BTreeSet<Recipient> = log
-        .membership()
-        .members()
-        .iter()
-        .filter(|(m_actor, m)| {
-            !log.recipient_is_removed(&m.binding.recipient())
-                && !log.membership().member_node_removed(m)
-                && !log.audience_left_out(&EpochAudience::Everyone, m_actor)
-                && !log
-                    .audience_left_out_recipient(&EpochAudience::Everyone, &m.binding.recipient())
-                && !local_roster
-                    .as_ref()
-                    .is_some_and(|r| member_denied_by_roster(r, m))
-        })
-        .map(|(_, m)| m.binding.recipient())
-        .collect();
-    if !log.needs_commons_reconcile(&identity.recipient(), &active_recipients, allow_coalesce) {
-        return Ok(Vec::new());
-    }
-    let Some((actor, device, incarnation)) = open_local_member_signer(paths, &log)? else {
-        return Ok(Vec::new());
-    };
-    let Some(mut opened) = log.open_audience_entries(&identity)? else {
-        return Ok(Vec::new());
-    };
-    let opened_roster = roster_from_doc_or_opened(None, Some(&opened), Some(&log));
-    let roster_denies = |m: &crate::membership_log::Member| {
-        local_roster
-            .as_ref()
-            .is_some_and(|r| member_denied_by_roster(r, m))
-            || opened_roster
-                .as_ref()
-                .is_some_and(|r| member_denied_by_roster(r, m))
-    };
-
-    let authored_ms = aterm_time::unix_millis().unwrap_or(0);
-    let mut minted = Vec::new();
-    device.with_seed(|writer_seed| -> crate::Result<()> {
-        let author = AuthorCtx {
-            actor: &actor,
-            writer_seed,
-            incarnation,
-            authored_ms,
-        };
-        if allow_coalesce {
-            coalesce_concurrent_commons_epochs(
-                &mut log,
-                &opened,
-                &author,
-                &active_recipients,
-                &mut minted,
-                false,
-            )?;
-            if !minted.is_empty() {
-                if !log.needs_commons_reconcile(&identity.recipient(), &active_recipients, false) {
-                    return Ok(());
-                }
-                let Some(refreshed) = log.open_audience_entries(&identity)? else {
-                    return Ok(());
-                };
-                opened = refreshed;
-            }
-        }
-        let membership = log.membership();
-        let active_member = |m: &crate::membership_log::Member| {
-            !log.recipient_is_removed(&m.binding.recipient())
-                && !membership.member_node_removed(m)
-                && !log
-                    .audience_left_out_recipient(&EpochAudience::Everyone, &m.binding.recipient())
-                && !roster_denies(m)
-        };
-        let commons_recipients: BTreeSet<Recipient> = membership
-            .members()
-            .iter()
-            .filter(|(m_actor, m)| {
-                active_member(m)
-                    && !log.left_out(&opened, &EpochAudience::Commons, m_actor)
-                    && !log.left_out(&opened, &EpochAudience::Everyone, m_actor)
-                    && !log.audience_left_out_recipient(
-                        &EpochAudience::Commons,
-                        &m.binding.recipient(),
-                    )
-            })
-            .map(|(_, m)| m.binding.recipient())
-            .collect();
-        let everyone_recipients: BTreeSet<Recipient> = membership
-            .members()
-            .iter()
-            .filter(|(m_actor, m)| {
-                active_member(m) && !log.left_out(&opened, &EpochAudience::Everyone, m_actor)
-            })
-            .map(|(_, m)| m.binding.recipient())
-            .collect();
-        wrap_unwrapped_commons_and_everyone(
-            &mut log,
-            &opened,
-            &author,
-            &commons_recipients,
-            &everyone_recipients,
-            &mut minted,
-        )?;
-        Ok(())
-    })?;
-    Ok(minted)
 }
 
 /// The text [`Audience`] an epoch of `audience` seals entries for; `None` for Commons, whose one
@@ -4034,18 +3880,16 @@ pub(super) fn reseal_audience(
     Ok(())
 }
 
-/// The coverage rule of §3.3.7 for `[everyone]` and Commons: where an audience has two or more
-/// newest epochs, or a newest epoch still wrapped to a Mac the log removed, mint one higher epoch
-/// that covers them, wrapped to the recipients it carries over, only when this Mac opens every
-/// newest epoch. An unobserved wrap does not prove that an unopened epoch has no holder.
-/// Its entries are resealed under it
-/// only where this Mac opens the whole audience, and an audience with an uncovered keyed epoch this
-/// Mac does not open is left to a holder's reseal (F21 rule 7). With `reseal` (the vault pass's
-/// ranked tender, `tend_epochs_at`), where this Mac holds every uncovered keyed epoch of an
-/// audience and every newest epoch there, it reseals the audience ([`reseal_audience`], F21 rule
-/// 5), and one epoch serves both rules. Without it (the Commons repair, which runs unranked on
-/// every exchange), an audience with an uncovered keyed epoch is left to the tender, so Macs do
-/// not reseal at once at a heal and the resealer records rule 8.
+/// The coverage rule of §3.3.7 for `[everyone]` and Commons, for each of them `only` names (the
+/// audiences whose turn has come in the vault pass's tender, `tend_epochs_at`): where an
+/// audience has two or more newest epochs that are not [`secure_twins`], or a newest epoch still
+/// wrapped to a Mac the log removed, mint one higher epoch that covers them, wrapped to the
+/// recipients it carries over, only when this Mac opens every newest epoch. An unobserved wrap
+/// does not prove that an unopened epoch has no holder. Its entries are resealed under it only
+/// where this Mac opens the whole audience, and an audience with an uncovered keyed epoch this
+/// Mac does not open is left to a holder's reseal (F21 rule 7). Where this Mac holds every
+/// uncovered keyed epoch of an audience and every newest epoch there, it reseals the audience
+/// ([`reseal_audience`], F21 rule 5), and one epoch serves both rules.
 ///
 /// # Errors
 /// A record fails to draft, sign or insert.
@@ -4063,101 +3907,46 @@ pub(super) fn coalesce_concurrent_commons_epochs(
     author: &AuthorCtx<'_>,
     active_recipients: &BTreeSet<Recipient>,
     minted: &mut Vec<Record>,
-    reseal: bool,
+    only: &[EpochAudience],
 ) -> crate::Result<()> {
-    // Without `reseal`, an audience with an uncovered keyed epoch waits for the ranked tender.
-    let tender_only = |audience: &EpochAudience| {
-        !reseal
-            && opened
-                .uncovered_keyed
-                .get(audience)
-                .is_some_and(|epochs| !epochs.is_empty())
-    };
     let removed = log.removed_recipients();
-    let max_everyone = opened
-        .maximal_epochs
-        .get(&EpochAudience::Everyone)
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
-    // An absent wrap may still be in flight. Neither an empty recipient set nor one
-    // containing no currently active member proves that an unopened epoch may be replaced.
-    let can_open_all_max_everyone = !max_everyone.is_empty()
-        && max_everyone
-            .iter()
-            .all(|ep_id| opened.unwrapped_keys.contains_key(ep_id));
-    let everyone_wraps_removed = !removed.is_empty()
-        && max_everyone.iter().any(|ep_id| {
-            opened
-                .wrapped_recipients
-                .get(ep_id)
-                .is_some_and(|set| !set.is_disjoint(&removed))
-        });
     let empty_exclude = BTreeSet::new();
-    // F21 rule 7: an audience with an uncovered keyed epoch this Mac does not open waits for a
-    // holder's reseal, and only an audience it opens whole is resealed entry by entry; rule 5:
-    // a holder of every uncovered keyed epoch reseals it.
-    if !tender_only(&EpochAudience::Everyone)
-        && (reseal_ready(opened, &EpochAudience::Everyone)
-            || (can_open_all_max_everyone
-                && !opened.awaits_reseal(&EpochAudience::Everyone)
-                && (max_everyone.len() > 1 || everyone_wraps_removed)))
-    {
-        let everyone_recipients = carried_audience_recipients(
-            log,
-            opened,
-            &EpochAudience::Everyone,
-            active_recipients,
-            &empty_exclude,
-        );
-        reseal_audience(
-            log,
-            opened,
-            author,
-            &EpochAudience::Everyone,
-            &everyone_recipients,
-            minted,
-        )?;
+    for audience in [EpochAudience::Everyone, EpochAudience::Commons] {
+        if !only.contains(&audience) {
+            continue;
+        }
+        let newest = opened
+            .maximal_epochs
+            .get(&audience)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        // An absent wrap may still be in flight. Neither an empty recipient set nor one
+        // containing no currently active member proves that an unopened epoch may be replaced.
+        let opens_all = !newest.is_empty()
+            && newest
+                .iter()
+                .all(|ep_id| opened.unwrapped_keys.contains_key(ep_id));
+        let stale = (newest.len() > 1
+            && !secure_twins(newest, &opened.wrapped_recipients, &removed))
+            || newest.iter().any(|ep_id| {
+                opened
+                    .wrapped_recipients
+                    .get(ep_id)
+                    .is_some_and(|set| !set.is_disjoint(&removed))
+            });
+        // F21 rule 7: an audience with an uncovered keyed epoch this Mac does not open waits for
+        // a holder's reseal, and only an audience it opens whole is resealed entry by entry;
+        // rule 5: a holder of every uncovered keyed epoch reseals it.
+        if !reseal_ready(opened, &audience)
+            && (!opens_all || opened.awaits_reseal(&audience) || !stale)
+        {
+            continue;
+        }
+        let recipients =
+            carried_audience_recipients(log, opened, &audience, active_recipients, &empty_exclude);
+        reseal_audience(log, opened, author, &audience, &recipients, minted)?;
     }
-
-    let max_commons = opened
-        .maximal_epochs
-        .get(&EpochAudience::Commons)
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
-    let can_open_all_max_commons = !max_commons.is_empty()
-        && max_commons
-            .iter()
-            .all(|ep_id| opened.unwrapped_keys.contains_key(ep_id));
-    let commons_wraps_removed = !removed.is_empty()
-        && max_commons.iter().any(|ep_id| {
-            opened
-                .wrapped_recipients
-                .get(ep_id)
-                .is_some_and(|set| !set.is_disjoint(&removed))
-        });
-    if tender_only(&EpochAudience::Commons)
-        || (!reseal_ready(opened, &EpochAudience::Commons)
-            && (!can_open_all_max_commons
-                || opened.awaits_reseal(&EpochAudience::Commons)
-                || (max_commons.len() <= 1 && !commons_wraps_removed)))
-    {
-        return Ok(());
-    }
-    let commons_recipients = carried_audience_recipients(
-        log,
-        opened,
-        &EpochAudience::Commons,
-        active_recipients,
-        &empty_exclude,
-    );
-    reseal_audience(
-        log,
-        opened,
-        author,
-        &EpochAudience::Commons,
-        &commons_recipients,
-        minted,
-    )
+    Ok(())
 }
 
 enum LogEnrollPlan {
@@ -4524,7 +4313,7 @@ fn draft_enroll_commons_member(
         } else {
             commons_recipients.clone()
         };
-        wrap_unwrapped_commons_and_everyone(
+        wrap_admission_epochs(
             &mut log,
             &opened,
             &AuthorCtx {
@@ -5016,6 +4805,38 @@ fn mirror_heads(
 /// ([`crate::membership_log::Log::gap_rank`]).
 pub(super) const GAP_STEP_MS: u64 = 60_000;
 
+/// How long every member but a remover waits on a re-key a removal made due, from when it first
+/// saw the audience due, before its own rank counts ([`super::remove::tend_epochs_at`]): the
+/// remover's rotation is in its own batch, so it arrives with the `Remove` or soon after.
+pub(super) const REMOVER_GRACE_MS: u64 = 10 * GAP_STEP_MS;
+
+/// How long an epoch another Mac minted holds the re-keys and gap closes over it while this Mac
+/// may hold only a prefix of its minter's batch ([`unsettled_of_others`]), from first sight. Not
+/// every batch ends in a record that settles it (a rotation of an audience its minter does not
+/// open whole ends in `Wrap`s), so a minter that falls silent after its last `Wrap` does not hold
+/// the audience forever.
+pub(super) const SETTLE_GRACE_MS: u64 = REMOVER_GRACE_MS;
+
+#[cfg(test)]
+thread_local! {
+    /// The negative control of settledness: while set, every epoch reads as settled.
+    pub(super) static UNSETTLED_OK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The epochs of `epochs` a Mac other than `me` minted whose batch `log` may hold only a prefix
+/// of ([`Log::unsettled`]): nobody mints from them, carries recipients from them or closes their
+/// gaps until they settle, or [`SETTLE_GRACE_MS`] after first sight.
+pub(super) fn unsettled_of_others(log: &Log, epochs: &[RecordId], me: &MemberId) -> Vec<RecordId> {
+    #[cfg(test)]
+    if UNSETTLED_OK.with(std::cell::Cell::get) {
+        return Vec::new();
+    }
+    log.unsettled(epochs)
+        .into_iter()
+        .filter(|id| log.get(id).is_some_and(|record| record.actor() != me))
+        .collect()
+}
+
 /// The most the `wrap-gaps` mark file holds; a longer one reads as none (every gap seen now).
 const MAX_GAP_MARK: usize = 256 * 1024;
 
@@ -5092,7 +4913,9 @@ fn write_gap_mark(
 /// not have known that member ([`Log::wrap_gaps`]). Of the members that hold the epoch, the one
 /// ranked `k` ([`Log::gap_rank`]) signs the `Wrap` once `now_ms` is `k` [`GAP_STEP_MS`] past the
 /// time this Mac first saw the gap, so after a heal one member closes each gap instead of all
-/// ~35. The spread counts from first sight, not from when the gap opened: after a split longer
+/// ~35; on an epoch another Mac minted whose batch this Mac may hold only a prefix of
+/// ([`unsettled_of_others`]), not before [`SETTLE_GRACE_MS`] past that first sight unless the
+/// batch settles. The spread counts from first sight, not from when the gap opened: after a split longer
 /// than a few steps every holder would otherwise be past due at its first look, and all sign.
 /// The records' heads digest gates the work: with no new record and nothing due, it reads
 /// nothing more. It looks without the state lock first, which the desk, the subscriber and the
@@ -5200,7 +5023,10 @@ fn wrap_gaps_pass(
     let mut due_now = Vec::new();
     let mut next_due: Option<u64> = None;
     let mut seen = BTreeMap::new();
-    for gap in log.wrap_gaps(&opened, &audiences) {
+    let gaps = log.wrap_gaps(&opened, &audiences);
+    let gap_epochs: Vec<RecordId> = gaps.iter().map(|gap| gap.epoch).collect();
+    let unsettled = unsettled_of_others(&log, &gap_epochs, &actor);
+    for gap in gaps {
         if membership.get(&gap.member).is_some_and(|m| {
             local_roster
                 .as_ref()
@@ -5220,8 +5046,16 @@ fn wrap_gaps_pass(
         // A clock set back since never puts first sight in the future.
         let first = earlier.get(&key).copied().unwrap_or(now_ms).min(now_ms);
         seen.insert(key, first);
+        // The holders a rank counts are the epoch's `Wrap`s, so a prefix of its minter's batch
+        // ranks other Macs than the whole one: the gap waits for the batch to settle.
+        let settle = if unsettled.contains(&gap.epoch) {
+            first.saturating_add(SETTLE_GRACE_MS)
+        } else {
+            0
+        };
         let due = first
-            .saturating_add(GAP_STEP_MS.saturating_mul(u64::try_from(rank).unwrap_or(u64::MAX)));
+            .saturating_add(GAP_STEP_MS.saturating_mul(u64::try_from(rank).unwrap_or(u64::MAX)))
+            .max(settle);
         if now_ms < due {
             next_due = Some(next_due.map_or(due, |at| at.min(due)));
             continue;

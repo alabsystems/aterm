@@ -32,6 +32,18 @@ pub(super) fn join_host(paths: &Paths, source: &str, host: &str) {
     .expect("join host");
 }
 
+/// The vault pass's ranked wrap-gap closer and epoch tender on `paths` alone
+/// ([`remove::test_tend_at`]), at first sight and then a thousand gap steps on, past every grace
+/// and rank: what a Commons exchange's repair once signed at once.
+pub(super) fn vault_passes(paths: &Paths) -> Vec<Record> {
+    let now = aterm_time::unix_millis().unwrap_or(0);
+    let mut signed = Vec::new();
+    for at in [now, now + 1_000 * log_entries::GAP_STEP_MS] {
+        signed.extend(remove::test_tend_at(paths, at).expect("the vault pass looks"));
+    }
+    signed
+}
+
 pub(super) fn start_loopback_server(store: &Path) -> crate::server::Running {
     start_loopback_server_at(store, None)
 }
@@ -921,20 +933,26 @@ impl<'a> CommonsLogHarness<'a> {
                 self.merged = true;
             }
             "Reconcile" => {
-                let _ = reconcile_commons_log(&self.m2, true).expect("reconcile commons log");
-                let wire = load_records(&self.m2).unwrap().encode();
-                for p in [&self.m3, &self.m4] {
-                    save_records(p, &wire).unwrap();
-                }
-                if load_records(&self.m2)
-                    .unwrap()
-                    .log()
-                    .unwrap()
-                    .membership()
-                    .members()
-                    .contains_key(&self.fixture.actor_d)
-                {
-                    save_records(&self.m5, &wire).unwrap();
+                // The members' vault passes after the heal (a Commons exchange signs nothing):
+                // each Mac's ranked closer and tender at first sight, then past every grace and
+                // rank, every Mac's records carried to every other between passes.
+                let macs = [&self.m1, &self.m2, &self.m3, &self.m4, &self.m5];
+                let carry = || {
+                    for from in macs {
+                        let wire = load_records(from).unwrap().encode();
+                        for to in macs {
+                            if to.home != from.home && load_records(to).unwrap().log().is_some() {
+                                save_records(to, &wire).unwrap();
+                            }
+                        }
+                    }
+                };
+                let now = aterm_time::unix_millis().unwrap_or(0);
+                for at in [now, now + 1_000 * log_entries::GAP_STEP_MS] {
+                    for p in macs {
+                        remove::test_tend_at(p, at).expect("the vault pass looks");
+                        carry();
+                    }
                 }
                 self.reconciled = true;
             }
@@ -1102,9 +1120,9 @@ fn commons_log_model_conforms_and_catches_its_mutants() {
         "every state was replayed and judged"
     );
 
-    // Negative control: claiming reconciliation finished without running `reconcile_commons_log`
-    // after concurrent removals + newcomer admission violates both `WrapGapClosedAfterReconcile`
-    // and `ConcurrentEpochsCoalesced`.
+    // Negative control: claiming reconciliation finished without running the members' vault
+    // passes after concurrent removals + newcomer admission violates both
+    // `WrapGapClosedAfterReconcile` and `ConcurrentEpochsCoalesced`.
     let mut bad = CommonsLogHarness::replay(
         &fixture,
         &root.path().join("neg-skip-reconcile"),
@@ -2550,7 +2568,7 @@ fn log_witness_skips_inert_admit_concurrent_remove_excludes_epoch_writer_and_adm
         &encode_records(&removed_m7_log.records().cloned().collect::<Vec<_>>()),
     )
     .unwrap();
-    let _ = reconcile_commons_log(m22, false).unwrap();
+    let _ = vault_passes(m22);
     save_records(&m8, &load_records(m22).unwrap().encode()).unwrap();
     let witness_wire = Bootstrap::required(&m8)
         .unwrap()
@@ -2708,7 +2726,7 @@ fn log_witness_skips_inert_admit_concurrent_remove_excludes_epoch_writer_and_adm
 }
 
 #[test]
-fn configured_log_member_observation_is_stable_across_peer_records_and_concurrent_reconcile_serializes()
+fn configured_log_member_observation_is_stable_across_peer_records_and_concurrent_gap_closers_serialize()
  {
     use crate::commons::{Observation, Unavailable, bootstrap::Device};
     use crate::membership_log::{Entrant, EpochAudience, Evidence};
@@ -2729,6 +2747,7 @@ fn configured_log_member_observation_is_stable_across_peer_records_and_concurren
         .request(trust.network, trust.authority)
         .unwrap();
     let actor8 = req8.binding().actor();
+    let rec8 = req8.binding().recipient();
     admit_member_in_log(
         m22,
         Entrant {
@@ -2784,8 +2803,39 @@ fn configured_log_member_observation_is_stable_across_peer_records_and_concurren
     };
     assert!(snap_before.same_observation(&snap_after));
 
-    // Four concurrent `reconcile_commons_log(..., true)` workers on `m22` serialize cleanly and
-    // mint at most one coalescing `Commons` epoch rather than racing at the same sequence.
+    // `m7`'s epoch, minted before it learned of `m8`, leaves `m8` a wrap gap. Four concurrent
+    // gap closers on `m22`, each past every rank's step, serialize cleanly under the authoring
+    // lock and close it once rather than racing at the same sequence: each looks again under the
+    // lock. Where `m22` is not the first ranked holder, one look before them records when it
+    // first saw the gap.
+    let (_, actor22, _) = member_key(m22);
+    let gapped = load_records(m22).unwrap().log().unwrap().clone();
+    let opened = gapped
+        .open_audience_entries(&read_identity(m22).unwrap().unwrap())
+        .unwrap()
+        .unwrap();
+    let gaps = gapped.wrap_gaps(
+        &opened,
+        &crate::membership_log::admission_audiences(&opened),
+    );
+    assert!(
+        gaps.iter().any(|gap| gap.recipient == rec8),
+        "CONTROL: m7's epoch leaves m8 a wrap gap"
+    );
+    let rank = gaps
+        .iter()
+        .filter_map(|gap| gapped.gap_rank(&opened, gap, &actor22))
+        .max()
+        .expect("m22 holds a rank for the gap");
+    let later = if rank == 0 {
+        1
+    } else {
+        assert!(
+            log_entries::close_wrap_gaps(m22, 1).unwrap().is_empty(),
+            "a holder ranked after the first waits its step"
+        );
+        1 + 100 * log_entries::GAP_STEP_MS
+    };
     let barrier = Arc::new(Barrier::new(4));
     let mut handles = Vec::new();
     for _ in 0..4 {
@@ -2793,17 +2843,22 @@ fn configured_log_member_observation_is_stable_across_peer_records_and_concurren
         let barrier = Arc::clone(&barrier);
         handles.push(std::thread::spawn(move || {
             barrier.wait();
-            reconcile_commons_log(&paths, true).unwrap()
+            // A look that finds another closer holding the state lock is busy, and leaves the
+            // gap to the next pass.
+            match log_entries::close_wrap_gaps(&paths, later) {
+                Ok(signed) => signed.len(),
+                Err(error) => {
+                    assert!(error.to_string().contains("busy"), "{error}");
+                    0
+                }
+            }
         }));
     }
-    let minted_counts: Vec<usize> = handles
-        .into_iter()
-        .map(|h| h.join().unwrap().len())
-        .collect();
+    let minted_counts: Vec<usize> = handles.into_iter().map(|h| h.join().unwrap()).collect();
     assert_eq!(
         minted_counts.iter().filter(|&&n| n > 0).count(),
         1,
-        "exactly one concurrent reconcile worker should author the coalescing epoch and wraps: {minted_counts:?}"
+        "exactly one concurrent gap closer should sign the wrap to m8: {minted_counts:?}"
     );
     let id22 = read_identity(m22).unwrap().unwrap();
     let merged_log = load_records(m22).unwrap().log().unwrap().clone();
@@ -4237,8 +4292,12 @@ fn unproved_founders_respect_commons_audience_and_revocation_rotates_and_bars_en
     );
 }
 
+/// Concurrent removals on two islands leave `[everyone]` and Commons two newest epochs each, each
+/// still wrapping the other island's removed Mac; after the merge the vault passes on `m22` (a
+/// remover, so it acts within a step) coalesce both into one epoch each that wraps neither, and the next pass,
+/// after a newcomer's admission, finds nothing due.
 #[test]
-fn reconcile_coalesces_concurrent_remove_everyone_epochs_and_skips_superseded_everyone_epochs() {
+fn the_tender_coalesces_concurrent_remove_epochs_and_skips_superseded_everyone_epochs() {
     use crate::commons::bootstrap::Device;
     use crate::membership_log::{Entrant, EpochAudience, Evidence, MemberId};
 
@@ -4280,7 +4339,7 @@ fn reconcile_coalesces_concurrent_remove_everyone_epochs_and_skips_superseded_ev
     remove_member_in_log(m22, actor8).unwrap();
     remove_member_in_log(m7, actor9).unwrap();
 
-    // Merge both islands onto `m22`. Before reconcile, both `EpochAudience::Commons` and
+    // Merge both islands onto `m22`. Before the tender, both `EpochAudience::Commons` and
     // `EpochAudience::Everyone` have 2 concurrent maximal epochs, each still wrapping the other
     // island's removed member.
     let wire7 = load_records(m7).unwrap().encode();
@@ -4295,15 +4354,25 @@ fn reconcile_coalesces_concurrent_remove_everyone_epochs_and_skips_superseded_ev
         .collect();
     assert!(!active_recs.contains(&rec8));
     assert!(!active_recs.contains(&rec9));
-    assert!(pre_log.needs_commons_reconcile(&id22.recipient(), &active_recs, true));
+    let due: BTreeSet<EpochAudience> = pre_log
+        .rekey_dues()
+        .into_iter()
+        .filter(|due| due.rotation && due.coverage)
+        .map(|due| due.audience)
+        .collect();
+    assert_eq!(
+        due,
+        BTreeSet::from([EpochAudience::Everyone, EpochAudience::Commons]),
+        "CONTROL: both audiences are due"
+    );
 
-    let minted = reconcile_commons_log(m22, true).unwrap();
+    let minted = vault_passes(m22);
     assert!(!minted.is_empty());
 
     let post_log = load_records(m22).unwrap().log().unwrap().clone();
     assert!(
-        !post_log.needs_commons_reconcile(&id22.recipient(), &active_recs, true),
-        "reconcile must converge in one pass without false-positive loop"
+        post_log.rekey_dues().is_empty(),
+        "the tender converges in one pass without a false-positive loop"
     );
     let opened = post_log.open_audience_entries(&id22).unwrap().unwrap();
     for aud in [EpochAudience::Commons, EpochAudience::Everyone] {
@@ -4318,23 +4387,23 @@ fn reconcile_coalesces_concurrent_remove_everyone_epochs_and_skips_superseded_ev
         assert!(!wraps.contains(&rec9), "{aud:?} must exclude removed m9");
     }
 
-    // Admitting a newcomer `m10` after `Everyone` epoch rotations wraps only active `Everyone`
-    // epochs (and all `Commons` epochs) to `m10`; `needs_commons_reconcile` must return `false`
-    // rather than looping on superseded `Everyone` epochs.
+    // Admitting a newcomer `m10` after epoch rotations wraps only the winning and newest epochs
+    // to `m10`; no re-key is due and no wrap gap opens, so the vault passes sign nothing rather
+    // than looping on superseded epochs.
     let (_m10, _, rec10) = admit_new("m10", 0xaa);
     let after_admit_log = load_records(m22).unwrap().log().unwrap().clone();
-    let active_with_m10: BTreeSet<Recipient> = after_admit_log
-        .membership()
-        .members()
-        .values()
-        .map(|m| m.binding.recipient())
-        .collect();
-    assert!(active_with_m10.contains(&rec10));
     assert!(
-        !after_admit_log.needs_commons_reconcile(&id22.recipient(), &active_with_m10, true),
-        "superseded Everyone epochs must not trigger false-positive needs_commons_reconcile after newcomer admission"
+        after_admit_log
+            .membership()
+            .members()
+            .values()
+            .any(|m| m.binding.recipient() == rec10)
     );
-    assert!(reconcile_commons_log(m22, true).unwrap().is_empty());
+    assert!(
+        after_admit_log.rekey_dues().is_empty(),
+        "superseded epochs must not make a re-key due after a newcomer's admission"
+    );
+    assert!(vault_passes(m22).is_empty());
 
     // A log-only newcomer (`m10`, configured with `configure_log_member` and holding no 0.145
     // envelope) reads reserved entries (`aterm-swarm-roster`, `aterm-fleet-code`), overlays
@@ -4810,9 +4879,9 @@ fn code_only_log_member_is_removed_on_admin_publish_and_not_rewrapped_by_commons
         "new Commons epoch must not be wrapped to code-only m40"
     );
 
-    // Neither `reconcile_commons_log` (at a Commons handshake) nor `close_wrap_gaps` (on m7's
-    // subscriber pass) may re-wrap `[everyone]` or `Commons` epochs back to removed m40.
-    log_entries::reconcile_commons_log(m22, true).expect("reconcile commons log on m22");
+    // Neither m22's vault passes (the ranked closer and tender) nor `close_wrap_gaps` on m7's
+    // subscriber pass may re-wrap `[everyone]` or `Commons` epochs back to removed m40.
+    let _ = vault_passes(m22);
     sync(m7, None).expect("m7 syncs v2 and runs gap closer");
     let log7 = load_records(m7).unwrap().log().unwrap().clone();
     assert!(log7.recipient_is_removed(&m40_recipient));
@@ -4868,7 +4937,7 @@ fn second_member_remove_after_sync_forms_quorum_and_voids_post_cutoff_records() 
     sync_records(m22, None).expect("m22 pulls admit records");
 
     // 0. Before any `Body::Remove`, if `m22` rotates `Everyone` and `Commons` epochs leaving `m40`
-    //    out on purpose (`left_out`), `reconcile_commons_log` must not re-wrap them to `m40`,
+    //    out on purpose (`left_out`), the vault passes must not re-wrap them to `m40`,
     //    `check_log_commons_enrollment` must refuse `m40`, and `admit_by_phrase` must keep `m40`
     //    out even if it asks under a new device writer seed with the same age recipient.
     let rec_m40 = request.binding().recipient();
@@ -4879,8 +4948,8 @@ fn second_member_remove_after_sync_forms_quorum_and_voids_post_cutoff_records() 
             .expect("rotate epochs excluding m40");
     }
     assert!(
-        reconcile_commons_log(m22, true).unwrap().is_empty(),
-        "reconcile_commons_log must not re-wrap epochs to a left-out member"
+        vault_passes(m22).is_empty(),
+        "the vault passes must not re-wrap epochs to a left-out member"
     );
     assert!(
         log_entries::check_log_commons_enrollment(m22, trust, request.binding()).is_err(),
@@ -5156,8 +5225,8 @@ fn excluding_member_from_commons_control_rotates_commons_epoch_and_keeps_it_out_
         "admit_by_phrase and admit_member_in_log must not wrap Commons back to Commons-left-out m7"
     );
     assert!(
-        reconcile_commons_log(m22, true).unwrap().is_empty(),
-        "reconcile_commons_log must be a clean no-op when Commons-left-out m7 is already wrapped in Everyone"
+        vault_passes(m22).is_empty(),
+        "the vault passes must be a clean no-op when Commons-left-out m7 is already wrapped in Everyone"
     );
 
     let (m8, req8, _) = newcomer(macs.root.path(), m22, "m8");
@@ -5178,8 +5247,16 @@ fn excluding_member_from_commons_control_rotates_commons_epoch_and_keeps_it_out_
         log_with_m8
             .unwrap_commons_epoch(&init_commons_basis, &m8_id)
             .unwrap()
+            .is_none(),
+        "newcomer m8 gets no backfilled wrap of the superseded init_commons_basis: it reads that \
+         history through a handoff (ACHG1)"
+    );
+    assert!(
+        log_with_m8
+            .unwrap_commons_epoch(access22.basis(), &m8_id)
+            .unwrap()
             .is_some(),
-        "newcomer m8 receives backfilled wrap to read historical init_commons_basis"
+        "newcomer m8 is wrapped the Commons epoch in use at its admission"
     );
     let (_, init_writers_after_m8) = log_with_m8
         .historical_commons_writers(&init_commons_basis)
@@ -5481,15 +5558,15 @@ fn excluding_member_from_commons_control_rotates_commons_epoch_and_keeps_it_out_
     drop(macs.root);
 }
 
-/// `reconcile_commons_log` runs inside a Commons exchange (`aterm-db`'s `sync_log_membership`),
-/// which one 30 s deadline bounds: the records it mints go to the vault's source after it
-/// returns. Before, it POSTed them first, so a source that took the POST and did not answer (a
-/// server that stalls, a Mac asleep mid-answer) held the exchange for the POST's own two-minute
-/// deadline, past the exchange's, and the peer never received what the reconcile minted.
-/// NEGATIVE CONTROL: posting in `reconcile_commons_log` before it returns (main before this fix)
-/// keeps it from returning while the source holds the POST, and the hang detector fires.
+/// `enroll_commons_member_in_log` runs inside a Commons enrollment (`ACE1` / `ACW2`), which one
+/// deadline bounds: the records it mints go to the vault's source after it returns, so a source
+/// that takes the POST and does not answer (a server that stalls, a Mac asleep mid-answer) does
+/// not hold the enrollment past its own deadline. `publish_local_node_key` yields within its
+/// lock bound while another local writer holds `StateLock`.
+/// NEGATIVE CONTROL: posting in `enroll_commons_member_in_log` before it returns keeps it from
+/// returning while the source holds the POST, and the hang detector fires.
 #[test]
-fn reconcile_returns_while_the_vault_source_holds_its_post() {
+fn enrollment_returns_while_the_vault_source_holds_its_post() {
     use crate::commons::bootstrap::Device;
     use std::io::{Read, Write};
 
@@ -5519,7 +5596,7 @@ fn reconcile_returns_while_the_vault_source_holds_its_post() {
         .unwrap();
         actor
     };
-    // Removals on two islands leave concurrent Commons epochs, which the reconcile coalesces.
+    // Removals on two islands leave concurrent Commons epochs.
     let actor8 = admit_new("m8", 0x88);
     let actor9 = admit_new("m9", 0x99);
     save_records(m7, &load_records(m22).unwrap().encode()).unwrap();
@@ -5527,7 +5604,7 @@ fn reconcile_returns_while_the_vault_source_holds_its_post() {
     remove_member_in_log(m7, actor9).unwrap();
     save_records(m22, &load_records(m7).unwrap().encode()).unwrap();
 
-    // The vault's source takes each POST and answers it only once the reconcile returned.
+    // The vault's source takes each POST and answers it only once the enrollment returned.
     let source = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let mut cfg = config(m22).unwrap().unwrap();
     cfg.source = Source::Url(format!(
@@ -5535,67 +5612,11 @@ fn reconcile_returns_while_the_vault_source_holds_its_post() {
         source.local_addr().expect("addr")
     ));
     save_config(m22, &cfg).unwrap();
-    let (returned, on_return) = std::sync::mpsc::channel::<()>();
-    let (posted, on_post) = std::sync::mpsc::channel::<Vec<u8>>();
-    let source_first = source.try_clone().expect("clone");
-    let holder = std::thread::spawn(move || {
-        let (mut stream, _) = source_first
-            .accept()
-            .expect("the minted records are posted");
-        stream
-            .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
-            .expect("timeout");
-        let mut head = Vec::new();
-        let mut byte = [0u8; 1];
-        while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).expect("read") == 1 {
-            head.push(byte[0]);
-        }
-        let head = String::from_utf8_lossy(&head).into_owned();
-        let length = head
-            .lines()
-            .find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("content-length")
-                    .then(|| value.trim().parse::<usize>().ok())
-                    .flatten()
-            })
-            .unwrap_or(0);
-        let mut body = vec![0u8; length];
-        stream.read_exact(&mut body).expect("body");
-        let _ = posted.send(body);
-        let answered_after = on_return
-            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
-            .is_ok();
-        let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n");
-        answered_after
-    });
-    let paths = m22.clone();
-    let worker = std::thread::spawn(move || {
-        let minted = reconcile_commons_log(&paths, true);
-        let _ = returned.send(());
-        minted
-    });
-    let body = on_post
-        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
-        .expect("the minted records reach the source");
-    assert!(
-        holder.join().expect("the source"),
-        "reconcile_commons_log returned only once the source answered its POST"
-    );
-    let minted = worker.join().expect("the reconcile").expect("reconciled");
-    assert!(!minted.is_empty(), "the reconcile minted nothing");
-    assert_eq!(body, encode_records(&minted));
 
-    // When `StateLock` is held by another local writer, `reconcile_commons_log` and
-    // `publish_local_node_key` yield within their 2 s lock bound instead of blocking the Commons
-    // exchange or fleet listener watch loop indefinitely.
+    // When `StateLock` is held by another local writer, `publish_local_node_key` yields within
+    // its 2 s lock bound instead of blocking the fleet listener watch loop indefinitely.
     {
         let _held = StateLock::take(m7).expect("hold m7 StateLock");
-        let yielded = reconcile_commons_log(m7, true).expect("reconcile under held StateLock");
-        assert!(
-            yielded.is_empty(),
-            "reconcile_commons_log must yield empty when StateLock is held past its bound"
-        );
         use ring::signature::{Ed25519KeyPair, KeyPair as _};
         let node_pair = Ed25519KeyPair::from_seed_unchecked(&[0x77; 32]).unwrap();
         let node_pub: [u8; 32] = node_pair.public_key().as_ref().try_into().unwrap();
@@ -5613,10 +5634,10 @@ fn reconcile_returns_while_the_vault_source_holds_its_post() {
         );
     }
 
-    // `enroll_commons_member_in_log` (called inside `ACE1` / `ACW2` enrollment) likewise posts its
+    // `enroll_commons_member_in_log` (called inside `ACE1` / `ACW2` enrollment) posts its
     // newly minted records via `post_records_aside` so a stalled source never delays `ACW2`.
     // Admit `m10` on `m7`'s island before merging into `m22`, so `m10` lacks `Wrap`s on `m22`'s
-    // coalesced epochs and `enroll_commons_member_in_log` on `m22` mints and posts them aside.
+    // newest epochs and `enroll_commons_member_in_log` on `m22` mints and posts them aside.
     let m10 = Paths::for_home(&macs.root.path().join("m10"));
     configure_log_member(&m10, &format!("{}#{}", macs.url, macs.signer), "m10").unwrap();
     let dev10 = Device::open(&m10).unwrap().unwrap();

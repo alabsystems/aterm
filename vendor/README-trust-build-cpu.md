@@ -3,7 +3,7 @@
 `trust-build-cpu` is original Andrew Yates code shared with the Trust compiler,
 not an alternate implementation of its lease protocol. This directory packages
 Trust's `crates/trust-build-cpu` from commit
-`afda6b4602be9bebc79e3ec20ad2aba40449bd7f` (version 0.12.0).
+`4cfdfb2c23be00fcd895c78756de77f3b7f0c04d` (version 0.12.0).
 
 The three Rust files and upstream README are byte-identical to that commit.
 The manifest materializes the upstream workspace's version, edition, licence,
@@ -26,5 +26,5 @@ Current upstream file SHA-256 values:
 
 - `README.md`: `0c9eb30adae00c0122cdfc9158f919e8cea796ce7f831b9a344268c365b955d1`
 - `src/lib.rs`: `178618103d006b79fbc3a221854626505465f957f2f874ad6ef0bce4bd02bc08`
-- `src/unix.rs`: `05761702c3d440b0b56f8a95f547dfbce065e4e24cd4c03897eb6e768732b50b`
-- `src/tests.rs`: `00843aed61d644cb5d550d0250fbeb2aead57b01dc901608b16542167a89ae3a`
+- `src/unix.rs`: `fc8b3232bdf27c34b6c3a43b7c8fb95e694e1c070d648394d1ddbc302fc776c3`
+- `src/tests.rs`: `712af9b254584dce445b4e9ceefa19190da2becd9ec3cc050c35cf2538f2466b`

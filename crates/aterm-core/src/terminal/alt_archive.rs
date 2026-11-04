@@ -365,9 +365,15 @@ impl AltArchiveBudget {
     /// Returns the total bytes in this pool.
     #[inline]
     #[must_use]
-    #[cfg(test)]
     pub const fn total(&self) -> usize {
         self.total
+    }
+
+    /// Returns the minimum byte floor allotted to each active archive in this pool.
+    #[inline]
+    #[must_use]
+    pub const fn min_share(&self) -> usize {
+        self.min_share
     }
 
     /// Returns the number of active archives currently drawing on this pool.

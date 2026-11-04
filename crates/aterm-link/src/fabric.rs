@@ -1222,16 +1222,13 @@ fn lapsed(e: &io::Error) -> bool {
 /// long path's `chmod` is not cut off.
 const CAP_REFUSAL_WORDS: usize = 640;
 
-/// The words of `aterm fabric`'s lapsed-ring warning ([`BrokerView::cap_expired`]), by which
-/// `doctor` picks the renewal ([`crate::enable::fix_for`]).
+/// The words of `aterm fabric`'s lapsed-ring warning ([`BrokerView::cap_expired`]).
 pub const CAP_LAPSED: &str = "refuses this node's cap as lapsed";
 
-/// The words of `aterm fabric`'s poisoned-log warning ([`BrokerView::poisoned`]), by which
-/// `doctor` picks its remedy ([`crate::enable::fix_for`]).
+/// The words of `aterm fabric`'s poisoned-log warning ([`BrokerView::poisoned`]).
 pub const POISONED_WARNING: &str = "says its log is POISONED";
 
-/// The words of the warning for a broker whose flushes failed without poisoning its log, by
-/// which `doctor` picks the disk's remedy.
+/// The words of the warning for a broker whose flushes failed without poisoning its log.
 pub const FLUSH_FAILED_WARNING: &str = "says a flush of its log failed";
 
 /// Name the broker's process ([`BrokerView::locate`]), read the health snapshot beside its log,
@@ -1457,6 +1454,18 @@ fn health_json(b: &BrokerView, now_ms: u64) -> J {
                 ("parked_tails", J::Num(h.parked_tails)),
                 ("durable_head", J::Num(h.durable_head)),
                 ("flushes", flushes(&h.flushes)),
+                // The broker process's own tally, as the holds row quotes it; null in a
+                // snapshot an older broker wrote, which carries none.
+                (
+                    "process_flushes",
+                    h.process_flushes.map_or(J::Null, |t| {
+                        J::Obj(vec![
+                            ("full", J::Num(t.full)),
+                            ("barrier", J::Num(t.barrier)),
+                            ("plain", J::Num(t.plain)),
+                        ])
+                    }),
+                ),
             ])
         }
     };
@@ -2677,6 +2686,8 @@ pub struct Report {
     /// longer keeps every verdict above them on their asker's lane: one warning names the count
     /// (audit finding BUS2-3).
     pub overdue_unjudged: usize,
+    /// Structured WARNINGS paired with their [`WarningKind`] for [`crate::enable::fix_for`].
+    pub warning_items: Vec<Warning>,
     /// WARNINGS.
     pub warnings: Vec<String>,
     /// When the report was taken, ms since the epoch.
@@ -2819,6 +2830,7 @@ pub fn gather() -> Result<Report, Off> {
         traffic: Vec::new(),
         overdue: Vec::new(),
         overdue_unjudged: 0,
+        warning_items: Vec::new(),
         warnings: Vec::new(),
         now_ms,
     };
@@ -2834,7 +2846,10 @@ pub fn gather() -> Result<Report, Off> {
                 report.roster_truncated = g.truncated;
                 roster = Some(g);
             }
-            Err(e) => bus_errors.push(format!("the presence roster could not be read: {e}")),
+            Err(e) => bus_errors.push(Warning::new(
+                WarningKind::BusUnreadable,
+                format!("the presence roster could not be read: {e}"),
+            )),
         }
         if let Some(node) = report.node.clone() {
             report.subjects =
@@ -2849,7 +2864,10 @@ pub fn gather() -> Result<Report, Off> {
             TRAFFIC_ROWS,
         ) {
             Ok(t) => report.traffic = t,
-            Err(e) => bus_errors.push(format!("the traffic could not be read: {e}")),
+            Err(e) => bus_errors.push(Warning::new(
+                WarningKind::BusUnreadable,
+                format!("the traffic could not be read: {e}"),
+            )),
         }
         halts = fleet_halts(&mut conn, &report.cfg.fleet);
         match overdue_work(&mut conn, &report.cfg.fleet, faces.as_deref(), head, now_ms) {
@@ -2857,7 +2875,10 @@ pub fn gather() -> Result<Report, Off> {
                 report.overdue = d.overdue;
                 report.overdue_unjudged = d.unjudged;
             }
-            Err(e) => bus_errors.push(format!("the deadlines could not be read: {e}")),
+            Err(e) => bus_errors.push(Warning::new(
+                WarningKind::BusUnreadable,
+                format!("the deadlines could not be read: {e}"),
+            )),
         }
         let in_filters = in_filters(&report.cfg.fleet, faces.as_deref());
         for inst in &report.instances {
@@ -2878,8 +2899,13 @@ pub fn gather() -> Result<Report, Off> {
         }
     }
     join_sessions(&mut report, roster.as_ref());
-    report.warnings = warnings(&report, &ages, &halts);
-    report.warnings.extend(bus_errors);
+    report.warning_items = warning_items(&report, &ages, &halts);
+    report.warning_items.extend(bus_errors);
+    report.warnings = report
+        .warning_items
+        .iter()
+        .map(|w| w.text.clone())
+        .collect();
     Ok(report)
 }
 
@@ -3039,14 +3065,143 @@ pub fn age(ms: u64) -> String {
     }
 }
 
-/// The words each warning of records the broker's retention gave up says what happened with,
-/// which `doctor` matches for its fix ([`crate::enable::fix_for`]).
+/// The words each warning of records the broker's retention gave up says what happened with.
 pub const RETENTION_GAVE_UP: &str = "the broker's retention gave up";
 
 /// The words of the warning that counts the asks past their deadline the deadline scan cannot
-/// judge ([`Report::overdue_unjudged`]), which `doctor` matches for its fix
-/// ([`crate::enable::fix_for`]).
+/// judge ([`Report::overdue_unjudged`]).
 pub const OVERDUE_UNJUDGED: &str = "past their deadline cannot be judged";
+
+/// Closed warning grammar covering every finding emitted by [`gather`] and `doctor` so
+/// [`crate::enable::fix_for`] dispatches exhaustively without prose substring matching.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WarningKind {
+    /// No `[fabric] command` in `aterm.toml`; report fell back to a running instance's bridge.
+    NoFabricCommand,
+    /// State directory has no `node` identity file.
+    NoNodeId,
+    /// A configured cap file could not be read or parsed.
+    CapUnreadable {
+        /// Whether the refusal is an owner-only mode or symlink violation on a secret cap file.
+        owner_or_link_refused: bool,
+    },
+    /// A configured cap file grants wider authority than this node's ceiling.
+    CapWiderRing,
+    /// The broker speaks a different `astream` wire protocol version than this `aterm`.
+    BrokerProtocolSkew,
+    /// The broker endpoint did not answer the probe.
+    BrokerUnreachable {
+        /// Untruncated last non-empty stderr line from `<root>/broker.err`, if present.
+        last_word: Option<String>,
+    },
+    /// The broker refused this node's capability ring as expired (`exp=`).
+    BrokerCapLapsed,
+    /// The broker answered, or connected, and a bus read failed.
+    BusUnreadable,
+    /// The serving broker process maps a replaced executable image.
+    BrokerReplacedBuild,
+    /// The broker accepted an unverified probe capability (running unguarded).
+    BrokerUnguarded,
+    /// The broker reports a poisoned log.
+    BrokerLogPoisoned,
+    /// The broker reports failed log flushes without poisoning the log.
+    BrokerFlushFailed,
+    /// Local `aterm` control-socket discovery failed.
+    InstanceDiscoveryFailed,
+    /// A local `aterm` instance did not answer on its control socket.
+    InstanceUnreachable,
+    /// A local `aterm` instance is unsupervised and has no bridge.
+    InstanceNoBridge,
+    /// A local `aterm` instance's supervised bridge is down (`fabric=disconnected`).
+    BridgeDown,
+    /// A local `aterm` instance's bridge stands by behind another bridge holding its state dir.
+    BridgeStateLocked,
+    /// A local `aterm` instance's bridge has attached and has not yet reported its broker link.
+    BridgeStarting,
+    /// A local `aterm` instance's bridge is stalled on its broker link (`fabric=stalled`).
+    BridgeLinkDown {
+        /// The `reason=` token reported by `fabric status`.
+        reason: String,
+        /// Untruncated last non-empty stderr line from `<root>/broker.err`, when applicable.
+        last_word: Option<String>,
+    },
+    /// A local `aterm` instance's bridge has stopped answering work (`fabric=stale`).
+    BridgeStale,
+    /// An instance reports `fabric=connected` while this report's probe cannot reach the broker.
+    ConnectedProbeMismatch,
+    /// An instance's bridge build differs from the instance's own build.
+    BridgeBuildMismatch,
+    /// An instance failed to parse one or more lines from its bridge (`lane_faults > 0`).
+    BridgeLaneFaults,
+    /// Broker retention gave up unread node mail or a session's own lane/topic records.
+    RetentionGaveUp,
+    /// An instance's supervised bridge was armed with a different command than the config.
+    BridgeDifferentCommand,
+    /// An instance reports `fabric=connected` while the bus presence row marks its node away.
+    ConnectedPresenceMismatch,
+    /// Querying a listed session over its instance's control socket failed.
+    SessionQueryFailed {
+        /// Instance PID hosting the session.
+        pid: u32,
+        /// Control socket path when `--pid <pid>` does not reach the instance.
+        sock: Option<String>,
+    },
+    /// A session's bounded inbox ring evicted unhandled messages (`dropped > 0`).
+    SessionInboxEvicted,
+    /// A session is held (`hold=1`).
+    SessionHeld {
+        /// Session identifier without leading `@`.
+        sid: String,
+        /// Instance PID hosting the session.
+        pid: u32,
+        /// Control socket path when `--pid <pid>` does not reach the instance.
+        sock: Option<String>,
+        /// Comma-separated `origin=` / `hold_origin=` slots from the timeline, if still present.
+        origin: Option<String>,
+        /// Whether the hold reason is `fabric-lost`.
+        fabric_lost: bool,
+    },
+    /// A session has unhandled `task` or `ask` work older than `STALE_WORK_MS`.
+    SessionUnhandledStaleWork,
+    /// A session has queued outbound posts with no working bridge.
+    SessionQueuedPostsNoBridge,
+    /// An `ask` or `task` on the bus passed its `dl=` deadline without a reply.
+    OverdueWork {
+        /// Whether the recipient is a person (`@<person>@p`).
+        to_person: bool,
+    },
+    /// One or more held asks past their deadline lack kept reply-lane history to judge.
+    OverdueUnjudged,
+    /// The bus advertises a `live` session row on a local node that no local instance hosts.
+    GhostSessionRow,
+    /// A fleet halt stands on the bus or in local kept state.
+    FleetHaltStanding,
+    /// The presence roster read hit `glance::MAX_ROWS` and truncated remaining rows.
+    RosterTruncated,
+    /// This node holds at least `SUBJECT_BUDGET_WARN` subjects on the broker.
+    SubjectBudgetHigh,
+    /// `doctor` found no `rendezvous.toml` file.
+    RendezvousMissing,
+    /// `doctor` found an unreadable or malformed `rendezvous.toml` file.
+    RendezvousUnreadable,
+}
+
+/// One rendered warning line paired with its structured [`WarningKind`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Warning {
+    /// Structured warning classification for [`crate::enable::fix_for`].
+    pub kind: WarningKind,
+    /// Human-readable warning sentence printed in `WARNINGS` and `doctor`.
+    pub text: String,
+}
+
+impl Warning {
+    /// Construct a [`Warning`] pairing `kind` with its rendered `text`.
+    #[must_use]
+    pub fn new(kind: WarningKind, text: String) -> Self {
+        Self { kind, text }
+    }
+}
 
 /// How many ranges one warning names before it counts the rest.
 const GAP_RANGES_SHOWN: usize = 4;
@@ -3147,12 +3302,13 @@ fn session_given_up(s: &LocalSession) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("; "))
 }
 
-fn warnings(
+pub(crate) fn warning_items(
     r: &Report,
     ages: &BTreeMap<(String, u64), u64>,
     halts: &[(String, String)],
-) -> Vec<String> {
+) -> Vec<Warning> {
     let mut w = Vec::new();
+    let mut push = |kind: WarningKind, text: String| w.push(Warning::new(kind, text));
     let broker = safe(&r.cfg.broker, 256);
 
     if let Source::Instance(pid) = r.source {
@@ -3160,80 +3316,118 @@ fn warnings(
             .config_path
             .as_ref()
             .map_or_else(|| "aterm.toml".to_string(), |p| p.display().to_string());
-        w.push(format!(
-            "no [fabric] command in {path}: this report read instance {pid}'s running bridge \
-             instead, and the next aterm launch starts none"
-        ));
+        push(
+            WarningKind::NoFabricCommand,
+            format!(
+                "no [fabric] command in {path}: this report read instance {pid}'s running bridge \
+                 instead, and the next aterm launch starts none"
+            ),
+        );
     }
     if r.node.is_none() {
-        w.push(format!(
-            "no node id in {}/node: the bridge has no identity to answer mail as",
-            safe(&r.cfg.state_dir, 256)
-        ));
+        push(
+            WarningKind::NoNodeId,
+            format!(
+                "no node id in {}/node: the bridge has no identity to answer mail as",
+                safe(&r.cfg.state_dir, 256)
+            ),
+        );
     }
     for (path, caps) in &r.caps {
         if let Err(e) = caps {
-            w.push(format!(
-                "cap file {}: {}",
-                safe(path, 256),
-                safe(e, CAP_REFUSAL_WORDS)
-            ));
+            push(
+                WarningKind::CapUnreadable {
+                    owner_or_link_refused: e.contains("a secret file")
+                        || e.contains("read through no link"),
+                },
+                format!(
+                    "cap file {}: {}",
+                    safe(path, 256),
+                    safe(e, CAP_REFUSAL_WORDS)
+                ),
+            );
         }
     }
     for (path, why) in &r.wide_caps {
-        w.push(format!("cap file {}: {}", safe(path, 256), safe(why, 512)));
+        push(
+            WarningKind::CapWiderRing,
+            format!("cap file {}: {}", safe(path, 256), safe(why, 512)),
+        );
     }
 
     if let Some(skew) = r.broker.protocol {
-        w.push(format!(
-            "the broker at {broker} speaks astream protocol {} and this aterm speaks {}: \
-             neither can read what the other sends, so no record lands and none is delivered",
-            skew.broker, skew.client
-        ));
+        push(
+            WarningKind::BrokerProtocolSkew,
+            format!(
+                "the broker at {broker} speaks astream protocol {} and this aterm speaks {}: \
+                 neither can read what the other sends, so no record lands and none is delivered",
+                skew.broker, skew.client
+            ),
+        );
     } else if !r.broker.reachable {
         let last = r.broker.last_word.as_deref().map_or_else(String::new, |l| {
             format!("; its supervisor's broker.err, {}", safe(l, 256))
         });
-        w.push(format!(
-            "the broker at {broker} does not answer ({}): no record lands and none is \
-             delivered{last}",
-            safe(r.broker.error.as_deref().unwrap_or("unknown"), 256)
-        ));
+        push(
+            WarningKind::BrokerUnreachable {
+                last_word: r.broker.last_word.clone(),
+            },
+            format!(
+                "the broker at {broker} does not answer ({}): no record lands and none is \
+                 delivered{last}",
+                safe(r.broker.error.as_deref().unwrap_or("unknown"), 256)
+            ),
+        );
     } else if r.broker.cap_expired {
-        w.push(format!(
-            "the broker at {broker} {CAP_LAPSED} (its grants' `exp=` has passed): no record of \
-             this node lands and none is delivered to it — {}",
-            safe(r.broker.error.as_deref().unwrap_or("unknown"), 256)
-        ));
+        push(
+            WarningKind::BrokerCapLapsed,
+            format!(
+                "the broker at {broker} {CAP_LAPSED} (its grants' `exp=` has passed): no record of \
+                 this node lands and none is delivered to it — {}",
+                safe(r.broker.error.as_deref().unwrap_or("unknown"), 256)
+            ),
+        );
     } else if !r.broker.read_ok() && !r.broker.cap_unread {
-        // A cap the report could not read is its own warning below (`r.caps`), its fix what that
+        // A cap the report could not read is its own warning above (`r.caps`), its fix what that
         // file needs: nothing is known of the bus, and a second warning would say the bus failed.
-        w.push(format!(
-            "the broker at {broker} answers but the bus could not be read: {}",
-            safe(r.broker.error.as_deref().unwrap_or("unknown"), 256)
-        ));
+        push(
+            WarningKind::BusUnreadable,
+            format!(
+                "the broker at {broker} answers but the bus could not be read: {}",
+                safe(r.broker.error.as_deref().unwrap_or("unknown"), 256)
+            ),
+        );
     }
     if let (Some(pid), Some(exe)) = (r.broker.pid, &r.broker.replaced) {
-        w.push(format!(
-            "the broker (pid {pid}) runs a replaced build: {} is another file than the one it \
-             started from, so the broker-side fixes of the build on disk are not running",
-            safe(exe, 256)
-        ));
+        push(
+            WarningKind::BrokerReplacedBuild,
+            format!(
+                "the broker (pid {pid}) runs a replaced build: {} is another file than the one it \
+                 started from, so the broker-side fixes of the build on disk are not running",
+                safe(exe, 256)
+            ),
+        );
     }
     if r.broker.guarded == Some(false) {
-        w.push(format!(
-            "the broker at {broker} checks no capability (it accepted one it cannot verify): \
-             any process that reaches it can publish as any node or human, and set or lift any \
-             fleet halt"
-        ));
+        push(
+            WarningKind::BrokerUnguarded,
+            format!(
+                "the broker at {broker} checks no capability (it accepted one it cannot verify): \
+                 any process that reaches it can publish as any node or human, and set or lift any \
+                 fleet halt"
+            ),
+        );
     }
     if let Some(why) = r.broker.poisoned() {
-        w.push(format!(
-            "the broker at {broker} {POISONED_WARNING} ({}): it refuses every write until the \
-             log is reopened, so no record lands; a broker of this build exits within seconds \
-             for its supervisor to reopen it",
-            safe(why, 256)
-        ));
+        push(
+            WarningKind::BrokerLogPoisoned,
+            format!(
+                "the broker at {broker} {POISONED_WARNING} ({}): it refuses every write until the \
+                 log is reopened, so no record lands; a broker of this build exits within seconds \
+                 for its supervisor to reopen it",
+                safe(why, 256)
+            ),
+        );
     } else if let Some(failed) = r
         .broker
         .health
@@ -3241,50 +3435,65 @@ fn warnings(
         .map(|h| h.flushes.failed)
         .filter(|n| *n > 0)
     {
-        w.push(format!(
-            "the broker at {broker} {FLUSH_FAILED_WARNING} {failed} time(s) since it opened: \
-             the disk under {} is failing writes, and the log was not poisoned when this asked \
-             (a failed flush that put acked records at risk poisons it, and the next report \
-             says so)",
-            safe(
-                &r.broker
-                    .log
-                    .as_ref()
-                    .map_or_else(|| "its log".to_string(), |l| l.display().to_string()),
-                256
-            )
-        ));
+        push(
+            WarningKind::BrokerFlushFailed,
+            format!(
+                "the broker at {broker} {FLUSH_FAILED_WARNING} {failed} time(s) since it opened: \
+                 the disk under {} is failing writes, and the log was not poisoned when this asked \
+                 (a failed flush that put acked records at risk poisons it, and the next report \
+                 says so)",
+                safe(
+                    &r.broker
+                        .log
+                        .as_ref()
+                        .map_or_else(|| "its log".to_string(), |l| l.display().to_string()),
+                    256
+                )
+            ),
+        );
     }
 
     if let Some(e) = &r.discovery_error {
-        w.push(format!(
-            "cannot list this machine's aterm instances: {}",
-            safe(e, 512)
-        ));
+        push(
+            WarningKind::InstanceDiscoveryFailed,
+            format!(
+                "cannot list this machine's aterm instances: {}",
+                safe(e, 512)
+            ),
+        );
     }
     let config_flags = serve_flags(&r.command);
     for inst in &r.instances {
         let pid = inst.pid;
         if let Some(e) = &inst.error {
-            w.push(format!(
-                "instance {pid} did not answer ({}): its bridge and sessions are not in \
-                 this report",
-                safe(e, 256)
-            ));
+            push(
+                WarningKind::InstanceUnreachable,
+                format!(
+                    "instance {pid} did not answer ({}): its bridge and sessions are not in \
+                     this report",
+                    safe(e, 256)
+                ),
+            );
             continue;
         }
         let own = inst.command.as_deref().and_then(|c| bridge_config(c).ok());
         let same_broker = own.as_ref().is_none_or(|c| c.broker == r.cfg.broker);
         match (inst.fabric.as_deref(), inst.supervised) {
-            (_, Some(false)) => w.push(format!(
-                "instance {pid} has no bridge (fabric={}, not supervised): its sessions \
-                 receive no mail and their posts only queue",
-                safe(inst.fabric.as_deref().unwrap_or("-"), 32)
-            )),
-            (Some("disconnected"), _) => w.push(format!(
-                "instance {pid}'s bridge is down (fabric=disconnected): its sessions get no \
-                 mail and their posts queue; aterm relaunches the bridge"
-            )),
+            (_, Some(false)) => push(
+                WarningKind::InstanceNoBridge,
+                format!(
+                    "instance {pid} has no bridge (fabric={}, not supervised): its sessions \
+                     receive no mail and their posts only queue",
+                    safe(inst.fabric.as_deref().unwrap_or("-"), 32)
+                ),
+            ),
+            (Some("disconnected"), _) => push(
+                WarningKind::BridgeDown,
+                format!(
+                    "instance {pid}'s bridge is down (fabric=disconnected): its sessions get no \
+                     mail and their posts queue; aterm relaunches the bridge"
+                ),
+            ),
             (Some("stalled"), _) if inst.reason.as_deref() == Some("state-locked") => {
                 let holder = r
                     .instances
@@ -3299,73 +3508,98 @@ fn warnings(
                         || "another bridge".to_string(),
                         |o| format!("instance {}'s bridge", o.pid),
                     );
-                w.push(format!(
-                    "instance {pid}'s bridge stands by (fabric=stalled reason=state-locked): \
-                     {holder} holds its state dir {}, and one state dir is one node — its \
-                     sessions receive no mail and no fleet halt, and their posts queue until \
-                     that bridge exits",
-                    safe(inst.state_dir.as_deref().unwrap_or("-"), 256)
-                ));
+                push(
+                    WarningKind::BridgeStateLocked,
+                    format!(
+                        "instance {pid}'s bridge stands by (fabric=stalled reason=state-locked): \
+                         {holder} holds its state dir {}, and one state dir is one node — its \
+                         sessions receive no mail and no fleet halt, and their posts queue until \
+                         that bridge exits",
+                        safe(inst.state_dir.as_deref().unwrap_or("-"), 256)
+                    ),
+                );
             }
             (Some("stalled"), _) if inst.reason.as_deref() == Some("starting") => {
-                w.push(format!(
-                    "instance {pid}'s bridge is attached and has not reported its broker link \
-                     (fabric=stalled reason=starting); if this stays, check the broker at \
-                     {broker}"
-                ));
+                push(
+                    WarningKind::BridgeStarting,
+                    format!(
+                        "instance {pid}'s bridge is attached and has not reported its broker link \
+                         (fabric=stalled reason=starting); if this stays, check the broker at \
+                         {broker}"
+                    ),
+                );
             }
             (Some("stalled"), _) => {
                 let reason = inst.reason.as_deref().unwrap_or("-");
-                let last = match (reason, r.broker.last_word.as_deref()) {
-                    ("no-socket" | "refused", Some(l)) if same_broker && !r.broker.reachable => {
-                        format!("; its supervisor's broker.err, {}", safe(l, 256))
-                    }
-                    _ => String::new(),
+                let (last_word, last) = match (reason, r.broker.last_word.as_deref()) {
+                    ("no-socket" | "refused", Some(l)) if same_broker && !r.broker.reachable => (
+                        Some(l.to_string()),
+                        format!("; its supervisor's broker.err, {}", safe(l, 256)),
+                    ),
+                    _ => (None, String::new()),
                 };
-                w.push(format!(
-                    "instance {pid}'s bridge is attached but its broker link is down \
-                     (fabric=stalled reason={}, last ack {}): its posts queue and no mail \
-                     arrives from the broker at {broker}{last}",
-                    safe(reason, 32),
+                push(
+                    WarningKind::BridgeLinkDown {
+                        reason: reason.to_string(),
+                        last_word,
+                    },
+                    format!(
+                        "instance {pid}'s bridge is attached but its broker link is down \
+                         (fabric=stalled reason={}, last ack {}): its posts queue and no mail \
+                         arrives from the broker at {broker}{last}",
+                        safe(reason, 32),
+                        inst.link_age_ms
+                            .map_or_else(|| "never".to_string(), |a| format!("{} ago", age(a)))
+                    ),
+                );
+            }
+            (Some("stale"), _) => push(
+                WarningKind::BridgeStale,
+                format!(
+                    "instance {pid}'s bridge has not answered for the work it was given \
+                     (fabric=stale, last ack {}): its posts queue and `post --wait` from its \
+                     sessions fails fast",
                     inst.link_age_ms
                         .map_or_else(|| "never".to_string(), |a| format!("{} ago", age(a)))
-                ));
-            }
-            (Some("stale"), _) => w.push(format!(
-                "instance {pid}'s bridge has not answered for the work it was given \
-                 (fabric=stale, last ack {}): its posts queue and `post --wait` from its \
-                 sessions fails fast",
-                inst.link_age_ms
-                    .map_or_else(|| "never".to_string(), |a| format!("{} ago", age(a)))
-            )),
-            (Some("connected"), _) if !r.broker.reachable && same_broker => w.push(format!(
-                "instance {pid} says fabric=connected (its bridge's last ack was {}), but the \
-                 broker at {broker} does not answer this report's own probe: either the broker \
-                 died since that ack and the bridge has not exchanged a record with it yet, \
-                 or the two are not looking at the same socket",
-                inst.link_age_ms
-                    .map_or_else(|| "never".to_string(), |a| format!("{} ago", age(a)))
-            )),
+                ),
+            ),
+            (Some("connected"), _) if !r.broker.reachable && same_broker => push(
+                WarningKind::ConnectedProbeMismatch,
+                format!(
+                    "instance {pid} says fabric=connected (its bridge's last ack was {}), but the \
+                     broker at {broker} does not answer this report's own probe: either the broker \
+                     died since that ack and the bridge has not exchanged a record with it yet, \
+                     or the two are not looking at the same socket",
+                    inst.link_age_ms
+                        .map_or_else(|| "never".to_string(), |a| format!("{} ago", age(a)))
+                ),
+            ),
             _ => {}
         }
         if let (Some(theirs), Some(ours)) = (&inst.bridge_build, &inst.build) {
             if theirs != ours {
-                w.push(format!(
-                    "instance {pid}'s bridge is another build than the instance: bridge {}, \
-                     instance {}",
-                    safe(theirs, 64),
-                    safe(ours, 64)
-                ));
+                push(
+                    WarningKind::BridgeBuildMismatch,
+                    format!(
+                        "instance {pid}'s bridge is another build than the instance: bridge {}, \
+                         instance {}",
+                        safe(theirs, 64),
+                        safe(ours, 64)
+                    ),
+                );
             }
         }
         if let Some(n) = inst.lane_faults.filter(|n| *n > 0) {
-            w.push(format!(
-                "instance {pid} could not parse {n} of its bridge's lines (lane_faults={n}): \
-                 the mail they carried is held back on the bus, not lost"
-            ));
+            push(
+                WarningKind::BridgeLaneFaults,
+                format!(
+                    "instance {pid} could not parse {n} of its bridge's lines (lane_faults={n}): \
+                     the mail they carried is held back on the bus, not lost"
+                ),
+            );
         }
         if let Some(line) = node_mail_given_up(inst) {
-            w.push(line);
+            push(WarningKind::RetentionGaveUp, line);
         }
         let program_differs = inst.program.is_some() && inst.program != r.program;
         if inst.supervised == Some(true)
@@ -3403,12 +3637,15 @@ fn warnings(
                     }
                 },
             );
-            w.push(format!(
-                "instance {pid}'s bridge was armed with a different command than {}: \
-                 {differs} — an instance records its command at launch or `fabric attach`, \
-                 so this report and that bridge are not describing the same fabric",
-                r.source.describe()
-            ));
+            push(
+                WarningKind::BridgeDifferentCommand,
+                format!(
+                    "instance {pid}'s bridge was armed with a different command than {}: \
+                     {differs} — an instance records its command at launch or `fabric attach`, \
+                     so this report and that bridge are not describing the same fabric",
+                    r.source.describe()
+                ),
+            );
         }
         if inst.fabric.as_deref() == Some("connected") {
             if let Some(row) = inst
@@ -3417,34 +3654,51 @@ fn warnings(
                 .and_then(|n| r.nodes.iter().find(|row| row.node == n))
             {
                 if row.state != "live" || row.fabric != "connected" {
-                    w.push(format!(
-                        "instance {pid} says fabric=connected, but the bus's own presence \
-                         for its node {} says state={} fabric={}: every peer reading the \
-                         fleet's roster sees this node away",
-                        safe(row.node.as_str(), 64),
-                        safe(row.reads(), 16),
-                        safe(&row.fabric, 16)
-                    ));
+                    push(
+                        WarningKind::ConnectedPresenceMismatch,
+                        format!(
+                            "instance {pid} says fabric=connected, but the bus's own presence \
+                             for its node {} says state={} fabric={}: every peer reading the \
+                             fleet's roster sees this node away",
+                            safe(row.node.as_str(), 64),
+                            safe(row.reads(), 16),
+                            safe(&row.fabric, 16)
+                        ),
+                    );
                 }
             }
         }
         let bridge_ok = inst.fabric.as_deref() == Some("connected") && r.broker.reachable;
+        let reach_sock = (!inst.pid_reaches).then(|| inst.sock.clone());
         for s in &inst.sessions {
             let at = format!("@{} (instance {pid})", s.sid);
             if let Some(e) = &s.error {
-                w.push(format!("{at}: {}", safe(e, 256)));
+                push(
+                    WarningKind::SessionQueryFailed {
+                        pid,
+                        sock: reach_sock.clone(),
+                    },
+                    format!("{at}: {}", safe(e, 256)),
+                );
                 continue;
             }
             if let Some(n) = s.dropped.filter(|n| *n > 0) {
-                w.push(format!(
-                    "{at} lost {n} message(s): its inbox ring evicted rows nobody handled \
-                     (dropped={n})"
-                ));
+                push(
+                    WarningKind::SessionInboxEvicted,
+                    format!(
+                        "{at} lost {n} message(s): its inbox ring evicted rows nobody handled \
+                         (dropped={n})"
+                    ),
+                );
             }
             if let Some(lost) = session_given_up(s) {
-                w.push(format!(
-                    "{at}: {RETENTION_GAVE_UP} records of its own before it handled them: {lost}"
-                ));
+                push(
+                    WarningKind::RetentionGaveUp,
+                    format!(
+                        "{at}: {RETENTION_GAVE_UP} records of its own before it handled them: \
+                         {lost}"
+                    ),
+                );
             }
             if s.hold == Some(1) {
                 let why = s.hold_why.as_ref().map_or_else(
@@ -3462,9 +3716,19 @@ fn warnings(
                         safe(&inst.sock, 256)
                     )
                 };
-                w.push(format!(
-                    "{at} is HELD ({why}): every key and turn verb answers ERR halted"
-                ));
+                push(
+                    WarningKind::SessionHeld {
+                        sid: s.sid.clone(),
+                        pid,
+                        sock: reach_sock.clone(),
+                        origin: s.hold_why.as_ref().map(|(_, o)| o.clone()),
+                        fabric_lost: s
+                            .hold_why
+                            .as_ref()
+                            .is_some_and(|(reason, _)| reason == "fabric-lost"),
+                    },
+                    format!("{at} is HELD ({why}): every key and turn verb answers ERR halted"),
+                );
             }
             let stale: Vec<(&MsgMeta, u64)> = s
                 .unhandled
@@ -3477,91 +3741,117 @@ fn warnings(
                 })
                 .collect();
             if let Some((oldest, old)) = stale.iter().max_by_key(|(_, old)| *old) {
-                w.push(format!(
-                    "{at} has {} unhandled task/ask older than 10 min — the oldest, {} from \
-                     {}, is {} old",
-                    stale.len(),
-                    safe(&oldest.kind, 16),
-                    safe(&oldest.from, 128),
-                    age(*old)
-                ));
+                push(
+                    WarningKind::SessionUnhandledStaleWork,
+                    format!(
+                        "{at} has {} unhandled task/ask older than 10 min — the oldest, {} from \
+                         {}, is {} old",
+                        stale.len(),
+                        safe(&oldest.kind, 16),
+                        safe(&oldest.from, 128),
+                        age(*old)
+                    ),
+                );
             }
             if let Some(n) = s.posts.filter(|n| *n > 0) {
                 if !bridge_ok {
-                    w.push(format!(
-                        "{at} has {n} queued post(s) and no working bridge to publish them"
-                    ));
+                    push(
+                        WarningKind::SessionQueuedPostsNoBridge,
+                        format!(
+                            "{at} has {n} queued post(s) and no working bridge to publish them"
+                        ),
+                    );
                 }
             }
         }
     }
     for o in &r.overdue {
-        w.push(format!(
-            "{} off={} from {} to @{} passed its deadline {} ago (dl={} ms) with no answer, \
-             report or ack — {}",
-            safe(&o.kind, 16),
-            o.off,
-            safe(&o.from, 128),
-            safe(&o.to, 128),
-            age(o.late_ms),
-            o.dl,
-            match o.expired {
-                Some(true) => "the asker's bridge recorded it expired",
-                Some(false) => "not yet recorded expired by the asker's bridge",
-                None => "whether the asker's bridge recorded it expired is not kept on the bus",
-            }
-        ));
+        push(
+            WarningKind::OverdueWork {
+                to_person: o.to.ends_with("@p"),
+            },
+            format!(
+                "{} off={} from {} to @{} passed its deadline {} ago (dl={} ms) with no answer, \
+                 report or ack — {}",
+                safe(&o.kind, 16),
+                o.off,
+                safe(&o.from, 128),
+                safe(&o.to, 128),
+                age(o.late_ms),
+                o.dl,
+                match o.expired {
+                    Some(true) => "the asker's bridge recorded it expired",
+                    Some(false) => "not yet recorded expired by the asker's bridge",
+                    None => "whether the asker's bridge recorded it expired is not kept on the bus",
+                }
+            ),
+        );
     }
     if r.overdue_unjudged > 0 {
-        w.push(format!(
-            "{} held ask(s) {OVERDUE_UNJUDGED}: the bus no longer keeps (or this cap does not \
-             read) every answer, report and ack above them on their asker's lane, so status \
-             cannot say whether they had one",
-            r.overdue_unjudged
-        ));
+        push(
+            WarningKind::OverdueUnjudged,
+            format!(
+                "{} held ask(s) {OVERDUE_UNJUDGED}: the bus no longer keeps (or this cap does not \
+                 read) every answer, report and ack above them on their asker's lane, so status \
+                 cannot say whether they had one",
+                r.overdue_unjudged
+            ),
+        );
     }
     let answered = every_instance_answered(r);
     let local_nodes = local_nodes(&r.instances, r.node.as_deref());
     if answered {
         for s in ghost_rows(&r.sessions, &local_nodes) {
-            w.push(format!(
-                "the bus advertises @{} {} on {} — this machine's node — but no \
-                 aterm instance here hosts it: mail to it is undeliverable",
-                safe(&s.sid, 64),
-                safe(&s.bus, 16),
-                safe(&s.node, 64)
-            ));
+            push(
+                WarningKind::GhostSessionRow,
+                format!(
+                    "the bus advertises @{} {} on {} — this machine's node — but no \
+                     aterm instance here hosts it: mail to it is undeliverable",
+                    safe(&s.sid, 64),
+                    safe(&s.bus, 16),
+                    safe(&s.node, 64)
+                ),
+            );
         }
     }
     for (who, reason) in halts {
-        w.push(format!(
-            "{who} has a fleet halt standing (reason={}): every session on the fleet \
-             is held",
-            safe(reason, 128)
-        ));
+        push(
+            WarningKind::FleetHaltStanding,
+            format!(
+                "{who} has a fleet halt standing (reason={}): every session on the fleet \
+                 is held",
+                safe(reason, 128)
+            ),
+        );
     }
     if r.roster_truncated {
-        w.push(format!(
-            "the presence roster has more than {} rows and the read stopped there \
-             (rows={}+ truncated): NODES, SESSIONS and every warning drawn from them leave \
-             out what lies past it",
-            crate::glance::MAX_ROWS,
-            crate::glance::MAX_ROWS
-        ));
+        push(
+            WarningKind::RosterTruncated,
+            format!(
+                "the presence roster has more than {} rows and the read stopped there \
+                 (rows={}+ truncated): NODES, SESSIONS and every warning drawn from them leave \
+                 out what lies past it",
+                crate::glance::MAX_ROWS,
+                crate::glance::MAX_ROWS
+            ),
+        );
     }
     if let (Some(Ok(used)), Some(node)) = (&r.subjects, r.node.as_deref()) {
         if *used >= SUBJECT_BUDGET_WARN {
-            w.push(format!(
-                "node {} holds {used} of the {SUBJECT_BUDGET} distinct subjects one node may \
-                 hold at once: a departed session's presence row and the lanes this node wrote \
-                 to it go back five minutes after it leaves (its `ev` face once the session-log \
-                 mirror landed its tail), but each topic a session broadcast on keeps one \
-                 subject for good, so what stays is held by live sessions, every topic face a \
-                 session of this node ever broadcast on, mail still owed and the node's own \
-                 faces; past the bound a new session gets no presence row and its posts are \
-                 refused",
-                safe(node, 64)
-            ));
+            push(
+                WarningKind::SubjectBudgetHigh,
+                format!(
+                    "node {} holds {used} of the {SUBJECT_BUDGET} distinct subjects one node may \
+                     hold at once: a departed session's presence row and the lanes this node wrote \
+                     to it go back five minutes after it leaves (its `ev` face once the session-log \
+                     mirror landed its tail), but each topic a session broadcast on keeps one \
+                     subject for good, so what stays is held by live sessions, every topic face a \
+                     session of this node ever broadcast on, mail still owed and the node's own \
+                     faces; past the bound a new session gets no presence row and its posts are \
+                     refused",
+                    safe(node, 64)
+                ),
+            );
         }
     }
     let kept = if r.cfg.state_dir.is_empty() {
@@ -3570,15 +3860,30 @@ fn warnings(
         crate::state::StateDir::peek(&r.cfg.state_dir).standing_halts(&r.cfg.fleet)
     };
     for (who, halt) in kept.into_iter().filter(|(_, h)| h.kept) {
-        w.push(format!(
-            "{}'s fleet halt (reason={}) stands on this node with no row on the bus: it was \
-             read on a bus log since replaced, and only {0}'s own `state=off` on this log \
-             lifts it",
-            safe(&who, 64),
-            safe(&crate::pct::decode(&halt.reason), 128)
-        ));
+        push(
+            WarningKind::FleetHaltStanding,
+            format!(
+                "{}'s fleet halt (reason={}) stands on this node with no row on the bus: it was \
+                 read on a bus log since replaced, and only {0}'s own `state=off` on this log \
+                 lifts it",
+                safe(&who, 64),
+                safe(&crate::pct::decode(&halt.reason), 128)
+            ),
+        );
     }
     w
+}
+
+#[cfg(test)]
+fn warnings(
+    r: &Report,
+    ages: &BTreeMap<(String, u64), u64>,
+    halts: &[(String, String)],
+) -> Vec<String> {
+    warning_items(r, ages, halts)
+        .into_iter()
+        .map(|w| w.text)
+        .collect()
 }
 
 /// The local clock's offset from UTC in seconds at `ms` since the epoch (`tm_gmtoff`); `None`
@@ -7323,9 +7628,14 @@ mod tests {
             traffic: Vec::new(),
             overdue: Vec::new(),
             overdue_unjudged: 0,
+            warning_items: Vec::new(),
             warnings: Vec::new(),
             now_ms: 100 * 60 * 1000,
         }
+    }
+
+    fn warned_items(r: &Report) -> Vec<Warning> {
+        warning_items(r, &BTreeMap::new(), &[])
     }
 
     fn warned(r: &Report) -> Vec<String> {
@@ -7351,17 +7661,17 @@ mod tests {
         );
         let mut r = healthy();
         r.wide_caps = vec![("/c/node.cap".to_string(), violation.clone())];
-        let w = warned(&r);
-        let wide: Vec<&String> = w
+        let w = warned_items(&r);
+        let wide: Vec<&Warning> = w
             .iter()
-            .filter(|l| l.contains(crate::enable::WIDER_RING))
+            .filter(|l| l.text.contains(crate::enable::WIDER_RING))
             .collect();
         assert_eq!(
-            wide,
+            wide.iter().map(|l| &l.text).collect::<Vec<_>>(),
             [&format!("cap file /c/node.cap: {violation}")],
             "{w:#?}"
         );
-        let fix = crate::enable::fix_for(wide[0], &crate::enable::Role::default());
+        let fix = crate::enable::fix_for(&wide[0].kind, &crate::enable::Role::default());
         assert!(
             fix.contains("<root>/node.cap")
                 && fix.contains("keeps aside")
@@ -7390,11 +7700,11 @@ mod tests {
         r.broker.cap_unread = true;
         r.broker.error = Some(format!("cap file {long}: {said}"));
 
-        let w = warned(&r);
-        let about: Vec<&String> = w.iter().filter(|l| l.contains(&long)).collect();
+        let w = warned_items(&r);
+        let about: Vec<&Warning> = w.iter().filter(|l| l.text.contains(&long)).collect();
         assert_eq!(about.len(), 1, "{w:#?}");
-        assert!(about[0].contains(&chmod), "{w:#?}");
-        let fix = crate::enable::fix_for(about[0], &crate::enable::Role::default());
+        assert!(about[0].text.contains(&chmod), "{w:#?}");
+        let fix = crate::enable::fix_for(&about[0].kind, &crate::enable::Role::default());
         assert!(fix.contains("chmod 600 <cap>"), "{fix}");
         assert!(!fix.contains("re-mints"), "{fix}");
 
@@ -7548,23 +7858,24 @@ mod tests {
         );
         let mut r = healthy();
         r.broker = view;
-        let w = warned(&r);
+        let w = warned_items(&r);
         let warning = w
             .iter()
-            .find(|l| l.contains("speaks astream protocol"))
+            .find(|l| l.text.contains("speaks astream protocol"))
             .unwrap_or_else(|| panic!("no protocol warning: {w:#?}"));
         assert!(
-            warning.contains(&format!(
+            warning.text.contains(&format!(
                 "protocol {} and this aterm speaks {PROTO_VERSION}",
                 PROTO_VERSION + 1
-            )) && !warning.contains("does not answer"),
-            "{warning}"
+            )) && !warning.text.contains("does not answer"),
+            "{}",
+            warning.text
         );
         assert!(
-            crate::enable::fix_for(warning, &crate::enable::Role::default())
+            crate::enable::fix_for(&warning.kind, &crate::enable::Role::default())
                 .contains("different releases"),
             "{}",
-            crate::enable::fix_for(warning, &crate::enable::Role::default())
+            crate::enable::fix_for(&warning.kind, &crate::enable::Role::default())
         );
         let summary = summary_of(&r.broker);
         assert_eq!(summary.level, SummaryLevel::Warn);
@@ -7672,22 +7983,26 @@ mod tests {
         assert!(!view.reachable);
         let mut r = healthy();
         r.broker = view;
-        let w = warned(&r);
+        let w = warned_items(&r);
         let warning = w
             .iter()
-            .find(|l| l.contains("does not answer (connect:"))
+            .find(|l| l.text.contains("does not answer (connect:"))
             .unwrap_or_else(|| panic!("no unreachable warning: {w:#?}"));
         assert!(
-            warning.contains("; its supervisor's broker.err, written ")
+            warning
+                .text
+                .contains("; its supervisor's broker.err, written ")
                 && warning
+                    .text
                     .ends_with("ago: aterm link broker: open bus.log: record format v9: refused"),
-            "{warning}"
+            "{}",
+            warning.text
         );
         assert!(
-            crate::enable::fix_for(warning, &crate::enable::Role::default())
+            crate::enable::fix_for(&warning.kind, &crate::enable::Role::default())
                 .contains("fix that first"),
             "{}",
-            crate::enable::fix_for(warning, &crate::enable::Role::default())
+            crate::enable::fix_for(&warning.kind, &crate::enable::Role::default())
         );
     }
 
@@ -7699,7 +8014,7 @@ mod tests {
             .tempdir()
             .expect("scratch");
         let role = crate::enable::Role::default();
-        let fix = |w: &str| crate::enable::fix_for(w, &role);
+        let fix = |w: &Warning| crate::enable::fix_for(&w.kind, &role);
         let root = crate::enable::default_root(Path::new("/Users//someone"));
         let log = root.join("bus.log").to_string_lossy().into_owned();
         let argv = format!(
@@ -7719,10 +8034,10 @@ mod tests {
             let inst = &mut r.instances[0];
             inst.fabric = Some("stalled".to_string());
             inst.reason = Some("no-socket".to_string());
-            let w = warned(&r);
+            let w = warned_items(&r);
             let pick = |needle: &str| {
                 w.iter()
-                    .find(|l| l.contains(needle))
+                    .find(|l| l.text.contains(needle))
                     .unwrap_or_else(|| panic!("no {needle:?} warning: {w:#?}"))
                     .clone()
             };
@@ -7738,13 +8053,14 @@ mod tests {
                 "PRECONDITION: {supervised}"
             );
             for w in warnings(&supervised) {
-                assert!(w.contains("supervisor's broker.err"), "{w}");
+                assert!(w.text.contains("supervisor's broker.err"), "{}", w.text);
                 let f = fix(&w);
                 assert!(
                     f.starts_with("the broker exited over a poisoned log for its supervisor")
                         && !f.contains("fix that first")
                         && !f.contains("--repair"),
-                    "{f}\nfor: {w}"
+                    "{f}\nfor: {}",
+                    w.text
                 );
             }
             let alone = crate::broker_health::poisoned_line(&log, reason, Some(&argv));
@@ -7755,7 +8071,8 @@ mod tests {
                         "the broker exited over a poisoned log, and no `aterm fabric on`"
                     ) && f.contains("broker.err")
                         && !f.contains("fix that first"),
-                    "{f}\nfor: {w}"
+                    "{f}\nfor: {}",
+                    w.text
                 );
             }
             let other = format!("aterm link broker: open {log}: {reason}");
@@ -7781,7 +8098,7 @@ mod tests {
         std::fs::write(root.join("bus.log.seal"), b"binding").expect("seal");
         assert!(crate::at_rest::is_sealed(&log));
         let role = crate::enable::Role::default();
-        let fix = |w: &str| crate::enable::fix_for(w, &role);
+        let fix = |w: &Warning| crate::enable::fix_for(&w.kind, &role);
         let warnings = |last: &str| {
             std::fs::write(dir.path().join("broker.err"), format!("{last}\n")).expect("err");
             let mut r = healthy();
@@ -7791,10 +8108,10 @@ mod tests {
             let inst = &mut r.instances[0];
             inst.fabric = Some("stalled".to_string());
             inst.reason = Some("no-socket".to_string());
-            let w = warned(&r);
+            let w = warned_items(&r);
             let pick = |needle: &str| {
                 w.iter()
-                    .find(|l| l.contains(needle))
+                    .find(|l| l.text.contains(needle))
                     .unwrap_or_else(|| panic!("no {needle:?} warning: {w:#?}"))
                     .clone()
             };
@@ -7811,7 +8128,7 @@ mod tests {
             let whole = line(remedy);
             assert!(whole.chars().count() > 256, "PRECONDITION: {whole}");
             for w in warnings(&whole) {
-                assert!(w.contains("supervisor's broker.err"), "{w}");
+                assert!(w.text.contains("supervisor's broker.err"), "{}", w.text);
                 let f = fix(&w);
                 assert!(
                     f.starts_with("the broker refuses its log, sealed at rest")
@@ -7820,7 +8137,8 @@ mod tests {
                         && f.contains("--repair <log>")
                         && f.contains("dropping the records from there on")
                         && f.contains(crate::at_rest::RETIRE_VERB),
-                    "{f}\nfor: {w}"
+                    "{f}\nfor: {}",
+                    w.text
                 );
             }
         }
@@ -7831,7 +8149,8 @@ mod tests {
             assert!(
                 f.starts_with("a `--retire-log` of the broker's log stopped part way")
                     && f.contains(crate::at_rest::RETIRE_VERB),
-                "{f}\nfor: {w}"
+                "{f}\nfor: {}",
+                w.text
             );
         }
     }
@@ -7894,10 +8213,12 @@ mod tests {
     fn the_report_says_what_the_broker_says_of_its_log() {
         use astream_broker::{FlushCounts, HelloHealth};
         let role = crate::enable::Role::default();
-        let fix = |w: &str| crate::enable::fix_for(w, &role);
-        let ours = |w: &[String]| -> Vec<String> {
+        let fix = |w: &Warning| crate::enable::fix_for(&w.kind, &role);
+        let ours = |w: &[Warning]| -> Vec<Warning> {
             w.iter()
-                .filter(|l| l.contains(POISONED_WARNING) || l.contains(FLUSH_FAILED_WARNING))
+                .filter(|l| {
+                    l.text.contains(POISONED_WARNING) || l.text.contains(FLUSH_FAILED_WARNING)
+                })
                 .cloned()
                 .collect()
         };
@@ -7916,7 +8237,7 @@ mod tests {
                 ..FlushCounts::default()
             },
         });
-        assert!(ours(&warned(&r)).is_empty(), "{:?}", warned(&r));
+        assert!(ours(&warned_items(&r)).is_empty(), "{:?}", warned_items(&r));
         let health = row(&r, "health").expect("a health row");
         assert!(
             health.ends_with(
@@ -7938,15 +8259,16 @@ mod tests {
         if let Some(h) = r.broker.health.as_mut() {
             h.flushes.failed = 2;
         }
-        let w = ours(&warned(&r));
+        let w = ours(&warned_items(&r));
         assert_eq!(w.len(), 1, "{w:?}");
         assert!(
-            w[0].contains(&format!("{FLUSH_FAILED_WARNING} 2 time(s)")),
+            w[0].text
+                .contains(&format!("{FLUSH_FAILED_WARNING} 2 time(s)")),
             "{}",
-            w[0]
+            w[0].text
         );
         assert!(fix(&w[0]).starts_with("check the disk"), "{}", fix(&w[0]));
-        for said in [w[0].as_str(), fix(&w[0]).as_str()] {
+        for said in [w[0].text.as_str(), fix(&w[0]).as_str()] {
             assert!(
                 !said.contains("lost nothing") && !said.contains("nothing acked was lost"),
                 "{said}"
@@ -7957,17 +8279,18 @@ mod tests {
         if let Some(h) = r.broker.health.as_mut() {
             h.poisoned = Some("a flush failed (EIO)\u{1b}[2J".to_string());
         }
-        let w = ours(&warned(&r));
+        let w = ours(&warned_items(&r));
         assert_eq!(w.len(), 1, "the poison, not the disk too: {w:?}");
         assert!(
-            w[0].contains(&format!("{POISONED_WARNING} (a flush failed (EIO)")),
+            w[0].text
+                .contains(&format!("{POISONED_WARNING} (a flush failed (EIO)")),
             "{}",
-            w[0]
+            w[0].text
         );
         assert!(
-            !w[0].contains('\u{1b}'),
+            !w[0].text.contains('\u{1b}'),
             "astream's words are made safe: {}",
-            w[0]
+            w[0].text
         );
         let f = fix(&w[0]);
         assert!(
@@ -7992,7 +8315,7 @@ mod tests {
         );
 
         r.broker.health = None;
-        assert!(ours(&warned(&r)).is_empty());
+        assert!(ours(&warned_items(&r)).is_empty());
         let health = row(&r, "health").expect("a health row");
         assert!(health.contains("carries no health entry"), "{health}");
         assert_eq!(summary_of(&r.broker).level, SummaryLevel::Note);
@@ -8069,6 +8392,11 @@ mod tests {
         h.retained_bytes = 2048;
         h.distinct_subjects = 3;
         h.active_conns = 4;
+        h.process_flushes = Some(astream_sys::FlushTally {
+            full: 7,
+            barrier: 2,
+            plain: 1,
+        });
         let read = |writer, h: &BrokerHealth| HealthRead {
             health: h.clone(),
             writer,
@@ -8078,10 +8406,33 @@ mod tests {
             row(&r).as_deref(),
             Some(
                 "5 record(s) in 2.0 KiB, 3 subject(s), 0 pending will(s), 0 group commit(s); 4 \
-                 connection(s), 0 parked tail(s); 0 full, 0 barrier and 0 plain flush(es) by its \
+                 connection(s), 0 parked tail(s); 7 full, 2 barrier and 1 plain flush(es) by its \
                  process since it started (astream's <log>.health, written 1m ago)"
             )
         );
+        // `--json` carries every fact the row shows, the process's tally among them; an older
+        // broker's snapshot, which carries none, reads null there and says so in the row.
+        assert!(
+            render_json(&r).contains(r#""process_flushes":{"full":7,"barrier":2,"plain":1}"#),
+            "{}",
+            render_json(&r)
+        );
+        let mut older = h.clone();
+        older.process_flushes = None;
+        r.broker.snapshot = Some(Ok(read(HealthWriter::Serving, &older)));
+        assert!(
+            render_json(&r).contains(r#""process_flushes":null"#),
+            "{}",
+            render_json(&r)
+        );
+        assert!(
+            row(&r)
+                .expect("a row")
+                .contains(crate::broker_health::NO_PROCESS_FLUSHES),
+            "{:?}",
+            row(&r)
+        );
+        r.broker.snapshot = Some(Ok(read(HealthWriter::Serving, &h)));
         assert!(r.broker.snapshot_now().is_some());
         r.broker.pid = Some(43);
         assert!(row(&r)
@@ -8140,31 +8491,38 @@ mod tests {
             if let Some(c) = command {
                 inst.command = Some(words(&c));
             }
-            let w = warned(&r);
+            let w = warned_items(&r);
             let bridge = w
                 .iter()
-                .find(|l| l.contains("broker link is down"))
+                .find(|l| l.text.contains("broker link is down"))
                 .unwrap_or_else(|| panic!("no bridge warning: {w:#?}"))
                 .clone();
             let broker = w
                 .iter()
-                .find(|l| l.contains("does not answer (connect:"))
+                .find(|l| l.text.contains("does not answer (connect:"))
                 .unwrap_or_else(|| panic!("no broker warning: {w:#?}"))
                 .clone();
             (bridge, broker)
         };
-        let fix = |w: &str| crate::enable::fix_for(w, &role);
+        let fix = |w: &Warning| crate::enable::fix_for(&w.kind, &role);
         for reason in ["no-socket", "refused"] {
             let (bridge, broker) = report(K::InvalidData, reason, None);
             assert!(
-                bridge.contains("; its supervisor's broker.err, written ")
-                    && bridge.contains(crate::cli::CORRUPT_LOG_REMEDY),
-                "{bridge}"
+                bridge
+                    .text
+                    .contains("; its supervisor's broker.err, written ")
+                    && bridge.text.contains(crate::cli::CORRUPT_LOG_REMEDY),
+                "{}",
+                bridge.text
             );
             assert!(fix(&bridge).starts_with(&fix(&broker)), "{}", fix(&bridge));
             assert!(fix(&bridge).contains("--repair"), "{}", fix(&bridge));
             let (bridge, broker) = report(K::Unsupported, reason, None);
-            assert!(bridge.contains(crate::cli::NEWER_LOG_REMEDY), "{bridge}");
+            assert!(
+                bridge.text.contains(crate::cli::NEWER_LOG_REMEDY),
+                "{}",
+                bridge.text
+            );
             assert!(
                 fix(&bridge).starts_with(&fix(&broker)) && !fix(&bridge).contains("--repair"),
                 "{}",
@@ -8174,10 +8532,10 @@ mod tests {
         let other = CMD.replace("/tmp/b.sock", "/elsewhere/b.sock");
         assert_ne!(other, CMD, "PRECONDITION: the command names /tmp/b.sock");
         let (bridge, _) = report(K::InvalidData, "refused", Some(other));
-        assert!(!bridge.contains("broker.err"), "{bridge}");
+        assert!(!bridge.text.contains("broker.err"), "{}", bridge.text);
         assert!(fix(&bridge).contains("starts it"), "{}", fix(&bridge));
         let (bridge, _) = report(K::InvalidData, "no-ack", None);
-        assert!(!bridge.contains("broker.err"), "{bridge}");
+        assert!(!bridge.text.contains("broker.err"), "{}", bridge.text);
     }
 
     #[cfg(unix)]
@@ -8215,13 +8573,17 @@ mod tests {
             "{:?}",
             r.broker
         );
-        let w = warned(&r);
+        let w = warned_items(&r);
         let warning = w
             .iter()
-            .find(|l| l.contains(CAP_LAPSED))
+            .find(|l| l.text.contains(CAP_LAPSED))
             .unwrap_or_else(|| panic!("no lapsed warning: {w:#?}"));
-        assert!(!warning.contains("could not be read"), "{warning}");
-        let here = crate::enable::fix_for(warning, &crate::enable::Role::default());
+        assert!(
+            !warning.text.contains("could not be read"),
+            "{}",
+            warning.text
+        );
+        let here = crate::enable::fix_for(&warning.kind, &crate::enable::Role::default());
         assert!(
             here.contains("lapsed") && here.contains("move <root>/node.cap aside"),
             "{here}"
@@ -8596,7 +8958,7 @@ mod tests {
                 .filter(|l| l.contains("this node's unread mail"))
                 .collect()
         };
-        let fix = |l: &str| crate::enable::fix_for(l, &crate::enable::Role::default());
+        let fix = |k: &WarningKind| crate::enable::fix_for(k, &crate::enable::Role::default());
 
         let mut r = healthy();
         r.instances[0].mail_gaps = Some(2);
@@ -8611,7 +8973,7 @@ mod tests {
             ],
             "the counter alone, no session told"
         );
-        assert!(fix(&warned(&r)[0]).starts_with("nothing brings those records back"));
+        assert!(fix(&warned_items(&r)[0].kind).starts_with("nothing brings those records back"));
         r.instances[0].mail_gap = None;
         assert_eq!(
             node_lines(&r),
@@ -8676,10 +9038,10 @@ mod tests {
             ("deploy".to_string(), range(70, 80, None)),
             ("news".to_string(), range(81, 90, Some(4))),
         ];
-        let w = warned(&r);
-        let own: Vec<&String> = w.iter().filter(|l| l.starts_with("@s-one ")).collect();
+        let w = warned_items(&r);
+        let own: Vec<&Warning> = w.iter().filter(|l| l.text.starts_with("@s-one ")).collect();
         assert_eq!(
-            own,
+            own.iter().map(|l| &l.text).collect::<Vec<_>>(),
             [
                 "@s-one (instance 100): the broker's retention gave up records of its own before it \
               handled them: its mail lane @50..@60 (`inbox` lane_given_up=); topic deploy \
@@ -8687,7 +9049,7 @@ mod tests {
             ],
             "{w:#?}"
         );
-        assert!(fix(own[0]).starts_with("nothing brings those records back"));
+        assert!(fix(&own[0].kind).starts_with("nothing brings those records back"));
         assert_eq!(w.len(), 2, "the node's range is its own line: {w:#?}");
         r.instances[0].sessions[0].lane_given_up = None;
         one(
@@ -9050,14 +9412,16 @@ mod tests {
             let mut r = healthy();
             r.overdue = found.overdue;
             r.overdue_unjudged = found.unjudged;
-            r.warnings = warned(&r);
+            r.warning_items = warned_items(&r);
+            r.warnings = r.warning_items.iter().map(|w| w.text.clone()).collect();
             assert_eq!(r.warnings.len(), 1, "{faces:?}: {:?}", r.warnings);
+            assert_eq!(r.warning_items[0].kind, WarningKind::OverdueUnjudged);
             let role = crate::enable::Role::default();
-            assert_ne!(
-                crate::enable::fix_for(&r.warnings[0], &role),
-                crate::enable::fix_for("a warning no remedy names", &role),
-                "doctor gives the warning its own fix: {}",
-                r.warnings[0]
+            let fix = crate::enable::fix_for(&r.warning_items[0].kind, &role);
+            assert!(
+                fix.contains("nothing on the bus is broken")
+                    && fix.contains(&OVERDUE_SCAN_SPAN.to_string()),
+                "doctor gives the warning its own fix: {fix}"
             );
             assert_eq!(exit_of(&r), 1, "{faces:?}");
             let json: aterm_json::Value = aterm_json::from_str(&render_json(&r)).expect("JSON");

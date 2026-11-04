@@ -194,6 +194,11 @@ pub struct Slot {
     /// `sessions status` row or `@<sid> status`) or an agent verdict's. A read that named none
     /// (`gen=-`: the terminal was busy) leaves the one before ([`Slot::saw_screen`]).
     screen: Option<ScreenGen>,
+    /// Whether aterm gave the session's agent verdict ([`Slot::saw_agent`]): an `@<sid> status`
+    /// read (whose `agent=` an older server leaves out, which clears the phase), a batch row that
+    /// said `agent=`, or an agent verdict event. A batch row that deferred it
+    /// (`agent_deferred=1`: another holder had the session's timeline) gives none.
+    verdict: bool,
     /// Newest row sent onto the bus (including in-flight rows), as [`Slot::on_bus`] spells it, and
     /// send timestamp.
     published: Option<(String, Instant)>,
@@ -231,12 +236,20 @@ impl Slot {
         }
     }
 
-    /// Whether aterm has named a generation for the session yet.
-    #[must_use]
-    pub(crate) const fn knows_screen(&self) -> bool {
-        self.screen.is_some()
+    /// Takes `word` as the session's agent verdict: the phase ([`Fields::set_agent`]), and that a
+    /// verdict was given.
+    pub(crate) fn saw_agent(&mut self, word: Option<&str>) {
+        self.fields.set_agent(word);
+        self.verdict = true;
     }
 
+    /// Whether status reads have given the session both its screen generation and its agent
+    /// verdict. A slot that lacks either (a read that met the terminal busy, `gen=-`, or a
+    /// batch row that deferred the verdict) is one its live row reads `@<sid> status` for.
+    #[must_use]
+    pub(crate) const fn knows_status(&self) -> bool {
+        self.screen.is_some() && self.verdict
+    }
     /// The row's `gen=` token: [`gen_token`] of the newest generation aterm named, [`ABSENT`]
     /// before any.
     #[must_use]
@@ -429,7 +442,7 @@ mod tests {
         let m = Mode::Meta;
         let mut slot = Slot::default();
         slot.saw_screen(None);
-        assert!(!slot.knows_screen());
+        assert!(!slot.knows_status());
         assert_eq!(slot.row_gen(), ABSENT);
         published(&mut slot, m, t0);
         slot.saw_screen(None);
@@ -452,6 +465,29 @@ mod tests {
             Due::Unchanged,
             "a moved screen alone owes no row"
         );
+    }
+
+    /// A SLOT KNOWS ITS STATUS ONCE READS GAVE BOTH ITS SCREEN AND ITS VERDICT: a generation
+    /// alone (a batch row that deferred the verdict) or a verdict alone (a read that met the
+    /// terminal busy) leaves the slot one its row reads `@<sid> status` for. A verdict given as
+    /// no word (an older server's `status`) is still a verdict.
+    #[test]
+    fn a_slot_knows_its_status_once_reads_gave_its_screen_and_its_verdict() {
+        let screen = ScreenGen { epoch: 1, seq: 3 };
+        let mut deferred = Slot::default();
+        deferred.saw_screen(Some(screen));
+        assert!(!deferred.knows_status(), "a generation without a verdict");
+        deferred.saw_agent(None);
+        assert!(deferred.knows_status());
+        assert_eq!(deferred.fields.phase, ABSENT);
+
+        let mut busy = Slot::default();
+        busy.saw_agent(Some("busy"));
+        busy.saw_screen(None);
+        assert!(!busy.knows_status(), "a verdict without a generation");
+        busy.saw_screen(Some(screen));
+        assert!(busy.knows_status());
+        assert_eq!(busy.fields.phase, "busy");
     }
 
     #[test]

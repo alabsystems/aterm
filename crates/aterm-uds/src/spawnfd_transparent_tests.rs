@@ -23,6 +23,73 @@ fn holds(fd: RawFd) -> [String; 2] {
     ["-c".to_string(), test_support::held_probe(fd)]
 }
 
+#[test]
+fn a_configurable_transparent_command_retains_descriptor_inheritance() {
+    let unflagged = unflagged_at_or_above(100);
+    let flagged = park(std::fs::File::open("/dev/null").unwrap().into(), 100);
+    for (fd, expected) in [(unflagged.as_raw_fd(), true), (flagged.as_raw_fd(), false)] {
+        let mut pass = transparent("/bin/sh");
+        pass.args(holds(fd));
+        let mut configured = pass.into_command();
+        configured.stdin(Stdio::null());
+        assert_eq!(answer(configured.status().unwrap()), expected);
+        assert_eq!(
+            answer(configured.status().unwrap()),
+            expected,
+            "reused command"
+        );
+    }
+    assert!(!answer(
+        command("/bin/sh")
+            .args(holds(unflagged.as_raw_fd()))
+            .status()
+            .unwrap()
+    ));
+}
+
+#[test]
+fn a_configurable_transparent_command_retains_edits_and_accepts_owned_stdio() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let mut pass = transparent("/bin/sh");
+    pass.arg0("native-configured").args([
+        "-c",
+        "printf '%s|%s|%s' \"$0\" \"$ATERM_CONFIGURED_PASS\" \"$PWD\"",
+    ]);
+    pass.env("ATERM_CONFIGURED_PASS", "first")
+        .env("ATERM_CONFIGURED_PASS", "last");
+    let result = pass
+        .into_command()
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    let expected = format!(
+        "native-configured|last|{}",
+        std::fs::canonicalize(dir.path()).unwrap().display()
+    );
+    assert_eq!(String::from_utf8(result.stdout).unwrap(), expected);
+}
+
+#[test]
+fn a_configurable_transparent_command_supplies_an_actual_cohort_child() {
+    let mut command = transparent("/bin/cat").into_command();
+    command.stdin(Stdio::piped()).stdout(Stdio::piped());
+    let attempt = BirthAttempt::new().unwrap();
+    let key = attempt.key().clone();
+    let mut born = command.spawn_cohort(attempt).unwrap();
+    let input = crate::deadline::cat_echoes(born.child_mut());
+    assert_eq!(born.key(), &key);
+    let pid = born.child_mut().id();
+    assert_eq!(
+        crate::process::read_lineage(i32::try_from(pid).unwrap())
+            .unwrap()
+            .pgid,
+        pid
+    );
+    drop(input);
+    assert!(born.into_child().wait().unwrap().success());
+}
+
 /// A [`transparent`] child inherits unflagged descriptors above stdio and excludes `FD_CLOEXEC` ones, whereas [`command`] and [`spawn`] inherit only stdio.
 #[test]
 fn a_transparent_child_holds_every_descriptor_this_process_hands_on_and_nothing_flagged() {
@@ -495,15 +562,18 @@ fn a_prepared_exec_captures_before_go_and_checks_the_original_deadline_at_dispat
     let before_action = sigpipe();
     let mut command = transparent("/nonexistent/prepared-native-image");
     command
+        .arg0("original-agent-name")
         .arg("captured")
         .env("ATERM_PREPARED_ENV", "before-go");
     let prepared = command.prepare_exec().expect("prepare exact path");
     command
+        .arg0("too-late-name")
         .arg("too-late")
         .env("ATERM_PREPARED_ENV", "after-go");
     let (image, path) = prepared.captured();
     assert_eq!(path.to_bytes(), b"/nonexistent/prepared-native-image");
     assert_eq!(image.argv.len(), 2);
+    assert_eq!(image.argv[0].to_bytes(), b"original-agent-name");
     assert_eq!(image.argv[1].to_bytes(), b"captured");
     assert!(
         image

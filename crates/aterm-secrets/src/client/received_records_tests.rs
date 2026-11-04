@@ -384,7 +384,9 @@ fn broken_layout_and_raw_frame_overflow_offer_no_prefix() {
         assert_eq!(actual.store.inventory(), history.store.inventory());
         assert_eq!(actual.memo_heads, 0);
     }
-    let bytes = good.bytes().repeat(crate::membership_log::MAX_RECORDS + 1);
+    let bytes = good
+        .bytes()
+        .repeat(crate::membership_log::MAX_HELD_RECORDS + 1);
     let actual = compare(&history.store, &history.store, bytes);
     assert!(actual.offered.is_none());
     assert_eq!(actual.memo_heads, 0);
@@ -470,16 +472,16 @@ fn decoded_receive_preserves_fresh_network_fallback_and_capacity_refusal() {
     assert_eq!(actual.store.inventory(), history.store.inventory());
 
     let mut previous = *history.genesis.id();
-    for sequence in 1..crate::membership_log::MAX_RECORDS as u64 {
+    for sequence in 1..crate::membership_log::MAX_HELD_RECORDS as u64 {
         let next = history.name(vec![previous], (sequence > 1).then_some(previous), sequence);
         previous = *next.id();
         history.store.insert(next).unwrap();
     }
-    assert_eq!(history.store.len(), crate::membership_log::MAX_RECORDS);
+    assert_eq!(history.store.len(), crate::membership_log::MAX_HELD_RECORDS);
     let beyond = history.name(
         vec![previous],
         Some(previous),
-        crate::membership_log::MAX_RECORDS as u64,
+        crate::membership_log::MAX_HELD_RECORDS as u64,
     );
     let actual = compare(&history.store, &history.store, beyond.bytes().to_vec());
     assert!(actual.whole);

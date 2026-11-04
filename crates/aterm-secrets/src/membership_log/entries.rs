@@ -1698,6 +1698,29 @@ impl Log {
         }))
     }
 
+    /// Every counting [`EpochAudience::Commons`] epoch, in record order: the log-era sources a
+    /// history handoff (`ACHG1`) can carry the key of to a member that holds no `Wrap` of one.
+    #[must_use]
+    pub fn commons_epoch_ids(&self) -> Vec<RecordId> {
+        let effective = self.effective();
+        self.order
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter(|&(i, record)| {
+                effective.counts(i)
+                    && matches!(
+                        record.body(),
+                        Body::Epoch {
+                            audience: EpochAudience::Commons,
+                            ..
+                        }
+                    )
+            })
+            .map(|(_, record)| *record.id())
+            .collect()
+    }
+
     /// Unwrap a single effective `EpochAudience::Commons` epoch key by record identifier (`F18`).
     ///
     /// # Errors
@@ -1764,377 +1787,6 @@ impl Log {
             }
         }
         Ok(None)
-    }
-
-    /// Fast structural check (without X25519 or AEAD decryption) for whether `my_recipient` has
-    /// any [`EpochAudience::Commons`] or active [`EpochAudience::Everyone`] wrap gap to close for
-    /// `active_recipients` or (when `allow_coalesce` is `true`) concurrent maximal epochs or
-    /// maximal epochs still wrapping removed recipients to rotate (`F18`).
-    #[must_use]
-    pub fn needs_commons_reconcile(
-        &self,
-        my_recipient: &Recipient,
-        active_recipients: &BTreeSet<Recipient>,
-        allow_coalesce: bool,
-    ) -> bool {
-        self.reconcile_due(my_recipient, active_recipients, allow_coalesce, true, false)
-    }
-
-    /// The coverage rule of §3.3.7 for host lists: the header hosts of each host list whose every
-    /// causally newest epoch is wrapped to `my_recipient` (so this Mac opens them) and which has two
-    /// or more newest epochs, or a newest epoch still wrapped to a Mac this log removed. A removal
-    /// by a member outside the list cannot rotate it, so one of the list's own members mints its
-    /// next epoch on a vault pass (F16's review).
-    #[must_use]
-    pub fn hosts_rotation_due(&self, my_recipient: &Recipient) -> Vec<Vec<String>> {
-        if self.recipient_is_removed(my_recipient) {
-            return Vec::new();
-        }
-        let effective = self.effective();
-        let mut epochs: BTreeMap<Vec<String>, Vec<(usize, RecordId)>> = BTreeMap::new();
-        let mut wrapped: BTreeMap<RecordId, BTreeSet<Recipient>> = BTreeMap::new();
-        for (i, record) in self.order.iter().enumerate().skip(1) {
-            if !effective.counts(i) {
-                continue;
-            }
-            match record.body() {
-                Body::Epoch {
-                    audience: EpochAudience::Hosts(hosts),
-                    ..
-                } => epochs
-                    .entry(hosts.clone())
-                    .or_default()
-                    .push((i, *record.id())),
-                Body::Wrap {
-                    epoch, recipient, ..
-                } => {
-                    wrapped.entry(*epoch).or_default().insert(*recipient);
-                }
-                _ => {}
-            }
-        }
-        let removed = self.removed_recipients();
-        let reseal = self.reseal_due(my_recipient);
-        epochs
-            .into_iter()
-            .filter(|(hosts, list)| {
-                let maximal: Vec<&RecordId> = list
-                    .iter()
-                    .filter(|&&(a, _)| !list.iter().any(|&(b, _)| a != b && effective.before(a, b)))
-                    .map(|(_, id)| id)
-                    .collect();
-                let opens = maximal.iter().all(|id| {
-                    wrapped
-                        .get(*id)
-                        .is_some_and(|set| set.contains(my_recipient))
-                });
-                let stale = maximal.len() > 1
-                    || maximal.iter().any(|id| {
-                        wrapped
-                            .get(*id)
-                            .is_some_and(|set| !set.is_disjoint(&removed))
-                    });
-                let due = reseal.contains(&EpochAudience::Hosts(hosts.clone()));
-                !maximal.is_empty() && opens && (stale || due)
-            })
-            .map(|(hosts, _)| hosts)
-            .collect()
-    }
-
-    /// F21 rule 5's due reason, structural: each audience with an uncovered keyed epoch that a
-    /// current member holds ([`Log::keyed_epochs`]), where the member `my_recipient` names holds
-    /// every such epoch and has the key of every newest counting epoch of the audience (it minted
-    /// it, or a counting [`Body::Wrap`] of it is addressed to `my_recipient`). A Mac that holds
-    /// none of them is not due for that audience at all, so it never takes a rank it cannot use.
-    #[must_use]
-    pub fn reseal_due(&self, my_recipient: &Recipient) -> BTreeSet<EpochAudience> {
-        let effective = self.effective();
-        let keyed = self.keyed_epochs_in(effective);
-        if keyed.is_empty() || self.recipient_is_removed(my_recipient) {
-            return BTreeSet::new();
-        }
-        let membership = self.membership();
-        let mine: BTreeSet<MemberId> = membership
-            .members()
-            .iter()
-            .filter(|(_, m)| m.binding.recipient() == *my_recipient)
-            .map(|(actor, _)| *actor)
-            .collect();
-        let mut uncovered: BTreeMap<EpochAudience, Vec<&Keyed>> = BTreeMap::new();
-        for epoch in &keyed {
-            if !epoch.covered && epoch.holders.iter().any(|h| membership.contains(h)) {
-                uncovered
-                    .entry(epoch.audience.clone())
-                    .or_default()
-                    .push(epoch);
-            }
-        }
-        if mine.is_empty() || uncovered.is_empty() {
-            return BTreeSet::new();
-        }
-        let mut epochs: BTreeMap<&EpochAudience, Vec<usize>> = BTreeMap::new();
-        let mut wrapped: BTreeMap<&RecordId, BTreeSet<&Recipient>> = BTreeMap::new();
-        for (i, record) in self.order.iter().enumerate().skip(1) {
-            if !effective.counts(i) {
-                continue;
-            }
-            match record.body() {
-                Body::Epoch { audience, .. } => epochs.entry(audience).or_default().push(i),
-                Body::Wrap {
-                    epoch, recipient, ..
-                } => {
-                    wrapped.entry(epoch).or_default().insert(recipient);
-                }
-                _ => {}
-            }
-        }
-        uncovered
-            .into_iter()
-            .filter(|(audience, list)| {
-                let held = list
-                    .iter()
-                    .all(|epoch| epoch.holders.iter().any(|h| mine.contains(h)));
-                let all = epochs.get(audience).map_or(&[][..], Vec::as_slice);
-                let newest: Vec<usize> = all
-                    .iter()
-                    .copied()
-                    .filter(|&a| !all.iter().any(|&b| a != b && effective.before(a, b)))
-                    .collect();
-                held && !newest.is_empty()
-                    && newest.iter().all(|&h| {
-                        mine.contains(self.order[h].actor())
-                            || wrapped
-                                .get(self.order[h].id())
-                                .is_some_and(|set| set.contains(my_recipient))
-                    })
-            })
-            .map(|(audience, _)| audience)
-            .collect()
-    }
-
-    /// What the vault pass's tender (`tend_epochs_at`) acts on for `[everyone]` and Commons: the
-    /// coverage rule of §3.3.7 ([`Log::coverage_due`]) or F21 rule 5's reseal
-    /// ([`Log::reseal_due`]). No wrap gap counts here: those close by the causal rule
-    /// (`Log::wrap_gaps`).
-    #[must_use]
-    pub fn rotation_due(
-        &self,
-        my_recipient: &Recipient,
-        active_recipients: &BTreeSet<Recipient>,
-    ) -> bool {
-        self.reconcile_due(my_recipient, active_recipients, true, false, true)
-    }
-
-    /// The coverage rule of §3.3.7 alone (keychain "Epochs"): whether the member `my_recipient`,
-    /// among `active_recipients`, has a wrap for every newest [`EpochAudience::Commons`] or
-    /// `[everyone]` epoch whose
-    /// audience has two or more causally newest epochs (concurrent removals on two sides of a
-    /// split) or a newest epoch still wrapped to a Mac this log removed (a quorum `Remove` voided
-    /// the remover's rotation, or a removal reached it before its new epoch), so the next writer
-    /// mints one higher epoch that covers them.
-    #[must_use]
-    pub fn coverage_due(
-        &self,
-        my_recipient: &Recipient,
-        active_recipients: &BTreeSet<Recipient>,
-    ) -> bool {
-        self.reconcile_due(my_recipient, active_recipients, true, false, false)
-    }
-
-    /// `reseal`: F21 rule 5's reason counts too. Only the ranked tender reseals, so the Commons
-    /// repair's [`Log::needs_commons_reconcile`] leaves it out.
-    fn reconcile_due(
-        &self,
-        my_recipient: &Recipient,
-        active_recipients: &BTreeSet<Recipient>,
-        allow_coalesce: bool,
-        gaps: bool,
-        reseal: bool,
-    ) -> bool {
-        if active_recipients.is_empty() || !active_recipients.contains(my_recipient) {
-            return false;
-        }
-        let effective = self.effective();
-        let mut commons_epochs: Vec<(usize, RecordId)> = Vec::new();
-        let mut everyone_epochs: Vec<(usize, RecordId)> = Vec::new();
-        let mut everyone_puts: Vec<(usize, RecordId)> = Vec::new();
-        let mut wrapped: BTreeMap<RecordId, BTreeSet<Recipient>> = BTreeMap::new();
-        for (i, record) in self.order.iter().enumerate().skip(1) {
-            if !effective.counts(i) {
-                continue;
-            }
-            match record.body() {
-                Body::Epoch {
-                    audience: EpochAudience::Commons,
-                    ..
-                } => {
-                    commons_epochs.push((i, *record.id()));
-                }
-                Body::Epoch {
-                    audience: EpochAudience::Everyone,
-                    ..
-                } => {
-                    everyone_epochs.push((i, *record.id()));
-                }
-                Body::Put {
-                    audience: EpochAudience::Everyone,
-                    epoch,
-                    ..
-                } => {
-                    everyone_puts.push((i, *epoch));
-                }
-                Body::Wrap {
-                    epoch, recipient, ..
-                } => {
-                    wrapped.entry(*epoch).or_default().insert(*recipient);
-                }
-                _ => {}
-            }
-        }
-        let maximal_commons: Vec<RecordId> = commons_epochs
-            .iter()
-            .filter(|&&(a, _)| {
-                !commons_epochs
-                    .iter()
-                    .any(|&(b, _)| a != b && effective.before(a, b))
-            })
-            .map(|&(_, id)| id)
-            .collect();
-        let maximal_everyone: Vec<RecordId> = everyone_epochs
-            .iter()
-            .filter(|&&(a, _)| {
-                !everyone_epochs
-                    .iter()
-                    .any(|&(b, _)| a != b && effective.before(a, b))
-            })
-            .map(|&(_, id)| id)
-            .collect();
-        if allow_coalesce {
-            // F21 rule 5: a holder of every uncovered keyed epoch of `[everyone]` or Commons, with
-            // the key of every newest epoch there, reseals it.
-            if reseal {
-                let due = self.reseal_due(my_recipient);
-                if due.contains(&EpochAudience::Everyone) || due.contains(&EpochAudience::Commons) {
-                    return true;
-                }
-            }
-            let removed = self.removed_recipients();
-            let can_open_all_max_commons = !maximal_commons.is_empty()
-                && maximal_commons.iter().all(|id| {
-                    wrapped
-                        .get(id)
-                        .is_some_and(|set| set.contains(my_recipient))
-                });
-            if can_open_all_max_commons
-                && (maximal_commons.len() > 1
-                    || (!removed.is_empty()
-                        && maximal_commons.iter().any(|id| {
-                            wrapped
-                                .get(id)
-                                .is_some_and(|set| !set.is_disjoint(&removed))
-                        })))
-            {
-                return true;
-            }
-            let can_open_all_max_everyone = !maximal_everyone.is_empty()
-                && maximal_everyone.iter().all(|id| {
-                    wrapped
-                        .get(id)
-                        .is_some_and(|set| set.contains(my_recipient))
-                });
-            if can_open_all_max_everyone
-                && (maximal_everyone.len() > 1
-                    || (!removed.is_empty()
-                        && maximal_everyone.iter().any(|id| {
-                            wrapped
-                                .get(id)
-                                .is_some_and(|set| !set.is_disjoint(&removed))
-                        })))
-            {
-                return true;
-            }
-        }
-        if !gaps {
-            return false;
-        }
-        let membership = self.membership();
-        let mut latest_entry_by_recipient: BTreeMap<Recipient, usize> = BTreeMap::new();
-        for seat in membership.members().values() {
-            if let Some(&entry_at) = self.held.get(&seat.entry) {
-                latest_entry_by_recipient
-                    .entry(seat.binding.recipient())
-                    .and_modify(|cur| *cur = (*cur).max(entry_at))
-                    .or_insert(entry_at);
-            }
-        }
-        let left_out_of = |maximal: &[RecordId]| -> BTreeSet<Recipient> {
-            latest_entry_by_recipient
-                .iter()
-                .filter_map(|(&recipient, &entry_at)| {
-                    let left_out = maximal.iter().any(|epoch| {
-                        let is_wrapped = wrapped
-                            .get(epoch)
-                            .is_some_and(|set| set.contains(&recipient));
-                        let knew = self
-                            .held
-                            .get(epoch)
-                            .is_some_and(|&at| entry_at == at || effective.before(entry_at, at));
-                        !is_wrapped && knew
-                    });
-                    left_out.then_some(recipient)
-                })
-                .collect()
-        };
-        let left_out_commons = left_out_of(&maximal_commons);
-        let left_out_everyone = left_out_of(&maximal_everyone);
-        if left_out_everyone.contains(my_recipient)
-            || self.audience_left_out_recipient(&EpochAudience::Everyone, my_recipient)
-        {
-            return false;
-        }
-        let commons_active: BTreeSet<Recipient> = active_recipients
-            .iter()
-            .copied()
-            .filter(|r| {
-                !left_out_commons.contains(r)
-                    && !left_out_everyone.contains(r)
-                    && !self.audience_left_out_recipient(&EpochAudience::Commons, r)
-                    && !self.audience_left_out_recipient(&EpochAudience::Everyone, r)
-            })
-            .collect();
-        let everyone_active: BTreeSet<Recipient> = active_recipients
-            .iter()
-            .copied()
-            .filter(|r| {
-                !left_out_everyone.contains(r)
-                    && !self.audience_left_out_recipient(&EpochAudience::Everyone, r)
-            })
-            .collect();
-        if commons_epochs.iter().any(|(_, ep_id)| {
-            wrapped
-                .get(ep_id)
-                .is_some_and(|set| set.contains(my_recipient) && !commons_active.is_subset(set))
-        }) {
-            return true;
-        }
-        for &(_, ep_id) in &everyone_epochs {
-            let is_maximal = maximal_everyone.contains(&ep_id);
-            let has_unretired_put = !is_maximal
-                && everyone_puts.iter().any(|&(p_idx, p_ep)| {
-                    p_ep == ep_id
-                        && !everyone_epochs
-                            .iter()
-                            .any(|&(b, _)| effective.before(p_idx, b))
-                });
-            if (is_maximal || has_unretired_put)
-                && wrapped.get(&ep_id).is_some_and(|set| {
-                    set.contains(my_recipient) && !everyone_active.is_subset(set)
-                })
-            {
-                return true;
-            }
-        }
-        false
     }
 
     /// Every keyed epoch (F21 rules 1 and 4), in record order: its dependents, who holds its key,
@@ -3503,6 +3155,15 @@ mod tests {
     }
 
     /// Sign `draft` with (`seed`, `incarnation`), hold it in `log`, and hand back its id.
+    /// The audiences `member` reseals under F21 rule 5 ([`Log::rekey_dues`]).
+    fn reseal_due_on(log: &Log, member: &MemberId) -> BTreeSet<EpochAudience> {
+        log.rekey_dues()
+            .into_iter()
+            .filter(|due| due.reseal && due.resealers.contains(member))
+            .map(|due| due.audience)
+            .collect()
+    }
+
     fn hold(log: &mut Log, draft: Draft, seed: &[u8; 32], incarnation: [u8; 16]) -> RecordId {
         let record = draft.sign(seed, incarnation).unwrap();
         let id = *record.id();
@@ -3878,9 +3539,8 @@ mod tests {
     /// §3.3.7's coverage rule has nothing to do there; the keyed epoch alone makes the list due
     /// on m2, its holder, which reads `h1`.
     ///
-    /// NEGATIVE CONTROL (restored with cp from a backup plus touch, confirmed with cmp):
-    /// `hosts_rotation_due` ignoring rule 5's reason (`stale || due` cut to `stale`): fails "the
-    /// list is due on its holder".
+    /// NEGATIVE CONTROL: `Log::rekey_dues` without rule 5's reason (`rotation || coverage ||
+    /// reseal` cut to `rotation || coverage`): fails "the list is due on its holder".
     #[test]
     fn a_host_list_with_an_uncovered_keyed_epoch_is_due_on_its_holder() {
         let t = three();
@@ -3942,8 +3602,8 @@ mod tests {
             "CONTROL: the list's keyed epoch is uncovered"
         );
         assert_eq!(
-            healed.hosts_rotation_due(&t.id2.recipient()),
-            std::slice::from_ref(&hosts),
+            reseal_due_on(&healed, &t.m2),
+            BTreeSet::from([EpochAudience::Hosts(hosts.clone())]),
             "the list is due on its holder"
         );
         let opened = healed.open_audience_entries(&t.id2).unwrap().unwrap();
@@ -4824,7 +4484,7 @@ mod tests {
             keyed.iter().any(|k| k.epoch == epoch_f && !k.covered),
             "CONTROL: F is uncovered after heal 2"
         );
-        let due = side_a.reseal_due(&t.id2.recipient());
+        let due = reseal_due_on(&side_a, &t.m2);
         assert!(
             due.contains(&EpochAudience::Everyone),
             "CONTROL: m2 is due to reseal F"
@@ -4842,9 +4502,9 @@ mod tests {
             side_a.keyed_epochs().iter().all(|k| k.covered),
             "m2's reseal covers F"
         );
-        for id in [&t.id1, &t.id2] {
+        for member in [&t.m1, &t.m2] {
             assert!(
-                side_a.reseal_due(&id.recipient()).is_empty(),
+                reseal_due_on(&side_a, member).is_empty(),
                 "no reseal is due once F is covered"
             );
         }

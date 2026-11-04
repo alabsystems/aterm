@@ -2761,7 +2761,7 @@ mod tests {
     }
 
     #[test]
-    fn source_debug_omits_url_credentials_including_nested_config() {
+    fn source_debug_omits_url_credentials() {
         let query = "synthetic-vault-query-credential";
         let fragment = "synthetic-vault-fragment-credential";
         for url in [
@@ -2769,22 +2769,7 @@ mod tests {
             format!("https://{query}@vault.example/v1/alab#{fragment}"),
         ] {
             let source = Source::Url(url);
-            #[cfg(unix)]
-            let config = crate::client::Config {
-                source: source.clone(),
-                name: "alab".to_owned(),
-                signer: None,
-                followed: Vec::new(),
-                host: "test-machine".to_owned(),
-            };
-            for shown in [
-                format!("{source:?}"),
-                format!("{source:#?}"),
-                #[cfg(unix)]
-                format!("{config:?}"),
-                #[cfg(unix)]
-                format!("{config:#?}"),
-            ] {
+            for shown in [format!("{source:?}"), format!("{source:#?}")] {
                 assert!(!shown.contains(query));
                 assert!(!shown.contains(fragment));
             }

@@ -3,9 +3,10 @@
 
 //! [`transparent`].
 
-use super::{Image, LaneChild, Placement, platform};
+use super::{Image, LaneChild, Placement, c_string, platform};
 use std::ffi::{OsStr, OsString};
 use std::io;
+use std::os::unix::ffi::OsStrExt as _;
 use std::process::ExitStatus;
 
 /// What [`TransparentCommand::spawn`] starts.
@@ -50,6 +51,7 @@ impl PreparedExec {
 #[derive(Debug)]
 pub struct TransparentCommand {
     program: OsString,
+    arg0: Option<OsString>,
     args: Vec<OsString>,
     /// Variables set over this process's environment, in the order they were set.
     env: Vec<(OsString, OsString)>,
@@ -60,12 +62,29 @@ pub struct TransparentCommand {
 pub fn transparent(program: impl AsRef<OsStr>) -> TransparentCommand {
     TransparentCommand {
         program: program.as_ref().to_owned(),
+        arg0: None,
         args: Vec::new(),
         env: Vec::new(),
     }
 }
 
 impl TransparentCommand {
+    /// Retain this pass-through's program, arguments, environment edits and descriptor
+    /// inheritance in a configurable native command with an owned [`super::Child`]. This
+    /// permits explicit stdio, directory and group policy without dropping inherited handles
+    /// such as a compiler jobserver's pipes. Ordinary [`super::command`] still inherits only
+    /// its explicitly named guards. The returned command follows [`super::Command`]'s signal,
+    /// session and exec rules. This conversion supplies no cohort birth receipt.
+    #[must_use]
+    pub fn into_command(self) -> super::Command {
+        let mut command = super::no_fork::Command::inheriting(self.program);
+        if let Some(arg0) = self.arg0 {
+            command.arg0(arg0);
+        }
+        command.args(self.args).envs(self.env);
+        command
+    }
+
     fn image(&self) -> io::Result<Image> {
         let mut env: Vec<(OsString, OsString)> = std::env::vars_os().collect();
         for (key, value) in &self.env {
@@ -74,7 +93,11 @@ impl TransparentCommand {
                 None => env.push((key.clone(), value.clone())),
             }
         }
-        Image::build(&self.program, &self.args, &env)
+        let mut image = Image::build(&self.program, &self.args, &env)?;
+        if let Some(arg0) = &self.arg0 {
+            image.argv[0] = c_string(arg0.as_bytes())?;
+        }
+        Ok(image)
     }
 
     /// Capture a native exec's environment, C strings, executable search and platform objects
@@ -88,6 +111,13 @@ impl TransparentCommand {
     /// attribute preparation. No signal disposition or descriptor flag has been changed.
     pub fn prepare_exec(&mut self) -> io::Result<PreparedExec> {
         platform::PreparedExec::new(self.image()?).map(PreparedExec)
+    }
+
+    /// Set argv[0] independently of the executable path used for dispatch.
+    /// Captured by `prepare_exec`, just like the remaining argument strings.
+    pub fn arg0(&mut self, arg0: impl AsRef<OsStr>) -> &mut Self {
+        self.arg0 = Some(arg0.as_ref().to_owned());
+        self
     }
 
     /// Append one argument.

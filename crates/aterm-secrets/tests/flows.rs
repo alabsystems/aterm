@@ -5,6 +5,8 @@
 
 #![cfg(unix)]
 
+aterm_durable::plain_durable_flushes_in_tests!();
+
 use aterm_secrets::SecretBytes;
 use aterm_secrets::age::Identity;
 use aterm_secrets::client::{

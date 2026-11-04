@@ -470,6 +470,7 @@ struct World {
 
 impl World {
     fn new(name: &str) -> Self {
+        aterm_spec::fs_lane::join();
         let scratch = aterm_tempfile::tempdir().unwrap().keep();
         eprintln!("capacity {name} world={}", scratch.display());
         let home = scratch.join("home");

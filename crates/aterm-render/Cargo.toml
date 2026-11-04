@@ -122,6 +122,8 @@ aterm-effects = { workspace = true }
 # tests/presentation_gate.rs: a derived-model proof that a default-text code point
 # never resolves to the colour-emoji face.
 aterm-spec = { workspace = true }
+# `.ubd/*.noindex` temporary directories with RAII cleanup for font_catalog tests.
+aterm-tempfile = { workspace = true }
 # The models its tests drive (a model edit rebuilds only their tests).
 aterm-models-effects = { workspace = true }
 aterm-models-render = { workspace = true }

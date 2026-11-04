@@ -83,7 +83,7 @@ pub use renderer::WindowTarget;
 pub use renderer::{
     DropOverlay, FetchProbe, FetchStage, FrameShape, GpuRenderer, GpuSurface, OverlayRefusal,
     PresentCrop, SurfacePresentFailure, TrayDelta, TrayLayer, TrayQuad, TrayScrim, UnormAblation,
-    UnormRoute, WindowGpu, tray_rows_to_upload,
+    UnormRoute, WindowGpu, drop_border_px, scaled_border_px, tray_rows_to_upload,
 };
 /// Demand-built effect pipeline identifiers and names (`renderer::EffectPipelines`).
 pub use renderer::{

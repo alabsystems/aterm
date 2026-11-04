@@ -445,7 +445,7 @@ pub fn record_path(home: &Path, pid: u32) -> PathBuf {
 
 /// The `$CODEX_HOME` a process started with `codex_home`/`home` in `cwd` uses:
 /// `CODEX_HOME` (resolved against `cwd` when relative), else `$HOME/.codex`; canonical where it exists.
-fn codex_home_of(
+pub(super) fn codex_home_of(
     codex_home: Option<&str>,
     cwd: Option<&Path>,
     home: Option<&str>,

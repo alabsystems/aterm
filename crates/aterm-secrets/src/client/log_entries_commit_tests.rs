@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::commons::binding::Request;
-use crate::membership_log::MAX_RECORDS;
+use crate::membership_log::MAX_HELD_RECORDS;
 
 fn entrant(tag: u8, label: &str) -> ([u8; 32], [u8; 16], MemberId, Entrant) {
     let writer = [tag; 32];
@@ -59,7 +59,7 @@ fn concurrent_ingress_cannot_commit_only_a_prefix_of_an_authored_batch() {
     let (writer, incarnation, actor, first) = entrant(1, "m1");
     let (peer_writer, peer_incarnation, peer, second) = entrant(2, "m2");
     let mut base = Log::new(Record::found(&[7; 32], vec![first, second], 1_000).unwrap()).unwrap();
-    while base.held_count() < MAX_RECORDS - 8 {
+    while base.held_count() < MAX_HELD_RECORDS - 8 {
         append_name(&mut base, &actor, &writer, incarnation);
     }
     super::super::save_records(&paths, &encode_records(base.records())).unwrap();
@@ -96,7 +96,7 @@ fn concurrent_ingress_cannot_commit_only_a_prefix_of_an_authored_batch() {
         retained, 0,
         "a refused authored batch must not publish a prefix"
     );
-    assert_eq!(after.len(), MAX_RECORDS - 1);
+    assert_eq!(after.len(), MAX_HELD_RECORDS - 1);
     assert!(
         peer_ids.iter().all(|id| after.contains(id)),
         "peer ingress remains durable"
@@ -120,7 +120,7 @@ fn concurrent_ingress_cannot_commit_only_a_prefix_of_an_authored_batch() {
     })
     .unwrap();
     assert_eq!(records.len(), 1);
-    assert_eq!(complete.len(), MAX_RECORDS);
+    assert_eq!(complete.len(), MAX_HELD_RECORDS);
     assert!(complete.holds(records[0].id()));
 
     // An already-held batch is a complete idempotent result even at capacity.
@@ -174,7 +174,7 @@ fn an_admin_publish_that_cannot_fit_its_log_refuses_without_publishing() {
                 .contains(&request.binding().actor())
         );
         owner.device().with_seed(|seed| {
-            while store.log().unwrap().held_count() < MAX_RECORDS {
+            while store.log().unwrap().held_count() < MAX_HELD_RECORDS {
                 let record = store
                     .log()
                     .unwrap()

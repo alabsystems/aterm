@@ -27,6 +27,11 @@
 //!   ahead under the namespace's validation, and its grant then writes the durable grant line
 //!   through `Laid::admit_cohort` (the traced claim's own grant is the model's initial state).
 //!
+//! Joining another member through `Claim::launch_cohort_member` changes none of these modeled
+//! fields: the group remains bound and nonempty. Its runtime controls retain the whole claim
+//! through leader reaping and each member's exit, admitting competing work only after final
+//! drain. New launches require the original live owned leader and current durable custody.
+//!
 //! The conformance traces (`cohort_failure_tests.rs`) project each: the host-then-worker SIGKILL
 //! trace, the live holder's drain with its finish and Drop or its Drop alone, the no-child
 //! cancellation, which keeps the next request waiting until its Drop retires it, and the unknown
@@ -65,7 +70,7 @@
     aterm_spec_anchor::spec_unmodeled(
         machine = "CapacityCohort",
         action = "ActualSpawn",
-        reason = "The actual child's birth: the kernel's fork and exec through aterm-uds's spawnfd::Command::spawn_cohort, which consumes a one-use BirthAttempt in a new self-led group; no function here starts a process. The conformance traces step it at the actual spawn and project the child's group from the kernel."
+        reason = "The actual child's birth: the kernel's fork and exec through aterm-uds's spawnfd::Command::spawn_cohort, which consumes a one-use BirthAttempt in a new self-led group. Claim::launch_cohort composes that native birth between durable ARM and BIND; the ledger does not implement fork or exec. The conformance traces step it at the actual spawn and project the child's group from the kernel."
     )
 )]
 #[cfg_attr(

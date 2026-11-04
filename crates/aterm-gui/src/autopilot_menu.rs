@@ -11,6 +11,7 @@ use crate::autopilot::AutopilotView;
 use crate::autopilot_timers::TimerChoice;
 use crate::claude_lights::{Fact, LandAtGlass};
 use crate::fact_menu::FactAct;
+use crate::menu_viewport::MenuViewport;
 use crate::tab_menu::{MenuRect, display_cells, ellipsize};
 use crate::{App, WindowId};
 
@@ -574,34 +575,39 @@ pub(crate) fn place(
 
 /// Index into `rows` at `frame_row`, or `None` on a border or past truncation.
 #[must_use]
-pub(crate) const fn row_at(rect: MenuRect, frame_row: usize) -> Option<usize> {
+pub(crate) fn row_at(
+    rect: MenuRect,
+    viewport: MenuViewport,
+    total: usize,
+    frame_row: usize,
+) -> Option<usize> {
     if frame_row <= rect.row || frame_row + 1 >= rect.row + rect.h {
         return None;
     }
-    Some(frame_row - rect.row - 1)
+    viewport.absolute(total, rect.h.saturating_sub(2), frame_row - rect.row - 1)
 }
 
 /// Selectable row index at frame `(row, col)`.
 #[must_use]
-pub(crate) fn item_at(rect: MenuRect, rows: &[MenuRow], row: usize, col: usize) -> Option<usize> {
+pub(crate) fn item_at(
+    rect: MenuRect,
+    rows: &[MenuRow],
+    viewport: MenuViewport,
+    row: usize,
+    col: usize,
+) -> Option<usize> {
     if !rect.contains(row, col) {
         return None;
     }
-    let i = row_at(rect, row)?;
+    let i = row_at(rect, viewport, rows.len(), row)?;
     rows.get(i).filter(|r| r.selectable()).map(|_| i)
 }
 
-/// Advance highlight by one selectable row within the first `shown` rows.
+/// Advance highlight through every selectable logical row, wrapping at either end.
 #[must_use]
-pub(crate) fn step(
-    rows: &[MenuRow],
-    from: Option<usize>,
-    down: bool,
-    shown: usize,
-) -> Option<usize> {
+pub(crate) fn step(rows: &[MenuRow], from: Option<usize>, down: bool) -> Option<usize> {
     let live: Vec<usize> = rows
         .iter()
-        .take(shown)
         .enumerate()
         .filter(|(_, r)| r.selectable())
         .map(|(i, _)| i)
@@ -617,11 +623,47 @@ pub(crate) fn step(
     })
 }
 
+fn page(
+    rows: &[MenuRow],
+    from: Option<usize>,
+    down: bool,
+    viewport: MenuViewport,
+    shown: usize,
+) -> Option<usize> {
+    if rows.is_empty() {
+        return None;
+    }
+    let at = from
+        .filter(|at| *at < rows.len())
+        .unwrap_or(viewport.range(rows.len(), shown).start);
+    let target = if down {
+        at.saturating_add(shown.max(1))
+            .min(rows.len().saturating_sub(1))
+    } else {
+        at.saturating_sub(shown.max(1))
+    };
+    let enabled = |i: &usize| rows[*i].selectable();
+    if down {
+        (target..rows.len())
+            .find(enabled)
+            .or_else(|| (0..=target).rev().find(enabled))
+    } else {
+        (0..=target)
+            .rev()
+            .find(enabled)
+            .or_else(|| (target..rows.len()).find(enabled))
+    }
+}
+
 /// Key action for an open menu.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MenuKey {
     Up,
     Down,
+    Home,
+    End,
+    PageUp,
+    PageDown,
     Choose,
     Close,
     PassThrough,
@@ -638,6 +680,10 @@ pub(crate) const fn key_of(key: &aterm_types::keyboard::Key) -> MenuKey {
     match key {
         Key::Named(Nk::ArrowUp | Nk::NumpadArrowUp) => MenuKey::Up,
         Key::Named(Nk::ArrowDown | Nk::NumpadArrowDown) => MenuKey::Down,
+        Key::Named(Nk::Home | Nk::NumpadHome) => MenuKey::Home,
+        Key::Named(Nk::End | Nk::NumpadEnd) => MenuKey::End,
+        Key::Named(Nk::PageUp | Nk::NumpadPageUp) => MenuKey::PageUp,
+        Key::Named(Nk::PageDown | Nk::NumpadPageDown) => MenuKey::PageDown,
         Key::Named(Nk::Enter | Nk::NumpadEnter) => MenuKey::Choose,
         Key::Named(Nk::Escape) => MenuKey::Close,
         _ => MenuKey::PassThrough,
@@ -649,6 +695,7 @@ pub(crate) const fn key_of(key: &aterm_types::keyboard::Key) -> MenuKey {
 pub(crate) fn paint(
     rect: MenuRect,
     rows: &[MenuRow],
+    viewport: MenuViewport,
     highlight: Option<usize>,
     theme: Theme,
 ) -> Vec<Vec<RenderCell>> {
@@ -670,7 +717,16 @@ pub(crate) fn paint(
     };
     let mut out = Vec::with_capacity(rect.h);
     out.push(edge('\u{250C}', '\u{2500}', '\u{2510}'));
-    for (i, row) in rows.iter().enumerate().take(rect.h.saturating_sub(2)) {
+    let visible = viewport.range(rows.len(), rect.h.saturating_sub(2));
+    if visible.start > 0 && w > 2 {
+        out[0][w - 2] = cell('↑', c.band.value, c.card_bg, true, false);
+    }
+    for (i, row) in rows
+        .iter()
+        .enumerate()
+        .take(visible.end)
+        .skip(visible.start)
+    {
         if matches!(row, MenuRow::Rule) {
             out.push(edge('\u{251C}', '\u{2500}', '\u{2524}'));
             continue;
@@ -721,6 +777,12 @@ pub(crate) fn paint(
     }
     if out.len() < rect.h {
         out.push(edge('\u{2514}', '\u{2500}', '\u{2518}'));
+    }
+    if visible.end < rows.len()
+        && w > 2
+        && let Some(bottom) = out.last_mut()
+    {
+        bottom[w - 2] = cell('↓', c.band.value, c.card_bg, true, false);
     }
     out.truncate(rect.h);
     out
@@ -781,6 +843,12 @@ pub(crate) struct AutopilotMenu {
     /// Armed timer deadline (unix ms) targeted by the cancel row.
     pub(crate) cancels: Option<i64>,
     pub(crate) highlight: Option<usize>,
+    pub(crate) viewport: MenuViewport,
+    /// Last painted capacity, retained while a changed viewport awaits its next frame.
+    pub(crate) page_rows: usize,
+    /// Partial wheel gestures belong to this popup, never to the covered pane.
+    pub(crate) wheel_residual: f64,
+    pub(crate) wheel_residual_x: f64,
     pub(crate) rect: Option<MenuRect>,
     pub(crate) laid: Option<crate::app_mouse::GlassGrid>,
     pub(crate) generation: u64,
@@ -811,6 +879,17 @@ impl PointerRest {
 type Choice = (MenuAct, String, bool);
 
 impl AutopilotMenu {
+    pub(crate) fn reveal_highlight(&mut self) {
+        if self
+            .viewport
+            .reveal(self.rows.len(), self.page_rows, self.highlight)
+        {
+            // Until painted, the new logical rows have no corresponding pixel hit targets.
+            self.rect = None;
+            self.generation = self.generation.wrapping_add(1);
+        }
+    }
+
     fn choice_at(&self, i: usize) -> Option<Choice> {
         match self.rows.get(i)? {
             MenuRow::Item {
@@ -868,6 +947,12 @@ impl AutopilotMenu {
             self.rect = None;
         }
         self.rows = laid;
+        if self
+            .viewport
+            .reveal(self.rows.len(), self.page_rows, self.highlight)
+        {
+            self.rect = None;
+        }
         self.generation = self.generation.wrapping_add(1);
         true
     }
@@ -927,6 +1012,8 @@ impl AutopilotMenu {
         self.spoken.hash(&mut h);
         self.cancels.hash(&mut h);
         self.rows.hash(&mut h);
+        self.viewport.hash(&mut h);
+        self.rect.hash(&mut h);
         crate::a11y_tree::menu_epoch_from(h.finish())
     }
 
@@ -938,6 +1025,8 @@ impl AutopilotMenu {
         self.anchor.hash(&mut h);
         self.highlight.hash(&mut h);
         self.rows.hash(&mut h);
+        self.viewport.hash(&mut h);
+        self.page_rows.hash(&mut h);
         h.finish() | 1
     }
 }
@@ -1095,9 +1184,7 @@ impl App {
             ..self.autopilot_menu_facts(session)
         };
         let rows = self.autopilot_menu_fit(wid, session, anchor, rows(&facts));
-        let highlight = keyboard
-            .then(|| step(&rows, None, true, rows.len()))
-            .flatten();
+        let highlight = keyboard.then(|| step(&rows, None, true)).flatten();
         let focus = self.focused_session_id(wid);
         let px = self
             .windows
@@ -1114,6 +1201,10 @@ impl App {
             spoken: facts.spoken,
             cancels: self.autopilot_timers.land_at_ms(session),
             highlight,
+            viewport: MenuViewport::default(),
+            page_rows: 0,
+            wheel_residual: 0.0,
+            wheel_residual_x: 0.0,
             rect: None,
             laid: None,
             generation: 0,
@@ -1303,14 +1394,23 @@ impl App {
             self.close_autopilot_menu();
             return None;
         };
+        let menu = self.autopilot_menu.as_mut()?;
+        menu.page_rows = rect.h.saturating_sub(2);
+        if menu
+            .viewport
+            .reveal(menu.rows.len(), menu.page_rows, menu.highlight)
+        {
+            menu.generation = menu.generation.wrapping_add(1);
+        }
         let laid = self.glass_grid(wid);
+        let menu = self.autopilot_menu.as_ref()?;
         let arrived = (menu.rect != Some(rect) || menu.laid != laid)
             && menu
                 .rest
                 .px
                 .and_then(|(x, y)| self.frame_cell_at(wid, x, y))
                 .is_some_and(|(row, col)| rect.contains(row, col));
-        let painted = paint(rect, &menu.rows, menu.highlight, theme);
+        let painted = paint(rect, &menu.rows, menu.viewport, menu.highlight, theme);
         let ws = self.windows.get_mut(&wid)?;
         let ground = crate::tab_menu::ground_cell(theme, ws.input_scratch.default_bg);
         let right = rect.col + rect.w;
@@ -1436,18 +1536,56 @@ impl App {
         if meaning != MenuKey::Inert {
             self.account_menu_read.cancel_keyboard_selection();
         }
-        let shown = menu.rect.map_or(menu.rows.len(), |r| r.h.saturating_sub(2));
         match meaning {
             MenuKey::Inert => true,
             MenuKey::Up | MenuKey::Down => {
                 let down = meaning == MenuKey::Down;
-                menu.highlight = step(&menu.rows, menu.highlight, down, shown);
+                menu.highlight = step(&menu.rows, menu.highlight, down);
+                menu.reveal_highlight();
+                self.request_menu_frame(wid);
+                true
+            }
+            MenuKey::Home | MenuKey::End | MenuKey::PageUp | MenuKey::PageDown => {
+                menu.highlight = if meaning == MenuKey::Home {
+                    menu.rows.iter().position(MenuRow::selectable)
+                } else if meaning == MenuKey::End {
+                    menu.rows.iter().rposition(MenuRow::selectable)
+                } else {
+                    let down = meaning == MenuKey::PageDown;
+                    let selected = page(
+                        &menu.rows,
+                        menu.highlight,
+                        down,
+                        menu.viewport,
+                        menu.page_rows,
+                    );
+                    let amount = isize::try_from(menu.page_rows).unwrap_or(isize::MAX);
+                    if menu.viewport.scroll(
+                        menu.rows.len(),
+                        menu.page_rows,
+                        if down { amount } else { -amount },
+                    ) {
+                        menu.rect = None;
+                        menu.generation = menu.generation.wrapping_add(1);
+                    }
+                    selected
+                };
+                menu.reveal_highlight();
                 self.request_menu_frame(wid);
                 true
             }
             MenuKey::Choose => {
                 match menu.highlight {
-                    Some(i) => self.choose_autopilot_menu_row(i),
+                    Some(i)
+                        if menu.rect.is_some_and(|rect| {
+                            menu.viewport
+                                .range(menu.rows.len(), rect.h.saturating_sub(2))
+                                .contains(&i)
+                        }) =>
+                    {
+                        self.choose_autopilot_menu_row(i)
+                    }
+                    Some(_) => self.request_menu_frame(wid),
                     None => {
                         self.close_autopilot_menu();
                     }
@@ -1463,6 +1601,30 @@ impl App {
                 false
             }
         }
+    }
+
+    /// Consume wheel input for this modal popup, including at its bounds and before first paint.
+    pub(crate) fn autopilot_menu_wheel(
+        &mut self,
+        wid: WindowId,
+        dir: aterm_types::mouse::WheelDir,
+        lines: i32,
+    ) -> bool {
+        let Some(menu) = self.autopilot_menu.as_mut().filter(|menu| menu.wid == wid) else {
+            return false;
+        };
+        self.account_menu_read.cancel_keyboard_selection();
+        if let Some(up) = dir.vertical_up() {
+            let amount = isize::try_from(lines.max(0)).unwrap_or(isize::MAX);
+            let delta = if up { -amount } else { amount };
+            if menu.viewport.scroll(menu.rows.len(), menu.page_rows, delta) {
+                menu.highlight = None;
+                menu.rect = None;
+                menu.generation = menu.generation.wrapping_add(1);
+                self.request_menu_frame(wid);
+            }
+        }
+        true
     }
 
     /// Handle a controller input event while the menu is open in `wid`.
@@ -1482,6 +1644,7 @@ impl App {
                 ..
             } => false,
             InputEvent::Key { key, .. } => self.autopilot_menu_nav(wid, key_of(key)),
+            InputEvent::Wheel { dir, lines, .. } => self.autopilot_menu_wheel(wid, *dir, *lines),
             _ => {
                 self.close_autopilot_menu();
                 false
@@ -1509,7 +1672,7 @@ impl App {
             .filter(|(rect, (row, col))| rect.contains(*row, *col));
         match on_card {
             Some((rect, (row, col))) => {
-                if left && let Some(i) = item_at(rect, &menu.rows, row, col) {
+                if left && let Some(i) = item_at(rect, &menu.rows, menu.viewport, row, col) {
                     if menu.press_lands(row, i) {
                         self.choose_autopilot_menu_row(i);
                         if self.autopilot_menu.as_ref().is_none_or(|m| m.wid != wid) {
@@ -1575,7 +1738,7 @@ impl App {
             menu.note_pointer((x, y), cell.map(|(r, _)| r), None);
             return false;
         };
-        let hovered = item_at(rect, &menu.rows, row, col);
+        let hovered = item_at(rect, &menu.rows, menu.viewport, row, col);
         menu.note_pointer((x, y), Some(row), hovered);
         if hovered.is_some() && hovered != menu.highlight {
             menu.highlight = hovered;
@@ -1616,7 +1779,14 @@ impl App {
         let mut selected = None;
         let mut notes: Vec<&str> = Vec::new();
         let mut set_by: Vec<&str> = Vec::new();
-        for (i, row) in menu.rows.iter().enumerate().take(shown_rows(rect)) {
+        let visible = menu.viewport.range(menu.rows.len(), shown_rows(rect));
+        for (i, row) in menu
+            .rows
+            .iter()
+            .enumerate()
+            .take(visible.end)
+            .skip(visible.start)
+        {
             match row {
                 MenuRow::Note { spoken, .. } | MenuRow::Plot { spoken, .. } => {
                     notes.push(spoken.as_str());
@@ -1636,7 +1806,7 @@ impl App {
                         label: spoken.clone(),
                         checked: matches!(act, MenuAct::Mode(_)).then_some(*checked),
                         disabled: !enabled,
-                        row: top + 1 + i,
+                        row: top + 1 + i - visible.start,
                     });
                 }
                 MenuRow::Header(_) | MenuRow::Name(_) | MenuRow::Rule | MenuRow::Gap(_) => {}
@@ -1677,10 +1847,12 @@ impl App {
             .filter(|m| m.wid == wid && m.a11y_epoch() == epoch)
             .and_then(|m| {
                 let rect = m.rect?;
+                let visible = m.viewport.range(m.rows.len(), shown_rows(rect));
                 m.rows
                     .iter()
                     .enumerate()
-                    .take(shown_rows(rect))
+                    .take(visible.end)
+                    .skip(visible.start)
                     .filter(|(_, row)| matches!(row, MenuRow::Item { .. }))
                     .nth(item)
                     .map(|(i, _)| i)

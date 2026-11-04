@@ -56,8 +56,6 @@ pub const ROUND_S: i64 = 600;
 /// A lookback rise of at least this many tenths (one point) on the carrier's scale is the
 /// working pass's week rate; less, and the week's pace is.
 pub const WORKING_WEEK_MIN_X10: i64 = 10;
-/// The most rows the outlook models ([`accounts::MAX_ACCOUNTS`]).
-pub const MAX_ROWS: usize = accounts::MAX_ACCOUNTS;
 
 const FULL_X10: i64 = 1000;
 const HOUR: i64 = 3600;
@@ -234,6 +232,8 @@ pub enum Fresh {
     ResetUnread,
     /// No figure, wall or warning, ever.
     NeverRead,
+    /// A reading exists, but its observation time cannot be admitted on this clock.
+    ClockInvalid,
     /// A wall stands.
     Walled,
     /// Its login is signed out.
@@ -255,6 +255,7 @@ impl Fresh {
             Fresh::Pool => "pool",
             Fresh::ResetUnread => "reset-unread",
             Fresh::NeverRead => "never-read",
+            Fresh::ClockInvalid => "clock-invalid",
             Fresh::Walled => "walled",
             Fresh::SignedOut => "signed-out",
             Fresh::NotEnrolled => "not-enrolled",
@@ -266,9 +267,11 @@ impl Fresh {
         match self {
             Fresh::Now | Fresh::AsOf | Fresh::Stale | Fresh::Walled => Known::Exact,
             Fresh::IdleHere | Fresh::UsedSince | Fresh::Pool => Known::Lower,
-            Fresh::ResetUnread | Fresh::NeverRead | Fresh::SignedOut | Fresh::NotEnrolled => {
-                Known::Unknown
-            }
+            Fresh::ResetUnread
+            | Fresh::NeverRead
+            | Fresh::ClockInvalid
+            | Fresh::SignedOut
+            | Fresh::NotEnrolled => Known::Unknown,
         }
     }
 
@@ -873,8 +876,9 @@ impl Offsets {
 // ---------------------------------------------------------------------------------------------
 // Figures and classes
 
-/// The newest figure of a window on record: a tap figure (not cut by a reset), a sample's, else a
-/// warning's, whatever its reset.
+/// A window's newest time-admitted tap/sample figure, else an admitted warning,
+/// whatever its reset. Raw clock-invalid evidence survives only when no source
+/// is admitted, so its unknown clock is distinct from an unread window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Seen {
     pct_x10: u32,
@@ -884,7 +888,7 @@ struct Seen {
     source: Source,
 }
 
-fn seen_of(acct: &accounts::Account, w: Window, machine: &str) -> Option<Seen> {
+fn seen_of(acct: &accounts::Account, w: Window, machine: &str, now: i64) -> Option<Seen> {
     let tap = acct.windows.get(w.id()).filter(|f| !f.cut()).map(|f| Seen {
         pct_x10: f.pct_x10.min(1000),
         reset: f.reset,
@@ -917,11 +921,7 @@ fn seen_of(acct: &accounts::Account, w: Window, machine: &str) -> Option<Seen> {
             },
         })
     });
-    let newer = match (tap, sample) {
-        (Some(a), Some(b)) => Some(if b.at > a.at { b } else { a }),
-        (a, b) => a.or(b),
-    };
-    newer.or_else(|| {
+    let warning = (|| {
         let warned = match w {
             Window::Week => acct.warned_week.as_ref(),
             Window::Five => acct.warned_session.as_ref(),
@@ -935,7 +935,30 @@ fn seen_of(acct: &accounts::Account, w: Window, machine: &str) -> Option<Seen> {
                 here: true,
             },
         })
-    })
+    })();
+    let newer = |a: Option<Seen>, b: Option<Seen>| match (a, b) {
+        (Some(a), Some(b)) => Some(if b.at > a.at { b } else { a }),
+        (a, b) => a.or(b),
+    };
+    let admitted = |reading: Option<Seen>| {
+        reading.filter(|reading| {
+            super::profile::usage_read_age(reading.at, now).is_some()
+                && acct
+                    .windows
+                    .get(w.id())
+                    .is_none_or(|window| window.admits_reading(reading.at))
+        })
+    };
+    let clock_invalid = |reading: Option<Seen>| {
+        reading.filter(|reading| super::profile::usage_read_age(reading.at, now).is_none())
+    };
+    // An invalid newer source cannot hide admissible history. If none is admitted,
+    // retain clock-invalid evidence to distinguish it from an unread window. A
+    // reading before the refill barrier remains cut, as it was before fallback.
+    newer(admitted(tap), admitted(sample))
+        .or_else(|| admitted(warning))
+        .or_else(|| newer(clock_invalid(tap), clock_invalid(sample)))
+        .or_else(|| clock_invalid(warning))
 }
 
 fn ran_here_since(state: &State, label: &str, since: i64) -> bool {
@@ -964,7 +987,7 @@ fn fresh_of(
     now: i64,
 ) -> (Fresh, Option<Seen>) {
     let acct = state.accounts.get(&row.label);
-    let seen = acct.and_then(|a| seen_of(a, w, &state.machine));
+    let seen = acct.and_then(|a| seen_of(a, w, &state.machine, now));
     let fresh = match cond {
         Condition::NotEnrolled => Fresh::NotEnrolled,
         Condition::SignedOut => Fresh::SignedOut,
@@ -983,6 +1006,7 @@ fn fresh_of(
         }
         _ => match seen {
             None => Fresh::NeverRead,
+            Some(s) if super::profile::usage_read_age(s.at, now).is_none() => Fresh::ClockInvalid,
             Some(s) if s.reset > now => {
                 let age = now.saturating_sub(s.at);
                 if age <= super::profile::USAGE_CURRENT_S {
@@ -1036,8 +1060,12 @@ struct Run<'a> {
     figs: Vec<&'a account_series::Fig>,
 }
 
-fn runs<'a>(rows: &'a [SeriesRow], w: Window) -> Vec<Run<'a>> {
-    let mut figs: Vec<&account_series::Fig> = rows.iter().filter_map(|r| r.fig(w.id())).collect();
+fn runs<'a>(rows: &'a [SeriesRow], w: Window, now: i64) -> Vec<Run<'a>> {
+    let mut figs: Vec<&account_series::Fig> = rows
+        .iter()
+        .filter_map(|r| r.fig(w.id()))
+        .filter(|figure| super::profile::usage_read_age(figure.at, now).is_some())
+        .collect();
     figs.sort_by_key(|f| f.at);
     let mut out: Vec<Run<'a>> = Vec::new();
     for fig in figs {
@@ -1076,11 +1104,15 @@ fn rise(
     let mut earliest: Option<i64> = None;
     let mut before = false;
     for (label, rows) in series {
-        if rows.iter().any(|r| r.t <= a && r.fig(w.id()).is_some()) {
+        if rows.iter().any(|r| {
+            r.t <= a
+                && r.fig(w.id())
+                    .is_some_and(|figure| super::profile::usage_read_age(figure.at, now).is_some())
+        }) {
             before = true;
         }
         let m = i64::from(plans.get(label).copied().unwrap_or(default_m));
-        for run in runs(rows, w) {
+        for run in runs(rows, w, now) {
             let (Some(first), Some(last)) = (run.figs.first(), run.figs.last()) else {
                 continue;
             };
@@ -2031,7 +2063,8 @@ fn carrier_of<'a>(inputs: &Inputs<'a>) -> Result<&'a accounts::Row, Refusal> {
 fn win_of(seen: Option<Seen>, fresh: Fresh, m: u32, now: i64, w: Window) -> Win {
     let scale = i128::from(m.max(1)) * i128::from(DAY);
     let known = fresh.known();
-    let current = seen.filter(|s| s.reset > now);
+    let admitted = seen.filter(|s| super::profile::usage_read_age(s.at, now).is_some());
+    let current = admitted.filter(|s| s.reset > now);
     match (fresh, current) {
         (Fresh::Walled, s) => Win {
             acc: i128::from(FULL_X10) * scale,
@@ -2047,7 +2080,7 @@ fn win_of(seen: Option<Seen>, fresh: Fresh, m: u32, now: i64, w: Window) -> Win 
             low_fired: false,
             fills_at: None,
         },
-        (_, None) if w == Window::Five && seen.is_some() => Win {
+        (_, None) if w == Window::Five && admitted.is_some() => Win {
             acc: 0,
             reset: None,
             known: Known::Exact,
@@ -2062,6 +2095,52 @@ fn win_of(seen: Option<Seen>, fresh: Fresh, m: u32, now: i64, w: Window) -> Win 
             fills_at: None,
         },
     }
+}
+
+/// Only the replay's private copy withdraws clock-invalid quota inputs. Retain
+/// policy walls, access, claims, pins and session facts; the source stays lossless.
+fn quota_replay_state(source: &State, now: i64) -> State {
+    let mut replay = source.clone();
+    for account in replay.accounts.values_mut() {
+        let barriers = account.windows.clone();
+        let admitted = |window: &str, at: i64| {
+            super::profile::usage_read_age(at, now).is_some()
+                && barriers
+                    .get(window)
+                    .is_none_or(|barrier| barrier.admits_reading(at))
+        };
+        account.windows.retain(|_, figure| {
+            super::profile::usage_read_age(figure.at, now).is_some() || figure.cut()
+        });
+        for sample in [&mut account.sample, &mut account.before]
+            .into_iter()
+            .flatten()
+        {
+            if !admitted(
+                accounts::WEEK_LIMIT,
+                sample.week_read_at.unwrap_or(sample.at),
+            ) {
+                sample.week_pct = None;
+                sample.week_reset = None;
+            }
+            if !admitted(
+                accounts::SESSION_LIMIT,
+                sample.session_read_at.unwrap_or(sample.at),
+            ) {
+                sample.session_pct = None;
+                sample.session_reset = None;
+            }
+        }
+        account.warned_week = account
+            .warned_week
+            .take()
+            .filter(|warning| admitted(accounts::WEEK_LIMIT, warning.at));
+        account.warned_session = account
+            .warned_session
+            .take()
+            .filter(|warning| admitted(accounts::SESSION_LIMIT, warning.at));
+    }
+    replay
 }
 
 /// One decision the replay took: the clone it asked on, the carrier, the point, the instant and
@@ -2199,7 +2278,7 @@ fn build(
     }
     let mut rows = Vec::new();
     let mut sim_rows = Vec::new();
-    for row in roster.rows.iter().take(MAX_ROWS) {
+    for row in &roster.rows {
         let enrolled = inputs.enrolled.contains(&row.label);
         let cond = accounts::condition(row, state, enrolled, now);
         let is_carrier = carrier_label.as_deref() == Some(row.label.as_str());
@@ -2230,7 +2309,11 @@ fn build(
         let (fresh_five, seen_five) = fresh_of(row, state, cond, is_carrier, Window::Five, now);
         let window = |w: Window, fresh: Fresh, seen: Option<Seen>| WindowOutlook {
             window: w,
-            used_x10: seen.filter(|_| fresh.shows_figure()).map(|s| s.pct_x10),
+            used_x10: seen
+                .filter(|s| {
+                    fresh.shows_figure() && super::profile::usage_read_age(s.at, now).is_some()
+                })
+                .map(|s| s.pct_x10),
             reset: seen.map(|s| s.reset),
             at: seen.map(|s| s.at),
             fresh,
@@ -2238,7 +2321,7 @@ fn build(
             source: seen.map(|s| s.source),
         };
         let walled = matches!(cond, Condition::Limited { .. }).then(|| {
-            let mut clone = state.clone();
+            let mut clone = quota_replay_state(state, now);
             prove_available_active(inputs, &mut clone);
             let window = state
                 .accounts
@@ -2311,7 +2394,8 @@ fn build(
             week: start(seen_week, fresh_week, Window::Week),
             five: start(seen_five, fresh_five, Window::Five),
             fresh_week,
-            read_week: seen_week.filter(|s| s.reset > now),
+            read_week: seen_week
+                .filter(|s| s.reset > now && super::profile::usage_read_age(s.at, now).is_some()),
         });
     }
     let multiples: BTreeMap<String, u32> =
@@ -2364,7 +2448,7 @@ fn build(
             return out;
         }
     };
-    let mut clone = state.clone();
+    let mut clone = quota_replay_state(state, now);
     if clone.active.is_none() {
         clone.active = Some(carrier_label.clone());
     }
@@ -2456,7 +2540,8 @@ fn build(
             win.projection = match win.window {
                 Window::Week => week_proj.get(&key).copied(),
                 Window::Five => working_proj.get(&key).copied(),
-            };
+            }
+            .filter(|_| win.fresh != Fresh::ClockInvalid);
         }
     }
     out.not_needed = out
@@ -2498,8 +2583,13 @@ fn demand_of(
                 age_s: at.map_or(0, |at| now - at),
             });
         }
-        if at.is_some_and(|at| at > now + super::profile::USAGE_SKEW_S) {
+        if at.is_some_and(|at| {
+            at > 0 && now > 0 && super::profile::usage_read_age(at, now).is_none()
+        }) {
             return Some(Refusal::Skew);
+        }
+        if win.fresh == Fresh::ClockInvalid {
+            return Some(Refusal::NoFigure);
         }
         if win.reset.is_none_or(|r| r <= now) || at.is_none() {
             return Some(Refusal::NoFigure);
@@ -3120,14 +3210,14 @@ impl Outlook {
     #[must_use]
     pub fn verdict_spoken(&self) -> String {
         let cannot = |row: &str| {
-            let never = self
+            let fresh = self
                 .row(row)
                 .and_then(|r| r.window(Window::Week))
-                .is_some_and(|w| w.fresh == Fresh::NeverRead);
-            if never {
-                "which aterm has never read"
-            } else {
-                "which aterm cannot read"
+                .map(|w| w.fresh);
+            match fresh {
+                Some(Fresh::NeverRead) => "which aterm has never read",
+                Some(Fresh::ClockInvalid) => "whose observation time is unconfirmed",
+                _ => "which aterm cannot read",
             }
         };
         match &self.verdict {
@@ -3210,10 +3300,18 @@ impl Outlook {
     pub fn glance(&self, label: &str, used_x10: Option<u32>, movable: bool) -> Option<Glance> {
         let row = self.row(label)?;
         let week = row.window(Window::Week)?;
+        let clock_admitted = self.as_of > 0
+            && week
+                .at
+                .is_none_or(|at| super::profile::usage_read_age(at, self.as_of).is_some());
         let projection = week
             .projection
-            .filter(|_| self.demand.week.is_ok() && (movable || row.carrier));
-        let used = used_x10.or(week.used_x10);
+            .filter(|_| clock_admitted && self.demand.week.is_ok() && (movable || row.carrier));
+        let used = if week.fresh == Fresh::Walled {
+            Some(1000)
+        } else {
+            clock_admitted.then(|| used_x10.or(week.used_x10)).flatten()
+        };
         let bar = used.map(|used| {
             let ten = bar_cells(used, projection, 10);
             let five = bar_cells(used, projection, 5);
@@ -3224,7 +3322,7 @@ impl Outlook {
         });
         let reset = week
             .reset
-            .filter(|r| *r > self.as_of && week.fresh != Fresh::Walled)
+            .filter(|r| clock_admitted && *r > self.as_of && week.fresh != Fresh::Walled)
             .map(|r| self.when(r));
         // The 5-hour part says a figure of now only: the rule gives it no age, and a 5-hour
         // window moves too fast for an aged one to stand bare.
@@ -3278,7 +3376,7 @@ impl Outlook {
         let mut spoken = String::new();
         let week_reset = week
             .reset
-            .filter(|r| *r > self.as_of && week.fresh != Fresh::Walled);
+            .filter(|r| clock_admitted && *r > self.as_of && week.fresh != Fresh::Walled);
         if let Some(clause) = self.reset_pace_spoken(week_reset, projection) {
             let mut chars = clause.chars();
             if let Some(first) = chars.next() {
@@ -3519,6 +3617,7 @@ impl Outlook {
             Fresh::ResetUnread if short => "not read since reset".into(),
             Fresh::ResetUnread => "reset passed, not read since".into(),
             Fresh::NeverRead => "never read".into(),
+            Fresh::ClockInvalid => "observation time unconfirmed".into(),
             Fresh::Walled => format!(
                 "limited to {}",
                 row.walled
@@ -3568,6 +3667,12 @@ impl Outlook {
     }
 
     fn reset_words(&self, w: &WindowOutlook) -> String {
+        if !w
+            .at
+            .is_some_and(|at| super::profile::usage_read_age(at, self.as_of).is_some())
+        {
+            return String::new();
+        }
         match (w.fresh, w.reset) {
             (Fresh::ResetUnread, Some(r)) => {
                 format!("reset {}", day_words(r, &self.offsets))
@@ -3786,15 +3891,12 @@ impl Outlook {
         }
         let mut out = format!("Next 7 days at today's pace: {}", said.join(", then "));
         if let Some(lean) = &pass.lean {
-            out.push_str(&format!(
-                ", then {}, which aterm {}",
-                lean.row,
-                if lean.why == Fresh::NeverRead {
-                    "has never read"
-                } else {
-                    "cannot read"
-                }
-            ));
+            let cause = match lean.why {
+                Fresh::NeverRead => "which aterm has never read",
+                Fresh::ClockInvalid => "whose observation time is unconfirmed",
+                _ => "which aterm cannot read",
+            };
+            out.push_str(&format!(", then {}, {cause}", lean.row));
         } else if pass.stops.is_empty() {
             out.push_str("; no stop");
         }
@@ -3880,6 +3982,7 @@ impl Outlook {
                             "{head} ({})",
                             match why {
                                 Fresh::NeverRead => "never read",
+                                Fresh::ClockInvalid => "observation time unconfirmed",
                                 f if f.bounded() => "not read lately",
                                 _ => "not read",
                             }
@@ -4295,7 +4398,13 @@ impl Outlook {
 
     fn window_line(&self, row: &RowOutlook, w: &WindowOutlook) -> String {
         let mut out = format!("       {:<5} ", w.window.word());
-        let closed = w.reset.is_some_and(|r| r <= self.as_of);
+        if w.fresh == Fresh::ClockInvalid {
+            out.push_str("\u{2014} \u{b7} observation time unconfirmed");
+            return out;
+        }
+        let closed =
+            w.at.is_some_and(|at| super::profile::usage_read_age(at, self.as_of).is_some())
+                && w.reset.is_some_and(|r| r <= self.as_of);
         if w.window == Window::Five && closed {
             out.push_str(&format!(
                 "reset {} passed: opens on first use",

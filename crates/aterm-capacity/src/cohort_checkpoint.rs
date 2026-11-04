@@ -1336,6 +1336,9 @@ pub(super) struct TestWorld(Option<aterm_tempfile::TempDir>);
 #[cfg(test)]
 impl TestWorld {
     pub(super) fn new(label: &str) -> Self {
+        // Each ledger operation reopens and validates the namespace's directories, so a world's
+        // test is file system heavy: it takes a place in the lane.
+        aterm_spec::fs_lane::join();
         let temporary = aterm_tempfile::tempdir().unwrap();
         eprintln!(
             "capacity {label} fixture world: {}",

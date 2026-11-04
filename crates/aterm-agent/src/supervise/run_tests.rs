@@ -333,6 +333,9 @@ struct Mock {
     cell_attrs_on: BTreeMap<usize, &'static str>,
     cell_fg: &'static str,
     cell_unreadable: bool,
+    /// Every `cell` read fails (`ERR evicted`) while the script's screen `i` is the one last
+    /// served: a glyph's cell unread on that screen alone.
+    cell_unread_on: std::collections::BTreeSet<usize>,
     cells: BTreeMap<(usize, usize), String>,
     history_cells: BTreeMap<(usize, usize), String>,
     human_ms_reads: VecDeque<Option<u64>>,
@@ -1195,6 +1198,7 @@ impl Mock {
             cell_attrs_on: BTreeMap::new(),
             cell_fg: "d0d0d0",
             cell_unreadable: false,
+            cell_unread_on: std::collections::BTreeSet::new(),
             cells: BTreeMap::new(),
             history_cells: BTreeMap::new(),
             human_ms_reads: VecDeque::new(),
@@ -3291,6 +3295,13 @@ impl Mock {
             "search" if self.scrollback.is_some() => Ok(self.scrollback_search(tail)),
             "line" if self.scrollback.is_some() => Ok(self.scrollback_line(tail)),
             "cell" if self.cell_unreadable => Ok(err("no such verb: cell")),
+            "cell"
+                if self
+                    .cell_unread_on
+                    .contains(&self.served.saturating_sub(1).min(self.screens.len() - 1)) =>
+            {
+                Ok(err("evicted"))
+            }
             "cell" if self.cell_lost_once_told && self.attention.is_some() => {
                 self.cell_lost_once_told = false;
                 Ok(err("evicted"))

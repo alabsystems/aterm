@@ -29,7 +29,8 @@ pub(super) const HARNESS_CONFIG_TOGGLE: &str = "harness/config/toggle";
 pub(super) const HARNESS_DECIDED_ALL: &str = "harness/decided/all";
 
 /// Every action of the Owner rules card starts with this (`docs/DESIGN-harness-occupancy-2026-10-20.md`
-/// §3.3): its Confirm is the owner's yes to a rule's text, so `act` presses none of them
+/// §3.3): its Confirm is the owner's yes to a rule's text, so neither `act` nor a control
+/// client's key or click nor an accessibility client's press reaches any of them
 /// (`app_control`'s person-only list). No action carries it yet.
 pub(crate) const OWNER_RULES_PREFIX: &str = "harness/owner-rules/";
 

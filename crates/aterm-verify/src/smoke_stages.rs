@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::Ctx;
@@ -454,35 +455,212 @@ fn typing_burst(ctx: &Ctx, r: &mut Report, sb: &mut Sandbox, ctl_bin: &Path) {
         r.raw(smoke_log_tail("GUI smoke", &sb.gui_log));
         return;
     }
-    if !crate::smoke::activate_macos_gui_pid(pid) {
-        r.skip("gui smoke (could not keep the test window frontmost)");
-        return;
+    guarded_burst(
+        r,
+        burst_timing_entry,
+        |timing| {
+            burst_target_ready(
+                || !child_exited(sb),
+                || crate::smoke::activate_macos_gui_pid(pid),
+                || check_burst_timing(timing),
+            )?;
+            let got = ctl(ctx, sb, ctl_bin, &["metrics", "reset"]);
+            if !ok_reply(&got) {
+                return Err(BurstError::Failed(format!(
+                    "gui smoke: metrics reset -> {}",
+                    or_no_reply(&got)
+                )));
+            }
+            let args = hwkey_burst_args();
+            let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+            let got = ctl(ctx, sb, ctl_bin, &argv);
+            let Some(posted) = metric_u64(&got, "posted").filter(|_| ok_reply(&got)) else {
+                return Err(BurstError::Failed(format!(
+                    "gui smoke: hardware key injection -> {}",
+                    or_no_reply(&got)
+                )));
+            };
+            std::thread::sleep(SETTLE);
+            Ok(BurstReadings {
+                posted,
+                summary: ctl(ctx, sb, ctl_bin, &["metrics"]),
+                percentiles: ctl(ctx, sb, ctl_bin, &["metrics", "percentiles"]),
+            })
+        },
+        check_burst_timing,
+    );
+}
+
+struct BurstTiming {
+    outer: Arc<aterm_capacity::Claim>,
+    entry: aterm_capacity::Claim,
+}
+
+fn burst_timing_entry() -> Result<(BurstTiming, String), String> {
+    let outer = crate::current_quiet_claim().ok_or("gui burst has no stage timing reservation")?;
+    outer
+        .timing_admission()
+        .map_err(|why| format!("outer timing hold: {why}"))?;
+    let mut entry = crate::admit_live(
+        aterm_capacity::Need::timing("gui cursor-pacing burst entry"),
+        aterm_capacity::Admit::Wait,
+    )
+    .map_err(|why| format!("burst timing admission: {why}"))?;
+    let window = entry
+        .measurement_entry()
+        .map_err(|why| format!("burst measurement entry: {why}"))?;
+    outer
+        .timing_admission()
+        .map_err(|why| format!("outer timing hold after entry: {why}"))?;
+    let bounds = |claim: &aterm_capacity::Claim| {
+        let admitted = claim.record().timing.admitted_ms;
+        let expires = admitted
+            .zip(claim.record().need.patience)
+            .and_then(|(at, p)| at.checked_add(u64::try_from(p.hold.as_millis()).ok()?));
+        (admitted, expires)
+    };
+    let (admitted, expires) = bounds(&entry);
+    let (outer_admitted, outer_expires) = bounds(&outer);
+    let note = format!(
+        "timing phase=gui_burst_entry provider=sysprobe_core_ticks scope=sampled_global_cpu_window;not_continuous_quiet observed_ms={} interval_ns={} cores={} busy_ticks={} total_ticks={} entry_load1={:?} actual_admitted_ms={admitted:?} expires_ms={expires:?} outer_actual_admitted_ms={outer_admitted:?} outer_expires_ms={outer_expires:?}",
+        window.observed_ms,
+        window.interval_ns,
+        window.cores,
+        window.busy_ticks,
+        window.total_ticks,
+        entry.record().timing.entry_load1,
+    );
+    Ok((BurstTiming { outer, entry }, note))
+}
+
+fn check_burst_timing(timing: &BurstTiming) -> Result<(), String> {
+    timing
+        .outer
+        .timing_admission()
+        .map_err(|why| format!("outer timing hold: {why}"))?;
+    timing
+        .entry
+        .timing_admission()
+        .map_err(|why| format!("burst timing hold: {why}"))?;
+    Ok(())
+}
+
+struct BurstReadings {
+    posted: u64,
+    summary: String,
+    percentiles: String,
+}
+
+enum BurstError {
+    Failed(String),
+    Skipped(&'static str),
+    Unavailable(String),
+}
+
+fn burst_target_ready(
+    mut alive: impl FnMut() -> bool,
+    activate: impl FnOnce() -> bool,
+    protected: impl FnOnce() -> Result<(), String>,
+) -> Result<(), BurstError> {
+    if !alive() {
+        return Err(BurstError::Failed(
+            "gui smoke: aterm-gui exited before the burst".into(),
+        ));
     }
-    let got = ctl(ctx, sb, ctl_bin, &["metrics", "reset"]);
-    if !ok_reply(&got) {
-        r.fail(format!("gui smoke: metrics reset -> {}", or_no_reply(&got)));
-        return;
+    if !activate() {
+        return Err(BurstError::Skipped(
+            "gui smoke (could not keep the test window frontmost)",
+        ));
     }
-    let args = hwkey_burst_args();
-    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-    let got = ctl(ctx, sb, ctl_bin, &argv);
-    let Some(posted) = metric_u64(&got, "posted").filter(|_| ok_reply(&got)) else {
-        r.fail(format!(
-            "gui smoke: hardware key injection -> {}",
-            or_no_reply(&got)
+    if !alive() {
+        return Err(BurstError::Failed(
+            "gui smoke: aterm-gui exited during activation".into(),
+        ));
+    }
+    protected().map_err(BurstError::Unavailable)
+}
+
+const METRICS_RECEIPT_MAX: usize = 64 * 1024;
+
+fn bounded_burst_readings(readings: &BurstReadings) -> Result<(), String> {
+    for (name, text) in [
+        ("summary", &readings.summary),
+        ("percentiles", &readings.percentiles),
+    ] {
+        if text.len() > METRICS_RECEIPT_MAX || !ok_reply(text) || text.lines().count() != 1 {
+            return Err(format!(
+                "gui smoke: invalid {name} receipt ({} bytes; maximum {METRICS_RECEIPT_MAX})",
+                text.len()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn retain_burst_readings(r: &mut Report, readings: &BurstReadings) {
+    r.raw(format!("gui smoke metrics summary: {}", readings.summary));
+    r.raw(format!(
+        "gui smoke metrics percentiles: {}",
+        readings.percentiles
+    ));
+}
+
+fn guarded_burst<G>(
+    r: &mut Report,
+    enter: impl FnOnce() -> Result<(G, String), String>,
+    collect: impl FnOnce(&G) -> Result<BurstReadings, BurstError>,
+    protected: impl FnOnce(&G) -> Result<(), String>,
+) {
+    let (guard, note) = match enter() {
+        Ok(entered) => entered,
+        Err(why) => {
+            r.cannot_run(format!(
+                "gui smoke: timing entry unavailable ({why}); no reset or keys"
+            ));
+            return;
+        }
+    };
+    r.raw(note);
+    let readings = match collect(&guard) {
+        Ok(readings) => readings,
+        Err(BurstError::Failed(why)) => {
+            r.fail(why);
+            return;
+        }
+        Err(BurstError::Skipped(why)) => {
+            r.skip(why);
+            return;
+        }
+        Err(BurstError::Unavailable(why)) => {
+            r.cannot_run(why);
+            return;
+        }
+    };
+    let bounded = bounded_burst_readings(&readings);
+    if let Err(why) = protected(&guard) {
+        match bounded {
+            Ok(()) => retain_burst_readings(r, &readings),
+            Err(why) => r.raw(why),
+        }
+        r.cannot_run(format!(
+            "gui smoke: timing protection unavailable after collection ({why}); result unqualified"
         ));
         return;
-    };
-    std::thread::sleep(SETTLE);
-    let summary = ctl(ctx, sb, ctl_bin, &["metrics"]);
-    let percentiles = ctl(ctx, sb, ctl_bin, &["metrics", "percentiles"]);
-    match effects_verdict(&summary) {
-        Ok(line) => r.pass(line),
-        Err(bad) => r.fail(bad),
     }
-    match hardware_key_verdict(posted, &summary, &percentiles) {
-        Ok(line) => r.pass(line),
-        Err(bad) => r.fail(bad),
+    if let Err(why) = bounded {
+        r.fail(why);
+        return;
+    }
+    let effects = effects_verdict(&readings.summary);
+    let hardware = hardware_key_verdict(readings.posted, &readings.summary, &readings.percentiles);
+    if effects.is_ok() && hardware.is_ok() {
+        retain_burst_readings(r, &readings);
+    }
+    for verdict in [effects, hardware] {
+        match verdict {
+            Ok(line) => r.pass(line),
+            Err(why) => r.fail(why),
+        }
     }
 }
 
@@ -875,6 +1053,160 @@ mod tests {
                 "present_glass_p99_ms=8.90",
                 &format!("present_glass_p99_ms={p99}"),
             )
+    }
+
+    fn burst_readings() -> BurstReadings {
+        BurstReadings {
+            posted: 30,
+            summary: summary(40, "10.00", 0, 0, 0)
+                .replace("fx_under_frames=0", "fx_under_frames=20")
+                .replace("cursor_effect:0/0", "cursor_effect:100/0"),
+            percentiles: percentiles(30, "6.00", "0.10", "1.00", "10.00"),
+        }
+    }
+
+    struct BurstDrop<'a>(&'a std::cell::Cell<bool>);
+    impl Drop for BurstDrop<'_> {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
+    }
+
+    #[test]
+    fn burst_entry_refusal_starts_no_reset_or_keys() {
+        let mut r = Report::new("burst");
+        guarded_burst::<()>(
+            &mut r,
+            || Err("entry unavailable".into()),
+            |_| panic!("collection before entry"),
+            |_| panic!("postcheck without entry"),
+        );
+        assert_eq!(
+            r.outcomes().map(|(o, _)| o).collect::<Vec<_>>(),
+            [crate::ladder::Outcome::Fail(
+                crate::ladder::Severity::CouldNotRun
+            )]
+        );
+    }
+
+    #[test]
+    fn burst_foreground_and_post_activation_guards_suppress_input() {
+        for scenario in 0..4 {
+            let mut r = Report::new("burst");
+            let dropped = std::cell::Cell::new(false);
+            let alive_calls = std::cell::Cell::new(0);
+            guarded_burst(
+                &mut r,
+                || Ok((BurstDrop(&dropped), String::new())),
+                |_| {
+                    burst_target_ready(
+                        || {
+                            let n = alive_calls.get();
+                            alive_calls.set(n + 1);
+                            scenario != 0 && !(scenario == 2 && n == 1)
+                        },
+                        || scenario != 1,
+                        || Err("outer hold expired during activation".into()),
+                    )?;
+                    panic!("reset/keys after unavailable target");
+                },
+                |_| panic!("no readings to qualify"),
+            );
+            assert!(dropped.get());
+            assert!(!r.outcomes().any(|(o, _)| o == crate::ladder::Outcome::Ok));
+            assert_eq!(alive_calls.get(), if scenario < 2 { 1 } else { 2 });
+        }
+    }
+
+    #[test]
+    fn burst_retains_full_success_metrics_and_guard_until_postcheck() {
+        let dropped = std::cell::Cell::new(false);
+        let phase = std::cell::Cell::new(0);
+        let mut r = Report::new("burst");
+        let expected = burst_readings();
+        guarded_burst(
+            &mut r,
+            || {
+                phase.set(1);
+                Ok((BurstDrop(&dropped), String::new()))
+            },
+            |_| {
+                assert_eq!(phase.replace(2), 1);
+                assert!(!dropped.get());
+                Ok(burst_readings())
+            },
+            |_| {
+                assert_eq!(phase.replace(3), 2);
+                assert!(!dropped.get());
+                Ok(())
+            },
+        );
+        assert!(dropped.get());
+        assert_eq!(phase.get(), 3);
+        assert_eq!(
+            r.outcomes().map(|(o, _)| o).collect::<Vec<_>>(),
+            [crate::ladder::Outcome::Ok, crate::ladder::Outcome::Ok]
+        );
+        for raw in [expected.summary, expected.percentiles] {
+            assert_eq!(
+                r.entries
+                    .iter()
+                    .filter(
+                        |e| matches!(e, crate::ladder::Entry::Raw(text) if text.ends_with(raw.trim_end_matches('\n')))
+                    )
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn burst_post_protection_failure_keeps_readings_but_never_passes() {
+        let dropped = std::cell::Cell::new(false);
+        let mut r = Report::new("burst");
+        guarded_burst(
+            &mut r,
+            || Ok((BurstDrop(&dropped), String::new())),
+            |_| Ok(burst_readings()),
+            |_| Err("protection expired".into()),
+        );
+        assert!(dropped.get());
+        assert_eq!(
+            r.outcomes().map(|(o, _)| o).collect::<Vec<_>>(),
+            [crate::ladder::Outcome::Fail(
+                crate::ladder::Severity::CouldNotRun
+            )]
+        );
+        assert_eq!(r.entries.iter().filter(|e| matches!(e, crate::ladder::Entry::Raw(text) if text.starts_with("gui smoke metrics"))).count(), 2);
+    }
+
+    #[test]
+    fn burst_oversized_receipt_cannot_pass_or_be_retained() {
+        for percentiles in [false, true] {
+            let mut readings = burst_readings();
+            let oversized = "x".repeat(METRICS_RECEIPT_MAX + 1);
+            if percentiles {
+                readings.percentiles = oversized.clone();
+            } else {
+                readings.summary = oversized.clone();
+            }
+            let mut r = Report::new("burst");
+            guarded_burst(
+                &mut r,
+                || Ok(((), String::new())),
+                |_| Ok(readings),
+                |_| Ok(()),
+            );
+            assert_eq!(
+                r.outcomes().map(|(o, _)| o).collect::<Vec<_>>(),
+                [crate::ladder::Outcome::Fail(
+                    crate::ladder::Severity::GateFailed
+                )]
+            );
+            assert!(!r.entries.iter().any(
+                |e| matches!(e, crate::ladder::Entry::Raw(text) if text.contains(&oversized))
+            ));
+        }
     }
 
     #[test]

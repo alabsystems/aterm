@@ -40,24 +40,32 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, OnceLock};
 
 pub mod admission;
+pub mod budgets;
 pub mod entries;
 mod eval;
 pub mod genesis;
 #[cfg(unix)]
 pub(crate) mod history;
 mod payload;
+mod reach;
+pub mod rekey;
 pub mod store;
 #[cfg(unix)]
 pub(crate) mod untaken;
 
 pub use admission::{Gap, Signer, admission_audiences};
 pub use astream_wire::sync::MAX_PARENTS;
+pub use budgets::{
+    Budget, LEGACY_RECORDS, MAX_HELD_RECORDS, MAX_KEYED_RECORDS, MAX_WEIGHED_RECORDS,
+    RecordBudgets, RecordCounts,
+};
 pub use entries::{
     CommonsEpochView, Keyed, OpenedAudienceEntries, OpenedEntries, epoch_commitment,
 };
 pub use eval::{Member, Membership, NodeStanding, Quorum, Removal, Undo};
 pub use genesis::Proof;
 pub use payload::Payload;
+pub use rekey::{RekeyDue, Turn, audience_tag, secure_twins};
 pub use store::{MAX_RECORDS_STREAM, Store, decode_records, encode_records};
 
 #[cfg(any(test, debug_assertions))]
@@ -87,7 +95,8 @@ pub fn quorum_relations_allocation_probe(dense: bool) -> usize {
 
 /// Prepare real candidate-derived authorization states before a test measures their results.
 /// The callback's operation retains its memo and every result through a checksum, then drops
-/// them. Graph, states, ancestry and scratch allocation happen before the callback.
+/// them. Graph, states and scratch allocation happen before the callback, which reads the log's
+/// own reachability index.
 ///
 /// # Panics
 /// `states` is zero or exceeds the distinct membership-void states of holding candidates.
@@ -98,7 +107,7 @@ pub fn with_authorization_allocation_probe(
     states: usize,
     observe: impl FnOnce(&mut dyn FnMut() -> usize),
 ) {
-    eval::with_authorization_allocation_probe(&log.order, states, observe);
+    eval::with_authorization_allocation_probe(log.history(), states, observe);
 }
 
 /// Which audience an [`Body::Epoch`], [`Body::Put`] or [`Body::Delete`] seals.
@@ -154,20 +163,21 @@ const VERSION: u8 = 1;
 const KIND_AT: usize = 4 + 1 + 32;
 /// Bytes through the parent-count field, before the variable parent list.
 const FRAME_PREFIX_LEN: usize = 4 + 1 + 32 + 1 + 48 + 8 + 32 + 1;
+/// The most bytes a record takes around its body: the header with [`MAX_PARENTS`] parents and
+/// its signed clock, the body's length, and the signature.
+const MOST_FRAME: usize = FRAME_PREFIX_LEN + 32 * MAX_PARENTS + 8 + 4 + 64;
 const SIGNING_DOMAIN: &[u8] = b"aterm/members/record/1\0";
 /// The largest record [`Record::decode`] reads: a 1 MiB secret value (`Put`) plus headers fits
 /// with room.
 pub const MAX_RECORD: usize = crate::text::MAX_VALUE + 64 * 1024;
-/// The most held records a [`Log`] or [`Store`] keeps, matching Commons control's inventory bound.
-pub const MAX_RECORDS: usize = 4096;
 /// The most records waiting for a missing parent that a [`Log`] or [`Store`] keeps.
 pub const MAX_WAITING: usize = 4096;
-#[cfg(unix)]
-const _: () = assert!(MAX_RECORDS == crate::commons::journal::MAX_NODES);
 #[cfg(unix)]
 const _: () = assert!(MAX_WAITING == crate::commons::journal::MAX_NODES);
 /// The longest host name a record carries, in bytes.
 pub const MAX_NAME: usize = 64;
+/// The longest membership label, in bytes: `m` and five digits ([`is_label`]).
+const MAX_LABEL: usize = 6;
 /// The most founders a genesis names.
 pub const MAX_FOUNDERS: usize = 255;
 
@@ -221,6 +231,24 @@ impl Kind {
             9 => Kind::Node,
             _ => return Err(Error::new("membership record of an unknown kind")),
         })
+    }
+
+    /// The most bytes a record of this kind takes on the wire, as [`Record::decode`] bounds its
+    /// header ([`MAX_PARENTS`] parents) and this kind's fields; [`MAX_RECORD`], the bound of
+    /// every record, for a genesis, an `Epoch`, a `Put` and a `Delete`, whose founder, host and
+    /// ciphertext fields this does not total. Every kind is named, so a new one is bounded where
+    /// it is added.
+    #[must_use]
+    pub const fn most_bytes(self) -> usize {
+        let body = match self {
+            Kind::Admit => REQUEST_LEN + 32 + (1 + MAX_NAME) + (1 + MAX_LABEL) + 1,
+            Kind::Remove => 48 + 32,
+            Kind::Name => 1 + MAX_NAME,
+            Kind::Wrap => 32 + 32 + 2 + entries::MAX_WRAP_CAPSULE,
+            Kind::Node => 32 + 64,
+            Kind::Genesis | Kind::Epoch | Kind::Put | Kind::Delete => return MAX_RECORD,
+        };
+        MOST_FRAME + body
     }
 }
 
@@ -1271,7 +1299,7 @@ pub fn is_label(label: &str) -> bool {
     let Some(digits) = label.strip_prefix('m') else {
         return false;
     };
-    (1..=5).contains(&digits.len())
+    (1..MAX_LABEL).contains(&digits.len())
         && !digits.starts_with('0')
         && digits.bytes().all(|b| b.is_ascii_digit())
 }
@@ -1372,16 +1400,50 @@ pub struct Log {
     /// insert walked every record, and a store at its bound repeated that walk for each record
     /// it let go (`docs/DESIGN-fluid-swarm-2026-10-28.md` §4.1 F23, rule 6).
     waiting_bytes: usize,
+    /// The budgets `order` stays within, fixed when the log was made.
+    budgets: RecordBudgets,
+    /// How many of `order`'s records count against each budget, kept by [`Log::hold`].
+    counts: RecordCounts,
     enforce_seats: bool,
+    /// Each held record's strict causal past, extended by [`Log::hold`]. Clones share its rows
+    /// until `hold` extends one of them ([`reach`]).
+    reach: reach::Reach,
+    /// What seats each Mac, kept by every change to `order` and `waiting`, so a record's seat
+    /// checks read the Mac's own entries rather than every record.
+    seats: BTreeMap<MemberId, Seating>,
     // Clones hold the same immutable prefix until `hold` extends one of them.
     // Its pure evaluation is shared too; no disk observation or grant is cached.
     membership: Arc<OnceLock<Membership>>,
     effective: Arc<OnceLock<eval::Effective>>,
-    ancestry: Arc<OnceLock<Arc<eval::Ancestry>>>,
+}
+
+/// What seats one Mac in a log: the genesis binding it as a founder, the held `Admit`s another Mac
+/// signed that let it in (record indexes, in order), and how many such `Admit`s wait for a parent.
+#[derive(Clone, Debug, Default)]
+struct Seating {
+    founder: bool,
+    admits: Vec<usize>,
+    waiting: usize,
+}
+
+impl Seating {
+    const fn is_empty(&self) -> bool {
+        !self.founder && self.admits.is_empty() && self.waiting == 0
+    }
+}
+
+/// The Mac `record` seats: the entrant of an `Admit` another Mac signed.
+fn seated_by(record: &Record) -> Option<MemberId> {
+    match record.body() {
+        Body::Admit { entrant, .. } if record.actor() != &entrant.member() => {
+            Some(entrant.member())
+        }
+        _ => None,
+    }
 }
 
 impl Log {
-    /// A log of the network `genesis` founds.
+    /// A log of the network `genesis` founds, within [`RecordBudgets::current`].
     ///
     /// # Errors
     /// `genesis` is not a genesis.
@@ -1391,17 +1453,52 @@ impl Log {
         }
         let held = BTreeMap::from([(genesis.id, 0)]);
         let held_bytes = genesis.bytes().len();
+        let mut reach = reach::Reach::default();
+        reach.push(std::iter::empty());
+        let mut seats: BTreeMap<MemberId, Seating> = BTreeMap::new();
+        if let Body::Genesis { founders, .. } = genesis.body() {
+            for member in founders.iter().filter_map(Founder::member) {
+                seats.entry(member).or_default().founder = true;
+            }
+        }
+        let counts = RecordCounts::of(genesis.kind());
         Ok(Self {
             order: vec![genesis],
             held,
             waiting: BTreeMap::new(),
             held_bytes,
             waiting_bytes: 0,
+            budgets: RecordBudgets::current(),
+            counts,
             enforce_seats: false,
+            reach,
+            seats,
             membership: Arc::default(),
             effective: Arc::default(),
-            ancestry: Arc::default(),
         })
+    }
+
+    /// What the evaluator reads of this log.
+    fn history(&self) -> eval::History<'_> {
+        eval::History {
+            records: &self.order,
+            at: &self.held,
+            reach: &self.reach,
+        }
+    }
+
+    /// The indexes of the held records among `ids`, in order; ids not held are skipped.
+    fn indexes(&self, ids: &[RecordId]) -> Vec<usize> {
+        ids.iter()
+            .filter_map(|id| self.held.get(id).copied())
+            .collect()
+    }
+
+    /// Whether the held record `target` is one of the held records `from` or lies in one's past.
+    fn reaches(&self, from: &[RecordId], target: &RecordId) -> bool {
+        self.held
+            .get(target)
+            .is_some_and(|&t| self.reach.in_past_of(t, &self.indexes(from)))
     }
 
     /// Refuse records whose signer has no founding or admitted seat in their causal past.
@@ -1437,6 +1534,23 @@ impl Log {
     /// How many records it holds, each after its parents: the length of [`Log::records`].
     pub fn held_count(&self) -> usize {
         self.order.len()
+    }
+    /// How many of its held records count against each budget.
+    #[must_use]
+    pub const fn counts(&self) -> RecordCounts {
+        self.counts
+    }
+    /// The budgets it holds its records within.
+    #[must_use]
+    pub const fn budgets(&self) -> RecordBudgets {
+        self.budgets
+    }
+    /// The first bound that holding `more` records of `more_bytes` wire bytes past what it holds
+    /// would pass ([`RecordBudgets::passed_with_bytes`]); `None` where they fit every one.
+    #[must_use]
+    pub const fn passed_by(&self, more: RecordCounts, more_bytes: usize) -> Option<Budget> {
+        self.budgets
+            .passed_with_bytes(self.counts, more, self.held_bytes, more_bytes)
     }
     /// The held records no held record follows, sorted.
     pub fn heads(&self) -> Vec<RecordId> {
@@ -1508,11 +1622,11 @@ impl Log {
             .flatten()
             .chain(follow.iter().copied())
         {
-            if self.held.contains_key(&needed) && !self.ancestors_of(&parents).contains(&needed) {
+            if self.held.contains_key(&needed) && !self.reaches(&parents, &needed) {
                 let target = self
                     .heads()
                     .into_iter()
-                    .find(|head| self.ancestors_of(&[*head]).contains(&needed))
+                    .find(|head| self.reaches(std::slice::from_ref(head), &needed))
                     .unwrap_or(needed);
                 if !parents.contains(&target) {
                     if parents.len() >= MAX_PARENTS
@@ -1528,7 +1642,7 @@ impl Log {
                 pinned.push(target);
             } else if let Some(&covering) = parents
                 .iter()
-                .find(|&&p| self.ancestors_of(&[p]).contains(&needed))
+                .find(|&p| self.reaches(std::slice::from_ref(p), &needed))
             {
                 pinned.push(covering);
             }
@@ -1558,9 +1672,11 @@ impl Log {
     /// `Put` or `Delete` names an `epoch` that is not a held [`Body::Epoch`] (for its audience, on
     /// a `Put` or `Delete`) in its causal past. In a store's log it fails when the signer has no
     /// seat in the record's causal past, or, for a record whose parents are missing, no seat in
-    /// the held log. It also fails when the log already holds [`MAX_RECORDS`] records or
-    /// [`MAX_WAITING`] waiting records. It also fails when holding or keeping the record waiting
-    /// would make the log's wire bytes exceed [`MAX_RECORDS_STREAM`].
+    /// the held log. It also fails, as [`crate::ErrorKind::MembershipCapacity`], when holding the
+    /// record would pass one of the log's budgets ([`Log::passed_by`]: its held total, the
+    /// budget of the record's kind, [`Kind::weighed`] or not, or [`MAX_RECORDS_STREAM`] bytes),
+    /// or when keeping it waiting would pass [`MAX_WAITING`] waiting records or make the log's
+    /// wire bytes exceed [`MAX_RECORDS_STREAM`].
     #[cfg_attr(
         all(unix, any(test, debug_assertions)),
         aterm_spec_anchor::refines(
@@ -1644,16 +1760,14 @@ impl Log {
                     "membership log holds its limit of waiting records",
                 ));
             }
-            self.waiting_bytes = self.waiting_bytes.saturating_add(record.bytes().len());
-            self.waiting.insert(record.id, record);
+            self.wait(record);
             return Ok(Inserted::Waiting);
         }
-        if self.order.len() >= MAX_RECORDS
-            || self.held_bytes().saturating_add(record.bytes().len()) > MAX_RECORDS_STREAM
+        if let Some(budget) = self.passed_by(RecordCounts::of(record.kind()), record.bytes().len())
         {
             return Err(Error::of_kind(
                 crate::ErrorKind::MembershipCapacity,
-                "membership log holds its limit of records",
+                format!("membership log holds its limit of {}", budget.counts()),
             ));
         }
         self.check_against_parents(&record)?;
@@ -1664,8 +1778,8 @@ impl Log {
 
     /// Insert every record `other` holds or keeps waiting. A record `other` holds that this log
     /// refuses is skipped and the rest come in: both logs check records the same way, so that
-    /// happens only at this log's bounds ([`MAX_RECORDS`], [`MAX_WAITING`]), which depend on what
-    /// reached each log first.
+    /// happens only at this log's bounds (its [`RecordBudgets`], [`MAX_WAITING`]), which depend on
+    /// what reached each log first.
     ///
     /// # Errors
     /// `other` is another network's log.
@@ -1712,18 +1826,13 @@ impl Log {
     )]
     pub fn membership(&self) -> Membership {
         self.membership
-            .get_or_init(|| eval::evaluate_with(&self.order, self.ancestry()))
+            .get_or_init(|| eval::evaluate_with(self.history()))
             .clone()
-    }
-
-    fn ancestry(&self) -> &Arc<eval::Ancestry> {
-        self.ancestry
-            .get_or_init(|| eval::Ancestry::new(&self.order))
     }
 
     fn effective(&self) -> &eval::Effective {
         self.effective
-            .get_or_init(|| eval::effective_records(&self.order, self.ancestry()))
+            .get_or_init(|| eval::effective_records(self.history()))
     }
 
     /// The cutoff of the quorum `Remove` of `actor` that F16's "Undo <actor>'s removals" row
@@ -1739,7 +1848,7 @@ impl Log {
     /// never vote. `None` where `actor` has no contested act or no entry in this log.
     #[must_use]
     pub fn undo_cutoff(&self, actor: &MemberId) -> Option<RecordId> {
-        eval::undo_cutoff(&self.order, self.ancestry(), actor)
+        eval::undo_cutoff(self.history(), actor)
     }
 
     /// Where the quorum `Remove` of `actor` at [`Log::undo_cutoff`] stands: its voters, the
@@ -1747,7 +1856,7 @@ impl Log {
     /// such cutoff.
     #[must_use]
     pub fn undo(&self, actor: &MemberId) -> Option<Undo> {
-        let mut undo = eval::undo(&self.order, self.ancestry(), actor)?;
+        let mut undo = eval::undo(self.history(), actor)?;
         undo.took_effect = self
             .membership()
             .quorums()
@@ -1770,20 +1879,16 @@ impl Log {
     /// in deterministic topological replay order (`F18`).
     #[must_use]
     pub fn ancestor_closure(&self, targets: &[RecordId]) -> Vec<Record> {
-        let held_targets: Vec<RecordId> = targets
-            .iter()
-            .copied()
-            .filter(|id| self.held.contains_key(id))
-            .collect();
+        let held_targets = self.indexes(targets);
         if held_targets.is_empty() {
             return Vec::new();
         }
-        let mut keep = self.ancestors_of(&held_targets);
-        keep.extend(held_targets);
+        let keep = self.reach.closure(held_targets);
         self.order
             .iter()
-            .filter(|r| keep.contains(&r.id))
-            .cloned()
+            .enumerate()
+            .filter(|(i, _)| (keep[i / 64] >> (i % 64)) & 1 == 1)
+            .map(|(_, r)| r.clone())
             .collect()
     }
 
@@ -1792,21 +1897,21 @@ impl Log {
     /// good by a quorum `Remove`).
     #[must_use]
     pub fn historical_seat_entry(&self, binding: &Binding) -> Option<RecordId> {
-        eval::historical_seat_entry(&self.order, self.ancestry(), binding)
+        eval::historical_seat_entry(self.history(), binding)
     }
 
     /// Whether `binding` holds a founding or effective admitted seat in this log (even if later
     /// retired by an ordinary `Remove`, unless voided out for good by a quorum `Remove`).
     #[must_use]
     pub fn has_historical_seat(&self, binding: &Binding) -> bool {
-        eval::has_historical_seat(&self.order, self.ancestry(), binding)
+        eval::has_historical_seat(self.history(), binding)
     }
 
     /// Whether `actor` holds a founding or non-void, authorized, non-cut-off admitted seat in
     /// this log (including actors later retired by an ordinary or quorum `Remove`).
     #[must_use]
     pub fn has_known_actor(&self, actor: &MemberId) -> bool {
-        eval::has_known_actor(&self.order, self.ancestry(), actor)
+        eval::has_known_actor(self.history(), actor)
     }
 
     /// Historical Commons writer bindings eligible to authenticate table records sealed under
@@ -1823,12 +1928,13 @@ impl Log {
         else {
             return None;
         };
-        let writers = eval::historical_bindings_for_epoch(&self.order, self.ancestry(), idx)?;
+        let writers = eval::historical_bindings_for_epoch(self.history(), idx)?;
         Some((*generation, writers))
     }
 
     fn check_against_parents(&self, record: &Record) -> Result<()> {
-        if self.enforce_seats && !self.has_seat_in_past(record) {
+        let parents = self.indexes(record.parents());
+        if self.enforce_seats && !self.has_seat_in_past(record, &parents) {
             return Err(Error::new(
                 "a membership record's signer has no seat in its causal past",
             ));
@@ -1867,7 +1973,7 @@ impl Log {
             }
         }
         if let Body::Remove { member, cutoff } = record.body() {
-            if !self.precedes(cutoff, record) {
+            if !self.precedes(cutoff, &parents) {
                 return Err(Error::new(
                     "a removal's cutoff is a record in its own causal past",
                 ));
@@ -1890,7 +1996,7 @@ impl Log {
         }
         match record.body() {
             Body::Wrap { epoch, .. }
-                if !self.precedes(epoch, record)
+                if !self.precedes(epoch, &parents)
                     || !matches!(self.get(epoch).map(Record::body), Some(Body::Epoch { .. })) =>
             {
                 return Err(Error::new("a Wrap names an Epoch in its causal past"));
@@ -1900,7 +2006,7 @@ impl Log {
             }
             | Body::Delete {
                 audience, epoch, ..
-            } if !self.precedes(epoch, record)
+            } if !self.precedes(epoch, &parents)
                 || !matches!(
                     self.get(epoch).map(Record::body),
                     Some(Body::Epoch { audience: ep_aud, .. }) if ep_aud == audience
@@ -1916,74 +2022,29 @@ impl Log {
     }
 
     /// Whether `actor` holds a seat anywhere in the log: a founder the genesis binds, or the Mac
-    /// a held or waiting `Admit` lets in.
+    /// a held or waiting `Admit` another Mac signed lets in.
     fn holds_seat(&self, actor: &MemberId) -> bool {
-        self.order
-            .iter()
-            .chain(self.waiting.values())
-            .any(|r| match r.body() {
-                Body::Genesis { founders, .. } => {
-                    founders.iter().any(|f| f.member() == Some(*actor))
-                }
-                Body::Admit { entrant, .. } => {
-                    r.actor() != &entrant.member() && entrant.member() == *actor
-                }
-                _ => false,
-            })
+        self.seats.get(actor).is_some_and(|seat| !seat.is_empty())
     }
 
-    /// Whether `record`'s signer is a bound founder in genesis or admitted in its causal past.
-    fn has_seat_in_past(&self, record: &Record) -> bool {
-        let actor = record.actor();
-        if let Body::Genesis { founders, .. } = self.genesis().body()
-            && founders.iter().any(|f| f.member() == Some(*actor))
-        {
-            return true;
-        }
-        for id in self.ancestors_of(record.parents()) {
-            if let Some(parent) = self.get(&id)
-                && matches!(
-                    parent.body(),
-                    Body::Admit { entrant, .. }
-                        if parent.actor() != &entrant.member() && entrant.member() == *actor
-                )
-            {
-                return true;
-            }
-        }
-        false
+    /// Whether `record`'s signer is a founder the genesis binds, or a held `Admit` another Mac
+    /// signed lets it in within the causal past of the held records at `parents` (`record`'s).
+    fn has_seat_in_past(&self, record: &Record, parents: &[usize]) -> bool {
+        self.seats.get(record.actor()).is_some_and(|seat| {
+            seat.founder
+                || seat
+                    .admits
+                    .iter()
+                    .any(|&admit| self.reach.in_past_of(admit, parents))
+        })
     }
 
-    /// Every held record in or reachable from `roots`.
-    fn ancestors_of(&self, roots: &[RecordId]) -> BTreeSet<RecordId> {
-        let mut seen = BTreeSet::new();
-        let mut stack: Vec<RecordId> = roots.to_vec();
-        while let Some(id) = stack.pop() {
-            if self.held.contains_key(&id)
-                && seen.insert(id)
-                && let Some(parent) = self.get(&id)
-            {
-                stack.extend(parent.parents().iter().copied());
-            }
-        }
-        seen
-    }
-
-    /// Whether the held record `ancestor` is in `record`'s causal past.
-    fn precedes(&self, ancestor: &RecordId, record: &Record) -> bool {
-        let mut seen = BTreeSet::new();
-        let mut stack: Vec<&RecordId> = record.parents().iter().collect();
-        while let Some(id) = stack.pop() {
-            if id == ancestor {
-                return true;
-            }
-            if seen.insert(*id)
-                && let Some(parent) = self.get(id)
-            {
-                stack.extend(parent.parents().iter());
-            }
-        }
-        false
+    /// Whether the held record `ancestor` lies in the causal past of a record whose parents are
+    /// the held records at `parents`.
+    fn precedes(&self, ancestor: &RecordId, parents: &[usize]) -> bool {
+        self.held
+            .get(ancestor)
+            .is_some_and(|&at| self.reach.in_past_of(at, parents))
     }
 
     /// The bytes of every held record: what the records of `order` take on the wire, and what a
@@ -2002,54 +2063,93 @@ impl Log {
     }
 
     fn hold(&mut self, record: Record) {
-        self.held.insert(record.id, self.order.len());
-        self.held_bytes = self.held_bytes.saturating_add(record.bytes().len());
-        self.order.push(record);
+        // The evaluation goes first: an `Effective` shares the index's chunks, and a lone log
+        // whose cache let go of it extends its last chunk in place.
         self.membership = Arc::default();
         self.effective = Arc::default();
-        self.ancestry = Arc::default();
+        let at = self.order.len();
+        self.reach
+            .push(record.parents().iter().map(|parent| self.held[parent]));
+        if let Some(member) = seated_by(&record) {
+            self.seats.entry(member).or_default().admits.push(at);
+        }
+        self.held.insert(record.id, at);
+        self.held_bytes = self.held_bytes.saturating_add(record.bytes().len());
+        self.counts = self.counts.plus(RecordCounts::of(record.kind()));
+        self.order.push(record);
     }
 
-    /// Hold every waiting record whose parents have all arrived, until none is left to land.
-    /// Each is taken in id order, so the result is the same whatever order records came in.
+    /// Keep `record` waiting for a parent, with [`Log::waiting_bytes`] and its seat.
+    fn wait(&mut self, record: Record) {
+        self.waiting_bytes = self.waiting_bytes.saturating_add(record.bytes().len());
+        if let Some(member) = seated_by(&record) {
+            self.seats.entry(member).or_default().waiting += 1;
+        }
+        self.waiting.insert(record.id, record);
+    }
+
+    /// Account for `record` no longer waiting: [`Log::waiting_bytes`] and its seat.
+    fn unwaited(&mut self, record: &Record) {
+        self.waiting_bytes = self.waiting_bytes.saturating_sub(record.bytes().len());
+        if let Some(member) = seated_by(record)
+            && let Some(seat) = self.seats.get_mut(&member)
+        {
+            seat.waiting -= 1;
+            if seat.is_empty() {
+                self.seats.remove(&member);
+            }
+        }
+    }
+
+    /// Hold every waiting record whose parents have all arrived, pass by pass, until a pass
+    /// lands none. A pass takes the records ready at its start in id order, so the result is the
+    /// same whatever order records came in. A ready record leaves the waiting room whether it
+    /// lands or not: one that fails its check against its parents, or would pass a budget
+    /// ([`Log::passed_by`]), could never land later, since the held log only grows and the
+    /// record's id fixes its causal past. Kept waiting it would be ready again on every pass, and
+    /// a waiting `Admit` would still give its Mac a seat ([`Log::holds_seat`]).
     fn land_waiting(&mut self) {
         loop {
-            if self.order.len() >= MAX_RECORDS {
-                return;
-            }
             let ready: Vec<RecordId> = self
                 .waiting
                 .values()
                 .filter(|r| r.parents().iter().all(|p| self.held.contains_key(p)))
                 .map(|r| r.id)
                 .collect();
-            if ready.is_empty() {
-                return;
-            }
+            #[cfg(test)]
+            let ready = budgets::mutant_order(ready);
+            let mut landed = false;
             for id in ready {
-                if self.order.len() >= MAX_RECORDS {
-                    return;
-                }
                 let Some(record) = self.waiting.remove(&id) else {
                     continue;
                 };
-                self.waiting_bytes = self.waiting_bytes.saturating_sub(record.bytes().len());
-                if self.held_bytes().saturating_add(record.bytes().len()) <= MAX_RECORDS_STREAM
+                self.unwaited(&record);
+                if self
+                    .passed_by(RecordCounts::of(record.kind()), record.bytes().len())
+                    .is_none()
                     && self.check_against_parents(&record).is_ok()
                 {
                     self.hold(record);
+                    landed = true;
+                    continue;
                 }
+                #[cfg(test)]
+                budgets::mutant_keeps_unfit(self, record);
+            }
+            if !landed {
+                return;
             }
         }
     }
 
-    /// Let the waiting record with the highest id go, keeping [`Log::waiting_bytes`]; `false`
-    /// when none waits. A store at its bound calls it to make room (`store::make_room`).
+    /// Let the waiting record with the highest id go, keeping [`Log::waiting_bytes`] and the
+    /// seat it gave; `false` when none waits. A store at its bound calls it to make room
+    /// (`store::make_room`).
     pub(super) fn drop_last_waiting(&mut self) -> bool {
         let Some((_, record)) = self.waiting.pop_last() else {
             return false;
         };
-        self.waiting_bytes = self.waiting_bytes.saturating_sub(record.bytes().len());
+        self.unwaited(&record);
         true
     }
 }

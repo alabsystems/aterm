@@ -154,11 +154,13 @@ pub enum Cli {
     Grok,
     /// Kimi Code CLI ([`KIMI`]).
     Kimi,
+    /// Antigravity CLI's native Google login.
+    Agy,
 }
 
 impl Cli {
     /// Every pooled CLI, Claude Code first.
-    pub const ALL: [Cli; 4] = [Cli::Claude, Cli::Codex, Cli::Grok, Cli::Kimi];
+    pub const ALL: [Cli; 5] = [Cli::Claude, Cli::Codex, Cli::Grok, Cli::Kimi, Cli::Agy];
 
     /// The connector row it names.
     #[must_use]
@@ -168,6 +170,7 @@ impl Cli {
             Cli::Codex => &CODEX,
             Cli::Grok => &GROK,
             Cli::Kimi => &KIMI,
+            Cli::Agy => &AGY,
         }
     }
 
@@ -180,7 +183,8 @@ impl Cli {
             Program::Codex => Some(Cli::Codex),
             Program::Grok => Some(Cli::Grok),
             Program::Kimi => Some(Cli::Kimi),
-            Program::Agy | Program::Muse | Program::Generic => None,
+            Program::Agy => Some(Cli::Agy),
+            Program::Muse | Program::Generic => None,
         }
     }
 
@@ -193,6 +197,7 @@ impl Cli {
             Cli::Codex => Program::Codex,
             Cli::Grok => Program::Grok,
             Cli::Kimi => Program::Kimi,
+            Cli::Agy => Program::Agy,
         }
     }
 
@@ -230,7 +235,7 @@ impl Cli {
     pub const fn renews_headlessly(self) -> bool {
         match &self.accounts().signin {
             Some(signin) => signin.headless_page,
-            None => true,
+            None => matches!(self, Cli::Claude),
         }
     }
 
@@ -298,7 +303,8 @@ pub struct Accounts {
     /// ([`crate::harness::accounts_sync::syncs_by_default`]).
     pub walls_measured_on: Option<&'static str>,
     /// How the harness signs one of its logins in by itself; `None` for Claude Code, whose
-    /// renewal is its own (`claude auth login` through the argv0 opener).
+    /// renewal is its own (`claude auth login` through the argv0 opener), or where
+    /// a native pool adapter has not been integrated.
     pub signin: Option<SignIn>,
 }
 
@@ -335,7 +341,8 @@ impl SignInPage {
 /// exports nothing and unsets the variable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Seam {
-    /// The variable names the login's directory; the CLI's home stays the default one.
+    /// The variable names the login's directory, including a private whole home where
+    /// the vendor uses `HOME` to choose its native credential backend's files.
     LoginDir {
         /// The variable.
         var: &'static str,
@@ -548,6 +555,9 @@ pub enum Drive {
     /// `127.0.0.1:1455` (fallback `1457`), exchanges the authorization code over HTTPS and writes
     /// `<staging>/auth.json` (`0600`) directly.
     CodexPkce,
+    /// Native agy PKCE with a typed, canonically verified Google grant. Generic
+    /// line and interactive drivers must refuse this route.
+    NativeGoogle,
 }
 
 /// How a sign-in page hands the login back to the CLI.
@@ -1128,15 +1138,54 @@ pub const CODEX: Connector = Connector {
     accounts: Some(&CODEX_ACCOUNTS),
 };
 
-/// Antigravity CLI (Google).
+/// Antigravity's private native homes. Rotation remains held until native pool renewal
+/// and account readiness have been measured end to end.
+pub const AGY_ACCOUNTS: Accounts = Accounts {
+    seam: Seam::Overlay {
+        var: "HOME",
+        shared: &[
+            Shared::Dir(".gemini/antigravity-cli/conversations"),
+            Shared::Dir(".gemini/antigravity-cli/presence"),
+            Shared::Dir(".gemini/antigravity-cli/crashes"),
+        ],
+        markers: &[],
+    },
+    roster_file: "accounts-agy.toml",
+    default_home: ".",
+    store_dir: "accounts-agy",
+    keys: RowKeys::Plain,
+    mail_senders: &["google"],
+    sign_in_page: SignInPage::Fixed("https://accounts.google.com/"),
+    web_session_key: None,
+    measured: false,
+    measured_on: None,
+    walls_measured_on: None,
+    signin: Some(AGY_SIGNIN),
+};
+
+/// Native agy owns PKCE; aterm approves its request in an owned headless browser.
+pub const AGY_SIGNIN: SignIn = SignIn {
+    routes: &[Route {
+        flow: Flow::Browser,
+        drive: Drive::NativeGoogle,
+        hosts: Hosts::Fixed(&["accounts.google.com", "antigravity.google"]),
+    }],
+    env: &[],
+    no_opener: true,
+    no_desk: &[],
+    types_email: false,
+    headless_page: true,
+};
+
+/// Antigravity CLI's native Google login and isolated account home.
 pub const AGY: Connector = Connector {
     id: "agy",
     product: "Antigravity CLI",
     home: Home {
         var: None,
-        default: ".gemini/antigravity-cli",
+        default: ".",
     },
-    stores: &[],
+    stores: &[".gemini/antigravity-cli/antigravity-oauth-token"],
     credential_env: &["GEMINI_API_KEY"],
     login: Login::Run {
         args: &[],
@@ -1168,7 +1217,7 @@ pub const AGY: Connector = Connector {
     ],
     limit_words: &["resource_exhausted", "quota exceeded", "rate limit"],
     measured: false,
-    accounts: None,
+    accounts: Some(&AGY_ACCOUNTS),
 };
 
 /// Muse Code (Meta), served on macOS only.

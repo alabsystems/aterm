@@ -3,12 +3,12 @@
 
 //! Running the stages' children.
 
+use aterm_uds::spawnfd::{Child, Command, Stdio};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -335,7 +335,8 @@ impl Unfinished {
 /// walk waits for admission or a lock. Each child the walk starts books into the meter of the
 /// stage that called this ([`crate::memory::current`]), on the walk's thread or through the
 /// output executor it installs. Its quiet reservation, when the calling stage has one, stays
-/// held until the worker actually ends even if the ceiling returns first.
+/// held until the worker actually ends even if the ceiling returns first. The actual stage
+/// memory reservation is shared across the same handoff; a cover marker alone cannot hold it.
 /// # Errors
 /// [`Unfinished`]: the walk timed out or panicked.
 pub fn bounded<T: Send + 'static>(
@@ -364,6 +365,7 @@ fn bounded_wait<T: Send + 'static>(
     let meter = crate::memory::current();
     let cover = crate::memory::cover();
     let quiet = crate::current_quiet_claim();
+    let memory = crate::current_memory_claim();
     let scope = Close(std::sync::Arc::new(output::Scope::metered(meter.clone())));
     let executor = std::sync::Arc::clone(&scope.0);
     let (tx, rx) = std::sync::mpsc::channel();
@@ -371,6 +373,7 @@ fn bounded_wait<T: Send + 'static>(
         let _metering = crate::memory::metering(meter);
         let _covering = crate::memory::covering(cover);
         let _quiet = crate::holding_quiet_claim(quiet);
+        let _memory = crate::holding_memory_claim(memory);
         aterm_uds::output::with_executor(
             std::sync::Arc::new(move |command| executor.output(command)),
             || {
@@ -386,6 +389,9 @@ fn bounded_wait<T: Send + 'static>(
     answer
 }
 
+#[cfg(test)]
+#[path = "exec_memory_custody_tests.rs"]
+mod memory_custody_tests;
 #[path = "exec_output.rs"]
 mod output;
 #[path = "exec_test_progress.rs"]
@@ -1048,12 +1054,22 @@ mod ends {
 }
 
 fn spawn_command(cmd: &Cmd, env: ExecEnv<'_>, taskpolicy: &Path) -> Command {
+    let native = |program: &OsStr| {
+        #[cfg(unix)]
+        {
+            aterm_uds::spawnfd::transparent(program).into_command()
+        }
+        #[cfg(not(unix))]
+        {
+            aterm_uds::spawnfd::command(program)
+        }
+    };
     let mut c = if cmd.demoted
         && at_desk(env.host)
         && crate::is_executable_file(taskpolicy)
         && resolves(cmd, env)
     {
-        let mut c = Command::new(taskpolicy);
+        let mut c = native(taskpolicy.as_os_str());
         c.args(["-c", "utility"]);
         let dyld = dyld_assignments(&cmd.envs);
         if !dyld.is_empty()
@@ -1065,12 +1081,11 @@ fn spawn_command(cmd: &Cmd, env: ExecEnv<'_>, taskpolicy: &Path) -> Command {
         c.arg(&cmd.program);
         c
     } else {
-        Command::new(&cmd.program)
+        native(cmd.program.as_os_str())
     };
     c.args(&cmd.args).stdin(Stdio::null());
     #[cfg(unix)]
     {
-        use std::os::unix::process::CommandExt as _;
         c.process_group(0);
     }
     c
@@ -1264,7 +1279,7 @@ fn finish(
 }
 
 fn kill_and_reap(
-    child: &mut std::process::Child,
+    child: &mut Child,
     #[cfg(unix)] live: &mut group::Live,
     grace: Option<Duration>,
 ) -> String {
@@ -1358,6 +1373,41 @@ fn waited_clause(lock: Duration, core: Duration) -> String {
 /// Process-group custody and interrupt handling for stage children.
 #[cfg(unix)]
 pub mod group {
+    /// The actual owned child implementations used by stage execution and GUI smoke.
+    /// Custody checks the owned child's pid before observation or reap.
+    pub(crate) trait WaitChild {
+        fn id(&self) -> u32;
+        fn wait(&mut self) -> std::io::Result<std::process::ExitStatus>;
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>>;
+    }
+
+    impl WaitChild for std::process::Child {
+        fn id(&self) -> u32 {
+            Self::id(self)
+        }
+        fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+            Self::wait(self)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+            Self::try_wait(self)
+        }
+    }
+
+    impl WaitChild for aterm_uds::spawnfd::Child {
+        fn id(&self) -> u32 {
+            Self::id(self)
+        }
+        fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+            Self::wait(self)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+            Self::try_wait(self)
+        }
+    }
+
     use std::ffi::c_long;
     use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
@@ -1467,7 +1517,7 @@ pub mod group {
         }
         pub(crate) fn exited(
             &mut self,
-            child: &mut std::process::Child,
+            child: &mut impl WaitChild,
             block: bool,
         ) -> std::io::Result<bool> {
             #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1498,7 +1548,7 @@ pub mod group {
         }
         pub(super) fn reap_stage(
             &mut self,
-            child: &mut std::process::Child,
+            child: &mut impl WaitChild,
             block: bool,
         ) -> std::io::Result<Option<std::process::ExitStatus>> {
             self.reap_stage_sweeping(child, block, |_| {}, |_| {})
@@ -1508,7 +1558,7 @@ pub mod group {
         /// `reaped` with the same group once it is (macOS and Linux only).
         pub(crate) fn reap_stage_sweeping(
             &mut self,
-            child: &mut std::process::Child,
+            child: &mut impl WaitChild,
             block: bool,
             sweep: impl FnOnce(u32),
             reaped: impl FnOnce(u32),
@@ -1954,6 +2004,30 @@ pub fn capture_reply(cmd: &Cmd, env: ExecEnv<'_>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_native_stage_keeps_its_inherited_pipe_descriptor() {
+        use std::io::Write as _;
+        use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        // SAFETY: F_DUPFD creates one owned, non-close-on-exec duplicate without replacing
+        // another descriptor. The original remains live throughout the call.
+        let fd = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_DUPFD, 100) };
+        assert!(fd >= 100);
+        // SAFETY: the successful duplicate is newly owned by this test alone.
+        let inherited = unsafe { OwnedFd::from_raw_fd(fd) };
+        writer.write_all(b"shared-jobserver-handle\n").unwrap();
+        drop(writer);
+        let result = run(
+            &Cmd::new("/bin/cat").arg(format!("/dev/fd/{fd}")),
+            env_in(dir.path()),
+        );
+        assert!(result.ok, "{}", result.output);
+        assert_eq!(result.output, "shared-jobserver-handle\n");
+        drop(inherited);
+    }
 
     fn env_in(dir: &Path) -> ExecEnv<'_> {
         ceiled(dir, Some(DEFAULT_CHILD_CEILING))

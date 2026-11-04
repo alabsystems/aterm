@@ -516,6 +516,101 @@ fn test_build() -> Build {
     classify(&words(&["--unverified", "test", "-p", "a"]), Tool::Targo).expect("claims")
 }
 
+#[cfg(unix)]
+fn cohort_seat<'m>(dir: &Path, machine: &'m Fixed) -> Seat<'m> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    let home = dir.join("private-home");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&home)
+        .unwrap();
+    let namespace =
+        aterm_capacity::cohort_namespace::Namespace::create_private(dir, &home).unwrap();
+    let mut selected = seat(dir, machine, std::process::id());
+    selected.ledger = Some(Ledger::at(namespace.fence()));
+    selected
+}
+
+#[cfg(unix)]
+#[test]
+fn cohort_ledgers_refuse_holder_only_build_admission() {
+    for mode in [Admit::Wait, Admit::Now] {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let m = machine();
+        let mut selected = cohort_seat(dir.path(), &m);
+        selected.mode = mode;
+        let mut said = Vec::new();
+        let got = admit(&test_build(), dir.path(), &selected, &mut |line| {
+            said.push(line.to_owned())
+        });
+        assert!(matches!(got, Admission::Refused(_)), "{got:?}");
+        assert_eq!(said.len(), 1);
+        assert!(said[0].contains("cohort"), "{said:?}");
+        assert!(said[0].contains("no build started"), "{said:?}");
+        assert!(selected.ledger.as_ref().unwrap().list().unwrap().is_empty());
+    }
+    // The ordinary holder route remains available with the same machine and build.
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let m = machine();
+    let ordinary = seat(dir.path(), &m, std::process::id());
+    assert!(matches!(
+        admit(&test_build(), dir.path(), &ordinary, &mut |_| {}),
+        Admission::Claimed(_)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn cohort_ledgers_refuse_before_covering_or_own_claim_fallback() {
+    for covers in [false, true] {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let m = machine();
+        let me = std::process::id();
+        m.set_procs(Some(Procs::of(vec![proc(me, 1)])));
+        let mut selected = cohort_seat(dir.path(), &m);
+        let mut need = Need::new("existing cohort controller").mem(4 * GIB);
+        if covers {
+            need = need.covers();
+        }
+        let stage = aterm_capacity::admit_with(
+            selected.ledger.as_ref().unwrap(),
+            &m,
+            need,
+            Admit::Now,
+            Pace::default(),
+            &mut |_| {},
+        )
+        .unwrap();
+        selected.marker = Some(stage.record().cover_marker());
+        let got = admit(&test_build(), dir.path(), &selected, &mut |_| {});
+        assert!(
+            matches!(got, Admission::Refused(_)),
+            "covers={covers}: {got:?}"
+        );
+        assert_eq!(selected.ledger.as_ref().unwrap().list().unwrap().len(), 1);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cohort_ledgers_refuse_the_launch_port_without_unclaimed_fallback() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let m = machine();
+    let selected = cohort_seat(dir.path(), &m);
+    assert_eq!(
+        run_if_claimed_at(
+            &dir.path().join("must-not-be-launched"),
+            &words(&["--unverified", "build"]),
+            Tool::Targo,
+            &[],
+            dir.path(),
+            &selected
+        ),
+        Some(std::process::ExitCode::from(75))
+    );
+    assert!(selected.ledger.as_ref().unwrap().list().unwrap().is_empty());
+}
+
 /// A build an ancestor's covering claim covers claims nothing, and no second record appears.
 /// NEGATIVE CONTROL: under an ancestor's claim that does not cover (a VM's), the build claims for
 /// itself, and the ledger holds both.

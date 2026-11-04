@@ -100,6 +100,50 @@ mod unix {
     }
 
     #[test]
+    fn the_initializers_lock_lets_go_while_a_copy_of_its_descriptor_lives() {
+        use std::os::fd::{AsRawFd, BorrowedFd};
+        fn file_of(fd: i32) -> Option<(libc::dev_t, libc::ino_t)> {
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: fstat writes only the buffer; a descriptor nobody holds fails with EBADF.
+            (unsafe { libc::fstat(fd, stat.as_mut_ptr()) } == 0).then(|| {
+                // SAFETY: fstat succeeded, so it filled the buffer.
+                let stat = unsafe { stat.assume_init() };
+                (stat.st_dev, stat.st_ino)
+            })
+        }
+        // A copy of the opener's descriptor stands for a forked child's before its exec: a host
+        // whose spawns fork (a `pre_exec` hook does) holds one of every descriptor open then.
+        let _fixture = kernel_fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let pool = Pool::open_in(dir.path(), width(1)).unwrap();
+        let held =
+            std::fs::OpenOptions::new().write(true).open(pool.path().join("init.lock")).unwrap();
+        held.lock().unwrap();
+        let identity = file_of(held.as_raw_fd()).unwrap();
+        let root = dir.path().to_owned();
+        let opener = std::thread::spawn(move || Pool::open_in(&root, width(1)).map(drop));
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let copy = loop {
+            // The opener's own descriptor onto init.lock, open while it waits on `held`.
+            let found = (0..4096)
+                .filter(|&fd| fd != held.as_raw_fd())
+                .find(|&fd| file_of(fd) == Some(identity));
+            if let Some(fd) = found {
+                // SAFETY: the opener keeps `fd` open until `held` lets go, after this borrow.
+                let opened = unsafe { BorrowedFd::borrow_raw(fd) };
+                break std::fs::File::from(opened.try_clone_to_owned().unwrap());
+            }
+            assert!(Instant::now() < deadline, "the opener's descriptor within the hang detector");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        held.unlock().unwrap();
+        opener.join().unwrap().unwrap();
+        assert!(Pool::open_existing(dir.path()).unwrap().is_some());
+        assert!(pool.try_acquire(owner()).unwrap().is_some());
+        drop(copy);
+    }
+
+    #[test]
     fn stale_unlocked_metadata_is_available_but_corrupt_held_metadata_is_busy() {
         let _fixture = kernel_fixture();
         let dir = tempfile::tempdir().unwrap();

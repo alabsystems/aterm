@@ -52,17 +52,23 @@ pub const fn subprocess_boot_slots(slots: usize) -> usize {
 }
 
 fn init_subprocess_pool_dir(dir: &Path, slots: usize) -> std::io::Result<()> {
+    use std::io::Write as _;
+
     let slots = slots.clamp(1, 64);
     let boots = subprocess_boot_slots(slots);
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
+    let metadata = std::fs::symlink_metadata(dir)?;
+    if !metadata.file_type().is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("subprocess pool is not a directory: {}", dir.display()),
+        ));
+    }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::DirBuilderExt as _;
-        builder.mode(0o700);
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     }
-    builder.create(dir)?;
-    let touch = |path: PathBuf| -> std::io::Result<()> {
+    let create = |path: PathBuf, contents: Option<usize>| -> std::io::Result<()> {
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create_new(true);
         #[cfg(unix)]
@@ -70,18 +76,38 @@ fn init_subprocess_pool_dir(dir: &Path, slots: usize) -> std::io::Result<()> {
             use std::os::unix::fs::OpenOptionsExt as _;
             opts.mode(0o600);
         }
-        let _file = opts.open(path)?;
+        let mut file = opts.open(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        if let Some(count) = contents {
+            writeln!(file, "{count}")?;
+        }
         Ok(())
     };
-    for idx in 0..slots {
-        touch(dir.join(format!("slot-{idx:04}.lock")))?;
-    }
-    for idx in 0..boots {
-        touch(dir.join(format!("boot-{idx:04}.lock")))?;
-    }
-    std::fs::write(dir.join("count"), format!("{slots}\n"))?;
-    std::fs::write(dir.join("boot_count"), format!("{boots}\n"))?;
-    Ok(())
+    (|| {
+        for idx in 0..slots {
+            create(dir.join(format!("slot-{idx:04}.lock")), None)?;
+        }
+        for idx in 0..boots {
+            create(dir.join(format!("boot-{idx:04}.lock")), None)?;
+        }
+        create(dir.join("count"), Some(slots))?;
+        create(dir.join("boot_count"), Some(boots))?;
+        Ok(())
+    })()
+}
+
+fn subprocess_pool(scratch: &Path, slots: usize) -> std::io::Result<aterm_tempfile::TempDir> {
+    std::fs::create_dir_all(scratch)?;
+    let pool = aterm_tempfile::Builder::new()
+        .prefix("test-subprocs.")
+        .suffix(".noindex")
+        .tempdir_in(scratch)?;
+    init_subprocess_pool_dir(pool.path(), slots)?;
+    Ok(pool)
 }
 
 /// How many of the run's slowest binaries [`poles`] names.
@@ -593,6 +619,8 @@ pub fn poles(bins: &[Binary], walls: &[Duration], total: Duration) -> String {
 /// Run `run(i)` for each distinct index below `n` in `order`, `jobs` at a time (at least one),
 /// each worker booking its children into the calling stage's memory meter
 /// ([`crate::memory::current`]) and handing them its cover marker ([`crate::memory::cover`]).
+/// Workers also retain the actual stage reservation so a nested bounded walk can outlive
+/// its pool callback without releasing memory still used by that walk.
 pub fn pool<T, F>(n: usize, order: &[usize], jobs: usize, run: F) -> Vec<Option<T>>
 where
     T: Send,
@@ -602,11 +630,13 @@ where
     let next = AtomicUsize::new(0);
     let meter = crate::memory::current();
     let cover = crate::memory::cover();
+    let memory = crate::current_memory_claim();
     std::thread::scope(|scope| {
         for _ in 0..jobs.clamp(1, order.len().max(1)) {
             scope.spawn(|| {
                 let _metering = crate::memory::metering(meter.clone());
                 let _covering = crate::memory::covering(cover.clone());
+                let _reservation = crate::holding_memory_claim(memory.clone());
                 while let Some(&i) = order.get(next.fetch_add(1, Ordering::SeqCst)) {
                     let out = run(i);
                     *answers[i]
@@ -798,12 +828,6 @@ fn binary_features(bins: &mut [Binary], features: &str) {
 
 /// Record Cargo's current test invocations and run them with the admitted parallelism.
 pub fn run_tests(ctx: &crate::Ctx, r: &mut Report, label: &str, serial: &Cmd) {
-    struct ScratchDirGuard(PathBuf);
-    impl Drop for ScratchDirGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
     let mut cores = None;
     let mut host_cores = || *cores.get_or_insert_with(|| ctx.cores());
     let managed_share = match crate::test_workers::admitted_share(&ctx.env) {
@@ -814,40 +838,50 @@ pub fn run_tests(ctx: &crate::Ctx, r: &mut Report, label: &str, serial: &Cmd) {
         }
     };
     let asked_cores = managed_share.unwrap_or_else(&mut host_cores).max(1);
-    let _subprocess_claim = ctx.memory.as_ref().and_then(|_| {
-        crate::admit_live(
+    let _subprocess_claim = if ctx.memory.is_some() {
+        match crate::admit_live(
             aterm_capacity::Need::new(format!("verify {label} subprocesses")).cores(asked_cores),
-            aterm_capacity::Admit::Now,
-        )
-        .ok()
-    });
-    let granted_cores = _subprocess_claim
-        .as_ref()
-        .map(aterm_capacity::Claim::cores)
-        .filter(|&c| c > 0)
-        .unwrap_or(asked_cores)
-        .min(asked_cores);
+            aterm_capacity::Admit::Wait,
+        ) {
+            Ok(claim) => Some(claim),
+            Err(why) => {
+                r.cannot_run(format!(
+                    "subprocess CPU admission refused: {why}; no test was run"
+                ));
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    let granted_cores = match _subprocess_claim.as_ref().map(aterm_capacity::Claim::cores) {
+        Some(0) => {
+            r.cannot_run("subprocess CPU admission granted no cores; no test was run");
+            return;
+        }
+        Some(cores) => cores.min(asked_cores),
+        None => asked_cores,
+    };
     let (jobs, threads) = ctx.test_workers_for(granted_cores, host_cores);
     let thread_override = (ctx.env.build_slot_held.is_some()
         || ctx.test_threads.is_some()
         || granted_cores < asked_cores)
         .then_some(threads);
-    let slots_seq = SUBPROCESS_POOLS.fetch_add(1, Ordering::SeqCst);
-    let slots_dir = ctx
-        .scratch
-        .join(format!("test-subprocs.{}.{slots_seq}", std::process::id()));
-    let _slots_guard =
-        init_subprocess_pool_dir(&slots_dir, subprocess_slots_for_cores(granted_cores))
-            .ok()
-            .map(|()| ScratchDirGuard(slots_dir.clone()));
+    let slots = match subprocess_pool(&ctx.scratch, subprocess_slots_for_cores(granted_cores)) {
+        Ok(pool) => pool,
+        Err(why) => {
+            r.cannot_run(format!(
+                "cannot initialize shared subprocess pool: {why}; no test was run"
+            ));
+            return;
+        }
+    };
 
     let mut serial = thread_override.map_or_else(
         || serial.clone(),
         |threads| serial.clone().env("RUST_TEST_THREADS", threads.to_string()),
     );
-    if _slots_guard.is_some() {
-        serial = serial.env(SUBPROCESS_SLOTS_ENV, &slots_dir);
-    }
+    serial = serial.env(SUBPROCESS_SLOTS_ENV, slots.path());
     let serial = &serial;
     let features = feature_args(serial);
     #[cfg(unix)]
@@ -982,7 +1016,6 @@ pub fn run_tests(ctx: &crate::Ctx, r: &mut Report, label: &str, serial: &Cmd) {
 }
 
 static RECORDING: AtomicUsize = AtomicUsize::new(0);
-static SUBPROCESS_POOLS: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(test)]
 #[path = "testrun_environment_tests.rs"]
@@ -995,6 +1028,57 @@ mod discovery_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn broken_subprocess_pool_initialization_refuses_before_test_dispatch() {
+        let tmp = aterm_tempfile::tempdir().expect("scratch");
+        let scratch = tmp.path().join("not-a-directory");
+        std::fs::write(&scratch, b"retained").expect("block pool initialization");
+        let ctx = crate::Ctx::new(
+            tmp.path().to_path_buf(),
+            crate::Scope::workspace(),
+            crate::EnvSnapshot::default(),
+            scratch.clone(),
+        );
+        let mut report = Report::new("pool refusal");
+        run_tests(
+            &ctx,
+            &mut report,
+            "fixture",
+            &Cmd::new("must-not-be-dispatched"),
+        );
+        assert!(
+            matches!(&report.entries[..], [crate::ladder::Entry::Ladder {
+            outcome: crate::ladder::Outcome::Fail(crate::ladder::Severity::CouldNotRun), label, ..
+        }] if label.starts_with("cannot initialize shared subprocess pool:"))
+        );
+        assert_eq!(
+            std::fs::read(&scratch).expect("retained blocker"),
+            b"retained"
+        );
+    }
+
+    #[test]
+    fn subprocess_pool_cleanup_owns_only_its_new_directory() {
+        let tmp = aterm_tempfile::tempdir().expect("scratch");
+        let existing = tmp.path().join("existing");
+        std::fs::create_dir(&existing).expect("owned existing fixture");
+        init_subprocess_pool_dir(&existing, 2).expect("existing pool");
+        let sentinel = existing.join("sentinel");
+        std::fs::write(&sentinel, b"retained").expect("sentinel");
+        assert!(init_subprocess_pool_dir(&existing, 2).is_err());
+        let owned = subprocess_pool(tmp.path(), 2).expect("owned pool");
+        let owned_path = owned.path().to_path_buf();
+        assert_ne!(owned_path, existing);
+        drop(owned);
+        assert!(!owned_path.exists());
+        assert_eq!(
+            std::fs::read(&sentinel).expect("existing sentinel"),
+            b"retained"
+        );
+        assert!(existing.join("slot-0000.lock").is_file());
+        assert!(existing.join("slot-0001.lock").is_file());
+    }
 
     #[test]
     fn failed_binary_is_reported_while_another_binary_is_still_running() {
@@ -1625,7 +1709,12 @@ mod tests {
 
         let tmp = aterm_tempfile::tempdir().expect("scratch pool");
         let dir = tmp.path().join("pool");
+        std::fs::create_dir(&dir).expect("owned pool directory");
         init_subprocess_pool_dir(&dir, 2).expect("init 2-slot pool");
+        assert!(
+            init_subprocess_pool_dir(&dir, 2).is_err(),
+            "a populated fixed layout must not be rewritten"
+        );
 
         let (release_a, wait_a) = std::sync::mpsc::channel::<()>();
         let (release_b, wait_b) = std::sync::mpsc::channel::<()>();
@@ -1635,37 +1724,43 @@ mod tests {
             let dir_ref = &dir;
             let ready_tx_a = ready_tx.clone();
             let h_a = scope.spawn(move || {
-                let lease =
-                    subprocess_lane::acquire_with_pool(Some(dir_ref), Duration::from_secs(5));
-                let boot = subprocess_lane::acquire_boot_permit_with_pool(
+                let _lease =
+                    subprocess_lane::acquire_with_pool(Some(dir_ref), Duration::from_secs(60))
+                        .expect("stack admission");
+                let _boot = subprocess_lane::acquire_boot_permit_with_pool(
                     Some(dir_ref),
-                    Duration::from_secs(5),
-                );
-                ready_tx_a
-                    .send(lease.is_exclusive() && boot.is_exclusive())
-                    .expect("send a");
+                    Duration::from_secs(60),
+                )
+                .expect("boot admission");
+                ready_tx_a.send(true).expect("send a");
                 let _ = wait_a.recv();
             });
             let h_b = scope.spawn(move || {
                 let lease =
-                    subprocess_lane::acquire_with_pool(Some(dir_ref), Duration::from_secs(5));
-                ready_tx.send(lease.is_exclusive()).expect("send b");
+                    subprocess_lane::acquire_with_pool(Some(dir_ref), Duration::from_secs(60));
+                ready_tx.send(lease.is_ok()).expect("send b");
                 let _ = wait_b.recv();
             });
-            assert!(ready_rx.recv().expect("a acquired"));
-            assert!(ready_rx.recv().expect("b acquired"));
+            assert!(
+                ready_rx
+                    .recv_timeout(Duration::from_secs(60))
+                    .expect("a acquired")
+            );
+            assert!(
+                ready_rx
+                    .recv_timeout(Duration::from_secs(60))
+                    .expect("b acquired")
+            );
 
             let third = scope
                 .spawn(move || {
-                    subprocess_lane::acquire_with_pool(Some(dir_ref), Duration::from_millis(25))
-                        .is_exclusive()
+                    subprocess_lane::acquire_with_pool(Some(dir_ref), Duration::ZERO)
+                        .err()
+                        .map(|e| e.kind())
                 })
                 .join()
                 .expect("third joined");
-            assert!(
-                !third,
-                "third thread must not take an exclusive slot while 2/2 are held"
-            );
+            assert_eq!(third, Some(std::io::ErrorKind::TimedOut));
 
             drop(release_a);
             drop(release_b);

@@ -13,7 +13,7 @@ pub fn account_worker_environment_model() -> Model {
             const Buggy = 0;
             var provider = 0; var own = 0; var carried = 0; var phase = 0;
             var login = 0; var clean = 1; var kept = 1; var writable = 1;
-            action Provider when (phase == 0 && 3 > provider) { provider = provider + 1; }
+            action Provider when (phase == 0 && 4 > provider) { provider = provider + 1; }
             action Own when (phase == 0 && own == 0) { own = 1; }
             action Carried when (phase == 0 && 2 > carried) { carried = carried + 1; }
             action Apply when (phase == 0) {

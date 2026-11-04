@@ -433,13 +433,6 @@ pub(in crate::harness) fn adopt(
     if row.browser.is_some() {
         return Err(super::super::account_catalog::NAMED_BROWSER_UNSUPPORTED.into());
     }
-    if is_new
-        && (raw.rows.len() >= accounts::MAX_ACCOUNTS
-            || (!logins.labels.contains_key(&row.label)
-                && logins.labels.len() >= accounts::MAX_ACCOUNTS))
-    {
-        return Err("local account capacity is exhausted".into());
-    }
     let before_parent = accounts::RenewalParent::capture(&logins, &row.label);
     let email = row
         .expected_identity_email()

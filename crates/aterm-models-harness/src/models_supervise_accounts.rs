@@ -7,9 +7,10 @@ use aterm_spec::derive::{Liveness, Model};
 
 /// Supervisor account rotation and rate-limit failover model.
 ///
-/// Accounts 1 and 2 (`d1`, `d2`) are rows this Mac prefers, account 3 (`sh`) a pool row: one
-/// another Mac prefers or none does (`docs/DESIGN-alab-lab-model-2026-11-01.md` §0). The order is
-/// an order and never a limit: `PreferredBeforePool` says a move takes a preferred row while one
+/// Accounts 1 and 2 (`pref1`, `pref2`, and the actions ending `Pref1` and `Pref2`) are rows this
+/// Mac prefers, account 3 (`pool`, the actions ending `Pool`) a pool row: one another Mac prefers
+/// or none does (`docs/DESIGN-alab-lab-model-2026-11-01.md` §0). Each variable is its account's
+/// condition: 0 usable, 1 low, 2 at its wall. The order is an order and never a limit: `PreferredBeforePool` says a move takes a preferred row while one
 /// of them is neither low nor at its wall, and `NoWaitWhileOneIsUsable` with the liveness
 /// `EveryUsableAccountIsTried` say the pool row is moved to, never waited past, once the
 /// preferred rows are spent. The model has no clock: that a wait is for the earliest instant of
@@ -22,9 +23,9 @@ pub fn supervisor_account_rotation_model() -> Model {
         SupervisorAccountRotation {
             const Buggy = 0;
             const Budget = 2;
-            var d1 = 0;
-            var d2 = 0;
-            var sh = 0;
+            var pref1 = 0;
+            var pref2 = 0;
+            var pool = 0;
             var act = 0;
             var run = 0;
             var prov = 0;
@@ -67,8 +68,8 @@ pub fn supervisor_account_rotation_model() -> Model {
                 pw = 0;
                 cx = 0;
             }
-            action WallD1 when (d1 <= 1 && (s1 == 1 || s2 == 1)) {
-                d1 = 2;
+            action WallPref1 when (pref1 <= 1 && (s1 == 1 || s2 == 1)) {
+                pref1 = 2;
                 run = if act == 1 { 0 } else { run };
                 pin = if pin == 1 { 0 } else { pin };
                 n1 = 0;
@@ -79,8 +80,8 @@ pub fn supervisor_account_rotation_model() -> Model {
                 pw = 0;
                 cx = 0;
             }
-            action WallD2 when (d2 <= 1 && (s1 == 2 || s2 == 2)) {
-                d2 = 2;
+            action WallPref2 when (pref2 <= 1 && (s1 == 2 || s2 == 2)) {
+                pref2 = 2;
                 run = if act == 2 { 0 } else { run };
                 pin = if pin == 2 { 0 } else { pin };
                 n1 = 0;
@@ -91,8 +92,8 @@ pub fn supervisor_account_rotation_model() -> Model {
                 pw = 0;
                 cx = 0;
             }
-            action WallSh when (sh <= 1 && (s1 == 3 || s2 == 3)) {
-                sh = 2;
+            action WallPool when (pool <= 1 && (s1 == 3 || s2 == 3)) {
+                pool = 2;
                 run = if act == 3 { 0 } else { run };
                 pin = if pin == 3 { 0 } else { pin };
                 n1 = 0;
@@ -103,10 +104,10 @@ pub fn supervisor_account_rotation_model() -> Model {
                 pw = 0;
                 cx = 0;
             }
-            action LowD1 when (
-                d1 == 0 && (s1 == 1 || s2 == 1) && (prov == 1 || act == 0 || 2 <= act)
+            action LowPref1 when (
+                pref1 == 0 && (s1 == 1 || s2 == 1) && (prov == 1 || act == 0 || 2 <= act)
             ) {
-                d1 = 1;
+                pref1 = 1;
                 run = if act == 1 { 1 } else { run };
                 n1 = 0;
                 n2 = 0;
@@ -116,10 +117,10 @@ pub fn supervisor_account_rotation_model() -> Model {
                 pw = 0;
                 cx = 0;
             }
-            action LowD2 when (
-                d2 == 0 && (s1 == 2 || s2 == 2) && (prov == 1 || act <= 1 || act == 3)
+            action LowPref2 when (
+                pref2 == 0 && (s1 == 2 || s2 == 2) && (prov == 1 || act <= 1 || act == 3)
             ) {
-                d2 = 1;
+                pref2 = 1;
                 run = if act == 2 { 1 } else { run };
                 n1 = 0;
                 n2 = 0;
@@ -129,8 +130,8 @@ pub fn supervisor_account_rotation_model() -> Model {
                 pw = 0;
                 cx = 0;
             }
-            action LowSh when (sh == 0 && (s1 == 3 || s2 == 3) && (prov == 1 || act <= 2)) {
-                sh = 1;
+            action LowPool when (pool == 0 && (s1 == 3 || s2 == 3) && (prov == 1 || act <= 2)) {
+                pool = 1;
                 run = if act == 3 { 1 } else { run };
                 n1 = 0;
                 n2 = 0;
@@ -140,8 +141,8 @@ pub fn supervisor_account_rotation_model() -> Model {
                 pw = 0;
                 cx = 0;
             }
-            action ResetD1 when (1 <= d1) {
-                d1 = 0;
+            action ResetPref1 when (1 <= pref1) {
+                pref1 = 0;
                 run = if act == 1 { 2 } else { run };
                 w1 = 0;
                 w2 = 0;
@@ -153,8 +154,8 @@ pub fn supervisor_account_rotation_model() -> Model {
                 pw = 0;
                 cx = 0;
             }
-            action ResetD2 when (1 <= d2) {
-                d2 = 0;
+            action ResetPref2 when (1 <= pref2) {
+                pref2 = 0;
                 run = if act == 2 { 2 } else { run };
                 w1 = 0;
                 w2 = 0;
@@ -166,8 +167,8 @@ pub fn supervisor_account_rotation_model() -> Model {
                 pw = 0;
                 cx = 0;
             }
-            action ResetSh when (1 <= sh) {
-                sh = 0;
+            action ResetPool when (1 <= pool) {
+                pool = 0;
                 run = if act == 3 { 2 } else { run };
                 w1 = 0;
                 w2 = 0;
@@ -179,10 +180,10 @@ pub fn supervisor_account_rotation_model() -> Model {
                 pw = 0;
                 cx = 0;
             }
-            action UseD1 when (pin == 0 || 2 <= pin) {
-                d1 = if d1 == 2 { 0 } else { d1 };
+            action UsePref1 when (pin == 0 || 2 <= pin) {
+                pref1 = if pref1 == 2 { 0 } else { pref1 };
                 act = 1;
-                run = if d1 == 1 { 1 } else { 2 };
+                run = if pref1 == 1 { 1 } else { 2 };
                 prov = 1;
                 prev = 0;
                 pp = 0;
@@ -190,18 +191,18 @@ pub fn supervisor_account_rotation_model() -> Model {
                 hold = 0;
                 w1 = 0;
                 w2 = 0;
-                n1 = if s1 == 1 && d1 == 2 { 1 } else { 0 };
-                n2 = if s2 == 1 && d1 == 2 { 1 } else { 0 };
+                n1 = if s1 == 1 && pref1 == 2 { 1 } else { 0 };
+                n2 = if s2 == 1 && pref1 == 2 { 1 } else { 0 };
                 mv = 0;
                 pa = 0;
                 ph = 0;
                 pw = 0;
                 cx = 0;
             }
-            action UseD2 when (pin <= 1 || pin == 3) {
-                d2 = if d2 == 2 { 0 } else { d2 };
+            action UsePref2 when (pin <= 1 || pin == 3) {
+                pref2 = if pref2 == 2 { 0 } else { pref2 };
                 act = 2;
-                run = if d2 == 1 { 1 } else { 2 };
+                run = if pref2 == 1 { 1 } else { 2 };
                 prov = 1;
                 prev = 0;
                 pp = 0;
@@ -209,18 +210,18 @@ pub fn supervisor_account_rotation_model() -> Model {
                 hold = 0;
                 w1 = 0;
                 w2 = 0;
-                n1 = if s1 == 2 && d2 == 2 { 1 } else { 0 };
-                n2 = if s2 == 2 && d2 == 2 { 1 } else { 0 };
+                n1 = if s1 == 2 && pref2 == 2 { 1 } else { 0 };
+                n2 = if s2 == 2 && pref2 == 2 { 1 } else { 0 };
                 mv = 0;
                 pa = 0;
                 ph = 0;
                 pw = 0;
                 cx = 0;
             }
-            action UseSh when (pin <= 2) {
-                sh = if sh == 2 { 0 } else { sh };
+            action UsePool when (pin <= 2) {
+                pool = if pool == 2 { 0 } else { pool };
                 act = 3;
-                run = if sh == 1 { 1 } else { 2 };
+                run = if pool == 1 { 1 } else { 2 };
                 prov = 1;
                 prev = 0;
                 pp = 0;
@@ -228,8 +229,8 @@ pub fn supervisor_account_rotation_model() -> Model {
                 hold = 0;
                 w1 = 0;
                 w2 = 0;
-                n1 = if s1 == 3 && sh == 2 { 1 } else { 0 };
-                n2 = if s2 == 3 && sh == 2 { 1 } else { 0 };
+                n1 = if s1 == 3 && pool == 2 { 1 } else { 0 };
+                n2 = if s2 == 3 && pool == 2 { 1 } else { 0 };
                 mv = 0;
                 pa = 0;
                 ph = 0;
@@ -264,14 +265,14 @@ pub fn supervisor_account_rotation_model() -> Model {
                 cx = 0;
             }
             action Strike when (1 <= run && prov == 0 && (s1 == act || s2 == act)) {
-                d1 = if act == 1 { 2 } else { d1 };
-                d2 = if act == 2 { 2 } else { d2 };
-                sh = if act == 3 { 2 } else { sh };
+                pref1 = if act == 1 { 2 } else { pref1 };
+                pref2 = if act == 2 { 2 } else { pref2 };
+                pool = if act == 3 { 2 } else { pool };
                 act = prev;
-                run = if (prev == 1 && d1 == 0) || (prev == 2 && d2 == 0) || (prev == 3 && sh == 0)
+                run = if (prev == 1 && pref1 == 0) || (prev == 2 && pref2 == 0) || (prev == 3 && pool == 0)
                 {
                     2
-                } else if (prev == 1 && d1 == 1) || (prev == 2 && d2 == 1) || (prev == 3 && sh == 1)
+                } else if (prev == 1 && pref1 == 1) || (prev == 2 && pref2 == 1) || (prev == 3 && pool == 1)
                 {
                     1
                 } else {
@@ -308,59 +309,59 @@ pub fn supervisor_account_rotation_model() -> Model {
                 w1 == 0 && jobs == 0 && (
                     ((s1 > act || act > s1) && 1 <= run && prov == 0 && hold == 0
                         && (run == 2
-                            || (s1 == 1 && d1 == 2) || (s1 == 2 && d2 == 2)
-                            || (s1 == 3 && sh == 2)))
+                            || (s1 == 1 && pref1 == 2) || (s1 == 2 && pref2 == 2)
+                            || (s1 == 3 && pool == 2)))
                     || ((s1 > act || act > s1) && 1 <= run && prov == 1
                         && (run == 2 || 1 <= pin
-                            || (s1 == 1 && d1 == 2) || (s1 == 2 && d2 == 2)
-                            || (s1 == 3 && sh == 2)))
-                    || (((s1 == 1 && d1 == 2) || (s1 == 2 && d2 == 2) || (s1 == 3 && sh == 2))
-                        && run == 0 && rot <= Budget - 1 && (d1 <= 1 || d2 <= 1 || sh <= 1))
-                    || (((s1 == 1 && d1 == 1) || (s1 == 2 && d2 == 1) || (s1 == 3 && sh == 1))
-                        && pin == 0 && rot <= Budget - 1 && (d1 == 0 || d2 == 0 || sh == 0)
+                            || (s1 == 1 && pref1 == 2) || (s1 == 2 && pref2 == 2)
+                            || (s1 == 3 && pool == 2)))
+                    || (((s1 == 1 && pref1 == 2) || (s1 == 2 && pref2 == 2) || (s1 == 3 && pool == 2))
+                        && run == 0 && rot <= Budget - 1 && (pref1 <= 1 || pref2 <= 1 || pool <= 1))
+                    || (((s1 == 1 && pref1 == 1) || (s1 == 2 && pref2 == 1) || (s1 == 3 && pool == 1))
+                        && pin == 0 && rot <= Budget - 1 && (pref1 == 0 || pref2 == 0 || pool == 0)
                         && (run == 0 || (prov == 1 && run == 1)))
                 )
             ) {
                 s1 = if run == 0
-                    || (prov == 1 && run == 1 && pin == 0 && (d1 == 0 || d2 == 0 || sh == 0)
+                    || (prov == 1 && run == 1 && pin == 0 && (pref1 == 0 || pref2 == 0 || pool == 0)
                         && rot <= Budget - 1)
                 {
-                    if d1 == 0 { 1 } else if d2 == 0 { 2 } else if sh == 0 { 3 }
-                    else if d1 == 1 { 1 } else if d2 == 1 { 2 } else { 3 }
+                    if pref1 == 0 { 1 } else if pref2 == 0 { 2 } else if pool == 0 { 3 }
+                    else if pref1 == 1 { 1 } else if pref2 == 1 { 2 } else { 3 }
                 } else {
                     act
                 };
                 act = if run == 0
-                    || (prov == 1 && run == 1 && pin == 0 && (d1 == 0 || d2 == 0 || sh == 0)
+                    || (prov == 1 && run == 1 && pin == 0 && (pref1 == 0 || pref2 == 0 || pool == 0)
                         && rot <= Budget - 1)
                 {
-                    if d1 == 0 { 1 } else if d2 == 0 { 2 } else if sh == 0 { 3 }
-                    else if d1 == 1 { 1 } else if d2 == 1 { 2 } else { 3 }
+                    if pref1 == 0 { 1 } else if pref2 == 0 { 2 } else if pool == 0 { 3 }
+                    else if pref1 == 1 { 1 } else if pref2 == 1 { 2 } else { 3 }
                 } else {
                     act
                 };
                 run = if run == 0
-                    || (prov == 1 && run == 1 && pin == 0 && (d1 == 0 || d2 == 0 || sh == 0)
+                    || (prov == 1 && run == 1 && pin == 0 && (pref1 == 0 || pref2 == 0 || pool == 0)
                         && rot <= Budget - 1)
-                { if (d1 == 0 || d2 == 0 || sh == 0) { 2 } else { 1 } } else { run };
+                { if (pref1 == 0 || pref2 == 0 || pool == 0) { 2 } else { 1 } } else { run };
                 prov = if run == 0
-                    || (prov == 1 && run == 1 && pin == 0 && (d1 == 0 || d2 == 0 || sh == 0)
+                    || (prov == 1 && run == 1 && pin == 0 && (pref1 == 0 || pref2 == 0 || pool == 0)
                         && rot <= Budget - 1)
                 { 0 } else { prov };
                 prev = if run == 0
-                    || (prov == 1 && run == 1 && pin == 0 && (d1 == 0 || d2 == 0 || sh == 0)
+                    || (prov == 1 && run == 1 && pin == 0 && (pref1 == 0 || pref2 == 0 || pool == 0)
                         && rot <= Budget - 1)
                 { act } else { prev };
                 pp = if run == 0
-                    || (prov == 1 && run == 1 && pin == 0 && (d1 == 0 || d2 == 0 || sh == 0)
+                    || (prov == 1 && run == 1 && pin == 0 && (pref1 == 0 || pref2 == 0 || pool == 0)
                         && rot <= Budget - 1)
                 { prov } else { pp };
                 rot = if run == 0
-                    || (prov == 1 && run == 1 && pin == 0 && (d1 == 0 || d2 == 0 || sh == 0)
+                    || (prov == 1 && run == 1 && pin == 0 && (pref1 == 0 || pref2 == 0 || pool == 0)
                         && rot <= Budget - 1)
                 { rot + 1 } else { rot };
                 hold = if run == 0
-                    || (prov == 1 && run == 1 && pin == 0 && (d1 == 0 || d2 == 0 || sh == 0)
+                    || (prov == 1 && run == 1 && pin == 0 && (pref1 == 0 || pref2 == 0 || pool == 0)
                         && rot <= Budget - 1)
                     || prov == 0
                 { 1 } else { hold };
@@ -368,60 +369,60 @@ pub fn supervisor_account_rotation_model() -> Model {
                 mv = 1;
                 pa = act;
                 ph = hold;
-                pw = if (s1 == 1 && d1 == 2) || (s1 == 2 && d2 == 2) || (s1 == 3 && sh == 2) { 1 } else { 0 };
+                pw = if (s1 == 1 && pref1 == 2) || (s1 == 2 && pref2 == 2) || (s1 == 3 && pool == 2) { 1 } else { 0 };
                 cx = 0;
             }
             action Leave1 when (
                 w1 == 0 && jobs == 0
-                && ((s1 == 1 && d1 == 2) || (s1 == 2 && d2 == 2) || (s1 == 3 && sh == 2))
+                && ((s1 == 1 && pref1 == 2) || (s1 == 2 && pref2 == 2) || (s1 == 3 && pool == 2))
                 && (
                     ((s1 > act || act > s1) && run == 2 && prov == 0 && hold == 0)
                     || ((s1 > act || act > s1) && prov == 1
                         && (run == 2 || (run == 1 && 1 <= pin)))
-                    || (pin == 0 && rot <= Budget - 1 && (d1 == 0 || d2 == 0 || sh == 0)
+                    || (pin == 0 && rot <= Budget - 1 && (pref1 == 0 || pref2 == 0 || pool == 0)
                         && (run == 0 || (prov == 1 && run == 1)))
                 )
             ) {
                 s1 = if run == 0
-                    || (prov == 1 && run == 1 && pin == 0 && (d1 == 0 || d2 == 0 || sh == 0)
+                    || (prov == 1 && run == 1 && pin == 0 && (pref1 == 0 || pref2 == 0 || pool == 0)
                         && rot <= Budget - 1)
                 {
-                    if d1 == 0 { 1 } else if d2 == 0 { 2 } else if sh == 0 { 3 }
-                    else if d1 == 1 { 1 } else if d2 == 1 { 2 } else { 3 }
+                    if pref1 == 0 { 1 } else if pref2 == 0 { 2 } else if pool == 0 { 3 }
+                    else if pref1 == 1 { 1 } else if pref2 == 1 { 2 } else { 3 }
                 } else {
                     act
                 };
                 act = if run == 0
-                    || (prov == 1 && run == 1 && pin == 0 && (d1 == 0 || d2 == 0 || sh == 0)
+                    || (prov == 1 && run == 1 && pin == 0 && (pref1 == 0 || pref2 == 0 || pool == 0)
                         && rot <= Budget - 1)
                 {
-                    if d1 == 0 { 1 } else if d2 == 0 { 2 } else if sh == 0 { 3 }
-                    else if d1 == 1 { 1 } else if d2 == 1 { 2 } else { 3 }
+                    if pref1 == 0 { 1 } else if pref2 == 0 { 2 } else if pool == 0 { 3 }
+                    else if pref1 == 1 { 1 } else if pref2 == 1 { 2 } else { 3 }
                 } else {
                     act
                 };
                 run = if run == 0
-                    || (prov == 1 && run == 1 && pin == 0 && (d1 == 0 || d2 == 0 || sh == 0)
+                    || (prov == 1 && run == 1 && pin == 0 && (pref1 == 0 || pref2 == 0 || pool == 0)
                         && rot <= Budget - 1)
-                { if (d1 == 0 || d2 == 0 || sh == 0) { 2 } else { 1 } } else { run };
+                { if (pref1 == 0 || pref2 == 0 || pool == 0) { 2 } else { 1 } } else { run };
                 prov = if run == 0
-                    || (prov == 1 && run == 1 && pin == 0 && (d1 == 0 || d2 == 0 || sh == 0)
+                    || (prov == 1 && run == 1 && pin == 0 && (pref1 == 0 || pref2 == 0 || pool == 0)
                         && rot <= Budget - 1)
                 { 0 } else { prov };
                 prev = if run == 0
-                    || (prov == 1 && run == 1 && pin == 0 && (d1 == 0 || d2 == 0 || sh == 0)
+                    || (prov == 1 && run == 1 && pin == 0 && (pref1 == 0 || pref2 == 0 || pool == 0)
                         && rot <= Budget - 1)
                 { act } else { prev };
                 pp = if run == 0
-                    || (prov == 1 && run == 1 && pin == 0 && (d1 == 0 || d2 == 0 || sh == 0)
+                    || (prov == 1 && run == 1 && pin == 0 && (pref1 == 0 || pref2 == 0 || pool == 0)
                         && rot <= Budget - 1)
                 { prov } else { pp };
                 rot = if run == 0
-                    || (prov == 1 && run == 1 && pin == 0 && (d1 == 0 || d2 == 0 || sh == 0)
+                    || (prov == 1 && run == 1 && pin == 0 && (pref1 == 0 || pref2 == 0 || pool == 0)
                         && rot <= Budget - 1)
                 { rot + 1 } else { rot };
                 hold = if run == 0
-                    || (prov == 1 && run == 1 && pin == 0 && (d1 == 0 || d2 == 0 || sh == 0)
+                    || (prov == 1 && run == 1 && pin == 0 && (pref1 == 0 || pref2 == 0 || pool == 0)
                         && rot <= Budget - 1)
                     || prov == 0
                 { 1 } else { hold };
@@ -434,11 +435,11 @@ pub fn supervisor_account_rotation_model() -> Model {
             }
             action Wait1 when (
                 w1 == 0
-                && ((s1 == 1 && d1 == 2) || (s1 == 2 && d2 == 2) || (s1 == 3 && sh == 2))
+                && ((s1 == 1 && pref1 == 2) || (s1 == 2 && pref2 == 2) || (s1 == 3 && pool == 2))
                 && (
                     jobs == 1
                     || (1 <= run && prov == 0 && hold == 1)
-                    || (run == 0 && (Budget <= rot || (d1 == 2 && d2 == 2 && sh == 2)))
+                    || (run == 0 && (Budget <= rot || (pref1 == 2 && pref2 == 2 && pool == 2)))
                 )
             ) {
                 w1 = 1;
@@ -450,7 +451,7 @@ pub fn supervisor_account_rotation_model() -> Model {
             }
             action Resume1 when (
                 w1 == 0 && n1 == 1
-                && ((s1 == 1 && d1 <= 1) || (s1 == 2 && d2 <= 1) || (s1 == 3 && sh <= 1))
+                && ((s1 == 1 && pref1 <= 1) || (s1 == 2 && pref2 <= 1) || (s1 == 3 && pool <= 1))
             ) {
                 n1 = 0;
                 mv = 0;
@@ -468,59 +469,59 @@ pub fn supervisor_account_rotation_model() -> Model {
                 w2 == 0 && (
                     ((s2 > act || act > s2) && 1 <= run && prov == 0 && hold == 0
                         && (run == 2
-                            || (s2 == 1 && d1 == 2) || (s2 == 2 && d2 == 2)
-                            || (s2 == 3 && sh == 2)))
+                            || (s2 == 1 && pref1 == 2) || (s2 == 2 && pref2 == 2)
+                            || (s2 == 3 && pool == 2)))
                     || ((s2 > act || act > s2) && 1 <= run && prov == 1
                         && (run == 2 || 1 <= pin
-                            || (s2 == 1 && d1 == 2) || (s2 == 2 && d2 == 2)
-                            || (s2 == 3 && sh == 2)))
-                    || (((s2 == 1 && d1 == 2) || (s2 == 2 && d2 == 2) || (s2 == 3 && sh == 2))
-                        && run == 0 && rot <= Budget - 1 && (d1 <= 1 || d2 <= 1 || sh <= 1))
-                    || (((s2 == 1 && d1 == 1) || (s2 == 2 && d2 == 1) || (s2 == 3 && sh == 1))
-                        && pin == 0 && rot <= Budget - 1 && (d1 == 0 || d2 == 0 || sh == 0)
+                            || (s2 == 1 && pref1 == 2) || (s2 == 2 && pref2 == 2)
+                            || (s2 == 3 && pool == 2)))
+                    || (((s2 == 1 && pref1 == 2) || (s2 == 2 && pref2 == 2) || (s2 == 3 && pool == 2))
+                        && run == 0 && rot <= Budget - 1 && (pref1 <= 1 || pref2 <= 1 || pool <= 1))
+                    || (((s2 == 1 && pref1 == 1) || (s2 == 2 && pref2 == 1) || (s2 == 3 && pool == 1))
+                        && pin == 0 && rot <= Budget - 1 && (pref1 == 0 || pref2 == 0 || pool == 0)
                         && (run == 0 || (prov == 1 && run == 1)))
                 )
             ) {
                 s2 = if run == 0
-                    || (prov == 1 && run == 1 && pin == 0 && (d1 == 0 || d2 == 0 || sh == 0)
+                    || (prov == 1 && run == 1 && pin == 0 && (pref1 == 0 || pref2 == 0 || pool == 0)
                         && rot <= Budget - 1)
                 {
-                    if d1 == 0 { 1 } else if d2 == 0 { 2 } else if sh == 0 { 3 }
-                    else if d1 == 1 { 1 } else if d2 == 1 { 2 } else { 3 }
+                    if pref1 == 0 { 1 } else if pref2 == 0 { 2 } else if pool == 0 { 3 }
+                    else if pref1 == 1 { 1 } else if pref2 == 1 { 2 } else { 3 }
                 } else {
                     act
                 };
                 act = if run == 0
-                    || (prov == 1 && run == 1 && pin == 0 && (d1 == 0 || d2 == 0 || sh == 0)
+                    || (prov == 1 && run == 1 && pin == 0 && (pref1 == 0 || pref2 == 0 || pool == 0)
                         && rot <= Budget - 1)
                 {
-                    if d1 == 0 { 1 } else if d2 == 0 { 2 } else if sh == 0 { 3 }
-                    else if d1 == 1 { 1 } else if d2 == 1 { 2 } else { 3 }
+                    if pref1 == 0 { 1 } else if pref2 == 0 { 2 } else if pool == 0 { 3 }
+                    else if pref1 == 1 { 1 } else if pref2 == 1 { 2 } else { 3 }
                 } else {
                     act
                 };
                 run = if run == 0
-                    || (prov == 1 && run == 1 && pin == 0 && (d1 == 0 || d2 == 0 || sh == 0)
+                    || (prov == 1 && run == 1 && pin == 0 && (pref1 == 0 || pref2 == 0 || pool == 0)
                         && rot <= Budget - 1)
-                { if (d1 == 0 || d2 == 0 || sh == 0) { 2 } else { 1 } } else { run };
+                { if (pref1 == 0 || pref2 == 0 || pool == 0) { 2 } else { 1 } } else { run };
                 prov = if run == 0
-                    || (prov == 1 && run == 1 && pin == 0 && (d1 == 0 || d2 == 0 || sh == 0)
+                    || (prov == 1 && run == 1 && pin == 0 && (pref1 == 0 || pref2 == 0 || pool == 0)
                         && rot <= Budget - 1)
                 { 0 } else { prov };
                 prev = if run == 0
-                    || (prov == 1 && run == 1 && pin == 0 && (d1 == 0 || d2 == 0 || sh == 0)
+                    || (prov == 1 && run == 1 && pin == 0 && (pref1 == 0 || pref2 == 0 || pool == 0)
                         && rot <= Budget - 1)
                 { act } else { prev };
                 pp = if run == 0
-                    || (prov == 1 && run == 1 && pin == 0 && (d1 == 0 || d2 == 0 || sh == 0)
+                    || (prov == 1 && run == 1 && pin == 0 && (pref1 == 0 || pref2 == 0 || pool == 0)
                         && rot <= Budget - 1)
                 { prov } else { pp };
                 rot = if run == 0
-                    || (prov == 1 && run == 1 && pin == 0 && (d1 == 0 || d2 == 0 || sh == 0)
+                    || (prov == 1 && run == 1 && pin == 0 && (pref1 == 0 || pref2 == 0 || pool == 0)
                         && rot <= Budget - 1)
                 { rot + 1 } else { rot };
                 hold = if run == 0
-                    || (prov == 1 && run == 1 && pin == 0 && (d1 == 0 || d2 == 0 || sh == 0)
+                    || (prov == 1 && run == 1 && pin == 0 && (pref1 == 0 || pref2 == 0 || pool == 0)
                         && rot <= Budget - 1)
                     || prov == 0
                 { 1 } else { hold };
@@ -528,60 +529,60 @@ pub fn supervisor_account_rotation_model() -> Model {
                 mv = 2;
                 pa = act;
                 ph = hold;
-                pw = if (s2 == 1 && d1 == 2) || (s2 == 2 && d2 == 2) || (s2 == 3 && sh == 2) { 1 } else { 0 };
+                pw = if (s2 == 1 && pref1 == 2) || (s2 == 2 && pref2 == 2) || (s2 == 3 && pool == 2) { 1 } else { 0 };
                 cx = 0;
             }
             action Leave2 when (
                 w2 == 0
-                && ((s2 == 1 && d1 == 2) || (s2 == 2 && d2 == 2) || (s2 == 3 && sh == 2))
+                && ((s2 == 1 && pref1 == 2) || (s2 == 2 && pref2 == 2) || (s2 == 3 && pool == 2))
                 && (
                     ((s2 > act || act > s2) && run == 2 && prov == 0 && hold == 0)
                     || ((s2 > act || act > s2) && prov == 1
                         && (run == 2 || (run == 1 && 1 <= pin)))
-                    || (pin == 0 && rot <= Budget - 1 && (d1 == 0 || d2 == 0 || sh == 0)
+                    || (pin == 0 && rot <= Budget - 1 && (pref1 == 0 || pref2 == 0 || pool == 0)
                         && (run == 0 || (prov == 1 && run == 1)))
                 )
             ) {
                 s2 = if run == 0
-                    || (prov == 1 && run == 1 && pin == 0 && (d1 == 0 || d2 == 0 || sh == 0)
+                    || (prov == 1 && run == 1 && pin == 0 && (pref1 == 0 || pref2 == 0 || pool == 0)
                         && rot <= Budget - 1)
                 {
-                    if d1 == 0 { 1 } else if d2 == 0 { 2 } else if sh == 0 { 3 }
-                    else if d1 == 1 { 1 } else if d2 == 1 { 2 } else { 3 }
+                    if pref1 == 0 { 1 } else if pref2 == 0 { 2 } else if pool == 0 { 3 }
+                    else if pref1 == 1 { 1 } else if pref2 == 1 { 2 } else { 3 }
                 } else {
                     act
                 };
                 act = if run == 0
-                    || (prov == 1 && run == 1 && pin == 0 && (d1 == 0 || d2 == 0 || sh == 0)
+                    || (prov == 1 && run == 1 && pin == 0 && (pref1 == 0 || pref2 == 0 || pool == 0)
                         && rot <= Budget - 1)
                 {
-                    if d1 == 0 { 1 } else if d2 == 0 { 2 } else if sh == 0 { 3 }
-                    else if d1 == 1 { 1 } else if d2 == 1 { 2 } else { 3 }
+                    if pref1 == 0 { 1 } else if pref2 == 0 { 2 } else if pool == 0 { 3 }
+                    else if pref1 == 1 { 1 } else if pref2 == 1 { 2 } else { 3 }
                 } else {
                     act
                 };
                 run = if run == 0
-                    || (prov == 1 && run == 1 && pin == 0 && (d1 == 0 || d2 == 0 || sh == 0)
+                    || (prov == 1 && run == 1 && pin == 0 && (pref1 == 0 || pref2 == 0 || pool == 0)
                         && rot <= Budget - 1)
-                { if (d1 == 0 || d2 == 0 || sh == 0) { 2 } else { 1 } } else { run };
+                { if (pref1 == 0 || pref2 == 0 || pool == 0) { 2 } else { 1 } } else { run };
                 prov = if run == 0
-                    || (prov == 1 && run == 1 && pin == 0 && (d1 == 0 || d2 == 0 || sh == 0)
+                    || (prov == 1 && run == 1 && pin == 0 && (pref1 == 0 || pref2 == 0 || pool == 0)
                         && rot <= Budget - 1)
                 { 0 } else { prov };
                 prev = if run == 0
-                    || (prov == 1 && run == 1 && pin == 0 && (d1 == 0 || d2 == 0 || sh == 0)
+                    || (prov == 1 && run == 1 && pin == 0 && (pref1 == 0 || pref2 == 0 || pool == 0)
                         && rot <= Budget - 1)
                 { act } else { prev };
                 pp = if run == 0
-                    || (prov == 1 && run == 1 && pin == 0 && (d1 == 0 || d2 == 0 || sh == 0)
+                    || (prov == 1 && run == 1 && pin == 0 && (pref1 == 0 || pref2 == 0 || pool == 0)
                         && rot <= Budget - 1)
                 { prov } else { pp };
                 rot = if run == 0
-                    || (prov == 1 && run == 1 && pin == 0 && (d1 == 0 || d2 == 0 || sh == 0)
+                    || (prov == 1 && run == 1 && pin == 0 && (pref1 == 0 || pref2 == 0 || pool == 0)
                         && rot <= Budget - 1)
                 { rot + 1 } else { rot };
                 hold = if run == 0
-                    || (prov == 1 && run == 1 && pin == 0 && (d1 == 0 || d2 == 0 || sh == 0)
+                    || (prov == 1 && run == 1 && pin == 0 && (pref1 == 0 || pref2 == 0 || pool == 0)
                         && rot <= Budget - 1)
                     || prov == 0
                 { 1 } else { hold };
@@ -594,10 +595,10 @@ pub fn supervisor_account_rotation_model() -> Model {
             }
             action Wait2 when (
                 w2 == 0
-                && ((s2 == 1 && d1 == 2) || (s2 == 2 && d2 == 2) || (s2 == 3 && sh == 2))
+                && ((s2 == 1 && pref1 == 2) || (s2 == 2 && pref2 == 2) || (s2 == 3 && pool == 2))
                 && (
                     (1 <= run && prov == 0 && hold == 1)
-                    || (run == 0 && (Budget <= rot || (d1 == 2 && d2 == 2 && sh == 2)))
+                    || (run == 0 && (Budget <= rot || (pref1 == 2 && pref2 == 2 && pool == 2)))
                 )
             ) {
                 w2 = 1;
@@ -609,7 +610,7 @@ pub fn supervisor_account_rotation_model() -> Model {
             }
             action Resume2 when (
                 w2 == 0 && n2 == 1
-                && ((s2 == 1 && d1 <= 1) || (s2 == 2 && d2 <= 1) || (s2 == 3 && sh <= 1))
+                && ((s2 == 1 && pref1 <= 1) || (s2 == 2 && pref2 <= 1) || (s2 == 3 && pool <= 1))
             ) {
                 n2 = 0;
                 mv = 0;
@@ -624,7 +625,7 @@ pub fn supervisor_account_rotation_model() -> Model {
             }
 
             action RotatesIntoALimited when (
-                Buggy == 1 && w1 == 0 && jobs == 0 && s1 == 1 && d1 == 2 && d2 == 2
+                Buggy == 1 && w1 == 0 && jobs == 0 && s1 == 1 && pref1 == 2 && pref2 == 2
                 && (act <= 1 || act == 3) && run == 0 && rot <= Budget - 1
             ) {
                 s1 = 2;
@@ -643,10 +644,10 @@ pub fn supervisor_account_rotation_model() -> Model {
                 cx = 0;
             }
             action WallUnread when (
-                Buggy == 1 && act == 2 && 1 <= run && prov == 1 && d2 <= 1
+                Buggy == 1 && act == 2 && 1 <= run && prov == 1 && pref2 <= 1
                 && (s1 == 2 || s2 == 2)
             ) {
-                d2 = 2;
+                pref2 = 2;
                 n1 = 0;
                 n2 = 0;
                 mv = 0;
@@ -656,7 +657,7 @@ pub fn supervisor_account_rotation_model() -> Model {
                 cx = 0;
             }
             action PoolFirst when (
-                Buggy == 1 && w1 == 0 && jobs == 0 && s1 == 1 && d1 == 2 && d2 == 0 && sh == 0
+                Buggy == 1 && w1 == 0 && jobs == 0 && s1 == 1 && pref1 == 2 && pref2 == 0 && pool == 0
                 && run == 0 && rot <= Budget - 1
             ) {
                 s1 = 3;
@@ -675,7 +676,7 @@ pub fn supervisor_account_rotation_model() -> Model {
                 cx = 0;
             }
             action LowFirst when (
-                Buggy == 1 && w1 == 0 && jobs == 0 && s1 == 1 && d1 == 2 && d2 == 1 && sh == 0
+                Buggy == 1 && w1 == 0 && jobs == 0 && s1 == 1 && pref1 == 2 && pref2 == 1 && pool == 0
                 && run == 0 && rot <= Budget - 1
             ) {
                 s1 = 2;
@@ -702,11 +703,11 @@ pub fn supervisor_account_rotation_model() -> Model {
                 mv = 2;
                 pa = act;
                 ph = hold;
-                pw = if (s2 == 1 && d1 == 2) || (s2 == 2 && d2 == 2) || (s2 == 3 && sh == 2) { 1 } else { 0 };
+                pw = if (s2 == 1 && pref1 == 2) || (s2 == 2 && pref2 == 2) || (s2 == 3 && pool == 2) { 1 } else { 0 };
                 cx = 0;
             }
             action WaitsOnTheWall when (
-                Buggy == 1 && w1 == 0 && jobs == 0 && s1 == 1 && d1 == 2 && d2 == 0
+                Buggy == 1 && w1 == 0 && jobs == 0 && s1 == 1 && pref1 == 2 && pref2 == 0
                 && run == 0 && rot <= Budget - 1
             ) {
                 w1 = 1;
@@ -717,7 +718,7 @@ pub fn supervisor_account_rotation_model() -> Model {
                 cx = 0;
             }
             action MovesEarlyUnderAPin when (
-                Buggy == 1 && w1 == 0 && jobs == 0 && s1 == 1 && pin == 1 && d1 == 1 && d2 == 0
+                Buggy == 1 && w1 == 0 && jobs == 0 && s1 == 1 && pin == 1 && pref1 == 1 && pref2 == 0
                 && rot <= Budget - 1
             ) {
                 s1 = 2;
@@ -736,7 +737,7 @@ pub fn supervisor_account_rotation_model() -> Model {
                 cx = 0;
             }
             action RotatesPastTheBreaker when (
-                Buggy == 1 && w1 == 0 && jobs == 0 && s1 == 1 && d1 == 2 && d2 == 0
+                Buggy == 1 && w1 == 0 && jobs == 0 && s1 == 1 && pref1 == 2 && pref2 == 0
                 && run == 0 && rot == Budget
             ) {
                 s1 = 2;
@@ -768,42 +769,42 @@ pub fn supervisor_account_rotation_model() -> Model {
             }
 
             invariant NeverIntoALimitedAccount:
-                (run == 0 || (act == 1 && d1 <= 1) || (act == 2 && d2 <= 1)
-                    || (act == 3 && sh <= 1))
+                (run == 0 || (act == 1 && pref1 <= 1) || (act == 2 && pref2 <= 1)
+                    || (act == 3 && pool <= 1))
                 && (mv == 0
                     || (mv == 1
-                        && ((s1 == 1 && d1 <= 1) || (s1 == 2 && d2 <= 1) || (s1 == 3 && sh <= 1)))
+                        && ((s1 == 1 && pref1 <= 1) || (s1 == 2 && pref2 <= 1) || (s1 == 3 && pool <= 1)))
                     || (mv == 2
-                        && ((s2 == 1 && d1 <= 1) || (s2 == 2 && d2 <= 1) || (s2 == 3 && sh <= 1))));
+                        && ((s2 == 1 && pref1 <= 1) || (s2 == 2 && pref2 <= 1) || (s2 == 3 && pool <= 1))));
             invariant PreferredBeforePool:
                 mv == 0 || act == pa || (mv == 1 && s1 <= 2) || (mv == 2 && s2 <= 2)
-                || (1 <= d1 && 1 <= d2);
+                || (1 <= pref1 && 1 <= pref2);
             invariant FreshBeforeLow:
                 mv == 0
                 || (mv == 1
-                    && ((s1 == 1 && (d1 == 0 || d1 == 2)) || (s1 == 2 && (d2 == 0 || d2 == 2))
-                        || (s1 == 3 && (sh == 0 || sh == 2))))
+                    && ((s1 == 1 && (pref1 == 0 || pref1 == 2)) || (s1 == 2 && (pref2 == 0 || pref2 == 2))
+                        || (s1 == 3 && (pool == 0 || pool == 2))))
                 || (mv == 2
-                    && ((s2 == 1 && (d1 == 0 || d1 == 2)) || (s2 == 2 && (d2 == 0 || d2 == 2))
-                        || (s2 == 3 && (sh == 0 || sh == 2))))
-                || (1 <= d1 && 1 <= d2 && 1 <= sh)
+                    && ((s2 == 1 && (pref1 == 0 || pref1 == 2)) || (s2 == 2 && (pref2 == 0 || pref2 == 2))
+                        || (s2 == 3 && (pool == 0 || pool == 2))))
+                || (1 <= pref1 && 1 <= pref2 && 1 <= pool)
                 || (act == pa && (prov == 0 || 1 <= pin || Budget <= rot));
             invariant OnlyAProvenActiveIsFollowed:
                 mv == 0 || act > pa || pa > act || prov == 1 || ph == 0;
             invariant NoWaitWhileOneIsUsable:
                 (w1 == 0 || (
-                    ((s1 == 1 && d1 == 2) || (s1 == 2 && d2 == 2) || (s1 == 3 && sh == 2))
+                    ((s1 == 1 && pref1 == 2) || (s1 == 2 && pref2 == 2) || (s1 == 3 && pool == 2))
                     && (
                         jobs == 1
                         || (1 <= act && prov == 0 && hold == 1)
-                        || (run == 0 && (Budget <= rot || (d1 == 2 && d2 == 2 && sh == 2)))
+                        || (run == 0 && (Budget <= rot || (pref1 == 2 && pref2 == 2 && pool == 2)))
                     )
                 ))
                 && (w2 == 0 || (
-                    ((s2 == 1 && d1 == 2) || (s2 == 2 && d2 == 2) || (s2 == 3 && sh == 2))
+                    ((s2 == 1 && pref1 == 2) || (s2 == 2 && pref2 == 2) || (s2 == 3 && pool == 2))
                     && (
                         (1 <= act && prov == 0 && hold == 1)
-                        || (run == 0 && (Budget <= rot || (d1 == 2 && d2 == 2 && sh == 2)))
+                        || (run == 0 && (Budget <= rot || (pref1 == 2 && pref2 == 2 && pool == 2)))
                     )
                 ));
             invariant TheOwnersWordHolds: pin == 0 || (act == pin && prov == 1);
@@ -823,18 +824,18 @@ pub fn supervisor_account_rotation_liveness() -> Liveness {
     let limited = |condition: &'static str| eq(var(condition), int(2));
     let not_at_its_wall = or_(
         or_(
-            and_(on(1), le(var("d1"), int(1))),
-            and_(on(2), le(var("d2"), int(1))),
+            and_(on(1), le(var("pref1"), int(1))),
+            and_(on(2), le(var("pref2"), int(1))),
         ),
-        and_(on(3), le(var("sh"), int(1))),
+        and_(on(3), le(var("pool"), int(1))),
     );
     let the_canarys_hold_stands = and_(
         and_(le(int(1), var("act")), eq(var("prov"), int(0))),
         eq(var("hold"), int(1)),
     );
     let every_other_is_limited = and_(
-        and_(or_(on(1), limited("d1")), or_(on(2), limited("d2"))),
-        or_(on(3), limited("sh")),
+        and_(or_(on(1), limited("pref1")), or_(on(2), limited("pref2"))),
+        or_(on(3), limited("pool")),
     );
     let nothing_to_rotate_to = and_(
         eq(var("run"), int(0)),

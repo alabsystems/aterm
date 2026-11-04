@@ -1348,6 +1348,175 @@ fn a_child_leads_the_group_or_the_session_it_was_given() {
     assert_eq!(plain_pgid, ours, "unasked, the child stays in this group");
 }
 
+#[test]
+fn two_children_coexist_in_a_known_live_group_and_later_births_keep_their_own() {
+    unsafe extern "C" {
+        fn getpgid(pid: i32) -> i32;
+        fn getpgrp() -> i32;
+    }
+    let mut leader = command("/bin/sleep")
+        .arg("60")
+        .spawn_in_dedicated_process_group()
+        .expect("a self-led leader");
+    let pid = |c: &Child| i32::try_from(c.id()).expect("pid");
+    let group = pid(&leader);
+
+    let mut first_command = command("/bin/sleep");
+    first_command.arg("60");
+    let mut first = first_command
+        .spawn_in_process_group(group)
+        .expect("the first member joins");
+    let mut second_command = command("/bin/sleep");
+    second_command.arg("60").process_group(0);
+    let mut second = second_command
+        .spawn_in_process_group(group)
+        .expect("the second member joins");
+    let mut first_later = first_command.spawn().expect("a later plain birth");
+    let mut second_later = second_command.spawn().expect("a later configured birth");
+
+    // SAFETY: integer queries about this test's own unreaped children.
+    let (leader_pgid, first_pgid, second_pgid, first_later_pgid, second_later_pgid, ours) = unsafe {
+        (
+            getpgid(pid(&leader)),
+            getpgid(pid(&first)),
+            getpgid(pid(&second)),
+            getpgid(pid(&first_later)),
+            getpgid(pid(&second_later)),
+            getpgrp(),
+        )
+    };
+    let second_later_pid = pid(&second_later);
+    for child in [
+        &mut first,
+        &mut second,
+        &mut first_later,
+        &mut second_later,
+        &mut leader,
+    ] {
+        child.kill().expect("kill");
+        child.wait().expect("wait");
+    }
+
+    assert_eq!(leader_pgid, group, "the leader leads the known group");
+    assert_eq!(first_pgid, group, "the first member is in the group");
+    assert_eq!(second_pgid, group, "the second member coexists in it");
+    assert_eq!(
+        first_later_pgid, ours,
+        "a default command's later birth is back in this group"
+    );
+    assert_eq!(
+        second_later_pgid, second_later_pid,
+        "a configured command's later birth leads its own group again"
+    );
+}
+
+#[test]
+fn joining_a_missing_group_is_an_error_and_the_command_spawns_on_as_configured() {
+    unsafe extern "C" {
+        fn getpgid(pid: i32) -> i32;
+    }
+    let mut leader = command("/bin/sleep")
+        .arg("60")
+        .spawn_in_dedicated_process_group()
+        .expect("a self-led leader");
+    let pid = |c: &Child| i32::try_from(c.id()).expect("pid");
+    let group = pid(&leader);
+    leader.kill().expect("kill");
+    leader.wait().expect("wait");
+
+    let mut borrowed = command("/bin/sleep");
+    borrowed.arg("60").process_group(0);
+    let missing = borrowed.spawn_in_process_group(group);
+    let missing_is_error = missing.is_err();
+    if let Ok(mut child) = missing {
+        child.kill().expect("kill");
+        child.wait().expect("wait");
+    }
+    let mut later = borrowed.spawn().expect("a later configured birth");
+    // SAFETY: an integer query about this test's own unreaped child.
+    let later_pgid = unsafe { getpgid(pid(&later)) };
+    let later_pid = pid(&later);
+    later.kill().expect("kill");
+    later.wait().expect("wait");
+
+    assert!(missing_is_error, "joining a group that is gone is an error");
+    assert_eq!(
+        later_pgid, later_pid,
+        "the failed join restored the configured group"
+    );
+}
+
+#[test]
+fn joining_a_group_refuses_contradictory_policies_before_the_target_runs() {
+    unsafe extern "C" {
+        fn getsid(pid: i32) -> i32;
+        fn getpgid(pid: i32) -> i32;
+    }
+    let scratch = Scratch::new("join-refused");
+    let mut leader = command("/bin/sleep")
+        .arg("60")
+        .spawn_in_dedicated_process_group()
+        .expect("a self-led leader");
+    let pid = |c: &Child| i32::try_from(c.id()).expect("pid");
+    let group = pid(&leader);
+
+    let attempt = |marker: &Path, join: &mut dyn FnMut(&mut Command) -> io::Result<Child>| {
+        let mut cmd = command("/bin/sh");
+        cmd.args(["-c", &format!("touch '{}'", marker.display())]);
+        match join(&mut cmd) {
+            Ok(mut child) => {
+                let _ = child.wait();
+                None
+            }
+            Err(error) => Some(error.kind()),
+        }
+    };
+
+    let invalid_marker = scratch.join("invalid-started");
+    let invalid = attempt(&invalid_marker, &mut |cmd| cmd.spawn_in_process_group(1));
+    let session_marker = scratch.join("session-started");
+    let session = attempt(&session_marker, &mut |cmd| {
+        cmd.setsid(true);
+        cmd.spawn_in_process_group(group)
+    });
+    let tether_marker = scratch.join("tether-started");
+    let tethered = attempt(&tether_marker, &mut |cmd| {
+        cmd.tether();
+        cmd.spawn_in_process_group(group)
+    });
+
+    let mut session_command = command("/bin/sleep");
+    session_command.arg("60").setsid(true);
+    let refused = session_command.spawn_in_process_group(group);
+    let refused_is_error = refused.is_err();
+    if let Ok(mut child) = refused {
+        child.kill().expect("kill");
+        child.wait().expect("wait");
+    }
+    let mut session_child = session_command.spawn().expect("a later session birth");
+    // SAFETY: integer queries about this test's own unreaped child.
+    let (session_sid, session_pgid) =
+        unsafe { (getsid(pid(&session_child)), getpgid(pid(&session_child))) };
+    let session_pid = pid(&session_child);
+    session_child.kill().expect("kill");
+    session_child.wait().expect("wait");
+    leader.kill().expect("kill");
+    leader.wait().expect("wait");
+
+    assert_eq!(invalid, Some(io::ErrorKind::InvalidInput));
+    assert_eq!(session, Some(io::ErrorKind::InvalidInput));
+    assert_eq!(tethered, Some(io::ErrorKind::InvalidInput));
+    assert!(!invalid_marker.exists(), "an invalid join ran the target");
+    assert!(!session_marker.exists(), "a refused session ran the target");
+    assert!(!tether_marker.exists(), "a refused tether ran the target");
+    assert!(refused_is_error, "a new session beside a join is refused");
+    assert_eq!(
+        (session_sid, session_pgid),
+        (session_pid, session_pid),
+        "the refusal left the session policy in place for a later birth"
+    );
+}
+
 /// `responsibility_get_pid_responsible_for_pid(pid)`: the process macOS
 /// charges `pid`'s TCC and syspolicyd questions to.
 #[cfg(target_vendor = "apple")]

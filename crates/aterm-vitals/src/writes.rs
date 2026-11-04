@@ -46,7 +46,7 @@ impl ProgramHour {
     #[must_use]
     pub fn per_hour(&self, covered_s: f64) -> Option<f64> {
         (covered_s.is_finite() && covered_s >= MIN_COVERED_S)
-            .then(|| self.bytes as f64 * 3600.0 / covered_s)
+            .then_some(self.bytes as f64 * 3600.0 / covered_s)
     }
 }
 

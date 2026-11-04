@@ -15,12 +15,15 @@
 //!   or with other words joined to it), or a person's keys drawn after it; a draw a break of the
 //!   agent's own background work saw is kept as evidence ([`Look::Kept`]) for the point's look.
 //! - [`Line::ended`]: its program ended (the host names another agent process).
-//! - [`Line::took`], [`Line::turned`], [`Line::outlasted`]: a turn read running after it settles
-//!   it once `status` reads the input clear; a line unread, or one no read can say of, outlasts
-//!   the turn.
+//! - [`Line::took`], [`Line::weighs`], [`Line::turned`], [`Line::outlasted`]: a turn read running
+//!   after it settles it once `status` reads the input clear on a read that shows none of it
+//!   ([`Turned`]); a line unread, or one no word can say of, outlasts the turn; a read that cannot
+//!   say what the composer holds keeps the turn's evidence for the next read that can.
 //! - [`Line::gate_read`] and [`Rest::gate`]: what a write at a point gets while the line stands
 //!   ([`CustodyGate`]): held, or the line lost where the worker read it and drew none of it
 //!   [`ECHO_HANG`] on, at rest.
+//! - [`answer_goes`]: once an input read proves the worker read the line, a key that answers a
+//!   box over the composer goes past it; without that proof the line holds the key too.
 //! - [`Line::lose`] and [`Restarts`]: the one restart in place a lost line gets short of an act
 //!   submitted, or a doubling wait ([`Loss`]).
 //! - [`line_held`]: what the host is told ([`LineHeld`]).
@@ -227,15 +230,58 @@ pub enum Look {
     Settled(Settles, LeftStands),
 }
 
+/// What a fresh `status` read after a turn read running comes to for a line held, on what a read
+/// showed of it ([`Line::turned`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Turned {
+    /// On a read that shows none of the line, the input reads clear: it went with the turn
+    /// ([`Settles::Turn`]).
+    Settles,
+    /// On a read that shows none of the line, the input still reads unread, or no word can say:
+    /// the line outlasted the turn ([`Line::outlasted`]).
+    Outlasts,
+    /// Nothing moves: no turn read running since the write (or since the last turn it outlasted),
+    /// or a read that shows typed text in the composer (the look's to settle) or cannot say what
+    /// it holds (a dialog over it, no composer drawn, a glyph's cell unread), under which the line
+    /// may stand drawn. The turn's evidence ([`Line::ran`]) is kept for the next read that can say.
+    Stands,
+}
+
 /// What a line held lets a write at a point do (`Session::custody_gate`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CustodyGate {
-    /// Nothing held: the write goes.
+    /// The write goes: nothing held, or a key that answers a box over the composer, past the
+    /// line held ([`answer_goes`]).
     Free,
     /// The line holds the write; a due stands for the next look.
     Hold,
     /// The worker read the line and drew none of it a minute on, at rest: a restart in place.
     Lost,
+}
+
+/// WHETHER THE LOOP'S ANSWER TO A BOX GOES PAST THE LINE HELD, on the read `shows` the answer was
+/// decided on and what `status input=` has proved of the line (`held`): a key that is no line's (a
+/// dialog's Enter or Esc, fenced on the box's own row and on no person's key since that read) goes
+/// only where the worker is known to have read the line and the read cannot say what the composer
+/// holds, the box over it. The box takes the key, never the composer, so the key neither joins nor
+/// enters the line, nor writes a second copy of it. The line stays held for the read after the box.
+/// With no proof the worker read the line, the key may be queued behind it and is held; where the
+/// read can say what the composer holds, no box is over it and the key is held too. A key behind
+/// later input `status` reads unread is also held by the session's own hold
+/// (`Session::input_unread`) after this gate.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "LineCustody",
+        action = "AnswersBox",
+        project = "conformance_custody::project"
+    )
+)]
+#[must_use]
+pub fn answer_goes(held: Held, shows: &Shows) -> bool {
+    let box_shown = shows.stands.is_none() || armed(Fault::CustodyAnswersComposer);
+    let line_read = matches!(held, Held::Read { .. }) || armed(Fault::CustodyAnswersWithoutRead);
+    box_shown && line_read
 }
 
 /// What the gate's `status` read came to for a line held ([`Line::gate_read`]).
@@ -682,12 +728,31 @@ impl Line {
         self.ran = true;
     }
 
+    /// WHETHER A FRESH `status` READ CAN MOVE THE LINE ON THE READ `shows` that the look at it
+    /// settled nothing on ([`Self::turned`]): a turn read running since the write ([`Self::ran`])
+    /// and a read that shows none of the line. A read that cannot say what the composer holds (a
+    /// dialog over it, no composer drawn, a glyph's cell unread) keeps the turn's evidence for the
+    /// next read that can, so the session reads `status` for the turn only where this says.
+    #[must_use]
+    pub fn weighs(&self, shows: &Shows) -> bool {
+        let stands = match shows.stands {
+            None if armed(Fault::CustodyTurnUnreadable) => Some(LeftStands::Nothing),
+            stands => stands,
+        };
+        self.ran && stands == Some(LeftStands::Nothing)
+    }
+
     /// WHAT A FRESH `status` READ AFTER A TURN READ RUNNING ([`Self::ran`]) SAYS OF THE LINE, on
-    /// a read that shows none of it: the input word `word` clear settles it ([`Settles::Turn`]),
-    /// which in order proves the worker read it by then, a turn run since its write. A line still
-    /// unread, or one no read can say of, outlasts the turn ([`Self::outlasted`]). With no turn
-    /// read running since the write, or since the last turn it outlasted, no word settles it: a
-    /// clear read alone (a busy spell of break reads) proves only that the worker read it.
+    /// the read `shows` that the look at it settled nothing on ([`Turned`]). On a read that shows
+    /// none of it ([`Self::weighs`]), the input word `word` clear settles it ([`Settles::Turn`]),
+    /// which in order proves the worker read it by then, a turn run since its write; a line still
+    /// unread, or one no word can say of, outlasts the turn ([`Self::outlasted`]). A read that
+    /// cannot say what the composer holds is no evidence either way: the line may stand drawn
+    /// under it, and a turn settled there would end the custody without handing the line back to
+    /// its writer, the line then taken for a person's draft; the turn's evidence is kept, nothing
+    /// moved, for the next read that can say. With no turn read running since the write, or since
+    /// the last turn it outlasted, no word settles it: a clear read alone (a busy spell of break
+    /// reads) proves only that the worker read it.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -705,14 +770,19 @@ impl Line {
         )
     )]
     #[must_use]
-    pub fn turned(&self, word: Option<&str>) -> Option<Settles> {
-        (self.ran && (word == Some("clear") || armed(Fault::CustodyTurnAnyWord)))
-            .then_some(Settles::Turn)
+    pub fn turned(&self, word: Option<&str>, shows: &Shows) -> Turned {
+        if !self.weighs(shows) {
+            Turned::Stands
+        } else if word == Some("clear") || armed(Fault::CustodyTurnAnyWord) {
+            Turned::Settles
+        } else {
+            Turned::Outlasts
+        }
     }
 
-    /// The line outlasted the turn ([`Self::turned`] settled nothing) on the input word `word`
-    /// read at `now`: what the read said moves [`Held`], and another turn read running is
-    /// waited for (a worker that holds it queued draws it after).
+    /// The line outlasted the turn ([`Turned::Outlasts`]) on the input word `word` read at `now`:
+    /// what the read said moves [`Held`], and another turn read running is waited for (a worker
+    /// that holds it queued draws it after).
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(

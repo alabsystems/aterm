@@ -5,28 +5,30 @@
 //! core of a line held in custody (`aterm_agent::supervise::custody`, ATERM-KI-1101-3): the
 //! custody formed on [`Line::formed`], every look's settle on [`Line::look`], its program's end
 //! on [`Line::ended`], a turn's on [`Line::took`], [`Line::turned`] and [`Line::outlasted`],
-//! the gate's hold and loss on [`Line::gate_read`] and [`Rest::gate`], the restart or the wait
-//! on [`Line::lose`] and [`Restarts`], and what the host is told on [`line_held`]. The worker's
-//! program, the person, the session's rest, the host's deferral and the clock are the model's
-//! environment, rendered into the reads, `status` words, rests, lanes and instants the core
-//! takes. At every state the core is probed on copies, so a look settles, a turn settles, a
-//! write is held or lost, a loss is restarted or waits, and the host is let type or move exactly
-//! where the model says. Each walk runs in the committed configuration and in each scenario (a
-//! host that serves no input word, no restart lane), under five renderings: the unread word
+//! the gate's hold and loss on [`Line::gate_read`] and [`Rest::gate`], the loop's answer to a box
+//! over the composer on [`answer_goes`], the restart or the wait on [`Line::lose`] and
+//! [`Restarts`], and what the host is told on [`line_held`]. The worker's program, the person, the
+//! session's rest, the host's deferral and the clock are the model's environment, rendered into
+//! the reads, `status` words, rests, lanes and instants the core takes. At every state the core is
+//! probed on copies, so a look settles, a turn settles, a write is held or lost, a box's answer
+//! goes, a loss is restarted or waits, and the host is let type or move exactly where the model
+//! says. Each walk runs in the committed configuration and in each scenario (a host that serves no
+//! input word, no restart lane), under five renderings: the unread word
 //! (`pending`, `typeahead`), for the line queued or input queued behind it, or the unserved one
 //! (none, `-`); a draw whole, arriving, joined to a person's words, or garbled with no person's
-//! key; a point's read that shows none of the line, or one that cannot say what the composer
-//! holds (a dialog over it); each cause of a read not at rest; each cause of no restart lane;
-//! and a clear read dated by the write's held-text note or not. A read that cannot say is
-//! rendered only where the model has the line shown nowhere: the model has no dialog over a
-//! drawn line, so the code's look under one is not bound here.
+//! key; each read under the model's box over the composer (`dlg`), the line drawn under it or
+//! not, as one that cannot say what the composer holds: a dialog's (no composer text), a glyph's
+//! cell unread (the composer's text, no say of what it holds), or no composer drawn (no text, no
+//! key count); each cause of a read not at rest; each cause of no restart lane; and a clear read
+//! dated by the write's held-text note or not. Every read the turn's settle takes is probed, so a
+//! turn settles, outlasts or keeps the line exactly where the model says, under the box too.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use aterm_agent::supervise::custody::{
     At, CustodyGate, ECHO_HANG, GateRead, Held, Lane, LeftStands, Line, LineHeld, Look, Loss,
-    LostRestart, Process, Rest, Restarts, Settles, Shows, line_held,
+    LostRestart, Process, Rest, Restarts, Settles, Shows, Turned, answer_goes, line_held,
 };
 use aterm_agent::supervise::occupancy::fault::{self, Fault};
 use aterm_models_harness::line_custody_model;
@@ -55,7 +57,9 @@ const STEP: Duration = Duration::from_millis(1);
 const NOTED: Duration = Duration::from_secs(50);
 
 /// The model's mutants, which no real step mirrors.
-const MUTANTS: [&str; 10] = [
+const MUTANTS: [&str; 13] = [
+    "AnswersComposer",
+    "AnswersWithoutRead",
     "HostOverStands",
     "LostWithinMinute",
     "RestartAgain",
@@ -63,13 +67,15 @@ const MUTANTS: [&str; 10] = [
     "RestartUnread",
     "SettleOnMove",
     "SettleWithoutTurn",
+    "TurnSettlesUnderDialog",
     "TurnSettlesUnread",
     "UpgradeOverStands",
     "WriteWhileHeld",
 ];
 
 /// The steps the core performs, each on its anchored function.
-const ANCHORED: [&str; 18] = [
+const ANCHORED: [&str; 19] = [
+    "AnswersBox",
     "AsksRestart",
     "BreakKeepsDraw",
     "Enters",
@@ -92,7 +98,9 @@ const ANCHORED: [&str; 18] = [
 
 /// The program's, the person's, the session's, the clock's and the host's steps, which the core
 /// only sees.
-const ENVIRONMENT: [&str; 15] = [
+const ENVIRONMENT: [&str; 17] = [
+    "DialogGoes",
+    "DialogShows",
     "Minute",
     "NextAct",
     "PersonClears",
@@ -156,12 +164,6 @@ struct Run {
 }
 
 impl Run {
-    /// Whether a point's read that shows none of the line is rendered as one that cannot say
-    /// what the composer holds.
-    fn unreadable(self) -> bool {
-        self.v % 3 == 1
-    }
-
     /// The model in this run's configuration.
     fn model(self) -> Model {
         interp::with_consts(
@@ -187,26 +189,33 @@ fn word(st: &State, run: Run) -> Option<&'static str> {
     })
 }
 
-/// What a point's or a break's read at `st` shows of the line: as [`fresh`] reads, but where it
-/// shows none of it, in the renderings that say so, a read that cannot say what the composer
-/// holds (a dialog over it), which is no evidence either.
+/// What a read at `st` shows of the line: a person's draft over it, its draw (whole, arriving,
+/// joined to a person's words, or a garble with no person's key since the write), or none of it;
+/// under the box over the composer, a read that cannot say what it holds, the line drawn under
+/// it or not (a dialog's, a glyph's cell unread, no composer drawn), which is no evidence.
 fn shows(st: &State, r: &Real, run: Run) -> Shows {
-    let read = fresh(st, r, run);
-    if run.unreadable() && read.stands == Some(LeftStands::Nothing) {
+    let human = Some(r.human);
+    if st["dlg"] == 1 {
+        let (composer, human) = match run.v % 3 {
+            0 => (String::new(), human),
+            1 => {
+                let text = if st["q"] == 1 {
+                    LINE
+                } else if st["pk"] == 1 {
+                    OTHER
+                } else {
+                    ""
+                };
+                (text.to_string(), human)
+            }
+            _ => (String::new(), None),
+        };
         return Shows {
             stands: None,
-            composer: String::new(),
-            human: None,
+            composer,
+            human,
         };
     }
-    read
-}
-
-/// What a read at `st` shows of the line: a person's draft over it, its draw (whole, arriving,
-/// joined to a person's words, or a garble with no person's key since the write), or none of it.
-/// The gate's second read is this one, as its rest needs a composer it can read.
-fn fresh(st: &State, r: &Real, run: Run) -> Shows {
-    let human = Some(r.human);
     let (stands, composer, human) = if st["pk"] == 1 {
         (LeftStands::Part, OTHER.to_string(), human)
     } else if st["q"] == 1 {
@@ -231,7 +240,7 @@ fn fresh(st: &State, r: &Real, run: Run) -> Shows {
 }
 
 /// What the read at `st` says of rest: at rest where the model's `rest` is, else one cause of
-/// not, and the composer clear where it shows none of the line.
+/// not, and the composer clear where it shows none of the line; a box over it is no rest.
 fn rest(st: &State, shows: &Shows, run: Run) -> Rest {
     let mut rest = Rest {
         idle: true,
@@ -250,6 +259,9 @@ fn rest(st: &State, shows: &Shows, run: Run) -> Rest {
             3 => rest.person = Some(GRACE - Duration::from_secs(1)),
             _ => rest.stuck = true,
         }
+    }
+    if st["dlg"] == 1 {
+        rest.idle = false;
     }
     rest.clear = rest.idle && shows.stands == Some(LeftStands::Nothing);
     rest
@@ -309,7 +321,8 @@ fn project(r: &Real) -> State {
 
 /// The core agrees with the model at `st`: its projection, what the host is told, and what its
 /// probes on copies say of a look at a point and at a break, the program's end, a turn's
-/// settle, the gate's decision for a line's write and for any other, and the loss.
+/// settle, a box's answer, the gate's decision for a line's write and for any other, and the
+/// loss.
 fn agrees(m: &Model, st: &State, r: &Real, run: Run) -> bool {
     if project(r).iter().any(|(k, v)| st[k] != *v) {
         return false;
@@ -345,7 +358,7 @@ fn agrees(m: &Model, st: &State, r: &Real, run: Run) -> bool {
     let brk = at_break.look(&shows, At::Break);
     let want_brk = if on("LookPerson") {
         Look::Settled(Settles::Person, LeftStands::Nothing)
-    } else if st["q"] == 1 {
+    } else if st["q"] == 1 && st["dlg"] == 0 {
         Look::Kept
     } else {
         Look::Stands
@@ -358,24 +371,28 @@ fn agrees(m: &Model, st: &State, r: &Real, run: Run) -> bool {
         return false;
     }
     let w = word(st, run);
-    if st["ran"] == 0 {
-        // No turn read running since the write: no word settles it.
-        if line.turned(w).is_some() {
-            return false;
-        }
-    } else if st["q"] != 1 && st["pk"] == 0 {
-        let settles = line.turned(w) == Some(Settles::Turn);
-        if settles != on("TurnSettles") || settles == on("TurnOutlasted") {
-            return false;
-        }
+    let want_turned = if on("TurnSettles") {
+        Turned::Settles
+    } else if on("TurnOutlasted") {
+        Turned::Outlasts
+    } else {
+        Turned::Stands
+    };
+    let mut answer = line.clone();
+    let _ = answer.gate_read(w, false, r.now);
+    if line.turned(w, &shows) != want_turned
+        || answer_goes(answer.held(), &shows) != on("AnswersBox")
+    {
+        return false;
     }
-    if st["q"] == 1 || st["pk"] == 1 || st["drawn"] == 1 || st["moved"] == 1 {
+    if st["drawn"] == 1 || st["moved"] == 1 || (st["dlg"] == 0 && (st["q"] == 1 || st["pk"] == 1)) {
+        // The look settles the line before the gate reads it.
         return true;
     }
     let mut copy = line.clone();
     let gate = match copy.gate_read(w, true, r.now) {
         GateRead::Holds => CustodyGate::Hold,
-        GateRead::Again => rest(st, &fresh(st, r, run), run).gate(),
+        GateRead::Again => rest(st, &shows, run).gate(),
     };
     let lost = on("AsksRestart") || on("WaitsLost");
     if (gate == CustodyGate::Lost) != lost || (gate == CustodyGate::Hold) != on("GateHolds") {
@@ -467,9 +484,9 @@ fn mirror(
             r.pid += 1;
             told != Some(LineHeld::Stands)
         }
-        "NextAct" | "PersonClears" | "ProgramDraws" | "ProgramDrops" | "ProgramReads"
-        | "Queues" | "ReadsAndDraws" | "ReadsAndDrops" | "ReadsBehind" | "RestartDeferred"
-        | "Rests" | "Stirs" => true,
+        "DialogGoes" | "DialogShows" | "NextAct" | "PersonClears" | "ProgramDraws"
+        | "ProgramDrops" | "ProgramReads" | "Queues" | "ReadsAndDraws" | "ReadsAndDrops"
+        | "ReadsBehind" | "RestartDeferred" | "Rests" | "Stirs" => true,
         _ => held_step(action, st, r, run, ev),
     }
 }
@@ -477,7 +494,6 @@ fn mirror(
 /// The real step for `action`, one of the custody's own on the line held, from `st`.
 fn held_step(action: &'static str, st: &State, r: &mut Real, run: Run, ev: &mut Ev) -> bool {
     let shows = shows(st, r, run);
-    let fresh = fresh(st, r, run);
     let process = r.process();
     let now = r.now;
     let w = word(st, run);
@@ -496,7 +512,7 @@ fn held_step(action: &'static str, st: &State, r: &mut Real, run: Run, ev: &mut 
         "LookDrawn" => {
             let kept = line.drawn();
             let look = ev.step(action, || line.look(&shows, At::Point));
-            let stands = if st["q"] == 1 {
+            let stands = if st["q"] == 1 && st["dlg"] == 0 {
                 Some(LeftStands::Nothing)
             } else {
                 kept
@@ -509,19 +525,25 @@ fn held_step(action: &'static str, st: &State, r: &mut Real, run: Run, ev: &mut 
             matches!(look, Look::Settled(Settles::Person, _))
         }
         "SeesEnded" => ev.step(action, || line.ended(process)),
-        "TurnSettles" => ev.step(action, || line.turned(w)) == Some(Settles::Turn),
+        "AnswersBox" => {
+            // The loop reads `status` before testing whether a dialog answer passes custody. A
+            // fresh clear word can therefore prove the held line read in this same step.
+            let _ = line.gate_read(w, false, now);
+            return ev.step(action, || answer_goes(line.held(), &shows));
+        }
+        "TurnSettles" => ev.step(action, || line.turned(w, &shows)) == Turned::Settles,
         "TurnOutlasted" => {
-            let settles = ev.step(action, || {
-                let settles = line.turned(w);
-                if settles.is_none() {
+            let turned = ev.step(action, || {
+                let turned = line.turned(w, &shows);
+                if turned == Turned::Outlasts {
                     line.outlasted(w, now);
                 }
-                settles
+                turned
             });
-            return settles.is_none();
+            return turned == Turned::Outlasts;
         }
         "GateHolds" => {
-            let rest = rest(st, &fresh, run);
+            let rest = rest(st, &shows, run);
             let gate = ev.step(action, || {
                 let gate = match line.gate_read(w, true, now) {
                     GateRead::Holds => CustodyGate::Hold,
@@ -535,7 +557,7 @@ fn held_step(action: &'static str, st: &State, r: &mut Real, run: Run, ev: &mut 
             return gate == CustodyGate::Hold;
         }
         "AsksRestart" | "WaitsLost" => {
-            let (rest, lane) = (rest(st, &fresh, run), lane(run));
+            let (rest, lane) = (rest(st, &shows, run), lane(run));
             let restarts = &r.restarts;
             let loss = ev.step(action, || match line.gate_read(w, true, now) {
                 GateRead::Again if rest.gate() == CustodyGate::Lost => {
@@ -656,12 +678,16 @@ type Applies = fn(Run) -> bool;
 
 #[test]
 fn tier1_each_planted_defect_disagrees_where_the_model_says() {
-    let controls: [(Fault, Applies, Where); 8] = [
-        // A point's look settles a line no read shows: the model holds it.
+    let controls: [(Fault, Applies, Where); 11] = [
+        // A point's look settles a line no read shows, or none can say of: the model holds it.
         (
             Fault::CustodySettlesUnshown,
             |_| true,
-            |st, _| st["cust"] == 1 && st["q"] != 1 && st["pk"] == 0 && st["drawn"] == 0,
+            |st, _| {
+                st["cust"] == 1
+                    && st["drawn"] == 0
+                    && (st["dlg"] == 1 || (st["q"] != 1 && st["pk"] == 0))
+            },
         ),
         // A turn settles a line on an input unread or unknown: the model outlasts the turn.
         (
@@ -694,9 +720,41 @@ fn tier1_each_planted_defect_disagrees_where_the_model_says() {
             |st, _| st["cust"] == 1 && st["lost"] == 0,
         ),
         // A read that cannot say is taken for the line whole: the model holds it.
-        (Fault::CustodySettlesUnreadable, Run::unreadable, |st, _| {
-            st["cust"] == 1 && st["q"] != 1 && st["pk"] == 0
-        }),
+        (
+            Fault::CustodySettlesUnreadable,
+            |_| true,
+            |st, _| st["cust"] == 1 && st["dlg"] == 1,
+        ),
+        // A turn settles or outlasts a line on a read that cannot say what the composer holds:
+        // the model keeps the turn's evidence for the read after the box.
+        (
+            Fault::CustodyTurnUnreadable,
+            |_| true,
+            |st, _| st["cust"] == 1 && st["dlg"] == 1 && st["ran"] == 1,
+        ),
+        // A key that is no line's goes where no box is over the composer: the model holds it.
+        (
+            Fault::CustodyAnswersComposer,
+            |run| run.served,
+            |st, run| {
+                st["cust"] == 1
+                    && st["dlg"] == 0
+                    && st["asked"] == 0
+                    && (st["held"] == 1 || (run.served && st["q"] != 4 && st["bq"] == 0))
+            },
+        ),
+        // A box's key follows a line that neither an earlier nor this gate's input read proved
+        // read: the model holds it.
+        (
+            Fault::CustodyAnswersWithoutRead,
+            |_| true,
+            |st, run| {
+                st["cust"] == 1
+                    && st["dlg"] == 1
+                    && st["asked"] == 0
+                    && (!run.served || (st["held"] != 1 && (st["q"] == 4 || st["bq"] == 1)))
+            },
+        ),
         // A read line is lost though input behind it reads unread: the model holds the write.
         (
             Fault::CustodyLostBehind,
@@ -722,6 +780,12 @@ fn tier1_each_planted_defect_disagrees_where_the_model_says() {
             w.off.iter().all(|st| at(st, run)),
             "{fault:?} ({run:?}): {:?}",
             w.off
+        );
+        // The box is rendered over a line drawn under it too, where a turn settled would leave
+        // the line drawn with no writer.
+        assert!(
+            fault != Fault::CustodyTurnUnreadable || w.off.iter().any(|st| st["q"] == 1),
+            "{fault:?} ({run:?}) never disagreed over a line drawn under the box"
         );
     }
 }

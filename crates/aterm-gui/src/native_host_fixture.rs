@@ -163,13 +163,17 @@ fn serve_connection_mode(
                 .split_ascii_whitespace()
                 .collect::<Vec<_>>()
                 .windows(2)
-                .any(|words| words == ["codex-renewal", "prepare"]);
+                .any(|words| {
+                    matches!(words[0], "codex-renewal" | "codex-rotation") && words[1] == "prepare"
+                });
         let drop_consume_ack = real_child
             && line
                 .split_ascii_whitespace()
                 .collect::<Vec<_>>()
                 .windows(2)
-                .any(|words| words == ["codex-renewal", "consume"]);
+                .any(|words| {
+                    matches!(words[0], "codex-renewal" | "codex-rotation") && words[1] == "consume"
+                });
         let drop_signal_ack = real_child
             && line
                 .split_ascii_whitespace()

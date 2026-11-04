@@ -111,14 +111,14 @@ xorshift64	contract	rng::XorShift::{new,next_u64,below,index,range,pick}	∀ see
 wait-within	contract	wait::{within,until_within}	∀ budget b, interval i, probe: within(b,i,probe) calls probe at least once and returns the first Some(v) it yields, or None once probe has yielded None and b has elapsed since the call, sleeping i between probes. until_within(b, what, probe) = v when within(...) = Some(v), else it panics 'timed out after {b:?} waiting for: {what}'.	-	7, 8, 13	FnMut closure, Instant/Duration, thread::sleep, loop
 first-exec-once-scratch	contract	wait::{first_exec,run_once,run_once_judged,file_id,scratch_dir}	∀ path p, args: first_exec(p, args) runs p at most once per file identity (dev, ino; a rename-replaced file is a new key) per process, and runs nothing when p does not exist (file_id(p) = None). The run sees only PATH, HOME = TMPDIR = a fresh scratch dir under temp_dir (not temp_dir itself), and that dir is removed after the run. If the child exceeds bound, run_once_judged queries held(pid) before kill_within and calls say with one diagnostic line naming path and pid iff held(pid) = Some(true).	src/wait.rs::a_warm_up_killed_while_held_says_so_once	8, 13	child process with env_clear, fs metadata, closures, process-global memo set
 hermetic-shell-env	contract	host::{hermetic_env,shell_command,SHELL_START_POINTERS}	∀ scratch: hermetic_env(scratch) = [("HOME", scratch), ("XDG_CONFIG_HOME", scratch/.config), ("XDG_DATA_HOME", scratch/.local/share), ("XDG_STATE_HOME", scratch/.local/state), ("XDG_CACHE_HOME", scratch/.cache)]. shell_command(sh, scratch) builds an aterm_uds::spawnfd::Command for sh with those 5 variables set and SHELL_START_POINTERS (["ZDOTDIR", "BASH_ENV"]) removed, isolating child shells from the host account's home and startup files.	src/host.rs::the_hermetic_childs_home_is_the_scratch_and_a_plain_childs_is_not	1, 8	Path::join, spawnfd::Command env/env_remove
-subprocess-lane-admission	contract	subprocess_lane::{slots_for_cores,boot_slots_for_pool,default_cores_from,init_pool_dir,acquire_with_pool,acquire_boot_permit_with_pool}	slots_for_cores(c) = 1 for c ≤ 1 and clamp(⌊c/2⌋, 2, 8) otherwise; boot_slots_for_pool(s) = clamp(⌊s/2⌋, 1, 3); default_cores_from(t, j, h) = min of max(h, 1) and any positive ASCII-decimal u32 in {t, j}. init_pool_dir(d, s) creates mode-0700 directory d with clamp(s, 1, 64) slot-NNNN.lock files, boot_slots_for_pool boot-NNNN.lock files, count and boot_count. acquire_with_pool(Some(d), τ) reuses a live Weak<SubprocessLease> on the calling thread without re-locking, otherwise acquires an exclusive non-inherited LockFile on some slot-NNNN.lock within τ (falling back to TimedOut on saturation) and releases the OS lock as soon as the last Arc<SubprocessLease> drops.	src/subprocess_lane.rs::slots_for_cores_scales_with_budget_and_clamps_bounds, src/subprocess_lane.rs::pool_caps_concurrent_holders_and_releases_on_drop, src/subprocess_lane.rs::reentrant_acquire_reuses_thread_lease_and_releases_when_last_clone_drops	1, 3, 8, 13	LockFile flock, thread_local Weak<Arc<_>>, Condvar fallback, OsStr parsing
+subprocess-lane-admission	contract	subprocess_lane::{slots_for_cores,boot_slots_for_pool,default_cores_from,init_pool_dir,acquire,acquire_with_pool,acquire_boot_permit,acquire_boot_permit_with_pool}	slots_for_cores(c) = 1 for c ≤ 1 and clamp(⌊c/2⌋, 2, 8) otherwise; boot_slots_for_pool(s) = clamp(⌊s/2⌋, 1, 3); default_cores_from(t, j, h) = min of max(h, 1) and any positive ASCII-decimal u32 in {t, j}. init_pool_dir(d, s) exclusively creates private mode-0700 d with create-new count files and clamp(s, 1, 64) stack slots plus boot_slots_for_pool boot slots; it refuses an existing destination and, after an error following its own directory creation, leaves the caller-owned partial state. Some(d) is authoritative: acquisition canonicalizes d and records the opened directory object's identity (including Windows' full FILE_ID_INFO); it reuses a live thread-local lease only while that identity still matches, thereby refusing a nested switch or re-entry through a same-path replacement. It requires a bounded decimal count and every declared plain regular slot of the requested kind, then returns an exclusive non-inherited LockFile lease within τ or Err for an unavailable, malformed, unsupported or saturated pool. It neither recreates missing members nor falls back locally, and rechecks pool identity after locking to refuse replacement during acquisition. None alone selects the bounded process-local semaphore. Stack leases release on last Arc drop and boot permits on their last owner.	src/subprocess_lane.rs::slots_for_cores_scales_with_budget_and_clamps_bounds, src/subprocess_lane.rs::pool_caps_concurrent_holders_and_releases_on_drop, src/subprocess_lane.rs::reentrant_acquire_reuses_thread_lease_and_releases_when_last_clone_drops, src/subprocess_lane.rs::a_broken_configured_pool_refuses_instead_of_falling_back_locally, src/subprocess_lane.rs::configured_count_bounds_refuse_stack_and_boot_admission, src/subprocess_lane.rs::boot_saturation_refuses_and_nested_admission_cannot_change_pools, src/subprocess_lane.rs::standalone_saturation_returns_no_lease, src/subprocess_lane.rs::reentrant_admission_tracks_the_pool_object_across_path_replacement	1, 3, 8, 13	LockFile flock, directory-object identity, thread_local Weak<Arc<_>>, Condvar fallback, OsStr parsing
 ```
 
-### 1.1 Distribution by kind (49)
+### 1.1 Distribution by kind (50)
 
 | kind | count | ids |
 |---|---|---|
-| contract | 30 | value-accessor-fail-closed, bounds-are-ranges, model-registry, bmc-reach-semantics, admits-iff-some-action, scc-components, nonprogress-cycle-fair-lasso, dead-negative-control-audit, ty-transcript-parsers, explored-space-guard, prove-and-catch-contract, tool-discovery-order, shell-literal-word, binary-identity-chain, provenance-claim-state, provenance-line-rendering, civil-date, ty-capabilities-parse, ty-capabilities-cache-and-probe, ty-cases-pool, ty-verdict-memo, check-main-dispatch, model-under-ty-interp-failure, ay-obligation-judging, ay-discharge-needs-success, step-audit-definitions, xorshift64, wait-within, first-exec-once-scratch, hermetic-shell-env |
+| contract | 31 | value-accessor-fail-closed, bounds-are-ranges, model-registry, bmc-reach-semantics, admits-iff-some-action, scc-components, nonprogress-cycle-fair-lasso, dead-negative-control-audit, ty-transcript-parsers, explored-space-guard, prove-and-catch-contract, tool-discovery-order, shell-literal-word, binary-identity-chain, provenance-claim-state, provenance-line-rendering, civil-date, ty-capabilities-parse, ty-capabilities-cache-and-probe, ty-cases-pool, ty-verdict-memo, check-main-dispatch, model-under-ty-interp-failure, ay-obligation-judging, ay-discharge-needs-success, step-audit-definitions, xorshift64, wait-within, first-exec-once-scratch, hermetic-shell-env, subprocess-lane-admission |
 | invariant | 6 | registered-model-sound, model-claim-breaks-first, model-deadlock-free, registry-intrusive-list, provenance-report-per-tool-serial, entered-anchor-window |
 | table-property | 4 | model-strict, mutant-table-catch, declared-dials-and-scenarios, prove-catch-multiply |
 | equivalence | 5 | text-zero-projection, interpreter-semantics, expr-tla-agrees-with-eval, compiled-walk-equals-by-name, one-walk-ghost-sweep |
@@ -302,6 +302,11 @@ src/verify_tests.rs	ty_capabilities_are_the_json_list_and_an_older_ty_has_none	t
 src/verify_tests.rs	ty_state_count_is_parsed_or_refused	ty-transcript-parsers	
 src/wait.rs	a_warm_up_killed_while_held_says_so_once	first-exec-once-scratch	
 src/subprocess_lane.rs	pool_caps_concurrent_holders_and_releases_on_drop	subprocess-lane-admission	
+src/subprocess_lane.rs	a_broken_configured_pool_refuses_instead_of_falling_back_locally	subprocess-lane-admission
+src/subprocess_lane.rs	configured_count_bounds_refuse_stack_and_boot_admission	subprocess-lane-admission
+src/subprocess_lane.rs	boot_saturation_refuses_and_nested_admission_cannot_change_pools	subprocess-lane-admission
+src/subprocess_lane.rs	standalone_saturation_returns_no_lease	subprocess-lane-admission
+src/subprocess_lane.rs	reentrant_admission_tracks_the_pool_object_across_path_replacement	subprocess-lane-admission
 src/subprocess_lane.rs	reentrant_acquire_reuses_thread_lease_and_releases_when_last_clone_drops	subprocess-lane-admission	
 src/subprocess_lane.rs	slots_for_cores_scales_with_budget_and_clamps_bounds	subprocess-lane-admission	
 src/xref.rs	a_move_inside_one_window_is_caught_when_the_new_site_is_wider	step-audit-definitions	
@@ -316,32 +321,32 @@ tests/macro_ty_model.rs	writing_a_model_registers_it	model-registry
 
 ## 3. Open findings
 
-- 723 tests read. 596 map to one of the 56 specs; 127 are not spec samples (§4).
+- 728 tests read. 601 map to one of the 50 specs; 127 are not spec samples (§4).
 - The biggest collapses (primary tests): `model-laws` (237), `registered-model-sound` (55), `mutant-table-catch` (45), `model-strict` (28), `declared-dials-and-scenarios` (27), `model-claim-breaks-first` (16), `liveness-obligations-sound` (16), `model-deadlock-free` (15).
 - 391 of the covered tests retire at Tier 0 without any Trust change, once M1 gives the
   models the surface to declare what the tests now script: `model-laws`, `mutant-table-catch`,
   `model-strict`, `declared-dials-and-scenarios`, `model-claim-breaks-first`,
   `model-deadlock-free`, `prove-catch-multiply` and `text-zero-projection`. A Clean proof of the
   same statements waits on gap 10.
-- The checker and tool code (`src/`) holds 125 of the tests; their specs are about the
+- The checker and tool code (`src/`) holds 130 of the tests; their specs are about the
   compiled `aterm-spec` fns and wait on gaps 1, 3 and 7 for the pure ones and gap 8 for the effectful ones.
 
 Gap histogram (gap number → number of specs blocked by it, from the `blocking_gaps` column):
 
 | gap | specs |
 |---|---|
-| 1 | 31 |
+| 1 | 32 |
 | 2 | 7 |
-| 3 | 12 |
+| 3 | 13 |
 | 4 | 2 |
 | 5 | 8 |
 | 7 | 20 |
-| 8 | 16 |
+| 8 | 17 |
 | 9 | 3 |
 | 10 | 11 |
 | 11 | 5 |
 | 12 | 1 |
-| 13 | 14 |
+| 13 | 15 |
 | 14 | 3 |
 | M1 (model-side, not in §7) | 6 |
 

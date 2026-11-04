@@ -7,7 +7,10 @@
 //! Each [`Record`] is self-delimiting on the wire (`ALM1`), so a stream or store file is the
 //! concatenation of signed record bytes: one record's [`Record::bytes`] is a one-record stream.
 
-use super::{Body, Kind, Log, MAX_RECORD, MAX_RECORDS, MAX_WAITING, Record, RecordId, genesis};
+use super::{
+    Body, Kind, Log, MAX_HELD_RECORDS, MAX_RECORD, MAX_WAITING, Record, RecordBudgets, RecordId,
+    genesis,
+};
 use crate::{Error, Result};
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -40,8 +43,8 @@ pub fn encode_records<'a>(records: impl IntoIterator<Item = &'a Record>) -> Vec<
 /// truncated, malformed, oversized or fails signature verification.
 ///
 /// # Errors
-/// `bytes` exceeds [`MAX_RECORDS_STREAM`], holds more than [`MAX_RECORDS`] records, or contains a
-/// malformed or invalidly signed record.
+/// `bytes` exceeds [`MAX_RECORDS_STREAM`], holds more than [`MAX_HELD_RECORDS`] records, or
+/// contains a malformed or invalidly signed record.
 pub fn decode_records(bytes: &[u8]) -> Result<Vec<Record>> {
     if bytes.len() > MAX_RECORDS_STREAM {
         return Err(Error::new("membership record stream is too large"));
@@ -49,7 +52,7 @@ pub fn decode_records(bytes: &[u8]) -> Result<Vec<Record>> {
     let mut out = Vec::new();
     let mut at = 0usize;
     while at < bytes.len() {
-        if out.len() >= MAX_RECORDS {
+        if out.len() >= MAX_HELD_RECORDS {
             return Err(Error::new("membership record stream exceeds record bound"));
         }
         let len = Record::wire_len_prefix(&bytes[at..])?;
@@ -81,8 +84,8 @@ pub(crate) struct Frame {
 /// while this framing pass retains its identity without trusting it.
 ///
 /// # Errors
-/// `bytes` exceeds [`MAX_RECORDS_STREAM`], holds more than [`MAX_RECORDS`] frames, or holds one
-/// this layout cannot frame (truncated, oversized, another layout version).
+/// `bytes` exceeds [`MAX_RECORDS_STREAM`], holds more than [`MAX_HELD_RECORDS`] frames, or holds
+/// one this layout cannot frame (truncated, oversized, another layout version).
 #[cfg(all(test, unix))]
 pub(crate) fn frames(bytes: &[u8]) -> Result<Vec<Frame>> {
     if bytes.len() > MAX_RECORDS_STREAM {
@@ -91,7 +94,7 @@ pub(crate) fn frames(bytes: &[u8]) -> Result<Vec<Frame>> {
     let mut out = Vec::new();
     let mut at = 0usize;
     while at < bytes.len() {
-        if out.len() >= MAX_RECORDS {
+        if out.len() >= MAX_HELD_RECORDS {
             return Err(Error::new("membership record stream exceeds record bound"));
         }
         let (len, parents) = Record::frame_prefix(&bytes[at..])?;
@@ -346,9 +349,10 @@ fn alab_keys() -> Vec<[u8; 32]> {
 ///
 /// Once a genesis arrives, records whose causal parents are present are checked and ordered by
 /// [`Log`]; verified records that arrive before genesis wait in `unrooted` (bounded by
-/// [`MAX_WAITING`]) and enter [`Log`] when genesis arrives. It holds at most [`MAX_RECORDS`]
-/// records in all: past that, the genesis or a record whose parents are held takes the place of a
-/// record waiting on a missing parent.
+/// [`MAX_WAITING`]) and enter [`Log`] when genesis arrives. Its log holds its records within the
+/// [`RecordBudgets`] the store was made with, and the store holds at most their held total in
+/// all, waiting records counted: past that, the genesis or a record whose parents are held takes
+/// the place of a record waiting on a missing parent.
 #[derive(Clone, Debug, Default)]
 pub struct Store {
     compiled: Option<RecordId>,
@@ -356,13 +360,16 @@ pub struct Store {
     log: Option<Log>,
     unrooted: BTreeMap<RecordId, Record>,
     lineage: Option<Vec<[u8; 32]>>,
+    /// The budgets its log takes when its genesis arrives ([`RecordBudgets::current`] when the
+    /// store was made).
+    budgets: RecordBudgets,
 }
 
-/// Drop records waiting on a missing parent, highest id first, until `log` holds at most
-/// [`MAX_RECORDS`] records and [`MAX_RECORDS_STREAM`] bytes in all, so its stream stays one
-/// [`decode_records`] reads.
+/// Drop records waiting on a missing parent, highest id first, until `log` holds at most its
+/// held total ([`RecordBudgets::held`]) of records and [`MAX_RECORDS_STREAM`] bytes in all, so
+/// its stream stays one [`decode_records`] reads.
 fn make_room(log: &mut Log) {
-    while log.order.len() + log.waiting.len() > MAX_RECORDS
+    while log.order.len() + log.waiting.len() > log.budgets.held
         || log.total_bytes() > MAX_RECORDS_STREAM
     {
         if !log.drop_last_waiting() {
@@ -388,15 +395,16 @@ impl Store {
         })
     }
 
-    /// An empty store pinned to `compiled` when `Some`.
+    /// An empty store pinned to `compiled` when `Some`, within [`RecordBudgets::current`].
     #[must_use]
-    pub const fn with_compiled(compiled: Option<RecordId>) -> Self {
+    pub fn with_compiled(compiled: Option<RecordId>) -> Self {
         Self {
             compiled,
             network: compiled,
             log: None,
             unrooted: BTreeMap::new(),
             lineage: None,
+            budgets: RecordBudgets::current(),
         }
     }
 
@@ -420,6 +428,7 @@ impl Store {
             log: None,
             unrooted: BTreeMap::new(),
             lineage: Some(lineage.to_vec()),
+            budgets: RecordBudgets::current(),
         }
     }
 
@@ -450,6 +459,13 @@ impl Store {
             }
         }
         self
+    }
+
+    /// The budgets its log holds its records within ([`RecordBudgets::current`] when the store
+    /// was made).
+    #[must_use]
+    pub const fn budgets(&self) -> RecordBudgets {
+        self.budgets
     }
 
     /// The keys one of which must have signed the genesis this store takes, when it checks the
@@ -493,7 +509,7 @@ impl Store {
         }
         let mut records = Vec::new();
         let mut at = 0usize;
-        while at < bytes.len() && records.len() < MAX_RECORDS {
+        while at < bytes.len() && records.len() < MAX_HELD_RECORDS {
             let Ok(len) = Record::wire_len_prefix(&bytes[at..]) else {
                 break;
             };
@@ -694,6 +710,23 @@ impl Store {
         self.log.as_ref()?.get(id).map(Record::bytes)
     }
 
+    /// What this store keeps in memory, as the records cache counts it: the wire bytes of every
+    /// record it holds, keeps waiting or keeps before a genesis, and its reachability index's
+    /// bytes.
+    #[cfg(unix)]
+    pub(crate) fn footprint(&self) -> usize {
+        self.log.as_ref().map_or_else(
+            || self.unrooted.values().map(|r| r.bytes().len()).sum(),
+            |log| log.total_bytes() + log.reach.bytes(),
+        )
+    }
+
+    /// The most [`Store::footprint`] reaches: a store keeps at most [`MAX_RECORDS_STREAM`] bytes
+    /// of records, and an index of at most [`MAX_HELD_RECORDS`] records.
+    #[cfg(unix)]
+    pub(crate) const MAX_FOOTPRINT: usize =
+        MAX_RECORDS_STREAM + super::reach::reserved_for(MAX_HELD_RECORDS);
+
     /// Every held record id, sorted.
     #[must_use]
     pub fn inventory(&self) -> BTreeSet<RecordId> {
@@ -819,23 +852,12 @@ impl Store {
         let Some(log) = &self.log else {
             return Vec::new();
         };
-        let mut known = BTreeSet::new();
-        let mut stack: Vec<RecordId> = have
-            .iter()
-            .filter(|id| log.get(id).is_some())
-            .copied()
-            .collect();
-        while let Some(id) = stack.pop() {
-            if known.insert(id)
-                && let Some(record) = log.get(&id)
-            {
-                stack.extend(record.parents().iter().copied());
-            }
-        }
+        let known = log.reach.closure(log.indexes(have));
         log.order
             .iter()
-            .filter(|r| !known.contains(&r.id))
-            .cloned()
+            .enumerate()
+            .filter(|(i, _)| (known[i / 64] >> (i % 64)) & 1 == 0)
+            .map(|(_, r)| r.clone())
             .collect()
     }
 
@@ -844,7 +866,8 @@ impl Store {
     /// # Errors
     /// The record belongs to another network, is a genesis none of a [`Store::dormant`] store's
     /// keys signed, or fails [`Log::against`] or [`Log::insert`], or it misses a parent and the store
-    /// already holds [`MAX_RECORDS`] records, or one short of [`MAX_WAITING`] before a genesis.
+    /// already holds its held total ([`RecordBudgets::held`]) of records, or one short of
+    /// [`MAX_WAITING`] before a genesis.
     /// It also fails when holding or keeping the record waiting would make the store's wire stream
     /// exceed [`MAX_RECORDS_STREAM`] (reserving [`MAX_RECORD`] bytes before a genesis).
     pub fn insert(&mut self, record: Record) -> Result<bool> {
@@ -870,13 +893,13 @@ impl Store {
         }
         // Records that wait on a missing parent cost a seated key (a removed Mac's among them)
         // nothing to make, so they never shut out the genesis or a record whose parents are
-        // held: once the store holds `MAX_RECORDS`, such a record takes the place of a waiting
+        // held: once the store holds its held total, such a record takes the place of a waiting
         // one, and a record missing a parent finds no room. The genesis comes first, before any
         // bound.
         if let Some(log) = &mut self.log {
             let complete = record.parents().iter().all(|p| log.held.contains_key(p));
             if !complete
-                && (log.order.len() + log.waiting.len() >= MAX_RECORDS
+                && (log.order.len() + log.waiting.len() >= log.budgets.held
                     || log.total_bytes().saturating_add(record.bytes().len()) > MAX_RECORDS_STREAM)
             {
                 return Err(Error::of_kind(
@@ -897,6 +920,7 @@ impl Store {
                 ));
             }
             let mut log = Log::against(record, self.compiled.as_ref(), &alab_lineage())?;
+            log.budgets = self.budgets;
             log.require_seats();
             self.network = Some(*log.network());
             // Each after its parents among them, so the log meets every seat before the records
@@ -914,7 +938,7 @@ impl Store {
         }
         // One short of `MAX_WAITING`, and `MAX_RECORD` bytes short of `MAX_RECORDS_STREAM`: a
         // store with no genesis yet always has room for it, however many records arrived first,
-        // and once it lands the store holds no more than `MAX_RECORDS` and `MAX_RECORDS_STREAM`
+        // and once it lands the store holds no more than its held total and `MAX_RECORDS_STREAM`
         // (what `decode_records` reads back).
         let unrooted_bytes: usize = self.unrooted.values().map(|r| r.bytes().len()).sum();
         if self.unrooted.len() >= MAX_WAITING - 1
@@ -932,7 +956,7 @@ impl Store {
     /// Decode and verify every record in `bytes`, then insert each one: if any record in the
     /// stream does not decode or verify, the store is left unchanged. A record [`Store::insert`]
     /// refuses is skipped and the rest are kept: which records a store refuses at its bounds
-    /// ([`MAX_RECORDS`], [`MAX_WAITING`], [`MAX_RECORDS_STREAM`]) depends on what reached it
+    /// (its [`RecordBudgets`], [`MAX_WAITING`], [`MAX_RECORDS_STREAM`]) depends on what reached it
     /// first, and a peer's stream that carries a record this store refuses still brings every
     /// other record. It works in place: [`Store::insert`] changes nothing when it refuses a
     /// record, and gives a waiting record's place only to a record it keeps, so a stream that
@@ -1120,7 +1144,7 @@ mod tests {
 
         let mut store = Store::with_compiled(Some(*genesis.id()));
         store.insert(genesis.clone()).expect("genesis");
-        for i in 0..MAX_RECORDS - 1 {
+        for i in 0..MAX_HELD_RECORDS - 1 {
             store.insert(waiting(i)).expect("room to wait");
         }
         assert_counters(store.log().expect("log"), "filling the store");
@@ -1145,7 +1169,7 @@ mod tests {
         let log = store.log().expect("log");
         assert_eq!(
             log.order.len() + log.waiting.len(),
-            MAX_RECORDS,
+            MAX_HELD_RECORDS,
             "make_room let one go"
         );
         assert_counters(log, "make_room");
@@ -1289,7 +1313,7 @@ mod tests {
 
         // Any host that reaches a server can POST records signed by a key it made, under the
         // network's public id, waiting on parents that never arrive.
-        let flood: Vec<Record> = (0..MAX_RECORDS - 1)
+        let flood: Vec<Record> = (0..MAX_HELD_RECORDS - 1)
             .map(|i| unseated(*genesis.id(), 0xEE, i))
             .collect();
         assert!(store.ingest(&encode_records(&flood)).is_err());
@@ -1656,7 +1680,7 @@ mod tests {
                     .expect("a record whose parents are held finds room")
             );
             assert!(store.log().expect("rooted").get(admit_two.id()).is_some());
-            assert_eq!(store.len(), MAX_RECORDS);
+            assert_eq!(store.len(), MAX_HELD_RECORDS);
             assert!(
                 store.insert(extra.clone()).is_err(),
                 "a record missing a parent finds no room in a full store"

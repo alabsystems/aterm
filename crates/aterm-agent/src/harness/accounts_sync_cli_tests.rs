@@ -98,8 +98,11 @@ fn malformed_automatic_source_is_a_refusal_and_preserves_account_records() {
 /// machine, a disqualifying note, a `?` machine, a `0` with a note or a value the column does not
 /// take, in either order, leave that address out of every pool while the sync takes the sheet's
 /// other row, and [`sheet_conflicts`] names the rows (never the address) for the window's
-/// digest. NEGATIVE CONTROL: before, the sync refused the whole sheet ("conflicting
-/// duplicate"), so one bad row stopped every account's sync on every Mac.
+/// digest; while the lab is pending (named this Mac before, not read yet) none is named. NEGATIVE
+/// CONTROL: before, the sync refused the whole sheet ("conflicting duplicate"), so one bad row
+/// stopped every account's sync on every Mac; with `sheet_conflicts_look` gated on a held lab
+/// naming this Mac alone, a CLI pool's conflict is still named while pending (`left: [SheetConflict
+/// { cli: Codex, .. }] right: []`).
 #[test]
 fn a_conflicting_sheet_row_skips_that_address_and_the_sync_reads_the_rest() {
     for cli in [Cli::Claude, Cli::Codex, Cli::Grok, Cli::Kimi] {
@@ -150,6 +153,14 @@ fn a_conflicting_sheet_row_skips_that_address_and_the_sync_reads_the_rest() {
                 assert_eq!(
                     (conflicts[0].cli, conflicts[0].rows.clone()),
                     (cli, vec![2, 3])
+                );
+                assert_eq!(
+                    crate::harness::alab_roster::while_pending(|| sheet_conflicts(
+                        &bed.home,
+                        &bed.aterm_toml()
+                    )),
+                    Vec::<SheetConflict>::new(),
+                    "{cli:?} {rows}: a lab not read yet reads no sheet"
                 );
             }
         }

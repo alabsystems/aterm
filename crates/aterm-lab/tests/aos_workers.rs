@@ -57,7 +57,9 @@ const SIX: &str = "\
 /// Take one slot from the shared subprocess pool (`aterm_spec::subprocess_lane`): each run
 /// spawns four judging processes, so multi-worker searches share the stage's subprocess budget.
 fn slot() -> impl Drop {
-    aterm_spec::subprocess_lane::acquire()
+    aterm_spec::subprocess_lane::acquire().unwrap_or_else(|e| {
+        aterm_spec::host::could_not_run(format!("subprocess admission refused ({e})"))
+    })
 }
 
 /// One finished run.

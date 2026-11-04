@@ -133,8 +133,8 @@ pub(crate) struct ProgramMarks {
     run: Option<Node>,
     /// Its tokens.
     bucket: MarkBucket,
-    /// The newest move not yet written, and how many states it replaced.
-    pending: Option<(ProgramWords, u64)>,
+    /// The newest move not yet written, its observation time, and how many states it replaced.
+    pending: Option<(ProgramWords, Stamp, u64)>,
 }
 
 /// WHAT THE PERSON IS SHOWN of a session's need: the printed tuple, as its `shown` mark words it.
@@ -551,8 +551,8 @@ impl SessionLog {
         self.enter_program_run(run, at);
         let p = &mut self.observed.program;
         p.pending = Some(match p.pending {
-            Some((_, replaced)) => (words, replaced.saturating_add(1)),
-            None => (words, 0),
+            Some((_, _, replaced)) => (words, at, replaced.saturating_add(1)),
+            None => (words, at, 0),
         });
         self.write_program(at, false);
     }
@@ -613,7 +613,8 @@ impl SessionLog {
 
     /// THE CLAIM'S TURNS: a codex-alab's screen opens no turn, so its run's turns follow the
     /// program marks written on it: `working` (or `blocked` in one) opens one and `idle`, `done`
-    /// or `error` closes it, at `src=engine conf=claim` (`aterm_slog::TurnTracker::claim`), each
+    /// or `error` closes it at the state's observation time, at `src=engine conf=claim`
+    /// (`aterm_slog::TurnTracker::claim`), each
     /// with its duration whatever its rollout tap binds; while a rollout is read `state=on` it
     /// opens its own turns and the claim stands aside, one read `state=partial` adds to the
     /// claim's and opens a turn only where none runs (fix E1), which the next `working` takes as
@@ -623,7 +624,7 @@ impl SessionLog {
     /// Past the bucket's burst a rest and the next `working` inside one refill coalesce into the
     /// newest mark: the rest's edge still ends its turn, but the next turn opens only once its
     /// `working` is written, so one whose rest replaced that `working` first is no claimed turn.
-    fn claim_turn(&mut self, run: Node, claimed: Claimed, at: Stamp) {
+    fn claim_turn(&mut self, run: Node, claimed: Claimed, event_at: Stamp, at: Stamp) {
         if self.codex_run() != Some(run) {
             return;
         }
@@ -631,7 +632,9 @@ impl SessionLog {
         self.resync();
         let Self { log, agent, .. } = self;
         if let Some(a) = agent.as_mut() {
-            let _ = a.tracker.claim(log, claimed, at);
+            // Mark emission and person reconciliation use the flush clock; only the
+            // claimed event keeps its observation clock across a delayed bucket tick.
+            let _ = a.tracker.claim(log, claimed, event_at);
         }
     }
 
@@ -658,7 +661,7 @@ impl SessionLog {
     fn write_program(&mut self, at: Stamp, force: bool) {
         let open = self.observed.program.run.filter(|n| self.log.is_open(*n));
         let p = &mut self.observed.program;
-        let Some((words, replaced)) = p.pending else {
+        let Some((words, event_at, replaced)) = p.pending else {
             return;
         };
         if !p.bucket.spend(at.mono_ms, force) {
@@ -675,7 +678,7 @@ impl SessionLog {
         );
         self.put(Kind::Program, Src::Engine, Conf::Claim, node, f, at);
         if let Some(claimed) = words.claimed {
-            self.claim_turn(node, claimed, at);
+            self.claim_turn(node, claimed, event_at, at);
         }
     }
 

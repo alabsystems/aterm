@@ -1857,6 +1857,66 @@ mod dead_pty_spawns {
         );
     }
 
+    /// ATERM-KI-1028-4 at a pty's open: a new pty whose node is gone as its slave opens by name
+    /// (here a name that names nothing, through [`pty_race::slave_opens_gone`]) is held open
+    /// while one fresh pair opens, so the fresh pair is another pty, and its slave is live.
+    #[test]
+    fn a_pty_whose_node_is_gone_as_its_slave_opens_is_held_while_a_fresh_one_opens() {
+        let _pool = OwnPool::new();
+        pty_race::slave_opens_gone(1);
+        let (master, slave) = open_pty_pair().expect("a fresh pair in place of the gone one");
+        let struck = pty_race::take_struck_opens();
+        let name = pts_name(master).expect("the fresh pty's name");
+        let live = slave_answers_fstat(slave);
+        // SAFETY: closing the pair this test opened.
+        unsafe {
+            libc::close(slave);
+            libc::close(master);
+        }
+        assert_eq!(struck.len(), 1, "one slave's open struck: {struck:?}");
+        assert_ne!(
+            name, struck[0],
+            "the gone pty held open while the fresh one opened, so another number"
+        );
+        assert!(live, "the fresh pty's slave answers fstat");
+    }
+
+    /// A second pty whose node is gone as its slave opens is an error of that kind naming both
+    /// ptys and this issue.
+    #[test]
+    fn a_second_pty_whose_node_is_gone_as_its_slave_opens_is_an_error_naming_both() {
+        let _pool = OwnPool::new();
+        pty_race::slave_opens_gone(2);
+        let err = open_pty_pair().expect_err("two gone ptys are an error");
+        let struck = pty_race::take_struck_opens();
+        let said = err.to_string();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound, "{said}");
+        assert_eq!(struck.len(), 2, "both slaves' opens struck: {struck:?}");
+        for name in &struck {
+            assert!(
+                said.contains(&*name.to_string_lossy()),
+                "{name:?} named: {said}"
+            );
+        }
+        assert!(said.contains("ATERM-KI-1028-4"), "{said}");
+    }
+
+    /// The spawn the pty host's test flaked on: a session leader whose pty's node is gone as its
+    /// slave opens still spawns, onto a fresh pty it holds as its controlling terminal, rather
+    /// than failing with ENOENT. The process's one read of the kernel's default termios opens a
+    /// pty of its own, so it is done first, and the struck open is the spawn's.
+    #[test]
+    fn a_session_leader_whose_ptys_node_is_gone_as_it_opens_holds_a_fresh_one() {
+        let _pool = OwnPool::new();
+        assert!(spawn_termios().is_some(), "the kernel's default termios");
+        pty_race::slave_opens_gone(1);
+        assert_session_leader_holds_live_pty();
+        let struck = pty_race::take_struck_opens();
+        let forked = spawn_trace::take();
+        assert_eq!(struck.len(), 1, "the spawn's slave open struck: {struck:?}");
+        assert_eq!(forked.len(), 1, "one fork, onto the fresh pty: {forked:?}");
+    }
+
     /// `spawn_session_leader_on_pty` replaces a pty that dies in the child right before
     /// `TIOCSCTTY` (`in_children`) or right after `TIOCSCTTY` (`after_login_tty`), holding the
     /// dead pty open while opening the fresh one so the child lands on a distinct live minor.
@@ -3427,4 +3487,30 @@ fn a_shell_spawn_waits_for_a_kept_out_socket_s_mark() {
         libc::close(master);
     }
     reap(pid);
+}
+
+/// [`end_session_on_pty`]'s drain of a master reads at most sixteen reads a round, so its
+/// deadline holds against a writer that outpaces its reads: a file longer than sixteen reads
+/// drains in two rounds, the first with more left.
+#[test]
+fn a_masters_drain_reads_at_most_sixteen_reads_a_round() {
+    use std::os::fd::AsRawFd as _;
+    let scratch = aterm_tempfile::tempdir().expect("scratch");
+    let path = scratch.path().join("output");
+    let len = 16 * 4096 + 1000;
+    std::fs::write(&path, vec![b'x'; len]).expect("the output");
+    let file = std::fs::File::open(&path).expect("the output, opened");
+    let mut got = 0;
+    let first = drain_master(file.as_raw_fd(), &mut |b: &[u8]| got += b.len()).expect("a round");
+    assert_eq!(
+        (first, got),
+        (false, 16 * 4096),
+        "the first round: sixteen reads, more left"
+    );
+    let second = drain_master(file.as_raw_fd(), &mut |b: &[u8]| got += b.len()).expect("a round");
+    assert_eq!(
+        (second, got),
+        (true, len),
+        "the second round: the rest, then the end"
+    );
 }

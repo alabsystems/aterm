@@ -271,8 +271,9 @@ struct PendingDocumentClose {
 struct PendingDocumentSaveIntent {
     seq: aterm_buffer::Seq,
     source_view: crate::tab_model::ViewId,
-    /// Whether control clients alone asked for it, so its replay is theirs
-    /// ([`crate::owner_keys_save`]); a person's request merged in makes it the person's.
+    /// Whether control clients or accessibility clients alone asked for it, so its replay is a
+    /// control client's ([`crate::owner_keys_save`]); a person's request merged in makes it the
+    /// person's.
     controller: bool,
 }
 
@@ -1689,10 +1690,8 @@ impl App {
     ) {
         let commits = self.editor_workspace.take_commits(document);
         if let Some((seq, _)) = commits.last() {
-            if self.person_gesture_refused() {
-                self.native_documents
-                    .unvouched
-                    .insert(document, crate::owner_keys_save::Unvouched::Controller);
+            if let Some(unvouched) = self.gesture_unvouched() {
+                self.native_documents.unvouched.insert(document, unvouched);
             }
             self.edit_document_committed(document, source_view, *seq);
             let other_views = self
@@ -3284,11 +3283,12 @@ impl App {
     }
 
     /// Why the save of `document` now is refused ([`crate::owner_keys_save`]): it is the
-    /// aterm.toml in force, a control client made the save or an edit no person here is known
-    /// to have made reached it, and the owner's keys in its text differ from the file's.
+    /// aterm.toml in force, a control client or an accessibility client made the save or an
+    /// edit no person here is known to have made reached it, and the owner's keys in its text
+    /// differ from the file's.
     fn owner_keys_save_refusal(&self, document: DocumentId) -> Option<String> {
         let provenance = crate::owner_keys_save::Provenance::new(
-            self.person_gesture_refused(),
+            self.gesture_unvouched().is_some(),
             self.native_documents.unvouched.get(&document).copied(),
         );
         if !provenance.fenced() {
@@ -3348,7 +3348,7 @@ impl App {
                 seq: snapshot.seq,
                 source_view,
                 controller: crate::owner_keys_save::queued_by_controller(
-                    self.person_gesture_refused(),
+                    self.gesture_unvouched().is_some(),
                 ),
             };
             self.native_documents

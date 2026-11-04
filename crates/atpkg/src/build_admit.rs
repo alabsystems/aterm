@@ -652,6 +652,24 @@ fn admit_bounded(
     let Some(ledger) = &seat.ledger else {
         return refuse(say, "no home directory keeps the capacity ledger");
     };
+    // This front transfers holder-based custody and preserves the command's group. It cannot
+    // arm/bind a dedicated cohort or establish drain, including when an existing claim covers
+    // this process. Do not admit work under a lifetime contract it cannot implement.
+    match ledger.cohort_aware() {
+        Ok(false) => {}
+        Ok(true) => {
+            return refuse(
+                say,
+                "the holder-based build front cannot supervise a cohort ledger; native cohort launch is required",
+            );
+        }
+        Err(error) => {
+            return refuse(
+                say,
+                &format!("the capacity ledger could not be validated ({error})"),
+            );
+        }
+    }
     match aterm_capacity::covering(ledger, seat.machine, seat.pid, seat.marker.as_deref()) {
         Ok(Some(holder)) => return Admission::Covered(holder),
         Ok(None) => {}

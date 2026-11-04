@@ -139,7 +139,7 @@ fn source(cli: Cli, action: &str, variant: bool) -> String {
         "ConflictingRows" => {
             let (machine, second) = if variant {
                 match cli {
-                    Cli::Claude => ("m3.2", value),
+                    Cli::Claude | Cli::Agy => ("m3.2", value),
                     Cli::Codex | Cli::Grok => ("m3", "device"),
                     Cli::Kimi => ("m3", "mainland-cn"),
                 }

@@ -1049,6 +1049,176 @@ fn account_read_and_stored_jwt_accept_only_chatgpt_accounts() {
 }
 
 #[test]
+fn identified_usage_keeps_the_request_identity_when_the_file_changes_before_the_reply() {
+    let now = 1_800_000_000;
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let path = tmp.path().join("auth.json");
+    let token = |account: &str, user: &str| {
+        make_jwt(&json!({
+            "exp": now + 3600, "email": "same@example.test",
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": account, "chatgpt_user_id": user
+            }
+        }))
+    };
+    let old = token("old-workspace", "old-user");
+    let new = token("new-workspace", "new-user");
+    write_auth_doc(
+        &path,
+        &json!({"auth_mode":"chatgpt", "tokens": {
+            "id_token": old, "access_token": old, "account_id":"old-workspace"
+        }}),
+    )
+    .unwrap();
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}/usage", listener.local_addr().unwrap());
+    let written = path.clone();
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "usage request did not arrive");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        };
+        let request = read_http_request(&mut stream).unwrap();
+        assert!(
+            request
+                .headers
+                .iter()
+                .any(|(key, value)| key == "chatgpt-account-id" && value == "old-workspace")
+        );
+        write_auth_doc(
+            &written,
+            &json!({"auth_mode":"chatgpt", "tokens": {
+                "id_token": new, "access_token": new, "account_id":"new-workspace"
+            }}),
+        )
+        .unwrap();
+        send_http_json(
+            &mut stream,
+            "200 OK",
+            &json!({
+                "rate_limit": {"allowed":false, "limit_reached":true,
+                    "secondary_window": {"used_percent":100.0,
+                        "limit_window_seconds":604800, "reset_at":now + 86400}}
+            }),
+        );
+    });
+    let result = read_identified_login_with(
+        &path,
+        &url,
+        &url,
+        Duration::from_secs(60),
+        now,
+        Some("same@example.test"),
+    )
+    .expect("identity-bound usage");
+    server.join().unwrap();
+    assert_eq!(
+        result.identity,
+        super::super::codex_renewal::Identity::from_native("old-workspace", "old-user")
+    );
+    assert_eq!(result.usage.sample.week_pct, Some(100));
+    assert_eq!(
+        renewal_identity(&path),
+        Some(super::super::codex_renewal::Identity::from_native(
+            "new-workspace",
+            "new-user"
+        ))
+    );
+}
+
+#[test]
+fn identified_usage_uses_the_shared_configuration_and_the_selected_auth_file() {
+    let now = 1_800_000_000;
+    let root = aterm_tempfile::tempdir().unwrap();
+    let auth_home = root.path().join("selected-account");
+    let config_home = root.path().join("shared-codex");
+    let user_home = root.path().join("user");
+    std::fs::create_dir_all(&auth_home).unwrap();
+    std::fs::create_dir_all(&config_home).unwrap();
+    std::fs::create_dir_all(user_home.join(".codex")).unwrap();
+    let token = make_chatgpt_jwt(Some("selected@example.test"), "pro", now + 3600);
+    write_auth_doc(
+        &auth_home.join("auth.json"),
+        &json!({"auth_mode":"chatgpt",
+            "tokens":{"id_token":token,"access_token":token,"account_id":"acct_native_test"}
+        }),
+    )
+    .unwrap();
+    for other in [&auth_home, &user_home.join(".codex")] {
+        std::fs::write(
+            other.join("config.toml"),
+            "chatgpt_base_url='http://127.0.0.1:1'\n",
+        )
+        .unwrap();
+    }
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    std::fs::write(
+        config_home.join("config.toml"),
+        format!(
+            "chatgpt_base_url='http://{}'\n",
+            listener.local_addr().unwrap()
+        ),
+    )
+    .unwrap();
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "shared route received no usage request"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        };
+        let request = read_http_request(&mut stream).unwrap();
+        assert_eq!(request.target, "/api/codex/usage");
+        assert!(
+            request
+                .headers
+                .iter()
+                .any(|(name, value)| name == "chatgpt-account-id" && value == "acct_native_test")
+        );
+        send_http_json(
+            &mut stream,
+            "200 OK",
+            &json!({
+                "rate_limit":{"allowed":true,"limit_reached":false,
+                "secondary_window":{"used_percent":12,"limit_window_seconds":604800,"reset_at":now+86400}}
+            }),
+        );
+    });
+    let usage = read_identified_login_with_config(
+        &auth_home,
+        &config_home,
+        &user_home,
+        Duration::from_secs(60),
+        now,
+        Some("selected@example.test"),
+    )
+    .expect("shared route");
+    server.join().unwrap();
+    assert_eq!(
+        usage.identity,
+        super::super::codex_renewal::Identity::from_native("acct_native_test", "user_native_test")
+    );
+    assert_eq!(usage.usage.sample.week_pct, Some(12));
+}
+
+#[test]
 fn native_wham_usage_reads_windows_walls_and_refreshes_expired_or_unauthorized_tokens() {
     use crate::harness::accounts::{SESSION_LIMIT, WEEK_LIMIT};
     let now = 1_790_000_000;

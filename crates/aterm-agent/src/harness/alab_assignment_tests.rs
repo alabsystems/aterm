@@ -398,10 +398,13 @@ fn labels_come_from_the_lab_and_only_a_legacy_label_is_renamed() {
 
 // 4. Mail.
 
-/// The routes and lab a mail-area `state` stands for, for the login `ann`: the lab's mailbox
-/// `lab-box` (whose pattern names another domain) where `lm`; a route naming `ann` where `own`;
-/// `ann` an alias of `hub`, which a route names, where `link`; a `*@example.test` route where
-/// `dom`.
+/// The routes and lab a mail-area `state` stands for, for the login `ann`. The lab is what
+/// `aterm-db`'s `LabView` hands the harness for the chain the state's registry rows make (its
+/// `Follow` is bound there, `alab::view::tests::an_alias_chain_takes_the_harness_models_steps`):
+/// `Lab::aliases` lists `hub` where `t1` and then `root` (or `ann` itself round a cycle) where
+/// `t2`, and `Lab::mailboxes` places `ann` in `lab-ann` where `eff` is 1 or `lab-root` where it
+/// is 2, with a route of that login whose pattern names another domain. Routes name `ann`
+/// where `own`, `hub` where `rh`, `root` where `rr`, and `*@example.test` where `dom`.
 fn mail_bed(state: &State) -> (Vec<MailboxRoute>, Lab) {
     let route = |login: &str, receives: String| MailboxRoute {
         login: login.to_owned(),
@@ -413,16 +416,33 @@ fn mail_bed(state: &State) -> (Vec<MailboxRoute>, Lab) {
     if state["dom"] == 1 {
         routes.push(route("domain-box", "*@example.test".to_owned()));
     }
-    if state["link"] == 1 {
-        routes.push(route("link-box", email("hub")));
-        lab.aliases = BTreeMap::from([(email("ann"), vec![email("hub")])]);
+    if state["rr"] == 1 {
+        routes.push(route("root-box", email("root")));
+    }
+    if state["rh"] == 1 {
+        routes.push(route("hub-box", email("hub")));
     }
     if state["own"] == 1 {
         routes.push(route("own-box", email("ann")));
     }
-    if state["lm"] == 1 {
-        routes.push(route("lab-box", "*@other.example.test".to_owned()));
-        lab.mailboxes = BTreeMap::from([(email("ann"), "lab-box".to_owned())]);
+    let mut chain = Vec::new();
+    if state["t1"] == 1 {
+        chain.push(email("hub"));
+    }
+    if state["t2"] == 1 {
+        chain.push(email(if state["hop"] == 1 { "root" } else { "ann" }));
+    }
+    if !chain.is_empty() {
+        lab.aliases = BTreeMap::from([(email("ann"), chain)]);
+    }
+    let lab_box = match state["eff"] {
+        0 => None,
+        1 => Some("lab-ann"),
+        _ => Some("lab-root"),
+    };
+    if let Some(login) = lab_box {
+        routes.push(route(login, "*@other.example.test".to_owned()));
+        lab.mailboxes = BTreeMap::from([(email("ann"), login.to_owned())]);
     }
     (routes, lab)
 }
@@ -430,67 +450,91 @@ fn mail_bed(state: &State) -> (Vec<MailboxRoute>, Lab) {
 /// The `res` a resolution to `at` in `routes` reads as.
 fn mail_res(routes: &[MailboxRoute], at: Option<usize>) -> i64 {
     match at.map(|at| routes[at].login.as_str()) {
-        Some("lab-box") => 1,
+        Some("lab-ann" | "lab-root") => 1,
         Some("own-box") => 2,
-        Some("link-box") => 3,
-        Some("domain-box") => 4,
+        Some("hub-box") => 3,
+        Some("root-box") => 4,
+        Some("domain-box") => 5,
         Some(other) => panic!("a route the bed never gives: {other}"),
-        None => 5,
+        None => 6,
     }
 }
 
 /// The mail area's projection of `action`: `Resolve` is [`resolve_index`] for `ann` under the
-/// lab the state stands for; the lab's rows and the routes set the bed.
+/// lab the state stands for. The registry's rows, its read (`Follow`, bound in `aterm-db`) and
+/// the routes are the bed this crate is handed, so the walk takes the model's one step for each.
 pub(crate) fn mail_transition(state: &State, action: &str) -> State {
-    let mut next = state.clone();
-    let flag = match action {
-        "Resolve" => {
-            let (routes, lab) = mail_bed(state);
-            let at = with_lab(lab, || resolve_index(&routes, Some(&email("ann"))));
-            next.insert("res", mail_res(&routes, at));
-            return next;
-        }
-        "LabMailbox" => "lm",
-        "OwnRoute" => "own",
-        "AliasLink" => "link",
-        "DomainRoute" => "dom",
-        other => panic!("{other} is no mail action"),
+    if action == "Resolve" {
+        let (routes, lab) = mail_bed(state);
+        let at = with_lab(lab, || resolve_index(&routes, Some(&email("ann"))));
+        let mut next = state.clone();
+        next.insert("res", mail_res(&routes, at));
+        return next;
+    }
+    let model = aterm_models_harness::fleet_machine_assignment_model();
+    let [next] = &model.successors(action, state)[..] else {
+        panic!("{action} is no deterministic mail input at {state:?}");
     };
-    next.insert(flag, 1);
-    next.insert("res", 0);
-    next
+    next.clone()
 }
 
 /// Every resolution a login's code fetch makes is a `FleetMachineAssignment` successor from every
 /// state its mail area reaches (§0: an alias is linked with the address its auth login is
 /// received at, and resolves to one mailbox): the lab's mailbox first, then the address's own
-/// route, then its link's, then a pattern.
-/// NEGATIVE CONTROL: a resolver that does not read the lab (no lab held) takes the address's own
-/// route over the lab's mailbox, breaking `LabMailboxFirst`, and the domain route over the alias
-/// link, breaking `LinkBeforePattern`; neither is a `Resolve` successor. Run against the code,
-/// `resolve_index` without its `mailbox_of` arm fails the walk the same way.
+/// route, then the routes of the chain the lab hands over, nearest first, then a pattern.
+/// NEGATIVE CONTROLS: a resolver that does not read the lab (no lab held) takes the address's
+/// own route over the lab's mailbox, breaking `LabMailboxFirst`, and the domain route over the
+/// chain's, breaking `LinkBeforePattern`; a lab whose chain is listed farthest first takes
+/// root's route over hub's, breaking `NearestLinkFirst`. None is a `Resolve` successor. Run
+/// against the code, `resolve_index` without its `mailbox_of` arm fails the walk the same way.
 #[test]
 fn an_alias_resolves_to_one_effective_mailbox() {
     let model = aterm_models_harness::fleet_machine_assignment_model();
     let states = area_states(&model, 4);
-    assert!(states.len() > 16, "{} mail states", states.len());
+    assert!(states.len() > 1000, "{} mail states", states.len());
     conforms(&model, &states, mail_transition);
 
-    for (flags, law) in [
-        ([1, 1, 0, 0], "LabMailboxFirst"),
-        ([0, 0, 1, 1], "LinkBeforePattern"),
-    ] {
-        let state = states
+    let unresolved = |want: &[(&str, i64)]| {
+        states
             .iter()
-            .find(|s| [s["lm"], s["own"], s["link"], s["dom"]] == flags && s["res"] == 0)
-            .expect("the unresolved bed");
+            .find(|s| s["fol"] == 1 && s["res"] == 0 && want.iter().all(|(k, v)| s[*k] == *v))
+            .expect("the unresolved bed")
+            .clone()
+    };
+    let refused = |state: &State, lab: Option<Lab>, law: &str| {
         let (routes, _) = mail_bed(state);
+        let resolve = || resolve_index(&routes, Some(&email("ann")));
+        let at = match lab {
+            Some(lab) => with_lab(lab, resolve),
+            None => resolve(),
+        };
         let mut next = state.clone();
-        next.insert(
-            "res",
-            mail_res(&routes, resolve_index(&routes, Some(&email("ann")))),
-        );
+        next.insert("res", mail_res(&routes, at));
         assert!(!model.check_invariant(law, &next), "{law}: {next:?}");
         assert!(!model.successors("Resolve", state).contains(&next));
+    };
+    refused(
+        &unresolved(&[("eff", 1), ("own", 1)]),
+        None,
+        "LabMailboxFirst",
+    );
+    refused(
+        &unresolved(&[("eff", 0), ("own", 0), ("t1", 1), ("rh", 1), ("dom", 1)]),
+        None,
+        "LinkBeforePattern",
+    );
+    let both = unresolved(&[
+        ("eff", 0),
+        ("own", 0),
+        ("hop", 1),
+        ("t1", 1),
+        ("t2", 1),
+        ("rh", 1),
+        ("rr", 1),
+    ]);
+    let mut reversed = mail_bed(&both).1;
+    for chain in reversed.aliases.values_mut() {
+        chain.reverse();
     }
+    refused(&both, Some(reversed), "NearestLinkFirst");
 }

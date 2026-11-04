@@ -978,7 +978,17 @@ fn now_words(line: Line, managed: &[&RowView]) -> String {
         .into_iter()
         .flatten()
         .collect(),
-        Line::Permissions => vec!["Granted".to_owned()],
+        // A grant on offer is nobody's yet: the line says so rather than Granted.
+        Line::Permissions => vec![
+            if managed.iter().any(
+                |row| matches!(&row.value, RowValue::Muted(word) if word == super::OFFERED_WORD),
+            ) {
+                super::OFFERED_WORD
+            } else {
+                "Granted"
+            }
+            .to_owned(),
+        ],
         Line::Secrets => vec![match value(Setting::Secrets) {
             Some("In sync") | None => "Joined · in sync".to_owned(),
             Some(other) => format!("Joined · {}", other.to_lowercase()),

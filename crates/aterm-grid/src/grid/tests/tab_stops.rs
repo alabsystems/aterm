@@ -75,10 +75,10 @@ fn grid_back_tab_n() {
     let mut grid = Grid::new(24, 80);
     grid.set_cursor(0, 40);
 
-    grid.back_tab_n(3);
+    grid.back_tab_n_margin(3, false, false);
     assert_eq!(grid.cursor_col(), 16);
 
-    grid.back_tab_n(10);
+    grid.back_tab_n_margin(10, false, false);
     assert_eq!(grid.cursor_col(), 0);
 }
 
@@ -87,10 +87,10 @@ fn grid_tab_n_with_default_stops() {
     let mut grid = Grid::new(24, 80);
     grid.set_cursor(0, 0);
 
-    grid.tab_n(3);
+    grid.tab_n_margin(3, false);
     assert_eq!(grid.cursor_col(), 24);
 
-    grid.tab_n(1);
+    grid.tab_n_margin(1, false);
     assert_eq!(grid.cursor_col(), 32);
 }
 
@@ -99,7 +99,7 @@ fn grid_tab_n_past_last_stop() {
     let mut grid = Grid::new(24, 80);
     grid.set_cursor(0, 0);
 
-    grid.tab_n(20);
+    grid.tab_n_margin(20, false);
     assert_eq!(grid.cursor_col(), 79);
 }
 
@@ -108,7 +108,7 @@ fn grid_tab_n_from_between_stops() {
     let mut grid = Grid::new(24, 80);
     grid.set_cursor(0, 10);
 
-    grid.tab_n(2);
+    grid.tab_n_margin(2, false);
     assert_eq!(grid.cursor_col(), 24);
 }
 

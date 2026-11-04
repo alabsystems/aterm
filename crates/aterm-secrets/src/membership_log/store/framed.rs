@@ -5,7 +5,7 @@
 //! Callers retain their own count, verification and recovery policies.
 
 use super::{MAX_RECORDS_STREAM, Record, Store};
-use crate::membership_log::{FRAME_PREFIX_LEN, MAX_RECORDS, RecordId};
+use crate::membership_log::{FRAME_PREFIX_LEN, MAX_HELD_RECORDS, RecordId};
 use crate::{Error, Result};
 use std::collections::BTreeSet;
 use std::io::{self, Read};
@@ -153,7 +153,7 @@ impl Store {
         let mut records = Vec::new();
         let mut strict = true;
         let mut frames = FrameReader::new();
-        while records.len() < MAX_RECORDS {
+        while records.len() < MAX_HELD_RECORDS {
             let frame = match frames.read(&mut reader) {
                 Ok(None) => {
                     return Ok(DecodedRecords {

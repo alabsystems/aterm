@@ -611,12 +611,6 @@ impl Grid {
         self.mark_scroll_damage(n);
     }
 
-    /// Scroll full-screen content down by `n` lines.
-    #[cfg(test)]
-    pub(crate) fn scroll_down(&mut self, n: usize) {
-        self.scroll_region_down(n);
-    }
-
     /// Scroll the active vertical scroll region up by `n` lines.
     pub fn scroll_region_up(&mut self, n: usize) {
         if n == 0 {

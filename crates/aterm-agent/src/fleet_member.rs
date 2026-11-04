@@ -4317,6 +4317,23 @@ const DENY_LIST_UNREAD: &str = "this Mac has not read its deny list yet (a vault
                                 now, or its last one failed: `aterm secrets sync` says which); \
                                 try again once it has";
 
+const FLEET_IDENTITY_CHANGED: &str = "this Mac left or changed fleets, or its local identity \
+                                     became unreadable, while its vault was being read";
+
+/// A local vault wait cannot carry credentials past a leave, rotation or identity change.
+/// This check holds no book or vault lock across the subsequent network operation.
+fn local_fleet_matches(places: &Places, secret: &FleetSecret, me: Option<&NodeIdentity>) -> bool {
+    let began = Held::Key(secret.clone());
+    member::write_held(&places.state, Began::Under(&began), |_| {
+        me.is_none_or(|expected| {
+            own_identity(places).is_some_and(|current| {
+                current.node() == expected.node() && current.key() == expected.key()
+            })
+        })
+    })
+    .unwrap_or(false)
+}
+
 /// This Mac's swarm deny list ([`aterm_secrets::client::swarm_denied_nodes`]; `None` while it
 /// cannot be read: mid-apply, a failed apply, a revoked or unreadable vault) and its membership
 /// log's verdict. Places with no vault read no deny list, which then names no one.
@@ -7472,13 +7489,18 @@ fn drive_fleet_proven_in(
         }
     };
     if let Some(node) = peer.node.as_deref() {
-        let (denied, log) = denied_and_log(places);
+        let (denied, log) = denied_and_log_by(places, Some(deadline.0));
         let Some(denied) = denied else {
             return Err(aterm_ctl::DriveRefused {
                 again: true,
                 ..aterm_ctl::DriveRefused::once(DENY_LIST_UNREAD.to_owned())
             });
         };
+        if !local_fleet_matches(places, &secret, Some(&me)) {
+            return Err(aterm_ctl::DriveRefused::once(
+                FLEET_IDENTITY_CHANGED.to_owned(),
+            ));
+        }
         let peer_key = peer.key.or_else(|| keys.bound(node));
         if aterm_net::fleet::is_denied_node(node, &denied)
             || peer_key.is_some_and(|key| {
@@ -7626,7 +7648,7 @@ fn copy_again(
     }) else {
         return Ok(false);
     };
-    let (denied, log) = denied_and_log(places);
+    let (denied, log) = denied_and_log_by(places, Some(deadline.0));
     let Some(denied) = denied else {
         return Err(Missed {
             why: DENY_LIST_UNREAD.to_owned(),
@@ -7634,6 +7656,13 @@ fn copy_again(
             unserved: false,
         });
     };
+    if !local_fleet_matches(places, secret, me) {
+        return Err(Missed {
+            why: FLEET_IDENTITY_CHANGED.to_owned(),
+            silent: false,
+            unserved: false,
+        });
+    }
     if peer_is_denied_or_held_out(&issuer, &denied, log.as_deref()) {
         let _ = member::keep_issuer_book(&places.state, secret, None);
         return Ok(false);

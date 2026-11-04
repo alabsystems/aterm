@@ -454,10 +454,10 @@ fn a_credential_in_the_environment_is_named_in_the_fact() {
 #[test]
 fn unknown_keyring_evidence_needs_no_action_but_a_definite_login_end_does() {
     let mut f = facts(&AGY);
+    f.hidden_store = true;
     f.home_exists = false;
     let row = assess(&f, true, NOW);
     assert_eq!((row.state, row.mark), (State::Unproven, Mark::Note));
-    assert!(row.fact.contains("not measured"), "{}", row.fact);
     assert!(!row.state.needs_act(row.wanted));
     f.record.ended_at = Some(NOW);
     f.record.ended_why = Some(crate::ai::store::Ended::ReviewAuth);

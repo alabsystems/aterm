@@ -109,9 +109,9 @@ USAGE:
     aterm harness accounts shared-renew <label> --account <digest> --decision <digest> --request <nonce>
                                                  renew one local Claude row under an exact root decision
     aterm harness accounts use <label> | --auto  pin an account or return to automatic rotation
-    aterm harness accounts sync [<source>] [--machine <mN>] [--json]
-                                                 sync accounts.toml and fleet-accounts.toml from <source>
-                                                 or the source this machine configured (no default)
+    aterm harness accounts sync [alab | <source>] [--machine <mN>] [--json]
+                                                 sync accounts.toml from the lab (first where it names
+                                                 this Mac), <source> or the source this machine configured
     aterm harness accounts serve [<source>] [--bind <addr:port>] [--machine <mN>]
                                                  serve account dashboard and fleet-accounts.toml
     aterm harness accounts mailboxes import <csv> --into <toml> [--dry-run]
@@ -1228,6 +1228,14 @@ pub enum AccountsCmd {
     },
     /// `accounts use --auto`: end the pin.
     Auto,
+    /// `accounts history <label|account> [--json]`: the account's history across Macs, this Mac's
+    /// ledger rows and every Mac's journal events about it ([`super::alab_seen::history`]).
+    History {
+        /// A row label, a lab label or legacy label, or an account key; never an address.
+        name: String,
+        /// The JSON form.
+        json: bool,
+    },
     /// `accounts stats [--json]`: what this machine has of the Claude Code account of the home the environment names ([`super::account_stats`]).
     Stats {
         /// The JSON form.
@@ -1238,7 +1246,7 @@ pub enum AccountsCmd {
         /// The JSON form.
         json: bool,
     },
-    /// `accounts sync [<source>] [--machine <mN>] [--json]`: synchronize this machine's `accounts.toml` and `fleet-accounts.toml` from `source`, else the source this machine configured ([`super::accounts_sync::configured_source`]); with neither, nothing.
+    /// `accounts sync [alab | <source>] [--machine <mN>] [--json]`: synchronize this machine's `accounts.toml` and `fleet-accounts.toml` from `source`, else the source this machine configured ([`super::accounts_sync::configured_source`]); with neither, nothing.
     Sync {
         /// Optional path or URL of a CSV or a `fleet-accounts.toml`.
         source: Option<String>,
@@ -1992,6 +2000,10 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
                     label: (*label).to_string(),
                 },
                 ["stats"] => AccountsCmd::Stats { json },
+                ["history", name] => AccountsCmd::History {
+                    name: (*name).to_string(),
+                    json,
+                },
                 ["refresh"] => AccountsCmd::Refresh { json },
                 ["add", label] => AccountsCmd::Add {
                     label: (*label).to_string(),
@@ -2091,14 +2103,16 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
                     AccountsCmd::Report { .. }
                         | AccountsCmd::Table { .. }
                         | AccountsCmd::Stats { .. }
+                        | AccountsCmd::History { .. }
                         | AccountsCmd::Refresh { .. }
                         | AccountsCmd::Sync { .. }
                 )
             {
                 return Err(
                     "--json is the report's form (`aterm harness accounts --json`), \
-                     `accounts table --json`, `accounts stats --json`, `accounts refresh \
-                     --cli kimi --json`, and `accounts sync --json`: the other forms print lines"
+                     `accounts table --json`, `accounts stats --json`, `accounts history \
+                     <label> --json`, `accounts refresh --cli kimi --json`, and `accounts sync \
+                     --json`: the other forms print lines"
                         .to_string(),
                 );
             }
@@ -2717,6 +2731,7 @@ fn accounts_of(
         | AccountsCmd::Use { .. }
         | AccountsCmd::Auto
         | AccountsCmd::Stats { .. }
+        | AccountsCmd::History { .. }
         | AccountsCmd::Refresh { .. }
         | AccountsCmd::Sync { .. } => None,
     };
@@ -6837,6 +6852,16 @@ pub trait AccountsHost {
         }
     }
 
+    /// Native Google authorization retains its canonical proof and exclusive profile
+    /// claim through pool publication. Inert hosts never read ambient credentials.
+    #[cfg(unix)]
+    fn native_google_sign_in(
+        &self,
+        _req: &super::login_drive::Request<'_>,
+    ) -> Result<super::agy_signin::VerifiedGoogleGrant, String> {
+        Err("this host has no native Google sign-in".into())
+    }
+
     /// Run a vendor's staged sign-in with exactly these approved mailbox inputs.
     /// This is a separate effect from ambient-mailbox discovery; inert hosts
     /// refuse it unless they explicitly implement the typed route.
@@ -7211,7 +7236,7 @@ impl AccountsHost for LiveAccounts {
         match cli {
             Cli::Claude => None,
             Cli::Codex => self.codex_launch_program(),
-            Cli::Grok | Cli::Kimi => Some(super::worker::pooled_launch_program_in(
+            Cli::Grok | Cli::Kimi | Cli::Agy => Some(super::worker::pooled_launch_program_in(
                 cli,
                 atpkg::store::resolve_configured().as_ref(),
             )),
@@ -7236,6 +7261,48 @@ impl AccountsHost for LiveAccounts {
             .map(PathBuf::from)
             .unwrap_or_default();
         super::login_drive::sign_in_live(req, &home, &|name| std::env::var_os(name))
+    }
+
+    #[cfg(all(unix, not(test)))]
+    fn native_google_sign_in(
+        &self,
+        req: &super::login_drive::Request<'_>,
+    ) -> Result<super::agy_signin::VerifiedGoogleGrant, String> {
+        if req.cli != Cli::Agy {
+            return Err("native Google sign-in is not this CLI's route".into());
+        }
+        let home = req
+            .store
+            .user_home()
+            .ok_or("Google login home is unavailable")?;
+        let state = req
+            .store
+            .dir
+            .parent()
+            .ok_or("Google login state is unavailable")?;
+        let program = super::login_drive::program_of(Cli::Agy, home);
+        let email = req
+            .row
+            .email
+            .as_deref()
+            .ok_or("Google login row has no email")?;
+        let previous = Some(req.row.dir.as_deref().map_or(home, Path::new));
+        let deadline = std::time::Instant::now() + super::login_drive::HANG;
+        super::agy_signin::run_google_staged(
+            &program,
+            state,
+            home,
+            &req.row.label,
+            super::agy_signin::StagedGoogleLogin {
+                profile: req.staging,
+                previous,
+                expected_email: email,
+            },
+            deadline,
+        )
+        .map_err(|error| error.to_string())?
+        .verify(deadline)
+        .map_err(str::to_owned)
     }
 
     fn vendor_sign_in_with_mailbox(
@@ -8177,7 +8244,7 @@ fn lists_own(cli: Cli, roster: &Roster, state: &accounts::State) -> bool {
 pub struct SurveyAccount {
     /// The row's label (`accounts.toml`), never its email.
     pub label: String,
-    /// Dedicated or shared.
+    /// Its order here: preferred on this Mac, or the pool (an order, never a limit).
     pub class: Class,
     /// Its login is made on this machine.
     pub enrolled: bool,
@@ -9857,6 +9924,70 @@ fn run_accounts_report(
     }
 }
 
+/// `accounts history <name> [--json]` ([`super::alab_seen::history`]): this Mac's ledger rows and
+/// every Mac's journal events about one account, oldest first. The name is a row label, a lab
+/// label or legacy label, or an account key; an address is refused. Nothing calls a provider.
+fn run_accounts_history(
+    cli: Cli,
+    env: &Env,
+    name: &str,
+    json: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let refuse = |err: &mut dyn Write, why: &str| {
+        let _ = writeln!(err, "aterm harness accounts history: {why}");
+        ExitCode::FAILURE
+    };
+    if name.contains('@') {
+        return refuse(
+            err,
+            "an account is named by its label or key, never its address",
+        );
+    }
+    let (Some(path), Some(store)) = (env.accounts_roster_for(cli), env.accounts_store_for(cli))
+    else {
+        return refuse(err, &no_home_for(cli));
+    };
+    let records = match store.read_account_records(Some(&path), env.now) {
+        Ok(records) => records,
+        Err(_) => return refuse(err, "the account records could not be read consistently"),
+    };
+    let lab = super::alab_roster::current();
+    let Some(asked) =
+        super::alab_seen::resolve(cli, name, &records.roster, &records.state, lab.as_deref())
+    else {
+        return refuse(err, "no row, lab label or account key goes by that name");
+    };
+    let ledger = store.tail(accounts::LEDGER_KEEP_ROWS).unwrap_or_default();
+    let seen = super::alab_seen::current(true);
+    let journal = seen
+        .as_deref()
+        .zip(asked.pk.as_deref())
+        .and_then(|(seen, pk)| seen.accounts.get(pk));
+    let lines = super::alab_seen::history(&asked, &ledger, journal);
+    if json {
+        let value = aterm_json::json!({
+            "label": asked.label,
+            "ac": asked.pk,
+            "journal": seen.is_some(),
+            "lines": lines,
+        });
+        let _ = writeln!(out, "{value}");
+    } else {
+        if seen.is_none() {
+            let _ = writeln!(
+                out,
+                "(this Mac's ledger only: no lab journal is read in this process)"
+            );
+        }
+        for line in &lines {
+            let _ = writeln!(out, "{line}");
+        }
+    }
+    ExitCode::SUCCESS
+}
+
 /// The rows, admitted state and login presence used to format an account report.
 /// A dashboard can reuse this observation without reading account records again.
 pub(super) struct ReportedAccounts {
@@ -9889,7 +10020,17 @@ pub(super) fn write_accounts_report(
     let catalog = super::account_catalog::read(env.home.as_deref());
     let mut local_out = Vec::new();
     let local = write_local_accounts_report((cli, launch), env, json, &mut local_out, err);
-    write_combined_accounts_report(cli, json, &local_out, local.as_ref(), catalog.as_ref(), out);
+    // What the journal says of each row (last used by, signed in on, quota): one read a person's
+    // verb waits for, of this Mac's own Commons, never a provider.
+    let seen = super::alab_seen::current(true);
+    write_combined_accounts_report(
+        cli,
+        json,
+        &local_out,
+        local.as_ref(),
+        (catalog.as_ref(), seen.as_deref()),
+        out,
+    );
     AccountReport { local, catalog }
 }
 
@@ -9898,31 +10039,49 @@ fn write_combined_accounts_report(
     json: bool,
     local_out: &[u8],
     local: Option<&ReportedAccounts>,
-    catalog: Option<&Result<super::account_catalog::Catalog, String>>,
+    (catalog, seen): (
+        Option<&Result<super::account_catalog::Catalog, String>>,
+        Option<&super::alab_seen::Seen>,
+    ),
     out: &mut dyn Write,
 ) {
-    let Some(catalog) = catalog else {
+    let lab = seen.zip(local).map(|(seen, local)| {
+        let lab = super::alab_roster::current();
+        super::alab_seen::rows(cli, &local.roster, &local.state, lab.as_deref(), seen)
+    });
+    let lab = lab.filter(|rows| !rows.is_empty());
+    if catalog.is_none() && lab.is_none() {
         let _ = out.write_all(local_out);
         return;
-    };
+    }
     let roster = local.map(|local| &local.roster);
     if json {
         let mut value: Value =
             aterm_json::from_slice(local_out).unwrap_or_else(|_| Value::Object(Map::new()));
         if let Some(object) = value.as_object_mut() {
-            object.insert(
-                "shared_accounts".into(),
-                super::account_catalog::report(catalog, cli, roster),
-            );
+            if let Some(catalog) = catalog {
+                object.insert(
+                    "shared_accounts".into(),
+                    super::account_catalog::report(catalog, cli, roster),
+                );
+            }
+            if let (Some(rows), Some(seen)) = (&lab, seen) {
+                object.insert("journal".into(), super::alab_seen::rows_json(rows, seen.at));
+            }
         }
         let _ = writeln!(out, "{value}");
     } else {
         let _ = out.write_all(local_out);
-        let _ = write!(
-            out,
-            "{}",
-            super::account_catalog::text(catalog, cli, roster)
-        );
+        if let (Some(rows), Some(seen)) = (&lab, seen) {
+            let _ = write!(out, "{}", super::alab_seen::rows_text(rows, seen.at));
+        }
+        if let Some(catalog) = catalog {
+            let _ = write!(
+                out,
+                "{}",
+                super::account_catalog::text(catalog, cli, roster)
+            );
+        }
     }
 }
 
@@ -9997,7 +10156,7 @@ mod shared_catalog_tests {
             true,
             refused.as_bytes(),
             None,
-            Some(&catalog),
+            (Some(&catalog), None),
             &mut output,
         );
         let report: Value = aterm_json::from_slice(&output).unwrap();
@@ -10048,7 +10207,14 @@ fn run_accounts_report_snapshot_with_catalog(
 ) -> ExitCode {
     let mut local_out = Vec::new();
     let local = write_accounts_report_snapshot(pool, env, json, path, records, &mut local_out, err);
-    write_combined_accounts_report(pool.0, json, &local_out, local.as_ref(), catalog, out);
+    write_combined_accounts_report(
+        pool.0,
+        json,
+        &local_out,
+        local.as_ref(),
+        (catalog, super::alab_seen::current(true).as_deref()),
+        out,
+    );
     if local.is_some() {
         ExitCode::SUCCESS
     } else {
@@ -12583,7 +12749,85 @@ struct SignInPlan {
     staging: PathBuf,
     staging_text: String,
     parent: accounts::RenewalParent,
+    #[cfg(unix)]
+    native_google: Option<super::agy_signin::VerifiedGoogleGrant>,
     _lock: accounts::Lock,
+}
+
+impl SignInPlan {
+    fn drive(
+        &mut self,
+        cli: Cli,
+        host: &dyn AccountsHost,
+        row: &accounts::Row,
+        store: &accounts::Store,
+    ) -> super::login_drive::Drove {
+        use super::login_drive::{Drove, Outcome};
+        let request = super::login_drive::Request {
+            cli,
+            route: self.route,
+            row,
+            staging: &self.staging,
+            store,
+            hosts: self.hosts,
+        };
+        if !matches!(self.route.drive, crate::ai::connector::Drive::NativeGoogle) {
+            return host.vendor_sign_in(&request);
+        }
+        #[cfg(unix)]
+        match host.native_google_sign_in(&request) {
+            Ok(grant) => {
+                let email = grant.profile().email.to_owned();
+                self.native_google = Some(grant);
+                Drove {
+                    outcome: Outcome::SignedIn {
+                        email: Some(email),
+                        page: false,
+                    },
+                    host: Some("accounts.google.com".into()),
+                }
+            }
+            Err(why) => Drove {
+                outcome: Outcome::NotRun(why),
+                host: None,
+            },
+        }
+        #[cfg(not(unix))]
+        Drove {
+            outcome: Outcome::NotRun(
+                "native Google sign-in is unavailable on this platform".into(),
+            ),
+            host: None,
+        }
+    }
+
+    fn check_native_google(&self, cli: Cli, email: &str) -> Result<(), String> {
+        if cli != Cli::Agy {
+            return Ok(());
+        }
+        #[cfg(unix)]
+        {
+            let grant = self
+                .native_google
+                .as_ref()
+                .ok_or("canonical Google proof is unavailable")?;
+            let path = grant.path().map_err(str::to_owned)?;
+            if !grant.profile().email.eq_ignore_ascii_case(email)
+                || path
+                    != self
+                        .staging
+                        .join(".gemini/antigravity-cli/antigravity-oauth-token")
+            {
+                return Err("canonical Google proof does not match this staged row".into());
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = email;
+            Err("native Google sign-in is unavailable on this platform".into())
+        }
+    }
 }
 
 /// Why a pool sign-in of Codex's row `label` is not made while Codex keeps its login in the OS
@@ -12748,6 +12992,8 @@ fn sign_in_plan(
         staging,
         staging_text,
         parent,
+        #[cfg(unix)]
+        native_google: None,
         _lock: lock,
     })
 }
@@ -12799,29 +13045,27 @@ fn reconcile_staging_overlay_suffixes(
             _ => None,
         })
         .collect();
-    if suffixes.is_empty() {
-        return Ok(());
-    }
     let mut created = Vec::new();
-    for entry in std::fs::read_dir(staging)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_file() {
-            continue;
-        }
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        if stores.contains(&name.as_str()) {
-            continue;
-        }
-        if suffixes.iter().any(|suffix| name.ends_with(suffix)) {
-            created.push(name);
+    if !suffixes.is_empty() {
+        for entry in std::fs::read_dir(staging)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if stores.contains(&name.as_str()) {
+                continue;
+            }
+            if suffixes.iter().any(|suffix| name.ends_with(suffix)) {
+                created.push(name);
+            }
         }
     }
-    if created.is_empty() {
-        return Ok(());
+    if !created.is_empty() {
+        aterm_types::fs_restricted::ensure_private_dir(default_home)?;
     }
-    aterm_types::fs_restricted::ensure_private_dir(default_home)?;
     created.sort();
     for name in &created {
         let src = staging.join(name);
@@ -13093,6 +13337,7 @@ fn bind_signed_in(
             // and before creating any recoverable completion checkpoint.
             plan.parent.require_current(logins, label)?;
             signin_policy_matches(row, raw, own_dir)?;
+            plan.check_native_google(cli, email)?;
             if cli == Cli::Claude {
                 shared_renewal::unmanaged(
                     logins,
@@ -13116,18 +13361,40 @@ fn bind_signed_in(
                 .map_err(|why| why.to_string())?;
             }
             if !email.is_empty() {
-                accounts::write_renewal_checkpoint_for(
-                    cli,
-                    row.vendor.region,
-                    label,
-                    email,
-                    &plan.staging_text,
-                    None,
-                    Some(proof),
-                    now,
-                    logins,
-                )
-                .map_err(|why| format!("completion checkpoint could not be saved: {why}"))?;
+                let checkpoint = if cli == Cli::Agy {
+                    #[cfg(unix)]
+                    {
+                        accounts::write_google_renewal_checkpoint(
+                            label,
+                            &plan.staging_text,
+                            plan.native_google
+                                .as_ref()
+                                .ok_or("canonical Google proof is unavailable")?,
+                            now,
+                            logins,
+                        )
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        return Err(
+                            "native Google publication is unavailable on this platform".into()
+                        );
+                    }
+                } else {
+                    accounts::write_renewal_checkpoint_for(
+                        cli,
+                        row.vendor.region,
+                        label,
+                        email,
+                        &plan.staging_text,
+                        None,
+                        Some(proof),
+                        now,
+                        logins,
+                    )
+                };
+                checkpoint
+                    .map_err(|why| format!("completion checkpoint could not be saved: {why}"))?;
             }
             let events = accounts::note_renewed(
                 state,
@@ -13139,6 +13406,14 @@ fn bind_signed_in(
                 now,
             );
             accounts::note_identity(logins, label, proof, (!email.is_empty()).then_some(email));
+            #[cfg(unix)]
+            if cli == Cli::Agy {
+                let grant = plan
+                    .native_google
+                    .as_ref()
+                    .ok_or("canonical Google proof is unavailable")?;
+                accounts::note_google_identity(logins, label, email, grant.profile().principal);
+            }
             Ok(events)
         },
     );
@@ -13269,7 +13544,7 @@ pub(super) fn renew_one_for(
     let c = cli.connector();
     let email = row.email.as_deref().unwrap_or("");
     let codex_program = report_program(cli, host);
-    let plan = match sign_in_plan(
+    let mut plan = match sign_in_plan(
         cli,
         store,
         SignInPolicy {
@@ -13294,14 +13569,7 @@ pub(super) fn renew_one_for(
         sign_in_words(cli, label, plan.route, plan.hosts)
     );
     let _ = out.flush();
-    let drove = host.vendor_sign_in(&super::login_drive::Request {
-        cli,
-        route: plan.route,
-        row,
-        staging: &plan.staging,
-        store,
-        hosts: plan.hosts,
-    });
+    let drove = plan.drive(cli, host, row, store);
     let now = host.now().max(floor);
     let policy_unchanged = || signin_policy_current(cli, row, roster_path, own_dir);
     if let Err(why) = policy_unchanged() {
@@ -13611,6 +13879,16 @@ fn run_accounts_login_for(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
+    if cli == Cli::Agy {
+        return run_accounts_renew_for(
+            cli,
+            env,
+            host,
+            (&[label.to_owned()], false, None),
+            out,
+            err,
+        );
+    }
     let Some((path, file_roster)) = accounts_read_roster_for(cli, env, err) else {
         return ExitCode::from(1);
     };
@@ -14201,6 +14479,9 @@ pub fn run_accounts(
         }
         AccountsCmd::Auto => run_accounts_use((Cli::Claude, host), env, None, out, err),
         AccountsCmd::Stats { json } => run_accounts_stats(env, *json, out),
+        AccountsCmd::History { name, json } => {
+            run_accounts_history(Cli::Claude, env, name, *json, out, err)
+        }
         AccountsCmd::Refresh { .. } => {
             let _ = writeln!(err, "aterm harness accounts refresh: use --cli kimi");
             ExitCode::from(2)
@@ -14380,6 +14661,9 @@ pub fn run_accounts_of(
         AccountsCmd::Use { label } => run_accounts_use((cli, host), env, Some(label), out, err),
         AccountsCmd::Auto => run_accounts_use((cli, host), env, None, out, err),
         AccountsCmd::Stats { json } => run_accounts_stats_of(cli, env, *json, out, err),
+        AccountsCmd::History { name, json } => {
+            run_accounts_history(cli, env, name, *json, out, err)
+        }
         AccountsCmd::Refresh { json } => run_kimi_refresh(env, *json, out, err),
         AccountsCmd::Renew { labels, due, on } => {
             run_accounts_renew_for(cli, env, host, (labels, *due, on.as_deref()), out, err)
@@ -15450,6 +15734,10 @@ fn launch_tap_value(args: &[String]) -> Option<String> {
 
 /// The front door's entry point (`aterm harness …`).
 pub fn main_entry(argv: Vec<OsString>) -> ExitCode {
+    #[cfg(unix)]
+    if let Some(result) = super::codex_exec_handoff::entry(&argv) {
+        return result;
+    }
     #[cfg(unix)]
     if let Some(result) = super::native_launch::entry(&argv) {
         return result;

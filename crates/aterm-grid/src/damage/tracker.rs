@@ -67,7 +67,7 @@ impl DamageTracker {
     pub(crate) fn mark_wide_cell(&mut self, row: u16, col: u16) {
         self.mark_seq = self.mark_seq.wrapping_add(1);
         let row_idx = row as usize;
-        if row_idx < self.row_bounds.len() {
+        if row_idx < self.row_bounds.len() && col < u16::MAX {
             let word = row_idx / 64;
             let bit = row_idx % 64;
             self.row_bits[word] |= 1 << bit;
@@ -89,7 +89,7 @@ impl DamageTracker {
     pub(crate) fn mark_cell(&mut self, row: u16, col: u16) {
         self.mark_seq = self.mark_seq.wrapping_add(1);
         let row_idx = row as usize;
-        if row_idx < self.row_bounds.len() {
+        if row_idx < self.row_bounds.len() && col < u16::MAX {
             let word = row_idx / 64;
             let bit = row_idx % 64;
             self.row_bits[word] |= 1 << bit;

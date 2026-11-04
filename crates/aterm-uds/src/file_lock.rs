@@ -145,8 +145,39 @@ impl LockFile {
     /// `path` holds anything but a regular file; the open's and the lock's own error, a link at
     /// `path` included.
     pub fn take(path: &std::path::Path, deadline: Instant, busy: &str) -> io::Result<Self> {
-        let file = open_or_make(path)?;
-        if !file.metadata()?.is_file() {
+        Self::lock(open_or_make(path)?, path, deadline, busy)
+    }
+
+    /// Take an exclusive lock on an existing plain regular file, without creating a missing file.
+    /// On Unix the open never follows a link or waits on a FIFO. On Windows it opens the reparse
+    /// point itself and refuses it rather than following or locking its target.
+    ///
+    /// # Errors
+    /// As [`Self::take`], also returning `NotFound` when the file does not exist and `InvalidData`
+    /// for a Windows reparse point.
+    pub fn take_existing(
+        path: &std::path::Path,
+        deadline: Instant,
+        busy: &str,
+    ) -> io::Result<Self> {
+        Self::lock(open_existing(path)?, path, deadline, busy)
+    }
+
+    fn lock(
+        file: std::fs::File,
+        path: &std::path::Path,
+        deadline: Instant,
+        busy: &str,
+    ) -> io::Result<Self> {
+        let metadata = file.metadata()?;
+        let plain_file = metadata.is_file();
+        #[cfg(windows)]
+        let plain_file = {
+            use std::os::windows::fs::MetadataExt as _;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+            plain_file && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+        };
+        if !plain_file {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("{} is no regular file", path.display()),
@@ -169,13 +200,10 @@ impl Drop for LockFile {
 fn open_or_make(path: &std::path::Path) -> io::Result<std::fs::File> {
     let mut making = std::fs::OpenOptions::new();
     making.write(true).create_new(true);
-    let mut existing = std::fs::OpenOptions::new();
-    existing.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
         making.mode(0o600);
-        existing.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     match making.open(path) {
         Ok(file) => {
@@ -186,14 +214,62 @@ fn open_or_make(path: &std::path::Path) -> io::Result<std::fs::File> {
             }
             Ok(file)
         }
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => existing.open(path),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => open_existing(path),
         Err(error) => Err(error),
     }
+}
+
+fn open_existing(path: &std::path::Path) -> io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options.open(path)
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn existing_only_lock_never_recreates_a_removed_slot() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let path = dir.path().join("slot");
+        assert_eq!(
+            LockFile::take_existing(&path, Instant::now(), "busy")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        assert!(!path.exists());
+        std::fs::write(&path, b"retained").unwrap();
+        let held = LockFile::take_existing(&path, Instant::now(), "busy").unwrap();
+        assert_eq!(
+            LockFile::take_existing(&path, Instant::now(), "busy")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"retained");
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            LockFile::take_existing(&path, Instant::now(), "busy")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        assert!(!path.exists());
+        drop(held);
+    }
 
     /// One holder at a time: a second take while the first holds it waits until its deadline and
     /// says `busy`, and takes it once the first let go; a missing file is made 0600, one there is

@@ -9,13 +9,14 @@
 //! targo --unverified verify perf --list
 //! ```
 //!
-//! Three kinds of lane. The FLOOR lanes ([`floors`], [`wasm`], [`vte_engine`]) measure the
-//! engine headless and judge each metric against its committed baseline in
+//! Three kinds of lane. The FLOOR lanes ([`floors`], [`deck`], [`wasm`], [`vte_engine`],
+//! [`vte_marks`]) measure headless, opening no window, and judge each metric against its
+//! committed baseline in
 //! `crates/aterm-verify/perf/golden/`; whatever they measured then meets the
 //! same-box trend ledger ([`trend`]), and a green run appends to it. A bare `verify
 //! perf` runs every floor lane. Each lane waits for a quiet machine first but
-//! `vte-engine`, which runs at the load it finds, reports it, and judges cycles,
-//! not time. The ARENA lanes ([`arena`]) open real
+//! `vte-engine` and `vte-marks`, which run at the load they find, report it, and judge
+//! cycles, not time. The ARENA lanes ([`arena`]) open real
 //! windows and take minutes; they run only when named, and what they measure
 //! has no floor, so they report MEASURED, never a pass. The MEASURED lanes
 //! ([`fabric`], [`restore_e2e`], [`aos`], [`commons`], [`journal`]) are headless but just as unjudgeable —
@@ -58,6 +59,8 @@ mod stats;
 mod trend;
 #[cfg(unix)]
 pub(crate) mod vte_engine;
+#[cfg(unix)]
+mod vte_marks;
 pub(crate) mod wasm;
 
 pub(crate) use trend::TrendSample;
@@ -119,6 +122,7 @@ pub(crate) enum Lane {
     Deck,
     Wasm,
     VteEngine,
+    VteMarks,
     Start,
     Compare,
     Cat,
@@ -144,7 +148,7 @@ pub(crate) enum Kind {
 }
 
 impl Lane {
-    pub(crate) const ALL: [Lane; 24] = [
+    pub(crate) const ALL: [Lane; 25] = [
         Lane::Throughput,
         Lane::Pathological,
         Lane::ScrollScrub,
@@ -159,6 +163,7 @@ impl Lane {
         Lane::Deck,
         Lane::Wasm,
         Lane::VteEngine,
+        Lane::VteMarks,
         Lane::Start,
         Lane::Compare,
         Lane::Cat,
@@ -187,6 +192,7 @@ impl Lane {
             Lane::Deck => "deck",
             Lane::Wasm => "wasm",
             Lane::VteEngine => "vte-engine",
+            Lane::VteMarks => "vte-marks",
             Lane::Start => "start",
             Lane::Compare => "compare",
             Lane::Cat => "cat",
@@ -215,7 +221,8 @@ impl Lane {
             | Lane::TrailLightComposer
             | Lane::Deck
             | Lane::Wasm
-            | Lane::VteEngine => Kind::Floor,
+            | Lane::VteEngine
+            | Lane::VteMarks => Kind::Floor,
             Lane::Start | Lane::Compare | Lane::Cat | Lane::Scroll | Lane::Vte => Kind::Arena,
             Lane::Fabric
             | Lane::RestoreE2e
@@ -231,12 +238,12 @@ impl Lane {
         self.kind() == Kind::Arena
     }
 
-    /// Whether the lane waits for a quiet machine before it starts ([`quiet`]). `vte-engine`
-    /// does not: it measures at the load it finds, reports that load beside its numbers, and is
-    /// judged by performance-core cycles, which the clock and the core a sample ran on do not
-    /// move.
+    /// Whether the lane waits for a quiet machine before it starts ([`quiet`]). `vte-engine` and
+    /// `vte-marks` do not: they measure at the load they find, report that load beside their
+    /// numbers, and are judged by performance-core cycles, which the clock and the core a sample
+    /// ran on do not move.
     fn takes_quiet_claim(self) -> bool {
-        self != Lane::VteEngine
+        !matches!(self, Lane::VteEngine | Lane::VteMarks)
     }
 
     /// What the lane measures, for `--list`.
@@ -278,6 +285,12 @@ impl Lane {
                 "performance-core cycles and ms per MiB (min and median) of the pinned \
                  vtebench's default suite and the d1 ascii and unicode corpora replayed into \
                  Terminal::process at 120x40; no PTY, GUI or window, at the load it finds"
+            }
+            Lane::VteMarks => {
+                "performance-core cycles and ms per MiB (min and median) of four mark-heavy \
+                 corpora (NFD Latin, Hindi and Thai, conjoining Hangul jamo, emoji selectors, \
+                 skin tones, joiners and flags) replayed into Terminal::process at 120x40: the \
+                 write path's mark branch, at the load it finds"
             }
             Lane::Start => "fresh-process real-window startup timing of one aterm",
             Lane::Compare => "paired ABBA startup A/B of two aterm binaries",
@@ -336,6 +349,10 @@ impl Lane {
                 "unix, targo (release build of aterm-bench), git and the network for the pinned \
                  vtebench's first clone; the vte lane's vtebench build to cross-check its \
                  payloads; macOS's per-core-type cycle counters to judge anything"
+            }
+            Lane::VteMarks => {
+                "unix, targo (release build of aterm-bench); macOS's per-core-type cycle \
+                 counters to judge anything"
             }
             Lane::Start => "macOS, a built aterm (--binary)",
             Lane::Compare => "macOS, two built aterm binaries (--baseline, --candidate)",
@@ -1137,6 +1154,13 @@ fn main(args: &[String]) -> ExitCode {
                 "run it on macOS or Linux",
             ),
             #[cfg(unix)]
+            Lane::VteMarks => vte_marks::run(record),
+            #[cfg(not(unix))]
+            Lane::VteMarks => LaneRun::skip(
+                "its corpora live in the arena's cache and scratch, which are unix-only",
+                "run it on macOS or Linux",
+            ),
+            #[cfg(unix)]
             Lane::Start => arena::start::run(&arena_args),
             #[cfg(unix)]
             Lane::Compare => arena::compare::run(&arena_args),
@@ -1399,7 +1423,8 @@ mod tests {
                 Lane::TrailLightComposer,
                 Lane::Deck,
                 Lane::Wasm,
-                Lane::VteEngine
+                Lane::VteEngine,
+                Lane::VteMarks
             ]
         );
         assert!(cli.record.is_empty());

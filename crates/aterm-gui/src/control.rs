@@ -9666,6 +9666,12 @@ fn serve_session_verb(
     if verb == "codex-renewal" {
         return crate::native_act::serve_codex_renewal(self_ctx, master, rest);
     }
+    if verb == "codex-rotation" {
+        return crate::native_act::serve_codex_rotation(self_ctx, master, rest);
+    }
+    if verb == "codex-exec-handoff" {
+        return crate::native_act::serve_codex_exec_handoff(self_ctx, master, rest);
+    }
     if verb == "native-observe" {
         return crate::native_act::serve_observation(self_ctx, master, rest);
     }

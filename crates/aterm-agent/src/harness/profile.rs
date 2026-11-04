@@ -946,6 +946,17 @@ pub const USAGE_SHOWN_S: i64 = 60 * 60;
 /// took its clock, or a fleet peer's clock a little ahead.
 pub(crate) const USAGE_SKEW_S: i64 = 60;
 
+/// The signed age of an observed quota reading on a known Unix clock. A reading
+/// may be at most 60 seconds ahead; older history has no age cutoff.
+/// Missing timestamps and arithmetic overflow provide no current evidence.
+#[must_use]
+pub fn usage_read_age(at: i64, now: i64) -> Option<i64> {
+    if at <= 0 || now <= 0 {
+        return None;
+    }
+    now.checked_sub(at).filter(|age| *age >= -USAGE_SKEW_S)
+}
+
 /// Facts for the requested on-screen account/subscription display.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct SubscriptionDisplay {
@@ -1000,9 +1011,8 @@ impl WeeklyFigure {
     /// for an older figure, one from further in the future, or one whose window has reset.
     #[must_use]
     pub fn words(&self, now: i64) -> Option<String> {
-        let age = now
-            .checked_sub(self.at)
-            .filter(|age| (-USAGE_SKEW_S..=USAGE_SHOWN_S).contains(age))?
+        let age = usage_read_age(self.at, now)
+            .filter(|age| *age <= USAGE_SHOWN_S)?
             .max(0);
         if self.resets_at <= now {
             return None;
@@ -1063,6 +1073,8 @@ pub enum WeeklyGap {
     /// The process carries the tap, and its last weekly figure is older than
     /// [`USAGE_SHOWN_S`]: no reply in the last hour.
     Stale,
+    /// An own-tap figure was read, but its observation time cannot be admitted.
+    ClockInvalid,
 }
 
 impl WeeklyGap {
@@ -1075,6 +1087,7 @@ impl WeeklyGap {
             Self::Untapped => "weekly \u{2013} \u{b7} until relaunch",
             Self::NoReply => "weekly \u{2013} \u{b7} no reply yet",
             Self::Stale => "weekly \u{2013} \u{b7} no reply 1h",
+            Self::ClockInvalid => "weekly \u{2013} \u{b7} time unconfirmed",
         }
     }
 
@@ -1089,6 +1102,7 @@ impl WeeklyGap {
             Self::Untapped => "weekly figure unknown until aterm next relaunches this Claude Code",
             Self::NoReply => "weekly figure unknown, no reply has brought it yet",
             Self::Stale => "weekly figure unknown, no reply in the last hour",
+            Self::ClockInvalid => "weekly figure unknown, its observation time is unconfirmed",
         }
     }
 }
@@ -1334,7 +1348,8 @@ pub fn muse_subscription_for(
         Some((figure, plan)) => (figure, plan),
         None => (None, None),
     };
-    let figure = WeeklyFigure::newer(figure, prev_figure).filter(|fig| fig.words(now).is_some());
+    let shown = |figure: Option<WeeklyFigure>| figure.filter(|figure| figure.words(now).is_some());
+    let figure = WeeklyFigure::newer(shown(figure), shown(prev_figure));
     let weekly = figure.and_then(|fig| fig.words(now)).or_else(|| {
         (same_email && prev.weekly_figure.is_none())
             .then(|| prev.weekly.clone())
@@ -2514,9 +2529,11 @@ fn agy_subscription_with_store_in_dir(
             let store_other = store_reading
                 .as_ref()
                 .and_then(|r| parse_agy_usage_json(r.doc.as_bytes(), !third_party, r.as_of));
-            let fallback = prev_figure
-                .or_else(|| cached.and_then(|(_, f)| f))
-                .or(store_fig);
+            let shown =
+                |figure: Option<WeeklyFigure>| figure.filter(|figure| figure.words(now).is_some());
+            let fallback = shown(prev_figure)
+                .or_else(|| shown(cached.and_then(|(_, f)| f)))
+                .or_else(|| shown(store_fig));
             if let Some(fig) = store_fig.filter(|f| f.current(now)) {
                 let mut guard = AGY_USAGE_CACHE
                     .lock()

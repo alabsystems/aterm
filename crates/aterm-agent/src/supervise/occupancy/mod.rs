@@ -231,6 +231,19 @@ pub mod fault {
         /// a minute ago as lost though `status` now reads input unread behind it: a restart in
         /// place hands that input to the shell.
         CustodyLostBehind,
+        /// [`Line::weighs`](crate::supervise::custody::Line::weighs), and so
+        /// [`Line::turned`](crate::supervise::custody::Line::turned), takes a read that cannot say
+        /// what the composer holds (a dialog over it) for one that shows none of the line: a turn
+        /// settles a line drawn under the dialog, and its Enter is no longer its writer's.
+        CustodyTurnUnreadable,
+        /// [`answer_goes`](crate::supervise::custody::answer_goes) lets a key that is no line's go
+        /// on a read that can say what the composer holds (no box over it): the key reaches the
+        /// composer the line held may still come to.
+        CustodyAnswersComposer,
+        /// [`answer_goes`](crate::supervise::custody::answer_goes) lets a box's key follow a line
+        /// no input read proved the worker read: the box can receive the queued line before its
+        /// answer.
+        CustodyAnswersWithoutRead,
     }
 
     thread_local! {
@@ -324,6 +337,9 @@ pub(crate) mod fault {
         CustodyHostUntold,
         CustodySettlesUnreadable,
         CustodyLostBehind,
+        CustodyTurnUnreadable,
+        CustodyAnswersComposer,
+        CustodyAnswersWithoutRead,
     }
 
     /// The shipped build: never armed.

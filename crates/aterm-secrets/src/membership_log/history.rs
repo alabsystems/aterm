@@ -4,7 +4,7 @@
 //! Fallible leases over one immutable, currently in-memory membership history.
 //! This boundary changes neither storage nor evaluation and claims no capacity improvement.
 
-use super::{Log, Record, RecordId};
+use super::{Body, EpochAudience, Log, Record, RecordId, epoch_commitment};
 use crate::commons::binding::Binding;
 use crate::{Error, Result, age::Identity};
 use aterm_digest::Sha256;
@@ -141,6 +141,38 @@ impl HistoryLease<'_> {
         self.view
             .log
             .unwrap_commons_epoch(epoch.record.id(), identity)
+    }
+
+    /// Whether `key` is the key of the counting Commons epoch `epoch` (it matches the
+    /// commitment its signed `Epoch` names) and `epoch` is `under` or in its causal past: what a
+    /// history handoff of a log-era Commons epoch carries, checked against the original record.
+    pub(crate) fn commons_epoch_key_under(
+        &self,
+        epoch: &RecordLease<'_>,
+        under: &RecordId,
+        key: &[u8; 32],
+    ) -> Result<bool> {
+        self.check_record(epoch)?;
+        let log = self.view.log;
+        let (Some(at), Some(top)) = (log.record_index(epoch.record.id()), log.record_index(under))
+        else {
+            return Ok(false);
+        };
+        let Body::Epoch {
+            audience: EpochAudience::Commons,
+            generation,
+            commitment,
+        } = epoch.record.body()
+        else {
+            return Ok(false);
+        };
+        let effective = log.effective();
+        Ok(effective.counts(at)
+            && (at == top || effective.before(at, top))
+            && aterm_digest::ct_eq(
+                &epoch_commitment(log.network(), &EpochAudience::Commons, *generation, key),
+                commitment,
+            ))
     }
 }
 

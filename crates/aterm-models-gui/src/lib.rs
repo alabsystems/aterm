@@ -17,6 +17,7 @@ mod models_foreground_handback;
 mod models_gui;
 mod models_lights;
 mod models_main_stall_refusal;
+mod models_menu_viewport;
 mod models_netprobe;
 mod models_output_retention;
 mod models_path_confine;
@@ -37,6 +38,7 @@ pub use models_foreground_handback::{
 pub use models_gui::*;
 pub use models_lights::*;
 pub use models_main_stall_refusal::main_thread_stall_refusal_model;
+pub use models_menu_viewport::menu_viewport_model;
 pub use models_netprobe::netprobe_shutdown_park_model;
 pub use models_output_retention::output_retention_model;
 pub use models_path_confine::path_confine_model;

@@ -156,7 +156,8 @@ impl Env {
     }
 }
 
-/// `std::process::Command`, whose child holds stdio and only explicitly named guards.
+/// A native command whose default child holds stdio and explicitly named guards. A converted
+/// [`super::TransparentCommand`] retains the caller's non-close-on-exec descriptors instead.
 pub struct Command {
     program: OsString,
     arg0: Option<OsString>,
@@ -168,6 +169,9 @@ pub struct Command {
     stderr: Option<Stdio>,
     #[cfg(unix)]
     guards: Vec<std::os::fd::OwnedFd>,
+    /// Pass-through commands retain the caller's non-close-on-exec table. Ordinary commands
+    /// still hand on only explicitly named guards.
+    inherit_all: bool,
     pgroup: Option<i32>,
     setsid: bool,
     /// The SPI that makes the child its own responsible process, when asked
@@ -188,6 +192,33 @@ enum Fallback {
 }
 
 impl Command {
+    fn with_dedicated_process_group<T>(&mut self, operation: impl FnOnce(&mut Self) -> T) -> T {
+        self.with_temporary_process_group(0, operation)
+    }
+
+    fn with_temporary_process_group<T>(
+        &mut self,
+        group: i32,
+        operation: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        struct Restore<'a> {
+            command: &'a mut Command,
+            pgroup: Option<i32>,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.command.pgroup = self.pgroup;
+            }
+        }
+
+        let configured = self.pgroup.replace(group);
+        let restore = Restore {
+            command: self,
+            pgroup: configured,
+        };
+        operation(&mut *restore.command)
+    }
+
     /// `program` with no arguments, this process's environment and working directory, and stdio inherited (`spawn`/`status`) or piped (`output`).
     #[must_use]
     pub fn new(program: impl AsRef<OsStr>) -> Self {
@@ -202,12 +233,19 @@ impl Command {
             stderr: None,
             #[cfg(unix)]
             guards: Vec::new(),
+            inherit_all: false,
             pgroup: None,
             setsid: false,
             disclaim: None,
             suspended: false,
             tether: false,
         }
+    }
+
+    pub(super) fn inheriting(program: impl AsRef<OsStr>) -> Self {
+        let mut command = Self::new(program);
+        command.inherit_all = true;
+        command
     }
 
     /// The child's `argv[0]`, in place of the program as it was named (which is still what is searched for and run) — `std::os::unix::process::CommandExt::arg0`'s.
@@ -415,6 +453,9 @@ impl Command {
     /// Consume one actual attempt and start a child in a new, self-led process group. Persist
     /// the attempt's key before calling; bind the returned actual child before acknowledging
     /// its work. An error is an opaque receipt for this attempt alone, not a reusable flag.
+    /// The dedicated group holds for this one spawn only: the command's configured process
+    /// group is restored when this call returns or unwinds, so a consumed attempt — spawned,
+    /// refused or failed alike — never reconfigures the command's later births.
     ///
     /// # Errors
     /// This attempt's process or scope changed, or the same controlled spawn errors as
@@ -423,8 +464,55 @@ impl Command {
         &mut self,
         attempt: super::BirthAttempt,
     ) -> Result<super::Spawned, super::SpawnFailure> {
-        self.process_group(0);
-        super::birth::observe_cohort(attempt, || self.spawn())
+        self.with_dedicated_process_group(|command| {
+            super::birth::observe_cohort(attempt, || command.spawn())
+        })
+    }
+
+    /// Start the child in a new, self-led process group for this one spawn only: the
+    /// command's configured process group is restored when this call returns or unwinds,
+    /// so a borrowed command's later births keep the group their caller configured.
+    /// Unlike [`Self::spawn_cohort`], no birth attempt is consumed and no receipt is
+    /// minted: this is for an owner that holds the child itself, not a durable launch.
+    /// # Errors
+    /// As [`Self::spawn`]'s.
+    pub fn spawn_in_dedicated_process_group(&mut self) -> io::Result<Child> {
+        self.with_dedicated_process_group(|command| command.spawn())
+    }
+
+    /// Start the child as a member of the existing process group `group` for this one
+    /// spawn only: the command's configured process group is restored when this call
+    /// returns or unwinds, so a borrowed command's later births keep the group their
+    /// caller configured. No birth attempt is consumed and no receipt is minted: the
+    /// result is an ordinary owned [`Child`], as [`Self::spawn`]'s. The integer is not
+    /// a capability: the caller owns keeping that group alive and proving it is the
+    /// group it meant, and the kernel still refuses a group the child may not join.
+    /// # Errors
+    /// `InvalidInput` before anything is dispatched when `group` is at most 1, when a
+    /// new session was asked for ([`Self::setsid`]), or when the child is tethered
+    /// ([`super::Tether`]): a session or a tethered birth would not land the target in
+    /// the group asked for, and neither setting is reset to make it fit. Otherwise as
+    /// [`Self::spawn`]'s, a kernel refusal to join the group included.
+    pub fn spawn_in_process_group(&mut self, group: i32) -> io::Result<Child> {
+        if group <= 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a process group to join is greater than 1",
+            ));
+        }
+        if self.setsid {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a child starting in a new session cannot join an existing process group",
+            ));
+        }
+        if self.tether {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a tethered child cannot join an existing process group",
+            ));
+        }
+        self.with_temporary_process_group(group, |command| command.spawn())
     }
 
     /// Run the child to its end with stdin `/dev/null` and stdout and stderr captured (unless set otherwise).
@@ -439,6 +527,142 @@ impl Command {
     /// As [`Self::spawn`]'s, and waiting.
     pub fn status(&mut self) -> io::Result<ExitStatus> {
         self.start(Fallback::Inherit, true)?.wait()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Command;
+    use std::cell::Cell;
+    use std::io;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    #[test]
+    fn a_temporary_process_group_is_restored_after_an_unwind() {
+        let mut command = Command::new("/bin/cat");
+        command.process_group(17);
+        let reached_injected_unwind = Cell::new(false);
+
+        let unwound = catch_unwind(AssertUnwindSafe(|| {
+            command.with_dedicated_process_group(|command| {
+                assert_eq!(command.pgroup, Some(0));
+                reached_injected_unwind.set(true);
+                panic!("injected spawn unwind");
+            });
+        }));
+
+        assert!(unwound.is_err());
+        assert!(reached_injected_unwind.get());
+        assert_eq!(command.pgroup, Some(17));
+    }
+
+    #[test]
+    fn a_dedicated_group_spawn_restores_the_configured_group() {
+        let mut configured = Command::new("/bin/sleep");
+        configured.arg("30").process_group(17);
+        let mut child = configured
+            .spawn_in_dedicated_process_group()
+            .expect("dedicated spawn");
+        child.kill().expect("kill");
+        child.wait().expect("wait");
+        assert_eq!(configured.pgroup, Some(17));
+
+        let mut plain = Command::new("/bin/sleep");
+        plain.arg("30");
+        let mut child = plain
+            .spawn_in_dedicated_process_group()
+            .expect("dedicated spawn");
+        child.kill().expect("kill");
+        child.wait().expect("wait");
+        assert_eq!(plain.pgroup, None);
+    }
+
+    #[test]
+    fn a_joined_group_is_restored_after_an_unwind() {
+        let mut command = Command::new("/bin/cat");
+        command.process_group(17);
+        let reached_injected_unwind = Cell::new(false);
+
+        let unwound = catch_unwind(AssertUnwindSafe(|| {
+            command.with_temporary_process_group(4242, |command| {
+                assert_eq!(command.pgroup, Some(4242));
+                reached_injected_unwind.set(true);
+                panic!("injected spawn unwind");
+            });
+        }));
+
+        assert!(unwound.is_err());
+        assert!(reached_injected_unwind.get());
+        assert_eq!(command.pgroup, Some(17));
+    }
+
+    #[test]
+    fn joining_a_group_restores_the_configured_group_on_success_and_error() {
+        let mut leader_command = Command::new("/bin/sleep");
+        leader_command.arg("30");
+        let mut leader = leader_command
+            .spawn_in_dedicated_process_group()
+            .expect("dedicated spawn");
+        let group = i32::try_from(leader.id()).expect("pid");
+
+        let mut configured = Command::new("/bin/sleep");
+        configured.arg("30").process_group(17);
+        let joined = configured.spawn_in_process_group(group);
+        let mut plain = Command::new("/bin/sleep");
+        plain.arg("30");
+        let missing = plain.spawn_in_process_group(i32::MAX);
+
+        let joined_ok = joined.is_ok();
+        if let Ok(mut joined) = joined {
+            joined.kill().expect("kill");
+            joined.wait().expect("wait");
+        }
+        let missing_ok = missing.is_ok();
+        if let Ok(mut missing) = missing {
+            missing.kill().expect("kill");
+            missing.wait().expect("wait");
+        }
+        leader.kill().expect("kill");
+        leader.wait().expect("wait");
+
+        assert!(joined_ok, "join the leader's group");
+        assert_eq!(configured.pgroup, Some(17));
+        assert!(!missing_ok, "a missing group is an error");
+        assert_eq!(plain.pgroup, None);
+    }
+
+    #[test]
+    fn joining_refuses_contradictory_policies_without_touching_the_command() {
+        for group in [1, 0, -1, i32::MIN] {
+            let mut command = Command::new("/bin/sleep");
+            command.arg("30").process_group(17);
+            let error = command
+                .spawn_in_process_group(group)
+                .expect_err("a group of at most 1");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+            assert_eq!(command.pgroup, Some(17));
+            assert!(!command.setsid);
+            assert!(!command.tether);
+        }
+
+        let mut session = Command::new("/bin/sleep");
+        session.arg("30").process_group(17).setsid(true);
+        let error = session
+            .spawn_in_process_group(4242)
+            .expect_err("a new session beside a join");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+        assert_eq!(session.pgroup, Some(17));
+        assert!(session.setsid, "the refusal does not reset the session");
+
+        let mut tethered = Command::new("/bin/sleep");
+        tethered.arg("30").process_group(17);
+        tethered.tether = true;
+        let error = tethered
+            .spawn_in_process_group(4242)
+            .expect_err("a tether beside a join");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+        assert_eq!(tethered.pgroup, Some(17));
+        assert!(tethered.tether, "the refusal does not reset the tether");
     }
 }
 
@@ -909,7 +1133,7 @@ impl Command {
                 setsid: self.setsid,
                 replace,
                 long_entry_ends: !self.env.saw_path(),
-                inherit_all: false,
+                inherit_all: self.inherit_all,
                 native_image: false,
                 disclaim: self.disclaim,
                 suspended: self.suspended,
@@ -1069,8 +1293,8 @@ impl Command {
         })
     }
 
-    /// The `std` command this one is: [`super::InheritNothing`]'s strip
-    /// first, then the empty mask and the session in one more hook.
+    /// The `std` command this one configures: its explicit descriptor policy first, then
+    /// the empty mask and session in one more hook.
     fn forked(&self) -> io::Result<super::StdCommand> {
         use super::InheritNothing as _;
         use std::os::unix::process::CommandExt as _;
@@ -1094,10 +1318,13 @@ impl Command {
         }
         #[expect(
             clippy::disallowed_types,
-            reason = "spawnfd's own Command, started through std's fork with the strip installed first"
+            reason = "spawnfd's own Command, with its explicit descriptor policy installed before the native process hook"
         )]
         let mut command = std::process::Command::new(&self.program);
-        command.inherit_nothing().args(&self.args);
+        if !self.inherit_all {
+            command.inherit_nothing();
+        }
+        command.args(&self.args);
         if let Some(arg0) = &self.arg0 {
             command.arg0(arg0);
         }

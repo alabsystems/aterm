@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::membership_log::store::framed::{FrameReadError, FrameReader};
-use crate::membership_log::{MAX_RECORDS, MAX_RECORDS_STREAM, Record, RecordId};
+use crate::membership_log::{MAX_HELD_RECORDS, MAX_RECORDS_STREAM, Record, RecordId};
 use std::io::{Cursor, Read, Write};
 
 pub(super) struct StagedRecords(Vec<Record>);
@@ -114,7 +114,7 @@ fn stage_with(
     let mut raw_count = 0;
     let mut started = false;
     let failure = loop {
-        if raw_count == MAX_RECORDS && reader.limit() > 0 {
+        if raw_count == MAX_HELD_RECORDS && reader.limit() > 0 {
             break Reply::text(400, "membership record stream exceeds record bound");
         }
         let frame = match frames.read(&mut reader) {

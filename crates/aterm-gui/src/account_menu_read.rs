@@ -335,10 +335,8 @@ impl App {
                     .as_mut()
                     .filter(|menu| menu.highlight.is_none())
             {
-                let shown = menu
-                    .rect
-                    .map_or(menu.rows.len(), |rect| rect.h.saturating_sub(2));
-                menu.highlight = crate::autopilot_menu::step(&menu.rows, None, true, shown);
+                menu.highlight = crate::autopilot_menu::step(&menu.rows, None, true);
+                menu.reveal_highlight();
                 self.request_menu_frame(wid);
             }
         } else {
@@ -654,11 +652,11 @@ mod tests {
                 rows: Ok((Vec::new(), true)),
             });
             let menu = app.autopilot_menu.as_mut().unwrap();
-            let first = crate::autopilot_menu::step(&menu.rows, None, true, menu.rows.len());
+            let first = crate::autopilot_menu::step(&menu.rows, None, true);
             assert!(first.is_some());
             assert_eq!(menu.highlight, keyboard.then_some(first).flatten());
             assert!(!app.account_menu_read.deferred_keyboard_selection);
-            let last = crate::autopilot_menu::step(&menu.rows, None, false, menu.rows.len());
+            let last = crate::autopilot_menu::step(&menu.rows, None, false);
             menu.highlight = last;
             let at = app
                 .account_menu_read

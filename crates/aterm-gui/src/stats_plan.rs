@@ -3788,9 +3788,10 @@ mod tests {
         })
     }
 
-    /// Every half-point width from 160 to 5120 pt on both faces, on every core. A width whose
-    /// plan the half point before it already planned is not headed again: the headers are
-    /// functions of the plan, and the plans read whole points ([`whole_width`]).
+    /// Every half-point width from 160 to 5120 pt on both faces, on every core: each whole width,
+    /// and the half point past it where it plans otherwise (the plans read whole points,
+    /// [`whole_width`]). A Folded plan that differs from the width before it only in `w` is not
+    /// headed again, since `header_folded` reads only the blocks and `ground_only`.
     #[test]
     fn key_is_placed() {
         let long = StateLabel {
@@ -3822,14 +3823,22 @@ mod tests {
         };
         let faces = [hn(), FaceMetrics::test_stack()];
         let widths: Vec<(usize, u32)> = (0..faces.len())
-            .flat_map(|face| (320..=10_240).map(move |px2| (face, px2)))
+            .flat_map(|face| (160..=5_120).map(move |w| (face, w)))
             .collect();
-        aterm_spec::check::each(&widths, |&(face, px2)| {
+        // `header_folded` reads only the blocks and `ground_only`: plans equal but for `w` head
+        // alike.
+        let sans_w = |p: FoldedPlan| FoldedPlan { w: 0.0, ..p };
+        aterm_spec::check::each(&widths, |&(face, w)| {
             let m = &faces[face];
-            let w = f64::from(px2) / 2.0;
-            let before = f64::from(px2 - 1) / 2.0;
-            let full = plan_full(w, m);
-            if !full.ground_only && (px2 == 320 || plan_full(before, m) != full) {
+            let w = f64::from(w);
+            // Each whole width, and the half point past it where that plans otherwise.
+            let (full, past) = (plan_full(w, m), plan_full(w + 0.5, m));
+            let fulls = if past == full {
+                vec![(full, w)]
+            } else {
+                vec![(full, w), (past, w + 0.5)]
+            };
+            for (full, w) in fulls.into_iter().filter(|(p, _)| !p.ground_only) {
                 check(
                     &header_full(&full, TEXT, None, m),
                     m,
@@ -3845,9 +3854,14 @@ mod tests {
                     &format!("Full W {w}, a state"),
                 );
             }
-            let folded = plan_folded(w, m);
-            if folded.ground_only || (px2 != 320 && plan_folded(before, m) == folded) {
-                return;
+            // A Folded plan equal but for `w` to the width before it was headed there.
+            let (folded, past) = (plan_folded(w, m), plan_folded(w + 0.5, m));
+            let mut folds = Vec::new();
+            if w == 160.0 || sans_w(plan_folded(w - 1.0, m)) != sans_w(folded) {
+                folds.push((folded, w));
+            }
+            if sans_w(past) != sans_w(folded) {
+                folds.push((past, w + 0.5));
             }
             let states: [[Option<StateLabel<'_>>; 2]; 5] = [
                 [None, None],
@@ -3856,10 +3870,12 @@ mod tests {
                 [Some(short), Some(long)],
                 [Some(long), Some(long)],
             ];
-            for pair in states {
-                let both = pair.iter().all(Option::is_some);
-                let head = header_folded(&folded, TEXT, pair, m);
-                check(&head, m, both, &format!("Folded W {w}"));
+            for (folded, w) in folds.into_iter().filter(|(p, _)| !p.ground_only) {
+                for pair in states {
+                    let both = pair.iter().all(Option::is_some);
+                    let head = header_folded(&folded, TEXT, pair, m);
+                    check(&head, m, both, &format!("Folded W {w}"));
+                }
             }
         });
     }

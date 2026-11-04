@@ -384,7 +384,7 @@ fn runs_split_at_reset_refill_epoch() {
         });
     }
     let rows = &fx.series["me"];
-    let cut = runs(rows, Window::Week);
+    let cut = runs(rows, Window::Week, NOW);
     let shape: Vec<(Began, Vec<u32>)> = cut
         .iter()
         .map(|run| (run.began, run.figs.iter().map(|f| f.pct_x10).collect()))
@@ -551,6 +551,265 @@ fn class_of(fx: &Fx, label: &str, w: Window) -> Fresh {
         .and_then(|r| r.window(w))
         .map(|w| w.fresh)
         .expect("the row")
+}
+
+#[test]
+fn quota_clock_admission_survives_the_codec_without_current_claims() {
+    for ahead in [60, 61, 120] {
+        let mut fx = Fx::new(&[("me", Class::Preferred)]);
+        fx.read("me", Some((380, NOW + H)), Some((580, THU9)), NOW + ahead);
+        fx.state = State::from_json(&fx.state.to_json(), NOW).unwrap();
+        let before = fx.state.clone();
+        assert_eq!(
+            fx.state.accounts["me"].windows[accounts::WEEK_LIMIT].at,
+            NOW + ahead
+        );
+        let out = fx.outlook();
+        let week = out.rows[0].window(Window::Week).unwrap();
+        assert_eq!(week.at, Some(NOW + ahead));
+        assert_eq!(week.reset, Some(THU9));
+        if ahead == 60 {
+            assert_eq!(week.fresh, Fresh::Now);
+            assert_eq!(week.used_x10, Some(580));
+        } else {
+            assert_eq!(week.fresh, Fresh::ClockInvalid);
+            assert_eq!(week.used_x10, None);
+            assert_eq!(week.projection, None);
+            assert_eq!(out.demand.week, Err(Refusal::Skew));
+            for supplied in [None, Some(580)] {
+                let glance = out.glance("me", supplied, true).unwrap();
+                assert!(glance.bar.is_none() && glance.reset.is_none() && glance.five.is_none());
+            }
+            for width in [44, 60] {
+                let cards = out.card_rows(Some("me"), width, None);
+                assert!(
+                    cards
+                        .iter()
+                        .any(|row| matches!(row, CardRow::Account { label, .. } if label == "me"))
+                );
+            }
+        }
+        assert_eq!(fx.state, before);
+    }
+    let invalid = Seen {
+        pct_x10: 500,
+        reset: NOW - 1,
+        at: NOW + 120,
+        source: Source {
+            kind: "tap",
+            here: true,
+        },
+    };
+    let five = win_of(Some(invalid), Fresh::ClockInvalid, 1, NOW, Window::Five);
+    assert_eq!(five.known, Known::Unknown);
+    assert_eq!(five.reset, None);
+    assert_eq!(five.acc, 0);
+}
+
+#[test]
+fn access_classes_cannot_admit_a_rejected_quota_clock() {
+    for not_enrolled in [false, true] {
+        let mut fx = Fx::new(&[("me", Class::Preferred)]);
+        fx.read("me", Some((380, NOW - 1)), Some((580, THU9)), NOW + 120);
+        if not_enrolled {
+            fx.roster.rows[0].dir = Some("/logins/me".into());
+            fx.enrolled.clear();
+        } else {
+            accounts::note_auth(&mut fx.state, "me", accounts::Auth::SignedOut, NOW);
+        }
+        let out = fx.outlook();
+        let row = &out.rows[0];
+        let week = row.window(Window::Week).unwrap();
+        assert_eq!(
+            week.fresh,
+            if not_enrolled {
+                Fresh::NotEnrolled
+            } else {
+                Fresh::SignedOut
+            }
+        );
+        assert_eq!((week.at, week.reset), (Some(NOW + 120), Some(THU9)));
+        assert_eq!(week.used_x10, None);
+        assert!(out.reset_words(week).is_empty());
+        for supplied in [None, Some(580)] {
+            let glance = out.glance("me", supplied, false).unwrap();
+            assert!(glance.bar.is_none() && glance.reset.is_none() && glance.five.is_none());
+            assert!(glance.title.is_none() && glance.spoken.is_none());
+        }
+        let five = row.window(Window::Five).unwrap();
+        let mut without_source = five.clone();
+        without_source.at = None;
+        without_source.reset = None;
+        assert_eq!(
+            out.window_line(row, five),
+            out.window_line(row, &without_source)
+        );
+    }
+}
+
+#[test]
+fn quota_source_fallback_obeys_clock_and_refill_before_newest() {
+    for post_epoch in [false, true] {
+        let mut fx = Fx::new(&[("me", Class::Preferred)]);
+        let at = if post_epoch {
+            NOW - 5 * MIN
+        } else {
+            NOW - 20 * MIN
+        };
+        fx.read("me", None, Some((950, THU9)), NOW + 120);
+        let acct = fx.state.accounts.get_mut("me").unwrap();
+        acct.windows.get_mut(accounts::WEEK_LIMIT).unwrap().epoch_at = Some(NOW - 10 * MIN);
+        acct.sample = Some(accounts::Sample {
+            week_pct: Some(38),
+            week_reset: Some(THU9),
+            week_read_at: Some(at),
+            at: NOW + 120,
+            ..accounts::Sample::default()
+        });
+        let out = fx.outlook();
+        let week = out.rows[0].window(Window::Week).unwrap();
+        assert_eq!(week.used_x10, post_epoch.then_some(380));
+        assert_eq!(
+            week.fresh,
+            if post_epoch {
+                Fresh::Now
+            } else {
+                Fresh::ClockInvalid
+            }
+        );
+        let clone = quota_replay_state(&fx.state, NOW);
+        assert_eq!(
+            clone.accounts["me"].sample.as_ref().unwrap().week_pct,
+            post_epoch.then_some(38)
+        );
+        assert_eq!(
+            fx.state.accounts["me"]
+                .sample
+                .as_ref()
+                .unwrap()
+                .week_read_at,
+            Some(at)
+        );
+    }
+    let mut fx = Fx::new(&[("me", Class::Preferred)]);
+    fx.read("me", None, Some((385, THU9)), NOW - 20 * MIN);
+    fx.state.accounts.get_mut("me").unwrap().sample = Some(accounts::Sample {
+        week_pct: Some(95),
+        week_reset: Some(THU9),
+        week_read_at: Some(NOW + 120),
+        at: NOW,
+        ..accounts::Sample::default()
+    });
+    let out = fx.outlook();
+    let week = out.rows[0].window(Window::Week).unwrap();
+    assert_eq!(
+        (week.fresh, week.at, week.used_x10),
+        (Fresh::AsOf, Some(NOW - 20 * MIN), Some(385))
+    );
+    assert_eq!(
+        outlook(&Inputs {
+            now: 0,
+            ..fx.inputs()
+        })
+        .rows[0]
+            .window(Window::Week)
+            .unwrap()
+            .fresh,
+        Fresh::ClockInvalid
+    );
+}
+
+#[test]
+fn a_clock_invalid_alternate_is_an_unknown_lean_not_measured_capacity() {
+    let mut passes = Vec::new();
+    for used in [0, 950] {
+        let mut fx = scenario_b();
+        fx.state.accounts.remove("alt1");
+        fx.series.remove("alt1");
+        fx.read(
+            "alt1",
+            Some((used, NOW + H)),
+            Some((used, FRI14)),
+            NOW + 120,
+        );
+        let before = fx.state.clone();
+        let out = fx.outlook();
+        let alt = out.rows.iter().find(|row| row.label == "alt1").unwrap();
+        assert_eq!(alt.window(Window::Week).unwrap().fresh, Fresh::ClockInvalid);
+        assert!(
+            alt.windows
+                .iter()
+                .all(|window| window.used_x10.is_none() && window.projection.is_none())
+        );
+        let pass = out.week.as_ref().expect("valid carrier pace");
+        assert_eq!(
+            pass.lean.as_ref().map(|lean| lean.why),
+            Some(Fresh::ClockInvalid)
+        );
+        passes.push(pass.clone());
+        assert_eq!(fx.state, before);
+    }
+    assert_eq!(
+        passes[0], passes[1],
+        "rejected numeric values cannot change the replay"
+    );
+}
+
+#[test]
+fn replay_clock_sanitation_preserves_walls_access_and_refill_cuts() {
+    let mut fx = Fx::new(&[("me", Class::Preferred)]);
+    fx.read("me", Some((380, NOW + H)), Some((580, THU9)), NOW + 120);
+    accounts::note_wall(
+        &mut fx.state,
+        "me",
+        accounts::WEEK_LIMIT,
+        Some(THU9),
+        NOW,
+        NOW,
+    );
+    accounts::note_auth(&mut fx.state, "me", accounts::Auth::Ok, NOW);
+    fx.state.pinned = true;
+    fx.session("s-me", "me", NOW);
+    fx.state
+        .accounts
+        .get_mut("me")
+        .unwrap()
+        .windows
+        .get_mut(accounts::WEEK_LIMIT)
+        .unwrap()
+        .epoch_at = Some(NOW + 121);
+    let before = fx.state.clone();
+    let clone = quota_replay_state(&fx.state, NOW);
+    assert_eq!(clone.active, before.active);
+    assert_eq!(clone.pinned, before.pinned);
+    assert_eq!(clone.proven, before.proven);
+    assert_eq!(clone.sessions, before.sessions);
+    assert_eq!(clone.claimed_at, before.claimed_at);
+    assert_eq!(clone.accounts["me"].walls, before.accounts["me"].walls);
+    assert_eq!(clone.accounts["me"].auth, accounts::Auth::Ok);
+    assert_eq!(clone.accounts["me"].auth_at, before.accounts["me"].auth_at);
+    assert_eq!(
+        clone.accounts["me"].windows[accounts::WEEK_LIMIT],
+        before.accounts["me"].windows[accounts::WEEK_LIMIT]
+    );
+    let out = fx.outlook();
+    assert_eq!(
+        out.rows[0].window(Window::Week).unwrap().fresh,
+        Fresh::Walled
+    );
+    let glance = out.glance("me", None, true).unwrap();
+    assert!(glance.bar.is_some());
+    assert_eq!(glance, out.glance("me", Some(0), true).unwrap());
+    assert_eq!(fx.state, before);
+}
+
+#[test]
+fn a_future_series_point_cannot_invent_past_demand() {
+    let mut fx = Fx::new(&[("me", Class::Preferred)]);
+    fx.fig("me", NOW - 2 * D, None, Some((100, THU9)));
+    let before = rise_of(&fx, Window::Week, D);
+    fx.fig("me", NOW + 120, None, Some((95, THU9)));
+    assert_eq!(rise_of(&fx, Window::Week, D), before);
 }
 
 /// T7: EACH CLASS OF §6 FROM A FIXTURE, AND ONE BIT MOVES IT. A reset that passed unread is
@@ -1525,9 +1784,7 @@ fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 /// the bound the pass runs on to its horizon. The wait is a one-minute hang detector.
 #[test]
 fn replay_is_bounded() {
-    let names: Vec<String> = (0..accounts::MAX_ACCOUNTS)
-        .map(|i| format!("a{i:02}"))
-        .collect();
+    let names: Vec<String> = (0..32).map(|i| format!("a{i:02}")).collect();
     let rows: Vec<(&str, Class)> = names
         .iter()
         .map(|n| (n.as_str(), Class::Preferred))

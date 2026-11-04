@@ -5424,7 +5424,7 @@ impl<'a, C: Ctl> Session<'a, C> {
                 self.carry_point(old, turn.screen.seq);
             }
             if review.unattended() {
-                self.custody_look(&turn, review);
+                self.custody_look(&turn, review)?;
             }
             if review.unattended()
                 && (self.left_line_look(&turn, opts, allow, review)?
@@ -5695,6 +5695,13 @@ impl<'a, C: Ctl> Session<'a, C> {
             && self.claim.watching_behind().is_none()
             && withheld.is_none()
         {
+            // A line the loop gave up on undrawn, held in custody, holds the 0 as it holds the
+            // other writers that ask it (ATERM-KI-1101-3): queued behind a line the worker has yet
+            // to read, or read as a line it read draws, the 0 may land in the composer beside it.
+            // The card is looked at again once the line settles.
+            if self.custody.is_some() {
+                return Ok(false);
+            }
             // Claude Code drops a digit sent within the first 600 ms of the card
             // ([`SURVEY_SETTLE`]): wait out what is left of it, on the screen's next
             // move, and look again from a fresh read.

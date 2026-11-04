@@ -1457,6 +1457,41 @@ impl Claim {
         Ok(attempt)
     }
 
+    /// Durably arm and bind one actual native child before acknowledging its launch.
+    /// The command starts a dedicated group; this is not containment of descendants that
+    /// deliberately escape that group. It does not transition the account's ledger.
+    ///
+    /// # Errors
+    /// ARM or controlled spawn refuses, or durable BIND fails. A failed BIND returns the
+    /// actual owned child in the error; a genuine no-child failure returns its cancellation
+    /// receipt. The controller must recover those outcomes without inferring release from
+    /// an error, a closed descriptor or the leader's exit.
+    #[cfg(unix)]
+    pub fn launch_cohort(
+        &mut self,
+        command: &mut aterm_uds::spawnfd::Command,
+    ) -> Result<crate::cohort::launch::CohortChild, crate::cohort::launch::LaunchError> {
+        crate::cohort::launch::launch(self, command)
+    }
+
+    /// Launch another owned child into this claim's already bound group. The original
+    /// leader must still be live and owned here; a saved group number supplies no authority.
+    /// Members share the full existing reservation, which remains charged until group drain.
+    /// The returned child can run concurrently with the leader and other members.
+    ///
+    /// # Errors
+    /// The claim's durable custody or original birth is stale, unknown or mismatched, the
+    /// leader has ended or changed group, or native spawn refuses. Session-creating and
+    /// tethered commands cannot join this group. No failure cancels or releases its claim.
+    #[cfg(unix)]
+    pub fn launch_cohort_member(
+        &self,
+        leader: &mut crate::cohort::launch::CohortChild,
+        command: &mut aterm_uds::spawnfd::Command,
+    ) -> io::Result<aterm_uds::spawnfd::Child> {
+        crate::cohort::launch::launch_member(self, leader, command)
+    }
+
     /// Bind the actual controlled child to its exact durable ARM before acknowledging work.
     /// Guard closure and holder death subsequently leave the entire reservation in the ledger.
     ///

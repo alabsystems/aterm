@@ -125,9 +125,13 @@ impl Pool {
         let directory =
             open_at(&capacity_handle, DIRECTORY_NAME, libc::O_RDONLY | libc::O_DIRECTORY, false)?;
         check_private(&directory, true)?;
-        let initialization = open_at(&directory, "init.lock", libc::O_RDWR, true)?;
+        // Typed, so a reader of the lock sites (aterm's lock-order census) can see this is an OS
+        // advisory lock rather than an in-process mutex; nothing fallible runs between taking the
+        // lock and the guard that lets it go.
+        let initialization: std::fs::File = open_at(&directory, "init.lock", libc::O_RDWR, true)?;
         check_private(&initialization, false)?;
         initialization.lock()?;
+        let initialization = Probe(initialization);
         let mut config = match open_at(&directory, "pool", libc::O_RDONLY, false) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 let mut identities = Vec::with_capacity(slots.get() as usize);
@@ -147,8 +151,6 @@ impl Pool {
             return Err(invalid("CPU pool capacity differs"));
         }
         let config_identity = Identity::of(&config)?;
-        // Final close, rather than explicit unlock, preserves all duplicated
-        // descriptor lifetimes throughout this protocol.
         drop(initialization);
         let pool = Self::from_parts(directory, path, config_identity, identities)?;
         pool.validate_path()?;
@@ -253,12 +255,12 @@ impl Pool {
         self.validate_path()?;
         let mut states = Vec::with_capacity(self.0.slots.get() as usize);
         for slot in 0..self.0.slots.get() {
-            let mut file = self.open_slot(slot, false)?;
-            states.push(match file.try_lock_shared() {
+            let mut probe = Probe(self.open_slot(slot, false)?);
+            states.push(match probe.0.try_lock_shared() {
                 Ok(()) => SlotState::Available { slot },
                 Err(std::fs::TryLockError::WouldBlock) => SlotState::Held {
                     slot,
-                    reported_owner: bounded_text(&mut file)
+                    reported_owner: bounded_text(&mut probe.0)
                         .ok()
                         .and_then(|text| Record::parse(&text).ok())
                         .filter(|record| record.slot == slot)
@@ -301,6 +303,20 @@ impl Pool {
             return Err(invalid("CPU slot file identity changed"));
         }
         Ok(file)
+    }
+}
+
+/// A lock taken only to order initialization or to observe the pool: the initializer's, an
+/// observer's, a snapshot's. Unlike a lease, no child inherits one on purpose, so it lets go
+/// explicitly at drop. A host that forks to spawn (a `pre_exec` hook does) copies every
+/// descriptor into the child until its exec, and a lock released only by its final close stays
+/// held that long: readers saw a pending initialization, and claimants a busy slot.
+struct Probe(File);
+
+impl Drop for Probe {
+    fn drop(&mut self) {
+        // A failed unlock leaves the release to the final close.
+        let _ = self.0.unlock();
     }
 }
 
@@ -383,14 +399,14 @@ fn open_parent(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-fn observe_initialization(directory: &File) -> io::Result<File> {
-    let file = open_at(directory, "init.lock", libc::O_RDONLY, false)?;
-    check_private(&file, false)?;
-    file.try_lock_shared().map_err(|error| match error {
+fn observe_initialization(directory: &File) -> io::Result<Probe> {
+    let probe = Probe(open_at(directory, "init.lock", libc::O_RDONLY, false)?);
+    check_private(&probe.0, false)?;
+    probe.0.try_lock_shared().map_err(|error| match error {
         std::fs::TryLockError::WouldBlock => io::Error::from(io::ErrorKind::WouldBlock),
         std::fs::TryLockError::Error(error) => error,
     })?;
-    Ok(file)
+    Ok(probe)
 }
 
 fn publish_config(directory: &File, text: &str) -> io::Result<()> {

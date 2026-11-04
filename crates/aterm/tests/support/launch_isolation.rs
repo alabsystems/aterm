@@ -86,7 +86,9 @@ pub struct Lifeline {
 #[cfg(unix)]
 #[allow(dead_code)]
 pub fn lifeline(cmd: &mut Command, root: &Path) -> Lifeline {
-    let lease = aterm_spec::subprocess_lane::acquire();
+    let lease = aterm_spec::subprocess_lane::acquire().unwrap_or_else(|e| {
+        aterm_spec::host::could_not_run(format!("subprocess admission refused ({e})"))
+    });
     let inner = aterm_uds::lifeline::Lifeline::arm(cmd, root)
         .unwrap_or_else(|e| panic!("arm the instance's lifeline in {}: {e}", root.display()));
     Lifeline {

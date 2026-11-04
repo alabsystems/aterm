@@ -125,7 +125,7 @@ fn the_newest_login_failure_remains_visible_in_a_short_account_menu() {
         let menu = rows(Fact::Account, &facts);
         let rect = crate::autopilot_menu::place(&menu, (12, 0), (0..14, 0..cols), (cols, 14), 0)
             .expect("short account menu");
-        let text = crate::autopilot_menu::paint(rect, &menu, None, theme)
+        let text = crate::autopilot_menu::paint(rect, &menu, Default::default(), None, theme)
             .into_iter()
             .map(|line| {
                 line.iter()
@@ -184,7 +184,7 @@ fn menu_facts(off: FactMask, side: bool) -> FactMenuFacts {
         accounts: Vec::new(),
         accounts_refused: None,
         accounts_loading: false,
-        auto_rotate: true,
+        pool_unpinned: true,
         off,
         cwd: side.then(|| PathBuf::from("/Users//someone/aterm")),
         repo_root: side.then(|| PathBuf::from("/Users//someone")),
@@ -200,7 +200,7 @@ fn menu_facts(off: FactMask, side: bool) -> FactMenuFacts {
 }
 
 #[test]
-fn account_recovery_notes_follow_the_observation_not_the_policy_switch() {
+fn account_recovery_notes_are_independent_of_pool_pin() {
     use aterm_agent::harness::account_progress::{AccountProgress, ProgressPhase};
     let mut progress = AccountProgress::unknown(100);
     progress.phase = ProgressPhase::Waiting;
@@ -208,7 +208,7 @@ fn account_recovery_notes_follow_the_observation_not_the_policy_switch() {
     progress.next_at = Some(160);
     let mut facts = menu_facts(FactMask::default(), false);
     facts.account_progress = Some(progress.clone());
-    facts.auto_rotate = true;
+    facts.pool_unpinned = true;
     let before = rows(Fact::Account, &facts);
     assert!(
         before
@@ -222,7 +222,7 @@ fn account_recovery_notes_follow_the_observation_not_the_policy_switch() {
             ..
         }
     )));
-    facts.auto_rotate = false;
+    facts.pool_unpinned = false;
     let after = rows(Fact::Account, &facts);
     let notes = |rows: &[MenuRow]| {
         rows.iter()
@@ -626,7 +626,7 @@ fn busy_columns_take_the_shaded_ground() {
     let mut card = vec![MenuRow::Header("Traffic \u{b7} tab 1".into())];
     card.extend(traffic_rows(&traffic(), T0 + 240, Some(0), 30));
     let rect = place(&card, (20, 0), (0..20, 0..80), (80, 21), 0).expect("a card");
-    let painted = paint(rect, &card, None, theme);
+    let painted = paint(rect, &card, Default::default(), None, theme);
     let row = &painted[3];
     let text = row.iter().map(|cell| cell.ch).collect::<String>();
     let lead = text
@@ -664,6 +664,7 @@ fn the_account_menu_says_why_the_week_is_missing() {
         WeeklyGap::Unrestarted,
         WeeklyGap::NoReply,
         WeeklyGap::Stale,
+        WeeklyGap::ClockInvalid,
     ] {
         let facts = FactMenuFacts {
             title: "Accounts \u{b7} tab 1".into(),
@@ -769,6 +770,15 @@ fn the_account_menu_takes_the_footers_week_or_its_reason() {
         (None, None, None),
         "its week reset since the footer's read: no row figure and no meter of the expired week"
     );
+    let future = SubscriptionDisplay {
+        weekly_figure: Some(WeeklyFigure {
+            at: NOW + 61,
+            ..aged.weekly_figure.unwrap()
+        }),
+        ..aged.clone()
+    };
+    assert_eq!(weekly_facts(&future, false, NOW), (None, None, None));
+    assert_eq!(weekly_facts(&future, true, NOW).0, left(0, ""));
     assert_eq!(
         weekly_facts(&aged, true, NOW + 86_400).0,
         left(0, ""),
@@ -824,6 +834,8 @@ fn an_account_rows_store_figure_carries_its_age() {
             },
         );
         state.accounts.insert("main".into(), acct);
+        let state = accounts::State::from_json(&state.to_json(), NOW).unwrap();
+        assert_eq!(state.accounts["main"].windows["seven_day"].at, at);
         let (rows, _) = account_menu_rows_from(
             &roster,
             &state,
@@ -838,6 +850,40 @@ fn an_account_rows_store_figure_carries_its_age() {
     };
     let label = |at: i64| label_with(at, None);
     assert_eq!(label(NOW - 60), "main \u{b7} preferred \u{b7} 61% left");
+    assert_eq!(label(NOW + 60), label(NOW - 60));
+    let mut observed = accounts::State::default();
+    accounts::note_auth(&mut observed, "main", accounts::Auth::Ok, NOW);
+    let unknown = account_menu_rows_from(
+        &roster,
+        &observed,
+        &enrolled,
+        true,
+        None,
+        None,
+        SessionWeek::default(),
+        NOW,
+    )
+    .0[0]
+        .label
+        .clone();
+    assert_eq!(label(NOW + 61), unknown);
+    assert_eq!(label(NOW + 120), unknown);
+    assert_eq!(label(0), unknown);
+    let sampled = |read_at| accounts::Sample {
+        week_pct: Some(39),
+        week_reset: Some(NOW + 86_400),
+        week_read_at: Some(read_at),
+        at: NOW + 120,
+        ..accounts::Sample::default()
+    };
+    assert_eq!(
+        label_with(NOW + 120, Some(sampled(NOW - 20 * 60))),
+        label(NOW - 20 * 60)
+    );
+    assert_eq!(
+        label_with(NOW - 20 * 60, Some(sampled(NOW + 120))),
+        label(NOW - 20 * 60)
+    );
     assert_eq!(
         label(NOW - 20 * 60),
         "main \u{b7} preferred \u{b7} 61% left \u{b7} 20m ago"
@@ -1068,6 +1114,101 @@ fn an_account_rows_store_figure_carries_its_age() {
     );
 }
 
+#[test]
+fn quota_rows_keep_only_time_admitted_post_refill_fallbacks() {
+    use aterm_agent::harness::{accounts, profile::WeeklyFigure};
+    const NOW: i64 = 1_790_000_000;
+    let roster = accounts::Roster {
+        rows: vec![accounts::Row {
+            label: "main".into(),
+            ..Default::default()
+        }],
+    };
+    let enrolled = std::collections::BTreeSet::from(["main".to_owned()]);
+    let row = |state: &accounts::State, session, now| {
+        account_menu_rows_from(
+            &roster,
+            state,
+            &enrolled,
+            true,
+            Some("main"),
+            None,
+            session,
+            now,
+        )
+        .0
+        .remove(0)
+    };
+    let mut observed = accounts::State::default();
+    accounts::note_auth(&mut observed, "main", accounts::Auth::Ok, NOW);
+    let empty = row(&observed, SessionWeek::default(), NOW);
+    for (sample_after, own_after) in [(false, false), (true, false), (false, true), (true, true)] {
+        let mut state = accounts::State::default();
+        let account = state.accounts.entry("main".into()).or_default();
+        account.windows.insert(
+            accounts::WEEK_LIMIT.into(),
+            accounts::WindowFig {
+                pct_x10: 950,
+                reset: NOW + 86400,
+                at: NOW + 120,
+                by: "peer".into(),
+                source: accounts::SOURCE_TAP.into(),
+                epoch_at: Some(NOW - 600),
+            },
+        );
+        account.sample = Some(accounts::Sample {
+            week_pct: Some(38),
+            week_reset: Some(NOW + 86400),
+            at: NOW + 120,
+            week_read_at: Some(if sample_after { NOW - 300 } else { NOW - 1200 }),
+            ..Default::default()
+        });
+        let state = accounts::State::from_json(&state.to_json(), NOW).unwrap();
+        let before = state.clone();
+        let figure = WeeklyFigure {
+            used_x10: 800,
+            resets_at: NOW + 86400,
+            at: if own_after { NOW - 240 } else { NOW - 1200 },
+        };
+        let session = SessionWeek {
+            label: Some("main".into()),
+            figure: Some(figure),
+            left: Some((20, String::new())),
+        };
+        let got = row(&state, session.clone(), NOW);
+        if own_after {
+            let mut control = state.clone();
+            control.accounts.clear();
+            assert_eq!(got, row(&control, session, NOW));
+        } else if sample_after {
+            assert_eq!(got, row(&state, SessionWeek::default(), NOW));
+            assert_ne!(got.label, empty.label);
+        } else {
+            assert_eq!(got.label, empty.label);
+        }
+        assert_eq!(row(&state, SessionWeek::default(), 0).label, empty.label);
+        assert_eq!(state, before);
+    }
+    let mut state = accounts::State::default();
+    state.accounts.entry("main".into()).or_default().warned_week = Some(accounts::WindowSaid {
+        pct: Some(95),
+        reset: Some(NOW + 86400),
+        at: NOW + 120,
+    });
+    assert_eq!(row(&state, SessionWeek::default(), NOW).label, empty.label);
+    accounts::note_wall(
+        &mut state,
+        "main",
+        accounts::WEEK_LIMIT,
+        Some(NOW + 3600),
+        NOW,
+        NOW,
+    );
+    let walled = row(&state, SessionWeek::default(), NOW);
+    state.accounts.get_mut("main").unwrap().warned_week = None;
+    assert_eq!(row(&state, SessionWeek::default(), NOW), walled);
+}
+
 /// THE SESSION'S WEEK REACHES THE ROW ITS LOGIN IS JUDGED TO (`SubscriptionDisplay::label`),
 /// on a one-row roster too, where the footer names no account; never one whose email
 /// contradicts the session's profile, nor the store's active fallback.
@@ -1198,7 +1339,7 @@ fn account_menu_shows_weekly_meter_and_rotation_accounts() {
                 enabled: true,
             },
         ],
-        auto_rotate: true,
+        pool_unpinned: true,
         ..menu_facts(FactMask::default(), true)
     };
     let menu = rows(Fact::Account, &facts);
@@ -1369,7 +1510,7 @@ fn account_menu_rows_from_distinguishes_auto_login_and_disabled_rows() {
     let _ = accounts::note_auth(&mut state, "m15-5", accounts::Auth::SignedOut, NOW);
     let _ = accounts::note_auth(&mut state, "m15-6", accounts::Auth::SignedOut, NOW);
 
-    let (menu_rows, auto_rotate) = account_menu_rows_from(
+    let (menu_rows, pool_unpinned) = account_menu_rows_from(
         &roster,
         &state,
         &enrolled,
@@ -1383,7 +1524,7 @@ fn account_menu_rows_from_distinguishes_auto_login_and_disabled_rows() {
         },
         NOW,
     );
-    assert!(auto_rotate);
+    assert!(pool_unpinned);
     assert_eq!(
         menu_rows
             .iter()
@@ -1597,14 +1738,21 @@ fn a_kimi_sessions_account_menu_reads_its_own_pool() {
             accounts_refused: Some(why),
             ..menu_facts(FactMask::default(), true)
         };
-        let menu = shown(&rows(Fact::Account, &refused));
+        let menu_rows = rows(Fact::Account, &refused);
+        let menu = shown(&menu_rows);
         assert!(
             menu.iter()
                 .any(|row| row.contains("Account state unavailable:")),
             "{menu:?}"
         );
         assert!(
-            !menu.iter().any(|row| row.contains("automatic selection")),
+            !menu_rows.iter().any(|row| matches!(
+                row,
+                MenuRow::Item {
+                    act: MenuAct::Fact(Fact::Account, FactAct::AutoRotate),
+                    ..
+                }
+            )),
             "{menu:?}"
         );
         assert!(
@@ -1619,7 +1767,8 @@ fn a_kimi_sessions_account_menu_reads_its_own_pool() {
         cli: Some(Cli::Kimi),
         ..menu_facts(FactMask::default(), true)
     };
-    let menu = shown(&rows(Fact::Account, &empty));
+    let menu_rows = rows(Fact::Account, &empty);
+    let menu = shown(&menu_rows);
     assert!(
         menu.contains(&"note No Kimi Code CLI rotation accounts listed".to_string()),
         "{menu:?}"
@@ -1629,9 +1778,14 @@ fn a_kimi_sessions_account_menu_reads_its_own_pool() {
         "{menu:?}"
     );
     assert!(
-        !menu
-            .iter()
-            .any(|row| row.contains("aterm init") || row.contains("automatic selection")),
+        !menu.iter().any(|row| row.contains("aterm init"))
+            && !menu_rows.iter().any(|row| matches!(
+                row,
+                MenuRow::Item {
+                    act: MenuAct::Fact(Fact::Account, FactAct::AutoRotate),
+                    ..
+                }
+            )),
         "{menu:?}"
     );
     let claude_empty = "note No rotation accounts configured \u{2014} run aterm init".to_string();

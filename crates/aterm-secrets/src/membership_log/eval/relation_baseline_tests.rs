@@ -4,7 +4,7 @@
 use super::*;
 use crate::age::Identity;
 use crate::commons::binding::Request;
-use crate::membership_log::{Draft, Entrant, Inserted, Log, MAX_RECORDS};
+use crate::membership_log::{Draft, Entrant, Inserted, Log, MAX_WEIGHED_RECORDS};
 
 struct Sample {
     records: usize,
@@ -44,10 +44,8 @@ impl std::fmt::Debug for Sample {
 }
 
 fn sample(log: &Log) -> Sample {
-    let records: Vec<_> = log.records().cloned().collect();
-    let ancestry = Ancestry::new(&records);
-    let session = ancestry.session();
-    let graph = Graph::new(&records, &session);
+    let records = &log.order;
+    let graph = Graph::new(log.history());
     let candidates = graph.candidates();
     let (accepted, apart, relations) = graph.weigh_all(
         &candidates,
@@ -107,7 +105,7 @@ fn founder(tag: u8) -> (MemberId, Entrant) {
 #[test]
 fn signed_candidate_groups_reach_the_record_bound() {
     const K: usize = 2_047;
-    assert_eq!(K, (MAX_RECORDS - 1) / 2);
+    assert_eq!(K, (MAX_WEIGHED_RECORDS - 1) / 2);
     let (a, entry_a) = founder(1);
     let (b, entry_b) = founder(2);
     let (c, entry_c) = founder(3);

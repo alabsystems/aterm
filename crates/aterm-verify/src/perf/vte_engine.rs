@@ -46,8 +46,8 @@ use super::arena::{Halt, Scratch, arena_dir, pins};
 use super::floors::{FloorLane, judge_keyed, measure_cycle_example_with, number};
 
 /// The grid the payloads are captured at and replayed into: the `vte` lane's default.
-const ROWS: u16 = 40;
-const COLS: u16 = 120;
+pub(super) const ROWS: u16 = 40;
+pub(super) const COLS: u16 = 120;
 
 /// The terminal type aterm gives its shells (aterm-pty), which the scripts' `tput` reads.
 const TERM: &str = "xterm-256color";
@@ -103,13 +103,24 @@ pub(crate) const LANE: FloorLane = FloorLane {
 
 /// The lane: capture, measure, judge (or record).
 pub(crate) fn run(record: bool) -> LaneRun {
-    match measure() {
-        Ok(json) => match unjudgeable(&json) {
+    judge(&LANE, measure(), record)
+}
+
+/// Judge (or record) a lane this harness measured, from its report: its performance-core
+/// cycles, or nothing where it counted none ([`unjudgeable`]). The `vte-marks` lane is judged
+/// here too.
+pub(super) fn judge(
+    lane: &FloorLane,
+    measured: Result<aterm_json::Value, Halt>,
+    record: bool,
+) -> LaneRun {
+    match measured {
+        Ok(json) => match unjudgeable(lane, &json) {
             Some(why) => {
-                eprintln!("  vte-engine: NOT JUDGED — {why}");
+                eprintln!("  {}: NOT JUDGED — {why}", lane.cli);
                 LaneRun::not_judged(why)
             }
-            None => judge_keyed(&LANE, &json, record),
+            None => judge_keyed(lane, &json, record),
         },
         Err(Halt::Skip { why, fix }) => LaneRun::skip(why, fix),
         Err(Halt::Timing(why)) => {
@@ -119,10 +130,10 @@ pub(crate) fn run(record: bool) -> LaneRun {
     }
 }
 
-/// Why the harness's report holds no figure to judge, if it does not: a kernel that counts no
-/// cycles per core type, or a scenario with no sample counted on performance cores (its line in
-/// the harness's report says why).
-fn unjudgeable(json: &aterm_json::Value) -> Option<String> {
+/// Why the harness's report holds no figure to judge for `lane`, if it does not: a kernel that
+/// counts no cycles per core type, or a scenario with no sample counted on performance cores
+/// (its line in the harness's report says why).
+fn unjudgeable(lane: &FloorLane, json: &aterm_json::Value) -> Option<String> {
     if json.get("counters").and_then(aterm_json::Value::as_bool) != Some(true) {
         return Some(
             "this kernel counts no cycles per core type, so only its ms per MiB, which move \
@@ -130,7 +141,7 @@ fn unjudgeable(json: &aterm_json::Value) -> Option<String> {
                 .to_string(),
         );
     }
-    let missing: Vec<&str> = LANE
+    let missing: Vec<&str> = lane
         .keys
         .iter()
         .filter(|k| number(json, k).is_none())
@@ -224,7 +235,7 @@ fn measure() -> Result<aterm_json::Value, Halt> {
 /// Leave this run's payloads at `shared` for a hand A/B, unless a run already left them there.
 /// `shared` names their digest, so a folder found there holds these bytes; no run removes one,
 /// and a run that loses the race to place it finds the winner's identical copy.
-fn share(part: &Path, shared: &Path) -> Result<(), String> {
+pub(super) fn share(part: &Path, shared: &Path) -> Result<(), String> {
     if shared.is_dir() {
         return Ok(());
     }
@@ -645,10 +656,11 @@ mod tests {
             text.push('}');
             aterm_json::from_str::<aterm_json::Value>(&text).expect("report")
         };
-        assert_eq!(unjudgeable(&report(true, None)), None);
-        let why = unjudgeable(&report(false, None)).expect("no counters");
+        assert_eq!(unjudgeable(&LANE, &report(true, None)), None);
+        let why = unjudgeable(&LANE, &report(false, None)).expect("no counters");
         assert!(why.contains("no cycles per core type"), "{why}");
-        let why = unjudgeable(&report(true, Some("sync_medium_cells"))).expect("one missing");
+        let why =
+            unjudgeable(&LANE, &report(true, Some("sync_medium_cells"))).expect("one missing");
         assert!(
             why.contains("no sample of sync_medium_cells counted"),
             "{why}"

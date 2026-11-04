@@ -499,14 +499,15 @@ impl<'a> Session<'a> {
             .map_err(failure)
     }
 
-    /// Probe a bounded window of selected historical rosters, even when a lost
-    /// handoff prevents opening an existing table. Requests confer no authority.
+    /// Probe a bounded window of selected historical rosters and, where the
+    /// roster is log-backed, the log's Commons epochs, even when a lost handoff
+    /// prevents opening an existing table. Requests confer no authority.
     pub(crate) fn history_needs(
         &self,
         after: Option<Digest>,
         limit: usize,
     ) -> Result<(Vec<Digest>, Option<Digest>)> {
-        let selected: std::collections::BTreeSet<Digest> =
+        let mut selected: std::collections::BTreeSet<Digest> =
             if let aterm_secrets::commons::journal::State::Ready { head, .. } = self.journal.state()
             {
                 let mut set = std::collections::BTreeSet::new();
@@ -535,6 +536,17 @@ impl<'a> Session<'a> {
             } else {
                 return Err(Error::new("table repair needs complete control history"));
             };
+        // Log-era rows are sealed under the log's Commons epochs: a member admitted after one
+        // holds no `Wrap` of it and asks a peer for its key.
+        if self.access.is_log_backed()
+            && let Some((log, _)) = aterm_secrets::client::trusted_commons_log(
+                self.bootstrap.paths(),
+                self.bootstrap.trust(),
+            )
+            .map_err(failure)?
+        {
+            selected.extend(log.commons_epoch_ids());
+        }
         let window: Vec<_> = selected
             .iter()
             .filter(|id| after.is_none_or(|after| **id > after))

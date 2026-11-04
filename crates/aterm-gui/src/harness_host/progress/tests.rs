@@ -352,7 +352,7 @@ fn recent_login_activity_keeps_the_blocker_and_filters_unrelated_or_invalid_time
     for cols in [60, 120] {
         let rect = crate::autopilot_menu::place(&rows, (25, 0), (0..26, 0..cols), (cols, 26), 0)
             .expect("account menu fits");
-        let painted = crate::autopilot_menu::paint(rect, &rows, None, theme);
+        let painted = crate::autopilot_menu::paint(rect, &rows, Default::default(), None, theme);
         assert!(
             painted.iter().any(|row| {
                 row.iter()
@@ -472,6 +472,7 @@ fn login_activity_requires_one_exact_captured_account_row() {
 #[test]
 fn completed_login_diagnostics_reach_the_menu_only_for_the_captured_account() {
     use aterm_agent::harness::accounts_sync::{LoginActivity, LoginDiagnostic, LoginIdentity};
+    use aterm_agent::harness::footer::{FactsOwner, FooterFacts};
     use aterm_agent::harness::open_url::{Met, MetWord};
 
     let row = accounts::Row {
@@ -516,6 +517,44 @@ fn completed_login_diagnostics_reach_the_menu_only_for_the_captured_account() {
         );
         value
     };
+    let rpc = |value: &AccountProgress, busy| {
+        let mut timeline = crate::session_timeline::SessionTimeline::for_test();
+        timeline.note_foreground_group(4242);
+        timeline.set_program(4242, Some("node".into()));
+        timeline.set_agent_reader_program_for_test(Some(Program::Claude));
+        assert!(timeline.set_claude_footer(
+            4242,
+            Some(BORN),
+            Some(FooterFacts {
+                owner: Some(FactsOwner {
+                    floor: Some(BORN),
+                    session_id: CONVERSATION.into(),
+                }),
+                ..FooterFacts::default()
+            }),
+        ));
+        assert!(timeline.set_account_progress(
+            4242,
+            Some(BORN),
+            Some(CONVERSATION),
+            Some(value.clone()),
+        ));
+        if busy {
+            assert!(timeline.set_account_progress_busy(4242, Some(BORN), Some(CONVERSATION)));
+        }
+        let reply = crate::harness_recovery_verb::cmd("recovery", true, || {
+            Ok(crate::harness_recovery_verb::snapshot(&timeline))
+        });
+        assert_eq!(
+            timeline.claude_footer().unwrap().account_progress.as_ref(),
+            Some(value)
+        );
+        reply
+            .split_whitespace()
+            .filter_map(|word| word.split_once('='))
+            .map(|(key, value)| (key.to_owned(), aterm_control::wire::pct_decode(value)))
+            .collect::<BTreeMap<_, _>>()
+    };
     let rows = [row.clone()];
     let value = project(&rows, activity(Some(diagnosis(80)), false));
     let control = project(&rows, activity(None, false));
@@ -532,6 +571,48 @@ fn completed_login_diagnostics_reach_the_menu_only_for_the_captured_account() {
     assert!(!text.contains("must-not-appear"));
     assert!(!text.contains("expected@example.test"));
     assert!(!text.contains("/synthetic/login"));
+    let reply = rpc(&value, false);
+    let no_diagnostic = rpc(&control, false);
+    assert_eq!(reply["login_diagnostic_count"], "1");
+    assert_eq!(reply["login_diagnostic_0_account"], row.label);
+    assert_eq!(reply["login_diagnostic_0_completed_at"], "80");
+    assert_eq!(reply["login_diagnostic_0_words"], text);
+    assert_eq!(no_diagnostic["login_diagnostic_count"], "0");
+    assert!(!no_diagnostic.contains_key("login_diagnostic_0_words"));
+    for (key, value) in &no_diagnostic {
+        if key != "login_diagnostic_count" {
+            assert_eq!(reply.get(key), Some(value));
+        }
+    }
+    for private in [
+        "must-not-appear",
+        "expected@example.test",
+        "/synthetic/login",
+    ] {
+        assert!(reply.values().all(|value| !value.contains(private)));
+    }
+    let mut paused = value.clone();
+    pause_progress(&mut paused, true, false);
+    for (history, busy, phase, paused) in [
+        (&value, true, "unknown", "0"),
+        (&paused, false, "paused", "1"),
+        (&paused, true, "unknown", "1"),
+    ] {
+        let retained = rpc(history, busy);
+        assert_eq!(retained["phase"], phase);
+        assert_eq!(retained["forecasts_paused"], paused);
+        assert_eq!(retained["eligible"], "-");
+        assert_eq!(retained["next_at"], "-");
+        assert_eq!(retained["observed_at"], "100");
+        for key in [
+            "login_diagnostic_count",
+            "login_diagnostic_0_account",
+            "login_diagnostic_0_completed_at",
+            "login_diagnostic_0_words",
+        ] {
+            assert_eq!(retained[key], reply[key]);
+        }
+    }
     let lab = crate::lab_screen::progress_facts_at(Some(&value), Some(100));
     let lab_text = format!("{lab:?}");
     assert!(lab_text.contains("headless browser"));
@@ -561,16 +642,14 @@ fn completed_login_diagnostics_reach_the_menu_only_for_the_captured_account() {
         vec![relocated],
         vec![row.clone(), row.clone()],
     ] {
-        assert_eq!(
-            project(&candidates, activity(Some(diagnosis(80)), false)),
-            project(&candidates, activity(None, false)),
-        );
+        let suppressed = project(&candidates, activity(Some(diagnosis(80)), false));
+        assert_eq!(suppressed, project(&candidates, activity(None, false)),);
+        assert_eq!(rpc(&suppressed, false)["login_diagnostic_count"], "0");
     }
     for at in [0, 101] {
-        assert_eq!(
-            project(&rows, activity(Some(diagnosis(at)), false)),
-            control,
-        );
+        let suppressed = project(&rows, activity(Some(diagnosis(at)), false));
+        assert_eq!(suppressed, control,);
+        assert_eq!(rpc(&suppressed, false)["login_diagnostic_count"], "0");
     }
     assert_eq!(
         project(&rows, activity(Some(diagnosis(80)), true)),
@@ -591,7 +670,7 @@ fn completed_login_diagnostics_reach_the_menu_only_for_the_captured_account() {
     for cols in [60, 120] {
         let rect = crate::autopilot_menu::place(&menu, (25, 0), (0..26, 0..cols), (cols, 26), 0)
             .expect("account menu fits");
-        let painted = crate::autopilot_menu::paint(rect, &menu, None, theme);
+        let painted = crate::autopilot_menu::paint(rect, &menu, Default::default(), None, theme);
         let text: String = painted
             .iter()
             .flat_map(|line| line.iter().map(|cell| cell.ch))

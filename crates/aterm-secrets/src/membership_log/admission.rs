@@ -24,6 +24,9 @@ use crate::age::Recipient;
 use aterm_digest::Sha256;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Epochs of an admission, each with its audience, by audience then id.
+type AudienceEpochs = Vec<(EpochAudience, RecordId)>;
+
 const RANK_DOMAIN: &[u8] = b"aterm/members/wrap-gap-rank/1\0";
 
 /// One epoch an effective member lacks a `Wrap` of ([`Log::wrap_gaps`]).
@@ -79,6 +82,27 @@ impl Log {
         out.into_iter().collect()
     }
 
+    /// The epochs [`Log::admit_with`] wraps to the Mac it admits, by audience then id: each
+    /// [`Log::admission_epochs`] epoch of `audiences` the member that opened `opened` unwrapped.
+    #[must_use]
+    pub fn admission_wraps(
+        opened: &OpenedAudienceEntries,
+        audiences: &[EpochAudience],
+    ) -> Vec<(EpochAudience, RecordId)> {
+        Self::admission_split(opened, audiences).0
+    }
+
+    /// [`Log::admission_epochs`] of `audiences`, split into those the member that opened
+    /// `opened` unwrapped ([`Log::admission_wraps`]) and those it lacks.
+    fn admission_split(
+        opened: &OpenedAudienceEntries,
+        audiences: &[EpochAudience],
+    ) -> (AudienceEpochs, AudienceEpochs) {
+        Self::admission_epochs(opened, audiences)
+            .into_iter()
+            .partition(|(_, epoch)| opened.unwrapped_keys.contains_key(epoch))
+    }
+
     /// Let `entrant` in on a person's Allow and phrase: sign an `Admit` and then a `Wrap` of
     /// every [`Log::admission_epochs`] epoch of `audiences` the signer unwrapped to the entrant's
     /// recipient, insert each, and return them in order. An epoch the signer lacks is allowed
@@ -125,9 +149,7 @@ impl Log {
         audiences: &[EpochAudience],
         authored_ms: u64,
     ) -> Result<Vec<Record>> {
-        let (epochs, lacking): (Vec<_>, Vec<_>) = Self::admission_epochs(opened, audiences)
-            .into_iter()
-            .partition(|(_, epoch)| opened.unwrapped_keys.contains_key(epoch));
+        let (epochs, lacking) = Self::admission_split(opened, audiences);
         if epochs.is_empty() {
             return Err(crate::Error::new(
                 "this Mac holds no epoch to hand a new Mac",

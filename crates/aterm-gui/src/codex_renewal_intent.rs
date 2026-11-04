@@ -92,8 +92,8 @@ impl RecordWitness {
         Some(Self {
             home: copy.home.clone(),
             pid: copy.pid,
-            starts: record["owed"]["renewal"]["starts"].as_u64()?,
-            goal: record["owed"]["renewal"]["goalId"].clone(),
+            starts: receipt.intent.marker(record)["starts"].as_u64()?,
+            goal: receipt.intent.marker(record)["goalId"].clone(),
         })
     }
 
@@ -110,10 +110,12 @@ impl RecordWitness {
             object.insert("status".into(), aterm_json::json!("waiting"));
         }
         receipt.intent.matches_record(&record, Some(&receipt.id))
-            && record["owed"]["renewal"]["goalId"] == self.goal
-            && record["owed"]["renewal"]["starts"].as_u64() == Some(self.starts)
+            && receipt.intent.marker(&record)["goalId"] == self.goal
+            && receipt.intent.marker(&record)["starts"].as_u64() == Some(self.starts)
             && renewal::history(&self.home, &receipt.intent).is_some_and(|history| {
-                history.auth_wall && history.latest_is_wall && history.starts == self.starts
+                receipt.intent.matches_history(&history)
+                    && history.latest_is_wall
+                    && history.starts == self.starts
             })
     }
 }

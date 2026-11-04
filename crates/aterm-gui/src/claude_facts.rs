@@ -5,6 +5,7 @@
 
 use std::path::Path;
 
+use aterm_agent::harness::account_progress::ProgressPhase;
 use aterm_agent::harness::footer::{FactKind, FactMask, FooterFacts};
 use aterm_agent::harness::session_usage::{self, UsageFacts};
 
@@ -92,6 +93,15 @@ fn usage_pair(usage: &UsageFacts) -> (u64, u64) {
         })
 }
 
+/// A transient profile miss may retain an old glance. Like the visible account
+/// unit, its disclosure uses those parts only while the profile remains present.
+fn account_glance(
+    facts: &FooterFacts,
+) -> Option<std::borrow::Cow<'_, aterm_agent::harness::outlook::Glance>> {
+    facts.subscription.as_ref()?;
+    facts.glance_view()
+}
+
 /// What a fact's title says, whole and short, hovered or selected (design §10.6.14).
 #[must_use]
 pub(crate) fn fact_title(facts: &FooterFacts, cwd: Option<&Path>, fact: Fact) -> (String, String) {
@@ -164,17 +174,22 @@ pub(crate) fn fact_title(facts: &FooterFacts, cwd: Option<&Path>, fact: Fact) ->
             (whole, "click: graph".to_owned())
         }
         Fact::Account => {
-            if let Some(progress) = facts.account_progress_view() {
+            let progress = facts.account_progress_view();
+            // A watch adds inventory beside the account's own readings. Limits and
+            // active or unconfirmed recovery keep the existing recovery-only disclosure.
+            if let Some(progress) = progress.as_deref()
+                && (progress.phase != ProgressPhase::Watching || progress.wall.is_some())
+            {
                 return (
                     format!(
                         "{} · click: accounts",
-                        aterm_agent::harness::footer::account_progress_text(&progress, false)
+                        aterm_agent::harness::footer::account_progress_text(progress, false)
                     ),
                     "click: accounts".into(),
                 );
             }
             let mut parts: Vec<std::borrow::Cow<'_, str>> = Vec::new();
-            let glance_view = facts.glance_view();
+            let glance_view = account_glance(facts);
             let glance = glance_view.as_deref();
             if let Some(sub) = facts.subscription.as_ref() {
                 if let Some(email) = sub.email.as_deref() {
@@ -210,13 +225,21 @@ pub(crate) fn fact_title(facts: &FooterFacts, cwd: Option<&Path>, fact: Fact) ->
             {
                 parts.push(acct.into());
             }
-            let summary = if parts.is_empty() {
-                "accounts".to_owned()
+            let summary = if let Some(progress) = progress.as_deref() {
+                let inventory =
+                    aterm_agent::harness::footer::account_progress_text(progress, false);
+                if parts.is_empty() {
+                    inventory
+                } else {
+                    format!("{inventory} · {}", parts.join(" · "))
+                }
+            } else if parts.is_empty() {
+                "⎆ accounts".to_owned()
             } else {
-                parts.join(" \u{b7} ")
+                format!("⎆ {}", parts.join(" · "))
             };
             (
-                format!("\u{2386} {summary} \u{b7} click: accounts"),
+                format!("{summary} · click: accounts"),
                 "click: accounts".to_owned(),
             )
         }
@@ -363,11 +386,14 @@ pub(crate) fn fact_spoken_of(
             )
         }
         Fact::Account => {
-            if let Some(progress) = facts.account_progress_view() {
+            let progress = facts.account_progress_view();
+            if let Some(progress) = progress.as_deref()
+                && (progress.phase != ProgressPhase::Watching || progress.wall.is_some())
+            {
                 return (
                     format!(
                         "Account: {}",
-                        aterm_agent::harness::footer::account_progress_text(&progress, false)
+                        aterm_agent::harness::footer::account_progress_text(progress, false)
                     ),
                     "Activate for account recovery details.".into(),
                 );
@@ -397,17 +423,27 @@ pub(crate) fn fact_spoken_of(
             }
             let words = parts.join(", ");
             // The outlook's sentences follow the week's own words (§2.5).
-            let glance = facts.glance_view();
+            let glance = account_glance(facts);
             let more = glance
                 .as_deref()
                 .and_then(|g| g.spoken.as_deref())
                 .map_or_else(String::new, |more| {
                     format!(". {}", more.trim_end_matches('.'))
                 });
-            (
-                format!("{name}: {words}{more}"),
-                "Activate for the accounts menu.".to_owned(),
-            )
+            if let Some(progress) = progress.as_deref() {
+                let inventory =
+                    aterm_agent::harness::footer::account_progress_text(progress, false);
+                let separator = if words.is_empty() { "" } else { ". " };
+                (
+                    format!("{name}: {inventory}{separator}{words}{more}"),
+                    "Activate for account recovery details.".into(),
+                )
+            } else {
+                (
+                    format!("{name}: {words}{more}"),
+                    "Activate for the accounts menu.".to_owned(),
+                )
+            }
         }
         Fact::TopEffort => top_spoken(facts.top_effort.unwrap_or(false)),
     };

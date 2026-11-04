@@ -14,7 +14,7 @@
     aterm_spec_anchor::spec_unmodeled(
         machine = "LineCustody",
         action = "ProgramReads",
-        reason = "The worker's program reading the queued line from its input before any turn since the write: the program's. The Tier-1 bind renders the next status read clear exactly there."
+        reason = "The worker's program reading the queued line from its input before any turn since the write: the program's. The Tier-1 bind renders the next status read clear exactly there, unless input queued behind the line is unread (Queues)."
     )
 )]
 #[cfg_attr(
@@ -22,7 +22,7 @@
     aterm_spec_anchor::spec_unmodeled(
         machine = "LineCustody",
         action = "ReadsAndDraws",
-        reason = "The program reading the queued line after a turn since the write and drawing it: the program's. The Tier-1 bind renders the composer holding it exactly there."
+        reason = "The program reading the queued line after a turn since the write and drawing it: the program's. The Tier-1 bind renders the composer holding it exactly there. Under a box over the composer (DialogShows) it renders every read as one that cannot say instead."
     )
 )]
 #[cfg_attr(
@@ -30,7 +30,7 @@
     aterm_spec_anchor::spec_unmodeled(
         machine = "LineCustody",
         action = "ReadsAndDrops",
-        reason = "The program reading the queued line after a turn since the write and dropping it: the program's. The Tier-1 bind renders the input clear and the composer empty exactly there."
+        reason = "The program reading the queued line after a turn since the write and dropping it: the program's. The Tier-1 bind renders the input clear, unless input queued behind the line is unread (Queues), and the composer empty exactly there. Under a box over the composer (DialogShows) it renders every read as one that cannot say instead."
     )
 )]
 #[cfg_attr(
@@ -38,7 +38,7 @@
     aterm_spec_anchor::spec_unmodeled(
         machine = "LineCustody",
         action = "ProgramDraws",
-        reason = "The program drawing a line it read: the program's. The Tier-1 bind renders the composer holding it (whole, arriving, or joined) exactly there."
+        reason = "The program drawing a line it read: the program's. The Tier-1 bind renders the composer holding it (whole, arriving, or joined) exactly there. Under a box over the composer (DialogShows) it renders every read as one that cannot say instead."
     )
 )]
 #[cfg_attr(
@@ -62,7 +62,7 @@
     aterm_spec_anchor::spec_unmodeled(
         machine = "LineCustody",
         action = "PersonDraws",
-        reason = "A person's keys drawn after the line: the person's. The Tier-1 bind raises the read's key count and renders their text in the composer exactly there."
+        reason = "A person's keys drawn after the line: the person's. The Tier-1 bind raises the read's key count and renders their text in the composer exactly there. Under a box over the composer (DialogShows) it renders every read as one that cannot say instead."
     )
 )]
 #[cfg_attr(
@@ -86,7 +86,7 @@
     aterm_spec_anchor::spec_unmodeled(
         machine = "LineCustody",
         action = "PersonClears",
-        reason = "Someone clearing the drawn line from the composer: the person's. The Tier-1 bind renders the composer empty exactly there."
+        reason = "Someone clearing the drawn line from the composer: the person's. The Tier-1 bind renders the composer empty exactly there. Under a box over the composer (DialogShows) it renders every read as one that cannot say instead."
     )
 )]
 #[cfg_attr(
@@ -102,7 +102,7 @@
     aterm_spec_anchor::spec_unmodeled(
         machine = "LineCustody",
         action = "Stirs",
-        reason = "The session leaving rest (a turn running, a dialog, a hold, the word Off, a person's key within the grace, a background call making no progress): the session's. The Tier-1 bind renders one of those into the read's Rest exactly there."
+        reason = "The session leaving rest (a turn running, a frame torn mid-redraw, a hold, the word Off, a person's key within the grace, a background call making no progress): the session's. A box over the composer is DialogShows. The Tier-1 bind renders one of those into the read's Rest exactly there."
     )
 )]
 #[cfg_attr(
@@ -110,7 +110,23 @@
     aterm_spec_anchor::spec_unmodeled(
         machine = "LineCustody",
         action = "Rests",
-        reason = "The session at rest again: the session's. The Tier-1 bind renders the read's Rest at rest exactly there."
+        reason = "The session at rest again: the session's. The Tier-1 bind renders the read's Rest at rest exactly there. Under a box over the composer (DialogShows) it renders the read's Rest not idle instead, as a box is no rest."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "LineCustody",
+        action = "DialogShows",
+        reason = "A box drawn over the composer (a permission box, a question), no composer drawn (a full-screen view), or the composer's glyph cell unread, while a line is held: the program's or the window's, which the loop or a person answers or closes, never the custody. The Tier-1 bind renders every read from there, the gate's included, as one that cannot say what the composer holds (Shows::stands None: no composer text, the composer's text with its cell unread, or no key count), the line drawn under it or not, and the read's Rest not idle."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "LineCustody",
+        action = "DialogGoes",
+        reason = "The box over the composer going (answered, closed, the view left, the cell read): the program's, the person's, or the approval loop's answer to a permission box, which asks no custody (the turn-end loop's answer through the custody's gate is AnswersBox). The Tier-1 bind renders the composer as the model holds it again exactly there."
     )
 )]
 #[cfg_attr(
@@ -207,6 +223,30 @@
         machine = "LineCustody",
         action = "UpgradeOverStands",
         reason = "Buggy=10 negative control only; the host's upgrade moves behind a line that stands, so a line still queued goes to the shell (the Tier-1 bind plants CustodyHostUntold in line_held)"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "LineCustody",
+        action = "TurnSettlesUnderDialog",
+        reason = "Buggy=11 negative control only; a turn settles the line on a read that cannot say what the composer holds (a box over it), so a line drawn under the box leaves the custody unhanded and is taken for a person's draft (the Tier-1 bind plants CustodyTurnUnreadable in Line::turned)"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "LineCustody",
+        action = "AnswersComposer",
+        reason = "Buggy=12 negative control only; a key that is no line's goes past the line held where no box is over the composer, so it reaches the composer and enters or clears a line drawn there, which no writer gets back (the Tier-1 bind plants CustodyAnswersComposer in answer_goes)"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "LineCustody",
+        action = "AnswersWithoutRead",
+        reason = "Buggy=13 negative control only; a dialog's key goes past a line no clear input read proved the worker read, so the still-queued line may reach the dialog before its answer (the Tier-1 bind plants CustodyAnswersWithoutRead in answer_goes)"
     )
 )]
 #[doc(hidden)]

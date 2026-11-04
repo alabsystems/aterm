@@ -262,7 +262,8 @@ fn row_key(
 
 /// Key every account of `state` that a row of `roster` names by the installed sink's account
 /// key; nothing without a sink. A row's key follows the email its row names now, as the claims
-/// key does, so a relabelled login is keyed as the account it holds.
+/// key does, so a relabelled login is keyed as the account it holds; what was observed under the
+/// key it had stays under that key, in [`State::forgotten`](super::accounts::State::forgotten).
 pub fn learn(cli: Cli, roster: &Roster, state: &mut State) {
     if let Some(sink) = SINK.get() {
         learn_with(cli, roster, state, &|realm, email| {
@@ -278,12 +279,37 @@ pub fn learn_with(
     state: &mut State,
     keyer: &dyn Fn(&str, &str) -> Option<String>,
 ) {
+    let mut handed_off = Vec::new();
     for (label, account) in &mut state.accounts {
         if let Some(pk) = row_key(cli, roster, label, keyer)
             && account.pk.as_deref() != Some(pk.as_str())
         {
-            account.pk = Some(pk);
+            // The row now names another account: what this Mac observed under the label is the
+            // account it was keyed as, so it is filed under that key, never carried to the new one.
+            if let Some(was) = account.pk.replace(pk) {
+                handed_off.push((was, super::accounts::take_observations(account)));
+            }
         }
+    }
+    for (was, observed) in handed_off {
+        super::accounts::remember_forgotten(state, was, observed);
+    }
+    // A row of an account this Mac forgot takes back what it observed of it, whatever the row is
+    // called now: observations are the account's, keyed by its lab key beside the label
+    // (`accounts::forget_account`), so a removed and re-added or renamed row starts from them.
+    if state.forgotten.is_empty() {
+        return;
+    }
+    for row in &roster.rows {
+        let Some(pk) = row_key(cli, roster, &row.label, keyer) else {
+            continue;
+        };
+        let Some(held) = state.forgotten.remove(&pk) else {
+            continue;
+        };
+        let account = state.accounts.entry(row.label.clone()).or_default();
+        account.pk = Some(pk);
+        super::accounts::fill_observations(account, held);
     }
 }
 

@@ -437,6 +437,53 @@ impl App {
         }
         self.push_a11y_tree(wid);
     }
+
+    /// What an attached accessibility client sends for `action` on `view`'s control `key`,
+    /// carrying `data`: `wid`'s tree is published as the client reads it, and the request names
+    /// that control's node and action context.
+    #[cfg(test)]
+    pub(crate) fn accessibility_request_for_test(
+        &mut self,
+        wid: WindowId,
+        view: ViewId,
+        key: &str,
+        action: aterm_a11y::model::Action,
+        data: Option<aterm_a11y::model::ActionData>,
+    ) -> aterm_a11y::model::ActionRequest {
+        self.windows
+            .get_mut(&wid)
+            .expect("headless window")
+            .a11y_active = true;
+        assert!(self.prepare_native_input_scratch(wid));
+        let (update, published) = self
+            .take_native_accessibility_update(wid)
+            .expect("an accessibility update")
+            .expect("a valid accessibility update");
+        let node = crate::native_accessibility::stable_node_id_for_view(
+            view,
+            &crate::native_ui::UiKey::new(key),
+        );
+        let control = &update
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == node)
+            .unwrap_or_else(|| panic!("the tree publishes {key}"))
+            .1;
+        assert!(control.supports_action(action), "{key} takes {action:?}");
+        let context = control.action_context();
+        assert!(context.is_some(), "{key} carries an action context");
+        self.windows
+            .get_mut(&wid)
+            .expect("headless window")
+            .native_a11y_published = Some(published);
+        aterm_a11y::model::ActionRequest {
+            context,
+            action,
+            target_tree: aterm_a11y::model::TreeId::ROOT,
+            target_node: node,
+            data,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -924,30 +971,18 @@ mod tests {
         key: &str,
         value: Option<&str>,
     ) -> ActionRequest {
-        set_a11y_active(app, wid, true);
-        assert!(app.prepare_native_input_scratch(wid));
-        let (update, published) = app.take_native_accessibility_update(wid).unwrap().unwrap();
-        let node = stable_node_id_for_view(view, &UiKey::new(key));
         let action = if value.is_some() {
             Action::SetValue
         } else {
             Action::Click
         };
-        let control = &update.nodes.iter().find(|(id, _)| *id == node).unwrap().1;
-        assert!(
-            control.supports_action(action),
-            "the saved control was enabled"
-        );
-        let context = control.action_context();
-        assert!(context.is_some());
-        app.windows.get_mut(&wid).unwrap().native_a11y_published = Some(published);
-        ActionRequest {
-            context,
+        app.accessibility_request_for_test(
+            wid,
+            view,
+            key,
             action,
-            target_tree: TreeId::ROOT,
-            target_node: node,
-            data: value.map(|text| aterm_a11y::model::ActionData::Value(text.into())),
-        }
+            value.map(|text| aterm_a11y::model::ActionData::Value(text.into())),
+        )
     }
 
     fn launch_offer_ax_navigation(action: Action) {

@@ -65,7 +65,7 @@ pub(super) struct Apart {
     pub(super) weighed: BTreeMap<usize, Weighed>,
 }
 
-impl Graph<'_, '_> {
+impl Graph<'_> {
     /// [`Graph::accepted`], with each candidate that holds apart and how it was weighed with
     /// nothing void, and the relations among them.
     pub(super) fn weigh_all(
@@ -225,7 +225,7 @@ fn grounded_with_storage(apart: &[usize], relations: &Relations) -> (Vec<usize>,
 
 #[cfg(any(test, debug_assertions))]
 pub(super) fn allocation_probe(dense: bool) -> usize {
-    let active: Vec<usize> = (0..(crate::membership_log::MAX_RECORDS - 1) / 2).collect();
+    let active: Vec<usize> = (0..relations::MAX_CANDIDATES).collect();
     let mut relations = Relations::new(&active).unwrap();
     if dense {
         for &one in &active {
@@ -275,7 +275,7 @@ struct Readers {
 }
 
 impl Readers {
-    fn new(graph: &Graph<'_, '_>) -> Self {
+    fn new(graph: &Graph<'_>) -> Self {
         let n = graph.records.len();
         let mut about = vec![usize::MAX; n];
         let mut cut = vec![usize::MAX; n];
@@ -407,8 +407,8 @@ enum Reach {
 }
 
 /// The walk's state: the classes, the order, and the marks and caches its steps reuse.
-struct Walk<'w, 'a, 'cache> {
-    graph: &'w Graph<'a, 'cache>,
+struct Walk<'w, 'a> {
+    graph: &'w Graph<'a>,
     candidates: &'w [Candidate],
     apart: &'w Apart,
     readers: Readers,
@@ -435,9 +435,9 @@ struct Walk<'w, 'a, 'cache> {
     after_mark: Vec<u32>,
 }
 
-impl<'w, 'a, 'cache> Walk<'w, 'a, 'cache> {
+impl<'w, 'a> Walk<'w, 'a> {
     fn new(
-        graph: &'w Graph<'a, 'cache>,
+        graph: &'w Graph<'a>,
         candidates: &'w [Candidate],
         apart: &'w Apart,
         memo: &mut Memo,
@@ -828,8 +828,8 @@ impl<'w, 'a, 'cache> Walk<'w, 'a, 'cache> {
 
 /// One slow step's view for the pins: the cutoff, the state stepped to, and the reader records up
 /// to the cutoff whose liveness differs from the kept state's (`pending`).
-struct Step<'s, 'a, 'cache> {
-    graph: &'s Graph<'a, 'cache>,
+struct Step<'s, 'a> {
+    graph: &'s Graph<'a>,
     readers: &'s Readers,
     always: &'s [bool],
     sometimes_out: &'s [Vec<usize>],
@@ -839,7 +839,7 @@ struct Step<'s, 'a, 'cache> {
     pending: &'s Bits,
 }
 
-impl Step<'_, '_, '_> {
+impl Step<'_, '_> {
     /// Whether the `Remove` `r` up to the cutoff, live in some state but not every one, is live in
     /// both the kept state and the step's: not toggled, and live in the step's.
     fn steady(&self, r: usize) -> bool {
@@ -1055,7 +1055,7 @@ impl Bits {
 }
 
 #[cfg(test)]
-impl Walk<'_, '_, '_> {
+impl Walk<'_, '_> {
     /// In a checked walk, the members the walk keeps at `cutoff` are the members there under the
     /// class, by a full pass.
     fn check_members(&self, cutoff: usize, class: usize, member: &[bool]) {
@@ -1108,7 +1108,7 @@ thread_local! {
 /// each candidate holding apart weighed beside every other one at a full membership pass, and
 /// the verdict found by sweeping until nothing changes.
 #[cfg(test)]
-impl Graph<'_, '_> {
+impl Graph<'_> {
     pub(super) fn accepted_by_pairs(
         &self,
         candidates: &[Candidate],

@@ -5471,7 +5471,7 @@ pub(crate) fn accounts_wrong_entry(labels: &[String]) -> Option<Entry> {
 }
 
 /// The one word a glass title names `cli` by (six words at most): `Claude`, as its notices
-/// always have, `Codex`, `Grok`, `Kimi`.
+/// always have, `Codex`, `Grok`, `Kimi`, `Antigravity`.
 const fn title_word(cli: aterm_agent::harness::accounts::Cli) -> &'static str {
     use aterm_agent::harness::accounts::Cli;
     match cli {
@@ -5479,6 +5479,7 @@ const fn title_word(cli: aterm_agent::harness::accounts::Cli) -> &'static str {
         Cli::Codex => "Codex",
         Cli::Grok => "Grok",
         Cli::Kimi => "Kimi",
+        Cli::Agy => "Antigravity",
     }
 }
 

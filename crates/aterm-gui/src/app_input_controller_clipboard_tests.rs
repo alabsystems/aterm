@@ -840,7 +840,11 @@ fn an_edit_item_a_key_hwkey_posted_chose_reaches_no_clipboard() {
             current_key(keycode, posted),
             crate::tab_spawn::native_post_by_controller,
         );
-        app.run_posted_menu_action(action, None, by_controller, edit_menu_body);
+        let gesture = crate::app_take_over::GestureMarks {
+            controller: by_controller,
+            assistive: false,
+        };
+        app.run_posted_menu_action(action, None, gesture, edit_menu_body);
     };
 
     item(&mut app, MenuAction::Paste, 9, true);

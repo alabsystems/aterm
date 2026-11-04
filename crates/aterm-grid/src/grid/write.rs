@@ -4,8 +4,6 @@
 
 //! Character writes: `write_char`, the ASCII bulk paths (`write_cell_run`, `write_ascii_blast`, `write_ascii_run_styled_packed`), and the stale-extras probe every writer shares.
 
-#[cfg(test)]
-use super::PackedColor;
 use super::{Cell, CellCoord, CellFlags, Grid, PackedColors};
 
 /// The extras-map entries a write over `start, end)` of `row` is about to leave without a cell to claim them, probed before it lands (the write clears the HAS_EXTRAS bits this reads).
@@ -572,21 +570,6 @@ impl Grid {
         debug_assert!(written <= ascii.len());
         debug_assert!(self.storage.cursor.row < self.storage.visible_rows);
         written
-    }
-
-    /// Write styled ASCII bytes with autowrap and deferred wrapping.
-    #[inline]
-    #[cfg(test)]
-    pub fn write_ascii_run_styled(
-        &mut self,
-        ascii: &[u8],
-        fg: PackedColor,
-        bg: PackedColor,
-        flags: CellFlags,
-        last_byte: &mut Option<u8>,
-    ) -> usize {
-        let colors = Cell::convert_colors(fg, bg);
-        self.write_ascii_run_styled_packed(ascii, colors, flags, last_byte)
     }
 
     /// Write styled ASCII bytes with autowrap and deferred wrapping, given packed colors.

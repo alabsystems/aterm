@@ -265,7 +265,8 @@ fn boot_under(
     configure: impl FnOnce(&Path, &mut Command),
     ready: impl Fn(&Instance) -> bool,
 ) -> Instance {
-    let lease = aterm_spec::subprocess_lane::acquire();
+    let lease = aterm_spec::subprocess_lane::acquire()
+        .unwrap_or_else(|e| could_not_run(format!("subprocess admission refused ({e})")));
     let world = WorldGuard::new(scratch_root(prefix));
     let tmp = world.path().to_path_buf();
     let log = tmp.join("gui.log");
@@ -311,7 +312,8 @@ fn boot_under(
              (`-e`), so no login shell of the instance can be asked what it names {by_name:?}"
         ));
     }
-    let _boot = aterm_spec::subprocess_lane::acquire_boot_permit();
+    let _boot = aterm_spec::subprocess_lane::acquire_boot_permit()
+        .unwrap_or_else(|e| could_not_run(format!("subprocess boot admission refused ({e})")));
     let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => could_not_run(format!("cannot launch aterm --headless ({e})")),

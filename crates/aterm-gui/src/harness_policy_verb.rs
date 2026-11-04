@@ -23,6 +23,7 @@ pub(crate) struct PolicyFacts {
     pub(crate) effective: (bool, &'static str),
     /// The session's own `meta questions` word, when it has one.
     pub(crate) session_questions: Option<String>,
+    pub(crate) codex_rotation: bool,
 }
 
 /// The inputs of `effective=`/`why=` for one session.
@@ -158,6 +159,9 @@ pub(crate) fn reply_serving(
     if let Some(served) = served {
         line.push_str(&format!(" contract={served}"));
     }
+    if facts.codex_rotation {
+        line.push_str(" codex_rotation=1");
+    }
     for (key, value) in facts.policy.texts() {
         let value = if key == "continue_text" {
             continuation_text(&facts.policy, rules)
@@ -221,6 +225,7 @@ pub(crate) fn configured_facts(
     };
     PolicyFacts {
         generation,
+        codex_rotation: ctx.native_policy.quota_rotation_enabled(),
         policy: policy.clone(),
         session_questions,
         effective: effective(
@@ -318,6 +323,7 @@ mod tests {
     fn facts(policy: SupervisorConfig) -> PolicyFacts {
         PolicyFacts {
             generation: 7,
+            codex_rotation: false,
             effective: effective(&policy, posture()),
             policy,
             session_questions: None,
@@ -329,6 +335,18 @@ mod tests {
             .split(' ')
             .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
             .map(str::to_string)
+    }
+
+    #[test]
+    fn quota_capability_requires_host_support_and_is_owner_only() {
+        let mut value = facts(SupervisorConfig::default());
+        assert_eq!(field(&reply(&value, None, true), "codex_rotation"), None);
+        value.codex_rotation = true;
+        assert_eq!(
+            field(&reply(&value, None, true), "codex_rotation").as_deref(),
+            Some("1")
+        );
+        assert_eq!(field(&reply(&value, None, false), "codex_rotation"), None);
     }
 
     #[test]

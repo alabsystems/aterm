@@ -91,6 +91,18 @@ impl ClosedRestart {
         self.retired.store(true, Ordering::Release);
     }
 
+    pub(super) fn cancelled_without_successor(
+        &self,
+        prepare: &Prepare,
+        kernel: &dyn Kernel,
+    ) -> bool {
+        self.predecessor == *prepare
+            && self.retired.load(Ordering::Acquire)
+            && self.successor.get().is_none()
+            && self.children.is_empty()
+            && self.quiescent(kernel)
+    }
+
     /// Recheck retained kernel objects and the exact drained input boundary.
     /// Source/child absence without those objects never passes this predicate.
     pub(super) fn quiescent(&self, kernel: &dyn Kernel) -> bool {

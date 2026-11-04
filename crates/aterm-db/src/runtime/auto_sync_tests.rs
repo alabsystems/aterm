@@ -1066,6 +1066,7 @@ fn two_loopback_islands_write_admit_and_remove_then_join_and_match_inventories()
         .unwrap()
         .request(trust.network, trust.authority)
         .unwrap();
+    let actor5 = req5.binding().actor();
     admit_member_in_log(
         &m1,
         Entrant {
@@ -1131,12 +1132,74 @@ fn two_loopback_islands_write_admit_and_remove_then_join_and_match_inventories()
     rt_b4.stop();
     rt_b2.stop();
 
-    // --- JOIN (`port_joined`): both loopback islands move onto one multicast port, close wrap
-    //     gaps over `ACX2`, and converge to identical 4-operation inventories! ---
-    let (rt_j1, att_j1) = start_paths(&m1, "j1", port_joined);
-    let (rt_j2, att_j2) = start_paths(&m2, "j2", port_joined);
-    let (rt_j4, att_j4) = start_paths(&m4, "j4", port_joined);
-    let (rt_j5, att_j5) = start_paths(&m5, "j5", port_joined);
+    // --- JOIN (`port_joined`): both loopback islands move onto one multicast port and trade
+    //     their records over `ACX2`, which signs none. `m4`'s rotation left newcomer `m5` a
+    //     `Wrap` gap: with the runtimes stopped, the holders' vault passes (each subscriber's,
+    //     after it pulls records) close it, at first sight and again past every rank's step with
+    //     what each signed carried to the others between, and the runtimes, started again, carry
+    //     the `Wrap` and converge to identical 4-operation inventories! ---
+    let joined = [
+        start_paths(&m1, "j1", port_joined).0,
+        start_paths(&m2, "j2", port_joined).0,
+        start_paths(&m4, "j4", port_joined).0,
+        start_paths(&m5, "j5", port_joined).0,
+    ];
+    let holders = [&m1, &m2, &m4];
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "every holder holds m5's admission and m3's removal over ACX2",
+        || {
+            holders
+                .iter()
+                .all(|paths| {
+                    load_records(paths).ok().is_some_and(|store| {
+                        store.log().is_some_and(|log| {
+                            let membership = log.membership();
+                            membership.contains(&actor5) && membership.removal(&actor_m3).is_some()
+                        })
+                    })
+                })
+                .then_some(())
+        },
+    );
+    for runtime in joined {
+        runtime.stop();
+    }
+    let m5_recipient = machine_identity(&m5).unwrap().recipient();
+    let at = aterm_time::unix_millis().unwrap_or(0);
+    let mut closed = Vec::new();
+    for at in [at, at + 100 * 60_000] {
+        for paths in holders {
+            closed.extend(aterm_secrets::client::test_tend_at(paths, at).unwrap());
+        }
+        for from in holders {
+            let records = load_records(from).unwrap().encode();
+            for to in holders {
+                save_records(to, &records).unwrap();
+            }
+        }
+    }
+    let wraps_to_m5 = |records: &[aterm_secrets::membership_log::Record]| {
+        records
+            .iter()
+            .filter(|record| {
+                matches!(
+                    record.body(),
+                    aterm_secrets::membership_log::Body::Wrap { recipient, .. }
+                        if *recipient == m5_recipient
+                )
+            })
+            .count()
+    };
+    assert!(
+        wraps_to_m5(&closed) > 0,
+        "a ranked holder's vault pass closes m5's gap: {closed:?}"
+    );
+
+    let (rt_j1, att_j1) = start_paths(&m1, "k1", port_joined);
+    let (rt_j2, att_j2) = start_paths(&m2, "k2", port_joined);
+    let (rt_j4, att_j4) = start_paths(&m4, "k4", port_joined);
+    let (rt_j5, att_j5) = start_paths(&m5, "k5", port_joined);
 
     for (name, att) in [
         ("m1", &att_j1),

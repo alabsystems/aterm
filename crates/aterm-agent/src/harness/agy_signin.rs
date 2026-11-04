@@ -173,7 +173,6 @@ pub struct UnverifiedGrant {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GoogleLoginError {
     Configuration,
-    Credentials(super::google_credentials::Error),
     Approval(super::google_direct::Error),
     Native(Error),
 }
@@ -184,7 +183,6 @@ impl std::fmt::Display for GoogleLoginError {
             Self::Configuration => {
                 f.write_str("Explicit agy Google identity binding is unavailable or changed")
             }
-            Self::Credentials(error) => std::fmt::Display::fmt(error, f),
             Self::Approval(error) => std::fmt::Display::fmt(error, f),
             Self::Native(error) => std::fmt::Display::fmt(error, f),
         }
@@ -224,6 +222,14 @@ impl VerifiedGoogleWorker {
 }
 
 impl VerifiedGoogleGrant {
+    pub(super) fn account_label(&self) -> &str {
+        &self.grant.account
+    }
+
+    pub(super) fn digest(&self) -> Result<[u8; 32], &'static str> {
+        self.check_current()?;
+        Ok(self.digest)
+    }
     /// Carry the verified profile into a worker, replacing inherited profile routing.
     /// The native executable is the same managed program that produced the grant.
     pub fn prepare_worker(
@@ -306,13 +312,19 @@ fn native_access_token(bytes: &[u8]) -> Result<SecretBytes, &'static str> {
         aterm_json::from_slice(bytes).map_err(|_| "Native Google grant is unreadable")?;
     // Current native StoredToken wraps golang.org/x/oauth2.Token in `token`.
     // Cached id_token_email and legacy id_token are not account proof.
-    let token = value["token"]["access_token"]
-        .as_str()
-        .filter(|s| {
-            !s.is_empty() && s.len() <= LIMIT && s.bytes().all(|b| (0x21..=0x7e).contains(&b))
-        })
-        .map(|s| SecretBytes::from(s.as_bytes()))
-        .ok_or("Native Google grant has no valid access token");
+    // Native 1.4.12 names this route `consumer`; its separate `gcp` route also
+    // uses Google's account endpoint, so userinfo alone cannot establish the native route.
+    let token = if value["auth_method"].as_str() != Some("consumer") {
+        Err("Native Google grant is not a consumer login")
+    } else {
+        value["token"]["access_token"]
+            .as_str()
+            .filter(|s| {
+                !s.is_empty() && s.len() <= LIMIT && s.bytes().all(|b| (0x21..=0x7e).contains(&b))
+            })
+            .map(|s| SecretBytes::from(s.as_bytes()))
+            .ok_or("Native Google grant has no valid access token")
+    };
     fn wipe(value: aterm_json::Value) {
         match value {
             aterm_json::Value::String(s) => drop(SecretBytes::from(s)),
@@ -329,6 +341,14 @@ impl UnverifiedGoogleGrant {
     /// Prove the exact native token's Google account before making it usable.
     /// Provider rejection, deadline expiry, or concurrent binding/grant changes fail closed.
     pub fn verify(self, deadline: Instant) -> Result<VerifiedGoogleGrant, &'static str> {
+        self.verify_classified(deadline)
+            .map_err(super::google_profile::Error::message)
+    }
+
+    fn verify_classified(
+        self,
+        deadline: Instant,
+    ) -> Result<VerifiedGoogleGrant, super::google_profile::Error> {
         self.check_binding().map_err(|_| "Google binding changed")?;
         let bytes = grant_bytes(self.path())?;
         let digest = grant_digest(bytes.as_slice());
@@ -343,7 +363,7 @@ impl UnverifiedGoogleGrant {
             wait,
         )?;
         if Instant::now() >= deadline {
-            return Err("Google verification deadline expired");
+            return Err("Google verification deadline expired".into());
         }
         let verified = VerifiedGoogleGrant {
             grant: self,
@@ -397,14 +417,91 @@ fn native_profile(
         .join(aterm_codec::hex::encode_lower(&digest.finalize()))
 }
 
+/// Revalidate a published native grant without running a CLI, opening a browser or
+/// requesting a password. Expired/rejected grants require the pool's staged renewal path.
+pub fn verify_google_existing(
+    program: &Path,
+    state: &Path,
+    account: &str,
+    expected_email: &str,
+    profile: &Path,
+    deadline: Instant,
+) -> Result<VerifiedGoogleGrant, super::google_profile::Error> {
+    remaining(deadline).map_err(|_| "Google verification deadline expired")?;
+    if !program.is_absolute()
+        || !program.is_file()
+        || !state.is_absolute()
+        || !profile.is_absolute()
+    {
+        return Err("Published native Google profile is unavailable".into());
+    }
+    let registry = registry(state).ok_or("Explicit Google binding is unavailable")?;
+    let (identity, binding) = registry
+        .resolve("agy", account)
+        .ok_or("Explicit Google binding is unavailable")?;
+    if !identity
+        .email()
+        .eq_ignore_ascii_case(binding.expected_email())
+        || !expected_email.eq_ignore_ascii_case(binding.expected_email())
+    {
+        return Err("Google account does not match the selected pool row".into());
+    }
+    let claim = super::browser_window::ProfileLock::claim(profile)
+        .map_err(|_| "Published native Google profile is held or unavailable")?;
+    UnverifiedGoogleGrant {
+        native: UnverifiedGrant {
+            path: profile.join(".gemini/antigravity-cli/antigravity-oauth-token"),
+            program: program.into(),
+            _claim: claim,
+        },
+        expected_email: expected_email.into(),
+        state: state.into(),
+        account: account.into(),
+        revision: registry.binding_revision("agy", account),
+    }
+    .verify_classified(deadline)
+}
+
 /// Approve a native agy login using its explicitly bound Google identity and registered
-/// credentials. No account is selected implicitly and no interactive fallback is opened.
+/// session and credentials when needed. No account is selected implicitly and no interactive fallback is opened.
 /// Native completion remains unverified until a canonical provider check accepts its grant.
 pub fn run_google(
     program: &Path,
     state: &Path,
     home: &Path,
     account: &str,
+    deadline: Instant,
+) -> Result<UnverifiedGoogleGrant, GoogleLoginError> {
+    run_google_at(program, state, home, account, None, deadline)
+}
+
+/// Authenticate into the pool's private staging home, binding the selected row's email
+/// to the explicit Google registry before starting native or browser authorization.
+/// Keep the returned grant through canonical verification and atomic pool publication.
+pub struct StagedGoogleLogin<'a> {
+    pub profile: &'a Path,
+    pub previous: Option<&'a Path>,
+    pub expected_email: &'a str,
+}
+
+/// Run the selected account's native authorization in its separately claimed staging home.
+pub fn run_google_staged(
+    program: &Path,
+    state: &Path,
+    home: &Path,
+    account: &str,
+    staging: StagedGoogleLogin<'_>,
+    deadline: Instant,
+) -> Result<UnverifiedGoogleGrant, GoogleLoginError> {
+    run_google_at(program, state, home, account, Some(staging), deadline)
+}
+
+fn run_google_at(
+    program: &Path,
+    state: &Path,
+    home: &Path,
+    account: &str,
+    staging: Option<StagedGoogleLogin<'_>>,
     deadline: Instant,
 ) -> Result<UnverifiedGoogleGrant, GoogleLoginError> {
     remaining(deadline).map_err(GoogleLoginError::Native)?;
@@ -421,51 +518,60 @@ pub fn run_google(
     {
         return Err(GoogleLoginError::Configuration);
     }
-    let profile = native_profile(state, account, identity);
-    let warm = aterm_secrets::fsx::has_private_nonempty(
-        &profile.join(".gemini/antigravity-cli/antigravity-oauth-token"),
-        LIMIT,
-    );
-    // An existing native grant owns its refresh independently of the Google web password.
-    // Fresh profiles still refuse unavailable credentials before starting a native child.
-    let mut credentials = if warm {
-        None
+    let profile = match staging.as_ref() {
+        Some(staging) => {
+            if !staging.profile.is_absolute()
+                || !staging
+                    .expected_email
+                    .eq_ignore_ascii_case(binding.expected_email())
+                || staging.profile == native_profile(state, account, identity)
+                || staging
+                    .previous
+                    .is_some_and(|old| !old.is_absolute() || old == staging.profile)
+            {
+                return Err(GoogleLoginError::Configuration);
+            }
+            staging.profile.to_path_buf()
+        }
+        None => native_profile(state, account, identity),
+    };
+    let staged = staging.is_some();
+    let claim = if let Some(staging) = staging {
+        Some(stage_profile(staging.profile, staging.previous).map_err(GoogleLoginError::Native)?)
     } else {
-        Some(
-            super::google_credentials::Credentials::load(identity, home)
-                .map_err(GoogleLoginError::Credentials)?,
-        )
+        None
     };
     let revision = registry.binding_revision("agy", account);
     let current = || binding_current(state, account, revision);
     let mut approval_error = None;
-    let native = run(program, &profile, deadline, |request, deadline| {
-        if credentials.is_none() {
-            match super::google_credentials::Credentials::load(identity, home) {
-                Ok(loaded) => credentials = Some(loaded),
+    let recovery = staged.then_some(StagedRecovery {
+        expected_email: binding.expected_email(),
+        current: &current,
+    });
+    let native = run_claimed(
+        program,
+        &profile,
+        claim,
+        recovery,
+        deadline,
+        |request, deadline| {
+            let mailbox = super::headless_oauth::discover_mailbox_config(Some(home), Some(state));
+            let context = super::google_direct::Context {
+                identity,
+                home,
+                state,
+                mailbox: mailbox.as_ref(),
+                current: &current,
+            };
+            match super::google_direct::approve(request, &context, deadline) {
+                Ok(code) => Ok(code),
                 Err(error) => {
-                    approval_error = Some(GoogleLoginError::Credentials(error));
-                    return Err(Error::Authorization);
+                    approval_error = Some(GoogleLoginError::Approval(error));
+                    Err(Error::Authorization)
                 }
             }
-        }
-        let credentials = credentials.as_mut().ok_or(Error::Authorization)?;
-        let mailbox = super::headless_oauth::discover_mailbox_config(Some(home), Some(state));
-        let context = super::google_direct::Context {
-            identity,
-            home,
-            state,
-            mailbox: mailbox.as_ref(),
-            current: &current,
-        };
-        match super::google_direct::approve(request, credentials, &context, deadline) {
-            Ok(code) => Ok(code),
-            Err(error) => {
-                approval_error = Some(GoogleLoginError::Approval(error));
-                Err(Error::Authorization)
-            }
-        }
-    });
+        },
+    );
     if let Some(error) = approval_error {
         return Err(error);
     }
@@ -582,6 +688,82 @@ pub fn run(
     program: &Path,
     profile: &Path,
     deadline: Instant,
+    approve: impl FnMut(&Authorization, Instant) -> Result<Code, Error>,
+) -> Result<UnverifiedGrant, Error> {
+    run_claimed(program, profile, None, None, deadline, approve)
+}
+
+fn stage_profile(
+    profile: &Path,
+    previous: Option<&Path>,
+) -> Result<super::browser_window::ProfileLock, Error> {
+    aterm_types::fs_restricted::ensure_private_dir(profile).map_err(|_| Error::Profile)?;
+    let claim = super::browser_window::ProfileLock::claim(profile).map_err(|_| Error::Profile)?;
+    let token = profile.join(".gemini/antigravity-cli/antigravity-oauth-token");
+    // A staging home is owned by this attempt. Never overwrite a grant left by another
+    // attempt, and never let native refresh mutate the currently published home.
+    if token.try_exists().map_err(|_| Error::Profile)? {
+        return Err(Error::Profile);
+    }
+    if let Some(previous) = previous {
+        let source = previous.join(".gemini/antigravity-cli/antigravity-oauth-token");
+        if let Some(bytes) = aterm_secrets::fsx::read_private(&source, LIMIT)
+            .map_err(|_| Error::Profile)?
+            .filter(|bytes| !bytes.is_empty())
+        {
+            let parent = token.parent().ok_or(Error::Profile)?;
+            aterm_types::fs_restricted::ensure_private_dir(parent).map_err(|_| Error::Profile)?;
+            aterm_secrets::fsx::write_atomic(&token, bytes.as_slice(), 0o600)
+                .map_err(|_| Error::Profile)?;
+        }
+    }
+    Ok(claim)
+}
+
+/// Only an owned staging home may discard a canonically rejected token. The current
+/// registry binding must survive both the provider read and the exact-byte recheck.
+struct StagedRecovery<'a> {
+    expected_email: &'a str,
+    current: &'a dyn Fn() -> bool,
+}
+
+fn reset_rejected_staging(
+    profile: &Path,
+    recovery: &StagedRecovery<'_>,
+    deadline: Instant,
+    check: impl FnOnce(&str, Duration) -> Result<(), super::google_profile::Error>,
+) -> Result<bool, Error> {
+    if !(recovery.current)() {
+        return Err(Error::Authorization);
+    }
+    let path = profile.join(".gemini/antigravity-cli/antigravity-oauth-token");
+    let bytes = grant_bytes(&path).map_err(|_| Error::Native)?;
+    let token = native_access_token(bytes.as_slice()).map_err(|_| Error::Native)?;
+    let rejected = matches!(
+        check(token.as_str().ok_or(Error::Native)?, remaining(deadline)?),
+        Err(super::google_profile::Error::CredentialRejected)
+    );
+    if !rejected {
+        return Ok(false);
+    }
+    remaining(deadline)?;
+    if !(recovery.current)() {
+        return Err(Error::Authorization);
+    }
+    let current = grant_bytes(&path).map_err(|_| Error::Profile)?;
+    if grant_digest(current.as_slice()) != grant_digest(bytes.as_slice()) {
+        return Err(Error::Profile);
+    }
+    std::fs::remove_file(path).map_err(|_| Error::Profile)?;
+    Ok(true)
+}
+
+fn run_claimed(
+    program: &Path,
+    profile: &Path,
+    claim: Option<super::browser_window::ProfileLock>,
+    recovery: Option<StagedRecovery<'_>>,
+    deadline: Instant,
     mut approve: impl FnMut(&Authorization, Instant) -> Result<Code, Error>,
 ) -> Result<UnverifiedGrant, Error> {
     remaining(deadline)?;
@@ -589,7 +771,42 @@ pub fn run(
         return Err(Error::Profile);
     }
     aterm_types::fs_restricted::ensure_private_dir(profile).map_err(|_| Error::Profile)?;
-    let claim = super::browser_window::ProfileLock::claim(profile).map_err(|_| Error::Profile)?;
+    let claim = match claim {
+        Some(claim) => claim,
+        None => super::browser_window::ProfileLock::claim(profile).map_err(|_| Error::Profile)?,
+    };
+    let mut approval_started = false;
+    let mut result = run_attempt(program, profile, deadline, &mut |request, deadline| {
+        approval_started = true;
+        approve(request, deadline)
+    });
+    if matches!(result, Err(Error::Native))
+        && !approval_started
+        && let Some(recovery) = recovery
+    {
+        let rejected = reset_rejected_staging(profile, &recovery, deadline, |token, wait| {
+            super::google_profile::read(token, recovery.expected_email, wait).map(drop)
+        })?;
+        if rejected {
+            // The first native child is gone, and this same claim remains held.
+            // Retry once from an empty staging grant with the original deadline.
+            result = run_attempt(program, profile, deadline, &mut approve);
+        }
+    }
+    Ok(UnverifiedGrant {
+        path: result?,
+        program: program.to_owned(),
+        _claim: claim,
+    })
+}
+
+fn run_attempt(
+    program: &Path,
+    profile: &Path,
+    deadline: Instant,
+    approve: &mut impl FnMut(&Authorization, Instant) -> Result<Code, Error>,
+) -> Result<PathBuf, Error> {
+    remaining(deadline)?;
     let gemini = profile.join(".gemini");
     let (master, slave, mut child) = aterm_pty::spawn_session_leader_on_pty(|_| {
         #[allow(clippy::disallowed_types, reason = "the controlling-terminal spawn seam takes StdCommand and applies inherit_nothing before spawning")]
@@ -743,11 +960,39 @@ pub fn run(
     if !status.success() || grant.is_none_or(|bytes| bytes.is_empty()) {
         return Err(Error::Native);
     }
-    Ok(UnverifiedGrant {
-        path,
-        program: program.to_owned(),
-        _claim: claim,
-    })
+    Ok(path)
+}
+
+/// Synthetic post-verification capability for publication race tests; never authenticates.
+#[cfg(test)]
+pub(super) fn publication_fixture(
+    state: &Path,
+    profile: &Path,
+    account: &str,
+    email: &str,
+) -> VerifiedGoogleGrant {
+    let path = profile.join(".gemini/antigravity-cli/antigravity-oauth-token");
+    aterm_secrets::fsx::ensure_private_dir(path.parent().unwrap()).unwrap();
+    let bytes = br#"{"auth_method":"consumer","token":{"access_token":"synthetic-token"}}"#;
+    aterm_secrets::fsx::write_atomic(&path, bytes, 0o600).unwrap();
+    VerifiedGoogleGrant {
+        grant: UnverifiedGoogleGrant {
+            native: UnverifiedGrant {
+                path,
+                program: PathBuf::from("/synthetic/agy"),
+                _claim: super::browser_window::ProfileLock::claim(profile).unwrap(),
+            },
+            expected_email: email.into(),
+            state: state.into(),
+            account: account.into(),
+            revision: registry(state).unwrap().binding_revision("agy", account),
+        },
+        profile: super::google_profile::GoogleProfile {
+            email: email.into(),
+            principal: [1; 32],
+        },
+        digest: grant_digest(bytes),
+    }
 }
 
 #[cfg(test)]
@@ -755,18 +1000,145 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_google_subject_requires_guarded_scoped_identity() {
+        use super::super::accounts;
+        let root = aterm_tempfile::tempdir().unwrap();
+        let mut logins = accounts::Logins::default();
+        logins.labels.insert(
+            "one".into(),
+            accounts::Binding {
+                dir: Some(root.path().to_str().unwrap().into()),
+                ..Default::default()
+            },
+        );
+        accounts::note_google_identity(&mut logins, "one", "person@example.com", [1; 32]);
+        let serialized = logins.to_json();
+        let restored = accounts::Logins::from_json(&serialized, 2).unwrap();
+        assert_eq!(restored.labels["one"].google_principal, Some([1; 32]));
+        assert!(accounts::require_google_principal(&restored, "one", [1; 32]).is_ok());
+        assert!(accounts::require_google_principal(&restored, "one", [2; 32]).is_err());
+        for case in 0..3 {
+            let mut document: aterm_json::Value = aterm_json::from_str(&serialized).unwrap();
+            if case == 0 {
+                document
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("schema".into(), aterm_json::Value::from(3u64));
+            } else {
+                let binding = document
+                    .as_object_mut()
+                    .unwrap()
+                    .get_mut("labels")
+                    .unwrap()
+                    .as_object_mut()
+                    .unwrap()
+                    .get_mut("one")
+                    .unwrap()
+                    .as_object_mut()
+                    .unwrap();
+                if case == 1 {
+                    binding.insert(
+                        "google_principal".into(),
+                        aterm_json::Value::from("invalid"),
+                    );
+                } else {
+                    binding.insert("proved_dir".into(), aterm_json::Value::Null);
+                }
+            }
+            assert!(accounts::Logins::from_json(&document.to_string(), 2).is_err());
+        }
+        accounts::note_proof(&mut logins, "one", accounts::Proof::Unchecked);
+        let revoked = accounts::Logins::from_json(&logins.to_json(), 2).unwrap();
+        assert_eq!(revoked.labels["one"].google_principal, None);
+    }
+
+    #[test]
+    fn native_google_checkpoint_retains_subject_and_exact_grant_bytes() {
+        use super::super::accounts;
+        use crate::ai::connector::Cli;
+        let state = aterm_tempfile::tempdir().unwrap();
+        let staging = aterm_tempfile::tempdir().unwrap();
+        aterm_secrets::fsx::write_atomic(
+            &state.path().join("google-identities.toml"),
+            b"[[identities]]\nid='one'\nemail='person@example.com'\n[[bindings]]\nprovider='agy'\naccount='one'\nidentity='one'\nexpected_email='person@example.com'\n",
+            0o600,
+        ).unwrap();
+        let verified =
+            publication_fixture(state.path(), staging.path(), "one", "person@example.com");
+        let logins = accounts::Logins::default();
+        let actual = std::fs::canonicalize(staging.path()).unwrap();
+        assert!(
+            accounts::write_renewal_checkpoint_for(
+                Cli::Agy,
+                None,
+                "one",
+                "person@example.com",
+                staging.path().to_str().unwrap(),
+                None,
+                Some(accounts::Proof::Status),
+                1,
+                &logins
+            )
+            .is_err()
+        );
+        accounts::write_google_renewal_checkpoint(
+            "one",
+            staging.path().to_str().unwrap(),
+            &verified,
+            1,
+            &logins,
+        )
+        .unwrap();
+        let read = || accounts::read_renewal_checkpoint_for(Cli::Agy, staging.path(), &actual, 2);
+        let checkpoint = read().unwrap();
+        assert_eq!(checkpoint.google_principal, Some([1; 32]));
+        assert_eq!(
+            checkpoint.google_grant_digest,
+            Some(verified.digest().unwrap())
+        );
+        let row = accounts::Row {
+            label: "one".into(),
+            email: Some("person@example.com".into()),
+            ..Default::default()
+        };
+        assert!(accounts::checkpoint_identity_matches(
+            Cli::Agy,
+            &row,
+            &checkpoint
+        ));
+        assert!(accounts::checkpoint_current(
+            &row,
+            &accounts::State::default(),
+            &logins,
+            &checkpoint
+        ));
+        let token = verified.path().unwrap().to_owned();
+        aterm_secrets::fsx::write_atomic(&token, b"replaced after checkpoint", 0o600).unwrap();
+        assert!(read().is_none());
+        assert!(!accounts::checkpoint_current(
+            &row,
+            &accounts::State::default(),
+            &logins,
+            &checkpoint
+        ));
+        assert!(verified.digest().is_err());
+    }
+
+    #[test]
     fn native_token_requires_current_nested_schema_not_cached_identity() {
         let valid =
-            br#"{"token":{"access_token":"synthetic-token"},"id_token_email":"wrong@example.com"}"#;
+            br#"{"auth_method":"consumer","token":{"access_token":"synthetic-token"},"id_token_email":"wrong@example.com"}"#;
         assert_eq!(
             native_access_token(valid).unwrap().as_str(),
             Some("synthetic-token")
         );
         for invalid in [
-            br#"{"access_token":"synthetic-token"}"#.as_slice(),
+            br#"{"auth_method":"consumer","access_token":"synthetic-token"}"#.as_slice(),
             br#"{"id_token_email":"person@example.com","id_token":"synthetic-jwt"}"#,
-            br#"{"token":{"access_token":""}}"#,
-            br#"{"token":{"access_token":"bad\r\nheader"}}"#,
+            br#"{"auth_method":"consumer","token":{"access_token":""}}"#,
+            br#"{"auth_method":"consumer","token":{"access_token":"bad\r\nheader"}}"#,
+            br#"{"auth_method":"gcp","token":{"access_token":"synthetic-token"}}"#,
+            br#"{"token":{"access_token":"synthetic-token"}}"#,
         ] {
             assert!(native_access_token(invalid).is_err());
         }
@@ -785,7 +1157,7 @@ mod tests {
         let gemini = profile.path().join(".gemini");
         let path = gemini.join("antigravity-cli/antigravity-oauth-token");
         aterm_secrets::fsx::ensure_private_dir(path.parent().unwrap()).unwrap();
-        let bytes = br#"{"token":{"access_token":"synthetic-token"}}"#;
+        let bytes = br#"{"auth_method":"consumer","token":{"access_token":"synthetic-token"}}"#;
         aterm_secrets::fsx::write_atomic(&path, bytes, 0o600).unwrap();
         // Synthetic proof exercises the post-verification publication guard, not Google login.
         let verified = VerifiedGoogleGrant {
@@ -948,7 +1320,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_google_path_refuses_missing_credentials_before_native_launch() {
+    fn explicit_google_path_needs_credentials_only_after_a_native_handoff() {
         let state = aterm_tempfile::tempdir().unwrap();
         let home = aterm_tempfile::tempdir().unwrap();
         let registry = "[[identities]]\nid='one'\nemail='person@example.com'\n[[bindings]]\nprovider='agy'\naccount='one'\nidentity='one'\nexpected_email='person@example.com'\n";
@@ -967,9 +1339,7 @@ mod tests {
         );
         assert!(matches!(
             result,
-            Err(GoogleLoginError::Credentials(
-                super::super::google_credentials::Error::MissingReference
-            ))
+            Err(GoogleLoginError::Native(Error::Profile))
         ));
         assert!(!state.path().join("agy-logins").exists());
         assert!(!state.path().join("google-identities").exists());
@@ -984,35 +1354,87 @@ mod tests {
     }
 
     #[test]
-    fn existing_private_native_grant_reaches_native_route_without_a_google_password() {
+    fn staging_claim_precedes_seed_and_refuses_existing_grants() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let previous = root.path().join("previous");
+        let staging = root.path().join("staging");
+        let suffix = ".gemini/antigravity-cli/antigravity-oauth-token";
+        let source = previous.join(suffix);
+        aterm_secrets::fsx::ensure_private_dir(source.parent().unwrap()).unwrap();
+        aterm_secrets::fsx::write_atomic(&source, b"original", 0o600).unwrap();
+        let claim = stage_profile(&staging, Some(&previous)).unwrap();
+        assert!(super::super::browser_window::ProfileLock::claim(&staging).is_err());
+        aterm_secrets::fsx::write_atomic(&source, b"new-live-grant", 0o600).unwrap();
+        assert!(matches!(
+            stage_profile(&staging, Some(&previous)),
+            Err(Error::Profile)
+        ));
+        assert_eq!(std::fs::read(staging.join(suffix)).unwrap(), b"original");
+        drop(claim);
+        assert!(matches!(
+            stage_profile(&staging, Some(&previous)),
+            Err(Error::Profile)
+        ));
+        assert_eq!(std::fs::read(&source).unwrap(), b"new-live-grant");
+        assert_eq!(std::fs::read(staging.join(suffix)).unwrap(), b"original");
+    }
+
+    #[test]
+    fn staged_google_login_binds_the_row_before_touching_its_profile() {
         let state = aterm_tempfile::tempdir().unwrap();
         let home = aterm_tempfile::tempdir().unwrap();
-        let text = "[[identities]]\nid='one'\nemail='person@example.com'\n[[bindings]]\nprovider='agy'\naccount='one'\nidentity='one'\nexpected_email='person@example.com'\n";
         aterm_uds::private_file::write_private(
             state.path(),
             "google-identities.toml",
-            text.as_bytes(),
+            b"[[identities]]\nid='one'\nemail='person@example.com'\n[[bindings]]\nprovider='agy'\naccount='one'\nidentity='one'\nexpected_email='person@example.com'\n",
         )
         .unwrap();
-        let registry = super::registry(state.path()).unwrap();
-        let identity = registry.resolve("agy", "one").unwrap().0;
-        let path = native_profile(state.path(), "one", identity)
-            .join(".gemini/antigravity-cli/antigravity-oauth-token");
-        aterm_secrets::fsx::ensure_private_dir(path.parent().unwrap()).unwrap();
-        aterm_secrets::fsx::write_atomic(&path, b"synthetic-native-grant", 0o600).unwrap();
-        // Deliberately stop at native program admission: this proves password independence,
-        // not that the synthetic grant is valid or accepted by the provider.
-        let result = run_google(
-            Path::new("/not-a-native-program"),
-            state.path(),
-            home.path(),
-            "one",
-            Instant::now() + Duration::from_secs(30),
-        );
+        let staging = state.path().join("staged");
+        let previous = state.path().join("previous");
+        let attempt = |email: &str, profile: &Path| {
+            run_google_staged(
+                Path::new("/not-a-native-program"),
+                state.path(),
+                home.path(),
+                "one",
+                StagedGoogleLogin {
+                    profile,
+                    previous: Some(&previous),
+                    expected_email: email,
+                },
+                Instant::now() + Duration::from_secs(30),
+            )
+        };
         assert!(matches!(
-            result,
+            attempt("other@example.com", &staging),
+            Err(GoogleLoginError::Configuration)
+        ));
+        assert!(!staging.exists());
+        assert!(matches!(
+            attempt("person@example.com", Path::new("relative")),
+            Err(GoogleLoginError::Configuration)
+        ));
+        let registry = registry(state.path()).unwrap();
+        let identity = registry.resolve("agy", "one").unwrap().0;
+        let active = native_profile(state.path(), "one", identity);
+        assert!(matches!(
+            attempt("person@example.com", &active),
+            Err(GoogleLoginError::Configuration)
+        ));
+        assert!(!active.exists());
+        let token = previous.join(".gemini/antigravity-cli/antigravity-oauth-token");
+        aterm_secrets::fsx::ensure_private_dir(token.parent().unwrap()).unwrap();
+        aterm_secrets::fsx::write_atomic(&token, b"synthetic-native-grant", 0o600).unwrap();
+        assert!(matches!(
+            attempt("PERSON@example.com", &staging),
             Err(GoogleLoginError::Native(Error::Profile))
         ));
+        assert!(!active.exists());
+        assert_eq!(std::fs::read(&token).unwrap(), b"synthetic-native-grant");
+        assert_eq!(
+            std::fs::read(staging.join(".gemini/antigravity-cli/antigravity-oauth-token")).unwrap(),
+            b"synthetic-native-grant"
+        );
     }
 
     #[test]
@@ -1162,6 +1584,119 @@ mod tests {
         child.0 = 0;
         assert!(libc::WIFEXITED(status));
         assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    #[test]
+    fn rejected_staging_reset_preserves_refusals_and_concurrent_changes() {
+        const SAVED: &[u8] =
+            br#"{"auth_method":"consumer","token":{"access_token":"synthetic-only"}}"#;
+        for scenario in 0..7 {
+            let profile = aterm_tempfile::tempdir().unwrap();
+            let path = profile
+                .path()
+                .join(".gemini/antigravity-cli/antigravity-oauth-token");
+            aterm_secrets::fsx::ensure_private_dir(path.parent().unwrap()).unwrap();
+            aterm_secrets::fsx::write_atomic(&path, SAVED, 0o600).unwrap();
+            let current = std::cell::Cell::new(true);
+            let claim = super::super::browser_window::ProfileLock::claim(profile.path()).unwrap();
+            let deadline = if scenario == 6 {
+                Instant::now()
+            } else {
+                Instant::now() + Duration::from_secs(60)
+            };
+            let result = reset_rejected_staging(
+                profile.path(),
+                &StagedRecovery {
+                    expected_email: "person@example.com",
+                    current: &|| current.get(),
+                },
+                deadline,
+                |token, _| {
+                    assert_eq!(token, "synthetic-only");
+                    assert!(
+                        super::super::browser_window::ProfileLock::claim(profile.path()).is_err()
+                    );
+                    match scenario {
+                        0 => return Ok(()),
+                        1 => {
+                            return Err(super::super::google_profile::Error::Refused(
+                                "transport failed",
+                            ));
+                        }
+                        2 => {
+                            return Err(super::super::google_profile::Error::Refused(
+                                "identity mismatch",
+                            ));
+                        }
+                        4 => current.set(false),
+                        5 => aterm_secrets::fsx::write_atomic(&path, b"replaced", 0o600).unwrap(),
+                        _ => {}
+                    }
+                    Err(super::super::google_profile::Error::CredentialRejected)
+                },
+            );
+            match scenario {
+                0..=2 => assert_eq!(result, Ok(false)),
+                3 => assert_eq!(result, Ok(true)),
+                4 => assert_eq!(result, Err(Error::Authorization)),
+                5 => assert_eq!(result, Err(Error::Profile)),
+                6 => assert_eq!(result, Err(Error::Deadline)),
+                _ => unreachable!(),
+            }
+            if scenario == 3 {
+                assert!(!path.exists());
+            } else {
+                assert_eq!(
+                    std::fs::read(&path).unwrap(),
+                    if scenario == 5 {
+                        b"replaced".as_slice()
+                    } else {
+                        SAVED
+                    }
+                );
+            }
+            drop(claim);
+        }
+    }
+
+    #[test]
+    #[ignore = "contacts the installed native agy anonymously; ATERM_TEST_AGY names its pinned binary"]
+    fn native_expired_and_malformed_grants_reach_a_fresh_google_handoff() {
+        let program = std::env::var_os("ATERM_TEST_AGY")
+            .map(PathBuf::from)
+            .expect("ATERM_TEST_AGY is required");
+        let mut failed = Vec::new();
+        for (case, seed) in [
+            ("empty", None),
+            ("expired", Some(br#"{"auth_method":"consumer","id_token_email":"synthetic@example.invalid","token":{"access_token":"aterm-synthetic-access","token_type":"Bearer","refresh_token":"aterm-synthetic-invalid-refresh","expiry":"2000-01-01T00:00:00Z"}}"#.as_slice())),
+            ("rejected-before-expiry", Some(br#"{"auth_method":"consumer","id_token_email":"synthetic@example.invalid","token":{"access_token":"aterm-synthetic-access","token_type":"Bearer","refresh_token":"aterm-synthetic-invalid-refresh","expiry":"2100-01-01T00:00:00Z"}}"#.as_slice())),
+            ("malformed", Some(b"invalid synthetic native grant".as_slice())),
+        ] {
+            let profile = aterm_tempfile::tempdir().unwrap();
+            if let Some(seed) = seed {
+                let path = profile.path().join(".gemini/antigravity-cli/antigravity-oauth-token");
+                aterm_secrets::fsx::ensure_private_dir(path.parent().unwrap()).unwrap();
+                aterm_secrets::fsx::write_atomic(&path, seed, 0o600).unwrap();
+            }
+            let staging = aterm_tempfile::tempdir().unwrap();
+            let claim = stage_profile(staging.path(), Some(profile.path())).unwrap();
+            let original = std::fs::read(profile.path().join(".gemini/antigravity-cli/antigravity-oauth-token")).ok();
+            let mut observed = false;
+            let result = run_claimed(&program, staging.path(), Some(claim), Some(StagedRecovery { expected_email: "synthetic@example.invalid", current: &|| true }), Instant::now() + Duration::from_secs(60), |_, _| {
+                observed = true;
+                Err(Error::Callback)
+            });
+            println!("native recovery {case}: handoff={observed} failure={:?}", result.as_ref().err());
+            if !observed || !matches!(result, Err(Error::Callback)) {
+                failed.push(case);
+            }
+            assert_eq!(std::fs::read(profile.path().join(".gemini/antigravity-cli/antigravity-oauth-token")).ok(), original);
+            let _claim = super::super::browser_window::ProfileLock::claim(staging.path()).unwrap();
+        }
+        assert!(
+            failed.is_empty(),
+            "native recovery omitted Google handoff: {failed:?}"
+        );
     }
 
     #[test]

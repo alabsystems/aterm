@@ -277,6 +277,7 @@ impl Tallies {
                         "astream_flushes": {
                             "full": c.waits.flushes.full,
                             "barrier": c.waits.flushes.barrier,
+                            "plain": c.waits.flushes.plain,
                             "counted": wait_tally::FLUSHES_COUNTED,
                         },
                         "rows": rows_json(
@@ -589,7 +590,11 @@ mod tests {
             Reading { waits, handlers }
         };
         t.rebase(reading(10, 7, &[5_000], &[2_000]));
-        t.round("g", "1".into(), reading(10, 7, &[5_000, 9_000], &[2_000]));
+        let mut flushed = reading(10, 7, &[5_000, 9_000], &[2_000]);
+        flushed.waits.flushes.full = 3;
+        flushed.waits.flushes.barrier = 5;
+        flushed.waits.flushes.plain = 2;
+        t.round("g", "1".into(), flushed);
         t.round("g", "2".into(), reading(11, 7, &[3_000], &[2_000, 4_000]));
         let [one, two] = &t.rounds[..] else {
             panic!("two rounds")
@@ -619,6 +624,14 @@ mod tests {
             json["rounds"][1]["wait"]["rows"]["lane_status"]["count"].as_u64(),
             Some(1)
         );
+        // Every kind the tally counts, the plain fsync(2)s too, beside the claim it counts all.
+        let flushes = &json["rounds"][0]["wait"]["astream_flushes"];
+        assert_eq!(
+            ["full", "barrier", "plain"].map(|k| flushes[k].as_u64()),
+            [Some(3), Some(5), Some(2)],
+            "{flushes}"
+        );
+        assert_eq!(flushes["counted"].as_str(), Some("all"), "{flushes}");
         assert_eq!(
             json["rounds"][0]["handlers"]["rows"]
                 .as_object()

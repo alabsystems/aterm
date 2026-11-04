@@ -174,7 +174,8 @@ impl MembershipHint {
     /// [`hold_key`] is `key`, of which the peer durably took `taken`. The peer refuses whatever
     /// this Mac can offer once a run of refused rounds offered every record it lacks (the run's
     /// first record comes round again), or at once when `full`: a peer whose complete records
-    /// reach `MAX_RECORDS` takes no complete record (`Log::insert`). A run short of that proves
+    /// reach `LEGACY_RECORDS` (the most this wire's inventory names, and a 0.146-0.151 build's
+    /// held total) takes no complete record (`Log::insert`). A run short of that proves
     /// nothing, as a busy disk refuses a round and a peer parks a record whose parent it lacks
     /// without taking it. Once proved, the walk restarts at the earliest record the peer lacks,
     /// so the round after the hold offers parents before their children, and a refused round
@@ -1209,7 +1210,8 @@ impl Endpoint {
     }
 
     /// Synchronize verified membership records (`ACX2`) across bounded passes before control/table
-    /// repair, closing any local `Wrap` gaps and coalescing concurrent `Commons` epochs (`F18`).
+    /// repair. It signs no record: the vault pass's ranked closer and tender close `Wrap` gaps and
+    /// coalesce concurrent epochs ([`aterm_secrets::client::tend_epochs`], `F18`).
     fn sync_acx2_membership(
         &self,
         stream: &mut (impl Read + Write),
@@ -1224,10 +1226,6 @@ impl Endpoint {
             &MembershipDisk::new(paths, self.trust),
             side,
             &mut repair.membership_hint,
-            &mut |allow_coalesce| {
-                aterm_secrets::client::reconcile_commons_log(paths, allow_coalesce)
-                    .is_ok_and(|written| !written.is_empty())
-            },
             Instant::now(),
         )
     }
@@ -2091,17 +2089,16 @@ impl Store for Disk<'_> {
     }
 }
 
-/// Synchronize verified membership records (`ACX2`) in bounded passes, with a `reconcile`
-/// between them that may sign records (it closes `Wrap` gaps and, given `true`, coalesces
-/// concurrent `Commons` epochs) and answers whether it wrote any. The second `reconcile` and the
-/// third pass run only when the second pass moved records, which both sides see alike. `now`
-/// places the peer's refusal hold ([`MembershipHint::offers`]).
+/// Synchronize verified membership records (`ACX2`) in bounded passes; it signs nothing. A peer
+/// from before the exchange stopped signing may still sign between passes (a closed `Wrap` gap,
+/// a coalesced epoch), so a second pass always runs, and a third when the second moved records,
+/// which both sides see alike: the passes stay in step with such a peer. `now` places the peer's
+/// refusal hold ([`MembershipHint::offers`]).
 fn sync_log_membership(
     stream: &mut (impl Read + Write),
     store: &MembershipDisk<'_>,
     side: Side,
     hint: &mut MembershipHint,
-    reconcile: &mut dyn FnMut(bool) -> bool,
     now: Instant,
 ) -> Result<Report> {
     let mut total = Report::default();
@@ -2113,9 +2110,6 @@ fn sync_log_membership(
         if done {
             break;
         }
-    }
-    if reconcile(side == Side::Initiator) {
-        store.invalidate();
     }
     let mut second_moved = false;
     for _ in 0..16 {
@@ -2131,9 +2125,6 @@ fn sync_log_membership(
         }
     }
     if second_moved {
-        if reconcile(side == Side::Initiator) {
-            store.invalidate();
-        }
         for _ in 0..8 {
             let (round, done) = exchange_membership_round(stream, store, side, hint, now)?;
             total.sent += round.sent;
@@ -2352,7 +2343,7 @@ fn exchange_membership_round(
         key,
         &ids,
         sent,
-        remote.len() >= aterm_secrets::membership_log::MAX_RECORDS,
+        remote.len() >= aterm_secrets::membership_log::LEGACY_RECORDS,
         now,
     );
     let done =

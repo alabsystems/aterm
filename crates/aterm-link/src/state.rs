@@ -4555,12 +4555,10 @@ impl StateDir {
         let (tmp, mut file) = crate::enable::create_temp_beside(&target, 0o600)?;
         let staged = (|| {
             file.write_all(bytes)?;
+            // Quarantine evidence is flushed in full before its source may be unlinked:
+            // through aterm-durable, so astream-sys's tally counts it as every other flush.
             if flushes_media() {
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "quarantine evidence is flushed before its source may be unlinked"
-                )]
-                file.sync_all()?;
+                aterm_durable::durable(&file)?;
             }
             std::fs::hard_link(&tmp, &target)
         })();

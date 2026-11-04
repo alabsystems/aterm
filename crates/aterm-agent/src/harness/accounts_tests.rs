@@ -394,14 +394,11 @@ fn every_malformed_roster_is_refused_whole_and_names_the_row_and_the_reason() {
             })
             .collect()
     };
-    assert_eq!(
-        Roster::parse(&many(MAX_ACCOUNTS)).map(|r| r.rows.len()),
-        Ok(MAX_ACCOUNTS)
-    );
-    assert!(
-        Roster::parse(&many(MAX_ACCOUNTS + 1)).is_err(),
-        "over the bound"
-    );
+    assert_eq!(Roster::parse(&many(96)).map(|r| r.rows.len()), Ok(96));
+    for cli in [Cli::Claude, Cli::Codex] {
+        assert_eq!(Roster::parse_for(cli, &many(257)).unwrap().rows.len(), 257);
+    }
+    assert!(Roster::parse(&" ".repeat(MAX_ROSTER_BYTES as usize + 1)).is_err());
 
     for good in [
         "a",
@@ -675,6 +672,36 @@ fn full_state() -> State {
 }
 
 #[test]
+fn forgotten_account_observations_survive_large_roster_round_trips() {
+    let mut state = State::default();
+    for index in 0..256 {
+        remember_forgotten(
+            &mut state,
+            format!("ac-{index:016x}"),
+            Account {
+                auth: Auth::Ok,
+                auth_at: Some(NOW),
+                ran_at: Some(NOW - index),
+                ..Default::default()
+            },
+        );
+    }
+    assert_eq!(state.forgotten.len(), 256);
+    let serialized = state.to_json();
+    assert!(serialized.len() as u64 <= MAX_STATE_BYTES);
+    let restored = State::from_json(&serialized, NOW).expect("complete observation snapshot");
+    assert_eq!(restored.forgotten.len(), 256);
+    for index in 0..256 {
+        let key = format!("ac-{index:016x}");
+        let account = restored.forgotten.get(&key).expect("retained account");
+        assert_eq!(account.pk.as_deref(), Some(key.as_str()));
+        assert_eq!(account.ran_at, Some(NOW - index));
+        assert_eq!(account.auth, Auth::Unseen);
+        assert_eq!(account.auth_at, None);
+    }
+}
+
+#[test]
 fn the_state_round_trips_through_json_with_sorted_keys_and_null_for_unknown() {
     let s = full_state();
     let text = s.to_json();
@@ -944,7 +971,7 @@ fn a_stamp_ahead_of_the_clock_is_read_as_made_no_later_than_now_plus_the_skew() 
 fn a_hostile_state_is_bounded_as_it_is_read() {
     let long = "x".repeat(10_000);
     let mut accounts = aterm_json::Map::new();
-    for i in 0..(MAX_ACCOUNTS + 20) {
+    for i in 0..(96 + 20) {
         let mut walls = aterm_json::Map::new();
         for w in 0..(MAX_WALLS + 12) {
             walls.insert(
@@ -968,7 +995,7 @@ fn a_hostile_state_is_bounded_as_it_is_read() {
     accounts.insert(long.clone(), aterm_json::json!({"auth": "ok"}));
     accounts.insert("zz-not-an-object".into(), Value::from(3_i64));
     let mut sessions = aterm_json::Map::new();
-    for i in 0..(MAX_SESSIONS + 44) {
+    for i in 0..300 {
         sessions.insert(
             format!("s-{i:04}"),
             aterm_json::json!({"account": "a000", "at": i, "held": long.clone()}),
@@ -979,9 +1006,7 @@ fn a_hostile_state_is_bounded_as_it_is_read() {
         aterm_json::json!({"account": "No Such", "at": 1}),
     );
     sessions.insert("s-no-time".into(), aterm_json::json!({"account": "a000"}));
-    let rotations: Vec<Value> = (0..(MAX_ROTATIONS + 72))
-        .map(|i| Value::from(i64::try_from(i).expect("fits")))
-        .collect();
+    let rotations: Vec<Value> = (0..200).map(|i| Value::from(i64::from(i))).collect();
     let undo: Vec<Value> = (0..(MAX_UNDO + 5))
         .map(|i| {
             aterm_json::json!({
@@ -1010,7 +1035,7 @@ fn a_hostile_state_is_bounded_as_it_is_read() {
     let s = State::from_json(&aterm_json::to_string(&doc).expect("text"), NOW).expect("reads");
 
     assert_eq!(s.machine, "", "an id that is not hex is no id");
-    assert_eq!(s.accounts.len(), MAX_ACCOUNTS);
+    assert_eq!(s.accounts.len(), 116);
     assert!(s.accounts.keys().all(|k| admissible_label(k)));
     let a = &s.accounts["a000"];
     assert_eq!(a.walls.len(), MAX_WALLS);
@@ -1039,23 +1064,17 @@ fn a_hostile_state_is_bounded_as_it_is_read() {
     );
     assert_eq!((s.active.as_deref(), s.previous.as_deref()), (None, None));
     assert!(!s.proven && !s.pinned);
-    assert_eq!(s.sessions.len(), MAX_SESSIONS);
-    assert!(
-        s.sessions.values().all(|row| row.at >= 44),
-        "the newest sessions are the ones kept"
-    );
+    assert_eq!(s.sessions.len(), 300);
+    assert_eq!(s.sessions["s-0000"].at, 0);
+    assert_eq!(s.sessions["s-0299"].at, 299);
     assert!(
         s.sessions
             .values()
             .all(|row| row.held.as_ref().is_some_and(|h| h.len() <= WORD_MAX))
     );
     assert!(!s.sessions.contains_key("s-bad-account") && !s.sessions.contains_key("s-no-time"));
-    assert_eq!(s.rotations.len(), MAX_ROTATIONS);
-    assert_eq!(
-        s.rotations.first(),
-        Some(&72),
-        "the newest times are the ones kept"
-    );
+    assert_eq!(s.rotations.len(), 200);
+    assert_eq!(s.rotations.first(), Some(&0));
     assert_eq!(s.probe.as_ref().map(|c| c.sid.len()), Some(WORD_MAX));
     assert_eq!(s.reset, None, "a claim with no time is no claim");
     assert_eq!(s.canary.as_ref().map(|c| c.sid.len()), Some(WORD_MAX));
@@ -1069,28 +1088,155 @@ fn a_hostile_state_is_bounded_as_it_is_read() {
             && u.previous.as_deref().is_none_or(|l| l == "a000")
             && u.canary.as_ref().is_some_and(|c| c.sid.len() == WORD_MAX)
     }));
-    assert!(s.to_json().len() < 200_000, "what is kept is small");
+    assert!(
+        (s.to_json().len() as u64) < MAX_STATE_BYTES,
+        "retained observations fit the snapshot byte budget"
+    );
 }
 
 #[test]
-fn the_transactions_keep_every_map_bounded() {
+fn native_rotation_receipts_require_their_guarded_schema_and_survive_metadata_edits() {
+    let mut logins = Logins::default();
+    let id = "a".repeat(32);
+    logins.native_rotations.insert(id.clone(), "b".repeat(64));
+    let text = logins.to_json();
+    assert_eq!(Logins::from_json(&text, NOW).unwrap(), logins);
+    let mut doc: Value = aterm_json::from_str(&text).unwrap();
+    doc.as_object_mut()
+        .unwrap()
+        .insert("schema".into(), Value::from(3_u64));
+    assert!(Logins::from_json(&aterm_json::to_string(&doc).unwrap(), NOW).is_err());
+    doc.as_object_mut()
+        .unwrap()
+        .insert("schema".into(), Value::from(5_u64));
+    doc.as_object_mut().unwrap().remove("native_rotations");
+    assert!(Logins::from_json(&aterm_json::to_string(&doc).unwrap(), NOW).is_err());
+    let mut changed = logins.clone();
+    changed.native_rotations.clear();
+    assert!(advance_renewal_generations(&logins, &mut changed, &[]).is_err());
+    let mut changed = logins.clone();
+    changed.native_rotations.insert(id, "c".repeat(64));
+    assert!(advance_renewal_generations(&logins, &mut changed, &[]).is_err());
+}
+
+#[test]
+fn native_rotation_retirement_cannot_erase_another_binding_or_change_a_receipt() {
+    let id = "a".repeat(32);
+    let other = "c".repeat(32);
+    let binding = "b".repeat(64);
+    let mut before = Logins::default();
+    before.native_rotations.insert(id.clone(), binding.clone());
+    before
+        .native_rotations
+        .insert(other.clone(), binding.clone());
+    let mut after = before.clone();
+    after.native_rotations.remove(&id);
+    after.pending_native_retirement = Some(NativeRotationRetirement::new(&id, &binding));
+    advance_renewal_generations(&before, &mut after, &[]).unwrap();
+    assert!(after.pending_native_retirement.is_none());
+    assert_eq!(after.native_rotations.get(&other), Some(&binding));
+    assert_eq!(Logins::from_json(&after.to_json(), NOW).unwrap(), after);
+
+    for wrong in [false, true] {
+        let mut after = before.clone();
+        after.pending_native_retirement = Some(NativeRotationRetirement::new(&id, &binding));
+        if wrong {
+            after.native_rotations.insert(id.clone(), "d".repeat(64));
+        } else {
+            after.native_rotations.clear();
+        }
+        assert!(advance_renewal_generations(&before, &mut after, &[]).is_err());
+    }
+}
+
+#[test]
+fn oversized_account_snapshots_preserve_the_last_readable_files() {
+    let root = tmp("snapshot-bounds");
+    let store = Store::at(root.path());
+    store.save(&state()).unwrap();
+    store.save_logins(&Logins::default()).unwrap();
+    let old_state = std::fs::read(store.state_file()).unwrap();
+    let old_logins = std::fs::read(store.logins_file()).unwrap();
+    let mut large_state = state();
+    let mut large_logins = Logins::default();
+    for i in 0..8192 {
+        let label = format!("account-{i}");
+        large_state
+            .accounts
+            .insert(label.clone(), Account::default());
+        large_logins.labels.insert(label, Binding::default());
+    }
+    assert!(large_state.to_json().len() as u64 > MAX_STATE_BYTES);
+    assert!(large_logins.to_json().len() as u64 > MAX_LOGINS_BYTES);
+    assert_eq!(
+        store.save(&large_state).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    assert_eq!(
+        store.save_logins(&large_logins).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    assert_eq!(std::fs::read(store.state_file()).unwrap(), old_state);
+    assert_eq!(std::fs::read(store.logins_file()).unwrap(), old_logins);
+    assert!(store.load(NOW).is_ok());
+    assert!(store.load_logins(NOW).is_ok());
+}
+
+#[test]
+fn account_quota_and_execution_holds_survive_a_large_pool_round_trip() {
     let mut s = state();
-    for i in 0..(MAX_ACCOUNTS + 5) {
-        let at = NOW + i64::try_from(i).expect("fits");
+    for index in 0..96 {
+        let label = format!("pool-{index}");
+        note_wall(&mut s, &label, "seven_day", Some(NOW + DAY), NOW, NOW);
+    }
+    let mut doc: Value = aterm_json::from_str(&s.to_json()).expect("state");
+    let mut leases = Map::new();
+    let mut claimed = Map::new();
+    let names: Vec<_> = s.accounts.keys().cloned().collect();
+    for label in &names {
+        leases.insert(
+            label.clone(),
+            aterm_json::json!({
+                "holder": "machine-1", "until": NOW + DAY, "at": NOW
+            }),
+        );
+        claimed.insert(label.clone(), Value::from(NOW));
+    }
+    let object = doc.as_object_mut().expect("state object");
+    object.insert("schema".into(), Value::from(PREPARED_STATE_SCHEMA));
+    object.insert("leases".into(), Value::Object(leases));
+    object.insert("claimed_at".into(), Value::Object(claimed));
+    object.insert("home_accounts".into(), aterm_json::json!(names));
+    object.insert("prepared_accounts".into(), aterm_json::json!(names));
+    let loaded = State::from_json(&aterm_json::to_string(&doc).expect("json"), NOW)
+        .expect("large pool state");
+    assert_eq!(loaded.accounts.len(), 96);
+    assert_eq!(loaded.leases.len(), 96);
+    assert_eq!(loaded.claimed_at.len(), 96);
+    assert_eq!(loaded.home_accounts.len(), 96);
+    assert_eq!(loaded.prepared_accounts.len(), 96);
+    assert_eq!(State::from_json(&loaded.to_json(), NOW), Ok(loaded.clone()));
+    for account in loaded.accounts.values() {
+        assert_eq!(account.walls["seven_day"].until, Some(NOW + DAY));
+    }
+}
+
+#[test]
+fn transactions_preserve_accounts_and_bound_observation_history() {
+    let mut s = state();
+    for i in 0..(96 + 5) {
+        let at = NOW + i64::from(i);
         assert_eq!(
             note_auth(&mut s, &format!("a{i:02}"), Auth::Ok, at).len(),
             1
         );
     }
-    assert_eq!(s.accounts.len(), MAX_ACCOUNTS);
+    assert_eq!(s.accounts.len(), 96 + 5);
     assert!(
-        !s.accounts.contains_key("a00"),
-        "the one written longest ago went"
+        s.accounts.contains_key("a00"),
+        "adding accounts must not erase earlier quota and authentication state"
     );
-    assert!(
-        s.accounts
-            .contains_key(&format!("a{:02}", MAX_ACCOUNTS + 4))
-    );
+    assert!(s.accounts.contains_key(&format!("a{:02}", 96 + 4)));
 
     for w in 0..(MAX_WALLS + 3) {
         let until = NOW + i64::try_from(w).expect("fits") * HOUR;
@@ -1105,12 +1251,12 @@ fn the_transactions_keep_every_map_bounded() {
         "the most lapsed wall went"
     );
 
-    for i in 0..(MAX_SESSIONS + 9) {
-        let at = NOW + i64::try_from(i).expect("fits");
+    for i in 0..300 {
+        let at = NOW + i64::from(i);
         note_session(&mut s, &format!("s-{i:04}"), "a10", None, at);
     }
-    assert_eq!(s.sessions.len(), MAX_SESSIONS);
-    assert!(!s.sessions.contains_key("s-0000") && s.sessions.contains_key("s-0009"));
+    assert_eq!(s.sessions.len(), 300);
+    assert!(s.sessions.contains_key("s-0000") && s.sessions.contains_key("s-0299"));
 
     let r = roster(&[
         ("a10", Class::Preferred, None),
@@ -3937,6 +4083,36 @@ fn the_machine_rotates_at_most_twice_the_roster_size_an_hour() {
     assert_eq!(s.rotations.len(), bound);
     assert!(s.rotations.iter().all(|t| NOW - t < HOUR));
     assert!(rotations_spent(&s, &r, NOW));
+}
+
+#[test]
+fn a_large_roster_keeps_enough_rotation_history_to_enforce_its_breaker() {
+    let names: Vec<_> = (0..96).map(|i| format!("account-{i}")).collect();
+    let dirs: Vec<_> = names
+        .iter()
+        .map(|name| abs(&format!("/logins/{name}")))
+        .collect();
+    let rows: Vec<_> = names
+        .iter()
+        .zip(&dirs)
+        .map(|(name, dir)| (name.as_str(), Class::Preferred, Some(dir.as_str())))
+        .collect();
+    let r = roster(&rows);
+    let mut s = State {
+        rotations: vec![NOW; 191],
+        ..state()
+    };
+    assert!(!rotations_spent(&s, &r, NOW));
+    begin_rotation(&mut s, &r, &all(&r), None, mover(&names[0]), &names[1], NOW)
+        .expect("last permitted rotation");
+    let restored = State::from_json(&s.to_json(), NOW).unwrap();
+    assert_eq!(restored.rotations.len(), 192);
+    assert!(rotations_spent(&restored, &r, NOW));
+    assert_eq!(
+        breaker_until(&restored, &r, NOW),
+        Some(NOW + ROTATION_WINDOW_S)
+    );
+    assert!(!rotations_spent(&restored, &r, NOW + ROTATION_WINDOW_S));
 }
 
 #[test]

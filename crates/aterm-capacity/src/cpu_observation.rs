@@ -116,7 +116,13 @@ mod tests {
     }
 
     fn pool(dir: &Path, slots: u32) -> Pool {
-        Pool::open_in(dir, NonZeroU32::new(slots).unwrap()).unwrap()
+        eventually(
+            "the pool opener's inherited initialization lock to close",
+            || match Pool::open_in(dir, NonZeroU32::new(slots).unwrap()) {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => None,
+                result => Some(result.unwrap()),
+            },
+        )
     }
 
     #[test]

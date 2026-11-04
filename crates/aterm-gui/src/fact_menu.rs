@@ -72,7 +72,8 @@ pub(crate) enum FactAct {
     Type(Slash),
     /// Switch/pin onto the account named by the displayed roster row.
     UseAccount(AccountLabel),
-    /// Unpin and return to automatic account rotation (dedicated → pool).
+    /// Request this machine's CLI-pool pin release and normal upkeep, without changing
+    /// rotation mode or the session's Autopilot.
     AutoRotate,
     /// Open a terminal tab in aterm's configuration folder.
     AccountSettings,
@@ -249,14 +250,19 @@ pub(crate) fn weekly_gap_why(gap: WeeklyGap) -> &'static [&'static str] {
             "reply, and no reply in the last hour",
             "brought one.",
         ],
+        WeeklyGap::ClockInvalid => &[
+            "The weekly figure was read, but its",
+            "observation time is unconfirmed on this",
+            "clock. It is not shown as current.",
+        ],
     }
 }
 
 /// What the account menu takes from a footer's subscription `sub` at `now` (`walled`: a 7d wall
 /// in its transcript): the session's own row figure (as [`row_figure`] gives it), the meter
-/// line, and the footer's gap where there is neither. A figure whose week has reset since the
-/// footer read it gives no row or meter; a wall's or a screen's words, with no figure behind
-/// them, give their own percent.
+/// line, and the footer's gap where there is neither. A figure whose week has reset or whose
+/// observation clock is not admitted gives no row or meter; a wall's or a screen's words, with
+/// no figure behind them, give their own percent.
 pub(crate) fn weekly_facts(
     sub: &aterm_agent::harness::profile::SubscriptionDisplay,
     walled: bool,
@@ -289,12 +295,15 @@ pub(crate) fn session_figure(
     sub: &aterm_agent::harness::profile::SubscriptionDisplay,
     now: i64,
 ) -> Option<WeeklyFigure> {
-    sub.weekly_figure
-        .filter(|figure| sub.weekly.is_some() && figure.resets_at > now)
+    sub.weekly_figure.filter(|figure| {
+        sub.weekly.is_some()
+            && figure.resets_at > now
+            && aterm_agent::harness::profile::usage_read_age(figure.at, now).is_some()
+    })
 }
 
 /// An account row's whole percent left and, once the figure is past [`WeeklyFigure::current`],
-/// its age (` · 40m ago`, ` · 3h ago`, ` · 2d ago`); a figure stamped ahead of `now` has no age.
+/// its age (` · 40m ago`, ` · 3h ago`, ` · 2d ago`). Its caller admits observation time first.
 fn row_figure(figure: WeeklyFigure, now: i64) -> (u32, String) {
     let left = whole_left(1000u32.saturating_sub(figure.used_x10.min(1000)));
     let age = now.saturating_sub(figure.at);
@@ -350,8 +359,9 @@ pub(crate) struct FactMenuFacts {
     pub(crate) accounts_refused: Option<String>,
     /// Account choices are being read off the event-loop thread.
     pub(crate) accounts_loading: bool,
-    /// Whether automatic account selection is allowed (`!state.pinned`).
-    pub(crate) auto_rotate: bool,
+    /// This CLI pool on this machine has no committed account pin (`!state.pinned`).
+    /// A pending selection may still exist; this is not session recovery authority.
+    pub(crate) pool_unpinned: bool,
     /// The facts hidden in this session.
     pub(crate) off: FactMask,
     /// The session's absolute working directory.
@@ -772,7 +782,7 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
                 }
             }
             note(&mut out);
-            if facts.cli.is_none() {
+            let Some(cli) = facts.cli else {
                 if let Some(own) = facts.own_login {
                     out.push(MenuRow::note(own.to_string()));
                 }
@@ -786,7 +796,7 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
                     ));
                 }
                 return out;
-            }
+            };
             if facts.accounts_loading {
                 out.push(MenuRow::note("Loading account choices…"));
                 return out;
@@ -803,9 +813,7 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
                 });
                 return out;
             }
-            let other = facts
-                .cli
-                .filter(|cli| *cli != aterm_agent::harness::accounts::Cli::Claude);
+            let other = (cli != aterm_agent::harness::accounts::Cli::Claude).then_some(cli);
             if facts.accounts.is_empty()
                 && let Some(cli) = other
             {
@@ -835,8 +843,11 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
                 out.push(MenuRow::Rule);
                 out.push(MenuRow::Item {
                     glyph: "\u{21bb}",
-                    label: "Sync & allow automatic selection".to_string(),
-                    spoken: "Sync and allow automatic account selection".to_string(),
+                    label: "Sync accounts & clear this machine’s pin".to_string(),
+                    spoken: format!(
+                        "Sync accounts and clear this machine's {} pool pin",
+                        cli.connector().product
+                    ),
                     act: MenuAct::Fact(fact, FactAct::AutoRotate),
                     enabled: true,
                     checked: false,
@@ -872,11 +883,14 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
             out.push(MenuRow::Rule);
             out.push(MenuRow::Item {
                 glyph: "\u{21bb}",
-                label: "Allow automatic selection".to_string(),
-                spoken: "Allow automatic account selection".to_string(),
+                label: "No pinned account · this machine".to_string(),
+                spoken: format!(
+                    "No pinned account in this machine's {} pool",
+                    cli.connector().product
+                ),
                 act: MenuAct::Fact(fact, FactAct::AutoRotate),
                 enabled: true,
-                checked: facts.auto_rotate,
+                checked: facts.pool_unpinned,
             });
             out.push(MenuRow::Item {
                 glyph: "\u{22ef}",
@@ -1234,6 +1248,10 @@ pub(crate) fn account_menu_rows_from(
         }),
     };
     let session_label = session_row.map(|row| row.label.as_str());
+    let session_admitted = session.figure.is_none_or(|figure| {
+        figure.resets_at > now
+            && aterm_agent::harness::profile::usage_read_age(figure.at, now).is_some()
+    });
     let active_label = session_label.or(state.active.as_deref());
     let mut rows = Vec::with_capacity(roster.rows.len());
     for row in &roster.rows {
@@ -1243,6 +1261,23 @@ pub(crate) fn account_menu_rows_from(
         let is_enrolled = enrolled.contains(&row.label);
         let cond = accounts::condition(row, state, is_enrolled, now);
         let is_active = active_label == Some(row.label.as_str());
+        let barrier = state
+            .accounts
+            .get(&row.label)
+            .and_then(|account| account.windows.get(accounts::WEEK_LIMIT));
+        let own = session.figure.filter(|figure| {
+            session_admitted
+                && session_label == Some(row.label.as_str())
+                && barrier.is_none_or(|window| window.admits_reading(figure.at))
+        });
+        let left_admitted = session_admitted
+            && match session.figure {
+                Some(_) => own.is_some(),
+                None => {
+                    barrier.is_none_or(|window| window.epoch_at.is_none())
+                        || session.left.as_ref().is_some_and(|(left, _)| *left == 0)
+                }
+            };
         let pct_left = if matches!(cond, accounts::Condition::Limited { .. }) {
             Some((0, String::new()))
         } else {
@@ -1251,14 +1286,17 @@ pub(crate) fn account_menu_rows_from(
                 .get(&row.label)
                 .and_then(|acct| {
                     let [tapped, sampled] = crate::claude_footer::store_figures(acct, now);
-                    let own = session
-                        .figure
-                        .filter(|_| session_label == Some(row.label.as_str()));
                     WeeklyFigure::newer(WeeklyFigure::newer(tapped, sampled), own)
                         .map(|figure| row_figure(figure, now))
                         .or_else(|| {
                             acct.warned_week
                                 .as_ref()
+                                .filter(|warning| {
+                                    aterm_agent::harness::profile::usage_read_age(warning.at, now)
+                                        .is_some()
+                                        && barrier
+                                            .is_none_or(|window| window.admits_reading(warning.at))
+                                })
                                 .and_then(|w| w.figure(accounts::WEEK_WINDOW_S, now))
                                 .map(|(pct, _)| {
                                     (100u32.saturating_sub(pct.min(100)), String::new())
@@ -1266,7 +1304,7 @@ pub(crate) fn account_menu_rows_from(
                         })
                 })
                 .or_else(|| {
-                    (session_label == Some(row.label.as_str()))
+                    (left_admitted && session_label == Some(row.label.as_str()))
                         .then(|| session.left.clone())
                         .flatten()
                 })
@@ -1443,9 +1481,9 @@ impl App {
             };
             if cli.is_some() {
                 match self.account_menu_rows_cached(session) {
-                    Some(Ok((accounts, auto_rotate))) => {
+                    Some(Ok((accounts, pool_unpinned))) => {
                         out.accounts.clone_from(accounts);
-                        out.auto_rotate = *auto_rotate;
+                        out.pool_unpinned = *pool_unpinned;
                     }
                     Some(Err(why)) => out.accounts_refused = Some(why.clone()),
                     None => out.accounts_loading = true,
@@ -1592,9 +1630,7 @@ impl App {
             self.request_account_read(session);
         }
         let (rows, spoken) = self.fact_menu_rows(wid, session, fact);
-        let highlight = keyboard
-            .then(|| step(&rows, None, true, rows.len()))
-            .flatten();
+        let highlight = keyboard.then(|| step(&rows, None, true)).flatten();
         let focus = self.focused_session_id(wid);
         let px = self
             .windows
@@ -1611,6 +1647,10 @@ impl App {
             spoken,
             cancels: None,
             highlight,
+            viewport: crate::menu_viewport::MenuViewport::default(),
+            page_rows: 0,
+            wheel_residual: 0.0,
+            wheel_residual_x: 0.0,
             rect: None,
             laid: None,
             generation: 0,

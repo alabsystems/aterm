@@ -217,7 +217,7 @@ fn alias_relabel_onto_an_occupied_roster_target_moves_its_occupant_or_refuses_wh
 }
 
 #[test]
-fn full_fleet_refuses_to_assign_the_known_default_login_to_another_account() {
+fn large_fleet_preserves_the_known_default_login() {
     let mut bed = Bed::new();
     let mut old = Roster::load(&bed.path).unwrap();
     old.rows[0].email = Some("alias@example.test".into());
@@ -225,14 +225,13 @@ fn full_fleet_refuses_to_assign_the_known_default_login_to_another_account() {
     fs::write(&bed.path, format_roster_toml(&old).unwrap()).unwrap();
     let csv = format!(
         "email,computer,claude\n{}",
-        (0..accounts::MAX_ACCOUNTS)
+        (0..96)
             .map(|index| format!("other-{index}@example.test,m1,1\n"))
             .collect::<String>()
     );
     bed.fleet = parse_accounting_csv(&csv, "full.csv").unwrap();
-    let before = bed.records();
     for hint in [None, Some("owner@example.test")] {
-        let why = persist_accounts_sync(
+        persist_accounts_sync(
             &bed.store,
             &bed.path,
             (&bed.fleet, OptIn::Named),
@@ -241,10 +240,16 @@ fn full_fleet_refuses_to_assign_the_known_default_login_to_another_account() {
             NOW,
             (&[], &[]),
         )
-        .err()
-        .expect("full roster cannot displace the known default");
-        assert!(why.contains("known default login"), "{why}");
-        assert_eq!(bed.records(), before);
+        .expect("a large roster keeps its known default identity");
+        let stored = Roster::load(&bed.path).unwrap();
+        assert_eq!(stored.rows.len(), 97);
+        assert_eq!(
+            stored
+                .row_for_login(None)
+                .unwrap()
+                .expected_identity_email(),
+            Some("owner@example.test")
+        );
     }
 }
 

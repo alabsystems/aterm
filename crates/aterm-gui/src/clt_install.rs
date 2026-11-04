@@ -1211,7 +1211,8 @@ impl App {
     /// wakes, the row stays calm until that reading lands ([`Settling`]), and the shim comes off
     /// new shells. So does any other end of the current attempt where the tools are there now,
     /// having come another way while it ran: a tab closed at its password prompt, or one adopted
-    /// from an earlier aterm whose end gives no status, said nothing of them.
+    /// from an earlier aterm whose end gives no status, said nothing of them. After exit 0 the
+    /// current attempt's tab closes by itself unless it is its window's last.
     /// Exit 1 said why the install did not finish, and takes the account's [`Mark`] back where this
     /// build's line is the tab's own ([`Terminal::spent_mark`]: its landing's claim added it, or
     /// an adoption's did), so the next launch asks again; after a decline on this build, or an
@@ -1368,6 +1369,17 @@ impl App {
         }
         if current {
             self.settle_developer_tools_shim();
+        }
+        // Its work is done and nothing in it waits on anyone, so the current attempt's tab goes by
+        // itself and no tab is left for a person to close (nux round 9, item 12); an older one's
+        // late end keeps its tab and its result. The last tab of its window stays, since closing
+        // that would end the window.
+        if current
+            && matches!(exit, Some(aterm_pty::ChildExit::Code(0)))
+            && !self.close_ends_window(session)
+            && let Err(why) = self.close_session_by_id(session)
+        {
+            aterm_log::info!("System State: the Command Line Tools tab stays open: {why}");
         }
     }
 

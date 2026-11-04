@@ -1078,6 +1078,66 @@ fn steps(
             &format!("DRY RUN — nothing in {} will change", site_dir.display()),
         );
     }
+    // Write on origin's tip. Another machine's sync moves origin past this checkout, and a commit
+    // made on the older base would conflict, in the pull before the push, over the very files this
+    // sync rewrites. A checkout holding commits origin lacks keeps them for that pull.
+    halt(launch, "the fetch")?;
+    match git.out(&site_root, &["fetch", "--quiet", "origin", &branch]) {
+        Err(e) => say(
+            out,
+            &format!(
+                "fetch of origin {branch} failed ({}): writing on this checkout's HEAD, which the \
+                 pull before the push reconciles",
+                last_line(&e)
+            ),
+        ),
+        Ok(_) => {
+            let tip = git.line(
+                &site_root,
+                &[
+                    "rev-parse",
+                    "--quiet",
+                    "--verify",
+                    &format!("refs/remotes/origin/{branch}^{{commit}}"),
+                ],
+            );
+            let head = git.line(&site_root, &["rev-parse", "HEAD"]);
+            if let (Some(tip), Some(head)) = (tip, head)
+                && tip != head
+                && git.ok(&site_root, &["merge-base", "--is-ancestor", &head, &tip])
+            {
+                if dry {
+                    say(
+                        out,
+                        &format!(
+                            "dry run: a real sync first fast-forwards to origin {branch} @ {}",
+                            short(&tip)
+                        ),
+                    );
+                } else {
+                    git.out(&site_root, &["merge", "--ff-only", "--quiet", &tip])
+                        .map_err(|e| {
+                            child_failed(
+                                "git merge",
+                                format!(
+                                    "fast-forwarding the site checkout to origin {branch} @ {} \
+                                     failed, before anything was written: {}",
+                                    short(&tip),
+                                    last_line(&e)
+                                ),
+                            )
+                        })?;
+                    say(
+                        out,
+                        &format!(
+                            "site checkout fast-forwarded to origin {branch} @ {}",
+                            short(&tip)
+                        ),
+                    );
+                }
+            }
+        }
+    }
     let clone = scratch.dir.join("clone");
     halt(launch, "the clone")?;
     say(out, &format!("cloning {} (shallow)", env.clone_url));

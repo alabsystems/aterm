@@ -23842,30 +23842,35 @@ fn claims_touch_pushing(
     let Some(now) = aterm_time::unix_secs().and_then(|now| i64::try_from(now).ok()) else {
         return;
     };
-    let roster = accounts::default_roster_path();
-    let (touched, pushed) = aterm_agent::harness::claims::touch_pushing(
-        &home,
-        &state,
-        roster.as_deref(),
-        accounts::Cli::Claude,
-        act,
-        now,
-        deadline,
-    );
-    match (touched, pushed) {
-        (_, Some(Ok(()))) => aterm_log::info!(
-            "harness: account claims: this Mac's row before {before} went to a peer"
-        ),
-        (_, Some(Err(why))) => aterm_log::info!(
-            "harness: account claims: this Mac's row before {before} went to no peer ({why}); \
+    let config = aterm_types::dirs::aterm_config_path();
+    for cli in aterm_agent::harness::claims::CLAIMED_CLIS {
+        let roster = config
+            .as_deref()
+            .and_then(|path| accounts::roster_beside_for(path, cli));
+        let (touched, pushed) = aterm_agent::harness::claims::touch_pushing(
+            &home,
+            &state,
+            roster.as_deref(),
+            cli,
+            act,
+            now,
+            deadline,
+        );
+        match (touched, pushed) {
+            (_, Some(Ok(()))) => aterm_log::info!(
+                "harness: account claims: this Mac's row before {before} went to a peer"
+            ),
+            (_, Some(Err(why))) => aterm_log::info!(
+                "harness: account claims: this Mac's row before {before} went to no peer ({why}); \
              each peer reads it at its next repair round with this Mac, else this Mac's claims \
              at their row's until"
-        ),
-        (aterm_agent::harness::claims::Touched::Unrecorded(why), None) => aterm_log::info!(
-            "harness: account claims: this Mac's row before {before} was not written ({why}); \
+            ),
+            (aterm_agent::harness::claims::Touched::Unrecorded(why), None) => aterm_log::info!(
+                "harness: account claims: this Mac's row before {before} was not written ({why}); \
              its claims stand until their row lapses"
-        ),
-        (_, None) => {}
+            ),
+            (_, None) => {}
+        }
     }
 }
 
@@ -23876,15 +23881,14 @@ fn claims_touch(act: aterm_agent::harness::claims::Act<'_>) {
     let Some(now) = aterm_time::unix_secs().and_then(|now| i64::try_from(now).ok()) else {
         return;
     };
-    let roster = accounts::default_roster_path();
-    let _ = aterm_agent::harness::claims::touch(
-        &home,
-        &state,
-        roster.as_deref(),
-        accounts::Cli::Claude,
-        act,
-        now,
-    );
+    let config = aterm_types::dirs::aterm_config_path();
+    for cli in aterm_agent::harness::claims::CLAIMED_CLIS {
+        let roster = config
+            .as_deref()
+            .and_then(|path| accounts::roster_beside_for(path, cli));
+        let _ =
+            aterm_agent::harness::claims::touch(&home, &state, roster.as_deref(), cli, act, now);
+    }
 }
 
 /// The live upkeep where the instance runs as its account's own (`not_own` is `None`) or the

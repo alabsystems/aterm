@@ -4,7 +4,7 @@
 //! A launch's account claim (docs/DESIGN-fluid-swarm-2026-10-28.md F19): the row a launch starts
 //! on is claimed before its session starts, and a launch on another Mac that has heard the claim
 //! starts elsewhere. A launch whose claim this Mac could not record starts only on a home account,
-//! and only Claude Code's rows are claimed.
+//! for each provider participating in the shared machine claim set.
 
 use std::sync::Arc;
 
@@ -116,17 +116,85 @@ fn a_launch_never_starts_on_a_lease_its_claim_could_not_record() {
 }
 
 #[test]
-fn a_codex_launch_claims_nothing() {
-    // Nothing renews a Codex claim (Claude Code alone has a usage tap), so no Codex row is
-    // claimed, as none was leased.
+fn a_codex_launch_claims_its_account() {
     let m1 = World::new("claims-codex");
     m1.claimed_two(Cli::Codex);
     m1.on_main(Cli::Codex, &[]);
     let t1 = Arc::new(Replica::new("aa01"));
     let pick = claims::with_table(t1.clone(), || launch_env(&m1.seat(), Cli::Codex, &no_usage));
+    if cfg!(not(unix)) {
+        assert!(pick.is_none());
+        assert!(t1.row("aa01").is_none());
+        return;
+    }
     assert_eq!(pick.expect("a pick").label, "main");
-    assert_eq!(t1.row("aa01"), None);
+    assert!(
+        t1.row("aa01")
+            .unwrap()
+            .claim(&LeaseKey::new("codex", "main@example.test").unwrap())
+            .is_some()
+    );
     assert!(!m1.load(Cli::Codex).unrecorded);
+}
+
+#[cfg(unix)]
+#[test]
+fn native_quota_commit_claims_the_destination_and_refuses_a_senior_peer() {
+    use claims::Table;
+    for peer_holds in [false, true] {
+        let world = World::new("native-quota-machine-claim");
+        world.two(Cli::Codex);
+        world.claimed_two(Cli::Codex);
+        world.on_main(Cli::Codex, &[]);
+        let mut request = session(
+            Cli::Codex,
+            Supervisor::Own,
+            Mode::Early,
+            Path::new("/opt/codex"),
+        );
+        request.point = Point::Wall {
+            window: "seven_day".into(),
+            at: Some(NOW),
+        };
+        request.sample.as_mut().unwrap().week_pct = Some(100);
+        let plan = super::super::native_quota_plan(&world.seat(), &request, |note| note.record());
+        assert!(plan.selected_rows().is_some());
+        let table = Arc::new(Replica::new("aa01"));
+        let destination = LeaseKey::new("codex", "work@example.test").unwrap();
+        if peer_holds {
+            let peer = Replica::new("bb02");
+            peer.write(
+                &world.home,
+                &claims::Row {
+                    machine: "bb02".into(),
+                    label: "peer".into(),
+                    counter: 1,
+                    until: NOW + claims::HORIZON_S,
+                    claims: vec![claims::Claim {
+                        key: destination.clone(),
+                        kind: claims::Kind::Lease,
+                        since: NOW - 1,
+                    }],
+                },
+            )
+            .unwrap();
+            table.merge(&peer);
+        }
+        let result = claims::with_table(table.clone(), || {
+            plan.commit_native(NOW, &"ab".repeat(16), &"cd".repeat(32))
+        });
+        assert_eq!(result.line.is_some(), !peer_holds);
+        let state = world.load(Cli::Codex);
+        if peer_holds {
+            assert_eq!(state.active.as_deref(), Some("main"));
+            assert!(state.rotations.is_empty());
+            assert!(table.row("aa01").is_none());
+        } else {
+            assert_eq!(state.active.as_deref(), Some("work"));
+            assert_eq!(state.rotations, [NOW]);
+            assert!(table.row("aa01").unwrap().claim(&destination).is_some());
+        }
+    }
 }
 
 /// Rotation off moves nothing, and its launch on the owner's pin still never starts on another

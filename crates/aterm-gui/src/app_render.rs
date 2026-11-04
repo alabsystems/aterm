@@ -2737,10 +2737,6 @@ fn apply_bell_invert_at(pixels: &mut [u32], placement: PlacedFrame, active: bool
     }
 }
 
-fn drop_border_px(w: usize, h: usize) -> usize {
-    (w.min(h) / 200).clamp(2, 6)
-}
-
 const DROP_WASH_ALPHA: u32 = 28; // ~11% — readable content underneath
 const DROP_BORDER_ALPHA: u32 = 235; // ~92% — a crisp but not harsh frame
 
@@ -2753,38 +2749,8 @@ pub(crate) struct OverlayGlow {
     pub(crate) wash_a: u8,
     /// Inset-border alpha (0..255).
     pub(crate) border_a: u8,
-    /// Border thickness as a multiple of the size-derived law ([`drop_border_px`]), in 1/16 units.
+    /// Border thickness as a multiple of the size-derived law ([`aterm_gpu::drop_border_px`]), in 1/16 units.
     pub(crate) border_scale_q4: u8,
-}
-
-fn scaled_border_px(base: usize, scale_q4: u8) -> usize {
-    if scale_q4 == 0 {
-        return base;
-    }
-    let scaled = (base as u128 * u128::from(scale_q4)) / 16;
-    usize::try_from(scaled).unwrap_or(usize::MAX).max(1)
-}
-
-#[cfg(test)]
-mod scaled_border_px_tests {
-    use super::scaled_border_px;
-
-    #[test]
-    fn scaled_border_px_is_sixteenths_never_thinner_than_a_pixel() {
-        for (base, q4, want) in [
-            (6, 0, 6),
-            (6, 16, 6),
-            (6, 24, 9),
-            (1, 1, 1),
-            (0, 16, 1),
-            (1 << 25, 32, 1 << 26),
-            (usize::MAX, 0, usize::MAX),
-            (usize::MAX, 16, usize::MAX),
-            (usize::MAX, 255, usize::MAX),
-        ] {
-            assert_eq!(scaled_border_px(base, q4), want, "base {base} × {q4}/16");
-        }
-    }
 }
 
 const fn blend_rgb(bg: u32, fg: u32, a: u32) -> u32 {
@@ -2850,7 +2816,12 @@ pub(crate) fn apply_overlay_at(
     if fw == 0 || fh == 0 || sw == 0 || sh == 0 {
         return;
     }
-    let border = scaled_border_px(drop_border_px(fw, fh), glow.border_scale_q4)
+    let fw_u32 = u32::try_from(fw).unwrap_or(u32::MAX);
+    let fh_u32 = u32::try_from(fh).unwrap_or(u32::MAX);
+    let border = (aterm_gpu::scaled_border_px(
+        aterm_gpu::drop_border_px(fw_u32, fh_u32),
+        glow.border_scale_q4,
+    ) as usize)
         .min(fw / 2)
         .min(fh / 2)
         .max(1);

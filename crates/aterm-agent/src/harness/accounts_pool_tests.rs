@@ -83,6 +83,12 @@ mod preparation_races;
 #[path = "accounts_pool_planning_tests.rs"]
 mod planning;
 
+#[path = "accounts_pool_native_quota_tests.rs"]
+mod native_quota;
+
+#[path = "codex_rotation_tests.rs"]
+mod quota_proposals;
+
 #[path = "accounts_pool_canary_tests.rs"]
 mod canary;
 

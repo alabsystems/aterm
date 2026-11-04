@@ -100,6 +100,10 @@ fn a_weekly_figure_is_current_for_fifteen_minutes_then_aged_for_an_hour() {
     assert!(figure.current(AT - 60));
     assert_eq!(words(-61), None, "a reading from further in the future");
     assert_eq!(figure.words(AT + 86_400), None, "its window reset");
+    assert_eq!(usage_read_age(AT, AT + 2 * 86_400), Some(2 * 86_400));
+    for (at, now) in [(0, AT), (AT, 0), (-1, AT), (i64::MIN, i64::MAX)] {
+        assert_eq!(usage_read_age(at, now), None);
+    }
     let tenths = WeeklyFigure {
         used_x10: 385,
         ..figure
@@ -2068,6 +2072,65 @@ fn a_muse_login_store_names_its_account_alone() {
         muse_sub(&["muse"], &in_xdg).and_then(|s| s.email),
         Some("xdg@example.com".to_owned())
     );
+}
+
+#[test]
+fn a_future_muse_cache_cannot_hide_the_sessions_admitted_figure() {
+    let tmp = tmp_dir("muse-clock-fallback");
+    let home = tmp.path().join("home");
+    let config = home.join(".config/muse");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(config.join("auth.json"),
+        br#"{"schema_version":2,"providers":{"meta":{"mechanism":"oauth","user_email":"clock@example.test"}}}"#).unwrap();
+    let now = 1_792_800_000;
+    let figure = WeeklyFigure {
+        used_x10: 380,
+        resets_at: now + 86400,
+        at: now - 1200,
+    };
+    let previous = SubscriptionDisplay {
+        email: Some("clock@example.test".into()),
+        weekly: figure.words(now),
+        weekly_figure: Some(figure),
+        usage_read: true,
+        ..Default::default()
+    };
+    let key = (config, "clock@example.test".to_owned());
+    MUSE_USAGE_CACHE
+        .lock()
+        .unwrap()
+        .get_or_insert_with(Default::default)
+        .insert(
+            key.clone(),
+            MuseUsageEntry {
+                attempted_at: now + 120,
+                reading: Some((
+                    Some(WeeklyFigure {
+                        at: now + 120,
+                        used_x10: 950,
+                        ..figure
+                    }),
+                    None,
+                )),
+            },
+        );
+    let shown = muse_subscription_for(
+        &["/synthetic/muse".into()],
+        &[format!("HOME={}", home.display())],
+        &home,
+        &previous,
+        now,
+    );
+    MUSE_USAGE_CACHE
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .remove(&key);
+    let shown = shown.expect("synthetic native profile");
+    assert_eq!(shown.weekly_figure, Some(figure));
+    assert_eq!(shown.weekly, previous.weekly);
+    assert!(shown.usage_read);
 }
 
 /// A bare `muse`/`agy` launch name resolves on the supervised process's own `PATH`:

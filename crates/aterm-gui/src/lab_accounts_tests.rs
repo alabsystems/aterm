@@ -25,6 +25,22 @@ fn fact<'a>(view: &'a LabAccounts, key: &str) -> &'a str {
 }
 
 #[test]
+fn account_projection_keeps_every_row_in_a_large_roster() {
+    let mut records = records();
+    records.roster.rows = (0..256)
+        .map(|index| accounts::Row {
+            label: format!("account-{index}"),
+            ..Default::default()
+        })
+        .collect();
+    let view = project(&records, 200_000);
+    assert_eq!(view.rows.len(), records.roster.rows.len());
+    for (shown, source) in view.rows.iter().zip(&records.roster.rows) {
+        assert_eq!(shown.label, source.label);
+    }
+}
+
+#[test]
 fn an_unobserved_account_has_no_invented_budget_or_login() {
     let view = project(&records(), 200_000);
     assert!(fact(&view, "Last observed sign-in").starts_with("Unknown"));
@@ -476,4 +492,67 @@ fn invalid_times_are_unknown_and_future_quota_does_not_claim_current_capacity() 
     assert!(fact(&view, "5-hour quota observed").contains("future-dated"));
     assert!(fact(&view, "Sign-in observed").contains("future-dated"));
     assert!(fact(&view, "Last observed sign-in").contains("not checked now"));
+}
+
+/// A row whose account the lab journal knows shows who last used it, where it is signed in and
+/// each window, by its learned account key; a row of another key shows none of it.
+/// NEGATIVE CONTROL: with `project_with` skipping `journal_facts`, the first `fact` lookup panics
+/// (`fact`).
+#[test]
+fn a_row_shows_what_the_lab_journal_says_of_its_account() {
+    let mut records = records();
+    records.state.accounts.insert(
+        "one".into(),
+        accounts::Account {
+            pk: Some("ac-0123456789abcdef".into()),
+            ..Default::default()
+        },
+    );
+    let mut seen = alab_seen::Seen {
+        at: 200,
+        ..Default::default()
+    };
+    seen.accounts.insert(
+        "ac-0123456789abcdef".into(),
+        alab_seen::AccountSeen {
+            last_use: Some(alab_seen::LastUse {
+                by: "m17".into(),
+                t: 200 - 7_200,
+            }),
+            signed_in: vec![alab_seen::SignedIn {
+                on: "m17".into(),
+                state: "in".into(),
+                t: 100,
+            }],
+            windows: vec![alab_seen::WindowSeen {
+                window: "5h".into(),
+                sub: None,
+                figure: Some(alab_seen::Figure::Used {
+                    pct_x10: 420,
+                    reset: None,
+                }),
+                read: Some((140, "m17".into(), "statusline".into())),
+                wall_until: None,
+            }],
+            history: Vec::new(),
+        },
+    );
+    let view = project_with(&records, Some(&seen), 200_000);
+    assert_eq!(
+        fact(&view, "Last used by (lab journal)"),
+        "m17, about 2 h ago (its clock)"
+    );
+    assert_eq!(fact(&view, "Signed in on (lab journal)"), "m17 (in)");
+    assert_eq!(
+        fact(&view, "Lab 5h quota"),
+        "5h 42% used, reset unknown, read 1 min ago on m17 (statusline)"
+    );
+    records.state.accounts.get_mut("one").unwrap().pk = Some("ac-ffffffffffffffff".into());
+    let other = project_with(&records, Some(&seen), 200_000);
+    assert!(
+        !other.rows[0]
+            .facts
+            .iter()
+            .any(|(key, _)| key.contains("lab journal"))
+    );
 }

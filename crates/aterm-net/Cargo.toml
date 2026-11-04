@@ -56,6 +56,8 @@ aterm-netplace = { workspace = true }
 aterm-win32 = { workspace = true }
 
 [dev-dependencies]
+# Plain durable flushes for this test binary's process tree.
+aterm-durable = { workspace = true }
 # The interpreter, `verify`, `wait` and `host` the conformance tests drive.
 aterm-spec = { workspace = true }
 # The models those tests bind the code to: `NetSlotDisplacement` (slots.rs)

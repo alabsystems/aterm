@@ -912,3 +912,79 @@ fn a_meter_reads_each_heavy_compiler_once_for_its_unit() {
         None
     );
 }
+
+#[test]
+fn a_metering_guard_restores_this_threads_meter_in_nesting_order() {
+    let outer_meter = Meter::new();
+    let inner_meter = Meter::new();
+    let holds = |meter: &Arc<Meter>| current().is_some_and(|current| Arc::ptr_eq(&current, meter));
+    assert!(current().is_none(), "no stage runs on this thread yet");
+    let outer = metering(Some(Arc::clone(&outer_meter)));
+    assert!(holds(&outer_meter));
+    {
+        let _inner = metering(Some(Arc::clone(&inner_meter)));
+        assert!(holds(&inner_meter));
+        let _cleared = metering(None);
+        assert!(current().is_none(), "a nested guard can clear the meter");
+    }
+    assert!(
+        holds(&outer_meter),
+        "the inner guard's drop brought the outer meter back"
+    );
+    // The worker pattern the guards still allow: the meter crosses threads, the
+    // guard is made and dropped on the thread it restores.
+    let worker_meter = Arc::clone(&inner_meter);
+    std::thread::spawn(move || {
+        assert!(current().is_none(), "a fresh thread starts with no meter");
+        let _own = metering(Some(worker_meter));
+        assert!(current().is_some());
+    })
+    .join()
+    .expect("the worker thread");
+    assert!(
+        holds(&outer_meter),
+        "a worker's own guard leaves this thread's meter alone"
+    );
+    drop(outer);
+    assert!(
+        current().is_none(),
+        "the outer guard's drop restored what was here before it"
+    );
+}
+
+#[test]
+fn a_covering_guard_restores_this_threads_marker_in_nesting_order() {
+    assert!(cover().is_none(), "no stage runs on this thread yet");
+    let outer = covering(Some(Arc::from("outer-stage")));
+    assert_eq!(cover().as_deref(), Some("outer-stage"));
+    {
+        let _inner = covering(Some(Arc::from("inner-stage")));
+        assert_eq!(cover().as_deref(), Some("inner-stage"));
+        let _cleared = covering(None);
+        assert!(cover().is_none(), "a nested guard can clear the marker");
+    }
+    assert_eq!(
+        cover().as_deref(),
+        Some("outer-stage"),
+        "the inner guard's drop brought the outer marker back"
+    );
+    // The worker pattern the guards still allow: the marker crosses threads, the
+    // guard is made and dropped on the thread it restores.
+    std::thread::spawn(|| {
+        assert!(cover().is_none(), "a fresh thread starts with no marker");
+        let _own = covering(Some(Arc::from("worker-stage")));
+        assert_eq!(cover().as_deref(), Some("worker-stage"));
+    })
+    .join()
+    .expect("the worker thread");
+    assert_eq!(
+        cover().as_deref(),
+        Some("outer-stage"),
+        "a worker's own guard leaves this thread's marker alone"
+    );
+    drop(outer);
+    assert!(
+        cover().is_none(),
+        "the outer guard's drop restored what was here before it"
+    );
+}

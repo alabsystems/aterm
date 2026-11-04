@@ -1290,14 +1290,7 @@ fn a_host_that_has_just_begun_or_resumed_watching_flags_nothing_unwatched() {
 }
 
 #[cfg(unix)]
-fn jobs_on_a_tty(
-    dir: &std::path::Path,
-    tab: &str,
-) -> (
-    std::process::Child,
-    u32,
-    (std::os::fd::OwnedFd, std::os::fd::OwnedFd),
-) {
+fn jobs_on_a_tty(dir: &std::path::Path, tab: &str) -> (super::super::tests::TtyChild, u32) {
     let exe = std::env::current_exe().expect("exe");
     let park = format!(
         "'{}' harness::upgrade_drive::tests::park_when_asked --exact </dev/null >/dev/null 2>&1",
@@ -1309,7 +1302,7 @@ fn jobs_on_a_tty(
         "set -m; {park} & printf '%s\\n' \"$!\" > '{}'; exec {park}",
         pid_file.display()
     );
-    let (master, slave, mut front) = aterm_pty::spawn_session_leader_on_pty(|slave| {
+    let (master, slave, front) = aterm_pty::spawn_session_leader_on_pty(|slave| {
         let tty = || slave.try_clone().map(std::process::Stdio::from);
         let mut shell = std::process::Command::new(&sh_path);
         shell
@@ -1321,6 +1314,7 @@ fn jobs_on_a_tty(
         Ok(shell)
     })
     .expect("sh");
+    let mut front = super::super::tests::TtyChild::on_pty(front, master, slave);
     let parked = |pid: u32| {
         atpkg::caller_shell::process_args(pid).is_some_and(|a| {
             a.env_var("UPGRADE_DRIVE_TEST_PARK").is_some()
@@ -1332,14 +1326,12 @@ fn jobs_on_a_tty(
             .ok()
             .and_then(|s| s.trim().parse::<u32>().ok());
         if let Some(back) = back.filter(|&b| parked(b) && parked(front.id())) {
-            return (front, back, (master, slave));
+            return (front, back);
         }
+        front.lives("the two jobs");
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    let _ = front.kill();
-    drop((master, slave));
-    let _ = front.wait();
-    panic!("the two jobs never ran");
+    panic!("the two jobs never ran within the hang detector");
 }
 
 #[cfg(unix)]
@@ -1350,7 +1342,7 @@ fn a_tab_whose_agent_is_not_in_front_is_never_told_aterms_own_fault() {
     let dir = ScratchDir::new("upgrade-status", "aside");
     let o = opts(&dir);
     std::fs::create_dir_all(state_dir(&o)).expect("state");
-    let (mut front, back, pty) = jobs_on_a_tty(&dir, TAB);
+    let (front, back) = jobs_on_a_tty(&dir, TAB);
     register_as(&o.home, back, BACK, "2.1.281");
     register_as(&o.home, front.id(), FRONT, "2.1.281");
     let group = super::super::process_group(front.id()).expect("group");
@@ -1390,9 +1382,7 @@ fn a_tab_whose_agent_is_not_in_front_is_never_told_aterms_own_fault() {
     unsafe {
         libc::kill(libc::pid_t::try_from(back).expect("pid"), libc::SIGKILL);
     }
-    let _ = front.kill();
-    drop(pty);
-    let _ = front.wait();
+    front.end();
     pin_awake_since(0);
 
     for (how, held) in [("window", in_window), ("cli", by_cli)] {

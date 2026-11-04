@@ -3694,6 +3694,7 @@ pub fn resume_argv(cli: accounts::Cli, id: &str) -> [String; 2] {
         accounts::Cli::Codex => "resume",
         accounts::Cli::Claude | accounts::Cli::Grok => "--resume",
         accounts::Cli::Kimi => "--session",
+        accounts::Cli::Agy => "--conversation",
     };
     [word.to_string(), id.to_string()]
 }
@@ -3729,7 +3730,7 @@ pub fn pool_line(
                 .map_err(|why| format!("Codex's carried flags cannot resume a thread: {why}"))?;
             super::codex_alab::resume_words(kept, how.resume)
         }
-        accounts::Cli::Claude | accounts::Cli::Grok | accounts::Cli::Kimi => {
+        accounts::Cli::Claude | accounts::Cli::Grok | accounts::Cli::Kimi | accounts::Cli::Agy => {
             let resume = how.resume.map(|id| resume_argv(cli, id));
             flags
                 .into_iter()

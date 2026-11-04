@@ -11245,7 +11245,7 @@ fn mode_string(meta: &std::fs::Metadata) -> String {
 }
 
 fn list_json(prefix: &Prefix, rest: &[String]) -> ExitCode {
-    let opt_str = |v: Option<String>| v.map_or_else(|| JVal::Val(aterm_json::Value::Null), jstr);
+    let opt_str = |v: Option<String>| v.map_or(JVal::Val(aterm_json::Value::Null), jstr);
     let version_values = |i: &Installed| {
         let mut vs = i.versions.clone();
         vs.sort();

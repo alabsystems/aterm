@@ -682,7 +682,7 @@ fn account_progress_gallery() {
                     0
                 },
                 cli: Some(aterm_agent::harness::accounts::Cli::Claude),
-                auto_rotate: true,
+                pool_unpinned: true,
                 accounts,
                 accounts_refused: name
                     .contains("unobserved-recovery")

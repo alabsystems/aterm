@@ -3318,6 +3318,11 @@ pub fn test_cold_records(
     Ok((slot.store, slot.on_file))
 }
 
+/// The most digests the server reads from a records GET's `have=`. A pull names at most
+/// [`crate::membership_log::store::HAVE_IDS`], and no request head ([`MAX_HEAD`]) carries this
+/// many; the parse stops here whatever the head's bound.
+const MAX_HAVE_IDS: usize = 4096;
+
 fn have_query(query: Option<&str>) -> Result<Vec<crate::membership_log::RecordId>, Reply> {
     let Some(query) = query else {
         return Ok(Vec::new());
@@ -3330,7 +3335,7 @@ fn have_query(query: Option<&str>) -> Result<Vec<crate::membership_log::RecordId
     }
     let mut out = Vec::new();
     for part in rest.split(',') {
-        if out.len() >= crate::membership_log::MAX_RECORDS {
+        if out.len() >= MAX_HAVE_IDS {
             return Err(Reply::text(400, "have= names too many digests"));
         }
         let mut digest = [0u8; 32];
@@ -12221,7 +12226,7 @@ mod tests {
     /// the bytes on every look, failed an earlier form of the test with left 84.
     #[test]
     fn parked_subscribers_on_a_full_store_read_the_file_once() {
-        use crate::membership_log::{MAX_RECORDS, encode_records};
+        use crate::membership_log::{MAX_HELD_RECORDS, encode_records};
 
         const LOOKS: usize = 30;
         let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -12234,7 +12239,7 @@ mod tests {
         let running = run_tuned(&opts, tuning);
         let founded = Founded::new();
         let full: Vec<_> = std::iter::once(founded.genesis.clone())
-            .chain((0..MAX_RECORDS - 1).map(|i| founded.waiting(i)))
+            .chain((0..MAX_HELD_RECORDS - 1).map(|i| founded.waiting(i)))
             .collect();
         assert_eq!(
             post_records(&running.shared, "team", &encode_records(&full), false).status,
@@ -12340,17 +12345,17 @@ mod tests {
     /// wrote the records file whole" (another inode), as main before F23 did.
     #[test]
     fn a_complete_record_at_a_full_store_appends_only_itself() {
-        use crate::membership_log::{Body, Evidence, MAX_RECORDS, encode_records};
+        use crate::membership_log::{Body, Evidence, MAX_HELD_RECORDS, encode_records};
 
         let root = aterm_tempfile::tempdir().expect("tempdir");
         let running = run(&team_options(root.path()));
         let founded = Founded::new();
         let full: Vec<_> = std::iter::once(founded.genesis.clone())
-            .chain((0..MAX_RECORDS - 1).map(|i| founded.waiting(i)))
+            .chain((0..MAX_HELD_RECORDS - 1).map(|i| founded.waiting(i)))
             .collect();
         let post = |body: &[u8]| post_records(&running.shared, "team", body, false).status;
         assert_eq!(post(&encode_records(&full)), 204);
-        assert_eq!(running.stored_records("team").len(), MAX_RECORDS);
+        assert_eq!(running.stored_records("team").len(), MAX_HELD_RECORDS);
         let path = root.path().join("team.records");
         let before = file_stamp(&path);
         let admit = founded
@@ -12389,7 +12394,7 @@ mod tests {
     /// fix did) fails "the full store lost the waiting child its parent's POST brought".
     #[test]
     fn a_waiting_child_posted_with_its_parent_lands_at_a_full_store() {
-        use crate::membership_log::{MAX_RECORDS, encode_records};
+        use crate::membership_log::{MAX_HELD_RECORDS, encode_records};
 
         let root = aterm_tempfile::tempdir().expect("tempdir");
         let running = run(&team_options(root.path()));
@@ -12413,14 +12418,14 @@ mod tests {
                 (0..)
                     .map(|i| founded.waiting(i))
                     .filter(|w| w.id() < child.id())
-                    .take(MAX_RECORDS - 2),
+                    .take(MAX_HELD_RECORDS - 2),
             )
             .collect();
         let post = |body: &[u8]| post_records(&running.shared, "team", body, false).status;
         assert_eq!(post(&encode_records(&full)), 204);
         assert_eq!(post(child.bytes()), 204);
         let store = running.stored_records("team");
-        assert_eq!(store.len(), MAX_RECORDS, "the store is full");
+        assert_eq!(store.len(), MAX_HELD_RECORDS, "the store is full");
         assert!(store.uncomplete(child.id()).is_some(), "the child waits");
         assert_eq!(post(&encode_records([&first, &parent, &child])), 204);
         let held = running

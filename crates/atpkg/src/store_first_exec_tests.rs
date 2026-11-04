@@ -95,3 +95,56 @@ fn an_own_exit_never_releases_another_process_at_the_same_clock_reading() {
         "first.ran erased another process's hold at the same fixed clock"
     );
 }
+
+/// A bundle's resolve check registers every exposed binary of one build at once: siblings in one
+/// process take their turns at the program's gate, so each registers and each release takes its
+/// mark (nux round 9 found the trust bundle's flip failing on `first exec registration or removal
+/// is busy`). A registration while a removal holds the gate still refuses at once: the negative
+/// control, so the turn is no wait on a removal.
+#[test]
+fn siblings_in_one_process_each_register_and_release_while_a_removal_still_refuses() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let build = scratch.path().join("store/tool/1");
+    std::fs::create_dir_all(build.join("bin")).unwrap();
+    let bins: Vec<PathBuf> = (0..16)
+        .map(|i| {
+            let bin = build.join(format!("bin/tool{i}"));
+            std::fs::write(&bin, b"inert owned data").unwrap();
+            bin
+        })
+        .collect();
+    for _ in 0..4 {
+        let held: Vec<std::io::Result<FirstExec>> = std::thread::scope(|scope| {
+            let started: Vec<_> = bins
+                .iter()
+                .map(|bin| scope.spawn(move || hold_first_exec_at(bin, Some(CLOCK))))
+                .collect();
+            started.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let held: Vec<FirstExec> = held
+            .into_iter()
+            .map(|hold| hold.expect("each sibling registers"))
+            .collect();
+        assert!(held_unproven_at(&build, Some(CLOCK)));
+        std::thread::scope(|scope| {
+            for hold in held {
+                scope.spawn(move || hold.ran());
+            }
+        });
+        assert!(
+            !held_unproven_at(&build, Some(CLOCK)),
+            "every sibling's release took its mark"
+        );
+    }
+    let removing = first_exec_removal(&build).unwrap();
+    let started = Instant::now();
+    assert!(matches!(
+        hold_first_exec_at(&bins[0], Some(CLOCK)),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
+    assert!(
+        started.elapsed() < HANG,
+        "CONTROL: a removal is refused at once"
+    );
+    drop(removing);
+}

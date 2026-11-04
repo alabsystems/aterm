@@ -33,6 +33,7 @@ use aterm_json::Value;
 use aterm_secrets::{client::Paths, commons::bootstrap::Bootstrap};
 use std::collections::BTreeMap;
 
+pub(crate) use edit::edit as edit_grid;
 pub use edit::{Edited, Opener, amacs};
 
 /// How a table keys the row a new grid row becomes, from the typed values of its cells and the
@@ -679,6 +680,30 @@ impl Handle {
         declare: bool,
         derive: impl FnOnce(&View) -> Result<(T, Vec<Vec<Change>>)>,
     ) -> Result<(T, Applied)> {
+        self.commit_planned(declare, false, derive)
+    }
+
+    /// [`Self::commit_derived`] for the owner's own word (`aterm db alab add|retire|relabel`): each
+    /// record takes a random request id, as a grid save does, so the owner saying a value again
+    /// after saying another (a relabel back and forth, a retire undone and redone) is written,
+    /// never taken for a retry of the first record. A repeat of a value the table holds writes
+    /// nothing anyway: the verbs write only the cells that change.
+    ///
+    /// # Errors
+    /// As [`Self::commit_derived`].
+    pub(crate) fn commit_owner<T>(
+        &self,
+        derive: impl FnOnce(&View) -> Result<(T, Vec<Vec<Change>>)>,
+    ) -> Result<(T, Applied)> {
+        self.commit_planned(false, true, derive)
+    }
+
+    fn commit_planned<T>(
+        &self,
+        declare: bool,
+        random: bool,
+        derive: impl FnOnce(&View) -> Result<(T, Vec<Vec<Change>>)>,
+    ) -> Result<(T, Applied)> {
         let table = self.compiled.table;
         application::with_store(
             &self.paths,
@@ -698,9 +723,13 @@ impl Handle {
                 let mut applied = Applied::default();
                 for changes in pack(rows)? {
                     let count = changes.len();
-                    let request = typed::request_id(table.application, table.role, &changes)?;
+                    let request = if random {
+                        crate::crypto::random()?
+                    } else {
+                        typed::request_id(table.application, table.role, &changes)?
+                    };
                     let command = Command::Write { request, changes };
-                    if let Some(first) = log.retry(session.actor(), &command)? {
+                    if !random && let Some(first) = log.retry(session.actor(), &command)? {
                         applied.unchanged += count;
                         applied.operations.push(first);
                         continue;

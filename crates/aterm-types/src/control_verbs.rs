@@ -2125,7 +2125,11 @@ pub const VERBS: &[VerbSpec] = &[
          effective=<on|off>`. Owner-only `recovery` reads the account menu's cached, current-foreground \
          observation without probing or retrying: `OK recovery version=1 available=0` when absent; \
          otherwise `available=1 phase= account= target= route= known= eligible= wall= observed_at= \
-         next_at= forecasts_paused= detail_count= detail_0= ...`. `forecasts_paused=1` means the \
+         next_at= forecasts_paused= detail_count= detail_0= ... login_diagnostic_count= \
+         login_diagnostic_0_account= login_diagnostic_0_completed_at= login_diagnostic_0_words= \
+         ...`. Indexed login diagnostics retain the captured account label, original completion \
+         time and validated outcome words, never raw provider output. They are history and \
+         grant no retry or sign-in authority, including while paused or busy. `forecasts_paused=1` means the \
          session policy withdrew future recovery promises independently of current work; 0 \
          grants no authority when the observation is unknown or busy. \
          Text is percent-encoded; `-` means unknown or absent, \
@@ -2173,11 +2177,12 @@ pub const VERBS: &[VerbSpec] = &[
          an older one is read again before the reply (which waits at most 10 ms for it), and \
          `-` is no word: the package manager is inert, no store location resolves (no home \
          directory), or no read has landed in the last 4 s). Setup: \
-         `setup=<done[;asking:<row,…>][;offered:<row,…>]|pending|pending:<row,…>|->` \
+         `setup=<done[;asking:<row,…>][;offered:<row,…>]|pending|pending:<row,…>[;needs:<row,…>]|->` \
          (this Mac's first-run setup, read from the last status its worker published: no \
          probe, nothing changed; `done` leaves nothing for anyone to do now, `;asking:` names \
          what a parked run still asks for again by itself (an absent vault), `;offered:` the \
-         macOS grants on offer, which nothing waits for; rows `fda`, `devtools`, `debugger`, \
+         macOS grants on offer, which nothing waits for; `;needs:` the pending rows that wait on a \
+         person's press; rows `fda`, `devtools`, `debugger`, \
          `lan`, `ax`, `vault`, `repos`, …). Network: \
          `net=<alab-lan|remote|offline|checking|-> net_kind=<hotspot|lan|cellular|vpn|-> \
          net_since_ms= internet=<ok|down|path-up|unknown|-> internet_ms= \
@@ -2974,6 +2979,22 @@ pub const VERBS: &[VerbSpec] = &[
         "A kernel-authenticated idle login wall may follow only its native account's committed renewal. No caller paths, commands or credentials are accepted.",
     ).input(Input::NONE),
     v(
+        "codex-rotation",
+        Signal,
+        Status,
+        Session,
+        "native Codex weekly quota rotation",
+        "A kernel-authenticated completed quota wall may select a fresh pooled account through a sealed native restart. No caller paths, commands or credentials are accepted.",
+    ).input(Input::NONE),
+    v(
+        "codex-exec-handoff",
+        Signal,
+        Status,
+        Session,
+        "prepare a native Codex exec account move",
+        "A proven live exec peer may prepare a shared-pool quota selection. Selection grants no launcher or execution capability; commit, attach and execute are not yet supported.",
+    ).input(Input::NONE),
+    v(
         "native-act",
         Signal,
         Status,
@@ -3139,20 +3160,14 @@ pub const VERBS: &[VerbSpec] = &[
             open_aliases!(),
             "), replying `OK opened <target>` or `OK closed <target>`. `open fact-menu \
              <model|effort|path|branch|context|usage|top-effort|account|close>` opens or closes \
-             that composer-rule menu. Bare, `open autopilot-menu` opens the front window's \
-             focused session's menu at its Autopilot chip; `@<sid> open autopilot-menu \
-             at=<row>,<col> [by=pointer|keys]` opens `<sid>`'s at that 0-based cell of its own \
-             screen, for a program that draws its own Autopilot line (codex-alab's) and shows \
-             no chip: only where `<sid>` is the front window's focused session (`ERR the \
-             session is not focused in the front window`), the cell clamped into its pane, \
-             `by=keys` lighting its first row. It types nothing into `<sid>`, refuses a pane \
-             scrolled back or rewound (`ERR the session's pane is scrolled back or rewound`) or \
-             one that shows no cells yet (`ERR the session's pane shows no cells`), and closes \
-             when the focus moves, the pane scrolls back, is rewound or re-grids, or another \
-             job takes the foreground or the screen flips between main and alternate. Unaimed \
-             or with other words it is `ERR usage: @<sid> open autopilot-menu at=<row>,<col> \
-             [by=pointer|keys]`. While any session is held, opening `menu`, `tab-menu`, \
-             `overview`, `autopilot-menu` or `fact-menu` is `ERR halted` (see `hold`)."
+             that composer-rule menu. Opening requires the named fact to be visible in the \
+             front window's focused session. `open autopilot-menu` opens the front window's \
+             focused session's menu at its visible Autopilot chip; it refuses when no such \
+             chip is present. `open autopilot-menu close` closes it. These Autopilot-menu \
+             forms accept no coordinate (`at=`) or pointer/keyboard-origin (`by=`) operands. \
+             While any session is held, opening `menu`, `tab-menu`, \
+             `overview`, `autopilot-menu` or `fact-menu` is `ERR halted` (see `hold`); the \
+             `close` forms remain available while held."
         ),
     )
     .input(Input::NONE),

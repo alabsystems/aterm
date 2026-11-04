@@ -24,10 +24,11 @@ use aterm_uds::spawnfd::Stdio;
 use crate::instance::{take_flag, take_value};
 use crate::mac::{NOT_RUN, PERSON_HELPER, POLL, ROW, STEP, Vm, not_run};
 use crate::mac_nux_guest::{
-    Add, DEVTOOLS_CANCEL, DEVTOOLS_GOTO, DEVTOOLS_OPEN, DevtoolsActs, HidProof, Procs,
-    ReopenPresses, STALL_MS, Stall, Typed, Waited, Went, acts, click_latencies, completed_at,
-    devtools_acts, dialogs, first_session, hid_proof, read_census, read_person, read_procs,
-    read_record, read_watch, reopen_presses, runs, setup_field, stage_name, stage_starts,
+    APPLE_DEVTOOLS_DIALOG, Add, DEVTOOLS_CANCEL, DEVTOOLS_GOTO, DEVTOOLS_OPEN, DevtoolsActs,
+    HidProof, Presses, Procs, ReopenPresses, STALL_MS, Stall, Typed, Waited, Went, acts,
+    apple_devtools_dialogs, click_latencies, completed_at, devtools_acts, dialogs, first_session,
+    hid_proof, last_record, read_census, read_person, read_procs, read_record, read_watch,
+    reopen_presses, runs, session_programs, setup_field, shell_session, stage_name, stage_starts,
 };
 use crate::paths::paths;
 use crate::{Fail, LAB, Res, stop};
@@ -84,10 +85,18 @@ pub const USAGE: &str = "\
                                    its repairs' lines and when, what
                                    ~/.local/bin/aterm is after it, the change-journal records (the guest's
                                    disk grown to 100 GB first)
+                  devtools-control the negative control of every row's Apple developer-tools verdict
+                                   (each row fails on that dialog): with no aterm on a --no-clt guest,
+                                   /usr/bin/git runs and the census must list Apple's install dialog
+                                   within a minute, else this row fails (NOT RUN with the tools there)
                   first-launch     the app opened, then watched until the guest's own aterm ctl status says
                                    setup=done (the progress record's completion on a build without the
                                    field), or until setup stood still a minute with no new press by the
-                                   person and no app process starting or going: first prompt, first
+                                   person and no app process starting or going (a minute after the vault
+                                   look's own bound while only the vault is left): git and /usr/bin/git
+                                   typed in the first tab at its prompt and git again after the wait,
+                                   the presses setup= waited on (the row fails on one aterm could have
+                                   made) and the grants on offer, first prompt, first
                                    present, each stage's start (a guest-side watch of initial-setup.json)
                                    and the first one's after first present, n_present and present and
                                    input p50/p95/p99 while setup ran, aterm's state folder at boot and at
@@ -381,6 +390,7 @@ pub enum Scenario {
     PassHeld,
     Doctor,
     LaunchRepairs,
+    DevtoolsControl,
     FirstLaunch,
     TerminalLaunch,
     AppLaunch,
@@ -405,13 +415,14 @@ pub enum Scenario {
 }
 
 /// Every row, in the order a run takes them.
-pub const ALL: [Scenario; 14] = [
+pub const ALL: [Scenario; 15] = [
     Scenario::InitApply,
     Scenario::InitNotty,
     Scenario::InitSsh,
     Scenario::PassHeld,
     Scenario::Doctor,
     Scenario::LaunchRepairs,
+    Scenario::DevtoolsControl,
     Scenario::FirstLaunch,
     Scenario::TerminalLaunch,
     Scenario::AppLaunch,
@@ -456,6 +467,7 @@ impl Scenario {
             Scenario::PassHeld => "pass-held",
             Scenario::Doctor => "doctor",
             Scenario::LaunchRepairs => "launch-repairs",
+            Scenario::DevtoolsControl => "devtools-control",
             Scenario::FirstLaunch => "first-launch",
             Scenario::TerminalLaunch => "terminal-launch",
             Scenario::AppLaunch => "app-launch",
@@ -515,7 +527,10 @@ impl Scenario {
     /// Whether it runs the app this run built or was handed (the others install a public release).
     #[must_use]
     pub const fn needs_app(self) -> bool {
-        !matches!(self, Scenario::Successor | Scenario::InstallSh)
+        !matches!(
+            self,
+            Scenario::Successor | Scenario::InstallSh | Scenario::DevtoolsControl
+        )
     }
 }
 
@@ -1285,6 +1300,33 @@ pub fn local_network_blocks(log: &str) -> Vec<(Option<u64>, u32)> {
         .collect()
 }
 
+/// The distinct messages of a unified log's ndjson lines, at most `max`, each squeezed to 140
+/// characters, oldest first: what a process said, when the lane cannot read its window. Pure.
+#[must_use]
+pub fn distinct_messages(log: &str, max: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in log.lines() {
+        // Only an event's own message: never a line `log show` adds around them.
+        let Some(message) = aterm_json::from_str::<aterm_json::Value>(line)
+            .ok()
+            .and_then(|v| {
+                v.get("eventMessage")?
+                    .as_str()
+                    .map(|m| squeeze(m.trim(), 140))
+            })
+        else {
+            continue;
+        };
+        if !message.is_empty() && !out.contains(&message) {
+            out.push(message);
+            if out.len() == max {
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// Each process `ps -o pid=,command=` listed: its pid and command line.
 #[must_use]
 pub fn ps_commands(ps: &str) -> BTreeMap<u32, String> {
@@ -1457,7 +1499,13 @@ pub struct ReportJson {
     pub phases: BTreeMap<String, u64>,
     /// Each row whose outcome is not in place ([`IN_PLACE`]): its id and outcome, in report order.
     pub not_ok: Vec<(String, String)>,
+    /// Each row of [`Self::not_ok`] whose report says why (its `why`): its id and that reason,
+    /// cut to [`WHY_CHARS`] characters, so a failed row names its cause in the record.
+    pub why_not_ok: Vec<(String, String)>,
 }
+
+/// The most characters of a row's `why` a record keeps.
+const WHY_CHARS: usize = 160;
 
 /// The outcomes of a report's rows that leave nothing to do.
 pub const IN_PLACE: [&str; 4] = ["ok", "changed", "not-applicable", "n/a"];
@@ -1486,14 +1534,29 @@ pub fn read_report_json(text: &str) -> Option<ReportJson> {
                     .collect()
             })
             .unwrap_or_default();
-        let not_ok = items
+        let left: Vec<&aterm_json::Value> = items
+            .iter()
+            .filter(|i| {
+                i.get("outcome")
+                    .and_then(aterm_json::Value::as_str)
+                    .is_some_and(|outcome| !IN_PLACE.contains(&outcome))
+            })
+            .collect();
+        let not_ok = left
             .iter()
             .filter_map(|i| {
-                let outcome = i.get("outcome")?.as_str()?;
-                if IN_PLACE.contains(&outcome) {
-                    return None;
-                }
-                Some((i.get("id")?.as_str()?.to_owned(), outcome.to_owned()))
+                Some((
+                    i.get("id")?.as_str()?.to_owned(),
+                    i.get("outcome")?.as_str()?.to_owned(),
+                ))
+            })
+            .collect();
+        let why_not_ok = left
+            .iter()
+            .filter_map(|i| {
+                let why = i.get("why")?.as_str()?.trim();
+                let id = i.get("id")?.as_str()?.to_owned();
+                (!why.is_empty()).then(|| (id, why.chars().take(WHY_CHARS).collect()))
             })
             .collect();
         Some(ReportJson {
@@ -1502,6 +1565,7 @@ pub fn read_report_json(text: &str) -> Option<ReportJson> {
             slowest,
             phases,
             not_ok,
+            why_not_ok,
         })
     })
 }
@@ -1523,6 +1587,18 @@ fn not_ok_cell(row: &mut Row, label: &str, from: &str, report: Option<&ReportJso
             None => Value::Missing("the report did not parse as JSON".into()),
         },
     );
+    if let Some(j) = report.filter(|j| !j.why_not_ok.is_empty()) {
+        row.cell(
+            format!("{label}why rows not ok ({from})"),
+            Value::Text(
+                j.why_not_ok
+                    .iter()
+                    .map(|(id, why)| format!("{id}: {why}"))
+                    .collect::<Vec<_>>()
+                    .join(" · "),
+            ),
+        );
+    }
 }
 
 /// A run's `--json` report as cells under `label`.
@@ -1731,6 +1807,8 @@ struct Guest {
     /// What a row's dialogs count from (the guest's clock, epoch ms): the open, for a launch; the
     /// census' own start when a row sets none.
     mark_ms: std::cell::Cell<Option<u64>>,
+    /// What each `setup=` the row read asked of the person ([`setup_reading`]).
+    presses: std::cell::RefCell<Presses>,
 }
 
 impl Guest {
@@ -2095,11 +2173,20 @@ impl Watchers {
                             .get()
                             .or(census.started.map(|(at, _)| at))
                             .unwrap_or(0);
-                        Value::Text(dialog_text(&dialogs(&census, since)))
+                        let seen = dialogs(&census, since);
+                        devtools_verdict(row, &seen);
+                        Value::Text(dialog_text(&seen))
                     }
                 }
             }
         };
+        if matches!(dialogs_cell, Value::Missing(_)) {
+            // Nothing read the window list, so neither verdict is a reading.
+            row.cell(
+                "Apple developer-tools dialogs (target 0)",
+                Value::Missing("the census read no window list".into()),
+            );
+        }
         row.cell("dialogs", dialogs_cell);
         let _ =
             g.vm.exec(&g.as_root("pkill -INT -f '^/usr/bin/log stream'"), STEP);
@@ -2126,6 +2213,81 @@ impl Watchers {
         Ok(())
     }
 }
+
+/// The row's verdict on Apple's developer-tools install dialog among the dialogs its census saw
+/// (`seen`): every row fails on one, since aterm installs the tools itself and keeps the
+/// `/usr/bin` stubs from raising it; the `devtools-control` row, which raises it on purpose with
+/// no aterm on the guest, fails on none, since then the census cannot see it and a 0 elsewhere
+/// proves nothing.
+fn devtools_verdict(row: &mut Row, seen: &[crate::mac_nux_guest::Dialog]) {
+    let apple = apple_devtools_dialogs(seen);
+    let at = apple
+        .iter()
+        .map(|d| format!("{} at {} ms", d.owner, d.first_ms))
+        .collect::<Vec<_>>()
+        .join("; ");
+    row.cell(
+        if row.scenario == Scenario::DevtoolsControl {
+            "Apple developer-tools dialogs (control: target 1 or more)"
+        } else {
+            "Apple developer-tools dialogs (target 0)"
+        },
+        if apple.is_empty() {
+            Value::Count(0)
+        } else {
+            Value::Text(format!("{}: {at}", apple.len()))
+        },
+    );
+    match (row.scenario == Scenario::DevtoolsControl, apple.is_empty()) {
+        (true, true) => row.fail(format!(
+            "CONTROL: the census saw no {APPLE_DEVTOOLS_DIALOG} window after /usr/bin/git ran on a guest without the tools, so no row's 0 is a reading"
+        )),
+        (false, false) => row.fail(format!("Apple's developer-tools dialog came up: {at}")),
+        _ => {}
+    }
+}
+
+/// The negative control of every row's Apple developer-tools verdict ([`devtools_verdict`]): on a
+/// guest without the Command Line Tools and with no aterm, `/usr/bin/git --version` in the
+/// account's session raises Apple's install dialog, which the census must list within the
+/// one-minute hang detector. A guest that has the tools has no dialog to raise: NOT RUN.
+fn devtools_control(g: &Guest, row: &mut Row) -> Result<(), Fail> {
+    let developer = g.sh(
+        "xcode-select -p >/dev/null 2>&1 && echo tools || echo none",
+        STEP,
+    )?;
+    if developer.trim() == "tools" {
+        return Err(not_run(
+            "this base has the Command Line Tools, so /usr/bin/git raises no dialog (--no-clt runs the control)"
+                .to_owned(),
+        ));
+    }
+    let out = g.sh("/usr/bin/git --version 2>&1; echo \"rc=$?\"", STEP)?;
+    row.cell(
+        "/usr/bin/git, no aterm",
+        Value::Text(squeeze(out.trim(), 200)),
+    );
+    let census = format!("{GUEST_NUX}/census.txt");
+    let started = Instant::now();
+    loop {
+        stop::check()?;
+        if !apple_devtools_dialogs(&dialogs(&read_census(&g.read(&census)?), 0)).is_empty() {
+            row.cell("dialog seen after", Value::Ms(millis(started.elapsed())));
+            return Ok(());
+        }
+        if started.elapsed() >= STALL {
+            row.cell(
+                "dialog seen after",
+                Value::Missing(format!("the census listed none in {} s", STALL.as_secs())),
+            );
+            return Ok(());
+        }
+        stop::sleep(POLL)?;
+    }
+}
+
+/// The one-minute hang detector of a wait for something that must happen ([`STALL_MS`]).
+const STALL: Duration = Duration::from_millis(STALL_MS);
 
 /// The dialogs a census saw, as one cell.
 fn dialog_text(dialogs: &[crate::mac_nux_guest::Dialog]) -> String {
@@ -2316,6 +2478,9 @@ fn setup_reading(g: &Guest) -> Result<crate::mac_nux_guest::Reading, Fail> {
     )?;
     let (status, rest) = out.split_once("--- record").unwrap_or((&out, ""));
     let (record, moved) = rest.split_once("--- acts").unwrap_or((rest, ""));
+    if let Some(field) = setup_field(status) {
+        g.presses.borrow_mut().see(field);
+    }
     Ok(crate::mac_nux_guest::Reading {
         setup: setup_field(status).map(str::to_owned),
         record: read_record(record),
@@ -2960,6 +3125,7 @@ fn guest(
         standard,
         uid,
         mark_ms: std::cell::Cell::new(None),
+        presses: std::cell::RefCell::new(Presses::default()),
     })
 }
 
@@ -3603,12 +3769,20 @@ fn first_launch(g: &Guest, ask: &Ask, row: &mut Row) -> Result<(), Fail> {
     let present = first_present_ms(g)?;
     metrics_cells(g, row, "")?;
     state_snapshot(g, row, "window focus")?;
+    // What a person typing `git` first meets, before the tools are in: the census, read at the
+    // row's end, says whether Apple's dialog came up ([`devtools_verdict`]).
+    tab_git(g, row, "git", "at the first prompt")?;
+    // By its absolute path, past the shims on PATH: only `DEVELOPER_DIR` stands between it and
+    // Apple's stub (`aterm_types::clt_shim`), which only a guest without the tools can show.
+    tab_git(g, row, "/usr/bin/git", "at the first prompt")?;
     let waited_from = g.clock_ms()?.saturating_sub(open_ms);
     let done = wait_setup(g, row, "", waited_from)?;
     match done {
         Some(_) => captures.now(g, "setup-done", "aterm ctl status said setup=done"),
         None => captures.now(g, "end", "the wait on setup ended before setup=done"),
     }
+    presses_cells(row, &g.presses.borrow(), ask.person);
+    tab_git(g, row, "git", "once setup's wait ended")?;
     // Before the reads below: the ~/Desktop control's own consent dialog is no milestone.
     captures.stop(g);
     reopen_cells(g, ask, row, open_ms)?;
@@ -3647,8 +3821,45 @@ fn first_launch(g: &Guest, ask: &Ask, row: &mut Row) -> Result<(), Fail> {
             Err(why) => Value::Missing(format!("control FAILED: {why}")),
         },
     );
-    local_network_cell(g, row, open_ms)?;
+    let alerts = local_network_cell(g, row, open_ms)?;
+    unc_cells(g, row, open_ms)?;
     let log = g.log()?;
+    if !alerts.is_empty() {
+        // What raised each alert is in what the app logged just before it (finding 11).
+        let lines = log_lines(&log);
+        row.cell(
+            "aterm.log before each Local Network alert",
+            Value::Text(
+                alerts
+                    .iter()
+                    .map(|&at| {
+                        let said: Vec<String> =
+                            lines_before(&lines, at, BEFORE_ALERT_MS, BEFORE_ALERT_LINES)
+                                .iter()
+                                .map(|l| {
+                                    format!(
+                                        "-{} ms {}: {}",
+                                        at - l.at_ms,
+                                        l.target,
+                                        squeeze(l.message, 120)
+                                    )
+                                })
+                                .collect();
+                        format!(
+                            "{} ms: {}",
+                            at.saturating_sub(open_ms),
+                            if said.is_empty() {
+                                "nothing".to_owned()
+                            } else {
+                                said.join(" | ")
+                            }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ),
+        );
+    }
     if done.is_none() {
         // What the app said while setup did not finish, whole, for the run's record: the cause
         // of a launch that never starts setup is in it (the admin first-launch gap, SCR-1).
@@ -3775,6 +3986,109 @@ fn first_launch(g: &Guest, ask: &Ask, row: &mut Row) -> Result<(), Fail> {
     state_snapshot(g, row, "the end")?;
     around.cells(g, row, "")?;
     Ok(())
+}
+
+/// `<git> --version` typed at the first tab's shell (`git`: the name or a path; `label` names
+/// when), and the last line it printed with its exit, read back once it ended or after the
+/// one-minute hang detector.
+fn tab_git(g: &Guest, row: &mut Row, git: &str, label: &str) -> Result<(), Fail> {
+    let cell = format!("{git} in the first tab {label}");
+    let sessions = g.run(&format!("{} ctl ls 2>/dev/null", g.aterm), STEP)?;
+    // The shell's tab, never merely the first listed: a typed line is only a shell's to run.
+    let Some(sid) = shell_session(&sessions).map(str::to_owned) else {
+        let listed: Vec<String> = session_programs(&sessions)
+            .iter()
+            .map(|(sid, program)| format!("{sid} program={program}"))
+            .collect();
+        row.cell(
+            cell,
+            Value::Missing(if listed.is_empty() {
+                "aterm ctl ls listed no session".into()
+            } else {
+                format!("aterm ctl ls listed no shell: {}", listed.join(", "))
+            }),
+        );
+        return Ok(());
+    };
+    // Its own mark, so an earlier probe's line still on screen is not this one's answer.
+    let mark = format!("aterm-nux-git-{}", g.clock_ms()?);
+    let sent = g.run(
+        &format!(
+            "{} ctl @{sid} send '{git} --version 2>&1; echo \"{mark} rc=$?\"\\n' 2>&1",
+            g.aterm
+        ),
+        STEP,
+    )?;
+    if !sent.trim_start().starts_with("OK") {
+        row.cell(
+            cell,
+            Value::Missing(format!("aterm ctl send said {}", squeeze(sent.trim(), 160))),
+        );
+        return Ok(());
+    }
+    let started = Instant::now();
+    let said = loop {
+        stop::check()?;
+        let text = g.run(
+            // The whole screen, its trailing blank rows dropped: at a first prompt the answer is
+            // near the top of a grid whose last rows are blank, which a `tail=` read never reaches
+            // (`OK 0 trimmed=12 first=12` on a 24-row tab, finding 13).
+            &format!("{} ctl @{sid} text trim 2>&1", g.aterm),
+            STEP,
+        )?;
+        // The echo's own line, not the typed command's: its rc is a number.
+        let lines: Vec<&str> = text.lines().collect();
+        if let Some(at) = lines.iter().rposition(|line| {
+            line.split_once(&format!("{mark} rc="))
+                .is_some_and(|(_, rc)| rc.trim().parse::<i32>().is_ok())
+        }) {
+            let answer = at.checked_sub(1).map_or("", |i| lines[i]).trim();
+            break Value::Text(format!(
+                "{} ({})",
+                squeeze(answer, 160),
+                lines[at].trim().trim_start_matches(mark.as_str()).trim()
+            ));
+        }
+        if started.elapsed() >= STALL {
+            break Value::Missing(format!(
+                "no answer in {} s: {}",
+                STALL.as_secs(),
+                squeeze(text.trim(), 200)
+            ));
+        }
+        stop::sleep(POLL)?;
+    };
+    row.cell(cell, said);
+    Ok(())
+}
+
+/// The presses a first launch's `setup=` readings asked of the person ([`Presses`]): the row fails
+/// on any aterm could have made itself ([`Presses::avoidable`]; `person`: someone at the console
+/// asked for macOS's batch); the macOS grants on offer are no press and are listed beside it.
+fn presses_cells(row: &mut Row, presses: &Presses, person: bool) {
+    let avoidable = presses.avoidable(person);
+    row.cell(
+        "presses aterm could have made (target 0)",
+        if avoidable.is_empty() {
+            Value::Count(0)
+        } else {
+            Value::Text(format!("{}: {}", avoidable.len(), avoidable.join(", ")))
+        },
+    );
+    row.cell(
+        "macOS grants on offer (no press waits)",
+        if presses.offered.is_empty() {
+            Value::Text("none".into())
+        } else {
+            Value::Text(presses.offered.join(", "))
+        },
+    );
+    if !avoidable.is_empty() {
+        row.fail(format!(
+            "System State waited on a press aterm could have made: {}",
+            avoidable.join(", ")
+        ));
+    }
 }
 
 /// What a first launch's row saw of System Settings' Quit & Reopen: the person's press on the
@@ -4229,8 +4543,8 @@ fn person_stage_cells(g: &Guest, ask: &Ask, row: &mut Row) -> Result<(), Fail> {
 
 /// Which process macOS held back to ask its Local Network question since the open (`open_ms`,
 /// epoch ms), from the guest's unified log, each by its command as `ps` reads it now: the
-/// question System State's step is meant to ask first.
-fn local_network_cell(g: &Guest, row: &mut Row, open_ms: u64) -> Result<(), Fail> {
+/// question System State's step is meant to ask first. Each alert's time it could read (epoch ms).
+fn local_network_cell(g: &Guest, row: &mut Row, open_ms: u64) -> Result<Vec<u64>, Fail> {
     let since_s = g.clock_ms()?.saturating_sub(open_ms) / 1000 + 5;
     let log = g.sh(
         &format!(
@@ -4273,7 +4587,67 @@ fn local_network_cell(g: &Guest, row: &mut Row, open_ms: u64) -> Result<(), Fail
                 .join("; ")
         }),
     );
+    Ok(blocks.iter().filter_map(|(at, _)| *at).collect())
+}
+
+/// How many of UserNotificationCenter's and Background Task Management's messages a first launch
+/// names.
+const UNC_SHOWN: usize = 10;
+
+/// What macOS's UserNotificationCenter and Background Task Management said since the open
+/// (`open_ms`, epoch ms), from the guest's unified log: the lane's census sees the alert's window
+/// but never its words (finding 12), so these name the question and who asked it.
+fn unc_cells(g: &Guest, row: &mut Row, open_ms: u64) -> Result<(), Fail> {
+    let since_s = g.clock_ms()?.saturating_sub(open_ms) / 1000 + 5;
+    for (cell, predicate) in [
+        (
+            "UserNotificationCenter said",
+            "process == \"UserNotificationCenter\"",
+        ),
+        (
+            "Background Task Management said of aterm",
+            "subsystem == \"com.apple.backgroundtaskmanagement\" AND eventMessage CONTAINS[c] \"aterm\"",
+        ),
+    ] {
+        let log = g.sh(
+            &format!(
+                "/usr/bin/log show --last {since_s}s --info --style ndjson --predicate '{predicate}' \
+                 2>/dev/null || true"
+            ),
+            STEP,
+        )?;
+        let said = distinct_messages(&log, UNC_SHOWN);
+        row.cell(
+            cell,
+            if said.is_empty() {
+                Value::Text("nothing".into())
+            } else {
+                Value::Text(said.join(" | "))
+            },
+        );
+    }
     Ok(())
+}
+
+/// How far before a Local Network alert [`lines_before`] reads aterm.log.
+const BEFORE_ALERT_MS: u64 = 3000;
+/// How many of aterm.log's lines [`lines_before`] keeps before one alert.
+const BEFORE_ALERT_LINES: usize = 4;
+
+/// The last `max` lines of `lines` logged in the `window_ms` up to `at` (epoch ms), in order:
+/// what the app was doing when macOS held one of its connections back to ask. Pure.
+#[must_use]
+pub fn lines_before<'a>(
+    lines: &'a [LogLine<'a>],
+    at: u64,
+    window_ms: u64,
+    max: usize,
+) -> Vec<&'a LogLine<'a>> {
+    let within: Vec<&LogLine<'_>> = lines
+        .iter()
+        .filter(|l| l.at_ms <= at && l.at_ms + window_ms >= at)
+        .collect();
+    within[within.len().saturating_sub(max)..].to_vec()
 }
 
 /// Main to first present (`rust_main_to_first_present_ms` in `aterm ctl metrics`).
@@ -4320,7 +4694,11 @@ fn stage_cells(
         or_missing(
             completed_at(&looks).map(after),
             Value::Ms,
-            "initial-setup.json never said completed",
+            // What it said last, so the stage that kept it pending is named (finding 16).
+            &last_record(&looks).map_or_else(
+                || "initial-setup.json never said completed".to_owned(),
+                |last| format!("initial-setup.json never said completed; it said last {last}"),
+            ),
         ),
     );
     Ok(())
@@ -4820,6 +5198,7 @@ fn run_row(
         Scenario::PassHeld => pass_held(&g, &mut row),
         Scenario::Doctor => doctor(&g, &mut row),
         Scenario::LaunchRepairs => launch_repairs(&g, &mut row),
+        Scenario::DevtoolsControl => devtools_control(&g, &mut row),
         Scenario::FirstLaunch => first_launch(&g, ask, &mut row),
         Scenario::TerminalLaunch => terminal_launch(&g, &mut row),
         Scenario::AppLaunch => app_launch(&g, &mut row),
@@ -5177,7 +5556,14 @@ mod tests {
         );
         // Only the rows that run the app need it built or handed over.
         let needing: Vec<_> = ALL.into_iter().filter(|s| !s.needs_app()).collect();
-        assert_eq!(needing, [Scenario::Successor, Scenario::InstallSh]);
+        assert_eq!(
+            needing,
+            [
+                Scenario::DevtoolsControl,
+                Scenario::Successor,
+                Scenario::InstallSh
+            ]
+        );
     }
 
     #[test]
@@ -5245,7 +5631,7 @@ mod tests {
     #[test]
     fn a_report_names_each_row_left_not_in_place() {
         let json = r#"{"items":[{"id":"workstation.dock","outcome":"changed"},{"id":"base.clt","outcome":"person"},
-            {"id":"base.ok","outcome":"ok"},{"id":"secrets.vault","outcome":"failed"},{"id":"x.na","outcome":"not-applicable"},
+            {"id":"base.ok","outcome":"ok"},{"id":"secrets.vault","outcome":"failed","why":"no vault answered"},{"id":"x.na","outcome":"not-applicable"},
             {"id":"repos.clone","outcome":"deferred"}]}"#
             .replace('\n', "");
         let j = read_report_json(&json).unwrap();
@@ -5266,6 +5652,15 @@ mod tests {
                 Value::Text("base.clt person, secrets.vault failed, repos.clone deferred".into())
             )
         );
+        // A failed row names its cause; a row with none adds nothing.
+        assert_eq!(
+            row.cells[1],
+            (
+                "why rows not ok (init --check --json)".to_owned(),
+                Value::Text("secrets.vault: no vault answered".into())
+            )
+        );
+        assert_eq!(row.cells.len(), 2);
         // NEGATIVE CONTROL: a report every row of which is in place names none, and one that did
         // not parse is not measured, never "none".
         let all_ok = read_report_json(
@@ -5276,6 +5671,7 @@ mod tests {
         not_ok_cell(&mut row, "", "init", None);
         assert_eq!(row.cells[0].1, Value::Text("none".into()));
         assert!(matches!(row.cells[1].1, Value::Missing(_)));
+        assert_eq!(row.cells.len(), 2);
     }
 
     #[test]
@@ -5531,6 +5927,41 @@ mod tests {
         assert_eq!(
             row.cells[0].1,
             Value::Text("base 2100, context 120, questions 3, total 8623, workstation 6400".into())
+        );
+    }
+
+    #[test]
+    fn a_log_says_each_message_once_and_nothing_log_show_adds() {
+        let log = "{\"eventMessage\":\"Displaying alert for pid 812\",\"timestamp\":\"x\"}\n\
+                   {\"eventMessage\":\"Displaying alert for pid 812\"}\n\
+                   {\"eventMessage\":\"  \"}\n\
+                   {\"eventMessage\":\"Alert dismissed\"}\n\
+                   {\"count\":4,\"finished\":1}\n\
+                   Filtering the log data\n\
+                   {\"eventMessage\":\"third\"}\n";
+        assert_eq!(
+            distinct_messages(log, 6),
+            ["Displaying alert for pid 812", "Alert dismissed", "third"]
+        );
+        assert_eq!(distinct_messages(log, 1), ["Displaying alert for pid 812"]);
+        // NEGATIVE CONTROL: a log of nothing but `log show`'s own lines says nothing.
+        assert!(distinct_messages("{\"count\":0,\"finished\":1}\nFiltering\n", 6).is_empty());
+    }
+
+    #[test]
+    fn an_alert_names_the_last_lines_logged_just_before_it() {
+        let lines = log_lines(LOG);
+        let last = lines[5].at_ms;
+        // At the last line: it and those within the window, at most `max`, oldest first.
+        let before = lines_before(&lines, last, 60_000, 2);
+        assert_eq!(before.len(), 2);
+        assert_eq!(before[1].at_ms, last);
+        assert!(before[0].at_ms <= before[1].at_ms);
+        // NEGATIVE CONTROL: a line after the alert, or older than the window, is never named.
+        assert!(lines_before(&lines, lines[0].at_ms - 1, 60_000, 4).is_empty());
+        assert!(
+            lines_before(&lines, last + 10_000, 1000, 4).is_empty(),
+            "a line older than the window is not the alert's"
         );
     }
 

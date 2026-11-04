@@ -9,7 +9,7 @@
 //! only a [`Shared::Present`] link to the default home's entry while that entry is missing.
 
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::ai::connector::{Seam, Shared};
 
@@ -60,7 +60,8 @@ pub struct Ensured {
 /// an entry of that name of any kind is left. A seam that is no overlay does nothing.
 /// # Errors
 ///
-/// `overlay` or a shared directory cannot be made, the default home's root cannot be listed for
+/// A shared name is not a relative path within its home, a nested overlay parent is not a real
+/// private directory, `overlay` or a shared directory cannot be made, the default home's root cannot be listed for
 /// a [`Shared::Suffix`], an entry's kind (a [`Shared::Present`]'s in the default home included)
 /// or a link's target cannot be read, a link cannot be made or removed, or a marker cannot be
 /// written.
@@ -71,6 +72,25 @@ pub fn ensure(seam: Seam, overlay: &Path, default_home: &Path) -> io::Result<Ens
     else {
         return Ok(Ensured::default());
     };
+    for name in shared
+        .iter()
+        .filter_map(|entry| match entry {
+            Shared::Dir(name) | Shared::File(name) | Shared::Present(name) => Some(*name),
+            Shared::Suffix(_) => None,
+        })
+        .chain(markers.iter().copied())
+    {
+        if Path::new(name).components().next().is_none()
+            || !Path::new(name)
+                .components()
+                .all(|part| matches!(part, Component::Normal(_)))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "shared entries must be relative paths within their home",
+            ));
+        }
+    }
     aterm_types::fs_restricted::ensure_private_dir(overlay)?;
     let mut out = Ensured::default();
     for entry in shared {
@@ -154,6 +174,7 @@ fn unlink_own(
     name: &str,
     out: &mut Ensured,
 ) -> io::Result<()> {
+    private_parents(overlay, name)?;
     let at = overlay.join(name);
     match std::fs::symlink_metadata(&at) {
         Ok(meta) if meta.file_type().is_symlink() => {
@@ -171,6 +192,7 @@ fn unlink_own(
 
 /// Writes `overlay`'s `name` empty (mode `0600`) where it has no entry of that name.
 fn mark(overlay: &Path, name: &str, out: &mut Ensured) -> io::Result<()> {
+    private_parents(overlay, name)?;
     let mut open = std::fs::OpenOptions::new();
     open.write(true).create_new(true);
     #[cfg(unix)]
@@ -208,6 +230,7 @@ fn suffixed(home: &Path, suffix: &str) -> io::Result<Vec<String>> {
 }
 
 fn link(overlay: &Path, default_home: &Path, name: &str, out: &mut Ensured) -> io::Result<()> {
+    private_parents(overlay, name)?;
     let at = overlay.join(name);
     let target = default_home.join(name);
     match std::fs::symlink_metadata(&at) {
@@ -229,6 +252,29 @@ fn link(overlay: &Path, default_home: &Path, name: &str, out: &mut Ensured) -> i
             name: name.to_owned(),
             is: if meta.is_dir() { Is::Dir } else { Is::File },
         }),
+    }
+    Ok(())
+}
+
+/// Nested entries keep real private ancestors in the overlay. A foreign directory link
+/// cannot redirect creation of a shared leaf outside the claimed home.
+fn private_parents(overlay: &Path, name: &str) -> io::Result<()> {
+    let mut at = overlay.to_path_buf();
+    if let Some(parent) = Path::new(name).parent() {
+        for component in parent.components() {
+            at.push(component.as_os_str());
+            match std::fs::symlink_metadata(&at) {
+                Ok(meta) if !meta.file_type().is_dir() => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "shared entry parent is not a real directory",
+                    ));
+                }
+                Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+                _ => {}
+            }
+            aterm_types::fs_restricted::ensure_private_dir(&at)?;
+        }
     }
     Ok(())
 }

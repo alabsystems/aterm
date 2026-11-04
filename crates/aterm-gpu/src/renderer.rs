@@ -801,9 +801,19 @@ pub enum SurfacePresentFailure {
     Validation,
 }
 
+/// Inset-border thickness in pixels for a `w × h` frame: `(w.min(h) / 200).clamp(2, 6)`.
 #[inline]
-fn drop_border_px_gpu(w: u32, h: u32) -> u32 {
-    (w.min(h) / 200).clamp(2, 6)
+#[must_use]
+pub const fn drop_border_px(w: u32, h: u32) -> u32 {
+    let min_dim = if w < h { w } else { h };
+    let raw = min_dim / 200;
+    if raw < 2 {
+        2
+    } else if raw > 6 {
+        6
+    } else {
+        raw
+    }
 }
 
 #[cfg(trust_verify)]
@@ -849,18 +859,27 @@ macro_rules! verify_island {
 /// `base` scaled by `DropOverlay::border_scale_q4` (1/16 units, 0 keeps `base`), at least one
 /// pixel once scaled.
 #[inline]
-pub(crate) fn scaled_border_px(base: u32, scale_q4: u8) -> u32 {
+#[must_use]
+pub const fn scaled_border_px(base: u32, scale_q4: u8) -> u32 {
     if scale_q4 == 0 {
         return base;
     }
-    let scaled = (u64::from(base) * u64::from(scale_q4)) / 16;
-    u32::try_from(scaled).unwrap_or(u32::MAX).max(1)
+    let scaled = ((base as u64) * (scale_q4 as u64)) / 16;
+    let clamped = if scaled > u32::MAX as u64 {
+        u32::MAX
+    } else {
+        scaled as u32
+    };
+    if clamped < 1 { 1 } else { clamped }
 }
 
 #[cfg(test)]
 mod scaled_border_px_tests {
-    use super::scaled_border_px;
+    use super::{drop_border_px, scaled_border_px};
 
+    /// NEGATIVE CONTROL: unscaled `scale_q4 = 0` preserves `base = 0`, whereas any positive
+    /// `scale_q4` floors a zero `base` at 1 pixel; `drop_border_px` clamps small and huge frames to
+    /// `[2, 6]`.
     #[test]
     fn scaled_border_px_is_sixteenths_never_thinner_than_a_pixel() {
         for (base, q4, want) in [
@@ -872,11 +891,24 @@ mod scaled_border_px_tests {
             (1, 1, 1),
             (0, 16, 1),
             (0, 0, 0),
+            (u32::MAX, 0, u32::MAX),
             (u32::MAX, 16, u32::MAX),
             (u32::MAX, 255, u32::MAX),
             (1 << 25, 32, 1 << 26),
         ] {
             assert_eq!(scaled_border_px(base, q4), want, "base {base} × {q4}/16");
+        }
+        for (w, h, want) in [
+            (0, 0, 2),
+            (399, 1000, 2),
+            (400, 1000, 2),
+            (600, 800, 3),
+            (1000, 800, 4),
+            (1200, 1200, 6),
+            (4000, 3000, 6),
+            (u32::MAX, u32::MAX, 6),
+        ] {
+            assert_eq!(drop_border_px(w, h), want, "{w}×{h}");
         }
     }
 }
@@ -3403,7 +3435,7 @@ fn present_blit_uniform(
                 flag: invert as u32,
                 overlay: 1,
                 border_px: scaled_border_px(
-                    drop_border_px_gpu(source_width, visible_height),
+                    drop_border_px(source_width, visible_height),
                     overlay.border_scale_q4,
                 )
                 .min(source_width / 2)

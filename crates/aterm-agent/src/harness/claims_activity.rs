@@ -19,7 +19,6 @@ use std::time::Duration;
 
 #[cfg(unix)]
 const FILE: &str = "activity.json";
-const MAX_ENTRIES: usize = 4096;
 #[cfg(unix)]
 const MAX_BYTES: usize = 2 * 1024 * 1024;
 
@@ -47,7 +46,6 @@ impl Book {
             .ok_or("claim activity has no observation time")?;
         let rows = value["entries"]
             .as_array()
-            .filter(|rows| rows.len() <= MAX_ENTRIES)
             .ok_or("claim activity entries are missing or full")?;
         let mut entries = BTreeMap::new();
         for row in rows {
@@ -77,13 +75,17 @@ impl Book {
 
     #[cfg(unix)]
     fn encode(&self) -> Result<Vec<u8>, String> {
-        aterm_json::to_vec(&json!({
+        let bytes = aterm_json::to_vec(&json!({
             "version": 1, "machine": self.machine, "at": self.at,
             "entries": self.entries.iter().map(|(key, until)| json!({
                 "pool": key.pool, "email": key.email, "until": until
             })).collect::<Vec<_>>()
         }))
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+        if bytes.len() > MAX_BYTES {
+            return Err("local claim activity exceeds byte budget".into());
+        }
+        Ok(bytes)
     }
 
     /// Union of positive evidence; an older or empty observer never lowers a deadline.
@@ -104,13 +106,21 @@ impl Book {
         )
     )]
     fn note(&mut self, key: LeaseKey, until: i64) -> Result<(), String> {
-        if !self.entries.contains_key(&key) && self.entries.len() >= MAX_ENTRIES {
-            return Err("local claim activity is full".into());
-        }
+        let previous = self.entries.get(&key).copied();
         self.entries
-            .entry(key)
-            .and_modify(|held| *held = (*held).max(until))
-            .or_insert(until);
+            .insert(key.clone(), previous.unwrap_or(until).max(until));
+        #[cfg(unix)]
+        if let Err(error) = self.encode() {
+            match previous {
+                Some(previous) => {
+                    self.entries.insert(key, previous);
+                }
+                None => {
+                    self.entries.remove(&key);
+                }
+            }
+            return Err(error);
+        }
         Ok(())
     }
 

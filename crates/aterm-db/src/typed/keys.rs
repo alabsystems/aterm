@@ -121,6 +121,17 @@ pub fn machine_pk(birth: &str) -> String {
     h8("mc", b"aterm/alab/machine/1\0", &[birth.as_bytes()])
 }
 
+/// A planned machine's key for `label`: its birth key [`machine_pk`]`(label)`, or, where a row
+/// already holds that (`held`: a retired Mac, or one relabelled away from its birth label), the
+/// first `machine_pk("<label>/<n>")` from `n = 2` no row holds, so a replacement Mac gets a row
+/// of its own and the old row keeps its history. Deterministic, so two writers planning one
+/// label at once make one row. `None` only when every key is held.
+pub fn planned_machine_pk(label: &str, held: impl Fn(&str) -> bool) -> Option<String> {
+    std::iter::once(machine_pk(label))
+        .chain((2u32..).map(|n| machine_pk(&format!("{label}/{n}"))))
+        .find(|pk| !held(pk))
+}
+
 /// A Mac's hardware hint under one network, 16 hex (design §4.7): `HMAC(key, "aterm/alab/hw-hint/1"
 /// ‖ IOPlatformUUID)[..8]`, the key a digest of the network identity, not an epoch key, so it stays
 /// stable across rotations and says nothing of the hardware outside this network. The uuid is read

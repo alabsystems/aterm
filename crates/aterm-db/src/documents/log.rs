@@ -67,6 +67,7 @@ pub(crate) struct Log {
     scope: Scope,
     retained: usize,
     append_bound: usize,
+    local_use: crate::catalog::ring::Used,
     index: Index,
     records: BTreeMap<Digest, (Operation, Option<Command>)>,
     conflicts: BTreeSet<Digest>,
@@ -106,6 +107,7 @@ impl Log {
             scope,
             retained: 0,
             append_bound,
+            local_use: store.retained_use(session, session.actor())?,
             index: Index::new(crate::database::MAX_RECORDS * 2),
             records: BTreeMap::new(),
             conflicts: BTreeSet::new(),
@@ -367,6 +369,11 @@ impl Log {
             .filter(|(op, _)| op.header.actor == actor)
             .count();
         (self.retained, by_actor)
+    }
+
+    /// Retained storage use, including unavailable records, for this reader's writer.
+    pub(crate) fn local_use(&self) -> crate::catalog::ring::Used {
+        self.local_use
     }
 
     /// Maximum records the observed local writer needs for one append,

@@ -275,3 +275,204 @@ fn an_account_with_no_weekly_figure_names_why_in_its_title_and_to_a_reader() {
         "Account: owner@example.com, Max 20x, weekly 62% left, 40m ago"
     );
 }
+
+#[test]
+fn a_watching_inventory_keeps_the_observed_week_or_its_missing_reading_reason() {
+    use aterm_agent::harness::account_progress::{AccountProgress, ProgressPhase};
+    use aterm_agent::harness::footer::{WEEKLY_MARK, account_progress_text, segments};
+    use aterm_agent::harness::profile::{SubscriptionDisplay, WeeklyGap};
+
+    for (known, eligible) in [(Some(2), Some(1)), (Some(2), None), (None, None)] {
+        for weekly in [Some("weekly 62% left"), None] {
+            let mut progress = AccountProgress::unknown(100);
+            progress.phase = ProgressPhase::Watching;
+            progress.known = known;
+            progress.eligible = eligible;
+            let inventory = account_progress_text(&progress, false);
+            let facts = FooterFacts {
+                subscription: Some(SubscriptionDisplay {
+                    email: Some("owner@example.test".into()),
+                    plan: Some("Max 20x".into()),
+                    weekly: weekly.map(str::to_owned),
+                    weekly_gap: Some(WeeklyGap::Untapped),
+                    ..Default::default()
+                }),
+                account_progress: Some(progress),
+                ..facts()
+            };
+            let before = facts.clone();
+            let mut without_progress = facts.clone();
+            without_progress.account_progress = None;
+            let title = fact_title(&facts, None, Fact::Account).0;
+            let spoken = fact_spoken_of(&facts, None, Fact::Account, FactMask::default()).0;
+            for (said, observation) in [
+                (&title, weekly.unwrap_or(WeeklyGap::Untapped.words())),
+                (&spoken, weekly.unwrap_or(WeeklyGap::Untapped.spoken())),
+            ] {
+                let recovery_at = said.find(&inventory).expect("recovery inventory retained");
+                let quota_at = said
+                    .find(observation)
+                    .expect("observed quota or reason retained");
+                assert!(recovery_at < quota_at, "recovery leads: {said}");
+                assert!(said.contains("owner@example.test"));
+            }
+            let week = |facts: &FooterFacts| {
+                segments(facts)
+                    .into_iter()
+                    .find(|segment| segment.mark == WEEKLY_MARK)
+            };
+            assert_eq!(week(&facts), week(&without_progress));
+            assert_eq!(week(&facts).is_some(), weekly.is_some());
+            assert_eq!(
+                facts, before,
+                "disclosures read the same retained observation"
+            );
+        }
+    }
+}
+
+#[test]
+fn recovery_work_limits_and_busy_reads_keep_their_existing_disclosure_priority() {
+    use aterm_agent::harness::account_progress::{AccountProgress, ProgressPhase};
+    use aterm_agent::harness::outlook::Glance;
+    use aterm_agent::harness::profile::SubscriptionDisplay;
+    use aterm_agent::harness::session_usage::Wall;
+
+    for (phase, busy, transcript_wall) in [
+        (ProgressPhase::Unknown, false, false),
+        (ProgressPhase::Waiting, false, false),
+        (ProgressPhase::Paused, false, false),
+        (ProgressPhase::Ready, false, false),
+        (ProgressPhase::Switching { to: "alt1".into() }, false, false),
+        (ProgressPhase::Verifying { to: "alt1".into() }, false, false),
+        (
+            ProgressPhase::SigningIn {
+                label: "alt1".into(),
+                route: Some("mailbox".into()),
+            },
+            false,
+            false,
+        ),
+        (ProgressPhase::Watching, true, false),
+        (ProgressPhase::Watching, false, true),
+    ] {
+        let mut progress = AccountProgress::unknown(100);
+        progress.phase = phase;
+        progress.known = Some(2);
+        progress.eligible = Some(1);
+        progress.next_at = Some(200);
+        let facts = FooterFacts {
+            subscription: Some(SubscriptionDisplay {
+                email: Some("owner@example.test".into()),
+                weekly: Some("weekly 62% left".into()),
+                ..Default::default()
+            }),
+            account_progress: Some(progress),
+            account_progress_busy: busy,
+            usage: Some(UsageFacts {
+                wall: transcript_wall.then(|| Wall {
+                    label: "7d",
+                    resets: "Thu 09:00".into(),
+                }),
+                ..Default::default()
+            }),
+            glance: Some(Glance {
+                title_verdict: Some("synthetic future movement".into()),
+                spoken: Some("synthetic future movement".into()),
+                ..Default::default()
+            }),
+            ..facts()
+        };
+        let view = facts.account_progress_view().expect("recovery observation");
+        if busy {
+            assert_eq!(view.phase, ProgressPhase::Unknown);
+            assert_eq!(view.eligible, None);
+            assert_eq!(view.next_at, None);
+        }
+        if transcript_wall {
+            assert_eq!(view.phase, ProgressPhase::Waiting);
+            assert!(view.wall.is_some());
+        }
+        let mut recovery_only = facts.clone();
+        recovery_only.subscription = None;
+        recovery_only.glance = None;
+        recovery_only.account = None;
+        assert_eq!(
+            fact_title(&facts, None, Fact::Account),
+            fact_title(&recovery_only, None, Fact::Account),
+            "{:?}, busy={busy}, transcript_wall={transcript_wall}",
+            view.phase,
+        );
+        assert_eq!(
+            fact_spoken_of(&facts, None, Fact::Account, FactMask::default()),
+            fact_spoken_of(&recovery_only, None, Fact::Account, FactMask::default()),
+            "{:?}, busy={busy}, transcript_wall={transcript_wall}",
+            view.phase,
+        );
+    }
+}
+
+#[test]
+fn watching_disclosures_use_the_panes_glance_without_inventing_a_profile() {
+    use aterm_agent::harness::account_progress::{AccountProgress, ProgressPhase};
+    use aterm_agent::harness::outlook::Glance;
+    use aterm_agent::harness::profile::SubscriptionDisplay;
+
+    let future = "synthetic future movement";
+    for paused in [false, true] {
+        let mut progress = AccountProgress::unknown(100);
+        progress.phase = ProgressPhase::Watching;
+        progress.forecasts_paused = paused;
+        progress.known = Some(2);
+        let mut facts = FooterFacts {
+            subscription: Some(SubscriptionDisplay {
+                email: Some("owner@example.test".into()),
+                weekly: Some("weekly 62% left".into()),
+                ..Default::default()
+            }),
+            account_progress: Some(progress),
+            glance: Some(Glance {
+                reset: Some("Thu 09:00".into()),
+                five: Some("5h 62% left".into()),
+                title_verdict: Some(future.into()),
+                spoken: Some(future.into()),
+                ..Default::default()
+            }),
+            ..facts()
+        };
+        for said in [
+            fact_title(&facts, None, Fact::Account).0,
+            fact_spoken_of(&facts, None, Fact::Account, FactMask::default()).0,
+        ] {
+            assert!(said.contains("weekly 62% left"), "{said}");
+            assert_eq!(said.contains(future), !paused, "{said}");
+        }
+        facts.subscription = None;
+        facts.account = Some("retained-login".into());
+        let retained_glance = facts.glance.clone();
+        for with_progress in [true, false] {
+            if !with_progress {
+                facts.account_progress = None;
+            }
+            for said in [
+                fact_title(&facts, None, Fact::Account).0,
+                fact_spoken_of(&facts, None, Fact::Account, FactMask::default()).0,
+            ] {
+                assert!(said.contains("retained-login"), "{said}");
+                for absent in [
+                    "owner@example.test",
+                    "weekly 62% left",
+                    "Thu 09:00",
+                    "5h 62% left",
+                    future,
+                ] {
+                    assert!(!said.contains(absent), "{said}");
+                }
+            }
+            assert_eq!(
+                facts.glance, retained_glance,
+                "raw history remains retained"
+            );
+        }
+    }
+}

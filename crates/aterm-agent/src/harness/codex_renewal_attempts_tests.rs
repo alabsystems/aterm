@@ -62,8 +62,10 @@ fn fixture() -> (aterm_tempfile::TempDir, Env, Receipt, Prepare) {
         },
     };
     let receipt = Receipt {
+        destination: None,
         id: prepare.id.clone(),
         intent: Intent {
+            purpose: Default::default(),
             thread: "019a4b54-5fa1-7123-8123-123456789abc".into(),
             wall: "019a4b54-5fa2-7123-8123-123456789abc".into(),
             identity: Identity::from_native("account", "user"),

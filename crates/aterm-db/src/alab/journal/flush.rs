@@ -538,7 +538,7 @@ pub(crate) fn read_window(
     }
 }
 
-fn key_relay_bucket(key: &str) -> Option<u8> {
+pub(crate) fn key_relay_bucket(key: &str) -> Option<u8> {
     let (prefix, _) = key.split_once('.')?;
     let hex = prefix.strip_prefix("rl-")?;
     if hex.len() != 1 {

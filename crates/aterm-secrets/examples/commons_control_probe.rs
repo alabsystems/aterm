@@ -12,7 +12,7 @@ fn stored_stream(
     use aterm_json::json;
     use aterm_secrets::{
         fsx,
-        membership_log::{MAX_RECORDS, MAX_RECORDS_STREAM, decode_records},
+        membership_log::{MAX_HELD_RECORDS, MAX_RECORDS_STREAM, decode_records},
     };
 
     let Some(bytes) = fsx::read_private(&paths.records_file(), MAX_RECORDS_STREAM)? else {
@@ -46,7 +46,7 @@ fn stored_stream(
     }
     Ok(json!({
         "bytes": bytes.as_slice().len(), "decoded": true,
-        "records": records.len(), "at_record_limit": records.len() >= MAX_RECORDS,
+        "records": records.len(), "at_record_limit": records.len() >= MAX_HELD_RECORDS,
         "missing_from_recovered": missing, "accepted_in_memory": accepted,
         "recheck_errors": errors,
     }))
@@ -60,7 +60,7 @@ fn observe(
     use aterm_secrets::{
         client,
         commons::{self, Observation},
-        membership_log::{Body, EpochAudience, MAX_RECORDS},
+        membership_log::{Body, EpochAudience, MAX_HELD_RECORDS},
     };
 
     let Some(_guard) = client::try_commons_source_read(paths)? else {
@@ -127,8 +127,12 @@ fn observe(
                 "active_members": membership.members().len(),
                 "new_proof_capacity": {
                     "scope": "new-proof-admissions-only",
-                    "complete_records": proof_capacity.complete_records,
-                    "exclusive_record_limit": proof_capacity.exclusive_record_limit,
+                    "weighed_records": proof_capacity.weighed_records,
+                    "weighed_limit": proof_capacity.weighed_limit,
+                    "keyed_records": proof_capacity.keyed_records,
+                    "keyed_limit": proof_capacity.keyed_limit,
+                    "held_records": proof_capacity.held_records,
+                    "held_cap": proof_capacity.held_cap,
                     "within_limit": proof_capacity.within_limit,
                     "grants_membership": false,
                 },
@@ -144,8 +148,8 @@ fn observe(
         "schema": 1, "kind": "commons-control-evidence",
         "scope": "local-vault-observation", "available": true,
         "identity_present": identity.is_some(), "control": observation,
-        "retained_records": store.len(), "record_limit": MAX_RECORDS,
-        "at_record_limit": store.len() >= MAX_RECORDS, "log": log, "stored_stream": stored_stream,
+        "retained_records": store.len(), "record_limit": MAX_HELD_RECORDS,
+        "at_record_limit": store.len() >= MAX_HELD_RECORDS, "log": log, "stored_stream": stored_stream,
         "grants_membership": false,
     }))
 }

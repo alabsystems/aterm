@@ -1926,9 +1926,22 @@ impl App {
         }
     }
 
-    /// Route an OS accessibility `ActionRequest` on `wid`.
+    /// Route an OS accessibility `ActionRequest` on `wid`, the whole dispatch marked as an
+    /// accessibility client's ([`App::with_assistive_source`]): no person is known to stand
+    /// behind it, since every tab's program reaches the window's tree with aterm's own
+    /// Accessibility grant, as a screen reader does.
     #[cfg(a11y_tree)]
     pub(crate) fn on_accessibility_action(
+        &mut self,
+        wid: crate::WindowId,
+        req: aterm_a11y::model::ActionRequest,
+    ) {
+        self.with_assistive_source(|app| app.dispatch_accessibility_request(wid, req));
+    }
+
+    /// [`App::on_accessibility_action`]'s routing, under its mark.
+    #[cfg(a11y_tree)]
+    fn dispatch_accessibility_request(
         &mut self,
         wid: crate::WindowId,
         req: aterm_a11y::model::ActionRequest,

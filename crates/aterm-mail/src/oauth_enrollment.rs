@@ -460,10 +460,10 @@ mod tests {
         );
     }
 
-    /// NEGATIVE CONTROL: on BSD/macOS `TcpListener::accept` inherits `O_NONBLOCK` from the
-    /// nonblocking listener, and checking `stop` before `accept` drops an already-queued callback.
+    /// NEGATIVE CONTROL: checking `stop` before draining the accept queue drops an
+    /// already-sent valid callback.
     #[test]
-    fn receiver_drains_queued_and_delayed_callback_on_accepted_stream() {
+    fn receiver_drains_a_queued_callback_when_stopping() {
         let enrollment = Enrollment::bind(
             Client {
                 id: "ours".into(),
@@ -479,23 +479,43 @@ mod tests {
             enrollment.pending.state
         );
         let request_bytes = response(&target, &address.to_string());
-        std::thread::scope(|scope| {
-            scope.spawn(move || {
-                std::thread::sleep(Duration::from_millis(35));
-                stream.write_all(request_bytes.as_bytes()).unwrap();
-                // Behave like the browser: do not abort the callback before its reply.
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(60)))
-                    .unwrap();
-                let mut reply = String::new();
-                stream.read_to_string(&mut reply).unwrap();
-                assert!(reply.starts_with("HTTP/1.1 200 OK\r\n"));
-            });
-            let stop = AtomicBool::new(true);
-            let code = enrollment
-                .receive(Instant::now() + Duration::from_secs(60), &stop)
-                .expect("queued connection with delayed request bytes must succeed");
-            assert_eq!(code.expose(), "queued-code");
-        });
+        let end = Instant::now() + Duration::from_secs(60);
+        stream
+            .set_write_timeout(Some(Duration::from_secs(60)))
+            .unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(60)))
+            .unwrap();
+        stream.write_all(request_bytes.as_bytes()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsFd as _;
+            aterm_uds::ready::until(
+                enrollment.listener.as_fd(),
+                aterm_uds::ready::Interest::Read,
+                end,
+            )
+            .expect("callback queued before stopping");
+        }
+        let stop = AtomicBool::new(true);
+        let code = enrollment
+            .receive(end, &stop)
+            .expect("queued callback must be drained before stopping");
+        assert_eq!(code.expose(), "queued-code");
+
+        let mut response = std::io::BufReader::new(stream.take(16384));
+        let mut reply = Vec::new();
+        while !reply.ends_with(b"\r\n\r\n") {
+            assert_ne!(
+                std::io::BufRead::read_until(&mut response, b'\n', &mut reply).unwrap(),
+                0
+            );
+        }
+        assert!(reply.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert!(
+            reply
+                .windows(b"\r\nContent-Length: 0\r\n".len())
+                .any(|part| part == b"\r\nContent-Length: 0\r\n")
+        );
     }
 }

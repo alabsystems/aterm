@@ -196,7 +196,8 @@ impl Outbox {
     #[cfg(all(unix, debug_assertions))]
     pub(super) fn fixture_renewal_ready(&self) -> bool {
         matches!(self.segments.front(), Some(Segment::Bytes(bytes))
-            if bytes.starts_with(b"OK codex-renewal state=ready id="))
+            if bytes.starts_with(b"OK codex-renewal state=ready id=")
+                || bytes.starts_with(b"OK codex-rotation state=ready id="))
     }
 
     fn owed(&self) -> bool {

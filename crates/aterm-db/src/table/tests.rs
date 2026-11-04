@@ -882,6 +882,112 @@ fn newly_admitted_machines_replay_durable_tables_and_relay_historical_access_off
     );
 }
 
+/// A Mac the membership log lets in after a Commons rotation holds no `Wrap` of the log-era
+/// epoch an older row is sealed under (an admission wraps the admission epochs alone): table
+/// repair names that epoch among the history it needs, a member issues the history handoff
+/// (ACHG1) of it, and the Mac then reads the row.
+///
+/// NEGATIVE CONTROL: before the handoff the Mac cannot authenticate the row, and repair asks
+/// for the epoch.
+#[test]
+fn a_log_admitted_mac_reads_an_older_log_epochs_row_through_a_history_handoff() {
+    use aterm_secrets::{
+        client::{Paths, admit_member_in_log, load_records, remove_member_in_log, save_records},
+        commons::bootstrap::{Bootstrap, Device},
+        membership_log::{Entrant, Evidence},
+    };
+    let lab = Lab::with_foundation(&[Role::Writer, Role::Writer]);
+    client::seed_vault_genesis(&lab.paths[0], &lab._home.path().join("genesis.v2")).unwrap();
+    save_records(
+        &lab.paths[1],
+        &load_records(&lab.paths[0]).unwrap().encode(),
+    )
+    .unwrap();
+    let b1 = lab.bootstrap(0);
+    let trust = b1.trust();
+    let pinned = format!(
+        "{}#{}",
+        lab._home.path().join("test.vault").display(),
+        lab.signer
+    );
+    let session = Session::open(&b1).unwrap();
+    assert!(
+        session.is_log_backed(),
+        "CONTROL: the seeded log backs Commons"
+    );
+    let dir = lab._home.path().join("table-log");
+    let mut original = store::Store::create(&session, &dir).unwrap();
+    let scope = original.scope();
+    let receipt = original.commit_catalog(&session, b"log-era-row").unwrap();
+    let wire = original
+        .wire(&session, &receipt.id)
+        .unwrap()
+        .unwrap()
+        .to_vec();
+    let source = *session.authenticate(scope, &wire).unwrap().roster();
+    drop((original, session));
+
+    let entrant = |name: &str, byte: u8| -> (Paths, Entrant) {
+        let paths = Paths::for_home(&lab._home.path().join(name));
+        client::configure_log_member(&paths, &pinned, name).unwrap();
+        let _ = client::machine_identity(&paths).unwrap();
+        let request = Device::open(&paths)
+            .unwrap()
+            .unwrap()
+            .request(trust.network, trust.authority)
+            .unwrap();
+        let entrant = Entrant {
+            request,
+            node_key: [byte; 32],
+            name: name.to_owned(),
+            label: name.to_owned(),
+        };
+        (paths, entrant)
+    };
+    // A rotation: m4 is let in and removed again.
+    let (_m4, e4) = entrant("m4", 0x44);
+    let actor4 = e4.request.binding().actor();
+    admit_member_in_log(&lab.paths[0], e4, Evidence::Phrase).unwrap();
+    remove_member_in_log(&lab.paths[0], actor4).unwrap();
+    let (m3, e3) = entrant("m3", 0x33);
+    let actor3 = e3.request.binding().actor();
+    admit_member_in_log(&lab.paths[0], e3, Evidence::Phrase).unwrap();
+    let records = load_records(&lab.paths[0]).unwrap().encode();
+    save_records(&lab.paths[1], &records).unwrap();
+    save_records(&m3, &records).unwrap();
+    let b3 = Bootstrap::required(&m3).unwrap();
+    assert!(
+        Session::open(&b3)
+            .unwrap()
+            .authenticate(scope, &wire)
+            .is_err(),
+        "CONTROL: m3 holds no key of the older epoch"
+    );
+    let (needs, _) = Session::open(&b3).unwrap().history_needs(None, 64).unwrap();
+    assert!(needs.contains(&source), "repair asks for the log-era epoch");
+
+    let handoff = Session::open(&b1)
+        .unwrap()
+        .handoffs(actor3, &[source])
+        .unwrap()
+        .remove(0)
+        .expect("m1 issues the handoff of a log-era epoch");
+    Session::open(&b3)
+        .unwrap()
+        .import_handoff(source, &handoff)
+        .unwrap();
+    let (needs, _) = Session::open(&b3).unwrap().history_needs(None, 64).unwrap();
+    assert!(!needs.contains(&source), "the handoff answers the need");
+    assert_eq!(
+        Session::open(&b3)
+            .unwrap()
+            .authenticate(scope, &wire)
+            .unwrap()
+            .payload(),
+        b"log-era-row"
+    );
+}
+
 /// Table repair refuses a peer while this device has never read its roster (it could name that
 /// peer), admits it once a read succeeds, and keeps that answer through a read that fails after
 /// it. The read is made to fail by leaving the scratch vault's `source.toml` readable by other

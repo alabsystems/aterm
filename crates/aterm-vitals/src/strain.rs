@@ -127,7 +127,7 @@ impl Now {
 /// A row's now as a share of its capacity, as the deck's now % prints it.
 fn share(row: &ResourceView) -> Option<f64> {
     let (now, cap) = (row.now?, row.capacity?);
-    (cap > 0.0).then(|| now / cap)
+    (cap > 0.0).then_some(now / cap)
 }
 
 /// One 10 s bucket of the hour as [`soak()`] reads it. The default is a bucket nothing was read in.

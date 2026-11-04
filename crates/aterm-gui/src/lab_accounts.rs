@@ -9,6 +9,7 @@ use aterm_agent::harness::account_stats::{self, Missing, Tap};
 use aterm_agent::harness::accounts::{
     self, AccountRecords, AttemptOutcome, Auth, Cli, SignInAction,
 };
+use aterm_agent::harness::alab_seen;
 
 const LAST_TIMESTAMP: i64 = 253_402_300_799;
 
@@ -37,8 +38,39 @@ pub(crate) fn collect(config: &Path, now_ms: u64) -> LabAccounts {
     let now = seconds(now_ms);
     let store = accounts::Store::at(&state).bounded_by(&[]);
     match store.read_account_records(Some(&roster), now) {
-        Ok(records) => project(&records, now_ms),
+        // What the journal holds now, never waited on: the first ask starts its read, and a later
+        // collection shows it.
+        Ok(records) => project_with(
+            &records,
+            aterm_agent::harness::alab_seen::current(false).as_deref(),
+            now_ms,
+        ),
         Err(_) => unavailable("Local account records could not be read consistently"),
+    }
+}
+
+/// The lab journal's facts of one account: who last used it, where it is signed in, and each
+/// window with its reading's age, Mac and source.
+fn journal_facts(found: &alab_seen::AccountSeen, now: i64, facts: &mut Vec<(String, String)>) {
+    if let Some(last) = &found.last_use {
+        facts.push((
+            "Last used by (lab journal)".into(),
+            alab_seen::when(&last.by, last.t, now),
+        ));
+    }
+    if !found.signed_in.is_empty() {
+        let on: Vec<String> = found
+            .signed_in
+            .iter()
+            .map(|s| format!("{} ({})", s.on, s.state))
+            .collect();
+        facts.push(("Signed in on (lab journal)".into(), on.join(", ")));
+    }
+    for window in &found.windows {
+        facts.push((
+            format!("Lab {} quota", window.window),
+            alab_seen::window_line(window, now),
+        ));
     }
 }
 
@@ -73,9 +105,21 @@ fn observation_time(at: Option<i64>, now: i64) -> String {
     }
 }
 
+#[cfg(test)]
 fn project(records: &AccountRecords, now_ms: u64) -> LabAccounts {
+    project_with(records, None, now_ms)
+}
+
+/// The rows of `records`, each with what the lab journal `seen` says of its account (last used
+/// by, signed in on, each window), read from the journal and never from a provider.
+fn project_with(
+    records: &AccountRecords,
+    seen: Option<&alab_seen::Seen>,
+    now_ms: u64,
+) -> LabAccounts {
     let now = seconds(now_ms);
-    let rows: Vec<_> = records.roster.rows.iter().take(accounts::MAX_ACCOUNTS).map(|row| {
+    let lab = seen.and_then(|_| aterm_agent::harness::alab_roster::current());
+    let rows: Vec<_> = records.roster.rows.iter().map(|row| {
         let account = records.state.accounts.get(&row.label).cloned().unwrap_or_default();
         let binding = records.logins.get(&row.label);
         let next_step = binding.and_then(|binding| binding.sign_in_task)
@@ -179,6 +223,13 @@ fn project(records: &AccountRecords, now_ms: u64) -> LabAccounts {
                 };
                 facts.push((format!("{name} quota source"), source.into()));
             }
+        }
+        // What every Mac's journal says of this account, beside this Mac's own records.
+        if let Some(found) = seen.and_then(|seen| {
+            let pk = alab_seen::row_key(Cli::Claude, row, &records.state, lab.as_deref())?;
+            seen.accounts.get(&pk)
+        }) {
+            journal_facts(found, now, &mut facts);
         }
         LabAccount { label: row.label.clone(), facts }
     }).collect();

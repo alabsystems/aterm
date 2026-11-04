@@ -70,7 +70,7 @@ impl Source {
 
 /// The dialogs a person answers in a first launch, by the window owner the census names: each
 /// one's first window opens a person stage and its last window's going ends it.
-pub(crate) const PERSON_STAGES: [(&str, &str); 9] = [
+pub(crate) const PERSON_STAGES: [(&str, &str); 10] = [
     ("System Settings", "the walk's System Settings page"),
     ("nehelper", "the Local Network ask"),
     (
@@ -83,6 +83,11 @@ pub(crate) const PERSON_STAGES: [(&str, &str); 9] = [
     ("BackgroundTaskManagementAgent", "a Background Items notice"),
     (
         "Install Command Line Developer Tools",
+        "Apple's Command Line Tools install dialog",
+    ),
+    // macOS 27's name for it, cut short (`mac_nux_guest::dialog_kind`).
+    (
+        "Install Command Line Developer",
         "Apple's Command Line Tools install dialog",
     ),
     (

@@ -213,6 +213,31 @@ macro_rules! plain_durable_flushes_in_tests {
     };
 }
 
+/// Make the durable flushes of this test binary, and of every process it starts, the full
+/// flushes aterm ships, whatever mark it inherited from a marked test that started it
+/// ([`plain_durable_flushes_in_tests!`] is the other way): for a test binary that judges
+/// those flushes themselves, as aterm-durable's own do.
+#[macro_export]
+macro_rules! shipped_durable_flushes_in_tests {
+    () => {
+        #[cfg(all(test, target_vendor = "apple"))]
+        const _: () = {
+            extern "C" fn shipped_durable_flushes() {
+                // SAFETY: a load-time hook runs before `main`, so before any other thread
+                // and before astream-sys reads the mark, once, at the first flush.
+                unsafe { $crate::seam::shipped_durable_flushes() }
+            }
+            #[used]
+            #[unsafe(link_section = "__DATA,__mod_init_func,mod_init_funcs")]
+            static SHIPPED_DURABLE_FLUSHES: extern "C" fn() = shipped_durable_flushes;
+        };
+    };
+}
+
+// This crate's own tests judge the flushes aterm ships: the real F_FULLFSYNC and its
+// refusal on /dev/null, which a test mark's plain fsync(2) would hide.
+shipped_durable_flushes_in_tests!();
+
 /// Order everything written to `file`.
 /// # Errors
 /// The flush's own error (the full flush's, when the barrier was refused).
@@ -482,9 +507,10 @@ pub mod seam {
         })
     }
 
-    /// The environment variable [`plain_durable_flushes`] sets, on Apple targets, the only
-    /// ones that read it. A process a test starts without it takes the durable flushes aterm
-    /// ships ([`crate::durable_flushes_are_plain`] is `false` there).
+    /// The environment variable [`plain_durable_flushes`] sets and [`shipped_durable_flushes`]
+    /// removes, on Apple targets, the only ones that read it. A process a test starts without
+    /// it takes the durable flushes aterm ships ([`crate::durable_flushes_are_plain`] is
+    /// `false` there).
     #[cfg(target_vendor = "apple")]
     pub use astream_sys::TEST_PLAIN_FSYNC_ENV;
 
@@ -497,6 +523,19 @@ pub mod seam {
         #[cfg(target_vendor = "apple")]
         unsafe {
             std::env::set_var(astream_sys::TEST_PLAIN_FSYNC_ENV, "1");
+        }
+    }
+
+    /// Unmark this process, and every process it starts: its durable flushes are the full
+    /// flushes aterm ships whatever mark it inherited (`TEST_PLAIN_FSYNC_ENV` removed, on
+    /// Apple targets; [`plain_durable_flushes`] is the other way).
+    /// # Safety
+    /// No other thread may be running: it removes an environment variable.
+    pub unsafe fn shipped_durable_flushes() {
+        // SAFETY: the caller runs before any other thread exists.
+        #[cfg(target_vendor = "apple")]
+        unsafe {
+            std::env::remove_var(astream_sys::TEST_PLAIN_FSYNC_ENV);
         }
     }
 }
@@ -945,8 +984,10 @@ mod tests {
     }
 
     /// The shipped [`super::ordered_or_fsync`] on a descriptor that refuses both of [`ordered`]'s
-    /// flushes issues one plain `fsync(2)` and no other flush of this crate (a [`durable`] would
-    /// be a full flush outside a test binary), and one that takes the barrier issues none.
+    /// flushes issues one plain `fsync(2)` ([`primitive::fsync`], the one flush `FSYNCS`
+    /// counts) and one ordered flush to the seam, and one that takes the barrier issues no
+    /// `fsync(2)`. This binary takes the shipped flushes ([`shipped_durable_flushes_in_tests!`]),
+    /// so the refused full flush is the real `F_FULLFSYNC`'s.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn the_shipped_fallback_takes_fsync_where_both_flushes_are_refused() {

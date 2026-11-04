@@ -37,19 +37,19 @@ pub fn native_preparation_admission_model() -> Model {
                 offered = if Buggy == 5 {1} else {0};
                 a = if Buggy == 5 {12} else {11};
             }
-            action Full when (phase == 3) {
+            action Grow when (phase == 3) {
                 phase = 5;
-                picked = if Buggy == 6 {1} else {0};
-                offered = if Buggy == 6 {1} else {0};
-                count = if Buggy == 6 {2} else {1};
-                a = if Buggy == 6 {11} else {0};
+                picked = if Buggy == 6 {0} else {1};
+                offered = if Buggy == 6 {0} else {1};
+                count = if Buggy == 6 {1} else {2};
+                a = if Buggy == 6 {0} else {11};
             }
             invariant DeniedIsUncharged: 1 > phase || phase > 1 || (count == 0 && a == 0 && b == 0);
             invariant RetryIsAvailable: 2 > phase || phase > 2 || (picked == 1 && a == 11 && count == 1);
             invariant DeniedPrefixDoesNotBlock: 3 > phase || phase > 3 || (picked == 2 && a == 0 && b == 10 && count == 1);
             invariant StopsAtAdmission: 3 > phase || phase > 3 || offered == 2;
             invariant CoolingIsNotOffered: 4 > phase || phase > 4 || (picked == 0 && offered == 0 && a == 11);
-            invariant FullIsNotOffered: 5 > phase || phase > 5 || (picked == 0 && offered == 0 && count == 1 && a == 0);
+            invariant NewAccountsAreOffered: 5 > phase || phase > 5 || (picked == 1 && offered == 1 && count == 2 && a == 11);
         }
     }
 }

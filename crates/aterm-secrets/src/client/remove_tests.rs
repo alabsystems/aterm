@@ -8,6 +8,32 @@ use crate::client::log_entries_tests::{
 use crate::commons::bootstrap::Bootstrap;
 use crate::membership_log::encode_records;
 
+#[path = "convergence_tests.rs"]
+mod convergence;
+
+/// Every clock in the log-derived envelope survives persistence, including maximum
+/// timestamps. The former 64 KiB reader refuses this file and forgets every grace.
+#[test]
+fn tender_clocks_survive_the_full_record_bound() {
+    let home = aterm_tempfile::tempdir().unwrap();
+    let paths = Paths::for_home(home.path());
+    fsx::ensure_private_dir(&paths.dir).unwrap();
+    let mut mark = TendMark::default();
+    for i in 0..u64::try_from(crate::membership_log::MAX_HELD_RECORDS).unwrap() {
+        let mut id = [0; 32];
+        id[..8].copy_from_slice(&i.to_le_bytes());
+        mark.due.insert(id, u64::MAX);
+        mark.seen.insert(id, (u64::MAX, u64::MAX));
+    }
+    write_tend_mark(&paths, &mark).unwrap();
+    let path = epoch_mark_file(&paths);
+    assert!(fsx::read_private(&path, 64 * 1024).is_err());
+    assert!(std::fs::metadata(&path).unwrap().len() <= u64::try_from(MAX_TEND_MARK).unwrap());
+    let read = read_tend_mark(&paths);
+    assert_eq!(read.due, mark.due);
+    assert_eq!(read.seen, mark.seen);
+}
+
 /// A Mac that asks `member` to join under `name` from its own home `dir`: [`newcomer`] with the
 /// home apart from the name, so two Macs can ask under one name.
 fn asker(
@@ -235,10 +261,10 @@ fn remove_by_label_refuses_a_label_naming_two_macs() {
 }
 
 /// F16: on two sides of a split, m22 removes m40 and m7 removes m41; each mints its own next
-/// `[everyone]` and Commons epoch. After the heal, with no Commons handshake, the vault pass's
-/// epoch tender on one Mac (the first ranked) mints one higher epoch of each covering both
-/// removals, the other Mac waits its rank's step and then has nothing to do, and the newest epochs
-/// are wrapped to neither removed Mac.
+/// `[everyone]` and Commons epoch. After the heal the vault pass's epoch tender on one Mac (the
+/// first ranked of the two removers) mints one higher epoch of each covering both removals, the
+/// other Mac waits its rank's step and then has nothing to do, and the newest epochs are wrapped
+/// to neither removed Mac.
 ///
 /// NEGATIVE CONTROL: make `coalesce_concurrent_commons_epochs` return `Ok(())` at once: neither
 /// Mac signs, two `[everyone]` epochs stay in use, and the `"one Mac mints"` assert fails.
@@ -277,7 +303,17 @@ fn concurrent_removals_mint_one_higher_epoch_covering_both() {
         top.insert(audience.clone(), opened.max_generation[&audience]);
     }
     let active_now = active(m22);
-    assert!(healed.rotation_due(&id22.recipient(), &active_now));
+    let (_, actor22, _) = member_key(m22);
+    let (_, actor7, _) = member_key(m7);
+    for due in healed.rekey_dues() {
+        assert_eq!(
+            due.removers,
+            BTreeSet::from([actor22, actor7]),
+            "CONTROL: both removers rank first for {:?}",
+            due.audience
+        );
+    }
+    assert!(!healed.rekey_dues().is_empty());
 
     let t0 = aterm_time::unix_millis().unwrap_or(0);
     let first22 = tend_epochs_at(m22, t0).unwrap();
@@ -316,7 +352,7 @@ fn concurrent_removals_mint_one_higher_epoch_covering_both() {
         assert!(!wrapped.contains(&rec40) && !wrapped.contains(&rec41));
         assert!(active_now.is_subset(wrapped), "every member holds it");
     }
-    assert!(!covered.rotation_due(&id.recipient(), &active_now));
+    assert!(covered.rekey_dues().is_empty());
 
     macs.server.stop();
 }
@@ -1142,9 +1178,9 @@ fn a_mac_allowed_again_under_a_new_device_key_clears_its_node_and_recipient_deni
 /// an admin is in the list, so its mirror also moves the list's entries to `[m22]`; a list with
 /// no admin in it has only its members' pass.)
 ///
-/// NEGATIVE CONTROL: make `Log::hosts_rotation_due` return an empty list: m22's passes mint
-/// nothing for `[m22 m40]`, whose newest epoch still wraps m40, and the
-/// `"m22 rotates [m22 m40]"` assert fails.
+/// NEGATIVE CONTROL: make `Log::rekey_dues` skip host lists: m22's passes mint nothing for
+/// `[m22 m40]`, whose newest epoch still wraps m40, and the `"m22 rotates [m22 m40]"` assert
+/// fails.
 #[test]
 fn a_host_list_the_remover_cannot_open_is_named_and_rotated_by_its_members() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"v1".as_slice())]);
@@ -1183,8 +1219,9 @@ fn a_host_list_the_remover_cannot_open_is_named_and_rotated_by_its_members() {
     let line = removal.needs_you.expect("a NEEDS YOU line");
     assert!(line.contains(&ring.header()), "{line}");
 
-    // m22's pass runs the tender at the wall clock, which mints at once when m22 ranks first; a
-    // pass past every rank's step mints it when m22 ranks second.
+    // m22's pass runs the tender at the wall clock: m7, the remover, cannot carry the list, so
+    // its one holder m22 ranks first with no grace and mints at once; a pass past every rank's
+    // step finds nothing left.
     sync(m22, None).expect("m22 syncs the removal");
     let later = aterm_time::unix_millis().unwrap_or(0) + 40 * log_entries::GAP_STEP_MS;
     tend_epochs_at(m22, later).expect("tend");
@@ -2163,10 +2200,20 @@ impl KeyedSplit {
             .map(|entry| entry.value.as_slice().to_vec())
     }
 
-    /// Whether a reseal or the coverage rule is due on `paths` ([`Log::rotation_due`]).
+    /// Whether a reseal or the coverage rule is due on `paths` for `[everyone]` or Commons that it
+    /// can act on ([`Log::rekey_dues`]): it carries a rotation or coverage there, or reseals.
     pub(super) fn due(paths: &Paths) -> bool {
-        let id = read_identity(paths).unwrap().unwrap();
-        log_of(paths).rotation_due(&id.recipient(), &active(paths))
+        let (_, actor, _) = member_key(paths);
+        log_of(paths).rekey_dues().iter().any(|due| {
+            matches!(
+                due.audience,
+                EpochAudience::Everyone | EpochAudience::Commons
+            ) && if due.rotation || due.coverage {
+                due.carriers.contains(&actor)
+            } else {
+                due.resealers.contains(&actor)
+            }
+        })
     }
 
     /// Whether `paths` hides an epoch it cannot open.
@@ -2410,8 +2457,8 @@ fn the_vault_pass_after_the_heal_reseals_an_epoch_kept_readable() {
         "no Wrap hands m40 the reseal's epoch"
     );
     split.heal();
-    // m7's reseal changed the newest epochs, so m22 first sees the new rank key at `later`, and
-    // 40 steps on it is past any rank m22 could hold.
+    // m7's reseal covers E, so nothing is left due: m22 signs nothing at `later`, nor 40 steps on,
+    // past any rank or grace it could hold.
     let later = t0 + 40 * log_entries::GAP_STEP_MS;
     for at in [later, later + 40 * log_entries::GAP_STEP_MS] {
         assert!(
@@ -2442,30 +2489,21 @@ fn the_vault_pass_after_the_heal_reseals_an_epoch_kept_readable() {
     split.macs.server.stop();
 }
 
-/// F21 rule 5 runs only on the vault pass's ranked tender: the Commons repair
-/// (`reconcile_commons_log`, which every Commons exchange runs, unranked) leaves an audience with
-/// an uncovered keyed epoch alone. After the heal m7, which holds E and every newest epoch,
-/// signs no attestation of E on its Commons repair and E stays uncovered; its tender then
-/// reseals at first sight (rank 0, as the signer of E's dependent) and records what m40 could
-/// read while out (rule 8), which only the tender writes.
+/// F21 rules 5 and 8 on the vault pass's tender after the heal: m7, which holds E and every
+/// newest epoch, reseals at first sight (rank 0, as the signer of E's dependent), which covers E,
+/// and records what m40 could read while out.
 ///
-/// NEGATIVE CONTROL (restored with cp from a backup plus touch, confirmed with cmp): the reseal
-/// back on the Commons repair (`reconcile_due` counting rule 5 on every path, and
-/// `coalesce_concurrent_commons_epochs` resealing without `reseal`): fails "the Commons repair
-/// leaves E to the ranked tender".
+/// NEGATIVE CONTROL: `tend_epochs_at` never recording rule 8 (its `resealed` read as `false`):
+/// fails "the tender records what m40 could read".
 #[test]
-fn only_the_ranked_tender_reseals_a_keyed_epoch() {
+fn the_ranked_tender_reseals_a_keyed_epoch_and_records_rule_8() {
     let split = keyed_split(false);
     split.heal();
     let m7 = &split.macs.m7;
     assert!(KeyedSplit::due(m7), "CONTROL: a reseal is due on m7");
-    let minted = log_entries::reconcile_commons_log(m7, true).unwrap();
     assert!(
-        !minted.iter().any(|r| matches!(
-            r.body(),
-            Body::Wrap { epoch, .. } if *epoch == split.epoch
-        )) && log_of(m7).keyed_epochs().iter().any(|k| !k.covered),
-        "the Commons repair leaves E to the ranked tender"
+        log_of(m7).keyed_epochs().iter().any(|k| !k.covered),
+        "CONTROL: E is uncovered"
     );
     let t0 = aterm_time::unix_millis().unwrap_or(0);
     assert!(
@@ -2485,37 +2523,52 @@ fn only_the_ranked_tender_reseals_a_keyed_epoch() {
 /// m41, which holds the newest `[everyone]` epoch but no key of E, takes no rank: it could not
 /// reseal, and each rank ahead of the first holder delays the reseal by one step.
 ///
-/// NEGATIVE CONTROL (restored with cp from a backup plus touch, confirmed with cmp): ranking every
-/// holder of a newest epoch whatever is due (`tend_ranks` ignoring `coverage`): fails "m41, which
-/// holds no key of E, takes no rank".
+/// NEGATIVE CONTROL: `RekeyDue::turn` ranking the carriers for a reseal alone (every holder of a
+/// newest epoch, whatever is due): fails "m41, which holds no key of E, takes no rank".
 #[test]
 fn a_mac_without_a_key_of_the_keyed_epoch_takes_no_reseal_rank() {
     let split = keyed_split(false);
     split.heal();
     let (m22, m7, m41) = (&split.macs.m22, &split.macs.m7, &split.m41);
     let log = log_of(m22);
-    let id22 = read_identity(m22).unwrap().unwrap();
-    let opened = log.open_audience_entries(&id22).unwrap().unwrap();
-    let active = active(m22);
-    assert!(
-        !log.coverage_due(&id22.recipient(), &active),
-        "CONTROL: only the reseal is due"
-    );
-    let audiences = [EpochAudience::Everyone, EpochAudience::Commons];
-    let ranks = tend_ranks(&log, &opened, &audiences, &active, false);
+    let membership = log.membership();
+    let dues: Vec<RekeyDue> = log
+        .rekey_dues()
+        .into_iter()
+        .filter(|due| {
+            matches!(
+                due.audience,
+                EpochAudience::Everyone | EpochAudience::Commons
+            )
+        })
+        .collect();
+    assert!(!dues.is_empty(), "CONTROL: a reseal is due");
     let (_, a7, _) = member_key(m7);
     let (_, a22, _) = member_key(m22);
     let (_, a41, _) = member_key(m41);
-    assert_eq!(
-        ranks.order.first(),
-        Some(&a7),
-        "CONTROL: m7 signed E's dependent"
-    );
-    assert!(ranks.order.contains(&a22), "CONTROL: m22 holds E");
-    assert!(
-        !ranks.order.contains(&a41),
-        "m41, which holds no key of E, takes no rank"
-    );
+    for due in &dues {
+        assert!(
+            due.reseal && !due.rotation && !due.coverage,
+            "CONTROL: only the reseal is due"
+        );
+        assert_eq!(
+            due.turn(&membership, &a7),
+            Some(Turn {
+                rank: 0,
+                after_grace: false
+            }),
+            "CONTROL: m7 signed E's dependent"
+        );
+        assert!(
+            due.turn(&membership, &a22).is_some(),
+            "CONTROL: m22 holds E"
+        );
+        assert_eq!(
+            due.turn(&membership, &a41),
+            None,
+            "m41, which holds no key of E, takes no rank"
+        );
+    }
     split.macs.server.stop();
 }
 

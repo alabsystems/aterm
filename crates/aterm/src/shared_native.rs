@@ -21,7 +21,6 @@ mod input;
 
 const RECORDS: &str = "native-account-preparations.json";
 const SELECTION: &str = "native-account-selection.json";
-const MAX_RECORDS: usize = accounts::MAX_ACCOUNTS;
 static PREPARATIONS: OnceLock<Mutex<native_keys::PreparationQueue>> = OnceLock::new();
 static INPUT_FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
@@ -309,8 +308,7 @@ fn records(paths: &Paths) -> Result<Vec<Value>, String> {
     }
     let rows = value["records"]
         .as_array()
-        .filter(|r| r.len() <= MAX_RECORDS)
-        .ok_or("native preparation records exceed their bound")?;
+        .ok_or("native preparation records are not an array")?;
     let mut seen = std::collections::BTreeSet::new();
     for row in rows {
         if row.as_object().is_none_or(|object| object.len() != 12)
@@ -484,9 +482,6 @@ fn retain(
     if let Some(old) = rows.iter_mut().find(|r| same(r)) {
         *old = row;
     } else {
-        if rows.len() == MAX_RECORDS {
-            return Err("native preparation record capacity is full".into());
-        }
         rows.push(row);
     }
     let bytes = aterm_json::to_vec(&json!({"schema":1,"records":rows}))

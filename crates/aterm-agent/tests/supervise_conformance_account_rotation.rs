@@ -60,7 +60,7 @@ const _: () = assert!(CLEARED_S < NOTICE_ROW_S);
 
 const GONE: &str = "s-gone";
 
-const CONDS: [&str; 3] = ["d1", "d2", "sh"];
+const CONDS: [&str; 3] = ["pref1", "pref2", "pool"];
 const SESSIONS: [&str; 2] = ["s1", "s2"];
 const WAITING: [&str; 2] = ["w1", "w2"];
 const MOVES: [&str; 2] = ["Move1", "Move2"];
@@ -71,7 +71,7 @@ const NOTICES: [&str; 2] = ["n1", "n2"];
 const SIDS: [&str; 2] = ["s-one", "s-two"];
 
 const SEEN: [&str; 13] = [
-    "d1", "d2", "sh", "act", "run", "prov", "prev", "pp", "pin", "hold", "s1", "s2", "rot",
+    "pref1", "pref2", "pool", "act", "run", "prov", "prev", "pp", "pin", "hold", "s1", "s2", "rot",
 ];
 
 const DEFECTS: [&str; 10] = [
@@ -1492,11 +1492,11 @@ fn under_wall_mode(
 }
 
 fn account_of(action: &str) -> i64 {
-    if action.ends_with("D1") {
+    if action.ends_with("Pref1") {
         1
-    } else if action.ends_with("D2") {
+    } else if action.ends_with("Pref2") {
         2
-    } else if action.ends_with("Sh") {
+    } else if action.ends_with("Pool") {
         3
     } else {
         panic!("no account in `{action}`")
@@ -1523,21 +1523,21 @@ fn mirror(
         | "Resumed1"
         | "Resumed2"
         | "CarriesOnAfterAnEarlyMove" => {}
-        "ResetD1" | "ResetD2" | "ResetSh" | "Lapse" => {}
-        "WallD1" | "WallD2" | "WallSh" => {
+        "ResetPref1" | "ResetPref2" | "ResetPool" | "Lapse" => {}
+        "WallPref1" | "WallPref2" | "WallPool" => {
             let name = w.named(account_of(action));
             if accounts::note_wall(real, name, WINDOW, until, now, now).is_empty() {
                 return Err(format!("the wall on {name} was not recorded"));
             }
         }
-        "LowD1" | "LowD2" | "LowSh" => {
+        "LowPref1" | "LowPref2" | "LowPool" => {
             let account = account_of(action);
             let read = sample(w, account, true, now + WALL_S, now);
             if accounts::note_sample(real, w.named(account), read, now).is_empty() {
                 return Err(format!("the sample on account {account} was not recorded"));
             }
         }
-        "UseD1" | "UseD2" | "UseSh" => {
+        "UsePref1" | "UsePref2" | "UsePool" => {
             let name = w.named(account_of(action));
             accounts::pin(real, &w.roster, &w.enrolled, name, now)?;
         }
@@ -2832,8 +2832,8 @@ fn the_defects_and_todays_rule_disagree_with_the_real_code() {
             off.action.is_none()
                 && off.what.starts_with("session 1:")
                 && off.state["s1"] == 1
-                && off.state["d1"] == 2
-                && off.state["d2"] == 0
+                && off.state["pref1"] == 2
+                && off.state["pref2"] == 0
                 && off.state["run"] == 0
                 && off.state["rot"] == 0
         })
@@ -2854,9 +2854,9 @@ fn the_defects_and_todays_rule_disagree_with_the_real_code() {
     );
     assert!(
         !today.off.iter().any(|off| off.action.is_none()
-            && off.state["d1"] == 2
-            && off.state["d2"] == 2
-            && off.state["sh"] == 2),
+            && off.state["pref1"] == 2
+            && off.state["pref2"] == 2
+            && off.state["pool"] == 2),
         "today's rule is the model's where nothing is usable"
     );
 
@@ -3051,7 +3051,7 @@ fn a_real_history_from_an_empty_state_stays_in_step_with_the_model() {
         yields: None,
     };
 
-    h.step("WallD1");
+    h.step("WallPref1");
     assert_eq!(h.told(0), rotate("work-2", false));
     assert_eq!(h.told(1), rotate("work-2", false));
     h.step("Move1");
@@ -3066,7 +3066,7 @@ fn a_real_history_from_an_empty_state_stays_in_step_with_the_model() {
     assert_eq!(h.told(1), follow("work-2", false));
     h.step("Move2");
 
-    h.step("LowD2");
+    h.step("LowPref2");
     assert_eq!(h.told(0), rotate("pool-a", true));
     h.step("Move1");
     h.step("Strike");
@@ -3083,7 +3083,7 @@ fn a_real_history_from_an_empty_state_stays_in_step_with_the_model() {
     );
     h.step("Move1");
 
-    h.reset("ResetD1");
+    h.reset("ResetPref1");
     assert_eq!(h.told(0), Advice::Probe);
     assert_eq!(h.told_past(0), rotate("main", true));
     let place = Place {
@@ -3118,13 +3118,13 @@ fn a_real_history_from_an_empty_state_stays_in_step_with_the_model() {
     assert_eq!(h.told(1), follow("main", true));
     h.step("Move2");
 
-    h.step("UseSh");
+    h.step("UsePool");
     assert_eq!(h.told(0), follow("pool-a", true));
     h.step("Move1");
     h.step("Move2");
-    h.step("LowSh");
+    h.step("LowPool");
     assert_eq!(h.told(0), Advice::Stay(StayWhy::Pinned));
-    h.step("WallSh");
+    h.step("WallPool");
     assert!(!h.real.pinned, "a wall on the pinned account ends the pin");
     assert_eq!(h.told(1), rotate("main", false));
     h.step("Move2");
@@ -3145,8 +3145,8 @@ fn six_rotations_in_an_hour_are_the_bound_and_the_seventh_wall_is_waited_out() {
     let mut h = InStep::begin(5 * MIN);
     assert_eq!(cnst(&h.m, "Budget"), 6);
     let turns = [
-        ("WallD1", "ResetD1", "main", "work-2"),
-        ("WallD2", "ResetD2", "work-2", "main"),
+        ("WallPref1", "ResetPref1", "main", "work-2"),
+        ("WallPref2", "ResetPref2", "work-2", "main"),
     ];
     for (round, (wall, reset, from, to)) in turns.into_iter().cycle().take(6).enumerate() {
         h.step(wall);
@@ -3179,7 +3179,7 @@ fn six_rotations_in_an_hour_are_the_bound_and_the_seventh_wall_is_waited_out() {
         "all six are inside the hour"
     );
 
-    h.step("WallD1");
+    h.step("WallPref1");
     for i in 0..2 {
         assert_eq!(
             h.told(i),
@@ -3220,7 +3220,7 @@ fn a_canary_that_never_answers_is_replaced_by_the_next_session_after_its_hold() 
         takes_canary: true,
         yields: None,
     };
-    h.step("WallD1");
+    h.step("WallPref1");
     h.step("Move1");
     let chosen = h.now;
     assert_eq!(
@@ -3281,7 +3281,7 @@ fn a_canary_that_never_answers_is_replaced_by_the_next_session_after_its_hold() 
     );
 
     let mut h = InStep::begin(4 * HOUR);
-    h.step("WallD1");
+    h.step("WallPref1");
     h.step("Move1");
     assert_eq!(h.told(1), Advice::Stay(StayWhy::Canary));
     assert!(accounts::forget_session(&mut h.real, "s-one"));
@@ -3302,7 +3302,7 @@ fn a_strike_goes_back_to_an_account_that_never_served_as_unproven() {
     };
     for served in [false, true] {
         let mut h = InStep::begin(HOUR);
-        h.step("WallD1");
+        h.step("WallPref1");
         h.step("Move1");
         let chosen = h.now;
         let first = h.real.canary.clone();
@@ -3311,7 +3311,7 @@ fn a_strike_goes_back_to_an_account_that_never_served_as_unproven() {
             h.step("Served");
         }
         h.wall_s = 20 * MIN;
-        h.step("WallD2");
+        h.step("WallPref2");
         assert_eq!(
             (h.real.active.as_deref(), h.real.proven),
             (Some("work-2"), served),
@@ -3362,7 +3362,7 @@ fn a_strike_goes_back_to_an_account_that_never_served_as_unproven() {
             (2, i64::from(served), 2)
         );
 
-        h.reset("ResetD2");
+        h.reset("ResetPref2");
         assert_eq!(h.told(1), onto(!served), "served: {served}");
         h.step("Move2");
         assert_eq!(h.real.canary.is_some(), !served);
@@ -3551,7 +3551,7 @@ fn the_sessions_own_bounds_part_from_the_model_only_toward_todays_rule() {
     let mut c = Carried::begin(20 * MIN);
     let to = |account: i64, ahead: bool| Asked::Move { to: account, ahead };
 
-    c.wall("WallD1", &[0, 1]);
+    c.wall("WallPref1", &[0, 1]);
     let asked = c.ask(0);
     assert_eq!((c.said(&asked), c.model(0)), (to(2, false), to(2, false)));
     c.h.step("JobsStart");
@@ -3594,7 +3594,7 @@ fn the_sessions_own_bounds_part_from_the_model_only_toward_todays_rule() {
     assert_eq!(latched.action, follow.today);
     assert_eq!(c.said(&latched), Asked::Waits);
     assert_eq!(c.model(1), to(2, false), "the stated exception");
-    c.h.reset("ResetD1");
+    c.h.reset("ResetPref1");
     let resumed = c.ask(1);
     assert_eq!(resumed.point, None);
     assert_eq!(resumed.action.rule_id(), Some(RULE_LIMIT_RESUME));
@@ -3610,7 +3610,7 @@ fn the_sessions_own_bounds_part_from_the_model_only_toward_todays_rule() {
     c.first_act(1, RULE_CONTINUE);
     assert_eq!(c.turn_ends(1, None), Some(AccountAnswer::Served));
 
-    c.h.step("UseSh");
+    c.h.step("UsePool");
     assert_eq!(c.turn_ends(0, None), None);
     let pinned = c.ask(0);
     assert_eq!((c.said(&pinned), c.model(0)), (to(3, true), to(3, true)));
@@ -3629,7 +3629,7 @@ fn the_sessions_own_bounds_part_from_the_model_only_toward_todays_rule() {
     assert_eq!(c.said(&same), Asked::Today);
     assert_eq!(c.model(0), to(3, true), "the stated exception");
     c.typed(0, &same.action);
-    c.h.step("UseD1");
+    c.h.step("UsePref1");
     assert_eq!(c.turn_ends(0, None), None);
     let other = c.ask(0);
     assert_eq!((c.said(&other), c.model(0)), (to(1, true), to(1, true)));
@@ -3637,7 +3637,7 @@ fn the_sessions_own_bounds_part_from_the_model_only_toward_todays_rule() {
     c.first_act(0, RULE_CONTINUE);
     assert_eq!(c.turn_ends(0, None), Some(AccountAnswer::Served));
 
-    for (pin, account) in [("UseD2", 2), ("UseSh", 3)] {
+    for (pin, account) in [("UsePref2", 2), ("UsePool", 3)] {
         c.h.step(pin);
         let follow = c.ask(0);
         assert_eq!(
@@ -3655,7 +3655,7 @@ fn the_sessions_own_bounds_part_from_the_model_only_toward_todays_rule() {
         c.h.now - NOW < accounts::ROTATION_WINDOW_S,
         "the history is one rotation hour"
     );
-    c.h.step("UseD1");
+    c.h.step("UsePref1");
     let fifth = c.ask(0);
     assert_eq!(
         fifth.reading.account,
@@ -3668,7 +3668,7 @@ fn the_sessions_own_bounds_part_from_the_model_only_toward_todays_rule() {
     assert_eq!(c.model(0), to(1, true), "the stated exception");
     c.typed(0, &fifth.action);
     c.h.wall_s = 4 * HOUR;
-    c.wall("WallSh", &[0]);
+    c.wall("WallPool", &[0]);
     let capped = c.ask(0);
     assert_eq!(c.said(&capped), Asked::Waits);
     assert_eq!(c.model(0), to(1, false), "the stated exception");
@@ -3694,7 +3694,7 @@ fn the_sessions_own_bounds_part_from_the_model_only_toward_todays_rule() {
 fn the_first_turn_under_the_new_login_is_the_models_served_or_its_strike() {
     let mut c = Carried::begin(4 * HOUR);
     let to = |account: i64, ahead: bool| Asked::Move { to: account, ahead };
-    c.wall("WallD1", &[0, 1]);
+    c.wall("WallPref1", &[0, 1]);
     let old = c.screen[0];
     let asked = c.ask(0);
     assert_eq!(c.said(&asked), to(2, false));

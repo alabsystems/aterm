@@ -13,6 +13,7 @@ use aterm_window::event_loop::{ActiveEventLoop, EventLoopProxy};
 use aterm_window::keyboard::ModifiersState;
 use aterm_window::window::WindowId as WinitWindowId;
 
+use crate::app_take_over::GestureMarks;
 use crate::platform::AppRt as _;
 use crate::{App, Session, Wake, WindowId};
 
@@ -777,16 +778,24 @@ static NATIVE_MENU_MARKS: OnceLock<Arc<MenuMarks>> = OnceLock::new();
 pub(crate) struct MenuOrigin {
     window: WindowId,
     content: Option<crate::front_content::FrontContent>,
-    /// A control client's gesture chose the row: the command runs marked as one
-    /// ([`App::dispatch_marked_menu_action`]), so a person-only act in it refuses the client.
-    controller: bool,
+    /// The marks of the gesture that chose the row: the command runs under them
+    /// ([`App::dispatch_marked_menu_action`]), so a person-only act in a control client's
+    /// refuses the client, and an edit an accessibility client's makes is no person's
+    /// ([`crate::owner_keys_save`]).
+    chooser: GestureMarks,
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 impl MenuOrigin {
     /// Whether a control client's gesture chose the row.
+    #[cfg(unix)]
     pub(crate) const fn controller(self) -> bool {
-        self.controller
+        self.chooser.controller
+    }
+
+    /// Whether an accessibility client's request chose the row.
+    pub(crate) const fn assistive(self) -> bool {
+        self.chooser.assistive
     }
 }
 
@@ -795,25 +804,25 @@ pub(crate) fn serve_native_menu_marks(marks: &Arc<MenuMarks>) {
     let _ = NATIVE_MENU_MARKS.set(Arc::clone(marks));
 }
 
-/// Post `action` as a [`Wake::MenuAction`] recorded in `marks`, run as a control client's
-/// gesture when `controller` is set.
+/// Post `action` as a [`Wake::MenuAction`] recorded in `marks`, run under `gesture`, the marks
+/// of the gesture that posted it.
 pub(crate) fn post_menu_action(
     proxy: &EventLoopProxy<Wake>,
     marks: Option<&MenuMarks>,
     action: crate::menu::MenuAction,
-    controller: bool,
+    gesture: GestureMarks,
 ) -> bool {
-    post_menu_action_from(proxy, marks, action, None, controller)
+    post_menu_action_from(proxy, marks, action, None, gesture)
 }
 
-/// Post `action` as a [`Wake::MenuAction`], run as a control client's gesture when `controller`
-/// is set or `origin` says so ([`App::run_posted_menu_action`]).
+/// Post `action` as a [`Wake::MenuAction`], run under `gesture` and the marks of `origin`'s
+/// chooser ([`App::run_posted_menu_action`]).
 fn post_menu_action_from(
     proxy: &EventLoopProxy<Wake>,
     marks: Option<&MenuMarks>,
     action: crate::menu::MenuAction,
     origin: Option<MenuOrigin>,
-    controller: bool,
+    gesture: GestureMarks,
 ) -> bool {
     let mark = marks.map_or(MenuMark::NONE, |marks| marks.mint(Instant::now()));
     let sent = proxy
@@ -821,7 +830,7 @@ fn post_menu_action_from(
             action,
             mark,
             origin,
-            controller,
+            gesture,
         })
         .is_ok();
     if !sent && let Some(marks) = marks {
@@ -842,7 +851,10 @@ pub(crate) fn post_native_menu_action(
         NATIVE_MENU_MARKS.get().map(Arc::as_ref),
         action,
         None,
-        native_post_by_controller(),
+        GestureMarks {
+            controller: native_post_by_controller(),
+            assistive: false,
+        },
     )
 }
 
@@ -1467,21 +1479,22 @@ impl App {
         out
     }
 
-    /// Post `action` as a marked [`Wake::MenuAction`] on this App's event loop, run as a control
-    /// client's gesture when one is being dispatched now ([`Self::person_gesture_refused`]): a
-    /// posted ⌘Q, or a `pointer` press on the version slot, posts its action as the client's.
+    /// Post `action` as a marked [`Wake::MenuAction`] on this App's event loop, run under the
+    /// marks of the gesture being dispatched now ([`Self::gesture_marks`]): a posted ⌘Q, or a
+    /// `pointer` press on the version slot, posts its action as the client's.
     pub(crate) fn post_menu_action(&self, action: crate::menu::MenuAction) -> bool {
-        let controller = self.person_gesture_refused();
+        let gesture = self.gesture_marks();
         self.proxy.as_ref().is_some_and(|proxy| {
-            post_menu_action(proxy, Some(&self.tab_spawns.menu), action, controller)
+            post_menu_action(proxy, Some(&self.tab_spawns.menu), action, gesture)
         })
     }
 
+    /// Where a palette row is chosen in `window`, and the marks of the gesture choosing it.
     pub(crate) fn palette_menu_origin(&self, window: WindowId) -> Option<MenuOrigin> {
         self.windows.get(&window).map(|state| MenuOrigin {
             window,
             content: state.front_content,
-            controller: self.person_gesture_refused(),
+            chooser: self.gesture_marks(),
         })
     }
 
@@ -1500,7 +1513,7 @@ impl App {
                 Some(&self.tab_spawns.menu),
                 action,
                 Some(origin),
-                false,
+                GestureMarks::default(),
             )
         })
     }
@@ -1531,10 +1544,10 @@ impl App {
         action: crate::menu::MenuAction,
         mark: MenuMark,
         origin: Option<MenuOrigin>,
-        controller: bool,
+        gesture: GestureMarks,
     ) {
         let booked = self.tab_spawns.in_flight.len();
-        self.run_posted_menu_action(action, origin, controller, |app, action| {
+        self.run_posted_menu_action(action, origin, gesture, |app, action| {
             app.dispatch_menu_action(el, action);
         });
         if self.tab_spawns.menu.settle(mark) {
@@ -1547,18 +1560,22 @@ impl App {
         }
     }
 
-    /// Run a posted menu `action` with `dispatch` unless its origin moved, marked as a control
-    /// client's gesture when the post was one (`controller`) or its origin's chooser was.
+    /// Run a posted menu `action` with `dispatch` unless its origin moved, under every mark the
+    /// post carried (`gesture`) and every mark its origin's chooser had.
     pub(crate) fn run_posted_menu_action(
         &mut self,
         action: crate::menu::MenuAction,
         origin: Option<MenuOrigin>,
-        controller: bool,
+        gesture: GestureMarks,
         dispatch: impl FnOnce(&mut Self, crate::menu::MenuAction),
     ) {
-        let controller = controller || origin.is_some_and(|origin| origin.controller);
+        let chooser = origin.map_or_else(GestureMarks::default, |origin| origin.chooser);
+        let marks = GestureMarks {
+            controller: gesture.controller || chooser.controller,
+            assistive: gesture.assistive || chooser.assistive,
+        };
         if let Some(action) = self.menu_action_for_origin(action, origin) {
-            self.with_gesture_source(controller, |app| dispatch(app, action));
+            self.with_gesture_marks(marks, |app| dispatch(app, action));
         }
     }
 

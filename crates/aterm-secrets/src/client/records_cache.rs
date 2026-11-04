@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Recovered membership records under the current vault and admitted key set.
+//! Recovered membership records under the current vault and admitted key set, kept within a
+//! byte budget ([`MAX_BYTES`]).
 
 use super::{Paths, fsx, sha256};
 use crate::{
     Error, SecretBytes,
-    membership_log::{MAX_RECORDS_STREAM, Store},
+    membership_log::{MAX_RECORDS_STREAM, RecordBudgets, Store},
 };
 use aterm_digest::Sha256;
 use std::{
@@ -16,8 +17,12 @@ use std::{
 };
 use zeroize::Zeroizing;
 
-const MAX_ENTRIES: usize = 16;
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
+/// The entry charges kept together: records and index ([`Store::footprint`]), a small
+/// file's bytes, and entry/context storage. The budget is one maximum store plus a small
+/// file; smaller entries share that room, oldest let go first. This is a cache charge,
+/// not an allocator or process-footprint measurement.
+const MAX_BYTES: usize = Store::MAX_FOOTPRINT + MAX_INPUT_BYTES;
 
 pub(super) fn read(paths: &Paths, vault: String, store: Store) -> crate::Result<Store> {
     static CACHE: Cache = Cache::new();
@@ -26,6 +31,8 @@ pub(super) fn read(paths: &Paths, vault: String, store: Store) -> crate::Result<
 
 struct Cache {
     entries: Mutex<VecDeque<Entry>>,
+    /// The most the entries' charges sum to ([`MAX_BYTES`]).
+    budget: usize,
     #[cfg(test)]
     hashes: std::sync::atomic::AtomicUsize,
 }
@@ -33,15 +40,25 @@ struct Cache {
 struct Entry {
     vault: String,
     keys: Option<Vec<[u8; 32]>>,
+    /// The budgets its store holds records within: the same bytes recover to another store under
+    /// others.
+    budgets: RecordBudgets,
     digest: [u8; 32],
     bytes: Option<SecretBytes>,
     store: Store,
+    /// Its record/index, file, entry and context charge ([`MAX_BYTES`]).
+    kept: usize,
 }
 
 impl Cache {
     const fn new() -> Self {
+        Self::with_budget(MAX_BYTES)
+    }
+
+    const fn with_budget(budget: usize) -> Self {
         Self {
             entries: Mutex::new(VecDeque::new()),
+            budget,
             #[cfg(test)]
             hashes: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -65,9 +82,12 @@ impl Cache {
         reader.check_unchanged()?;
         after_observation();
         let keys = store.keys().map(<[[u8; 32]]>::to_vec);
-        let same_context = |entry: &Entry| entry.vault == vault && entry.keys == keys;
+        let budgets = store.budgets();
+        let same_context =
+            |entry: &Entry| entry.vault == vault && entry.keys == keys && entry.budgets == budgets;
         // A recovered store roots another genesis under different admitted
-        // keys. Reuse only after reading the current bytes and key context.
+        // keys, and keeps other records under other budgets. Reuse only after
+        // reading the current bytes, key and budget context.
         if let Observed::Small(bytes) = &observed
             && let Ok(entries) = self.entries.lock()
             && let Some(entry) = entries.iter().find(|entry| {
@@ -114,18 +134,37 @@ impl Cache {
             }
         };
         reader.check_unchanged()?;
+        // The context keys and the cloned store each retain a lineage vector. Even an
+        // empty records file must spend entry/context space, or zero-charge entries can
+        // accumulate forever without triggering eviction.
+        let lineage_bytes = keys.as_ref().map_or(0, |keys| {
+            keys.capacity().saturating_mul(2 * size_of::<[u8; 32]>())
+        });
+        let kept = store
+            .footprint()
+            .saturating_add(bytes.as_ref().map_or(0, SecretBytes::len))
+            .saturating_add(size_of::<Entry>())
+            .saturating_add(vault.capacity())
+            .saturating_add(lineage_bytes);
         if let Ok(mut entries) = self.entries.lock() {
             entries.retain(|entry| !same(entry));
-            if entries.len() >= MAX_ENTRIES {
-                entries.pop_front();
+            if kept <= self.budget {
+                let mut total: usize = entries.iter().map(|entry| entry.kept).sum();
+                while kept > self.budget.saturating_sub(total)
+                    && let Some(oldest) = entries.pop_front()
+                {
+                    total -= oldest.kept;
+                }
+                entries.push_back(Entry {
+                    vault,
+                    keys,
+                    budgets,
+                    digest,
+                    bytes,
+                    store: store.clone(),
+                    kept,
+                });
             }
-            entries.push_back(Entry {
-                vault,
-                keys,
-                digest,
-                bytes,
-                store: store.clone(),
-            });
         }
         Ok(store)
     }
@@ -256,6 +295,122 @@ mod tests {
             );
         }
         assert_eq!(cache.hashes.load(Ordering::Relaxed), 1);
+    }
+
+    /// Entry charges stay within the cache budget, letting the oldest go first; an entry
+    /// past the whole budget is read and never kept, and each read still answers its own file.
+    /// NEGATIVE CONTROL: the stores read together keep more than the budget, which a cache bounded
+    /// by its count of entries (16 before) would keep.
+    #[test]
+    fn the_cache_keeps_its_entries_within_its_byte_budget() {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let paths = Paths::for_home(home.path());
+        fsx::ensure_private_dir(&paths.dir).unwrap();
+        let wires: Vec<Vec<u8>> = (1..=6).map(|tag| signed(&SIGNER, tag)).collect();
+        let meter = Cache::new();
+        let mut costs = Vec::new();
+        for wire in &wires {
+            fsx::write_atomic(&paths.records_file(), wire, 0o600).unwrap();
+            meter.read(&paths, "fixture".into(), base(&SIGNER)).unwrap();
+            costs.push(meter.entries.lock().unwrap().back().unwrap().kept);
+        }
+        assert!(
+            costs.iter().all(|&cost| cost > wires[0].len()),
+            "the charge includes more than the file bytes"
+        );
+        let budget = costs[0] + costs[1] + costs[2];
+        assert!(costs.iter().sum::<usize>() > budget);
+        let cache = Cache::with_budget(budget);
+        for (wire, cost) in wires.iter().zip(&costs) {
+            fsx::write_atomic(&paths.records_file(), wire, 0o600).unwrap();
+            let store = cache.read(&paths, "fixture".into(), base(&SIGNER)).unwrap();
+            assert_eq!(store.encode(), *wire);
+            let entries = cache.entries.lock().unwrap();
+            let kept: usize = entries.iter().map(|entry| entry.kept).sum();
+            assert!(kept <= budget, "{kept} bytes kept within {budget}");
+            assert_eq!(entries.back().unwrap().kept, *cost);
+        }
+        assert!(cache.entries.lock().unwrap().len() < wires.len());
+
+        let tiny = Cache::with_budget(costs[0] - 1);
+        fsx::write_atomic(&paths.records_file(), &wires[0], 0o600).unwrap();
+        for _ in 0..2 {
+            let store = tiny.read(&paths, "fixture".into(), base(&SIGNER)).unwrap();
+            assert_eq!(store.encode(), wires[0]);
+            assert!(tiny.entries.lock().unwrap().is_empty());
+        }
+        assert_eq!(
+            tiny.hashes.load(Ordering::Relaxed),
+            2,
+            "nothing kept, nothing reused"
+        );
+    }
+
+    #[test]
+    fn empty_stores_still_spend_entry_and_context_budget() {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let paths = Paths::for_home(home.path());
+        fsx::ensure_private_dir(&paths.dir).unwrap();
+        fsx::write_atomic(&paths.records_file(), b"", 0o600).unwrap();
+        let budget = 4 * size_of::<Entry>();
+        let cache = Cache::with_budget(budget);
+        for i in 0..12 {
+            let vault = format!("empty-{i}");
+            let store = Store::for_vault(&vault).unwrap();
+            assert!(
+                cache
+                    .read(&paths, vault, store)
+                    .unwrap()
+                    .encode()
+                    .is_empty()
+            );
+        }
+        {
+            let entries = cache.entries.lock().unwrap();
+            assert!(!entries.is_empty());
+            assert!(
+                entries.len() < 12,
+                "empty files must still evict old contexts"
+            );
+            assert!(entries.iter().all(|entry| entry.kept >= size_of::<Entry>()));
+            assert!(entries.iter().map(|entry| entry.kept).sum::<usize>() <= budget);
+            assert!(!entries.iter().any(|entry| entry.vault == "empty-0"));
+        }
+
+        let mut large_name = String::with_capacity(budget + 1);
+        large_name.push_str("empty-large-name");
+        cache
+            .read(
+                &paths,
+                large_name,
+                Store::for_vault("empty-large-name").unwrap(),
+            )
+            .unwrap();
+        let lineage: Vec<[u8; 32]> = (0..budget / size_of::<[u8; 32]>() + 1)
+            .map(|i| {
+                let mut key = [0; 32];
+                key[..8].copy_from_slice(&u64::try_from(i).unwrap().to_le_bytes());
+                key
+            })
+            .collect();
+        cache
+            .read(
+                &paths,
+                "empty-large-lineage".into(),
+                Store::dormant(&lineage),
+            )
+            .unwrap();
+        let entries = cache.entries.lock().unwrap();
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| entry.vault == "empty-large-name")
+        );
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| entry.vault == "empty-large-lineage")
+        );
     }
 
     #[test]

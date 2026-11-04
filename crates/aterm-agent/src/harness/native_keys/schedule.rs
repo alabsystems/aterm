@@ -5,11 +5,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// Bounded local scheduling hints. A selected account still needs current
+/// Local scheduling hints. A selected account still needs current
 /// root authority and local policy before any credential or provider access.
+#[derive(Default)]
 pub struct PreparationQueue {
     seen: BTreeMap<(PathBuf, [u8; 32]), Seen>,
-    capacity: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -19,15 +19,6 @@ struct Seen {
 }
 
 const COOLDOWN: Duration = Duration::from_secs(60);
-
-impl Default for PreparationQueue {
-    fn default() -> Self {
-        Self {
-            seen: BTreeMap::new(),
-            capacity: super::super::accounts::MAX_ACCOUNTS,
-        }
-    }
-}
 
 impl PreparationQueue {
     /// Choose the least recently selected mature candidate, with unseen accounts
@@ -78,7 +69,7 @@ impl PreparationQueue {
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
             machine = "NativePreparationQueue",
-            action = "Full",
+            action = "Grow",
             project = "aterm_agent::harness::native_keys::schedule::tests::transition"
         )
     )]
@@ -173,7 +164,7 @@ impl PreparationQueue {
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
             machine = "NativePreparationAdmission",
-            action = "Full",
+            action = "Grow",
             project = "aterm_agent::harness::native_keys::schedule::tests::admission_transition"
         )
     )]
@@ -217,7 +208,6 @@ impl PreparationQueue {
                     {
                         None
                     }
-                    None if self.seen.len() >= self.capacity => None,
                     _ => Some((
                         seen.filter(|seen| seen.revision == *revision)
                             .map(|seen| seen.at),

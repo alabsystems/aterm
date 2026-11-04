@@ -41,9 +41,9 @@ fn scrolls_move_only_the_region_rows() {
     #[expect(clippy::type_complexity, reason = "a test's case table")]
     let cases: &[(&str, u16, Option<(u16, u16)>, u16, Op, &str)] = &[
         ("SU 1", 3, None, 0, |g| g.scroll_up(1), "BC "),
-        ("SD 1", 3, None, 0, |g| g.scroll_down(1), " AB"),
+        ("SD 1", 3, None, 0, |g| g.scroll_region_down(1), " AB"),
         ("SU 2", 4, None, 0, |g| g.scroll_up(2), "CD  "),
-        ("SD 2", 4, None, 0, |g| g.scroll_down(2), "  AB"),
+        ("SD 2", 4, None, 0, |g| g.scroll_region_down(2), "  AB"),
         ("SU 0", 3, None, 0, |g| g.scroll_up(0), "ABC"),
         (
             "full-screen region up",
@@ -204,12 +204,12 @@ fn autowrap_at_the_region_bottom_scrolls_the_region_only() {
         ("write_ascii_blast", |g| {
             assert_eq!(g.write_ascii_blast(b"XXXXXZ"), 6);
         }),
-        ("write_ascii_run_styled", |g| {
+        ("write_ascii_run_styled_packed", |g| {
             let mut last_byte = None;
-            let written = g.write_ascii_run_styled(
+            let colors = Cell::convert_colors(PackedColor::indexed(33), PackedColor::indexed(235));
+            let written = g.write_ascii_run_styled_packed(
                 b"XXXXXZ",
-                PackedColor::indexed(33),
-                PackedColor::indexed(235),
+                colors,
                 CellFlags::ITALIC,
                 &mut last_byte,
             );

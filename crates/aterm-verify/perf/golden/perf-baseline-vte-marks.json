@@ -1,0 +1,8 @@
+{
+  "_comment": "aterm VTE-MARKS baseline: per corpus, the best sample's MiB per 10^9 performance-core cycles (cycles per instruction on P-cores times all instructions, from the kernel's per-core-type counters) of four 16 MiB mark-heavy corpora (NFD Latin diacritics; Hindi and Thai signs; Korean in conjoining jamo; emoji with VS16, skin tones, ZWJ sequences and flags), each replayed into a fresh live session's Terminal::process at 120x40 in 16 KiB slices by vte_engine_harness. BIGGER-IS-BETTER; the lane runs unadmitted at the load it finds, so cycles are what is judged. Re-record with targo --unverified verify perf --record vte-marks.",
+  "marks_latin_best_mib_per_gcycle": 19.982,
+  "marks_brahmic_best_mib_per_gcycle": 34.180,
+  "marks_hangul_best_mib_per_gcycle": 25.158,
+  "marks_emoji_best_mib_per_gcycle": 23.374,
+  "pass_ratio": 0.450
+}

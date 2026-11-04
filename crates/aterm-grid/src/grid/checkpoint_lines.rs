@@ -41,23 +41,6 @@ impl GridImageCarry {
 }
 
 impl Grid {
-    /// Projects scrollback (oldest first) followed by visible rows into a flat `Vec<Line>`.
-    #[must_use]
-    #[cfg(test)]
-    pub fn checkpoint_lines(&self) -> Vec<Line> {
-        let scrollback_count = self.scrollback_lines();
-        let mut lines = Vec::with_capacity(scrollback_count + self.rows() as usize);
-
-        lines.extend(
-            self.history_lines_from(0)
-                .take(scrollback_count)
-                .map(|line| line.map_or_else(Line::new, std::borrow::Cow::into_owned)),
-        );
-
-        lines.extend(self.checkpoint_visible_lines());
-        lines
-    }
-
     /// Projects at most `max_history` recent scrollback lines followed by the visible rows.
     #[must_use]
     pub fn checkpoint_lines_bounded(&self, max_history: usize) -> Vec<Line> {
@@ -509,7 +492,7 @@ mod tests {
             e.set_bg_rgb(Some([10, 20, 30]));
         }
 
-        let lines = g.checkpoint_lines();
+        let lines = g.checkpoint_lines_bounded(usize::MAX);
         let rebuilt = rebuild_from_lines(3, 16, &lines);
 
         assert_eq!(visible_text(&rebuilt)[0], "XY");
@@ -551,7 +534,7 @@ mod tests {
         );
         write_text(&mut g, 0, ""); // no-op, keep wide cell
 
-        let lines = g.checkpoint_lines();
+        let lines = g.checkpoint_lines_bounded(usize::MAX);
         let rebuilt = rebuild_from_lines(2, 10, &lines);
 
         let c0 = *rebuilt.row(0).unwrap().get(0).unwrap();
@@ -572,7 +555,7 @@ mod tests {
             cell.set_has_extras(true);
         }
 
-        let lines = g.checkpoint_lines();
+        let lines = g.checkpoint_lines_bounded(usize::MAX);
         let rebuilt = rebuild_from_lines(2, 10, &lines);
 
         let extra = rebuilt
@@ -613,7 +596,7 @@ mod tests {
         );
         g.set_cell_complex_char(0, 0, "👨‍👩‍👧");
 
-        let lines = g.checkpoint_lines();
+        let lines = g.checkpoint_lines_bounded(usize::MAX);
         let rebuilt = rebuild_from_lines(2, 10, &lines);
 
         let extra = rebuilt
@@ -651,7 +634,7 @@ mod tests {
             }
         }
 
-        let lines = g.checkpoint_lines();
+        let lines = g.checkpoint_lines_bounded(usize::MAX);
         let rebuilt = rebuild_from_lines(2, 12, &lines);
 
         let extra = rebuilt
@@ -674,7 +657,7 @@ mod tests {
         }
         write_text(&mut g, 1, "ghi");
 
-        let lines = g.checkpoint_lines();
+        let lines = g.checkpoint_lines_bounded(usize::MAX);
         let rebuilt = rebuild_from_lines(3, 6, &lines);
 
         assert!(
@@ -702,7 +685,7 @@ mod tests {
         write_text(&mut g, 1, "visible1");
         write_text(&mut g, 2, "visible2");
 
-        let lines = g.checkpoint_lines();
+        let lines = g.checkpoint_lines_bounded(usize::MAX);
         assert_eq!(lines.len(), 10 + 3);
         assert_eq!(lines[0].as_str(), Some("history-0"));
         assert_eq!(lines[9].as_str(), Some("history-9"));

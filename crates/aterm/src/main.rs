@@ -519,6 +519,35 @@ fn settle_developer_dir() {
         // SAFETY: as above.
         DeveloperDirMove::Clear => unsafe { std::env::remove_var(DEVELOPER_DIR_ENV) },
     }
+    // The tools can arrive while this process runs (an `aterm init` that installed them, a
+    // window that outlives the install). It cannot then take the shim's directory out of its own
+    // environment, so each child it starts after that goes without it: an inherited shim
+    // directory makes Apple's tools fail (`missing DEVELOPER_DIR path`), as `aterm init`'s
+    // compiler read-back did on a guest that had just installed them (nux round 9).
+    if std::env::var_os(DEVELOPER_DIR_ENV)
+        .is_some_and(|dir| aterm_types::clt_shim::is_shim_developer_dir(dir.as_ref()))
+    {
+        aterm_uds::spawnfd::register_stale_inherited_var(stale_developer_dir);
+    }
+}
+
+/// `DEVELOPER_DIR` while it names the shim's directory and the tools are there now; once they
+/// are, they stay ([`settle_developer_dir`]).
+#[cfg(target_os = "macos")]
+fn stale_developer_dir() -> Option<&'static str> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static ARRIVED: AtomicBool = AtomicBool::new(false);
+    let dir = std::env::var_os(aterm_types::clt_shim::DEVELOPER_DIR_ENV)?;
+    if !aterm_types::clt_shim::is_shim_developer_dir(dir.as_ref()) {
+        return None;
+    }
+    if !ARRIVED.load(Ordering::Acquire) {
+        if !aterm_types::clt_shim::developer_git() {
+            return None;
+        }
+        ARRIVED.store(true, Ordering::Release);
+    }
+    Some(aterm_types::clt_shim::DEVELOPER_DIR_ENV)
 }
 
 pub(crate) fn main() -> ExitCode {
@@ -642,6 +671,9 @@ fn front_door_main() -> ExitCode {
     // The lab registry's preferences, as the harness's roster source (a release build only).
     #[cfg(unix)]
     alab_view::install();
+    // The journal's last use, sign-ins and quota, for the account surfaces (a release build only).
+    #[cfg(unix)]
+    alab_seen::install();
     #[cfg(windows)]
     let _ = aterm_gui::attach_parent_console();
     let mut args_os = std::env::args_os();
@@ -14371,6 +14403,10 @@ mod alab_journal;
 /// LabView's cache: the harness's roster source from the lab registry.
 #[cfg(unix)]
 mod alab_view;
+
+/// The journal's cache: the harness's account surfaces from the journal window.
+#[cfg(unix)]
+mod alab_seen;
 
 /// `aterm init --converge`'s live ports.
 #[cfg(unix)]

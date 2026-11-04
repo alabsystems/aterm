@@ -14,6 +14,9 @@ use aterm_uds::process;
 use aterm_uds::spawnfd::Child;
 use std::io;
 
+#[path = "cohort_launch.rs"]
+pub mod launch;
+
 #[path = "cohort_terminal_environment.rs"]
 mod terminal_environment;
 #[doc(hidden)]

@@ -927,6 +927,10 @@ pub fn read_account_in_home(home: &Path) -> Option<Account> {
 #[must_use]
 pub fn renewal_identity(home: &Path) -> Option<super::codex_renewal::Identity> {
     let stored = load_stored_auth(home)?;
+    stored_identity(&stored)
+}
+
+fn stored_identity(stored: &StoredAuth) -> Option<super::codex_renewal::Identity> {
     let account = stored.account_id.as_deref().filter(|s| !s.is_empty())?;
     // CodexAuth::get_account_id uses TokenData.account_id: an explicit selected
     // workspace intentionally outranks the JWT's default workspace.
@@ -1747,6 +1751,20 @@ fn get_usage_once(
         return None;
     }
     let client = http_client(usage_url, wait);
+    get_usage_once_using(usage_url, stored, wait, expected_email, &client)
+}
+
+fn get_usage_once_using(
+    usage_url: &str,
+    stored: &StoredAuth,
+    wait: Duration,
+    expected_email: Option<&str>,
+    client: &Client,
+) -> Option<(u16, Vec<u8>)> {
+    check_stored_identity(stored, expected_email).ok()?;
+    if wait.is_zero() || !is_allowed_auth_endpoint(usage_url) {
+        return None;
+    }
     let mut req = client
         .request(Method::Get, usage_url)
         .header("Accept", "application/json")
@@ -1856,16 +1874,92 @@ pub fn read_login_with(
     now: i64,
     expected_email: Option<&str>,
 ) -> Reading {
+    read_login_snapshot(
+        home,
+        usage_url,
+        fallback_token_url,
+        wait,
+        now,
+        expected_email,
+    )
+    .0
+}
+
+/// Successful usage tied to the immutable credential snapshot used by the HTTP
+/// request, rather than a later read of a login file another process can replace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentifiedUsage {
+    pub identity: super::codex_renewal::Identity,
+    pub usage: Usage,
+}
+
+/// Read usage as [`read_login_with`] does, retaining the exact request identity.
+/// A successful response without known account and user claims yields `None`.
+#[must_use]
+pub fn read_identified_login_with(
+    home: &Path,
+    usage_url: &str,
+    fallback_token_url: &str,
+    wait: Duration,
+    now: i64,
+    expected_email: Option<&str>,
+) -> Option<IdentifiedUsage> {
+    let (reading, identity) = read_login_snapshot(
+        home,
+        usage_url,
+        fallback_token_url,
+        wait,
+        now,
+        expected_email,
+    );
+    Some(IdentifiedUsage {
+        identity: identity?,
+        usage: reading.usage()?,
+    })
+}
+
+fn read_login_snapshot(
+    home: &Path,
+    usage_url: &str,
+    fallback_token_url: &str,
+    wait: Duration,
+    now: i64,
+    expected_email: Option<&str>,
+) -> (Reading, Option<super::codex_renewal::Identity>) {
+    read_login_snapshot_using(
+        home,
+        usage_url,
+        fallback_token_url,
+        wait,
+        now,
+        expected_email,
+        None,
+    )
+}
+
+fn read_login_snapshot_using(
+    home: &Path,
+    usage_url: &str,
+    fallback_token_url: &str,
+    wait: Duration,
+    now: i64,
+    expected_email: Option<&str>,
+    usage_client: Option<&Client>,
+) -> (Reading, Option<super::codex_renewal::Identity>) {
+    let get_usage = |stored: &StoredAuth, left: Duration| match usage_client {
+        Some(client) => get_usage_once_using(usage_url, stored, left, expected_email, client),
+        None => get_usage_once(usage_url, stored, left, expected_email),
+    };
     let deadline = Instant::now()
         .checked_add(wait)
         .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400));
     let left = || deadline.saturating_duration_since(Instant::now());
     recover_journal(home, deadline);
     let Some(mut stored) = load_stored_auth(home) else {
-        return Reading::Unread;
+        return (Reading::Unread, None);
     };
     if check_stored_identity(&stored, expected_email).is_err() {
-        return Reading::Unread;
+        return (Reading::Unread, None);
     }
     if needs_proactive_refresh(&stored, now) {
         if let Some(reloaded) = reload_updated_disk_auth(home, &stored) {
@@ -1885,22 +1979,29 @@ pub fn read_login_with(
             stored = refreshed;
         }
     }
-    let Some((mut status, mut body)) = get_usage_once(usage_url, &stored, left(), expected_email)
-    else {
-        return Reading::Unread;
+    let Some((mut status, mut body)) = get_usage(&stored, left()) else {
+        return (Reading::Unread, None);
     };
     if status == 401
         && let Some(reloaded) = reload_updated_disk_auth(home, &stored)
     {
         stored = reloaded;
-        let Some(again) = get_usage_once(usage_url, &stored, left(), expected_email) else {
-            return Reading::Unread;
+        let Some(again) = get_usage(&stored, left()) else {
+            return (Reading::Unread, None);
         };
         (status, body) = again;
     }
     if status == 401 {
         if stored.refresh_token.is_none() {
-            return confirmed_signed_out(home, &stored, usage_url, deadline, now, expected_email);
+            return confirmed_signed_out(
+                home,
+                &stored,
+                usage_url,
+                deadline,
+                now,
+                expected_email,
+                usage_client,
+            );
         }
         match refresh_outcome(
             home,
@@ -1911,11 +2012,11 @@ pub fn read_login_with(
             expected_email,
         ) {
             Refreshed::Done(refreshed) => {
-                let Some(again) = get_usage_once(usage_url, &refreshed, left(), expected_email)
-                else {
-                    return Reading::Unread;
+                let Some(again) = get_usage(&refreshed, left()) else {
+                    return (Reading::Unread, None);
                 };
                 (status, body) = again;
+                stored = *refreshed;
             }
             // Confirmed before it says signed out: a rotation another writer lands meanwhile
             // is a login, not a refusal.
@@ -1927,12 +2028,13 @@ pub fn read_login_with(
                     deadline,
                     now,
                     expected_email,
+                    usage_client,
                 );
             }
-            Refreshed::Failed => return Reading::Unread,
+            Refreshed::Failed => return (Reading::Unread, None),
         }
     }
-    usage_reading(status, &body, now)
+    (usage_reading(status, &body, now), stored_identity(&stored))
 }
 
 /// A `/wham/usage` answer's [`Reading`]: its usage where it served one.
@@ -1961,12 +2063,13 @@ fn confirmed_signed_out(
     deadline: Instant,
     now: i64,
     expected_email: Option<&str>,
-) -> Reading {
+    usage_client: Option<&Client>,
+) -> (Reading, Option<super::codex_renewal::Identity>) {
     let Some(end) = Instant::now()
         .checked_add(SIGNED_OUT_CONFIRM)
         .filter(|end| *end < deadline)
     else {
-        return Reading::Unread;
+        return (Reading::Unread, None);
     };
     let rotated = loop {
         if let Some(rotated) = reload_updated_disk_auth(home, stored) {
@@ -1980,13 +2083,17 @@ fn confirmed_signed_out(
     };
     let login = rotated.as_ref().unwrap_or(stored);
     let left = deadline.saturating_duration_since(Instant::now());
-    let Some((status, body)) = get_usage_once(usage_url, login, left, expected_email) else {
-        return Reading::Unread;
+    let response = match usage_client {
+        Some(client) => get_usage_once_using(usage_url, login, left, expected_email, client),
+        None => get_usage_once(usage_url, login, left, expected_email),
+    };
+    let Some((status, body)) = response else {
+        return (Reading::Unread, None);
     };
     if status == 401 && rotated.is_none() {
-        return Reading::SignedOut;
+        return (Reading::SignedOut, None);
     }
-    usage_reading(status, &body, now)
+    (usage_reading(status, &body, now), stored_identity(login))
 }
 
 /// Reads one Codex login's live usage in `home` directly over HTTPS (`/wham/usage` or
@@ -2025,6 +2132,56 @@ pub fn read_login_in_home(
     let usage_url = resolve_usage_url(home, user_home);
     let token_url = format!("{DEFAULT_ISSUER}/oauth/token");
     read_login_with(home, &usage_url, &token_url, wait, now, expected_email)
+}
+
+/// Read fresh usage using credentials in `home` and the route in the running
+/// session's shared Codex configuration. Account storage does not select a route.
+#[must_use]
+pub fn read_identified_login_with_config(
+    home: &Path,
+    config_home: &Path,
+    user_home: &Path,
+    wait: Duration,
+    now: i64,
+    expected_email: Option<&str>,
+) -> Option<IdentifiedUsage> {
+    let usage_url = resolve_usage_url(config_home, user_home);
+    let token_url = format!("{DEFAULT_ISSUER}/oauth/token");
+    read_identified_login_with(home, &usage_url, &token_url, wait, now, expected_email)
+}
+
+/// Explicit native-fixture transport: verify a loopback HTTPS server against
+/// supplied roots without changing platform trust or OAuth refresh transport.
+/// Installed release builds cannot select this path.
+#[cfg(debug_assertions)]
+#[must_use]
+pub fn read_identified_login_with_fixture_roots(
+    home: &Path,
+    config_home: &Path,
+    user_home: &Path,
+    wait: Duration,
+    now: i64,
+    expected_email: Option<&str>,
+    roots: Vec<Vec<u8>>,
+) -> Option<IdentifiedUsage> {
+    let usage_url = resolve_usage_url(config_home, user_home);
+    if !usage_url.starts_with("https://") || !is_loopback_endpoint(&usage_url) {
+        return None;
+    }
+    let client = Client::new(Trust::Roots(roots), ProxyMode::Direct, wait);
+    let (reading, identity) = read_login_snapshot_using(
+        home,
+        &usage_url,
+        &format!("{DEFAULT_ISSUER}/oauth/token"),
+        wait,
+        now,
+        expected_email,
+        Some(&client),
+    );
+    Some(IdentifiedUsage {
+        identity: identity?,
+        usage: reading.usage()?,
+    })
 }
 
 fn percent_encode_component(input: &str) -> String {

@@ -231,7 +231,8 @@ fn the_outlooks_inks_read_on_every_ground_and_day_stays_vivid() {
                 h: 4,
             };
             let rows = card_rows();
-            let painted = crate::autopilot_menu::paint(rect, &rows, None, theme);
+            let painted =
+                crate::autopilot_menu::paint(rect, &rows, Default::default(), None, theme);
             let card_meter = legible_on(menu.band.accent, menu.card_bg);
             for cell in &painted[1] {
                 let k = reads(cell.fg, menu.card_bg);

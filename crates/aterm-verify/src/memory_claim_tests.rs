@@ -170,6 +170,131 @@ fn run(root: &Path, book: Option<Book>, mode: Admit, seams: Seams) -> (i32, Stri
     run_checks(root, book, mode, seams, &[Check::Lint, Check::Fmt], false)
 }
 
+#[test]
+fn failed_memory_admission_never_starts_a_stage() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static LEDGER: OnceLock<PathBuf> = OnceLock::new();
+    #[cfg(unix)]
+    static COHORT: OnceLock<PathBuf> = OnceLock::new();
+    static STARTED: AtomicUsize = AtomicUsize::new(0);
+
+    fn broken_ledger(need: Need, mode: Admit) -> Result<Claim, Error> {
+        crate::admit_in(
+            &Ledger::at(LEDGER.get().unwrap()),
+            &machine(),
+            Pace::default(),
+            need,
+            mode,
+            &mut |_| {},
+        )
+    }
+
+    fn timing(_: Need, _: Admit) -> Result<Claim, Error> {
+        Err(Error::Timing(aterm_capacity::TimingIssue::Unavailable))
+    }
+
+    #[cfg(unix)]
+    fn cohort(need: Need, mode: Admit) -> Result<Claim, Error> {
+        crate::admit_in(
+            &Ledger::at(COHORT.get().unwrap()),
+            &machine(),
+            Pace::default(),
+            need,
+            mode,
+            &mut |_| {},
+        )
+    }
+
+    fn never(_: Need, _: Admit) -> Result<Claim, Error> {
+        Err(Error::Never("injected irrecoverable admission".to_owned()))
+    }
+
+    fn stage(_: &Ctx, spec: &StageSpec) -> Report {
+        STARTED.fetch_add(1, Ordering::SeqCst);
+        let mut report = Report::new(&spec.title);
+        report.pass("the callback ran");
+        report
+    }
+
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let blocked = dir.path().join("not-a-ledger-directory");
+    std::fs::write(&blocked, b"a file cannot hold a capacity ledger").unwrap();
+    LEDGER.set(blocked).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let home = dir.path().join("private-home");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&home)
+            .unwrap();
+        let namespace =
+            aterm_capacity::cohort_namespace::Namespace::create_private(dir.path(), &home).unwrap();
+        COHORT.set(namespace.fence().to_owned()).unwrap();
+    }
+    let mut spec = crate::plan::declared(&gui())
+        .into_iter()
+        .find(|spec| spec.id == StageId::Tippy)
+        .unwrap();
+    spec.mem = GIB;
+    let cases: &[(&str, crate::Admitter)] = &[
+        ("ledger", broken_ledger),
+        ("timing", timing),
+        ("irrecoverable", never),
+        #[cfg(unix)]
+        ("cohort", cohort),
+    ];
+    for &(name, admit) in cases {
+        for mode in [Admit::Wait, Admit::Now] {
+            let ctx = Ctx::new(
+                dir.path().to_owned(),
+                gui(),
+                EnvSnapshot::default(),
+                dir.path().join("scratch"),
+            )
+            .with_memory(book(dir.path()))
+            .with_quiet(Some(mode));
+            let quiet = Mutex::new(crate::Quiet {
+                claim: None,
+                left: 1,
+                admit,
+            });
+            let starts = std::cell::Cell::new(0);
+            let (report, ..) = crate::staged(
+                &ctx,
+                &quiet,
+                &spec,
+                None,
+                Seams {
+                    stage,
+                    admit_quiet: admit,
+                    admit_memory: admit,
+                },
+                || starts.set(starts.get() + 1),
+            );
+            assert_eq!(
+                STARTED.load(Ordering::SeqCst),
+                0,
+                "{name} under {mode:?}: admission failure must not run the stage"
+            );
+            assert_eq!(starts.get(), 0, "{name}: no start event before admission");
+            assert_eq!(
+                report
+                    .outcomes()
+                    .map(|(outcome, _)| outcome)
+                    .collect::<Vec<_>>(),
+                [crate::ladder::Outcome::Fail(
+                    crate::ladder::Severity::CouldNotRun
+                )],
+                "{name}: {}",
+                report.render()
+            );
+            assert!(report.render().contains(name), "{}", report.render());
+        }
+    }
+}
+
 /// [`run`] of `checks`, under `--no-windows` when `no_windows` says.
 fn run_checks(
     root: &Path,

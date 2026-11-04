@@ -97,6 +97,66 @@ pub(crate) fn archived(spool: &Path, since: u64) -> io::Result<BTreeMap<String, 
     Ok(held)
 }
 
+/// Every batch the archive holds from `since`'s day on, each whose events all decode (a line that
+/// does not read, or holds an event the vocabulary refuses, is skipped whole), oldest day first:
+/// the log's "heard by this Mac" part (design §7).
+///
+/// # Errors
+/// The archive's folder exists and cannot be listed, or a day file cannot be read.
+pub(crate) fn batches(spool: &Path, since: u64) -> io::Result<Vec<Batch>> {
+    let dir = spool.join(HEARD);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut days: Vec<(u64, String)> = Vec::new();
+    for entry in entries {
+        let name = entry?.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if let Some(day) = canonical_day(name).filter(|day| *day >= since / DAY) {
+            days.push((day, name.to_owned()));
+        }
+    }
+    days.sort();
+    let mut out = Vec::new();
+    for (_, name) in days {
+        let bytes = match aterm_uds::private_file::read_private(
+            &dir,
+            &name,
+            usize::try_from(HEARD_MAX).unwrap_or(usize::MAX),
+        ) {
+            Ok(bytes) => bytes,
+            Err(aterm_uds::private_file::PrivateFileError::Missing) => continue,
+            Err(aterm_uds::private_file::PrivateFileError::Io(error)) => return Err(error),
+            Err(other) => return Err(io::Error::other(other.to_string())),
+        };
+        for line in bytes.split(|b| *b == b'\n') {
+            let Ok(value) = aterm_json::from_slice::<Value>(line) else {
+                continue;
+            };
+            let read = (|| {
+                let m = value.get("m")?.as_str()?;
+                aterm_codec::hex::is_lower(m, 32).then_some(())?;
+                let events = value
+                    .get("e")?
+                    .as_array()?
+                    .iter()
+                    .map(Event::from_value)
+                    .collect::<Option<Vec<Event>>>()?;
+                Some((
+                    m.to_owned(),
+                    value.get("n")?.as_u64()?,
+                    value.get("p")?.as_u64()?,
+                    events,
+                ))
+            })();
+            out.extend(read);
+        }
+    }
+    Ok(out)
+}
+
 fn canonical_day(name: &str) -> Option<u64> {
     let digits = name.strip_suffix(".jsonl")?;
     if digits.is_empty()

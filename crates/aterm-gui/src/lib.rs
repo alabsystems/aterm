@@ -179,6 +179,9 @@ mod editor_carry_conformance;
 #[cfg(test)]
 mod host_exceptions_tests;
 mod ledger_key;
+mod menu_viewport;
+#[cfg(test)]
+mod menu_viewport_model_tests;
 mod native_about;
 mod native_act;
 mod native_allocation;
@@ -3956,9 +3959,10 @@ enum Wake {
         action: menu::MenuAction,
         mark: tab_spawn::MenuMark,
         origin: Option<tab_spawn::MenuOrigin>,
-        /// A control client's gesture chose it (a key an `hwkey` burst posted reached the item
-        /// by its key equivalent): it runs marked as one ([`App::run_posted_menu_action`]).
-        controller: bool,
+        /// The marks of the gesture that posted it (a key an `hwkey` burst posted reached the
+        /// item by its key equivalent, a control client's or an accessibility client's press):
+        /// it runs under them ([`App::run_posted_menu_action`]).
+        gesture: app_take_over::GestureMarks,
     },
     ConfirmedClose {
         replay: close_confirm::CloseReplay,
@@ -21667,9 +21671,9 @@ impl App {
                 action,
                 mark,
                 origin,
-                controller,
+                gesture,
             } => {
-                self.dispatch_marked_menu_action(el, action, mark, origin, controller);
+                self.dispatch_marked_menu_action(el, action, mark, origin, gesture);
             }
             #[cfg(target_os = "macos")]
             Wake::StatusAction { action } => {

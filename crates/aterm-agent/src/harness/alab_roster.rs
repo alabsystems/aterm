@@ -475,14 +475,12 @@ pub fn sync_due(cli: Cli, roster_path: &Path, retained: impl Fn(&str) -> bool) -
     let Some(fleet) = fleet_for(&lab, cli, Some(&existing)) else {
         return false;
     };
-    // A preferred account no row holds is due only while the roster has room for it: one the
-    // cap leaves out ([`retain`]) would otherwise call for a sync at every upkeep.
-    let room = existing.rows.len() < accounts::MAX_ACCOUNTS;
+    // New accounts and changed browser profiles need a roster refresh.
     fleet
         .accounts
         .iter()
         .any(|account| match existing.row(&account.label) {
-            None => room,
+            None => true,
             // A sync writes the lab's browser profile into the row of an account it lists.
             Some(row) => account.browser.is_some() && row.browser != account.browser,
         })
@@ -537,8 +535,6 @@ pub fn fleet_digest(cli: Cli) -> Option<[u8; 32]> {
 /// row the lab does not know keeps its class. A row is matched by its account, and a rebuilt row
 /// holding an existing row's label under another address gives the label back to that row. No
 /// row keeps a `held_by`: nothing under the lab limits who runs an account.
-/// [`accounts::MAX_ACCOUNTS`] still bounds a roster: an existing row is put back before any row
-/// the fleet added is kept.
 #[must_use]
 #[cfg_attr(
     any(test, debug_assertions),
@@ -587,16 +583,6 @@ pub fn retain(
             Some(at) => roster.rows[at] = prev.clone(),
             None => roster.rows.push(prev.clone()),
         }
-    }
-    while roster.rows.len() > accounts::MAX_ACCOUNTS {
-        let Some(added) = roster
-            .rows
-            .iter()
-            .rposition(|row| existing.row(&row.label).is_none())
-        else {
-            break;
-        };
-        roster.rows.remove(added);
     }
     for row in &mut roster.rows {
         // A hold an old pool file set would outlive its source: under the lab nothing limits
@@ -910,8 +896,9 @@ pub fn mailbox_labels() -> Vec<(Cli, String, String)> {
 }
 
 /// `FleetMachineAssignment`'s steps no code here takes: which area a walk checks, and the owner's
-/// verbs, a Mac's own rows, the inventory round and the mailbox routes, each an input
-/// `assignment_tests` sets in the lab, roster or routes the code then reads.
+/// verbs, a Mac's own rows, the inventory round, the registry's address rows and the mailbox
+/// routes, each an input `assignment_tests` (or, for the address rows, `aterm-db`'s chain test)
+/// sets in the lab, roster, registry or routes the code then reads.
 #[cfg(any(test, debug_assertions))]
 #[cfg_attr(
     any(test, debug_assertions),
@@ -1006,7 +993,63 @@ pub fn mailbox_labels() -> Vec<(Cli, String, String)> {
     aterm_spec_anchor::spec_unmodeled(
         machine = "FleetMachineAssignment",
         action = "LabMailbox",
-        reason = "The mailbox an address's codes arrive in is the registry's projection (`LabView::mailboxes`) and an admin Mac's ai-mailbox.toml: the conformance test sets `Lab::mailboxes` and a route with that login."
+        reason = "An address's own `mailbox` column is the owner's registry row: aterm-db's an_alias_chain_takes_the_harness_models_steps writes it into the registry rows LabView reads, and this crate's test is handed what that read gives."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "FleetMachineAssignment",
+        action = "AliasLink",
+        reason = "An alias link is the registry's `address.alias_of`: aterm-db's an_alias_chain_takes_the_harness_models_steps writes it into the registry rows LabView reads, and this crate's test is handed what that read gives."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "FleetMachineAssignment",
+        action = "SelfLink",
+        reason = "An `alias_of` naming the address itself, a cycle of one, is a registry row: aterm-db's an_alias_chain_takes_the_harness_models_steps writes it into the registry rows LabView reads, and this crate's test is handed what that read gives."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "FleetMachineAssignment",
+        action = "ChainLink",
+        reason = "The linked address's own `alias_of`, a chain's second link, is a registry row: aterm-db's an_alias_chain_takes_the_harness_models_steps writes it into the registry rows LabView reads, and this crate's test is handed what that read gives."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "FleetMachineAssignment",
+        action = "CycleLink",
+        reason = "An `alias_of` back to the alias, a cycle, is a registry row: aterm-db's an_alias_chain_takes_the_harness_models_steps writes it into the registry rows LabView reads, and this crate's test is handed what that read gives."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "FleetMachineAssignment",
+        action = "RetireHub",
+        reason = "Retiring an address is a registry row (`row = retired`): aterm-db's an_alias_chain_takes_the_harness_models_steps writes it into the registry rows LabView reads, and this crate's test is handed what that read gives."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "FleetMachineAssignment",
+        action = "RetireRoot",
+        reason = "Retiring an address is a registry row (`row = retired`): aterm-db's an_alias_chain_takes_the_harness_models_steps writes it into the registry rows LabView reads, and this crate's test is handed what that read gives."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "FleetMachineAssignment",
+        action = "RootMailbox",
+        reason = "The chain's end's `mailbox` column is the owner's registry row: aterm-db's an_alias_chain_takes_the_harness_models_steps writes it into the registry rows LabView reads, and this crate's test is handed what that read gives."
     )
 )]
 #[cfg_attr(
@@ -1021,8 +1064,16 @@ pub fn mailbox_labels() -> Vec<(Cli, String, String)> {
     any(test, debug_assertions),
     aterm_spec_anchor::spec_unmodeled(
         machine = "FleetMachineAssignment",
-        action = "AliasLink",
-        reason = "An alias link is the registry's `address.alias_of`: the conformance test sets `Lab::aliases` and a route naming the linked address."
+        action = "HubRoute",
+        reason = "A route naming the chain's first address is a row of ai-mailbox.toml: the conformance test adds it to the routes resolve_index reads."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "FleetMachineAssignment",
+        action = "RootRoute",
+        reason = "A route naming the chain's second address is a row of ai-mailbox.toml: the conformance test adds it to the routes resolve_index reads."
     )
 )]
 #[cfg_attr(

@@ -13,6 +13,171 @@ fn vault_beside(member: &World) -> Paths {
     paths
 }
 
+struct FleetPair {
+    _issuer_serving: Listener,
+    member_serving: Listener,
+    issuer: World,
+    member: World,
+}
+
+fn fleet_pair(tag: &str) -> FleetPair {
+    let (issuer, code, serving) = issuing(&format!("{tag}-issuer"));
+    let member = World::new(&format!("{tag}-member"));
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    ok(join(
+        &member.places,
+        &Opts {
+            host: Some("127.0.0.1".to_owned()),
+            port: Some(listener.local_addr().unwrap().port()),
+            ..Opts::default()
+        },
+        &code,
+    ));
+    let member_serving = Listener::serve(listener, &member.places.state);
+    ok(list_peers(&member.places, HANG));
+    FleetPair {
+        _issuer_serving: serving,
+        member_serving,
+        issuer,
+        member,
+    }
+}
+
+#[test]
+fn a_drive_waits_for_its_local_writer_before_dialing_once() {
+    let pair = fleet_pair("drive-busy-vault");
+    let node = member::node_id(&pair.member.places.state).unwrap();
+    // An issuer has no issuer-copy lookup to observe the lock before Drive's preflight.
+    assert!(
+        read_peers(&pair.issuer.places.state)
+            .unwrap()
+            .iter()
+            .all(|peer| peer.via != Via::Issuer)
+    );
+    let paths = vault_beside(&pair.issuer);
+    let writer = Rc::new(RefCell::new(Some(
+        client::test_hold_state_lock(&paths).unwrap(),
+    )));
+    let release = writer.clone();
+    let observed = Rc::new(Cell::new(0));
+    let count = observed.clone();
+    let refused = client::test_with_denied_nodes_busy(
+        move || {
+            count.set(count.get() + 1);
+            drop(release.borrow_mut().take());
+        },
+        || {
+            drive_fleet_in(&pair.issuer.places, &node, HANG)
+                .err()
+                .expect("the fixture serves no Drive")
+        },
+    );
+    drop(writer.borrow_mut().take());
+    assert_eq!(observed.get(), 1);
+    assert!(
+        refused.ungranted,
+        "the same call must reach the peer: {refused:?}"
+    );
+}
+
+#[test]
+fn a_book_refresh_waits_for_its_local_writer() {
+    let pair = fleet_pair("book-busy-vault");
+    let paths = vault_beside(&pair.member);
+    let writer = Rc::new(RefCell::new(Some(
+        client::test_hold_state_lock(&paths).unwrap(),
+    )));
+    let release = writer.clone();
+    let secret = read_key_file(&pair.member.places.state).unwrap();
+    let me = own_identity(&pair.member.places).unwrap();
+    let refreshed = client::test_with_denied_nodes_busy(
+        move || drop(release.borrow_mut().take()),
+        || {
+            copy_again(
+                &pair.member.places,
+                &secret,
+                Some(&me),
+                (after_now(HANG), HANG),
+            )
+        },
+    );
+    drop(writer.borrow_mut().take());
+    assert!(matches!(refreshed, Ok(true)), "{refreshed:?}");
+}
+
+#[test]
+fn a_drive_enforces_the_denial_committed_while_it_waited() {
+    let pair = fleet_pair("drive-denied-after-writer");
+    let node = member::node_id(&pair.member.places.state).unwrap();
+    let peer_key = own_identity(&pair.member.places).unwrap().key().hex();
+    let listener = pair.member_serving.take();
+    listener.set_nonblocking(true).unwrap();
+    let paths = vault_beside(&pair.issuer);
+    let writer = Rc::new(RefCell::new(Some(
+        client::test_hold_state_lock(&paths).unwrap(),
+    )));
+    let release = writer.clone();
+    let apply_paths = paths.clone();
+    let refused = client::test_with_denied_nodes_busy(
+        move || {
+            drop(release.borrow_mut().take());
+            let admin = client::admin_open(&apply_paths).unwrap();
+            let mut doc = admin.doc.clone();
+            doc.set_entry(
+                &aterm_secrets::text::Audience::Everyone,
+                client::SWARM_ROSTER_ENTRY,
+                format!("deny_nodes = [\"{peer_key}\"]\n").as_bytes(),
+            )
+            .unwrap();
+            client::admin_publish(&apply_paths, &admin, &doc).unwrap();
+        },
+        || drive_fleet_in(&pair.issuer.places, &node, HANG).is_err(),
+    );
+    drop(writer.borrow_mut().take());
+    assert!(refused);
+    assert!(matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+}
+
+#[test]
+fn a_leave_during_the_vault_wait_cancels_the_pending_drive() {
+    let pair = fleet_pair("drive-left-during-writer");
+    let node = member::node_id(&pair.member.places.state).unwrap();
+    let paths = vault_beside(&pair.issuer);
+    let writer = Rc::new(RefCell::new(Some(
+        client::test_hold_state_lock(&paths).unwrap(),
+    )));
+    let release = writer.clone();
+    let left_at = Places {
+        state: pair.issuer.places.state.clone(),
+        config: pair.issuer.places.config.clone(),
+    };
+    let observed = Rc::new(Cell::new(false));
+    let seen = observed.clone();
+    let refused = client::test_with_denied_nodes_busy(
+        move || {
+            seen.set(true);
+            drop(release.borrow_mut().take());
+            ok(leave(&left_at, &[]));
+        },
+        || {
+            drive_fleet_in(&pair.issuer.places, &node, HANG)
+                .err()
+                .expect("the drive was cancelled")
+        },
+    );
+    drop(writer.borrow_mut().take());
+    assert!(observed.get());
+    assert!(
+        !refused.again,
+        "a leave cancels rather than retries: {refused:?}"
+    );
+    assert!(
+        !refused.ungranted,
+        "the cancelled drive must not reach peer admission: {refused:?}"
+    );
+    assert!(read_key_file(&pair.issuer.places.state).is_err());
+}
+
 #[test]
 fn a_fleet_join_waits_for_its_own_vault_apply_to_finish() {
     let (issuer, code, mut serving) = issuing("join-busy-vault-issuer");

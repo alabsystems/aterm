@@ -212,10 +212,13 @@ fn run(
     home: &Path,
     configuration_current: impl Fn() -> bool,
 ) -> Approval {
-    let mut credentials = match Credentials::load(identity, home) {
-        Ok(credentials) => credentials,
-        Err(error) => return quiet(error),
-    };
+    if Instant::now() >= handoff.deadline {
+        return quiet("Google federation reached its deadline");
+    }
+    if !configuration_current() {
+        return quiet("Google identity configuration changed during sign-in");
+    }
+    let mut credentials: Option<Credentials> = None;
     let outer = match FlowBound::of(handoff.url) {
         Ok(bound) => bound,
         Err(why) => return Approval::Refused(why.into()),
@@ -277,7 +280,9 @@ fn run(
         if !configuration_current() {
             return quiet("Google identity configuration changed during sign-in");
         }
-        if let Err(error) = credentials.check_current() {
+        if let Some(credentials) = credentials.as_mut()
+            && let Err(error) = credentials.check_current()
+        {
             return quiet(error);
         }
         if (handoff.finished)() {
@@ -340,8 +345,7 @@ fn run(
                 if oauth::bot_check(&view) {
                     return Approval::BotCheck("Google sign-in requires a security check".into());
                 }
-                let email = credentials.email().to_owned();
-                let action = credentials.with_google_page(&view.url, |password, totp| {
+                let mut act = |password: Option<&str>, totp: Option<&str>| {
                     let otp = if totp_sent {
                         None
                     } else {
@@ -351,7 +355,7 @@ fn run(
                         })
                     };
                     let script = aterm_secrets::SecretBytes::from(google_action(
-                        &email,
+                        identity.email(),
                         password,
                         if totp_sent {
                             Authenticator::Submitted
@@ -373,13 +377,24 @@ fn run(
                         mail_code_sent,
                     ));
                     browser.evaluate(page, script.as_str().unwrap_or_default(), true)
-                });
+                };
+                let action = match credentials.as_mut() {
+                    Some(credentials) => credentials
+                        .with_google_page(&view.url, |password, totp| act(Some(password), totp)),
+                    None => Ok(act(None, None)),
+                };
                 let value = match action {
                     Ok(Ok(value)) => value,
                     Ok(Err(error)) => return quiet(error),
                     Err(error) => return quiet(error),
                 };
                 match value.as_str() {
+                    Some("credentials") => {
+                        credentials = match Credentials::load(identity, home) {
+                            Ok(loaded) => Some(loaded),
+                            Err(error) => return quiet(error),
+                        };
+                    }
                     Some("consent") => {
                         // The consent action proves the exact account on Google's origin.
                         // A chooser or password-entry page can still require reauthentication.
@@ -679,7 +694,7 @@ pub(super) enum Authenticator<'a> {
 
 pub(super) fn google_action(
     email: &str,
-    password: &str,
+    password: Option<&str>,
     authenticator: Authenticator<'_>,
     identifier_sent: bool,
     password_sent: bool,
@@ -702,9 +717,9 @@ pub(super) fn google_action(
         const identifier=document.querySelector('#identifierId');
         if(visible(identifier)) return {identifier_sent}?'wait':(fill(identifier,email,'#identifierNext')?'identifier':'wait');
         const field=[...document.querySelectorAll('input[type=password]')].find(visible);
-        if(field) {{if(!identities.some(exact)||({password_sent}&&field.getAttribute('aria-invalid')==='true'))return 'refused';return {password_sent}?'wait':(fill(field,{password},'#passwordNext')?'password':'wait');}}
+        if(field) {{if(!identities.some(exact)||({password_sent}&&field.getAttribute('aria-invalid')==='true'))return 'refused';if({password_sent})return 'wait';const password={password};if(password===null)return 'credentials';return fill(field,password,'#passwordNext')?'password':'wait';}}
         const totp=document.querySelector('#totpPin,input[name=totpPin]');
-        if(visible(totp)) {{if(!identities.some(exact))return 'refused';if({totp_sent})return totp.getAttribute('aria-invalid')==='true'?'totp_rejected':'wait';const otp={otp};return otp?(fill(totp,otp,'#totpNext')?'totp':'wait'):'challenge';}}
+        if(visible(totp)) {{if(!identities.some(exact))return 'refused';if({totp_sent})return totp.getAttribute('aria-invalid')==='true'?'totp_rejected':'wait';const otp={otp};return otp?(fill(totp,otp,'#totpNext')?'totp':'wait'):({password}===null?'credentials':'challenge');}}
         const mailField=[...document.querySelectorAll('#idvPin,input[name=idvPin]')].find(visible);
         if(mailField) {{
             if(!identities.some(exact))return 'refused';
@@ -863,7 +878,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_binding_is_exact_and_a_bad_entry_does_not_launch_a_browser() {
+    fn configured_binding_is_exact_and_an_expired_handoff_does_not_launch_a_browser() {
         use crate::ai::connector::Completion;
         let root = aterm_tempfile::tempdir().unwrap();
         let mut approver = VendorApprover::with_mailbox(
@@ -880,7 +895,7 @@ mod tests {
             hosts: HOSTS,
             email: Some("person@example.com"),
             finished: &|| false,
-            deadline: Instant::now() + Duration::from_secs(1),
+            deadline: Instant::now(),
         };
         assert!(configured(&approver, &handoff).is_none());
         let text = "[[identities]]\nid='one'\nemail='person@example.com'\ncredential_ref='missing-google-entry'\n[[bindings]]\nprovider='kimi-global'\naccount='work'\nidentity='one'\nexpected_email='person@example.com'\n";
@@ -892,7 +907,7 @@ mod tests {
         ));
         assert!(
             !root.path().join("google-identities").exists(),
-            "missing credentials must not start a browser"
+            "an expired handoff must not start a browser"
         );
         let wrong = Handoff {
             email: Some("other@example.com"),
@@ -926,10 +941,49 @@ mod tests {
         )
         .unwrap();
         let page = browser.open("about:blank").unwrap();
+        for (field, path) in [
+            (
+                "<input type=password><button id=passwordNext>Next</button>",
+                "/v3/signin/challenge/pwd",
+            ),
+            (
+                "<input id=totpPin><button id=totpNext>Next</button>",
+                "/v3/signin/challenge/totp",
+            ),
+        ] {
+            browser.evaluate(&page, &format!("document.body.innerHTML='<span id=profileIdentifier>person@example.com</span>{field}';window.actions=0;document.querySelector('button').onclick=()=>window.actions++;true"), false).unwrap();
+            let action = google_action(
+                "person@example.com",
+                None,
+                Authenticator::Unavailable,
+                true,
+                false,
+                None,
+                false,
+            );
+            let script = format!(
+                "((location)=>{action})({{origin:'https://accounts.google.com',pathname:{}}})",
+                json!(path)
+            );
+            assert_eq!(
+                browser.evaluate(&page, &script, true).unwrap(),
+                json!("credentials")
+            );
+            assert_eq!(
+                browser.evaluate(&page, "window.actions", false).unwrap(),
+                json!(0)
+            );
+            assert_eq!(
+                browser
+                    .evaluate(&page, "document.querySelector('input').value", false)
+                    .unwrap(),
+                json!("")
+            );
+        }
         browser.evaluate(&page,"document.body.innerHTML='<span id=profileIdentifier>person@example.com</span><input id=totpPin><button type=button id=totpNext>Next</button>';window.actions=0;document.querySelector('button').onclick=()=>window.actions++;true",false).unwrap();
         let submitted = google_action(
             "person@example.com",
-            "fixture-only",
+            Some("fixture-only"),
             Authenticator::Submitted,
             true,
             true,
@@ -981,7 +1035,7 @@ mod tests {
             browser.evaluate(&page, &format!("document.body.innerHTML='<span id=profileIdentifier>{account}</span><button id=submit_approve_access>Continue</button>';window.actions=0;document.querySelector('button').onclick=()=>window.actions++;true"), false).unwrap();
             let action = google_action(
                 "person@example.com",
-                "fixture-only",
+                None,
                 Authenticator::Unavailable,
                 true,
                 true,
@@ -1043,7 +1097,7 @@ mod tests {
             browser.evaluate(&page, &fixture, false).unwrap();
             let script = google_action(
                 "person@example.com",
-                "fake-fixture-only",
+                Some("fake-fixture-only"),
                 Authenticator::Unavailable,
                 false,
                 sent,
@@ -1111,7 +1165,7 @@ mod tests {
             browser.evaluate(&page, &fixture, false).unwrap();
             let script = google_action(
                 "person@example.com",
-                "fake-fixture-only",
+                Some("fake-fixture-only"),
                 Authenticator::Unavailable,
                 true,
                 true,
@@ -1133,7 +1187,7 @@ mod tests {
         browser.evaluate(&page,"document.body.innerHTML='<span id=profileIdentifier>person@example.com</span><form><p>Email sent to rescue@example.com</p><input id=idvPin aria-invalid=true><button type=button id=idvPreregisteredEmailNext>Next</button></form>';window.actions=0;document.querySelector('button').onclick=()=>window.actions++;true",false).unwrap();
         let rejected = google_action(
             "person@example.com",
-            "fixture-only",
+            Some("fixture-only"),
             Authenticator::Unavailable,
             true,
             true,
@@ -1159,7 +1213,7 @@ mod tests {
         ] {
             let script = google_action(
                 "person@example.com",
-                "fake-fixture-only",
+                Some("fake-fixture-only"),
                 Authenticator::Unavailable,
                 true,
                 true,
@@ -1182,7 +1236,7 @@ mod tests {
         browser.evaluate(&page,"document.body.innerHTML='<input type=password autocomplete=new-password><button id=passwordNext>Next</button>';window.actions=0;document.querySelector('button').onclick=()=>window.actions++;true",false).unwrap();
         let script = google_action(
             "person@example.com",
-            "fake-fixture-only",
+            Some("fake-fixture-only"),
             Authenticator::Unavailable,
             false,
             false,

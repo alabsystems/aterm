@@ -14,7 +14,7 @@ fn legacy_recovery(bytes: &[u8]) -> Store {
     }
     let mut records = Vec::new();
     let mut at = 0;
-    while at < bytes.len() && records.len() < MAX_RECORDS {
+    while at < bytes.len() && records.len() < MAX_HELD_RECORDS {
         let Ok(len) = Record::wire_len_prefix(&bytes[at..]) else {
             break;
         };
@@ -296,7 +296,7 @@ fn recovery_bound_counts_verified_frames_including_duplicates() {
     let mut bad = records[0].bytes().to_vec();
     *bad.last_mut().unwrap() ^= 1;
     let mut bytes = bad;
-    for _ in 0..MAX_RECORDS - 1 {
+    for _ in 0..MAX_HELD_RECORDS - 1 {
         bytes.extend_from_slice(records[0].bytes());
     }
     bytes.extend_from_slice(records[1].bytes());

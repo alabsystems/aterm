@@ -84,6 +84,9 @@ fn damage_bounds_iterator_skips_multiple_out_of_range() {
     );
 }
 
+/// NEGATIVE CONTROL: `col == u16::MAX` is out of range for every `u16`-width grid and
+/// leaves the row undamaged instead of recording an empty `(u16::MAX, u16::MAX)` interval,
+/// while `col == u16::MAX - 1` records the non-empty `(u16::MAX - 1, u16::MAX)` bound.
 #[test]
 fn row_damage_bounds_clamp_and_saturate() {
     let mut damage = Damage::new(10);
@@ -106,7 +109,13 @@ fn row_damage_bounds_clamp_and_saturate() {
 
     let mut tracker = DamageTracker::new(2);
     tracker.mark_cell(1, u16::MAX);
-    assert_eq!(tracker.row_damage_bounds(1), Some((u16::MAX, u16::MAX)));
+    tracker.mark_wide_cell(1, u16::MAX);
+    assert!(!tracker.is_row_damaged(1));
+    assert_eq!(tracker.row_damage_bounds(1), None);
+
+    tracker.mark_wide_cell(1, u16::MAX - 1);
+    assert!(tracker.is_row_damaged(1));
+    assert_eq!(tracker.row_damage_bounds(1), Some((u16::MAX - 1, u16::MAX)));
 }
 
 #[test]

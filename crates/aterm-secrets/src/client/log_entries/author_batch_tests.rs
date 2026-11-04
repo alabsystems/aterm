@@ -142,7 +142,7 @@ fn author<T>(
 fn final_ingress_cannot_publish_only_the_epoch_of_an_authored_batch() {
     let root = aterm_tempfile::tempdir().unwrap();
     let (mut store, writer) = rooted();
-    while store.len() < crate::membership_log::MAX_RECORDS - 5 {
+    while store.len() < crate::membership_log::MAX_HELD_RECORDS - 5 {
         let record = writer.name(
             store.log().unwrap(),
             1_001 + u64::try_from(store.len()).unwrap(),

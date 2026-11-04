@@ -707,7 +707,9 @@ pub struct CliFleet {
 
 /// The sheet's header words naming `cli`'s membership column, matched trimmed and in any case:
 /// `claude`; `Open AI` (or `openai`, `codex`) for Codex; `xai` (or `x`, the heading of the
-/// vault's own sheet, or `grok`) for Grok Build; `kimi` for Kimi Code. A header word is matched
+/// vault's own sheet, or `grok`) for Grok Build; `kimi` for Kimi Code; `agy` or `antigravity`
+/// for Antigravity. Google account status alone does not enroll an Antigravity subscription.
+/// A header word is matched
 /// whole; a note's vendor words have no lone `x`, so `x` scopes no note.
 #[must_use]
 pub const fn csv_columns(cli: Cli) -> &'static [&'static str] {
@@ -716,6 +718,7 @@ pub const fn csv_columns(cli: Cli) -> &'static [&'static str] {
         Cli::Codex => &["open ai", "openai", "codex"],
         Cli::Grok => &["xai", "x", "grok"],
         Cli::Kimi => &["kimi"],
+        Cli::Agy => &["agy", "antigravity"],
     }
 }
 
@@ -1413,7 +1416,7 @@ pub(crate) fn default_login_identity_matches(cli: Cli, home: &Path, row: &Row) -
     let found = match cli {
         Cli::Claude => home.parent().and_then(home_default_email),
         Cli::Codex => super::codex_app_login::read_account_email(home),
-        Cli::Grok | Cli::Kimi => None,
+        Cli::Grok | Cli::Kimi | Cli::Agy => None,
     };
     found.is_some_and(|found| accounts::email_matches(expected, &found))
 }
@@ -2348,10 +2351,7 @@ pub fn build_machine_roster(
         accounts::email_matches(expected, email)
     };
     let unlisted = default_email
-        .filter(|de| {
-            !fleet_rows.iter().any(|r| matches_identity(r, de))
-                && fleet_rows.len() < accounts::MAX_ACCOUNTS
-        })
+        .filter(|de| !fleet_rows.iter().any(|r| matches_identity(r, de)))
         .and_then(|de| {
             let kept = existing.and_then(|ex| {
                 ex.rows.iter().find(|r| {
@@ -2550,10 +2550,7 @@ fn carry_conflicting(fleet: &FleetRoster, machine: &str, existing: &Roster) -> F
                 accounts::email_matches(address, email) && conflict_names(conflict, Some(&norm))
             })
         });
-        if !conflicted
-            || carried.accounts.iter().any(|acct| acct.label == row.label)
-            || carried.accounts_for_machine(&norm).len() >= accounts::MAX_ACCOUNTS
-        {
+        if !conflicted || carried.accounts.iter().any(|acct| acct.label == row.label) {
             continue;
         }
         let Some(email) = row.email.clone() else {
@@ -3009,7 +3006,7 @@ fn fleet_takes_discovered(
 /// upkeep come from the lab). A Mac without the registry keeps reading it, so it keeps its rows;
 /// one whose registry could not be read yet ([`super::alab_roster::pending`]) reads it only once
 /// a read shows the lab does not name it.
-fn sheet_read_here() -> bool {
+pub(super) fn sheet_read_here() -> bool {
     !super::alab_roster::names_this_mac() && !super::alab_roster::pending()
 }
 
@@ -4472,7 +4469,7 @@ fn apply_pool_to_claude_roster(
             }),
             None => roster.rows.iter().any(|r| r.label == prev.label),
         };
-        if already_in || roster.rows.len() >= accounts::MAX_ACCOUNTS {
+        if already_in {
             continue;
         }
         let mut label = prev.label.clone();
@@ -4535,9 +4532,6 @@ fn retain_shared_rows(
                 return Err("source would change a locally retained shared account".into());
             }
         } else {
-            if next.rows.len() == accounts::MAX_ACCOUNTS {
-                return Err("source has no room for a retained shared account".into());
-            }
             next.rows.push(row.clone());
         }
     }
@@ -5141,7 +5135,7 @@ fn persist_accounts_sync_with_pool(
     })
 }
 
-/// Run `aterm harness accounts sync [<source>] [--machine <mN>] [--json]`.
+/// Run `aterm harness accounts sync [alab | <source>] [--machine <mN>] [--json]`.
 pub fn run_accounts_sync(
     env: &Env,
     source: Option<&str>,
@@ -6470,7 +6464,7 @@ pub(crate) fn sign_ins_off_for(config: &Path, cli: Cli) -> Option<&'static str> 
         match cli {
             Cli::Claude => Some("`[harness.claude] enabled = false`"),
             Cli::Codex => Some("`[harness.codex] enabled = false`"),
-            Cli::Grok | Cli::Kimi => None,
+            Cli::Grok | Cli::Kimi | Cli::Agy => None,
         }
     })
 }
@@ -6522,12 +6516,10 @@ fn sheet_conflicts_look(home: &Path, config: &Path) -> SheetLook {
     };
     let secrets = home.join(".secrets");
     let sheet = secrets.join(ACCOUNTS_CSV_FILE);
-    // Where the lab registry names this Mac, the sheet is the importer's input alone: upkeep
-    // reads the lab, and no sheet conflict is this Mac's to report.
-    if accounts_sync_off(Some(config))
-        || !source_entry_present(&sheet)
-        || super::alab_roster::current().is_some_and(|lab| lab.me.is_some())
-    {
+    // Where the lab registry names this Mac, or may and could not be read yet, the sheet is the
+    // importer's input alone ([`sheet_read_here`]): upkeep reads the lab, and no sheet conflict
+    // is this Mac's to report.
+    if accounts_sync_off(Some(config)) || !source_entry_present(&sheet) || !sheet_read_here() {
         return unread;
     }
     let Ok(text) = read_local_source_text(&sheet) else {
@@ -8082,6 +8074,9 @@ pub struct CliSynced {
     pub conflicts: Vec<SheetConflict>,
     /// Whether the sync changed the roster, account state or a recovered staging renewal.
     pub changed: bool,
+    /// Whether the fleet is the lab's and this Mac prefers no account of the CLI: the sync
+    /// added nothing and kept every row (§0: no preference limits nothing).
+    pub prefers_none: bool,
 }
 
 /// An [`Env`] for a sync run from init, the vault's verbs or a window's upkeep: it names the
@@ -8413,7 +8408,12 @@ fn sync_cli_with_replan(
             ctx.pool.accounts_for_cli(cli).len()
         });
     let mine = fleet.roster.accounts_for_machine(&machine);
-    if named && mine.is_empty() {
+    // Under the lab an empty fleet is this Mac preferring no account of `cli`: nothing is added,
+    // every row stays, and the sync still clears old holds and orders the rows below
+    // ([`CliSynced::prefers_none`]). Only another source naming no row of this machine's is an
+    // error, since there it means the wrong machine or the wrong file.
+    let lab_fleet = fleet.roster.alab.is_some();
+    if named && mine.is_empty() && !lab_fleet {
         return Err(with_conflicts(
             format!(
                 "no active {product} accounts found for machine `{machine}` in {}",
@@ -8638,6 +8638,7 @@ fn sync_cli_with_replan(
         kept,
         conflicts,
         changed,
+        prefers_none: lab_fleet && mine.is_empty(),
     }))
 }
 
@@ -8859,6 +8860,7 @@ fn run_cli_accounts_sync_with(
         o.insert("added".to_owned(), words(&synced.added));
         o.insert("held".to_owned(), words(&synced.held));
         o.insert("kept".to_owned(), words(&synced.kept));
+        o.insert("prefers_none".to_owned(), Value::from(synced.prefers_none));
         o.insert(
             "sheet_conflicts".to_owned(),
             conflicts_json(&synced.conflicts),
@@ -8881,6 +8883,14 @@ fn run_cli_accounts_sync_with(
     );
     let _ = writeln!(out, "roster: {}", synced.roster.display());
     let _ = writeln!(out, "source: {}", synced.source);
+    if synced.prefers_none {
+        let _ = writeln!(
+            out,
+            "the lab prefers no {product} account on `{}`: nothing was added, and every row the \
+             roster lists stays",
+            synced.machine
+        );
+    }
     if !synced.held.is_empty() {
         let _ = writeln!(
             out,
@@ -9199,12 +9209,14 @@ fn cli_sync_inputs(cli: Cli, home: &Path, config: &Path) -> [u8; 32] {
         }
         return hash.finalize();
     }
+    // The sheet only where the harness may read it ([`sheet_read_here`]): while the lab may name
+    // this Mac and could not be read yet, an edit to it calls for no sync.
     let fleet = [
-        secrets_pool.clone(),
-        secrets.join(cli_fleet_file(cli)),
-        secrets.join(ACCOUNTS_CSV_FILE),
+        Some(secrets_pool.clone()),
+        Some(secrets.join(cli_fleet_file(cli))),
+        sheet_read_here().then(|| secrets.join(ACCOUNTS_CSV_FILE)),
     ]
-    .map(|path| read_local_source_text(&path).map(String::into_bytes).ok());
+    .map(|path| path.and_then(|path| read_local_source_text(&path).map(String::into_bytes).ok()));
     let pool_identity = pool_entry_present(&secrets_pool).then(|| {
         super::ai_pool::resolve_local_pool_identity(Some(home), Some(config), None)
             .map(|id| format!("{}:{}", id.primary, id.aliases.join(",")).into_bytes())
@@ -11110,8 +11122,8 @@ pub(super) fn needed_renew_candidates_for(
 /// filling (Claude Code's first warning, well before the account is low), where no other row is
 /// ready to take it; tier 1, the enrolled logins due for renewal or ended; tier 2, every other
 /// row to sign in; tier 3, the rows to sign in that are themselves walled, ready once their wall
-/// ends. Within a tier, the signed-out rows sessions run on first, then roster order (dedicated
-/// rows first in tiers 0, 2 and 3), a row with an unaddressed sign-in task after every row without
+/// ends. Within a tier, the signed-out rows sessions run on first, then roster order (rows this
+/// Mac prefers first in tiers 0, 2 and 3), a row with an unaddressed sign-in task after every row without
 /// one and the older task first (read through `store` where one is given, else from `logins`
 /// alone), a row whose last renewal answered another account last.
 fn auto_renew_candidates_tiered(
@@ -12107,6 +12119,14 @@ fn recover_interrupted_staging_renewals_checked(
                         && let Some(proved_by) = proof.proved_by
                     {
                         accounts::note_identity(logins, &row.label, proved_by, Some(&proof.email));
+                        if let Some(principal) = proof.google_principal {
+                            accounts::note_google_identity(
+                                logins,
+                                &row.label,
+                                &proof.email,
+                                principal,
+                            );
+                        }
                     }
                     Ok(events)
                 },

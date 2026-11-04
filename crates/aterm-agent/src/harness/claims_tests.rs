@@ -1460,36 +1460,47 @@ fn a_running_session_keeps_its_claim_and_its_seniority_past_the_hour() {
 }
 
 #[test]
-fn a_claim_past_a_full_row_is_unrecorded_not_held() {
-    let table = Replica::new("aa01");
-    let labels: Vec<String> = (0..=MAX_CLAIMS).map(|n| format!("pool-{n:02}")).collect();
-    let keys: Vec<(String, LeaseKey)> = labels.iter().map(|l| (l.clone(), key(l))).collect();
-    let mut state = State {
-        swarm_label: Some("m1".into()),
-        ..State::default()
-    };
-    let home = std::path::Path::new("/nonexistent/home");
-    let mut touch = |label: &str, now: i64| {
-        touch_with(
-            &table,
-            home,
-            None,
-            &mut state,
-            Cli::Claude,
-            &keys,
-            Act::Claim(label),
-            now,
-        )
-    };
-    for label in &labels[..MAX_CLAIMS] {
-        assert_eq!(touch(label, NOW), Touched::Claimed);
+fn large_claim_sets_round_trip_without_count_truncation() {
+    for cli in CLAIMED_CLIS {
+        let mine = Mine {
+            machine: "aa01".into(),
+            label: "m1".into(),
+        };
+        let mut row = None;
+        for index in 0..256 {
+            let key =
+                LeaseKey::for_cli(cli, None, &format!("account{index}@example.test")).unwrap();
+            row = claimed(row.as_ref(), &mine, &key, Kind::Lease, |_| true, NOW);
+            assert_eq!(row.as_ref().unwrap().claims.len(), index + 1);
+        }
+        let row = row.unwrap();
+        assert_eq!(
+            Row::from_value(&mine.machine, &row.to_value()).unwrap(),
+            row
+        );
+        let oversized = Mine {
+            label: "x".repeat(MAX_CLAIM_BYTES),
+            ..mine
+        };
+        assert!(
+            claimed(
+                Some(&row),
+                &oversized,
+                &key("extra"),
+                Kind::Lease,
+                |_| true,
+                NOW
+            )
+            .is_none()
+        );
+        assert_eq!(
+            Row::from_value("aa01", &row.to_value())
+                .unwrap()
+                .claims
+                .len(),
+            256
+        );
     }
-    let last = &labels[MAX_CLAIMS];
-    assert!(matches!(touch(last, NOW + MIN), Touched::Unrecorded(_)));
-    assert!(state.unrecorded);
-    assert_eq!(state.lease_verdict(last, NOW + MIN), Err(WhyNot::Unclaimed));
-    let row = table.row("aa01").expect("m1's row");
-    assert_eq!(row.claims.len(), MAX_CLAIMS);
 }
 
 /// A Mac about to sleep gives up the claims it no longer uses and keeps the rest at most

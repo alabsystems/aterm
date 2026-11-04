@@ -24,10 +24,7 @@ impl Fixture {
             "Late" => (3, "home", vec![[1; 32], [2; 32]], 200),
             "Prune" => (4, "home", vec![[2; 32]], 70),
             "OtherHome" => (5, "other", vec![[1; 32]], 11),
-            "Full" => {
-                self.queue.capacity = 1;
-                (6, "home", vec![[1; 32], [2; 32]], 11)
-            }
+            "Grow" => (6, "home", vec![[1; 32], [2; 32]], 11),
             "Cooldown" => (7, "home", vec![[1; 32]], 69),
             "Boundary" => (8, "home", vec![[1; 32]], 70),
             "Future" => (9, "home", vec![[1; 32]], 9),
@@ -111,18 +108,15 @@ fn native_preparation_queue_conforms_and_catches_wrong_selection() {
 }
 
 #[test]
-fn retired_candidates_release_capacity_without_erasing_another_homes_cooldown() {
-    let mut q = PreparationQueue {
-        capacity: 2,
-        ..PreparationQueue::default()
-    };
+fn retired_candidates_release_history_without_erasing_another_homes_cooldown() {
+    let mut q = PreparationQueue::default();
     let start = Instant::now();
     let first = Path::new("first");
     let second = Path::new("second");
     assert_eq!(q.pick(first, &[[1; 32]], start), Some([1; 32]));
     assert_eq!(q.pick(second, &[[2; 32]], start), Some([2; 32]));
     assert_eq!(
-        q.pick(first, &[[3; 32]], start + Duration::from_secs(1)),
+        q.pick(first, &[[1; 32]], start + Duration::from_secs(1)),
         None
     );
     for n in 3..=20 {
@@ -141,23 +135,21 @@ fn retired_candidates_release_capacity_without_erasing_another_homes_cooldown() 
 }
 
 #[test]
-fn full_default_queue_keeps_mature_ties_ordered_and_refuses_a_new_key() {
+fn a_large_queue_keeps_mature_ties_ordered_and_admits_every_account() {
     let mut q = PreparationQueue::default();
-    let home = Path::new("full-default-queue");
+    let home = Path::new("large-queue");
     let start = Instant::now();
-    let mut candidates: Vec<_> = (1..=33).map(|n| [n; 32]).collect();
+    let mut candidates: Vec<_> = (1..=96).map(|n| [n; 32]).collect();
     candidates.reverse();
-    for n in 1..=32 {
+    for n in 1..=96 {
         assert_eq!(q.pick(home, &candidates, start), Some([n; 32]));
     }
-    assert_eq!(q.seen.len(), 32);
+    assert_eq!(q.seen.len(), 96);
     assert_eq!(q.pick(home, &candidates, start), None);
-    assert!(!q.seen.contains_key(&(home.to_owned(), [33; 32])));
     let mature = start + COOLDOWN;
     assert_eq!(q.pick(home, &candidates, mature), Some([1; 32]));
     assert_eq!(q.pick(home, &candidates, mature), Some([2; 32]));
-    assert_eq!(q.seen.len(), 32);
-    assert!(!q.seen.contains_key(&(home.to_owned(), [33; 32])));
+    assert_eq!(q.seen.len(), 96);
 }
 
 #[test]
@@ -180,10 +172,7 @@ fn sparse_maintenance_turns_do_not_starve_later_native_accounts() {
 fn native_revisions_replace_one_slot_only_after_admission() {
     let start = Instant::now();
     let home = Path::new("revision");
-    let mut queue = PreparationQueue {
-        capacity: 1,
-        ..PreparationQueue::default()
-    };
+    let mut queue = PreparationQueue::default();
     let first = BTreeMap::from([([1; 32], [1; 32])]);
     assert_eq!(
         queue.pick_revisions_if(home, &first, start, |_, _| true),
@@ -213,15 +202,6 @@ fn native_revisions_replace_one_slot_only_after_admission() {
         None,
         "a future clock remains held"
     );
-    let another = BTreeMap::from([([2; 32], [1; 32])]);
-    assert_eq!(
-        queue.pick_revisions_if(home, &another, next, |_, _| true),
-        None
-    );
-    assert_eq!(
-        queue.pick_revisions_if(Path::new("other"), &changed, next, |_, _| true),
-        None
-    );
     for revision in 3..=20 {
         let entries = BTreeMap::from([([1; 32], [revision; 32])]);
         assert!(
@@ -231,6 +211,16 @@ fn native_revisions_replace_one_slot_only_after_admission() {
         );
         assert_eq!(queue.seen.len(), 1);
     }
+    let another = BTreeMap::from([([2; 32], [1; 32])]);
+    assert_eq!(
+        queue.pick_revisions_if(home, &another, next, |_, _| true),
+        Some(([2; 32], [1; 32]))
+    );
+    assert_eq!(
+        queue.pick_revisions_if(Path::new("other"), &changed, next, |_, _| true),
+        Some(([1; 32], [2; 32]))
+    );
+    assert_eq!(queue.seen.len(), 3);
 }
 
 struct AdmissionFixture {
@@ -247,10 +237,7 @@ impl AdmissionFixture {
             "Retry" => (2, 11, vec![[1; 32], [2; 32]]),
             "Skip" => (3, 10, vec![[3; 32], [2; 32], [1; 32], [2; 32]]),
             "Cooling" => (4, 12, vec![[1; 32]]),
-            "Full" => {
-                self.queue.capacity = 1;
-                (5, 11, vec![[1; 32]])
-            }
+            "Grow" => (5, 11, vec![[1; 32]]),
             _ => panic!("unknown admission action {action}"),
         };
         self.offered = 0;

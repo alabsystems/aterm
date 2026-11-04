@@ -1672,6 +1672,10 @@ pub(crate) fn row_slug(subject: Subject) -> &'static str {
     }
 }
 
+/// The muted value of an Access row whose grant is on offer
+/// ([`aterm_types::macos_setup::ACCESS_OFFERED`]): nothing granted it yet.
+pub(crate) const OFFERED_WORD: &str = "Offered";
+
 /// A row's value, in the words a probe read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RowValue {
@@ -1849,7 +1853,7 @@ fn row_view_as(
                 if reading.and_then(|row| row.note.as_deref())
                     == Some(aterm_types::macos_setup::ACCESS_OFFERED)
                 {
-                    "Offered"
+                    OFFERED_WORD
                 } else {
                     "Not needed"
                 }

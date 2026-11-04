@@ -464,7 +464,7 @@ fn the_body_deadline_includes_later_frames_and_invalid_tail_drain() {
 #[test]
 fn raw_frame_limit_counts_duplicates_and_early_bytes_end_at_content_length() {
     let record = records().remove(0);
-    let repeated: Vec<u8> = std::iter::repeat_n(record.bytes(), MAX_RECORDS + 1)
+    let repeated: Vec<u8> = std::iter::repeat_n(record.bytes(), MAX_HELD_RECORDS + 1)
         .flatten()
         .copied()
         .collect();

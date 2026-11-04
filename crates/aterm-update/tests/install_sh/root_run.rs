@@ -1358,7 +1358,8 @@ ls_entry() {
 /// with its SDK (DEVELOPER_DIR), and a store whose targo writes the PATH it ran
 /// on to `build-path` in the folder `mk` made (`$W`), the git config variables
 /// it was given to `$W/build-git`, and the developer folder, SDK and toolchain
-/// xcrun would take to `$W/build-dev`, so no two folders' builds share a file.
+/// xcrun would take to `$W/build-dev`, so no two folders' builds share a file;
+/// `real <walk>...` takes the pre-flight's other walks as passed.
 const ROOT_LAYOUT: &str = r#"umask 022
 mk() {
 	W="$TMPDIR/$1"
@@ -1379,6 +1380,31 @@ mk() {
 	theirs "$W/their-bin"
 	ROOT="$W/co" HOME="$W/home" CARGO_LANE=store CARGO_BIN="$W/store/trust/1/bin/targo" DEVELOPER_DIR="$W/dev"
 	unset CARGO_HOME RUSTC RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER SDKROOT TOOLCHAINS
+}
+# real <walk>...: root_build_preflight runs the walks named, those a row's setup
+# can reach, and takes each other one as passed, as it passes on the first row's
+# layout, where every walk runs: checkout (the walk of $ROOT; its git dirs' run
+# always), cargo (of each .cargo and of cargo's home), xcode (root_xcode_judged,
+# whose stand-in leaves ROOT_DEVELOPER_DIR and ROOT_SDKROOT unset, which nothing
+# in the pre-flight reads after it) and lane (root_bin_dir of the lane's folder,
+# root_build_path's of it too, so a row that puts it on PATH names lane). Once
+# in a row's subshell.
+real() {
+	REAL_WALKS=" $* "
+	eval "real_$(declare -f root_tree_failing)"
+	root_tree_failing() {
+		case "$1" in
+		"$ROOT") [[ "$REAL_WALKS" == *" checkout "* ]] || return 0 ;;
+		*/.cargo | "${CARGO_HOME:-$HOME/.cargo}") [[ "$REAL_WALKS" == *" cargo "* ]] || return 0 ;;
+		esac
+		real_root_tree_failing "$@"
+	}
+	[[ "$REAL_WALKS" == *" xcode "* ]] || root_xcode_judged() { :; }
+	eval "real_$(declare -f root_bin_dir)"
+	root_bin_dir() {
+		[[ "$REAL_WALKS" == *" lane "* || "$1" != "${CARGO_BIN%/*}" ]] || return 0
+		real_root_bin_dir "$@"
+	}
 }"#;
 
 /// What a root build refuses: the path it names, relative to the row's folder
@@ -1391,7 +1417,9 @@ fn under_root_a_source_build_reads_and_runs_nothing_another_account_can_change()
     let tmp = scratch.join("tmp");
     let mut lib = Lib::new();
     lib.step(format!("{FOREIGN_FIND}\n{FAKE_ROOT}\n{ROOT_LAYOUT}"));
-    // (label, setup, None for a build)
+    // (label, setup, None for a build); a setup that starts `real` runs only
+    // the walks it names (ROOT_LAYOUT's `real`; the wrapper judge runs in every
+    // row) and takes the others, which see the first row's layout, as passed.
     let rows: [(&str, &str, Refusal); 29] = [
         ("root's alone", "", None),
         (
@@ -1406,23 +1434,23 @@ fn under_root_a_source_build_reads_and_runs_nothing_another_account_can_change()
         ),
         (
             "an ancestor's .cargo/config.toml",
-            "theirs \"$W/.cargo/config.toml\"",
+            "real cargo; theirs \"$W/.cargo/config.toml\"",
             Some((".cargo/config.toml", "checkout")),
         ),
         (
             "cargo home's config.toml",
-            "printf '[build]\\nrustc = \"x\"\\n' >\"$W/home/.cargo/config.toml\"; \
+            "real cargo; printf '[build]\\nrustc = \"x\"\\n' >\"$W/home/.cargo/config.toml\"; \
              theirs \"$W/home/.cargo/config.toml\"",
             Some(("home/.cargo/config.toml", "cargo home")),
         ),
         (
             "a cc in cargo home's bin/",
-            ": >\"$W/home/.cargo/bin/cc\"; theirs \"$W/home/.cargo/bin/cc\"",
+            "real cargo; : >\"$W/home/.cargo/bin/cc\"; theirs \"$W/home/.cargo/bin/cc\"",
             Some(("home/.cargo/bin/cc", "cargo home")),
         ),
         (
             "a cargo home still to be made in their folder",
-            "HOME=\"$W/their-home\"; mkdir -p \"$HOME\"; theirs \"$HOME\"",
+            "real cargo; HOME=\"$W/their-home\"; mkdir -p \"$HOME\"; theirs \"$HOME\"",
             Some(("their-home", "cargo home")),
         ),
         (
@@ -1445,15 +1473,19 @@ fn under_root_a_source_build_reads_and_runs_nothing_another_account_can_change()
             "mkdir -p \"$W/elsewhere\" && ln -s \"$W/elsewhere\" \"$W/co/vendor\"",
             Some(("co/vendor", "checkout")),
         ),
-        ("a link inside it", "ln -s src \"$W/co/alias\"", None),
+        (
+            "a link inside it",
+            "real checkout; ln -s src \"$W/co/alias\"",
+            None,
+        ),
         (
             "a link of theirs inside it",
-            "ln -s src \"$W/co/alias\"; theirs \"$W/co/alias\"",
+            "real checkout; ln -s src \"$W/co/alias\"; theirs \"$W/co/alias\"",
             cfg!(target_os = "macos").then_some(("co/alias", "checkout")),
         ),
         (
             "a link inside it by a path with ..",
-            "ln -s ../co/src \"$W/co/up\"",
+            "real checkout; ln -s ../co/src \"$W/co/up\"",
             None,
         ),
         (
@@ -1476,7 +1508,7 @@ fn under_root_a_source_build_reads_and_runs_nothing_another_account_can_change()
         ),
         (
             "a link back into it through a link of root's",
-            "mkdir -p \"$W/sealed\" && ln -s \"$W/co/src\" \"$W/sealed/hop\" && \
+            "real checkout; mkdir -p \"$W/sealed\" && ln -s \"$W/co/src\" \"$W/sealed/hop\" && \
              ln -s \"$W/sealed/hop\" \"$W/co/vendor\"",
             None,
         ),
@@ -1501,32 +1533,32 @@ fn under_root_a_source_build_reads_and_runs_nothing_another_account_can_change()
         ),
         (
             "a rustc wrapper of theirs",
-            "export RUSTC_WRAPPER=\"$W/their-bin/sccache\"",
+            "real; export RUSTC_WRAPPER=\"$W/their-bin/sccache\"",
             Some(("their-bin/sccache", "toolchain")),
         ),
         (
             "a wrapper's bare name only their folder on PATH holds",
-            "export PATH=\"$W/their-bin:$PATH\" RUSTC_WRAPPER=sccache",
+            "real; export PATH=\"$W/their-bin:$PATH\" RUSTC_WRAPPER=sccache",
             Some(("/sccache", "toolchain")),
         ),
         (
             "a wrapper of root's",
-            "export RUSTC_WORKSPACE_WRAPPER=\"$W/store/trust/1/bin/targo\"",
+            "real; export RUSTC_WORKSPACE_WRAPPER=\"$W/store/trust/1/bin/targo\"",
             None,
         ),
         (
             "RUSTC of theirs on rustup's lane",
-            "CARGO_LANE=rustup; export RUSTC=\"$W/their-bin/rustc\"",
+            "real; CARGO_LANE=rustup; export RUSTC=\"$W/their-bin/rustc\"",
             Some(("their-bin/rustc", "toolchain")),
         ),
         (
             "RUSTC of theirs on the store lane, which scrubs it",
-            "export RUSTC=\"$W/their-bin/rustc\"",
+            "real; export RUSTC=\"$W/their-bin/rustc\"",
             None,
         ),
         (
             "a program of theirs beside the lane's cargo",
-            "printf '#!/bin/sh\\n' >\"$W/store/trust/1/bin/cc\"; chmod 755 \"$W/store/trust/1/bin/cc\"; \
+            "real lane; printf '#!/bin/sh\\n' >\"$W/store/trust/1/bin/cc\"; chmod 755 \"$W/store/trust/1/bin/cc\"; \
              theirs \"$W/store/trust/1/bin/cc\"",
             Some(("store/trust/1/bin", "toolchain")),
         ),
@@ -1538,7 +1570,7 @@ fn under_root_a_source_build_reads_and_runs_nothing_another_account_can_change()
         ),
         (
             "root's own wrapper by a bare name, beside the store's targo",
-            "printf '#!/bin/sh\\n' >\"$W/store/trust/1/bin/sccache\"; \
+            "real lane; printf '#!/bin/sh\\n' >\"$W/store/trust/1/bin/sccache\"; \
              chmod 755 \"$W/store/trust/1/bin/sccache\"; export RUSTC_WRAPPER=sccache",
             None,
         ),
@@ -2188,13 +2220,17 @@ fn under_root_a_walk_through_a_filesystem_whose_owners_say_nothing_refuses() {
             ),
         ]);
     } else {
+        // A row that refuses for what the mount table says alone asks
+        // foreign_on_way of the volume itself: the walks to $W/vol/d by each
+        // spelling above pass its verdict on, as the walk to /dev/null below
+        // does that of a table that cannot be read.
         rows.extend([
-            ("folder_failing sealed_entry \"$W/fl/d\"", "$W/fl"),
-            ("folder_failing sealed_entry \"$W/stack/d\"", "$W/stack"),
+            ("foreign_on_way \"$W/fl\"", "$W/fl"),
+            ("foreign_on_way \"$W/stack\"", "$W/stack"),
             ("folder_failing sealed_entry \"$W/sib/d\"", ""),
-            ("folder_failing sealed_entry \"$W/dn/d\"", "$W/dn"),
+            ("foreign_on_way \"$W/dn\"", "$W/dn"),
             // A device name that ends in ` on`.
-            ("folder_failing sealed_entry \"$W/dno/d\"", "$W/dno"),
+            ("foreign_on_way \"$W/dno\"", "$W/dno"),
             ("root_entries_offender \"$W/xt\"", "$W/xt/sub"),
             // A mount in a tree that root may not stat.
             ("root_entries_offender \"$W/xg\"", "$W/xg/gone"),
@@ -2212,11 +2248,11 @@ fn under_root_a_walk_through_a_filesystem_whose_owners_say_nothing_refuses() {
                  [ ! -e \"$W/read.obin\" ] || echo read",
                 "",
             ),
-            ("no_table; folder_failing sealed_entry \"$W/ok/d\"", "$W/ok"),
+            ("no_table; foreign_on_way \"$W/ok\"", "$W/ok"),
             // A table cut off is not read, whatever it printed first.
             (
                 "eval \"base_$(declare -f macos_mounts)\"; macos_mounts() { base_macos_mounts; return 124; }; \
-                 folder_failing sealed_entry \"$W/ok/d\"",
+                 foreign_on_way \"$W/ok\"",
                 "$W/ok",
             ),
             (
@@ -2230,9 +2266,9 @@ fn under_root_a_walk_through_a_filesystem_whose_owners_say_nothing_refuses() {
             // refuse.
             ("folder_failing sealed_entry \"$W/lf/d\"", ""),
             ("folder_failing sealed_entry \"$W/gr/d\"", ""),
-            ("folder_failing sealed_entry \"$W/un/d\"", "$W/un"),
-            ("folder_failing sealed_entry \"$W/fs/d\"", "$W/fs"),
-            ("folder_failing sealed_entry \"$W/uf/d\"", "$W/uf"),
+            ("foreign_on_way \"$W/un\"", "$W/un"),
+            ("foreign_on_way \"$W/fs\"", "$W/fs"),
+            ("foreign_on_way \"$W/uf\"", "$W/uf"),
             // A walk across a volume stats no mount's folder and no line's
             // source that is no disk's.
             (
@@ -2256,7 +2292,7 @@ fn under_root_a_walk_through_a_filesystem_whose_owners_say_nothing_refuses() {
             (
                 "eval \"base_$(declare -f disk_devices)\"; \
                  disk_devices() { [ \"$1\" != /dev/disk999s16 ] || return 1; base_disk_devices \"$@\"; }; \
-                 folder_failing sealed_entry \"$W/lf/d\" 2>&1",
+                 foreign_on_way \"$W/lf\" 2>&1",
                 "$W/lf",
             ),
             // One read of a node serves every line that names it: a read
@@ -2265,7 +2301,7 @@ fn under_root_a_walk_through_a_filesystem_whose_owners_say_nothing_refuses() {
                 ": >\"$W/asked20\"; eval \"base_$(declare -f disk_devices)\"; disk_devices() { \
                  if [ \"$1\" = /dev/disk999s20 ]; then n=\"$(wc -l <\"$W/asked20\")\"; echo >>\"$W/asked20\"; \
                  [ $((n % 2)) -eq 0 ] || return 1; fi; base_disk_devices \"$@\"; }; \
-                 folder_failing sealed_entry \"$W/uf/d\"",
+                 foreign_on_way \"$W/uf\"",
                 "$W/uf",
             ),
             // A line that only starts like a node's is no disk's.
@@ -2612,7 +2648,21 @@ fn under_root_cc_runs_only_from_a_developer_folder_and_sdk_root_alone_can_change
     let calls: Vec<usize> = rows
         .iter()
         .enumerate()
-        .map(|(n, (_, setup, _))| lib.row(format!("( mk row{n}; {setup}\n {run} )"), &[]))
+        .map(|(n, (label, setup, _))| {
+            // Every row but the first changes only the developer folder, its SDK
+            // or xcode-select's pick, which no other walk reads: the first runs
+            // every walk on the layout the others would see, so the others take
+            // the checkout, .cargo, cargo-home and lane walks as passed
+            // (ROOT_LAYOUT's `real`) and run root_xcode_judged, the rest of the
+            // pre-flight and the pinned build for real. The one xcode-select
+            // chose runs every walk too, with DEVELOPER_DIR unset, as under sudo.
+            let walks = if n == 0 || *label == "the one xcode-select chose" {
+                ""
+            } else {
+                "real xcode; "
+            };
+            lib.row(format!("( mk row{n}; {walks}{setup}\n {run} )"), &[])
+        })
         .collect();
     let by_name = lib.row(
         "( mk by-name; export SDKROOT=macosx; ! root_xcode_judged && \
@@ -2852,9 +2902,14 @@ ls_entry() {
 		esac
 	done
 	[[ "$p" != "${ACL_AT:-}" && "$p" != "${ACL_UNREADABLE:-}" ]] || within=1
-	if [[ "$flags" != *d* ]]; then
+	# A recursive (-R) listing reads all that is below <p>, a folder's (no -d)
+	# only its own entries.
+	if [[ "$flags" == *R* ]]; then
 		case "${ACL_AT:-}" in "$p"/*) within=1 ;; esac
 		case "${ACL_UNREADABLE:-}" in "$p"/*) within=1 ;; esac
+	elif [[ "$flags" != *d* ]]; then
+		case "${ACL_AT:-}" in "$p"/*/*) ;; "$p"/*) within=1 ;; esac
+		case "${ACL_UNREADABLE:-}" in "$p"/*/*) ;; "$p"/*) within=1 ;; esac
 	fi
 	if [[ "$flags" == *l* && "$within" == 1 && -n "${ACL_UNREADABLE:-}" ]]; then return 1; fi
 	listing="$(base_ls_entry "${args[@]}")" || return
@@ -2874,25 +2929,40 @@ linux_acl_query() {
 	[[ "$p" == / ]] || p="${p%/}"
 	[[ -z "${ACL_QUERY_UNAVAILABLE:-}" ]] || return 1
 	[[ "$p" != "${ACL_AT:-}" && "$p" != "${ACL_UNREADABLE:-}" ]] || within=1
-	case "${ACL_AT:-}" in "$p"/*) within=1 ;; esac
-	case "${ACL_UNREADABLE:-}" in "$p"/*) within=1 ;; esac
+	# Only a recursive (-R) query reads what is below <p>.
+	if [[ "$1" == -*R* ]]; then
+		case "${ACL_AT:-}" in "$p"/*) within=1 ;; esac
+		case "${ACL_UNREADABLE:-}" in "$p"/*) within=1 ;; esac
+	fi
 	[[ "$within" != 1 || -z "${ACL_UNREADABLE:-}" ]] || return 1
 	printf '%s\n' user::rwx group::r-x other::r-x
 	[[ -z "${ACL_DEFAULT:-}" ]] || echo 'default:user::rwx'
 	[[ "$within" != 1 || -z "${ACL_AT:-}" ]] || echo 'user:424242:rwx'
 }"#,
     );
+    // (label, setup, whether it builds); a row whose ACL lies past the
+    // checkout's walk runs only the walk that finds it (ROOT_LAYOUT's `real`),
+    // and plain runs the others on the same layout; the lane rows judge the
+    // developer folder too, the one walk that sets what a later step reads.
     let rows = [
         ("plain", "", true),
         ("source-acl", "ACL_AT=\"$W/co/src/main.rs\"", false),
         ("ancestor-acl", "ACL_AT=\"$W\"", false),
-        ("config-acl", "ACL_AT=\"$W/.cargo/config.toml\"", false),
         (
-            "cargo-acl",
-            ": >\"$W/home/.cargo/config.toml\"; ACL_AT=\"$W/home/.cargo/config.toml\"",
+            "config-acl",
+            "real cargo; ACL_AT=\"$W/.cargo/config.toml\"",
             false,
         ),
-        ("tool-acl", "ACL_AT=\"$W/store/trust/1/bin/targo\"", false),
+        (
+            "cargo-acl",
+            "real cargo; : >\"$W/home/.cargo/config.toml\"; ACL_AT=\"$W/home/.cargo/config.toml\"",
+            false,
+        ),
+        (
+            "tool-acl",
+            "real xcode lane; ACL_AT=\"$W/store/trust/1/bin/targo\"",
+            false,
+        ),
         (
             "unreadable-tree-acl",
             "ACL_UNREADABLE=\"$W/co/src/main.rs\"",
@@ -2900,14 +2970,15 @@ linux_acl_query() {
         ),
         (
             "unreadable-tool-acl",
-            "ACL_UNREADABLE=\"$W/store/trust/1/bin/targo\"",
+            "real xcode lane; ACL_UNREADABLE=\"$W/store/trust/1/bin/targo\"",
             false,
         ),
     ];
     let mut checks = Vec::new();
+    // Rows run side by side: each has its own folder and foreign list (`mk`).
     for platform in ["Darwin", "Linux"] {
         for (label, setup, builds) in rows {
-            let call = lib.call(
+            let call = lib.row(
                 format!(
                     "( mk {platform}-{label}; PLATFORM={platform}; unset ACL_AT ACL_UNREADABLE; \
                      {setup}\n source_build_preflight )"
@@ -2928,9 +2999,7 @@ chmod 775 "$W/unsafe"
 printf '#!/bin/sh\n' >"$W/unsafe/cc"
 chmod 755 "$W/unsafe/cc"
 ln -s "$W/unsafe/cc" "$W/alias-bin/cc"
-! root_bin_dir "$W/unsafe" && ! root_bin_dir "$W/alias-bin" &&
 ! may_run "$W/unsafe/cc" && ! may_run "$W/alias-bin/cc" &&
-root_bin_dir "$W/safe" &&
 PATH="$W/unsafe:$W/alias-bin:$W/safe:{}" root_build_path )"#,
             system_path()
         ),
@@ -3604,10 +3673,16 @@ EOF",
         ("later", "TERM", "signal 15 aterm.app new ended"),
         ("laterhup", "HUP", "signal 1 aterm.app new ended"),
     ];
+    // Rows run side by side: each has its own DEST ($TMPDIR/{tag}, where its
+    // staging copy goes), TMP ($TMPDIR/{tag}.tmp) and done file; the stand-ins
+    // and place.bash are only read, and the probe files may_replace makes in the
+    // shared $TMPDIR have random names. group_run's perl restores the INT and
+    // QUIT a background row ignores, so place.bash starts with the signals a
+    // call's would.
     let calls: Vec<usize> = rows
         .iter()
         .map(|(tag, sig, _)| {
-            lib.call(
+            lib.row(
                 format!(
                     "r=\"$({})\"; i=0; until [ -e \"$TMPDIR/done-{tag}\" ] || [ $i -ge 600 ]; do sleep 0.1; i=$((i + 1)); done; \
                      echo \"$r\" $(ls -A \"$TMPDIR/{tag}\") $(ls \"$TMPDIR/{tag}/aterm.app/Contents\" 2>/dev/null) \

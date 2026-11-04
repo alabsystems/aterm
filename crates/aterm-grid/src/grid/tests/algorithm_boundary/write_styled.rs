@@ -2,7 +2,7 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tests for write_ascii_run_styled, the fast path for styled ASCII output.
+//! Tests for `write_ascii_run_styled_packed`, the fast path for styled ASCII output.
 
 use super::*;
 
@@ -31,6 +31,7 @@ fn write_ascii_run_styled_matches_per_char_writes() {
         (2, 3, (0, 0), b"ABCDEF"),
     ];
     for (fg, bg, flags) in styles {
+        let colors = Cell::convert_colors(fg, bg);
         for &(rows, cols, (row, col), text) in cases {
             let mut run = Grid::new(rows, cols);
             let mut per_char = Grid::new(rows, cols);
@@ -42,7 +43,7 @@ fn write_ascii_run_styled_matches_per_char_writes() {
                 String::from_utf8_lossy(text)
             );
             let mut last_byte = Some(b'~');
-            let written = run.write_ascii_run_styled(text, fg, bg, flags, &mut last_byte);
+            let written = run.write_ascii_run_styled_packed(text, colors, flags, &mut last_byte);
             assert_eq!(written, text.len(), "{at}");
             assert_eq!(last_byte, Some(*text.last().unwrap_or(&b'~')), "{at}");
             for &byte in text {

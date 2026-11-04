@@ -919,7 +919,9 @@ pub(crate) fn admit_live(
 ///
 /// # Errors
 /// As [`aterm_capacity::admit_until`]: [`aterm_capacity::Error::Stopped`] once the run ends, and
-/// [`aterm_capacity::Error::Stuck`] behind holders that made no progress.
+/// [`aterm_capacity::Error::Stuck`] behind holders that made no progress. A cohort ledger or
+/// failed namespace validation returns [`aterm_capacity::Error::Ledger`]: this verifier
+/// still uses holder-based claims and cannot supervise cohort custody.
 fn admit_in(
     ledger: &aterm_capacity::Ledger,
     machine: &dyn aterm_capacity::Machine,
@@ -928,6 +930,15 @@ fn admit_in(
     mode: aterm_capacity::Admit,
     say: &mut dyn FnMut(&str),
 ) -> Result<aterm_capacity::Claim, aterm_capacity::Error> {
+    match ledger.cohort_aware() {
+        Ok(false) => {}
+        Ok(true) => {
+            return Err(aterm_capacity::Error::Ledger(std::io::Error::other(
+                "the holder-based verifier cannot supervise a cohort ledger; native cohort launch is required",
+            )));
+        }
+        Err(error) => return Err(aterm_capacity::Error::Ledger(error)),
+    }
     aterm_capacity::admit_until(ledger, machine, need, mode, pace, say, &stopping)
 }
 
@@ -974,6 +985,8 @@ impl Quiet {
 thread_local! {
     /// The quiet reservation of this stage or bounded worker.
     static QUIET_CLAIM: RefCell<Option<Arc<aterm_capacity::Claim>>> = const { RefCell::new(None) };
+    /// The actual stage memory reservation retained by every supported worker handoff.
+    static MEMORY_CLAIM: RefCell<Option<Arc<aterm_capacity::Claim>>> = const { RefCell::new(None) };
 }
 
 /// The quiet reservation of this thread, captured before a bounded worker starts.
@@ -981,9 +994,12 @@ fn current_quiet_claim() -> Option<Arc<aterm_capacity::Claim>> {
     QUIET_CLAIM.with(|claim| claim.borrow().clone())
 }
 
-/// Restore this thread's previous quiet reservation when a stage or worker scope ends.
-#[must_use = "the quiet reservation is this thread's only while the guard lives"]
-struct QuietScope {
+type ClaimSlot = std::thread::LocalKey<RefCell<Option<Arc<aterm_capacity::Claim>>>>;
+
+/// Restore this thread's previous reservation when a stage or worker scope ends.
+#[must_use = "the reservation is this thread's only while the guard lives"]
+struct ReservationScope {
+    slot: &'static ClaimSlot,
     before: Option<Arc<aterm_capacity::Claim>>,
     /// A TLS restoration guard stays on the thread where it was installed.
     _thread: std::marker::PhantomData<*mut ()>,
@@ -991,17 +1007,33 @@ struct QuietScope {
 
 /// Hold `claim` as this thread's quiet reservation, restoring its predecessor on drop. A
 /// worker gets an owned share so a stage timeout cannot release its still-running work's desk.
-fn holding_quiet_claim(claim: Option<Arc<aterm_capacity::Claim>>) -> QuietScope {
-    QuietScope {
-        before: QUIET_CLAIM.with(|current| current.replace(claim)),
+fn holding_quiet_claim(claim: Option<Arc<aterm_capacity::Claim>>) -> ReservationScope {
+    holding_claim(&QUIET_CLAIM, claim)
+}
+
+fn current_memory_claim() -> Option<Arc<aterm_capacity::Claim>> {
+    MEMORY_CLAIM.with(|claim| claim.borrow().clone())
+}
+
+fn holding_memory_claim(claim: Option<Arc<aterm_capacity::Claim>>) -> ReservationScope {
+    holding_claim(&MEMORY_CLAIM, claim)
+}
+
+fn holding_claim(
+    slot: &'static ClaimSlot,
+    claim: Option<Arc<aterm_capacity::Claim>>,
+) -> ReservationScope {
+    ReservationScope {
+        slot,
+        before: slot.with(|current| current.replace(claim)),
         _thread: std::marker::PhantomData,
     }
 }
 
-impl Drop for QuietScope {
+impl Drop for ReservationScope {
     fn drop(&mut self) {
         let before = self.before.take();
-        QUIET_CLAIM.with(|claim| *claim.borrow_mut() = before);
+        self.slot.with(|claim| *claim.borrow_mut() = before);
     }
 }
 
@@ -1325,21 +1357,18 @@ fn held_note(
 }
 
 /// A stage's memory claim in this user's capacity ledger ([`claim_memory`]), held until the
-/// stage ends, and what it did for the stage's time line.
+/// stage and its supported workers end, and what it did for the stage's time line.
 struct MemoryClaim {
-    /// The claim; `None` where the ledger could not be used and the stage runs unadmitted.
-    _claim: Option<aterm_capacity::Claim>,
+    /// The actual admitted claim, shared with supported workers until they finish.
+    claim: Arc<aterm_capacity::Claim>,
     /// What it claimed, why, and how it was admitted.
     said: String,
 }
 
 impl MemoryClaim {
-    /// The cover marker its stage's children are handed ([`memory::cover`]); `None` where it runs
-    /// unadmitted.
-    fn cover(&self) -> Option<std::sync::Arc<str>> {
-        self._claim
-            .as_ref()
-            .map(|c| std::sync::Arc::from(c.record().cover_marker()))
+    /// The cover marker its stage's children are handed ([`memory::cover`]).
+    fn cover(&self) -> std::sync::Arc<str> {
+        std::sync::Arc::from(self.claim.record().cover_marker())
     }
 }
 
@@ -1391,14 +1420,15 @@ fn admitted_how(claim: &aterm_capacity::Claim, mode: aterm_capacity::Admit) -> S
 /// run alone ([`aterm_capacity::Need::alone`]): it waits for every other memory claim to end and
 /// then runs with none beside it, in this run ([`sched::memory_holders`]) or another. One the
 /// ledger refuses at its look though the run's budget held it (the machine read now has more
-/// wired) asks again, alone. A ledger that cannot be used is said, and the stage runs
-/// unadmitted. `Ok(None)` for a stage that claims nothing, or a run with no book.
+/// wired) asks again, alone. Failed admission starts no stage work. `Ok(None)` for a stage
+/// that claims nothing, or a run with no book.
 ///
 /// # Errors
 /// Why the stage never ran: an interrupt ended the wait, which ends the run
 /// (`exec::group::stop_run`, as a quiet claim's does in [`quietly`]); the wait gave up behind
 /// holders that made no progress, naming them, and this stage alone did not run; or the run was
-/// already ending ([`stopping`]), and no wait begins.
+/// already ending ([`stopping`]), and no wait begins; or admission fails because the ledger
+/// cannot be used, required timing is unavailable, or the need cannot be admitted alone.
 fn claim_memory(
     ctx: &Ctx,
     spec: &plan::StageSpec,
@@ -1444,7 +1474,7 @@ fn claim_memory(
         Ok(claim) => {
             let how = admitted_how(&claim, mode);
             Ok(Some(MemoryClaim {
-                _claim: Some(claim),
+                claim: Arc::new(claim),
                 said: format!("memory: {what}{how}"),
             }))
         }
@@ -1463,13 +1493,9 @@ fn claim_memory(
             eprintln!("verify: {title}: its memory claim {e}; {title} decided nothing");
             Err(format!("its memory claim {e}; it started nothing"))
         }
-        Err(e) => {
-            eprintln!("verify: {e}; {title} runs unadmitted");
-            Ok(Some(MemoryClaim {
-                _claim: None,
-                said: format!("memory: {what}, unadmitted: {e}"),
-            }))
-        }
+        Err(e) => Err(format!(
+            "its memory claim could not be admitted ({e}); it started nothing"
+        )),
     }
 }
 
@@ -1481,7 +1507,8 @@ fn claim_memory(
 /// ([`takes_quiet`]) claims its memory only once it holds it: a run holds that across all of its
 /// timed stages, so a timed stage of another run that held memory while it waited for it could
 /// keep this run's next timed stage waiting for that memory, and neither would ever start. A stage holds its memory
-/// claim until it ends, and waits for nothing while it holds one. A stage the run's end keeps
+/// share until it ends; bounded and pool workers retain their own shares until their work
+/// ends. It waits for nothing while it holds one. A stage the run's end keeps
 /// from starting ([`stopping`]), or whose memory or quiet claim an interrupt ended or gave up
 /// behind holders that made no progress ([`STUCK_ENDS`]), is COULD NOT RUN.
 fn staged(
@@ -1509,11 +1536,12 @@ fn staged(
     });
     let run = || {
         let claim = claim_memory(ctx, spec, seams.admit_memory)?;
+        let _reservation = holding_memory_claim(claim.as_ref().map(|held| Arc::clone(&held.claim)));
         if stopping() {
             return Err(ENDING.to_owned());
         }
         let _metering = memory::metering(meter.clone());
-        let _covering = memory::covering(claim.as_ref().and_then(MemoryClaim::cover));
+        let _covering = memory::covering(claim.as_ref().map(MemoryClaim::cover));
         let begun = Instant::now();
         let from = aterm_capacity::Live.read(None);
         on_started();

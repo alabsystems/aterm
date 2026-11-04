@@ -2672,6 +2672,11 @@ fn live_stats(log: &str) -> Result<(), AsbErr> {
         Some(why) => format!("yes {why}"),
         None => "no".to_string(),
     };
+    // A broker built before the tally joined the sidecar wrote none: `-`, never a zero.
+    let tally = |count: fn(&astream_sys::FlushTally) -> u64| match &h.process_flushes {
+        Some(t) => count(t).to_string(),
+        None => "-".to_string(),
+    };
     Ok(say(&format!(
         "base={} head={} records={} bytes={} subjects={} producers={} wills={} groups={} \
          replica={} visible={} durable={} connections={} parked_tails={} served={} \
@@ -2696,9 +2701,9 @@ fn live_stats(log: &str) -> Result<(), AsbErr> {
         h.flushes.full,
         h.flushes.skipped,
         h.flushes.failed,
-        h.process_flushes.full,
-        h.process_flushes.barrier,
-        h.process_flushes.plain,
+        tally(|t| t.full),
+        tally(|t| t.barrier),
+        tally(|t| t.plain),
         h.pid,
         h.written_at_ms,
     ))?)

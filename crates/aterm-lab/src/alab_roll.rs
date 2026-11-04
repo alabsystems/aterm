@@ -369,7 +369,9 @@ mod tests {
     #[test]
     fn the_partition_run_passes() {
         aterm_spec::fs_lane::join();
-        let _lease = aterm_spec::subprocess_lane::acquire();
+        let _lease = aterm_spec::subprocess_lane::acquire().unwrap_or_else(|e| {
+            aterm_spec::host::could_not_run(format!("subprocess admission refused ({e})"))
+        });
         let ev = run().unwrap();
         let failed: Vec<&str> = judge(&ev)
             .into_iter()

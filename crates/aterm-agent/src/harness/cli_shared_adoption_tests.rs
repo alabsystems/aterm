@@ -511,10 +511,11 @@ fn first_shared_adoption_publishes_only_after_identity_and_retains_one_use_floor
     assert!(host.online_calls.load(Ordering::SeqCst) > 0);
 }
 
+#[cfg(unix)]
 #[test]
-fn first_adoption_checks_capacity_before_staging_or_provider_work() {
+fn first_adoption_extends_a_large_roster_after_verified_provider_work() {
     let (_tmp, env, approval, mut host) = fixture(0);
-    let rows: Vec<_> = (0..accounts::MAX_ACCOUNTS)
+    let rows: Vec<_> = (0..96)
         .map(|i| accounts::Row {
             label: format!("local-{i}"),
             email: Some(format!("local-{i}@example.test")),
@@ -531,10 +532,16 @@ fn first_adoption_checks_capacity_before_staging_or_provider_work() {
     let text = accounts::append_rows_for(Cli::Claude, "", &rows).unwrap();
     fs::write(&host.roster, &text).unwrap();
     host.before = Some(text.into_bytes());
-    assert!(run(&env, &host, &approval).is_err());
-    assert_eq!(host.calls.load(Ordering::SeqCst), 0);
-    assert!(!env.accounts_store().logins_dir().exists());
-    assert_eq!(fs::read(&host.roster).unwrap(), host.before.unwrap());
+    assert_eq!(run(&env, &host, &approval), Ok(true));
+    assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+    let stored = accounts::Roster::load(&host.roster).unwrap();
+    assert_eq!(stored.rows.len(), 97);
+    assert!(
+        stored
+            .rows
+            .iter()
+            .any(|row| row.expected_identity_email() == Some(EMAIL))
+    );
 }
 
 #[test]

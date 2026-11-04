@@ -679,6 +679,104 @@ fn labels_resolve_through_live_rows_and_known_macs_before_a_placeholder() {
         && f.column.as_deref() == Some("label")));
 }
 
+/// A sheet naming a label whose birth key a retired row holds (m40 retired, a replacement Mac
+/// planned under m40) births a row of its own under `<label>/2`, as `add machine` keys it: the
+/// preference names the new row and nothing is written onto the retired one. A second import
+/// over the result answers the label by the new live row and writes nothing.
+/// NEGATIVE CONTROL: with `machine_for` keying the birth `keys::machine_pk(&stored)` again, the
+/// preference names the retired row (`left: Some(String("mc-…")) right: Some(String("mc-…"))`).
+#[test]
+fn a_retired_machines_label_births_a_row_of_its_own() {
+    let retired = keys::machine_pk("m40");
+    let mut book = Book::new();
+    book.write(
+        2,
+        &[],
+        vec![
+            put(&MACHINE, &retired, "label", json!("m40")),
+            put(&MACHINE, &retired, "status", json!("active")),
+            put(&MACHINE, &retired, "row", json!("retired")),
+        ],
+    );
+    let cells = book.cells();
+    let sheets = [vault(&[",ann@example.test,m40,,1,,,,,,,,"])];
+    let first = plan(&input(&sheets, &[], MailboxKeys::default()), &cells).unwrap();
+    let fresh = keys::machine_pk("m40/2");
+    let ann = keys::account_pk("claude", "ann@example.test").unwrap();
+    let on = |plan: &Plan| {
+        plan.planned
+            .iter()
+            .find(|p| p.collection == "preference" && p.column == "account" && p.x == json!(ann))
+            .and_then(|p| planned(plan, "preference", &p.pk, "machine"))
+            .cloned()
+    };
+    assert_eq!(on(&first), Some(json!(fresh)));
+    assert_eq!(
+        planned(&first, "machine", &fresh, "label"),
+        Some(&json!("m40"))
+    );
+    assert!(
+        first.planned.iter().all(|p| p.pk != retired),
+        "nothing is written onto the retired row"
+    );
+    let cells = apply(&mut book, &first);
+    let again = plan(&input(&sheets, &[], MailboxKeys::default()), &cells).unwrap();
+    assert!(
+        again.rows.is_empty(),
+        "a re-import over the result writes nothing"
+    );
+}
+
+/// A roster Mac whose node-born key a retired row holds (born `n-<node>`, then retired) is born
+/// again under `n-<node>/2`: the import writes label, status and node onto the new row and
+/// nothing onto the retired one, which keeps its history. A second import finds the new row by
+/// its node and writes nothing.
+/// NEGATIVE CONTROL: with `known_birth` keying a node birth `keys::machine_pk("n-<node>")` again,
+/// the label lands on the retired row: `left: None right: Some(String("m77"))`.
+#[test]
+fn a_retired_node_born_row_leaves_the_mac_a_row_of_its_own() {
+    let node = "0123456789abcdef0123456789abcdef";
+    let retired = keys::machine_pk(&format!("n-{node}"));
+    let mut book = Book::new();
+    book.write(
+        2,
+        &[],
+        vec![
+            put(&MACHINE, &retired, "label", json!("m77")),
+            put(&MACHINE, &retired, "fleet_node", json!(node)),
+            put(&MACHINE, &retired, "status", json!("active")),
+            put(&MACHINE, &retired, "row", json!("retired")),
+        ],
+    );
+    let cells = book.cells();
+    let macs = [KnownMac {
+        label: Some(Label::plain(77)),
+        aliases: Vec::new(),
+        node: Some(node.to_owned()),
+        hosts: Vec::new(),
+    }];
+    let first = plan(&input(&[], &macs, MailboxKeys::default()), &cells).unwrap();
+    let fresh = keys::machine_pk(&format!("n-{node}/2"));
+    assert_eq!(
+        planned(&first, "machine", &fresh, "label"),
+        Some(&json!("m77"))
+    );
+    assert_eq!(
+        planned(&first, "machine", &fresh, "fleet_node"),
+        Some(&json!(node))
+    );
+    assert!(
+        first.planned.iter().all(|p| p.pk != retired),
+        "nothing is written onto the retired row"
+    );
+    let cells = apply(&mut book, &first);
+    let again = plan(&input(&[], &macs, MailboxKeys::default()), &cells).unwrap();
+    assert!(
+        again.rows.is_empty(),
+        "a re-import over the result writes nothing"
+    );
+}
+
 /// An address never links to the mailbox it is itself: that link, beside the address row's own
 /// `addr`, would name the mailbox's login. A hub that receives for another row and is listed as
 /// a login too is a finding, and the other row's link (which names no login) is written.

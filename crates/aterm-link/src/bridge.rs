@@ -463,7 +463,7 @@ impl StatusSample {
     fn apply_presence(&self, slot: &mut Slot) {
         slot.fields.set_detail(Some(&self.detail));
         if !self.agent_deferred {
-            slot.fields.set_agent(self.agent.as_deref());
+            slot.saw_agent(self.agent.as_deref());
         }
         slot.saw_screen(self.screen);
     }
@@ -2790,15 +2790,19 @@ impl Bridge {
         }
         // THE ROW READS NO SCREEN (critic item D03). Its `gen=` is the newest generation a status
         // read named for the session ([`Slot::row_gen`]): the round's `sessions status` batch, the
-        // attach's ([`Bridge::presence_from_status_batch`]), an agent verdict's, or, for a slot
-        // none of those reached, the one `@<sid> status` read here. A screen read for it
-        // (`text --json`) would wait out any open DEC 2026 frame, up to the sync timeout, on
-        // the bridge's one loop, once a row. `meta` is read once a slot, here or by the round.
+        // attach's ([`Bridge::presence_from_status_batch`]), an agent verdict's, or the
+        // `@<sid> status` read here. A screen read for it (`text --json`) would wait out any open
+        // DEC 2026 frame, up to the sync timeout, on the bridge's one loop, once a row. Here
+        // `@<sid> status` is read for a slot those reads left short of a generation or a verdict
+        // ([`Slot::knows_status`]: a batch row said `gen=-` or `agent_deferred=1`, or none
+        // reached it), so a first row says the verdict, and for every row of an observer, which
+        // runs no round to keep its slots current. `meta` is read once a slot, here or by the
+        // round.
         if state == "live" {
             let slot = self.per_sid.presence.get(sid);
-            let (knows_screen, sampled) =
-                slot.map_or((false, false), |s| (s.knows_screen(), s.sampled));
-            if !knows_screen {
+            let (knows_status, sampled) =
+                slot.map_or((false, false), |s| (s.knows_status(), s.sampled));
+            if !knows_status || self.attachment == Attachment::Observer {
                 if let Some(sample) = self.status_sample(sid) {
                     self.status_into_presence(sid, &sample);
                 }
@@ -6665,10 +6669,12 @@ impl Bridge {
 
     /// THE ATTACH'S ONE STATUS READ (critic item D03): `sessions status` once, each row that
     /// reads Ready folded into its session's presence slot, so the attach's rows that follow read
-    /// no `@<sid> status` each ([`Bridge::publish_session_presence`]). A session with no usable
-    /// row (stale, malformed, or a batch aterm refused) is read alone by its row's publish, as
-    /// before. Hold convergence is the roster round's ([`Bridge::sample_local_control`]), so
-    /// nothing is written here.
+    /// no `@<sid> status` for a session whose row named its generation and gave its verdict
+    /// ([`Bridge::publish_session_presence`]). A session whose row said `gen=-` or
+    /// `agent_deferred=1`, or had no usable row (stale, malformed, or a batch aterm refused), is
+    /// read alone by its row's publish, as before. An observer reads none: each of its rows
+    /// reads its own status. Hold convergence is the roster round's
+    /// ([`Bridge::sample_local_control`]), so nothing is written here.
     fn presence_from_status_batch(&mut self) {
         if self.attachment == Attachment::Observer {
             return;
@@ -8290,7 +8296,7 @@ impl Bridge {
                     .find_map(|t| t.strip_prefix("gen="))
                     .and_then(ScreenGen::parse);
                 let slot = self.per_sid.presence.entry(sid.clone()).or_default();
-                slot.fields.set_agent(word);
+                slot.saw_agent(word);
                 slot.saw_screen(screen);
                 self.publish_presence_if_due(&sid);
             }
@@ -8614,14 +8620,14 @@ impl Bridge {
             return false;
         }
         let sids: Vec<String> = self.locals.values().cloned().collect();
-        // A first attach knows no session's screen, so one batch read stands in for a status
+        // A first attach knows no session's status, so one batch read stands in for a status
         // read per row; a re-attach whose slots all know theirs reads none.
         if sids.iter().any(|sid| {
             !self
                 .per_sid
                 .presence
                 .get(sid)
-                .is_some_and(Slot::knows_screen)
+                .is_some_and(Slot::knows_status)
         }) {
             self.presence_from_status_batch();
         }
@@ -12486,6 +12492,8 @@ mod tests {
         requests: Arc<std::sync::Mutex<Vec<String>>>,
         /// The header `@<sid> meta` answers, `None` to refuse it as before.
         meta_answer: Arc<std::sync::Mutex<Option<String>>>,
+        /// The header `@<sid> status` answers, `None` to refuse it as before.
+        single_status_answer: Arc<std::sync::Mutex<Option<String>>>,
     }
 
     #[derive(Default)]
@@ -12619,6 +12627,7 @@ mod tests {
                 mirror: Arc::default(),
                 requests: Arc::default(),
                 meta_answer: Arc::default(),
+                single_status_answer: Arc::default(),
             };
             let (transcript, on_deliver) = (lane.transcript.clone(), lane.on_deliver.clone());
             let deliver_answers = lane.deliver_answers.clone();
@@ -12645,6 +12654,7 @@ mod tests {
                 (lane.outbox_retires.clone(), lane.deliveries.clone());
             let mirror = lane.mirror.clone();
             let (requests, meta_answer) = (lane.requests.clone(), lane.meta_answer.clone());
+            let single_status_answer = lane.single_status_answer.clone();
             let reader_state = Arc::new((
                 std::sync::Mutex::new(LaneReaderState::default()),
                 std::sync::Condvar::new(),
@@ -12690,14 +12700,15 @@ mod tests {
                     if !line.starts_with("AUTH ") {
                         requests.lock().unwrap().push(line.clone());
                     }
-                    let meta = line
-                        .strip_prefix('@')
-                        .is_some_and(|l| l.ends_with(" meta"))
-                        .then(|| meta_answer.lock().unwrap().clone())
-                        .flatten();
+                    // The canned per-session header: `@<sid> meta`'s, or `@<sid> status`'s.
+                    let canned = match line.strip_prefix('@').and_then(|l| l.split_once(' ')) {
+                        Some((_, "meta")) => meta_answer.lock().unwrap().clone(),
+                        Some((_, "status")) => single_status_answer.lock().unwrap().clone(),
+                        _ => None,
+                    };
                     let reply = if line.starts_with("AUTH ") {
                         continue;
-                    } else if let Some(header) = meta {
+                    } else if let Some(header) = canned {
                         format!("{header}\n")
                     } else if matches!(line.as_str(), "outbox" | "outbox earlier-receipts=1") {
                         match outbox.lock().unwrap().as_ref() {
@@ -12919,6 +12930,11 @@ mod tests {
 
         fn answer_meta_with(&self, header: &str) {
             *self.meta_answer.lock().unwrap() = Some(header.to_string());
+        }
+
+        /// Answers every `@<sid> status` with `header`, as aterm's single status record.
+        fn answer_single_status_with(&self, header: &str) {
+            *self.single_status_answer.lock().unwrap() = Some(header.to_string());
         }
 
         fn answer_status_with(&self, rows: &[String]) {
@@ -23674,11 +23690,28 @@ mod tests {
     /// The `gen=` of every presence row of `sid` on the bus, oldest first.
     #[cfg(unix)]
     fn presence_gens(bridge: &Bridge, reader: &mut Conn, sid: &str) -> Vec<String> {
+        presence_phases_and_gens(bridge, reader, sid)
+            .into_iter()
+            .map(|(_, gen)| gen)
+            .collect()
+    }
+
+    /// The `(phase=, gen=)` of every presence row of `sid` on the bus, oldest first.
+    #[cfg(unix)]
+    fn presence_phases_and_gens(
+        bridge: &Bridge,
+        reader: &mut Conn,
+        sid: &str,
+    ) -> Vec<(String, String)> {
         let face = subject::session_face(&bridge.cfg.fleet, &bridge.node, sid, "presence");
         let (rows, _) = reader.fetch(0, &face, 256).unwrap();
         rows.iter()
             .filter(|(_, s, _)| *s == face)
-            .map(|(_, _, raw)| Body::decode(raw).0.gen.unwrap_or_default())
+            .map(|(_, _, raw)| {
+                let body = Body::decode(raw).0;
+                let phase = body.unknown.get("phase").cloned().unwrap_or_default();
+                (phase, body.gen.unwrap_or_default())
+            })
             .collect()
     }
 
@@ -23697,8 +23730,9 @@ mod tests {
     }
 
     /// THE ATTACH READS NO SCREEN, AND ITS SESSIONS' STATUS ONCE (critic item D03): a bridge
-    /// attaching N sessions whose `sessions status` rows are Ready asks that batch once and each
-    /// session's `meta` once, and no session's `status` or screen (`text --json`). Each row's
+    /// attaching N sessions whose `sessions status` rows are Ready, each naming a generation and
+    /// giving the verdict, asks that batch once and each session's `meta` once, and no session's
+    /// `status` or screen (`text --json`). Each row's
     /// `gen=` is the token of the generation its batch row named. CONTROL
     /// (`Mutant::ReadTheScreenEveryRow`, a screen read for every row as before D03): a
     /// `text --json` a session.
@@ -23748,6 +23782,116 @@ mod tests {
                     "{sid}'s row says the generation its batch row named"
                 );
             }
+        }
+    }
+
+    /// AN ATTACH READS A SESSION'S OWN STATUS WHERE ITS BATCH ROW LEFT THE SLOT SHORT (the D03
+    /// review): a Ready row that deferred the agent verdict (`agent_deferred=1`: a writer held
+    /// the session's timeline) or named no generation (`gen=-`: the terminal was busy) has that
+    /// session's row read `@<sid> status`, which waits for the verdict, so its first row says
+    /// the verdict, as every attach row did before D03. A session whose row gave both reads none
+    /// (the batch-only attach is `an_attach_of_ready_sessions_reads_one_status_batch_…`).
+    #[cfg(unix)]
+    #[test]
+    fn an_attach_reads_its_own_status_for_a_row_that_deferred_its_verdict_or_named_no_screen() {
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-1"), (2, "s-2"), (3, "s-3")]);
+        let (socket, _broker, _server) = serve_log(&lane, "attach-short");
+        bridge.cfg.broker = socket;
+        lane.answer_meta_with(META_HEADER);
+        lane.answer_single_status_with("OK hold=0 detail=- agent=busy gen=1.99");
+        let short = |local: u64, tail: &str| {
+            format!(
+                "{local} s-{local} {local:032x} sid={local} revision=1 hold=0 hold_origin=- \
+                 detail=- {tail}"
+            )
+        };
+        lane.answer_status_with(&[
+            ready_status_row(1, 11),
+            short(2, "agent_deferred=1 gen=1.12"),
+            short(3, "agent=idle gen=-"),
+        ]);
+        assert!(bridge.first_roster());
+        lane.take_requests();
+        assert!(bridge.attach_broker(), "the attach");
+        let asked = lane.take_requests();
+        let single: Vec<&str> = asked
+            .iter()
+            .filter(|(row, _)| *row == crate::wait_tally::Row::LaneStatus)
+            .map(|(_, line)| line.as_str())
+            .collect();
+        assert_eq!(
+            single,
+            ["@s-2 status", "@s-3 status"],
+            "the two short rows' sessions, and only they, read their own status"
+        );
+        assert_eq!(
+            presence_reads(&asked),
+            [1, 2, 3, 0],
+            "[sessions status, @sid status, @sid meta, @sid text]"
+        );
+        let (mut reader, _) = bridge.connect().unwrap();
+        let token = |seq| crate::presence::gen_token(ScreenGen { epoch: 1, seq });
+        assert_eq!(
+            presence_phases_and_gens(&bridge, &mut reader, "s-1"),
+            [("idle".to_string(), token(11))],
+        );
+        assert_eq!(
+            presence_phases_and_gens(&bridge, &mut reader, "s-2"),
+            [("busy".to_string(), token(99))],
+            "a deferred verdict's first row says the verdict its own read gave"
+        );
+        assert_eq!(
+            presence_phases_and_gens(&bridge, &mut reader, "s-3"),
+            [("busy".to_string(), token(99))],
+            "a busy terminal's first row says the generation its own read named"
+        );
+    }
+
+    /// AN OBSERVER'S EVERY ROW READS ITS SESSION'S STATUS (the D03 review): an observer runs no
+    /// round, so no `sessions status` batch keeps its slots current; each of its live rows reads
+    /// `@<sid> status` (never the screen) and says the generation and verdict that read gave, as
+    /// each of its rows read the screen before D03. CONTROL: an inherited bridge, whose round
+    /// keeps the slot current, reads the batch at the attach and nothing for a later row, which
+    /// says the slot's generation.
+    #[cfg(unix)]
+    #[test]
+    fn an_observers_every_row_reads_its_sessions_status() {
+        let token = |seq| crate::presence::gen_token(ScreenGen { epoch: 1, seq });
+        for attachment in [Attachment::Observer, Attachment::Inherited] {
+            let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-1")]);
+            bridge.attachment = attachment;
+            let (socket, _broker, _server) = serve_log(&lane, "observer-rows");
+            bridge.cfg.broker = socket;
+            lane.answer_meta_with(META_HEADER);
+            lane.answer_single_status_with("OK hold=0 detail=- agent=idle gen=1.5");
+            lane.answer_status_with(&[ready_status_row(1, 5)]);
+            assert!(bridge.first_roster());
+            lane.take_requests();
+            assert!(bridge.attach_broker(), "{attachment:?}: the attach");
+            let attach = presence_reads(&lane.take_requests());
+            lane.answer_single_status_with("OK hold=0 detail=- agent=busy gen=1.900");
+            assert!(bridge.batched(|b| b.publish_session_presence("s-1", "live")));
+            let later = presence_reads(&lane.take_requests());
+            let (mut reader, _) = bridge.connect().unwrap();
+            let rows = presence_phases_and_gens(&bridge, &mut reader, "s-1");
+            let row = |phase: &str, seq| (phase.to_string(), token(seq));
+            if attachment == Attachment::Inherited {
+                assert_eq!(attach, [1, 0, 1, 0], "the control's attach reads the batch");
+                assert_eq!(later, [0, 0, 0, 0], "the control's later row reads nothing");
+                assert_eq!(rows, [row("idle", 5), row("idle", 5)]);
+                continue;
+            }
+            assert_eq!(
+                attach,
+                [0, 1, 1, 0],
+                "an observer's attach row reads its status"
+            );
+            assert_eq!(later, [0, 1, 0, 0], "and so does its every later row");
+            assert_eq!(
+                rows,
+                [row("idle", 5), row("busy", 900)],
+                "each row says what its own read gave"
+            );
         }
     }
 

@@ -18,8 +18,9 @@ use aterm_spec::derive::*;
 ///
 /// `MergeIslands` takes the set union of `.records` before reconciliation: concurrent removals on
 /// both islands produce `epoch_heads == 2`, and if Island B rotated while Island A admitted `D`,
-/// `D` lacks a `Wrap` of Island B's maximal epoch (`d_wrapped_current == 0`). `Reconcile` runs
-/// `reconcile_commons_log`, closing `D`'s wrap gap (`d_wrapped_current == 1`), coalescing
+/// `D` lacks a `Wrap` of Island B's maximal epoch (`d_wrapped_current == 0`). `Reconcile` is the
+/// members' vault passes after the heal (a Commons exchange signs nothing): the ranked wrap-gap
+/// closer closes `D`'s wrap gap (`d_wrapped_current == 1`), and the ranked epoch tender coalesces
 /// concurrent maximal epochs into one higher `Commons` epoch (`epoch_heads == 1`), keeping removed
 /// `C` out (`c_has_current == 0`), and preserving log-backed Commons readiness even when legacy
 /// `Journal` is conflicted (`ready == 1`).

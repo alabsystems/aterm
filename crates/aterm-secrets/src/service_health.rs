@@ -129,24 +129,35 @@ pub fn subscriber(
     let records = value["records"]
         .as_array()
         .ok_or_else(|| Error::new("subscriber health lacks frontier"))?;
-    if nonce.is_empty()
-        || health.records.is_empty()
-        || value["nonce"].as_str() != Some(nonce)
-        || value["pid"].as_u64() != Some(u64::from(pid))
-        || value["image"].as_str() != Some(image)
-        || value["vault"].as_str() != Some(&health.vault)
-        || value["signer"].as_str() != Some(&health.signer)
-        || value["sequence"]
-            .as_u64()
-            .is_none_or(|seq| seq < health.frontier)
+    // Name only the failed check: signed repair outcomes retain this diagnostic,
+    // but must not copy response contents or expected identity values into it.
+    let mismatch = if nonce.is_empty() || value["nonce"].as_str() != Some(nonce) {
+        Some("challenge")
+    } else if value["pid"].as_u64() != Some(u64::from(pid)) {
+        Some("process")
+    } else if value["image"].as_str() != Some(image) {
+        Some("image")
+    } else if value["vault"].as_str() != Some(&health.vault) {
+        Some("vault")
+    } else if value["signer"].as_str() != Some(&health.signer) {
+        Some("signer")
+    } else if value["sequence"]
+        .as_u64()
+        .is_none_or(|seq| seq < health.frontier)
+    {
+        Some("sequence")
+    } else if health.records.is_empty()
         || health
             .records
             .iter()
             .any(|id| !records.iter().any(|r| r.as_str() == Some(id)))
     {
-        return Err(Error::new(
-            "subscriber health identity or signed frontier mismatch",
-        ));
+        Some("records")
+    } else {
+        None
+    };
+    if let Some(field) = mismatch {
+        return Err(Error::new(format!("subscriber health {field} mismatch")));
     }
     Ok(())
 }

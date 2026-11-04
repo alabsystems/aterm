@@ -29,6 +29,100 @@ fn homes() -> (aterm_tempfile::TempDir, PathBuf, PathBuf) {
 }
 
 #[test]
+fn native_google_overlay_shares_conversations_and_locks_but_not_grants() {
+    use std::os::unix::fs::MetadataExt as _;
+    let (root, default_home, first) = homes();
+    let second = root.path().join("second");
+    let seam = Cli::Agy.accounts().seam;
+    let token = ".gemini/antigravity-cli/antigravity-oauth-token";
+    aterm_types::fs_restricted::create_dir_restricted(default_home.join(token).parent().unwrap())
+        .unwrap();
+    aterm_secrets::fsx::write_atomic(&default_home.join(token), b"default-private-grant", 0o600)
+        .unwrap();
+    assert!(
+        ensure(seam, &first, &default_home)
+            .unwrap()
+            .drift
+            .is_empty()
+    );
+    assert!(
+        ensure(seam, &second, &default_home)
+            .unwrap()
+            .drift
+            .is_empty()
+    );
+    let config = ".gemini/antigravity-cli";
+    let conversation = "11111111-1111-4111-8111-111111111111";
+    for suffix in [".db", ".db-wal", ".db-shm"] {
+        let name = format!("{config}/conversations/{conversation}{suffix}");
+        std::fs::write(first.join(&name), b"preserved conversation fixture").unwrap();
+        assert_eq!(
+            std::fs::read(second.join(&name)).unwrap(),
+            b"preserved conversation fixture"
+        );
+        assert_eq!(
+            std::fs::metadata(first.join(&name)).unwrap().ino(),
+            std::fs::metadata(default_home.join(&name)).unwrap().ino()
+        );
+    }
+    let lock = format!("{config}/presence/{conversation}.lock");
+    std::fs::write(first.join(&lock), b"same native lock").unwrap();
+    assert_eq!(
+        std::fs::metadata(first.join(&lock)).unwrap().ino(),
+        std::fs::metadata(second.join(&lock)).unwrap().ino()
+    );
+    aterm_secrets::fsx::write_atomic(&first.join(token), b"first-private-grant", 0o600).unwrap();
+    aterm_secrets::fsx::write_atomic(&second.join(token), b"second-private-grant", 0o600).unwrap();
+    assert_eq!(
+        std::fs::read(first.join(token)).unwrap(),
+        b"first-private-grant"
+    );
+    assert_eq!(
+        std::fs::read(second.join(token)).unwrap(),
+        b"second-private-grant"
+    );
+    assert_eq!(
+        std::fs::read(default_home.join(token)).unwrap(),
+        b"default-private-grant"
+    );
+    assert_eq!(
+        ensure(seam, &first, &default_home).unwrap(),
+        Ensured::default()
+    );
+}
+
+#[test]
+fn native_google_overlay_preserves_existing_history_and_refuses_redirected_parents() {
+    let (root, default_home, overlay) = homes();
+    let conversations = overlay.join(".gemini/antigravity-cli/conversations");
+    std::fs::create_dir_all(&conversations).unwrap();
+    std::fs::write(conversations.join("owned.db"), b"owner data").unwrap();
+    let result = ensure(Cli::Agy.accounts().seam, &overlay, &default_home).unwrap();
+    assert!(result.drift.contains(&Drift {
+        name: ".gemini/antigravity-cli/conversations".into(),
+        is: Is::Dir
+    }));
+    assert_eq!(
+        std::fs::read(conversations.join("owned.db")).unwrap(),
+        b"owner data"
+    );
+    let redirected = root.path().join("redirected");
+    let outside = root.path().join("outside");
+    std::fs::create_dir_all(&redirected).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, redirected.join(".gemini")).unwrap();
+    assert!(ensure(Cli::Agy.accounts().seam, &redirected, &default_home).is_err());
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    let escape = Seam::Overlay {
+        var: "HOME",
+        shared: &[Shared::Dir("../escape")],
+        markers: &[],
+    };
+    assert!(ensure(escape, &overlay, &default_home).is_err());
+    assert!(!root.path().join("escape").exists());
+}
+
+#[test]
 fn shared_names_become_links_to_the_default_home_and_a_second_call_makes_none() {
     let (_tmp, default_home, overlay) = homes();
     std::fs::write(default_home.join("state_5.sqlite"), b"db").expect("db");

@@ -13,7 +13,7 @@ use aterm_spec::interp;
 use aterm_spec::walk::walk;
 
 /// Each mutant, its dial and the law it was written to break.
-const MUTANTS: [(&str, i64, &str); 10] = [
+const MUTANTS: [(&str, i64, &str); 13] = [
     ("SettleOnMove", 1, "NoTwoCopies"),
     ("SettleWithoutTurn", 2, "NoTwoCopies"),
     ("TurnSettlesUnread", 3, "NoTwoCopies"),
@@ -24,13 +24,22 @@ const MUTANTS: [(&str, i64, &str); 10] = [
     ("WriteWhileHeld", 8, "NoTwoCopies"),
     ("RestartBehind", 9, "ARestartHandsTheShellNothing"),
     ("UpgradeOverStands", 10, "ARestartHandsTheShellNothing"),
+    (
+        "TurnSettlesUnderDialog",
+        11,
+        "ADrawnLineGoesBackToItsWriter",
+    ),
+    ("AnswersComposer", 12, "ADrawnLineGoesBackToItsWriter"),
+    ("AnswersWithoutRead", 13, "ABoxAnswerFollowsARead"),
 ];
 
-/// A bound on the states the model reaches at any dial.
-const STATE_BOUND: usize = 20_000;
+/// A bound on the states the model reaches at any dial (the box and its custody-permission marker
+/// each distinguish states under it).
+const STATE_BOUND: usize = 60_000;
 
 /// The steps a host that serves no input word never takes: no read says the line was read.
-const UNSERVED: [&str; 7] = [
+const UNSERVED: [&str; 8] = [
+    "AnswersBox",
     "AsksRestart",
     "Minute",
     "RestartDeferred",
@@ -343,5 +352,145 @@ fn a_break_keeps_a_draw_and_a_person_or_an_end_settles_it() {
     assert!(
         !m.action_enabled("LookDrawn", &walk(&m, &["WritesQueued", "ProgramReads"])),
         "a read that shows none of it settles nothing"
+    );
+}
+
+/// A box over the composer is a read that cannot say what it holds: under it a turn after the
+/// line neither settles nor outlasts it, the look settles nothing it has not kept, and the gate
+/// holds every line's write, no restart asked, but lets the loop's answer to the box go only once
+/// an earlier or fresh clear input read proves the worker read the line. Custody permission alone
+/// does not claim the session's later input gate sent the key or closed the box. Once the box goes
+/// (after that key, or on its own), a line drawn under it is handed back to its writer and entered
+/// once, and a line dropped under it goes with the turn kept.
+#[test]
+fn a_box_over_the_composer_keeps_a_turn_for_the_read_after_it() {
+    let m = line_custody_model();
+    let queued = walk(&m, &["WritesQueued", "DialogShows"]);
+    assert_eq!((queued["held"], queued["q"]), (0, 4));
+    assert!(
+        !m.action_enabled("AnswersBox", &queued),
+        "a line still queued holds the box's answer"
+    );
+    let freshly_read = walk(&m, &["WritesQueued", "ProgramReads", "DialogShows"]);
+    assert_eq!((freshly_read["held"], freshly_read["q"]), (0, 3));
+    assert!(
+        m.action_enabled("AnswersBox", &freshly_read),
+        "this gate's fresh clear read lets the box's answer go"
+    );
+    let answered = walk(
+        &m,
+        &["WritesQueued", "ProgramReads", "DialogShows", "AnswersBox"],
+    );
+    assert_eq!(
+        (answered["held"], answered["dlg"], answered["answered"]),
+        (1, 1, 1),
+        "the fresh proof is kept and custody permits the answer"
+    );
+    let read_before = walk(&m, &["WritesRead", "Queues", "DialogShows"]);
+    assert_eq!((read_before["held"], read_before["bq"]), (1, 1));
+    assert!(
+        m.action_enabled("AnswersBox", &read_before),
+        "an earlier clear read remains proof; the ordinary input gate holds what queued behind"
+    );
+    let held_behind = walk(&m, &["WritesRead", "Queues", "DialogShows", "AnswersBox"]);
+    assert_eq!(
+        (
+            held_behind["answered"],
+            held_behind["dlg"],
+            held_behind["bq"],
+        ),
+        (1, 1, 1),
+        "custody permits it, but does not claim the later input gate sent or closed the box"
+    );
+    let unserved = interp::with_consts(&m, &[("Served", 0)]);
+    let unknown = walk(&unserved, &["WritesRead", "DialogShows"]);
+    assert_eq!(unknown["held"], 2);
+    assert!(
+        !unserved.action_enabled("AnswersBox", &unknown),
+        "no input word supplies no proof for the box's answer"
+    );
+    let drawn = walk(
+        &m,
+        &["WritesRead", "ProgramDraws", "TurnRuns", "DialogShows"],
+    );
+    assert_eq!((drawn["q"], drawn["ran"], drawn["dlg"]), (1, 1, 1));
+    for step in [
+        "TurnSettles",
+        "TurnOutlasted",
+        "LookDrawn",
+        "BreakKeepsDraw",
+        "AsksRestart",
+        "WaitsLost",
+    ] {
+        assert!(!m.action_enabled(step, &drawn), "{step} under the box");
+    }
+    assert!(m.action_enabled("GateHolds", &drawn), "the gate holds");
+    assert!(
+        m.action_enabled("AnswersBox", &drawn),
+        "the box's answer goes"
+    );
+    let ripe = walk(
+        &m,
+        &[
+            "WritesRead",
+            "ProgramDrops",
+            "TurnRuns",
+            "DialogShows",
+            "Minute",
+        ],
+    );
+    assert!(
+        !m.action_enabled("AsksRestart", &ripe),
+        "no restart under the box"
+    );
+    let entered = walk(
+        &m,
+        &[
+            "WritesRead",
+            "ProgramDraws",
+            "TurnRuns",
+            "DialogShows",
+            "AnswersBox",
+            "DialogGoes",
+            "LookDrawn",
+            "Enters",
+        ],
+    );
+    assert_eq!(
+        (
+            entered["cust"],
+            entered["st"],
+            entered["q"],
+            entered["stray"]
+        ),
+        (0, 2, 0, 0),
+        "handed back and entered once"
+    );
+    let dropped = walk(
+        &m,
+        &[
+            "WritesRead",
+            "ProgramDrops",
+            "TurnRuns",
+            "DialogShows",
+            "DialogGoes",
+            "TurnSettles",
+        ],
+    );
+    assert_eq!(dropped["cust"], 0, "the kept turn settles it");
+    let kept = walk(
+        &m,
+        &[
+            "WritesRead",
+            "ProgramDraws",
+            "BreakKeepsDraw",
+            "DialogShows",
+            "LookDrawn",
+        ],
+    );
+    assert_eq!(
+        (kept["cust"], kept["st"]),
+        (0, 1),
+        "a kept draw is handed back under the box"
     );
 }

@@ -185,8 +185,8 @@ impl Terminal {
     }
 
     /// Number of block command/output reads that found the block's rows already evicted from scrollback, over this session's lifetime.
+    #[inline]
     #[must_use]
-    #[cfg(test)]
     pub fn block_eviction_read_count(&self) -> u64 {
         self.shell.eviction_reads.get()
     }

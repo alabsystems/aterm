@@ -31,6 +31,7 @@ pub mod ai_pool;
 pub mod ai_signin;
 pub mod alab_exports;
 pub mod alab_roster;
+pub mod alab_seen;
 pub mod align;
 mod auth_deadline;
 #[cfg(test)]
@@ -40,9 +41,12 @@ pub mod claims;
 pub mod cli;
 pub mod codex_alab;
 pub mod codex_app_login;
+#[cfg(unix)]
+pub mod codex_exec_handoff;
 pub mod codex_facts;
 pub mod codex_renewal;
 pub mod codex_rollout;
+pub mod codex_rotation;
 pub mod codex_steps;
 pub mod codex_tap;
 pub mod contract;

@@ -183,10 +183,16 @@ thread_local! {
 pub fn boot_permit() -> BootPermit {
     LIVE_SLOT.with(|slot| {
         if slot.borrow().is_none() {
-            *slot.borrow_mut() = Some(aterm_spec::subprocess_lane::acquire());
+            *slot.borrow_mut() = Some(aterm_spec::subprocess_lane::acquire().unwrap_or_else(|e| {
+                aterm_spec::host::could_not_run(format!("subprocess admission refused ({e})"))
+            }));
         }
     });
-    BootPermit(aterm_spec::subprocess_lane::acquire_boot_permit())
+    BootPermit(
+        aterm_spec::subprocess_lane::acquire_boot_permit().unwrap_or_else(|e| {
+            aterm_spec::host::could_not_run(format!("subprocess boot admission refused ({e})"))
+        }),
+    )
 }
 
 struct Reaped(Child);
